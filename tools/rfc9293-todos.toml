@@ -10,15 +10,6 @@ reopen the connection directly from TIME-WAIT state (MAY-2), if it:
 '''
 
 [[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2"
-tags = ["MAY-10", "MAY-11"]
-reason = "MAY-10 [optional_omitted]: Optional IP Timestamp support is absent; unrelated to TCP timestamps. MAY-11 [optional_omitted]: Optional Record Route support is absent."
-quote = '''
-A TCP implementation MAY support the Timestamp (MAY-10) and Record
-Route (MAY-11) Options.
-'''
-
-[[todo]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1"
 tags = ["MUST-9"]
 reason = "MUST-9 [partial]: Secret and tuple sensitivity now have direct regression tests. HMAC uses a caller-supplied secret and TUN reads /dev/urandom; embeddings must still supply an unpredictable secret. Unit tests establish key dependence, not secrecy of caller key material."
@@ -36,27 +27,6 @@ quote = '''
 A TCP implementation MUST reject as an error a local OPEN call for an
 invalid remote IP address (e.g., a broadcast or multicast address)
 (MUST-46).
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.1"
-tags = ["MUST-51", "MUST-52"]
-reason = "MUST-51 [conditional_outside_profile]: Disabled-source-routing profile only. If IPv4 source routing is supported, the mandatory active-OPEN source-route API is missing; rejection does not implement it. MUST-52 [conditional_outside_profile]: Application-route precedence must be implemented if source routing enters the profile."
-quote = '''
-An application MUST be able to specify a source route when it
-actively opens a TCP connection (MUST-51), and this MUST take
-precedence over a source route received in a datagram (MUST-52).
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.1"
-tags = ["MUST-53"]
-reason = "MUST-53 [conditional_outside_profile]: Saving and using passive return routes is absent; required if such connections are supported."
-quote = '''
-When a TCP connection is OPENed passively and a packet arrives with a
-completed IP Source Route Option (containing a return route), TCP
-implementations MUST save the return route and use it for all
-segments sent on this connection (MUST-53).
 '''
 
 [[todo]]
@@ -88,14 +58,4 @@ This algorithm for reducing TIME-WAIT is a Best
 Current Practice that SHOULD be implemented since Timestamp Options
 are commonly used, and using them to reduce TIME-WAIT provides
 benefits for busy Internet servers (SHLD-4).
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.1"
-tags = ["SHLD-24"]
-reason = "SHLD-24 [conditional_outside_profile]: Later-route replacement is not implemented; SHOULD, not an unconditional MUST."
-quote = '''
-If a different source
-route arrives in a later segment, the later definition SHOULD
-override the earlier one (SHLD-24).
 '''

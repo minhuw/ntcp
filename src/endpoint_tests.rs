@@ -1826,3 +1826,334 @@ fn flush_discards_unsent_data_after_peer_advertises_zero_window() {
     assert_eq!(b.read(server, &mut received), Ok(11));
     assert_eq!(&received[..11], b"replacement");
 }
+
+fn completed_route(hops: &[u8]) -> Ipv4Options {
+    let mut bytes = [0; 40];
+    let len = 3 + hops.len() * 4;
+    bytes[..3].copy_from_slice(&[131, len as u8, len as u8 + 1]);
+    for (i, &hop) in hops.iter().enumerate() {
+        bytes[3 + i * 4..7 + i * 4].copy_from_slice(&[192, 0, 2, hop]);
+    }
+    Ipv4Options::parse(&bytes[..len], true).unwrap()
+}
+
+fn option_packet(endpoint: &mut Endpoint, now: u64) -> (Transmit, Vec<u8>) {
+    let mut bytes = [0; 2048];
+    for _ in 0..64 {
+        if let Some(packet) = endpoint.poll_transmit(now, &mut bytes, 16).unwrap().packet {
+            return (packet, bytes[..packet.len].to_vec());
+        }
+    }
+    panic!("no output");
+}
+
+// Check a real TCP pseudoheader against the logical destination, not the first hop.
+fn assert_route(packet: Transmit, bytes: &[u8], hops: &[u8]) {
+    use core::net::{IpAddr, Ipv4Addr};
+    let route = packet.ipv4_options.source_route.unwrap();
+    let expected: Vec<_> = hops.iter().map(|&n| Ipv4Addr::new(192, 0, 2, n)).collect();
+    assert_eq!(route.hops(), expected);
+    let (IpAddr::V4(source), IpAddr::V4(remote)) = (packet.ip.source, packet.ip.destination) else {
+        panic!()
+    };
+    let mut options = [0; 40];
+    let (first, len) = packet
+        .ipv4_options
+        .encode(source, remote, 0, &mut options)
+        .unwrap();
+    assert!(wire::parse(packet.ip, bytes).is_ok());
+    if !hops.is_empty() {
+        assert!(len <= 40);
+        assert_eq!(first, expected[0]);
+        assert!(
+            wire::parse(
+                IpMetadata {
+                    source: packet.ip.source,
+                    destination: first.into()
+                },
+                bytes
+            )
+            .is_err()
+        );
+        assert_eq!(
+            &options[3 + 4 * (hops.len() - 1)..7 + 4 * (hops.len() - 1)],
+            &remote.octets()
+        );
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.1
+//= type=test
+//# When a TCP connection is OPENed passively and a packet arrives with a
+//# completed IP Source Route Option (containing a return route), TCP
+//# implementations MUST save the return route and use it for all
+//# segments sent on this connection (MUST-53).  If a different source
+//# route arrives in a later segment, the later definition SHOULD
+//# override the earlier one (SHLD-24).
+#[test]
+fn ipv4_passive_owned_return_route_replacement_and_rejected_tcp_metadata() {
+    let (local, remote) = addresses();
+    let mut cfg = config();
+    cfg.ipv4_options_enabled = true;
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    a.connect(0, local, remote).unwrap();
+    let (syn, bytes) = option_packet(&mut a, 0);
+    let route_a = completed_route(&[8, 9]);
+    b.input_with_ipv4_options(0, syn.ip, 0, route_a, &bytes)
+        .unwrap();
+    let (synack, bytes) = option_packet(&mut b, 0);
+    assert_route(synack, &bytes, &[9, 8]);
+    a.input(0, synack.ip, &bytes).unwrap();
+    let (ack, ack_bytes) = option_packet(&mut a, 0);
+    b.input_with_ipv4_options(0, ack.ip, 0, route_a, &ack_bytes)
+        .unwrap();
+    let server = b.accept(listener).unwrap();
+    assert_eq!(b.received_ipv4_options(server).unwrap(), Some(route_a));
+    let original = wire::parse(ack.ip, &ack_bytes).unwrap().header;
+    let route_b = completed_route(&[10, 11]);
+    for case in 0..4 {
+        let mut header = original;
+        match case {
+            0 => header.sequence = header.sequence.wrapping_add(1_000_000),
+            1 => header.acknowledgment = header.acknowledgment.wrapping_add(1_000_000),
+            2 => header.flags = 0,
+            _ => {}
+        }
+        let mut forged = [0; 60];
+        let len = wire::encode(ack.ip, header, &[], &[], &mut forged).unwrap();
+        if case == 3 {
+            forged[16] ^= 1;
+        }
+        b.input_with_ipv4_options(0, ack.ip, 0, route_b, &forged[..len])
+            .unwrap();
+        assert_eq!(b.received_ipv4_options(server).unwrap(), Some(route_a));
+        b.write(server, b"x").unwrap();
+        let (packet, bytes) = option_packet(&mut b, 0);
+        assert_route(packet, &bytes, &[9, 8]);
+    }
+    b.input_with_ipv4_options(0, ack.ip, 0, route_b, &ack_bytes)
+        .unwrap();
+    assert_eq!(b.received_ipv4_options(server).unwrap(), Some(route_b));
+    b.write(server, b"x").unwrap();
+    let (packet, bytes) = option_packet(&mut b, 0);
+    assert_route(packet, &bytes, &[11, 10]);
+    b.input(0, ack.ip, &ack_bytes).unwrap();
+    assert_eq!(
+        b.received_ipv4_options(server).unwrap(),
+        Some(Ipv4Options::default())
+    );
+    b.write(server, b"x").unwrap();
+    let (packet, bytes) = option_packet(&mut b, 0);
+    assert_route(packet, &bytes, &[11, 10]);
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.1
+//= type=test
+//# An application MUST be able to specify a source route when it
+//# actively opens a TCP connection (MUST-51), and this MUST take
+//# precedence over a source route received in a datagram (MUST-52).
+#[test]
+fn ipv4_active_route_precedence_and_unoverridden_active_learning() {
+    use core::net::Ipv4Addr;
+    for explicit in [false, true] {
+        let (local, remote) = addresses();
+        let mut cfg = config();
+        cfg.ipv4_options_enabled = true;
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+        b.listen(remote, 4).unwrap();
+        let options = OutgoingIpv4Options {
+            source_route: explicit
+                .then(|| SourceRoute::new(&[Ipv4Addr::new(192, 0, 2, 7)], true).unwrap()),
+            ..Default::default()
+        };
+        let client = a
+            .connect_with_ipv4_options(0, local, remote, options)
+            .unwrap();
+        let (syn, bytes) = option_packet(&mut a, 0);
+        if explicit {
+            assert_route(syn, &bytes, &[7]);
+        }
+        b.input(0, syn.ip, &bytes).unwrap();
+        let (synack, bytes) = option_packet(&mut b, 0);
+        // SYN-SENT ACK rejection also cannot poison the return route.
+        let mut bad_header = wire::parse(synack.ip, &bytes).unwrap().header;
+        bad_header.acknowledgment = bad_header.acknowledgment.wrapping_add(500);
+        let mut bad = [0; 60];
+        let n = wire::encode(synack.ip, bad_header, &[], &[], &mut bad).unwrap();
+        a.input_with_ipv4_options(0, synack.ip, 0, completed_route(&[13]), &bad[..n])
+            .unwrap();
+        assert_eq!(a.received_ipv4_options(client).unwrap(), None);
+        let _ = packets(&mut a, 0); // Drain the bad-ACK reset.
+        a.input_with_ipv4_options(0, synack.ip, 0, completed_route(&[9]), &bytes)
+            .unwrap();
+        let (packet, bytes) = option_packet(&mut a, 0);
+        assert_route(packet, &bytes, if explicit { &[7] } else { &[9] });
+        assert_eq!(packet.ipv4_options.source_route.unwrap().strict, explicit);
+        assert_eq!(a.tuple(client).unwrap(), Tuple { local, remote });
+    }
+}
+
+#[test]
+fn ipv4_options_security_profile_validation_and_control_route() {
+    use core::net::Ipv4Addr;
+    let (local, remote) = addresses();
+    let route = SourceRoute::new(&[Ipv4Addr::new(192, 0, 2, 7)], false).unwrap();
+    let options = OutgoingIpv4Options {
+        source_route: Some(route),
+        ..Default::default()
+    };
+    let mut a = Endpoint::new(config(), [1; 32], 0).unwrap();
+    assert!(
+        a.connect_with_ipv4_options(0, local, remote, options)
+            .is_err()
+    );
+    let mut cfg = config();
+    cfg.ipv4_options_enabled = true;
+    cfg.ipv4_subnets.push((Ipv4Addr::new(192, 0, 2, 0), 24));
+    let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+    let mut bad = options;
+    bad.source_route = Some(SourceRoute::new(&[Ipv4Addr::new(192, 0, 2, 255)], false).unwrap());
+    assert!(b.connect_with_ipv4_options(0, local, remote, bad).is_err());
+    assert!(
+        b.connect_with_ipv4_options(
+            0,
+            "[2001:db8::1]:40000".parse().unwrap(),
+            "[2001:db8::2]:80".parse().unwrap(),
+            options
+        )
+        .is_err()
+    );
+    let client = a.connect(0, local, remote).unwrap();
+    let (syn, bytes) = option_packet(&mut a, 0);
+    assert_eq!(
+        a.input_with_ipv4_options(0, syn.ip, 0, completed_route(&[7]), &bytes)
+            .unwrap(),
+        InputDisposition::Dropped
+    );
+    assert_eq!(a.received_ipv4_options(client).unwrap(), None);
+    assert_eq!(
+        b.input_with_ipv4_options(0, syn.ip, 0, completed_route(&[255]), &bytes)
+            .unwrap(),
+        InputDisposition::Dropped
+    );
+    assert!(!b.has_pending_output());
+    b.input_with_ipv4_options(0, syn.ip, 0, completed_route(&[7, 8]), &bytes)
+        .unwrap();
+    let (reset, bytes) = option_packet(&mut b, 0);
+    assert_route(reset, &bytes, &[8, 7]);
+    assert_ne!(
+        wire::parse(reset.ip, &bytes).unwrap().header.flags & wire::RST,
+        0
+    );
+    let ipv6 = IpMetadata {
+        source: "2001:db8::1".parse().unwrap(),
+        destination: "2001:db8::2".parse().unwrap(),
+    };
+    assert_eq!(
+        b.input_with_ipv4_options(0, ipv6, 0, completed_route(&[7]), &bytes)
+            .unwrap(),
+        InputDisposition::Dropped
+    );
+}
+
+#[test]
+fn ipv4_options_reserve_send_budget_without_lowering_receive_mss() {
+    let (local, remote) = addresses();
+    for base in [68, 1480, u16::MAX] {
+        let mut cfg = config();
+        cfg.ipv4_options_enabled = true;
+        cfg.connection.mss = 1460;
+        cfg.connection.send_capacity = 65536;
+        cfg.connection.receive_capacity = 65536;
+        cfg.connection.send_ip_payload_limit = base;
+        cfg.connection.receive_ip_payload_limit = 1480;
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+        b.listen(remote, 4).unwrap();
+        let client = a.connect(0, local, remote).unwrap();
+        let (syn, bytes) = option_packet(&mut a, 0);
+        assert_eq!(wire::parse(syn.ip, &bytes).unwrap().options.mss, Some(1460));
+        b.input(0, syn.ip, &bytes).unwrap();
+        pump(&mut a, &mut b, 0);
+        a.write(client, &[0; 3000]).unwrap();
+        for (_, bytes) in packets(&mut a, 0) {
+            assert!(bytes.len() <= usize::from(base.min(65515) - 40));
+        }
+    }
+    for base in [0, 39, 40, 67] {
+        let mut cfg = config();
+        cfg.ipv4_options_enabled = true;
+        cfg.connection.send_ip_payload_limit = base;
+        assert!(Endpoint::new(cfg, [1; 32], 0).is_err());
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
+//= type=test
+//# A TCP implementation MAY support the Timestamp (MAY-10) and Record
+//# Route (MAY-11) Options.
+#[test]
+fn ipv4_outgoing_requests_and_received_owned_snapshot() {
+    use core::net::{IpAddr, Ipv4Addr};
+    let (local, remote) = addresses();
+    let mut cfg = config();
+    cfg.ipv4_options_enabled = true;
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let request = OutgoingIpv4Options {
+        source_route: Some(SourceRoute::new(&[], false).unwrap()),
+        record_route_slots: Some(2),
+        timestamp: Some(TimestampRequest::AddressTimes(2)),
+    };
+    let mut invalid = request;
+    invalid.source_route = None; // No fixed route budget for automatic route replacement.
+    assert!(
+        a.connect_with_ipv4_options(0, local, remote, invalid)
+            .is_err()
+    );
+    invalid = request;
+    invalid.record_route_slots = Some(9);
+    assert!(
+        a.connect_with_ipv4_options(0, local, remote, invalid)
+            .is_err()
+    );
+    invalid = request;
+    invalid.timestamp = Some(TimestampRequest::Prespecified {
+        addresses: [Ipv4Addr::BROADCAST; 4],
+        len: 1,
+    });
+    assert!(
+        a.connect_with_ipv4_options(0, local, remote, invalid)
+            .is_err()
+    );
+    a.connect_with_ipv4_options(0, local, remote, request)
+        .unwrap();
+    let (syn, bytes) = option_packet(&mut a, 0);
+    assert_eq!(syn.ipv4_options, request);
+    let (IpAddr::V4(source), IpAddr::V4(destination)) = (syn.ip.source, syn.ip.destination) else {
+        panic!()
+    };
+    let mut raw = [0; 40];
+    let (_, len) = syn
+        .ipv4_options
+        .encode(source, destination, 0x8000_0001, &mut raw)
+        .unwrap();
+    let options = Ipv4Options::parse(&raw[..len], true)
+        .unwrap()
+        .record(destination, 0x8000_0002)
+        .unwrap();
+    raw.fill(0); // No metadata borrows the input packet.
+    b.input_with_ipv4_options(0, syn.ip, 0, options, &bytes)
+        .unwrap();
+    let (synack, bytes) = option_packet(&mut b, 0);
+    a.input(0, synack.ip, &bytes).unwrap();
+    let (ack, bytes) = option_packet(&mut a, 0);
+    b.input_with_ipv4_options(0, ack.ip, 0, options, &bytes)
+        .unwrap();
+    let server = b.accept(listener).unwrap();
+    assert_eq!(b.received_ipv4_options(server).unwrap(), Some(options));
+}

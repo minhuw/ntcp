@@ -234,6 +234,7 @@ pub(crate) struct Connection {
     ecn_cwr_pending: bool,
     ecn_pause: Option<Instant>,
     last_output_ecn: u8,
+    pub(crate) accepted_metadata: bool,
     sample: Option<(Seq, Instant)>,
     syn_timed_out: bool,
     consecutive_timeouts: u32,
@@ -361,6 +362,7 @@ impl Connection {
             ecn_cwr_pending: false,
             ecn_pause: None,
             last_output_ecn: 0,
+            accepted_metadata: false,
             sample: None,
             syn_timed_out: false,
             consecutive_timeouts: 0,
@@ -1082,6 +1084,7 @@ impl Connection {
         traffic_class: u8,
         segment: &Segment<'_>,
     ) -> Result<(), Error> {
+        self.accepted_metadata = false;
         self.check_time(now)?;
         self.now = now;
         if self.state == State::Closed {
@@ -1113,6 +1116,7 @@ impl Connection {
             if h.flags & SYN == 0 {
                 return Ok(());
             }
+            self.accepted_metadata = true;
             self.learn_syn(segment);
             self.last_received = now;
             if valid_ack {
@@ -1142,6 +1146,7 @@ impl Connection {
             && ack == self.iss.wrapping_add(1)
             && ack == self.snd_nxt
         {
+            self.accepted_metadata = true;
             self.learn_ecn(h.flags);
             self.accept_ack(ack, false);
             self.establish();
@@ -1287,6 +1292,7 @@ impl Connection {
         if self.state == State::TimeWait {
             return Ok(());
         }
+        self.accepted_metadata = true;
         self.last_received = now;
         self.keepalive_probes = 0;
         self.keepalive_pending = false;

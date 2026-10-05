@@ -6,6 +6,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::{
+    Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options, SourceRoute, TimestampRequest,
     connection::{Connection, ConnectionConfig, ConnectionEvents, Error, Instant, State, Tuple},
     schedule::{Deadlines, ReadyQueue},
     wire::{self, ACK, Header, IpMetadata, RST, SYN},
@@ -25,6 +26,7 @@ pub struct ListenerId {
 #[derive(Clone, Debug)]
 pub struct EndpointConfig {
     pub max_connections: usize,
+    pub ipv4_options_enabled: bool,
     pub ipv4_subnets: Vec<(Ipv4Addr, u8)>,
     pub error_reports: bool,
     pub max_listeners: usize,
@@ -39,6 +41,7 @@ impl Default for EndpointConfig {
     fn default() -> Self {
         Self {
             max_connections: 1024,
+            ipv4_options_enabled: false,
             ipv4_subnets: Vec::new(),
             error_reports: true,
             max_listeners: 64,
@@ -58,6 +61,12 @@ pub enum EndpointError {
     LimitReached,
     AddressInUse,
     InvalidAddress,
+    Ipv4Options(Ipv4OptionsError),
+}
+impl From<Ipv4OptionsError> for EndpointError {
+    fn from(error: Ipv4OptionsError) -> Self {
+        Self::Ipv4Options(error)
+    }
 }
 impl From<Error> for EndpointError {
     fn from(error: Error) -> Self {
@@ -79,6 +88,7 @@ pub enum Event {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Transmit {
+    pub ipv4_options: OutgoingIpv4Options,
     pub ecn: u8,
     pub ip: IpMetadata,
     pub len: usize,
@@ -170,6 +180,9 @@ struct Slot {
     hop_limit: u8,
     dscp: u8,
     received_dscp: Option<u8>,
+    ipv4_options: OutgoingIpv4Options,
+    explicit_route: bool,
+    received_ipv4_options: Option<Ipv4Options>,
 }
 struct Listener {
     address: SocketAddr,
@@ -196,7 +209,7 @@ pub struct Endpoint {
     advice: ReadyQueue,
     cleanup: ReadyQueue,
     deadlines: Deadlines,
-    control: VecDeque<(IpMetadata, Header)>,
+    control: VecDeque<(IpMetadata, Header, OutgoingIpv4Options)>,
     passive_errors: VecDeque<Event>,
     control_epoch: Instant,
     control_count: usize,
@@ -225,7 +238,7 @@ fn valid_address(address: IpAddr) -> bool {
 
 impl Endpoint {
     pub fn new(
-        config: EndpointConfig,
+        mut config: EndpointConfig,
         secret: [u8; 32],
         now: Instant,
     ) -> Result<Self, EndpointError> {
@@ -237,6 +250,16 @@ impl Endpoint {
             || config.ipv4_subnets.iter().any(|(_, prefix)| *prefix > 32)
         {
             return Err(Error::InvalidArgument.into());
+        }
+        if config.ipv4_options_enabled {
+            // ponytail: reserve all 40 IPv4 option bytes; per-packet budgeting can reclaim slack later.
+            config.connection.send_ip_payload_limit = config
+                .connection
+                .send_ip_payload_limit
+                .min(65515)
+                .checked_sub(40)
+                .filter(|&budget| budget >= 28)
+                .ok_or(Error::InvalidArgument)?;
         }
         let count = config.max_connections;
         let listeners_count = config.max_listeners;
@@ -543,6 +566,9 @@ impl Endpoint {
             hop_limit: self.config.hop_limit,
             dscp: self.config.dscp,
             received_dscp: None,
+            ipv4_options: OutgoingIpv4Options::default(),
+            explicit_route: false,
+            received_ipv4_options: None,
         });
         self.buffer_bytes += self.per_connection_bytes;
         let id = self.id(index);
@@ -569,6 +595,91 @@ impl Endpoint {
         let connection =
             Connection::active(tuple, self.config.connection.clone(), self.isn(tuple), now)?;
         self.insert(connection, None)
+    }
+
+    fn validate_ipv4_options(
+        &self,
+        ip: IpMetadata,
+        options: OutgoingIpv4Options,
+    ) -> Result<(), EndpointError> {
+        if options == OutgoingIpv4Options::default() {
+            return Ok(());
+        }
+        let (IpAddr::V4(source), IpAddr::V4(destination)) = (ip.source, ip.destination) else {
+            return Err(EndpointError::InvalidAddress);
+        };
+        if !self.config.ipv4_options_enabled {
+            return Err(Ipv4OptionsError::SourceRouteDisabled.into());
+        }
+        if options
+            .source_route
+            .is_some_and(|r| r.hops().iter().any(|&a| !self.valid_address(a.into())))
+        {
+            return Err(EndpointError::InvalidAddress);
+        }
+        if let Some(TimestampRequest::Prespecified { addresses, len }) = options.timestamp
+            && (usize::from(len) > addresses.len()
+                || addresses[..usize::from(len)]
+                    .iter()
+                    .any(|&a| !self.valid_address(a.into())))
+        {
+            return Err(EndpointError::InvalidAddress);
+        }
+        options.encode(source, destination, 0, &mut [0; 40])?;
+        // An automatic return route can grow to 39 bytes. An explicit route (including
+        // an empty direct route) bounds space available to optional RR/TS requests.
+        if options.source_route.is_none()
+            && (options.record_route_slots.is_some() || options.timestamp.is_some())
+        {
+            return Err(Ipv4OptionsError::Capacity.into());
+        }
+        Ok(())
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.1
+    //# An application MUST be able to specify a source route when it
+    //# actively opens a TCP connection (MUST-51), and this MUST take
+    //# precedence over a source route received in a datagram (MUST-52).
+    pub fn connect_with_ipv4_options(
+        &mut self,
+        now: Instant,
+        local: SocketAddr,
+        remote: SocketAddr,
+        options: OutgoingIpv4Options,
+    ) -> Result<ConnectionId, EndpointError> {
+        self.validate_ipv4_options(
+            IpMetadata {
+                source: local.ip(),
+                destination: remote.ip(),
+            },
+            options,
+        )?;
+        let id = self.connect(now, local, remote)?;
+        let slot = self.slots[id.slot].as_mut().unwrap();
+        slot.ipv4_options = options;
+        slot.explicit_route = options.source_route.is_some();
+        Ok(id)
+    }
+
+    pub fn received_ipv4_options(
+        &self,
+        id: ConnectionId,
+    ) -> Result<Option<Ipv4Options>, EndpointError> {
+        Ok(self.slot(id)?.received_ipv4_options)
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.1
+    //# When a TCP connection is OPENed passively and a packet arrives with a
+    //# completed IP Source Route Option (containing a return route), TCP
+    //# implementations MUST save the return route and use it for all
+    //# segments sent on this connection (MUST-53).  If a different source
+    //# route arrives in a later segment, the later definition SHOULD
+    //# override the earlier one (SHLD-24).
+    fn save_ipv4_options(slot: &mut Slot, options: Ipv4Options, route: Option<SourceRoute>) {
+        slot.received_ipv4_options = Some(options);
+        if !slot.explicit_route && route.is_some() {
+            slot.ipv4_options.source_route = route;
+        }
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
@@ -744,7 +855,12 @@ impl Endpoint {
     //# containing a RST causes a RST to be sent in response.
 
     // Traceability limitation: Control replies are capacity- and rate-limited.
-    fn reset_for(&mut self, ip: IpMetadata, segment: &wire::Segment<'_>) {
+    fn reset_for(
+        &mut self,
+        ip: IpMetadata,
+        segment: &wire::Segment<'_>,
+        route: Option<SourceRoute>,
+    ) {
         if segment.header.flags & RST != 0 || self.control.len() >= self.config.max_control_packets
         {
             return;
@@ -789,6 +905,10 @@ impl Endpoint {
                 destination: ip.source,
             },
             header,
+            OutgoingIpv4Options {
+                source_route: route,
+                ..OutgoingIpv4Options::default()
+            },
         ));
         self.control_count += 1;
     }
@@ -809,7 +929,32 @@ impl Endpoint {
         traffic_class: u8,
         bytes: &[u8],
     ) -> Result<InputDisposition, EndpointError> {
+        self.input_with_ipv4_options(now, ip, traffic_class, Ipv4Options::default(), bytes)
+    }
+
+    pub fn input_with_ipv4_options(
+        &mut self,
+        now: Instant,
+        ip: IpMetadata,
+        traffic_class: u8,
+        options: Ipv4Options,
+        bytes: &[u8],
+    ) -> Result<InputDisposition, EndpointError> {
         self.clock(now)?;
+        if !options.is_empty()
+            && (!self.config.ipv4_options_enabled
+                || !ip.source.is_ipv4()
+                || !ip.destination.is_ipv4())
+        {
+            return Ok(InputDisposition::Dropped);
+        }
+        let route = match ip.source {
+            IpAddr::V4(source) => options.return_route(source),
+            _ => None,
+        };
+        if route.is_some_and(|r| r.hops().iter().any(|&a| !self.valid_address(a.into()))) {
+            return Ok(InputDisposition::Dropped);
+        }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
         //# |  An incoming SYN with an invalid source address MUST be ignored
         //# |  either by TCP or by the IP layer [(MUST-63)] (see
@@ -847,6 +992,9 @@ impl Endpoint {
             slot.received_dscp = Some(traffic_class >> 2);
             slot.connection
                 .input_with_traffic_class(now, traffic_class, &segment)?;
+            if slot.connection.accepted_metadata {
+                Self::save_ipv4_options(slot, options, route);
+            }
             self.refresh(index);
             return Ok(InputDisposition::Processed);
         }
@@ -861,7 +1009,7 @@ impl Endpoint {
             //# in the LISTEN state.  An acceptable reset segment should be
             //# formed for any arriving ACK-bearing segment.
             if segment.header.flags & ACK != 0 {
-                self.reset_for(ip, &segment);
+                self.reset_for(ip, &segment, route);
                 return Ok(InputDisposition::Processed);
             }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
@@ -886,14 +1034,16 @@ impl Endpoint {
             };
             match self.insert(connection, Some(listener)) {
                 Ok(id) => {
-                    self.slots[id.slot].as_mut().unwrap().received_dscp = Some(traffic_class >> 2);
+                    let slot = self.slots[id.slot].as_mut().unwrap();
+                    slot.received_dscp = Some(traffic_class >> 2);
+                    Self::save_ipv4_options(slot, options, route);
                     return Ok(InputDisposition::Processed);
                 }
                 Err(EndpointError::LimitReached) => return Ok(InputDisposition::Dropped),
                 Err(error) => return Err(error),
             }
         }
-        self.reset_for(ip, &segment);
+        self.reset_for(ip, &segment, route);
         Ok(InputDisposition::Dropped)
     }
 
@@ -1199,13 +1349,14 @@ impl Endpoint {
                 self.cleanup_one();
             }
             if !self.control.is_empty() && (self.control_turn || self.output.is_empty()) {
-                let (ip, header) = *self.control.front().unwrap();
+                let (ip, header, ipv4_options) = *self.control.front().unwrap();
                 let len = wire::encode(ip, header, &[], &[], out).map_err(Error::Wire)?;
                 self.control.pop_front();
                 self.control_turn = false;
                 return Ok(PollTransmit {
                     packet: Some(Transmit {
                         ecn: 0,
+                        ipv4_options,
                         ip,
                         len,
                         hop_limit: self.config.hop_limit,
@@ -1225,11 +1376,13 @@ impl Endpoint {
                     let hop_limit = slot.hop_limit;
                     let dscp = slot.dscp;
                     let ecn = slot.connection.last_output_ecn();
+                    let ipv4_options = slot.ipv4_options;
                     self.control_turn = true;
                     self.refresh(index);
                     return Ok(PollTransmit {
                         packet: Some(Transmit {
                             ecn,
+                            ipv4_options,
                             ip: IpMetadata {
                                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
                                 //# At all other times, a previous segment has either been sent or

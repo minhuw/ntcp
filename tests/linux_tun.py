@@ -19,6 +19,12 @@ def isolated_test(parent_namespace):
     subprocess.run(['ip', 'addr', 'add', '10.73.0.1/24', 'dev', 'ntcp-test'], check=True)
     subprocess.run(['ip', 'link', 'set', 'ntcp-test', 'up'], check=True)
     executable = ROOT / 'target/debug/examples/tun_echo'
+    mismatch = subprocess.run(
+        [str(executable), 'ntcp-test', '192.0.2.2', '8080'],
+        capture_output=True, timeout=5,
+    )
+    assert mismatch.returncode != 0
+    assert b'local IPv4 address must lie in the TUN interface subnet' in mismatch.stderr
     with tempfile.TemporaryFile(mode='w+b') as log:
         process = subprocess.Popen([str(executable), 'ntcp-test', '10.73.0.2', '8080'], stderr=log)
         try:
@@ -55,6 +61,20 @@ def isolated_test(parent_namespace):
                     if sender.is_alive() or errors:
                         raise AssertionError(f'sender failed: {errors}')
                     assert received == payload, (size, len(received))
+            if os.environ.get('NTCP_IPV4_OPTIONS') == '1':
+                # Exercise Linux-generated RR and IP Timestamp headers, not TCP timestamps.
+                for options in [bytes([7, 7, 4]) + bytes(5),
+                                bytes([68, 12, 5, 1]) + bytes(8)]:
+                    with socket.socket() as client:
+                        client.settimeout(10)
+                        client.setsockopt(socket.IPPROTO_IP, socket.IP_OPTIONS, options)
+                        client.connect(('10.73.0.2', 8080))
+                        client.sendall(b'ipv4-options')
+                        client.shutdown(socket.SHUT_WR)
+                        received = bytearray()
+                        while chunk := client.recv(1024):
+                            received.extend(chunk)
+                        assert received == b'ipv4-options', received
             # Linux sends one urgent byte; ntcp must retain it inline.
             with socket.create_connection(('10.73.0.2', 8080), timeout=10) as client:
                 client.settimeout(10)

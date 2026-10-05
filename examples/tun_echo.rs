@@ -7,7 +7,7 @@
 mod linux {
     use ntcp::{
         ConnectionConfig, ConnectionId, Endpoint, EndpointConfig, EndpointError, Error, Event,
-        IpMetadata, State,
+        IpMetadata, Ipv4Options, State,
     };
     use std::{
         fs::{File, OpenOptions},
@@ -53,7 +53,25 @@ mod linux {
         ip.octets()[0] != 0 && ip.octets()[0] < 224
     }
 
+    #[cfg(test)]
     fn parse_ipv4(packet: &[u8], local: Ipv4Addr) -> Option<(IpMetadata, &[u8])> {
+        parse_ipv4_options(packet, local, false, 0).map(|(ip, tcp, _)| (ip, tcp))
+    }
+
+    fn options_enabled(value: Option<&str>) -> io::Result<bool> {
+        match value {
+            None => Ok(false),
+            Some("1") => Ok(true),
+            _ => Err(invalid("NTCP_IPV4_OPTIONS must be exactly 1 or unset")),
+        }
+    }
+
+    fn parse_ipv4_options(
+        packet: &[u8],
+        local: Ipv4Addr,
+        enabled: bool,
+        timestamp: u32,
+    ) -> Option<(IpMetadata, &[u8], Ipv4Options)> {
         if packet.len() < IP_HEADER || packet[0] >> 4 != 4 {
             return None;
         }
@@ -69,27 +87,16 @@ mod linux {
         {
             return None;
         }
-        let mut options = &packet[IP_HEADER..header_len];
-        while let Some(&kind) = options.first() {
-            match kind {
-                0 => break,
-                1 => options = &options[1..],
-                131 | 137 => return None, // Source routing is disabled in this adapter.
-                //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
-                //# When received options are passed up to TCP from the IP layer, a TCP
-                //# implementation MUST ignore options that it does not understand (MUST-
-                //# 50).
-
-                // Well-formed unknown options are skipped; source routing is disabled.
-                _ => {
-                    let len = usize::from(*options.get(1)?);
-                    if len < 2 || len > options.len() {
-                        return None;
-                    }
-                    options = &options[len..];
-                }
-            }
-        }
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
+        //# When received options are passed up to TCP from the IP layer, a TCP
+        //# implementation MUST ignore options that it does not understand (MUST-
+        //# 50).
+        let options = Ipv4Options::parse(&packet[IP_HEADER..header_len], enabled).ok()?;
+        let options = if enabled {
+            options.record(local, timestamp).ok()?
+        } else {
+            Ipv4Options::default()
+        };
         let source = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
         let destination = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
@@ -97,7 +104,7 @@ mod linux {
         //# |  either by TCP or by the IP layer [(MUST-63)] (see
         //# |  Section 3.2.1.3).
 
-        // Subnet-directed broadcasts are checked by Endpoint using interface_prefix.
+        // Subnet-directed broadcasts are checked by Endpoint using interface_subnet.
         if destination != local || !unicast(source) || !unicast(destination) {
             return None;
         }
@@ -107,9 +114,11 @@ mod linux {
                 destination: destination.into(),
             },
             &packet[header_len..total_len],
+            options,
         ))
     }
 
+    #[cfg(test)]
     fn build_ipv4(
         packet: &mut [u8],
         ip: IpMetadata,
@@ -118,19 +127,53 @@ mod linux {
         dscp: u8,
         ecn: u8,
     ) -> io::Result<usize> {
+        build_ipv4_options(
+            packet,
+            ntcp::Transmit {
+                ip,
+                len: tcp_len,
+                hop_limit,
+                dscp,
+                ecn,
+                ipv4_options: ntcp::OutgoingIpv4Options::default(),
+            },
+            0,
+        )
+    }
+
+    fn build_ipv4_options(
+        packet: &mut [u8],
+        transmit: ntcp::Transmit,
+        timestamp: u32,
+    ) -> io::Result<usize> {
+        let ntcp::Transmit {
+            ip,
+            len: tcp_len,
+            hop_limit,
+            dscp,
+            ecn,
+            ipv4_options,
+        } = transmit;
         let (IpAddr::V4(source), IpAddr::V4(destination)) = (ip.source, ip.destination) else {
             return Err(invalid("TUN adapter only supports IPv4"));
         };
+        let mut options = [0; 40];
+        let (destination, option_len) = ipv4_options
+            .encode(source, destination, timestamp, &mut options)
+            .map_err(|_| invalid("invalid outgoing IPv4 options"))?;
+        let header_len = IP_HEADER + option_len;
         let total_len = tcp_len
-            .checked_add(IP_HEADER)
+            .checked_add(header_len)
             .ok_or_else(|| invalid("IP length overflow"))?;
         if total_len > MTU || total_len > packet.len() || !unicast(source) || !unicast(destination)
         {
             return Err(invalid("invalid outgoing IPv4 packet or MTU exceeded"));
         }
-        let header = &mut packet[..IP_HEADER];
+        packet.copy_within(IP_HEADER..IP_HEADER + tcp_len, header_len);
+        let header = &mut packet[..header_len];
         header.fill(0);
-        header[0] = 0x45;
+        header[0] = 0x40 | (header_len / 4) as u8;
+        header[IP_HEADER..].copy_from_slice(&options[..option_len]);
         header[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.1
         //# RFC 1122 allows that if a retransmitted packet is identical to the
@@ -192,7 +235,21 @@ mod linux {
         Ok(prefix as u8)
     }
 
-    fn interface_prefix(tun: &File) -> io::Result<u8> {
+    fn checked_interface_subnet(
+        local: Ipv4Addr,
+        address: Ipv4Addr,
+        mask: u32,
+    ) -> io::Result<(Ipv4Addr, u8)> {
+        let prefix = prefix_length(mask)?;
+        if u32::from(local) & mask != u32::from(address) & mask {
+            return Err(invalid(
+                "local IPv4 address must lie in the TUN interface subnet; unrelated routed endpoint addresses are unsupported",
+            ));
+        }
+        Ok((address, prefix))
+    }
+
+    fn interface_subnet(tun: &File, local: Ipv4Addr) -> io::Result<(Ipv4Addr, u8)> {
         // SAFETY: zero initializes every ifreq union member and the name buffer.
         let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
         // SAFETY: live TUN fd and writable, correctly sized ifreq. Querying the
@@ -211,12 +268,28 @@ mod linux {
             return Err(invalid("expected an IPv4 interface netmask"));
         }
         // sockaddr_in's network-order address follows its two-byte port.
-        prefix_length(u32::from_be_bytes([
+        let mask = u32::from_be_bytes([
             mask.sa_data[2] as u8,
             mask.sa_data[3] as u8,
             mask.sa_data[4] as u8,
             mask.sa_data[5] as u8,
-        ]))
+        ]);
+        // SAFETY: the live socket and kernel-returned interface name remain valid.
+        if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFADDR, &mut request) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful SIOCGIFADDR initialized this union member.
+        let address = unsafe { request.ifr_ifru.ifru_addr };
+        if i32::from(address.sa_family) != libc::AF_INET {
+            return Err(invalid("expected an IPv4 interface address"));
+        }
+        let address = Ipv4Addr::new(
+            address.sa_data[2] as u8,
+            address.sa_data[3] as u8,
+            address.sa_data[4] as u8,
+            address.sa_data[5] as u8,
+        );
+        checked_interface_subnet(local, address, mask)
     }
 
     struct Flow {
@@ -318,6 +391,11 @@ mod linux {
         if !unicast(local) || port == 0 {
             return Err(invalid("expected a unicast IPv4 address and nonzero port"));
         }
+        let ipv4_options_enabled = match std::env::var("NTCP_IPV4_OPTIONS") {
+            Ok(value) => options_enabled(Some(&value))?,
+            Err(std::env::VarError::NotPresent) => options_enabled(None)?,
+            Err(_) => return Err(invalid("invalid NTCP_IPV4_OPTIONS")),
+        };
         let mut secret = [0u8; 32];
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1
         //# F() MUST NOT be computable from the outside (MUST-9), or
@@ -339,7 +417,8 @@ mod linux {
             //# Generally, an application SHOULD NOT change the Diffserv field value
             //# during the course of a connection (SHLD-23).
             dscp: 0,
-            ipv4_subnets: vec![(local, interface_prefix(&tun)?)],
+            ipv4_options_enabled,
+            ipv4_subnets: vec![interface_subnet(&tun, local)?],
             error_reports: true,
             connection: ConnectionConfig {
                 send_capacity: 65536,
@@ -381,9 +460,14 @@ mod linux {
                         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "TUN closed"));
                     }
                     Ok(len) => {
-                        if let Some((ip, tcp)) = parse_ipv4(&input[..len], local) {
+                        if let Some((ip, tcp, options)) = parse_ipv4_options(
+                            &input[..len],
+                            local,
+                            ipv4_options_enabled,
+                            (start.elapsed().as_millis() as u32) | 0x8000_0000,
+                        ) {
                             endpoint
-                                .input_with_traffic_class(now(start), ip, input[1], tcp)
+                                .input_with_ipv4_options(now(start), ip, input[1], options, tcp)
                                 .map_err(engine)?;
                         }
                     }
@@ -446,13 +530,10 @@ mod linux {
                     .poll_transmit(now(start), &mut output[IP_HEADER..], 1)
                     .map_err(engine)?;
                 if let Some(packet) = polled.packet {
-                    let len = build_ipv4(
+                    let len = build_ipv4_options(
                         &mut output,
-                        packet.ip,
-                        packet.len,
-                        packet.hop_limit,
-                        packet.dscp,
-                        packet.ecn,
+                        packet,
+                        (start.elapsed().as_millis() as u32) | 0x8000_0000,
                     )?;
                     match tun.write(&output[..len]) {
                         Ok(written) if written == len => {}
@@ -489,6 +570,64 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn enabled_option_profile_header_mtu_and_timestamp_roundtrip() {
+            use ntcp::{OutgoingIpv4Options, SourceRoute, TimestampRequest};
+            assert!(!options_enabled(None).unwrap());
+            assert!(options_enabled(Some("1")).unwrap());
+            for value in ["", "0", "true", "01", " 1", "1 "] {
+                assert!(options_enabled(Some(value)).is_err());
+            }
+            let source = Ipv4Addr::new(192, 0, 2, 1);
+            let local = Ipv4Addr::new(192, 0, 2, 2);
+            let hop = Ipv4Addr::new(192, 0, 2, 9);
+            let ip = IpMetadata {
+                source: source.into(),
+                destination: local.into(),
+            };
+            let mut bytes = [0xa5; MTU];
+            let mut transmit = ntcp::Transmit {
+                ip,
+                len: 1440,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+                ipv4_options: OutgoingIpv4Options {
+                    source_route: Some(SourceRoute::new(&[hop], false).unwrap()),
+                    record_route_slots: Some(2),
+                    timestamp: Some(TimestampRequest::Times(4)),
+                },
+            };
+            let len = build_ipv4_options(&mut bytes, transmit, 0x8000_0001).unwrap();
+            assert_eq!(len, MTU);
+            assert_eq!(bytes[0], 0x4f);
+            assert_eq!(checksum(&bytes[..60]), 0);
+            assert_eq!(&bytes[16..20], &hop.octets());
+            assert_eq!(&bytes[23..27], &local.octets());
+            assert_eq!(&bytes[60..], &[0xa5; 1440]);
+            // Simulate RFC 791's router swap, not a live kernel source-route path.
+            bytes[16..20].copy_from_slice(&local.octets());
+            bytes[23..27].copy_from_slice(&hop.octets());
+            bytes[22] = 8;
+            reseal(&mut bytes);
+            assert!(parse_ipv4_options(&bytes, local, false, 0).is_none());
+            let (received_ip, tcp, options) =
+                parse_ipv4_options(&bytes, local, true, 0x8000_0002).unwrap();
+            assert_eq!(received_ip, ip);
+            assert_eq!(tcp, &[0xa5; 1440]);
+            assert_eq!(options.return_route(source).unwrap().hops(), &[hop]);
+            let recorded = options.as_bytes();
+            assert_eq!(&recorded[14..18], &local.octets()); // RR's second slot.
+            assert_eq!(&recorded[26..30], &0x8000_0002u32.to_be_bytes());
+            let before = bytes;
+            transmit.len = 1441;
+            assert!(build_ipv4_options(&mut bytes, transmit, 0).is_err());
+            assert_eq!(bytes, before);
+            transmit.len = 1440;
+            assert!(build_ipv4_options(&mut bytes[..MTU - 1], transmit, 0).is_err());
+            assert_eq!(bytes, before);
+        }
 
         fn packet() -> ([u8; MTU], usize, Ipv4Addr) {
             let local = Ipv4Addr::new(10, 0, 0, 2);
@@ -527,6 +666,44 @@ mod linux {
                 reseal(&mut bytes);
                 assert!(parse_ipv4(&bytes[..len + 4], local).is_none());
             }
+        }
+
+        #[test]
+        fn interface_subnet_rejects_routed_local_mismatch_and_keeps_edge_prefixes() {
+            let interface = Ipv4Addr::new(192, 0, 2, 2);
+            let local = Ipv4Addr::new(198, 51, 100, 2);
+            assert!(checked_interface_subnet(local, interface, 0xffff_ff00).is_err());
+            assert_eq!(
+                checked_interface_subnet(Ipv4Addr::new(192, 0, 2, 10), interface, 0xffff_ff00)
+                    .unwrap(),
+                (interface, 24)
+            );
+            assert_eq!(
+                checked_interface_subnet(local, interface, 0).unwrap(),
+                (interface, 0)
+            );
+            for tail in [2, 3] {
+                assert_eq!(
+                    checked_interface_subnet(
+                        Ipv4Addr::new(192, 0, 2, tail),
+                        interface,
+                        0xffff_fffe
+                    )
+                    .unwrap(),
+                    (interface, 31)
+                );
+            }
+            assert!(
+                checked_interface_subnet(Ipv4Addr::new(192, 0, 2, 1), interface, 0xffff_fffe)
+                    .is_err()
+            );
+            assert_eq!(
+                checked_interface_subnet(interface, interface, u32::MAX).unwrap(),
+                (interface, 32)
+            );
+            assert!(
+                checked_interface_subnet(Ipv4Addr::new(192, 0, 2, 3), interface, u32::MAX).is_err()
+            );
         }
 
         #[test]
