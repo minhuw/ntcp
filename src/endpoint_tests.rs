@@ -660,6 +660,13 @@ fn unknown_connection_reset_has_correct_sequence_and_never_answers_reset() {
     assert!(packets(&mut b, 0).is_empty());
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5
+//= type=test
+//= reason=Terminal notification cancels stream operations; explicit release reclaims storage after the pending reset is generated.
+//# All queued SENDs and RECEIVEs should be given "connection reset"
+//# notification; all segments queued for transmission (except for the
+//# RST formed above) or retransmission should be flushed. Delete the
+//# TCB, enter CLOSED state, and return.
 #[test]
 fn abort_release_retries_reset_before_reclaiming_storage() {
     let (mut a, mut b, listener, client) = endpoints();
@@ -668,6 +675,20 @@ fn abort_release_retries_reset_before_reclaiming_storage() {
     a.write(client, b"unsent data must not precede the reset")
         .unwrap();
     a.abort(client).unwrap();
+    assert_eq!(a.state(client).unwrap(), State::Closed);
+    assert_eq!(a.close_reason(client).unwrap(), Some(CloseReason::Aborted));
+    assert_eq!(
+        a.write(client, b"late"),
+        Err(EndpointError::Connection(Error::InvalidState))
+    );
+    assert_eq!(
+        a.read(client, &mut [0; 1]),
+        Err(EndpointError::Connection(Error::InvalidState))
+    );
+    assert!(core::iter::from_fn(|| a.next_event()).any(|event| {
+        matches!(event, Event::Connection(id, events)
+            if id == client && events.closed == Some(CloseReason::Aborted))
+    }));
     let retained = a.buffer_bytes();
     a.release(client).unwrap();
     assert_eq!(a.state(client), Err(EndpointError::InvalidHandle));
@@ -681,11 +702,12 @@ fn abort_release_retries_reset_before_reclaiming_storage() {
     assert!(a.has_pending_output());
     let reset = packets(&mut a, 0);
     assert_eq!(reset.len(), 1);
-    assert_ne!(
-        wire::parse(reset[0].0, &reset[0].1).unwrap().header.flags & wire::RST,
-        0
-    );
+    let segment = wire::parse(reset[0].0, &reset[0].1).unwrap();
+    assert_eq!(segment.header.flags, wire::RST);
+    assert!(segment.payload.is_empty());
     assert_eq!(a.buffer_bytes(), 0);
+    assert!(a.next_deadline().is_none());
+    assert!(packets(&mut a, 0).is_empty());
     deliver(&mut b, 0, reset);
     assert_eq!(b.state(server).unwrap(), State::Closed);
     assert_eq!(b.close_reason(server).unwrap(), Some(CloseReason::Reset));
