@@ -27,4 +27,5 @@ pub use endpoint::{
     ConnectionId, Endpoint, EndpointConfig, EndpointError, Event, InputDisposition, ListenerId,
     PollTransmit, Transmit,
 };
+pub use recovery::RecoveryAlgorithm;
 pub use wire::{IpMetadata, WireError};

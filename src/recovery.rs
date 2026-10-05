@@ -63,8 +63,25 @@ impl RttEstimator {
     }
 }
 
+// Fast recovery behavior; both choices share slow start and congestion avoidance.
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.2
+//= reason=Selectable RFC 5681 Reno-style and RFC 6582 NewReno recovery with shared conservative congestion and ECN guards; not a whole external-RFC compliance claim.
+//# An endpoint MAY implement such alternative
+//# algorithms provided that the algorithms are conformant with the TCP
+//# specifications from the IETF Standards Track as described in RFC
+//# 2914, RFC 5033 [7], and RFC 8961 [15] (MAY-18).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum RecoveryAlgorithm {
+    // RFC 5681 recovery, retaining conservative recovery/ECN epoch guards.
+    Reno,
+    // RFC 6582 partial-ACK recovery (the default).
+    #[default]
+    NewReno,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Congestion {
+    algorithm: RecoveryAlgorithm,
     mss: u32,
     cwnd: u32,
     ssthresh: u32,
@@ -80,10 +97,11 @@ pub(crate) struct Congestion {
 }
 
 impl Congestion {
-    pub(crate) fn new(mss: u32) -> Self {
+    pub(crate) fn new(mss: u32, algorithm: RecoveryAlgorithm) -> Self {
         assert!(mss > 0);
         let mss = mss.min(MAX_WINDOW);
         Self {
+            algorithm,
             mss,
             cwnd: Self::initial_window(mss),
             ssthresh: MAX_WINDOW,
@@ -165,6 +183,18 @@ impl Congestion {
             self.recover = None;
         }
         if self.fast_recovery {
+            if self.algorithm == RecoveryAlgorithm::Reno && relation.is_some() {
+                // Retain recover and the independent ECN epoch: exiting fast recovery
+                // must not allow a second reduction for the same flight.
+                //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+                //# When the next ACK arrives that acknowledges previously
+                //# unacknowledged data, a TCP MUST set cwnd to ssthresh (the value
+                //# set in step 2).
+                self.cwnd = self.ssthresh;
+                self.fast_recovery = false;
+                self.acknowledged = 0;
+                return false;
+            }
             if matches!(relation, Some(Ordering::Equal | Ordering::Greater)) {
                 // RFC 6582 option (1) limits the burst after a full ACK.
                 self.cwnd = self.ssthresh.min(
@@ -376,9 +406,12 @@ mod tests {
     //# collapse conditions (MUST-19).
     fn initial_slow_start_and_byte_counting() {
         for (mss, window) in [(500, 2_000), (1_000, 4_000), (1_460, 4_380), (3_000, 6_000)] {
-            assert_eq!(Congestion::new(mss).cwnd(), window);
+            assert_eq!(
+                Congestion::new(mss, RecoveryAlgorithm::default()).cwnd(),
+                window
+            );
         }
-        let mut c = Congestion::new(1_000);
+        let mut c = Congestion::new(1_000, RecoveryAlgorithm::default());
         c.on_ack(Seq(100), 100, 0);
         assert_eq!(c.cwnd(), 4_100);
         c.on_ack(Seq(2_100), 2_000, 0);
@@ -407,7 +440,7 @@ mod tests {
 
     #[test]
     fn newreno_partial_and_full_ack() {
-        let mut c = Congestion::new(1_000);
+        let mut c = Congestion::new(1_000, RecoveryAlgorithm::default());
         assert!(three_duplicates(&mut c, 8_000, Seq(8_000)));
         assert_eq!((c.ssthresh(), c.cwnd()), (4_000, 7_000));
         assert!(!c.on_duplicate_ack(8_000, Seq(8_000)));
@@ -427,136 +460,211 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= type=test
+    //# When the next ACK arrives that acknowledges previously
+    //# unacknowledged data, a TCP MUST set cwnd to ssthresh (the value
+    //# set in step 2).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.2
+    //= type=test
+    //= reason=Checks selectable recovery exit and partial-ACK behavior, wraparound and conservative epoch guards; not comprehensive external-RFC verification.
+    //# An endpoint MAY implement such alternative
+    //# algorithms provided that the algorithms are conformant with the TCP
+    //# specifications from the IETF Standards Track as described in RFC
+    //# 2914, RFC 5033 [7], and RFC 8961 [15] (MAY-18).
+    fn reno_and_newreno_recovery_exit() {
+        assert_eq!(RecoveryAlgorithm::default(), RecoveryAlgorithm::NewReno);
+        for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
+            for base in [Seq(0), Seq(u32::MAX - 3_999)] {
+                for acked in [500, 2_000, 8_000, 9_000] {
+                    let end = base.wrapping_add(8_000);
+                    let mut c = Congestion::new(1_000, algorithm);
+                    assert!(three_duplicates(&mut c, 8_000, end));
+                    // Control-only and ambiguous ACKs cannot exit recovery.
+                    assert!(!c.on_ack(base, 0, 8_000));
+                    assert!(!c.on_ack(end.wrapping_add(1 << 31), 1, 8_000));
+                    assert!(c.fast_recovery);
+                    let partial = acked < 8_000;
+                    let stays = partial && algorithm == RecoveryAlgorithm::NewReno;
+                    assert_eq!(
+                        c.on_ack(
+                            base.wrapping_add(acked),
+                            acked,
+                            8_000u32.saturating_sub(acked)
+                        ),
+                        stays
+                    );
+                    assert_eq!(c.fast_recovery, stays);
+                    let expected = if algorithm == RecoveryAlgorithm::Reno {
+                        4_000
+                    } else if partial {
+                        7_000 - acked + if acked >= 1_000 { 1_000 } else { 0 }
+                    } else {
+                        2_000
+                    };
+                    assert_eq!(c.cwnd(), expected);
+                    assert_eq!(c.recover, if acked > 8_000 { None } else { Some(end) });
+                    if algorithm == RecoveryAlgorithm::Reno && partial {
+                        assert!(!three_duplicates(&mut c, 6_000, end));
+                        assert_eq!(c.cwnd(), 4_000);
+                        assert!(!c.on_ecn(end, 6_000, end));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn timeout_marker_boundaries_and_wrap() {
-        for end in [Seq(10_000), Seq(0), Seq(u32::MAX)] {
-            let mut c = Congestion::new(1_000);
-            c.on_timeout(10_000, end);
-            assert_eq!((c.cwnd(), c.ssthresh()), (1_000, 5_000));
-            c.on_timeout(2_000, end);
-            assert_eq!(c.ssthresh(), 5_000);
-            assert!(!three_duplicates(&mut c, 10_000, end));
-            c.on_ack(end.wrapping_add(u32::MAX), 1, 1);
-            assert!(!three_duplicates(&mut c, 4_000, end.wrapping_add(4_000)));
-            c.on_ack(end, 1, 4_000);
-            assert!(!three_duplicates(&mut c, 4_000, end.wrapping_add(4_000)));
-            c.on_ack(end.wrapping_add(1), 1, 3_999);
-            assert!(three_duplicates(&mut c, 3_999, end.wrapping_add(4_000)));
-            assert!(c.on_ack(end.wrapping_add(1_001), 1_000, 2_999));
-            assert!(!c.on_ack(end.wrapping_add(4_000), 2_999, 0));
-            c.on_timeout(8_000, end.wrapping_add(8_000));
-            assert_eq!(c.ssthresh(), 4_000);
+        for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
+            for end in [Seq(10_000), Seq(0), Seq(u32::MAX)] {
+                let mut c = Congestion::new(1_000, algorithm);
+                c.on_timeout(10_000, end);
+                assert_eq!((c.cwnd(), c.ssthresh()), (1_000, 5_000));
+                c.on_timeout(2_000, end);
+                assert_eq!(c.ssthresh(), 5_000);
+                assert!(!three_duplicates(&mut c, 10_000, end));
+                c.on_ack(end.wrapping_add(u32::MAX), 1, 1);
+                assert!(!three_duplicates(&mut c, 4_000, end.wrapping_add(4_000)));
+                c.on_ack(end, 1, 4_000);
+                assert!(!three_duplicates(&mut c, 4_000, end.wrapping_add(4_000)));
+                c.on_ack(end.wrapping_add(1), 1, 3_999);
+                assert!(three_duplicates(&mut c, 3_999, end.wrapping_add(4_000)));
+                assert_eq!(
+                    c.on_ack(end.wrapping_add(1_001), 1_000, 2_999),
+                    algorithm == RecoveryAlgorithm::NewReno
+                );
+                assert!(!c.on_ack(end.wrapping_add(4_000), 2_999, 0));
+                c.on_timeout(8_000, end.wrapping_add(8_000));
+                assert_eq!(c.ssthresh(), 4_000);
+            }
         }
     }
 
     #[test]
     fn mss_idle_reset_and_saturation() {
-        let mut c = Congestion::new(1_000);
-        c.on_ack(Seq(1_000), 1_000, 0);
-        c.set_mss(500);
-        assert_eq!(c.cwnd(), 2_500);
-        c.restart_after_idle();
-        assert_eq!(c.cwnd(), 2_000);
-        c.on_timeout(10_000, Seq(10_000));
-        c.restart_after_idle();
-        assert_eq!(c.cwnd(), 500);
-        c.set_mss(1_000);
-        assert_eq!(c.cwnd(), 1_000);
-        let mut c = Congestion::new(u32::MAX);
-        assert_eq!(c.cwnd(), MAX_WINDOW);
-        c.on_ack(Seq(1), u32::MAX, u32::MAX);
-        assert_eq!(c.cwnd(), MAX_WINDOW);
-        assert!(three_duplicates(&mut c, u32::MAX, Seq(10)));
-        c.on_duplicate_ack(u32::MAX, Seq(10));
-        assert_eq!((c.cwnd(), c.ssthresh()), (MAX_WINDOW, MAX_WINDOW));
-        c.set_mss(u32::MAX);
-        c.on_timeout(u32::MAX, Seq(10));
-        assert_eq!((c.cwnd(), c.ssthresh()), (MAX_WINDOW, MAX_WINDOW));
-        let mut c = Congestion::new(1_000);
-        c.on_duplicate_ack(4_000, Seq(4_000));
-        c.on_duplicate_ack(4_000, Seq(4_000));
-        c.reset_duplicate_acks();
-        assert!(three_duplicates(&mut c, 4_000, Seq(4_000)));
+        for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
+            let mut c = Congestion::new(1_000, algorithm);
+            c.on_ack(Seq(1_000), 1_000, 0);
+            c.set_mss(500);
+            assert_eq!(c.cwnd(), 2_500);
+            c.restart_after_idle();
+            assert_eq!(c.cwnd(), 2_000);
+            c.on_timeout(10_000, Seq(10_000));
+            c.restart_after_idle();
+            assert_eq!(c.cwnd(), 500);
+            c.set_mss(1_000);
+            assert_eq!(c.cwnd(), 1_000);
+            let mut c = Congestion::new(u32::MAX, algorithm);
+            assert_eq!(c.cwnd(), MAX_WINDOW);
+            c.on_ack(Seq(1), u32::MAX, u32::MAX);
+            assert_eq!(c.cwnd(), MAX_WINDOW);
+            assert!(three_duplicates(&mut c, u32::MAX, Seq(10)));
+            c.on_duplicate_ack(u32::MAX, Seq(10));
+            assert_eq!((c.cwnd(), c.ssthresh()), (MAX_WINDOW, MAX_WINDOW));
+            c.set_mss(u32::MAX);
+            c.on_timeout(u32::MAX, Seq(10));
+            assert_eq!((c.cwnd(), c.ssthresh()), (MAX_WINDOW, MAX_WINDOW));
+            let mut c = Congestion::new(1_000, algorithm);
+            c.on_duplicate_ack(4_000, Seq(4_000));
+            c.on_duplicate_ack(4_000, Seq(4_000));
+            c.reset_duplicate_acks();
+            assert!(three_duplicates(&mut c, 4_000, Seq(4_000)));
+        }
     }
 
     #[test]
     #[should_panic]
     fn zero_mss_rejected() {
-        Congestion::new(0);
+        Congestion::new(0, RecoveryAlgorithm::default());
     }
 
     #[test]
     #[should_panic]
     fn zero_mss_update_rejected() {
-        Congestion::new(1_000).set_mss(0);
+        Congestion::new(1_000, RecoveryAlgorithm::default()).set_mss(0);
     }
     #[test]
     fn ecn_retransmission_loss_and_ack_boundaries_wrap() {
-        for base in [Seq(100), Seq(u32::MAX - 12_499)] {
-            for acked_retransmission in [0, 500, 1000] {
-                let end = base.wrapping_add(16_000);
-                let mut c = Congestion::new(1000);
-                assert!(c.on_ecn(base, 16_000, end));
-                assert_eq!(c.ssthresh(), 8000);
-                assert!(three_duplicates(&mut c, 16_000, end));
-                c.on_retransmit(base.wrapping_add(1000));
-                assert!(c.on_ack(base.wrapping_add(12_000), 12_000, 4000));
-                c.on_retransmit(base.wrapping_add(13_000));
-                // A shorter retransmission must not forget still-outstanding bytes.
-                c.on_retransmit(base.wrapping_add(12_500));
-                if acked_retransmission != 0 {
-                    assert!(c.on_ack(
-                        base.wrapping_add(12_000 + acked_retransmission),
-                        acked_retransmission,
-                        4000 - acked_retransmission
-                    ));
+        for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
+            for base in [Seq(100), Seq(u32::MAX - 12_499)] {
+                for acked_retransmission in [0, 500, 1000] {
+                    let end = base.wrapping_add(16_000);
+                    let mut c = Congestion::new(1000, algorithm);
+                    assert!(c.on_ecn(base, 16_000, end));
+                    assert_eq!(c.ssthresh(), 8000);
+                    assert!(three_duplicates(&mut c, 16_000, end));
+                    c.on_retransmit(base.wrapping_add(1000));
+                    assert_eq!(
+                        c.on_ack(base.wrapping_add(12_000), 12_000, 4000),
+                        algorithm == RecoveryAlgorithm::NewReno
+                    );
+                    c.on_retransmit(base.wrapping_add(13_000));
+                    // A shorter retransmission must not forget still-outstanding bytes.
+                    c.on_retransmit(base.wrapping_add(12_500));
+                    if acked_retransmission != 0 {
+                        assert_eq!(
+                            c.on_ack(
+                                base.wrapping_add(12_000 + acked_retransmission),
+                                acked_retransmission,
+                                4000 - acked_retransmission
+                            ),
+                            algorithm == RecoveryAlgorithm::NewReno
+                        );
+                    }
+                    c.on_timeout(4000 - acked_retransmission, end);
+                    let threshold = if acked_retransmission == 1000 {
+                        8000
+                    } else {
+                        2000
+                    };
+                    assert_eq!(c.ssthresh(), threshold);
+                    c.on_timeout(4000 - acked_retransmission, end);
+                    assert_eq!(c.ssthresh(), threshold);
                 }
-                c.on_timeout(4000 - acked_retransmission, end);
-                let threshold = if acked_retransmission == 1000 {
-                    8000
-                } else {
-                    2000
-                };
-                assert_eq!(c.ssthresh(), threshold);
-                c.on_timeout(4000 - acked_retransmission, end);
-                assert_eq!(c.ssthresh(), threshold);
             }
         }
     }
 
     #[test]
     fn ecn_loss_recovery_shares_reduction_but_not_retransmission() {
-        for base in [Seq(0), Seq(u32::MAX - 3_999)] {
-            let end = base.wrapping_add(4_000);
-            let mut c = Congestion::new(1_000);
-            assert!(c.on_ecn(base, 4_000, end));
-            assert_eq!((c.cwnd(), c.ssthresh()), (2_000, 2_000));
-            assert!(!c.on_ecn(end, 4_000, end));
-            // A real loss in the ECN window still fast retransmits, without
-            // a second threshold reduction (flight is intentionally smaller).
-            assert!(three_duplicates(&mut c, 2_000, end));
-            assert_eq!(c.ssthresh(), 2_000);
-            assert!(!c.on_ecn(base, 2_000, end));
-            assert!(c.on_ack_with_ecn(base.wrapping_add(1_000), 1_000, 1_000, true));
-            assert!(!c.on_ack_with_ecn(end, 1_000, 0, true));
-            assert!(!c.fast_recovery);
-            assert!(!c.on_ecn(end, 2_000, end));
-            assert!(c.on_ecn(end.wrapping_add(1), 2_000, end.wrapping_add(2_000)));
+        for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
+            for base in [Seq(0), Seq(u32::MAX - 3_999)] {
+                let end = base.wrapping_add(4_000);
+                let mut c = Congestion::new(1_000, algorithm);
+                assert!(c.on_ecn(base, 4_000, end));
+                assert_eq!((c.cwnd(), c.ssthresh()), (2_000, 2_000));
+                assert!(!c.on_ecn(end, 4_000, end));
+                // A real loss in the ECN window still fast retransmits, without
+                // a second threshold reduction (flight is intentionally smaller).
+                assert!(three_duplicates(&mut c, 2_000, end));
+                assert_eq!(c.ssthresh(), 2_000);
+                assert!(!c.on_ecn(base, 2_000, end));
+                assert_eq!(
+                    c.on_ack_with_ecn(base.wrapping_add(1_000), 1_000, 1_000, true),
+                    algorithm == RecoveryAlgorithm::NewReno
+                );
+                assert!(!c.on_ack_with_ecn(end, 1_000, 0, true));
+                assert!(!c.fast_recovery);
+                assert!(!c.on_ecn(end, 2_000, end));
+                assert!(c.on_ecn(end.wrapping_add(1), 2_000, end.wrapping_add(2_000)));
 
-            let mut c = Congestion::new(1_000);
-            assert!(three_duplicates(&mut c, 8_000, end));
-            let threshold = c.ssthresh();
-            assert!(!c.on_ecn(end, 8_000, end));
-            assert_eq!(c.ssthresh(), threshold);
-            c.on_timeout(2_000, end);
-            assert_eq!(c.cwnd(), 1_000);
-            assert!(!c.on_ecn(end, 2_000, end));
+                let mut c = Congestion::new(1_000, algorithm);
+                assert!(three_duplicates(&mut c, 8_000, end));
+                let threshold = c.ssthresh();
+                assert!(!c.on_ecn(end, 8_000, end));
+                assert_eq!(c.ssthresh(), threshold);
+                c.on_timeout(2_000, end);
+                assert_eq!(c.cwnd(), 1_000);
+                assert!(!c.on_ecn(end, 2_000, end));
 
-            let mut c = Congestion::new(1_000);
-            assert!(c.on_ecn(base, 8_000, end));
-            let threshold = c.ssthresh();
-            c.on_timeout(2_000, end);
-            assert_eq!(c.ssthresh(), threshold);
-            assert_eq!(c.cwnd(), 1_000);
+                let mut c = Congestion::new(1_000, algorithm);
+                assert!(c.on_ecn(base, 8_000, end));
+                let threshold = c.ssthresh();
+                c.on_timeout(2_000, end);
+                assert_eq!(c.ssthresh(), threshold);
+                assert_eq!(c.cwnd(), 1_000);
+            }
         }
     }
 }

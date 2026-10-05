@@ -5,7 +5,7 @@ use core::{cmp::Ordering, net::SocketAddr};
 
 use crate::{
     buffer::{ReceiveBuffer, SendBuffer},
-    recovery::{Congestion, RttEstimator},
+    recovery::{Congestion, RecoveryAlgorithm, RttEstimator},
     seq::Seq,
     wire::{self, ACK, CWR, ECE, FIN, Header, IpMetadata, PSH, RST, SYN, Segment, URG},
 };
@@ -30,6 +30,7 @@ pub struct ConnectionConfig {
     pub send_ip_payload_limit: u16,
     pub nagle: bool,
     pub ecn: bool,
+    pub recovery_algorithm: RecoveryAlgorithm,
     pub retransmit_beyond_window: bool,
     pub delayed_ack_us: u64,
     pub user_timeout_us: u64,
@@ -72,6 +73,7 @@ impl Default for ConnectionConfig {
             send_ip_payload_limit: u16::MAX,
             nagle: true,
             ecn: true,
+            recovery_algorithm: RecoveryAlgorithm::default(),
             retransmit_beyond_window: false,
             delayed_ack_us: 200_000,
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
@@ -303,6 +305,7 @@ impl Connection {
             .unwrap_or(14);
         let syn_window = config.receive_capacity.min(65535) as u16;
         let mss = config.mss.min(config.send_ip_payload_limit - 20) as usize;
+        let congestion = Congestion::new(mss as u32, config.recovery_algorithm);
         Ok(Self {
             tuple,
             config,
@@ -348,7 +351,7 @@ impl Connection {
             probe_pending: false,
             keepalive_pending: false,
             rtt: RttEstimator::new(),
-            congestion: Congestion::new(mss as u32),
+            congestion,
             ecn_sent_setup: false,
             ecn_sent_plain: false,
             ecn_peer_setup: false,
@@ -2987,6 +2990,50 @@ mod tests {
         assert_ne!(second.header.flags & URG, 0);
         assert_eq!(b.take_events().urgent, Some(65535 + 1460));
         assert_eq!(b.urgent_remaining(), 65535 + 1460);
+    }
+
+    #[test]
+    fn configured_recovery_reaches_active_and_passive_connections() {
+        assert_eq!(
+            ConnectionConfig::default().recovery_algorithm,
+            RecoveryAlgorithm::NewReno
+        );
+        for choice in [
+            None,
+            Some(RecoveryAlgorithm::Reno),
+            Some(RecoveryAlgorithm::NewReno),
+        ] {
+            let mut cfg = config(64, 4);
+            if let Some(algorithm) = choice {
+                cfg.recovery_algorithm = algorithm;
+            }
+            let newreno = cfg.recovery_algorithm == RecoveryAlgorithm::NewReno;
+            let (a, b) = pair(cfg, u32::MAX - 7);
+            for mut sender in [a, b] {
+                sender.write(&[1; 16]).unwrap();
+                for _ in 0..4 {
+                    packet(&mut sender, 40);
+                }
+                let seq = sender.receive.next();
+                let una = sender.snd_una;
+                for _ in 0..3 {
+                    inject(&mut sender, 41, seq, una, ACK, 64, b"");
+                }
+                assert!(sender.retx_pending);
+                packet(&mut sender, 42);
+                inject(&mut sender, 43, seq, una.wrapping_add(4), ACK, 64, b"");
+                assert_eq!(sender.retx_pending, newreno);
+                assert_eq!(sender.congestion.cwnd(), if newreno { 20 } else { 8 });
+                if newreno {
+                    let bytes = packet(&mut sender, 44);
+                    let segment = wire::parse(ip(sender.tuple()), &bytes).unwrap();
+                    assert_eq!(segment.header.sequence, una.wrapping_add(4).0);
+                }
+                inject(&mut sender, 45, seq, una.wrapping_add(16), ACK, 64, b"");
+                assert!(!sender.retx_pending);
+                assert_eq!(sender.flight(), 0);
+            }
+        }
     }
 
     #[test]

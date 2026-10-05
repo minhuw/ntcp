@@ -19,17 +19,6 @@ Route (MAY-11) Options.
 '''
 
 [[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.2"
-tags = ["MAY-18"]
-reason = "MAY-18 [optional_omitted]: Additional congestion-control families are optional; their omission is not a violation."
-quote = '''
-An endpoint MAY implement such alternative
-algorithms provided that the algorithms are conformant with the TCP
-specifications from the IETF Standards Track as described in RFC
-2914, RFC 5033 [7], and RFC 8961 [15] (MAY-18).
-'''
-
-[[todo]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1"
 tags = ["MUST-9"]
 reason = "MUST-9 [partial]: Secret and tuple sensitivity now have direct regression tests. HMAC uses a caller-supplied secret and TUN reads /dev/urandom; embeddings must still supply an unpredictable secret. Unit tests establish key dependence, not secrecy of caller key material."
