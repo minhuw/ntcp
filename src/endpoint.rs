@@ -398,8 +398,10 @@ impl Endpoint {
         u64::from_be_bytes(tag[..8].try_into().unwrap()) as usize
     }
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1
+    //= reason=isn adds the four-microsecond clock to the tuple-and-secret HMAC below.
     //# A TCP implementation MUST use the above type of "clock" for clock-
-    //# driven selection of initial sequence numbers (MUST-8),
+    //# driven selection of initial sequence numbers (MUST-8), and SHOULD
+    //# generate its initial sequence numbers with the expression:
 
     fn isn(&mut self, tuple: Tuple) -> u32 {
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1

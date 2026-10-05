@@ -1050,13 +1050,23 @@ fn opened_isn(endpoint: &mut Endpoint, now: u64, tuple: Tuple) -> u32 {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1
 //= type=test
+//= reason=Checks the clock progression, wraparound, and its addition to an independently assembled HMAC input.
 //# A TCP implementation MUST use the above type of "clock" for clock-
-//# driven selection of initial sequence numbers (MUST-8),
+//# driven selection of initial sequence numbers (MUST-8), and SHOULD
+//# generate its initial sequence numbers with the expression:
 fn isn_four_microsecond_clock_progresses_and_wraps() {
     let (local, remote) = addresses();
     let tuple = Tuple { local, remote };
     let mut endpoint = Endpoint::new(config(), [7; 32], 0).unwrap();
     let first = opened_isn(&mut endpoint, 0, tuple);
+    use hmac::{Hmac, Mac};
+    let mut prf = Hmac::<sha2::Sha256>::new_from_slice(&[7; 32]).unwrap();
+    prf.update(b"ntcp initial sequence");
+    // IPv4 family tags, addresses and network-order ports for addresses().
+    prf.update(&[4, 192, 0, 2, 1, 0x9c, 0x40, 4, 192, 0, 2, 2, 0x1f, 0x90]);
+    let tag = prf.finalize().into_bytes();
+    let f = u32::from_be_bytes(tag[..4].try_into().unwrap());
+    assert_eq!(first, f.wrapping_add(1)); // First OPEN advances the zero-time clock.
     let second = opened_isn(&mut endpoint, 4, tuple);
     assert_eq!(second, first.wrapping_add(1));
     let third = opened_isn(&mut endpoint, 44, tuple);

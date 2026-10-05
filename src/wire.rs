@@ -275,7 +275,9 @@ pub fn encode(
     out[20..20 + options.len()].copy_from_slice(options);
     out[header_len..len].copy_from_slice(payload);
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
-    //# The sender MUST generate it (MUST-2)
+    //= reason=encode generates the checksum; parse rejects a nonzero checksum before exposing a segment.
+    //# The sender MUST generate it
+    //# (MUST-2) and the receiver MUST check it (MUST-3).
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
     //# While computing the checksum, the checksum field itself is replaced with zeros.
     let sum = checksum(ip, &out[..len])?;

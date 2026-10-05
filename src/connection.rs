@@ -146,8 +146,9 @@ pub struct ConnectionEvents {
     pub connected: bool,
     pub readable: bool,
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.3
-    //# A TCP receiver MAY pass a received PSH bit to the application layer via
-    //# the PUSH flag in the interface (MAY-17), but it is not required
+    //# A TCP receiver MAY pass a received PSH bit to the application layer
+    //# via the PUSH flag in the interface (MAY-17), but it is not required
+    //# (this was clarified in RFC 1122, Section 4.2.2.2).
     pub pushed: bool,
     pub writable: bool,
     pub acknowledged: Option<u64>,
@@ -535,8 +536,9 @@ impl Connection {
         self.check_time(now)?;
         self.now = now;
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2
-        //# TCP implementations MUST silently discard any received ICMP Source Quench
-        //# messages (MUST-55).
+        //# Source Quench
+        //# TCP implementations MUST silently discard any received ICMP Source
+        //# Quench messages (MUST-55).
         if error == NetworkError::SourceQuench
             || matches!(self.state, State::Closed | State::TimeWait)
             || Seq(quoted_sequence).in_window(self.snd_una, self.flight()) != Some(true)
@@ -545,8 +547,9 @@ impl Connection {
         }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2
         //= reason=Acts on adapter-classified errors only; soft errors remain nonterminal.
-        //# Since these Unreachable messages indicate soft error conditions, a TCP
-        //# implementation MUST NOT abort the connection (MUST-56),
+        //# Since these Unreachable messages indicate soft error conditions, a
+        //# TCP implementation MUST NOT abort the connection (MUST-56), and it
+        //# SHOULD make the information available to the application (SHLD-25).
         self.events.network_error = Some(error);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2
         //# These are hard error conditions, so TCP implementations SHOULD abort the
@@ -898,6 +901,13 @@ impl Connection {
     //# Queue the data for transmission after entering ESTABLISHED state.
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.2
     //# Return "error: connection closing" and do not service request.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
+    //= reason=Explicit PUSH is supported by write_with_push; write supplies automatic PUSH, with arm_work deadlines requiring driver servicing.
+    //# If
+    //# PUSH flags are not implemented, then the sending TCP peer: (1) MUST
+    //# NOT buffer data indefinitely (MUST-60), and (2) MUST set the PSH bit
+    //# in the last buffered segment (i.e., when there is no more queued data
+    //# to be sent) (MUST-61).
     pub(crate) fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
         self.write_with_push(data, true)
     }
@@ -1110,6 +1120,10 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5
     //= reason=CLOSING, LAST-ACK and TIME-WAIT terminate without scheduling a reset.
     //# Respond with "ok" and delete the TCB, enter CLOSED state, and return.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5
+    //= reason=Aborted closes the connection and invalidates reads/writes; Endpoint release reclaims storage after reset output drains.
+    //# All queued SENDs and RECEIVEs should be given "connection reset"
+    //# notification.  Delete the TCB, enter CLOSED state, and return.
     pub(crate) fn abort(&mut self) {
         if self.state != State::Closed {
             self.pending_rst = matches!(
@@ -1801,10 +1815,16 @@ impl Connection {
                 1
             } else {
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
-                //# but SHOULD retransmit normally the old unacknowledged data between
+                //= reason=Retransmits the in-window flight by default; the new-data branch saturates usable credit at zero after shrink.
+                //# If this happens, the sender SHOULD NOT send new data (SHLD-15), but
+                //# SHOULD retransmit normally the old unacknowledged data between
                 //# SND.UNA and SND.UNA+SND.WND (SHLD-16).
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
-                //# The sender MAY also retransmit old data beyond SND.UNA+SND.WND (MAY-7),
+                //= reason=Optional retransmission is bounded by flight; user_deadline excludes responsive shrink/backoff from failure time.
+                //# The sender MAY also
+                //# retransmit old data beyond SND.UNA+SND.WND (MAY-7), but SHOULD NOT
+                //# time out the connection if data beyond the right window edge is not
+                //# acknowledged (SHLD-17).
                 let window = if self.config.retransmit_beyond_window && self.snd_wnd != 0 {
                     self.flight()
                 } else {
@@ -1823,7 +1843,11 @@ impl Connection {
                 seq = self.snd_nxt.wrapping_add(u32::MAX);
             }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4
-        //# An implementation SHOULD send a keep-alive segment with no data (SHLD-12);
+        //= reason=The default has no payload; send_garbage explicitly selects the initialized compatibility octet.
+        //# An implementation SHOULD send a keep-alive segment with no data
+        //# (SHLD-12); however, it MAY be configurable to send a keep-alive
+        //# segment containing one garbage octet (MAY-6), for compatibility with
+        //# erroneous TCP implementations.
         } else if keepalive {
             seq = self.snd_nxt.wrapping_add(u32::MAX);
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4
@@ -2157,8 +2181,11 @@ impl Connection {
             self.probe_pending = false;
             self.persist_unanswered_since.get_or_insert(now);
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
-            //# and SHOULD increase exponentially the interval between successive probes
-            //# (SHLD-30).
+            //= reason=arm_work starts at the current RTO; each emitted probe doubles the interval up to the timer cap.
+            //# The transmitting host SHOULD send the first zero-window probe when a
+            //# zero window has existed for the retransmission timeout period (SHLD-
+            //# 29) (Section 3.8.1), and SHOULD increase exponentially the interval
+            //# between successive probes (SHLD-30).
             self.persist_interval = self.persist_interval.saturating_mul(2).min(60_000_000);
             self.persist_deadline = Some(now.saturating_add(self.persist_interval));
         }
@@ -3265,12 +3292,15 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2
     //= type=test
-    //# TCP implementations MUST silently discard any received ICMP Source Quench
-    //# messages (MUST-55).
+    //# Source Quench
+    //# TCP implementations MUST silently discard any received ICMP Source
+    //# Quench messages (MUST-55).
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2
     //= type=test
-    //# Since these Unreachable messages indicate soft error conditions, a TCP
-    //# implementation MUST NOT abort the connection (MUST-56),
+    //= reason=The soft-error event is observable and the connection remains Established; outer ICMP validation belongs to the adapter.
+    //# Since these Unreachable messages indicate soft error conditions, a
+    //# TCP implementation MUST NOT abort the connection (MUST-56), and it
+    //# SHOULD make the information available to the application (SHLD-25).
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2
     //= type=test
     //# These are hard error conditions, so TCP implementations SHOULD abort the
@@ -3518,9 +3548,13 @@ mod tests {
     //# two hours (MUST-28).
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4
     //= type=test
-    //# If keep-alives are included, the application MUST be able to turn them on or off
-    //# for each TCP connection (MUST-24),
+    //= reason=Default configuration is off; per-connection enable, override and disable update the timers.
+    //# If
+    //# keep-alives are included, the application MUST be able to turn them
+    //# on or off for each TCP connection (MUST-24), and they MUST default to
+    //# off (MUST-25).
     fn keepalive_can_be_disabled_or_overridden_without_reusing_stale_deadlines() {
+        assert_eq!(ConnectionConfig::default().keepalive, None);
         assert_eq!(KeepaliveConfig::default().idle_us, 7_200_000_000);
         let (mut a, _) = pair(config(64, 8), 100);
         a.update_time(1_000_000).unwrap();
@@ -3691,13 +3725,11 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
     //= type=test
+    //= reason=Asserts the initial RTO deadline and successive doubled intervals, including failed output attempts.
     //# The transmitting host SHOULD send the first zero-window probe when a
     //# zero window has existed for the retransmission timeout period (SHLD-
-    //# 29) (Section 3.8.1),
-    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
-    //= type=test
-    //# and SHOULD increase exponentially the interval between successive probes
-    //# (SHLD-30).
+    //# 29) (Section 3.8.1), and SHOULD increase exponentially the interval
+    //# between successive probes (SHLD-30).
     fn persist_uses_updated_rto_once_per_episode() {
         let (mut a, _) = pair(config(64, 4), 100);
         a.write(b"abcdefgh").unwrap();
@@ -4486,13 +4518,18 @@ mod tests {
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
     //= type=test
-    //# The sender MAY also retransmit old data beyond SND.UNA+SND.WND (MAY-7),
+    //= reason=Checks both retransmission policies and survival beyond the user timeout while the shrunken peer answers without ACK progress.
+    //# The sender MAY also
+    //# retransmit old data beyond SND.UNA+SND.WND (MAY-7), but SHOULD NOT
+    //# time out the connection if data beyond the right window edge is not
+    //# acknowledged (SHLD-17).
     #[test]
     fn optional_beyond_window_retransmission_never_sends_new_bytes() {
         for iss in [100, u32::MAX - 3] {
             for enabled in [false, true] {
                 let mut cfg = config(64, 8);
                 cfg.retransmit_beyond_window = enabled;
+                cfg.user_timeout_us = 5_000_000;
                 let (mut a, _) = pair(cfg, iss);
                 a.write(b"abcdefghijklmnop").unwrap();
                 packet(&mut a, 40); // Only the first eight bytes have been sent.
@@ -4513,7 +4550,22 @@ mod tests {
                 assert_eq!(a.last_output_ecn(), 0);
                 assert_eq!(a.snd_nxt, next);
                 assert_eq!(a.send.len(), 16);
-                inject(&mut a, deadline + 1, seq, una, ACK, 0, b"");
+                let mut last = deadline;
+                for _ in 0..6 {
+                    inject(&mut a, last + 1, seq, una, ACK, 3, b"");
+                    assert_eq!(a.user_deadline(), None);
+                    last = a.rto_deadline.unwrap();
+                    a.timeout(last).unwrap();
+                    assert_eq!(a.state(), State::Established);
+                    let retry = packet(&mut a, last);
+                    assert_eq!(
+                        wire::parse(ip(tuple()), &retry).unwrap().payload,
+                        if enabled { &b"abcdefgh"[..] } else { b"abc" }
+                    );
+                    assert_eq!(a.snd_nxt, next);
+                }
+                assert!(last - 50 > a.user_timeout());
+                inject(&mut a, last + 1, seq, una, ACK, 0, b"");
                 let deadline = a.persist_deadline.unwrap();
                 a.timeout(deadline).unwrap();
                 let probe = packet(&mut a, deadline);
@@ -5030,11 +5082,12 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
     //= type=test
-    //# MUST NOT buffer data indefinitely (MUST-60),
-    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
-    //= type=test
-    //# MUST set the PSH bit in the last buffered segment (i.e., when there is
-    //# no more queued data to be sent) (MUST-61).
+    //= reason=Tests automatic-PUSH write packetization and deadline-serviced aggregation; explicit PUSH is implemented, so the conditional is not a claim about write_with_push(false).
+    //# If
+    //# PUSH flags are not implemented, then the sending TCP peer: (1) MUST
+    //# NOT buffer data indefinitely (MUST-60), and (2) MUST set the PSH bit
+    //# in the last buffered segment (i.e., when there is no more queued data
+    //# to be sent) (MUST-61).
     fn automatic_push_final_segment_partial_write_and_bounded_aggregation() {
         let (mut a, _) = pair(config(10, 8), 100);
         a.set_nagle(false);
@@ -5310,8 +5363,9 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.3
     //= type=test
-    //# A TCP receiver MAY pass a received PSH bit to the application layer via
-    //# the PUSH flag in the interface (MAY-17), but it is not required
+    //# A TCP receiver MAY pass a received PSH bit to the application layer
+    //# via the PUSH flag in the interface (MAY-17), but it is not required
+    //# (this was clarified in RFC 1122, Section 4.2.2.2).
     fn receive_push_waits_for_gap_and_ignores_duplicate_empty_and_trimmed_marks() {
         let (_, mut b) = pair(config(16, 8), u32::MAX - 2);
         let start = b.receive.next();
@@ -5435,8 +5489,11 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4
     //= type=test
-    //# it MAY be configurable to send a keep-alive segment containing one garbage
-    //# octet (MAY-6), for compatibility with erroneous TCP implementations.
+    //= reason=Checks both default empty and configured one-octet payloads, without advancing the stream.
+    //# An implementation SHOULD send a keep-alive segment with no data
+    //# (SHLD-12); however, it MAY be configurable to send a keep-alive
+    //# segment containing one garbage octet (MAY-6), for compatibility with
+    //# erroneous TCP implementations.
     fn keepalive_garbage_is_initialized_atomic_and_outside_stream_accounting() {
         assert!(!KeepaliveConfig::default().send_garbage);
         for garbage in [false, true] {
