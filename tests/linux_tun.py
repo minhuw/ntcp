@@ -31,6 +31,13 @@ def isolated_test(parent_namespace):
     )
     assert mismatch.returncode != 0
     assert b'local IPv4 address must lie in the TUN interface subnet' in mismatch.stderr
+    invalid_open = subprocess.run(
+        [str(executable), 'ntcp-test', '10.73.0.2', '8080', '10.73.0.255:9090'],
+        capture_output=True, timeout=5,
+    )
+    assert invalid_open.returncode != 0
+    assert b'TCP engine: InvalidAddress' in invalid_open.stderr
+    assert b'echo listening' not in invalid_open.stderr
     with tempfile.TemporaryFile(mode='w+b') as log:
         process = subprocess.Popen([str(executable), 'ntcp-test', '10.73.0.2', '8080'], stderr=log)
         try:
