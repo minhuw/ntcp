@@ -42,7 +42,7 @@ for some other connection.
 [[todo]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1"
 tags = ["MUST-46"]
-reason = "MUST-46 [partial]: OPEN now rejects broadcasts in configured ipv4_subnets, with /0-/32 and address-family tests. TUN supplies its actual interface prefix. Embeddings must configure every relevant subnet; unknown remote subnet broadcasts cannot be inferred from an IP address alone."
+reason = "MUST-46 [partial]: OPEN rejects configured broadcast addresses, with /0-/32 and address-family tests. ipv4_subnets is a context-independent broadcast denylist, not a routing table: overlapping /24 and /31 contexts can classify the same address differently. Route-dependent validation must occur before OPEN succeeds; the current API does not express that context. Unknown remote subnet broadcasts cannot be inferred from an IP address alone."
 quote = '''
 A TCP implementation MUST reject as an error a local OPEN call for an
 invalid remote IP address (e.g., a broadcast or multicast address)
@@ -73,7 +73,7 @@ segments sent on this connection (MUST-53).
 [[todo]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3"
 tags = ["MUST-57"]
-reason = "MUST-57 [partial]: Endpoint drops configured-subnet broadcast destinations before tuple lookup, with direct tests. TUN supplies its interface prefix; other adapters must provide their subnet knowledge. An empty prefix list cannot classify unknown subnet broadcasts."
+reason = "MUST-57 [partial]: Endpoint drops configured broadcast destinations before tuple lookup, with direct tests. The subnet union is a context-independent denylist, not contextual local-delivery validation. Adapters must validate incoming destination metadata in the applicable network context; unknown subnet broadcasts cannot be inferred."
 quote = '''
 |
 |  A TCP implementation MUST silently discard an incoming SYN segment
@@ -83,7 +83,7 @@ quote = '''
 [[todo]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3"
 tags = ["MUST-63"]
-reason = "MUST-63 [partial]: Endpoint drops configured-subnet broadcast sources before tuple lookup, with direct tests. Classification of unknown remote subnet broadcasts still requires lower-layer subnet knowledge."
+reason = "MUST-63 [partial]: Endpoint drops configured broadcast sources before tuple lookup, with direct tests. Overlapping subnet contexts can disagree on address validity; a global subnet union cannot resolve this. Incoming source validation still requires the applicable lower-layer network context and subnet knowledge."
 quote = '''
 |  An incoming SYN with an invalid source address MUST be ignored
 |  either by TCP or by the IP layer [(MUST-63)] (see
