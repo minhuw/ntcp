@@ -26,6 +26,7 @@ pub struct ListenerId {
 pub struct EndpointConfig {
     pub max_connections: usize,
     pub ipv4_subnets: Vec<(Ipv4Addr, u8)>,
+    pub error_reports: bool,
     pub max_listeners: usize,
     pub max_control_packets: usize,
     pub max_buffer_bytes: usize,
@@ -39,6 +40,7 @@ impl Default for EndpointConfig {
         Self {
             max_connections: 1024,
             ipv4_subnets: Vec::new(),
+            error_reports: true,
             max_listeners: 64,
             max_control_packets: 64,
             max_buffer_bytes: 256 * 1024 * 1024,
@@ -927,7 +929,10 @@ impl Endpoint {
             return Ok(false);
         }
         let listener = self.slots[index].as_ref().unwrap().listener;
-        if listener.is_some() && self.passive_errors.len() == self.config.max_connections {
+        if self.config.error_reports
+            && listener.is_some()
+            && self.passive_errors.len() == self.config.max_connections
+        {
             return Err(EndpointError::LimitReached);
         }
         let accepted = self.slots[index]
@@ -935,7 +940,10 @@ impl Endpoint {
             .unwrap()
             .connection
             .network_error(now, quoted_sequence, error)?;
-        if accepted && let Some(listener) = listener {
+        if accepted
+            && self.config.error_reports
+            && let Some(listener) = listener
+        {
             self.passive_errors.push_back(Event::PassiveError {
                 listener,
                 tuple,
@@ -1073,7 +1081,16 @@ impl Endpoint {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2
             //# SHOULD make the information available to the application (SHLD-25).
 
-            let events = slot.connection.take_events();
+            let mut events = slot.connection.take_events();
+            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8
+            //# However, an application program that does not want to receive such
+            //# ERROR_REPORT calls SHOULD be able to effectively disable these calls
+            //# (SHLD-20).
+            if !self.config.error_reports {
+                events.network_error = None;
+                events.retransmission_warning = false;
+                events.urgent = None;
+            }
             if !events.is_empty() {
                 return Some(Event::Connection(id, events));
             }

@@ -690,6 +690,115 @@ fn abort_release_retries_reset_before_reclaiming_storage() {
     assert_eq!(b.close_reason(server).unwrap(), Some(CloseReason::Reset));
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8
+//= type=test
+//# However, an application program that does not want to receive such
+//# ERROR_REPORT calls SHOULD be able to effectively disable these calls
+//# (SHLD-20).
+#[test]
+fn disabling_error_reports_keeps_data_and_terminal_events() {
+    let (local, remote) = addresses();
+    let mut cfg = config();
+    cfg.error_reports = false;
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
+    let mut b = Endpoint::new(cfg.clone(), [2; 32], 0).unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    a.connect(0, local, remote).unwrap();
+    let (tuple, seq) = passive_quote(&mut a, &mut b);
+    for _ in 0..2 * cfg.max_connections {
+        assert!(
+            b.network_error(0, tuple, seq, NetworkError::SoftUnreachable)
+                .unwrap()
+        );
+    }
+    assert!(b.next_event().is_none());
+    assert!(
+        b.network_error(0, tuple, seq, NetworkError::HardUnreachable)
+            .unwrap()
+    );
+    assert!(b.next_event().is_none());
+    assert_eq!(
+        b.accept(listener),
+        Err(EndpointError::Connection(Error::WouldBlock))
+    );
+
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let id = a.connect(0, local, remote).unwrap();
+    pump(&mut a, &mut b, 0);
+    let peer = b.accept(listener).unwrap();
+    while a.next_event().is_some() {}
+    a.write(id, b"x").unwrap();
+    let data = packets(&mut a, 0);
+    let seq = wire::parse(data[0].0, &data[0].1).unwrap().header.sequence;
+    let tuple = Tuple { local, remote };
+    assert!(
+        a.network_error(0, tuple, seq, NetworkError::SoftUnreachable)
+            .unwrap()
+    );
+    assert!(a.next_event().is_none());
+    b.write_urgent(peer, b"!").unwrap();
+    deliver(&mut a, 0, packets(&mut b, 0));
+    match a.next_event().unwrap() {
+        Event::Connection(event_id, events) => {
+            assert_eq!(event_id, id);
+            assert!(events.readable);
+            assert_eq!(events.urgent, None);
+            assert_eq!(events.network_error, None);
+        }
+        event => panic!("unexpected event: {event:?}"),
+    }
+    assert_eq!(a.read(id, &mut [0; 1]).unwrap(), 1);
+    assert!(
+        a.network_error(0, tuple, seq, NetworkError::HardUnreachable)
+            .unwrap()
+    );
+    assert!(
+        matches!(a.next_event(), Some(Event::Connection(event_id, events))
+        if event_id == id && events.closed == Some(CloseReason::NetworkError))
+    );
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8
+//= type=test
+//# However, an application program that does not want to receive such
+//# ERROR_REPORT calls SHOULD be able to effectively disable these calls
+//# (SHLD-20).
+#[test]
+fn warning_reports_can_be_disabled_without_suppressing_route_advice() {
+    let (local, remote) = addresses();
+    for enabled in [false, true] {
+        let mut cfg = config();
+        cfg.error_reports = enabled;
+        let mut a = Endpoint::new(cfg, [1; 32], 0).unwrap();
+        let id = a.connect(0, local, remote).unwrap();
+        packets(&mut a, 0);
+        for attempt in 0..3 {
+            let time = a.next_deadline().unwrap();
+            a.on_timeout(time, 64).unwrap();
+            packets(&mut a, time);
+            let mut warning = false;
+            let mut advice = false;
+            while let Some(event) = a.next_event() {
+                match event {
+                    Event::RouteAdvice(tuple) => {
+                        assert_eq!(tuple, Tuple { local, remote });
+                        advice = true;
+                    }
+                    Event::Connection(event_id, events) => {
+                        assert_eq!(event_id, id);
+                        warning |= events.retransmission_warning;
+                    }
+                    event => panic!("unexpected event: {event:?}"),
+                }
+            }
+            assert_eq!(advice, attempt == 2);
+            assert_eq!(warning, enabled && attempt == 2);
+        }
+    }
+}
+
 fn passive_quote(a: &mut Endpoint, b: &mut Endpoint) -> (Tuple, u32) {
     deliver(b, 0, packets(a, 0));
     let reply = packets(b, 0);

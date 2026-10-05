@@ -323,6 +323,7 @@ mod linux {
             hop_limit: 64,
             dscp: 0,
             ipv4_subnets: vec![(local, interface_prefix(&tun)?)],
+            error_reports: true,
             connection: ConnectionConfig {
                 send_capacity: 65536,
                 receive_capacity: 65536,

@@ -426,16 +426,6 @@ asynchronously to the application MUST include:
 '''
 
 [[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8"
-tags = ["SHLD-20"]
-reason = "Pull-based event polling lets applications ignore reports, but no per-category suppression exists. Validate whether this is effective disablement before marking this recommendation implemented."
-quote = '''
-However, an application program that does not want to receive such
-ERROR_REPORT calls SHOULD be able to effectively disable these calls
-(SHLD-20).
-'''
-
-[[todo]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2"
 tags = ["SHLD-23"]
 reason = "Application guidance: example uses fixed DSCP, while API permits explicit changes. Caller behavior must be assessed separately; no core conformance credit."
