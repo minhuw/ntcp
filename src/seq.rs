@@ -8,6 +8,9 @@ pub(crate) struct Seq(pub(crate) u32);
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4
 //# Since the space is finite, all arithmetic dealing with sequence numbers must be
 //# performed modulo 2^32.
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.4
+//# This unsigned arithmetic preserves the relationship of sequence numbers as they
+//# cycle from 2^32 - 1 to 0 again.
 impl Seq {
     pub(crate) fn serial_cmp(self, other: Self) -> Option<Ordering> {
         match self.distance_from(other) {

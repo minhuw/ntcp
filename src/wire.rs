@@ -486,6 +486,19 @@ mod tests {
         //# A given TCP implementation can support any currently defined options, but the
         //# following options MUST be supported (MUST-4 -- note Maximum Segment Size Option
         //# support is also part of MUST-14 in Section 3.7.1):
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
+        //= type=test
+        //# Case 1: A single octet of option-kind.
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
+        //= type=test
+        //# The option-length counts the two octets of option-kind and option-
+        //# length as well as the option-data octets.
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.2
+        //= type=test
+        //# Length: 1 byte; Length == 4.
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.2
+        //= type=test
+        //# Maximum Segment Size (MSS): 2 bytes.
         for prefix in 0..4 {
             let mut options = vec![1; prefix];
             options.extend([254, 3, 77, 2, 4, 0x12, 0x34, 3, 3, 7]);
@@ -633,6 +646,14 @@ mod tests {
                 //# segments if the corresponding future features are not implemented by the
                 //# sending or receiving host.
                 assert_eq!(out[12] & 0x0f, 0);
+                // The output started nonzero, including the checksum field.
+                //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
+                //= type=test
+                //# While computing the checksum, the checksum field itself is replaced with zeros.
+                let encoded_sum = u16::from_be_bytes([out[16], out[17]]);
+                let mut zeroed = out[..expected].to_vec();
+                zeroed[16..18].fill(0);
+                assert_eq!(encoded_sum, reference(ip, &zeroed));
                 assert_eq!(reference(ip, &out[..expected]), 0);
                 assert_eq!(&out[expected..], &[0xa5; 8]);
                 let parsed = parse(ip, &out[..expected]).unwrap();

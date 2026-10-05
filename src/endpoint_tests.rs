@@ -669,11 +669,30 @@ fn unknown_connection_reset_has_correct_sequence_and_never_answers_reset() {
     assert_eq!(reset.header.flags, wire::RST | wire::ACK);
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.1
     //= type=test
+    //# If the ACK bit is off, sequence number zero is used,
+    //#
     //# <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>
-
-    // Traceability limitation: Checks SYN sequence wrap, acknowledgment and flags; does
-    // not assert RST sequence zero or the incoming-ACK branch.
+    assert_eq!(reset.header.sequence, 0);
     assert_eq!(reset.header.acknowledgment, 0);
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.1
+    //= type=test
+    //# If the ACK bit is on,
+    //#
+    //# <SEQ=SEG.ACK><CTL=RST>
+    input_header(
+        &mut b,
+        ip,
+        wire::Header {
+            acknowledgment: 12345,
+            flags: wire::ACK,
+            ..header
+        },
+    );
+    let replies = packets(&mut b, 0);
+    assert_eq!(replies.len(), 1);
+    let reset = wire::parse(replies[0].0, &replies[0].1).unwrap();
+    assert_eq!(reset.header.sequence, 12345);
+    assert_eq!(reset.header.flags, wire::RST);
     let len = wire::encode(
         ip,
         wire::Header {
@@ -689,7 +708,8 @@ fn unknown_connection_reset_has_correct_sequence_and_never_answers_reset() {
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.1
     //= type=test
     //# An incoming
-    //# segment containing a RST is discarded.
+    //# segment containing a RST is discarded.  An incoming segment not
+    //# containing a RST causes a RST to be sent in response.
     assert!(packets(&mut b, 0).is_empty());
 }
 
@@ -1159,6 +1179,123 @@ fn isn_depends_on_secret_and_each_tuple_component() {
     }
 }
 
+#[test]
+fn listen_ignores_resets_resets_acks_and_drops_segments_without_syn() {
+    let (local, remote) = addresses();
+    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let ip = IpMetadata {
+        source: local.ip(),
+        destination: remote.ip(),
+    };
+    let header = wire::Header {
+        source_port: local.port(),
+        destination_port: remote.port(),
+        sequence: 100,
+        acknowledgment: 12345,
+        flags: 0,
+        window: 1024,
+        urgent_pointer: 0,
+    };
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
+    //= type=test
+    //# An incoming RST should be ignored.  Return.
+    for flags in [wire::RST, wire::RST | wire::ACK, wire::RST | wire::SYN] {
+        assert_eq!(
+            input_header(&mut b, ip, wire::Header { flags, ..header }),
+            InputDisposition::Dropped
+        );
+        assert!(packets(&mut b, 0).is_empty());
+        assert_eq!(b.buffer_bytes(), 0);
+    }
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
+    //= type=test
+    //# Any acknowledgment is bad if it arrives on a connection still
+    //# in the LISTEN state.  An acceptable reset segment should be
+    //# formed for any arriving ACK-bearing segment.
+    for flags in [wire::ACK, wire::ACK | wire::SYN, wire::ACK | wire::FIN] {
+        assert_eq!(
+            input_header(&mut b, ip, wire::Header { flags, ..header }),
+            InputDisposition::Processed
+        );
+        let replies = packets(&mut b, 0);
+        assert_eq!(replies.len(), 1);
+        let reset = wire::parse(replies[0].0, &replies[0].1).unwrap();
+        assert_eq!(reset.header.flags, wire::RST);
+        assert_eq!(reset.header.sequence, header.acknowledgment);
+        assert_eq!(b.buffer_bytes(), 0);
+    }
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
+    //= type=test
+    //# Drop the segment and return.
+    for flags in [0, wire::FIN, wire::PSH | wire::URG] {
+        assert_eq!(
+            input_header(&mut b, ip, wire::Header { flags, ..header }),
+            InputDisposition::Dropped
+        );
+        assert!(packets(&mut b, 0).is_empty());
+        assert_eq!(b.buffer_bytes(), 0);
+    }
+    assert_eq!(
+        b.accept(listener),
+        Err(EndpointError::Connection(Error::WouldBlock))
+    );
+    assert_eq!(
+        input_header(
+            &mut b,
+            ip,
+            wire::Header {
+                flags: wire::SYN,
+                ..header
+            }
+        ),
+        InputDisposition::Processed
+    );
+    let replies = packets(&mut b, 0);
+    assert_eq!(replies.len(), 1);
+    assert_eq!(
+        wire::parse(replies[0].0, &replies[0].1)
+            .unwrap()
+            .header
+            .flags,
+        wire::SYN | wire::ACK
+    );
+}
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
+//= type=test
+//# A passive OPEN call with a specified "local IP address" parameter
+//# will await an incoming connection request to that address.  If the
+//# parameter is unspecified, a passive OPEN will await an incoming
+//# connection request to any local IP address and then bind the local IP
+//# address of the connection to the particular address that is used.
+fn passive_bind_matches_concrete_or_any_local_address() {
+    let (local, remote) = addresses();
+    for bind in [remote, "0.0.0.0:8080".parse().unwrap()] {
+        for destination in [remote, "192.0.2.3:8080".parse().unwrap()] {
+            let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
+            let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+            let listener = b.listen(bind, 4).unwrap();
+            let client = a.connect(0, local, destination).unwrap();
+            pump(&mut a, &mut b, 0);
+            if bind.ip().is_unspecified() || bind == destination {
+                let server = b.accept(listener).unwrap();
+                assert_eq!(b.state(server).unwrap(), State::Established);
+                assert_eq!(b.tuple(server).unwrap().local, destination);
+                assert_eq!(a.state(client).unwrap(), State::Established);
+            } else {
+                assert_eq!(
+                    b.accept(listener),
+                    Err(EndpointError::Connection(Error::WouldBlock))
+                );
+                assert_eq!(b.buffer_bytes(), 0);
+                assert_eq!(a.close_reason(client).unwrap(), Some(CloseReason::Reset));
+            }
+        }
+    }
+}
+
 fn input_header(endpoint: &mut Endpoint, ip: IpMetadata, header: wire::Header) -> InputDisposition {
     let mut bytes = [0; 128];
     let len = wire::encode(ip, header, &[], &[], &mut bytes).unwrap();
@@ -1171,6 +1308,12 @@ fn input_header(endpoint: &mut Endpoint, ip: IpMetadata, header: wire::Header) -
 //# Note that a TCP implementation MUST keep track of whether a
 //# connection has reached SYN-RECEIVED state as the result of a passive
 //# OPEN or an active OPEN (MUST-11).
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.5.3
+//= type=test
+//# If the receiver was
+//# in SYN-RECEIVED state and had previously been in the LISTEN state,
+//# then the receiver returns to the LISTEN state; otherwise, the
+//# receiver aborts the connection and goes to the CLOSED state.
 fn syn_received_reset_preserves_passive_listener_but_closes_active_open() {
     let (mut a, mut b, listener, client) = endpoints();
     let syns = packets(&mut a, 0);
