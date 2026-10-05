@@ -3045,3 +3045,31 @@ fn base_invalid_addresses_never_reach_policy() {
     assert_eq!(endpoint.buffer_bytes(), 0);
     assert!(packets(&mut endpoint, 0).is_empty());
 }
+
+#[test]
+fn readable_bytes_is_a_pure_payload_getter_and_rejects_stale_handles() {
+    let (mut a, mut b, listener, client) = endpoints();
+    assert_eq!(a.readable_bytes(client), Ok(0));
+    pump(&mut a, &mut b, 0);
+    let server = b.accept(listener).unwrap();
+    a.write_urgent(client, b"abcdef").unwrap();
+    a.shutdown(client).unwrap();
+    pump(&mut a, &mut b, 1);
+    while b.next_event().is_some() {}
+    let deadline = b.next_deadline();
+    let output_pending = b.has_pending_output();
+    assert_eq!(b.readable_bytes(server), Ok(6));
+    assert_eq!(b.readable_bytes(server), Ok(6));
+    assert_eq!(b.next_deadline(), deadline);
+    assert_eq!(b.has_pending_output(), output_pending);
+    assert!(b.next_event().is_none());
+    let mut out = [0; 8];
+    assert_eq!(b.read(server, &mut out[..2]), Ok(2));
+    assert_eq!(b.readable_bytes(server), Ok(4));
+    assert_eq!(b.read(server, &mut out), Ok(4));
+    assert_eq!(b.readable_bytes(server), Ok(0));
+    assert_eq!(b.read(server, &mut out), Ok(0));
+    b.abort(server).unwrap();
+    b.release(server).unwrap();
+    assert_eq!(b.readable_bytes(server), Err(EndpointError::InvalidHandle));
+}

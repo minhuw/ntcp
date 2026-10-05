@@ -1,0 +1,33 @@
+--ip_version=ipv4
+--local_ip=192.0.2.1
+--remote_ip=192.0.2.2
+
+0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
++0 ioctl(3, SIOCINQ, [0]) = 0
++0 bind(3, ..., ...) = 0
++0 listen(3, 1) = 0
++0 ioctl(3, SIOCINQ, [0]) = -1 EINVAL (Invalid argument)
++0 < S 0:0(0) win 65535 <mss 1460,nop,wscale 0>
++0 > S. 0:0(0) ack 1 win 65535 <mss 1460,wscale 0,eol>
++0 < . 1:1(0) ack 1 win 65535
++0 accept(3, ..., ...) = 4
++0 < P. 4:7(3) ack 1 win 65535
++0 > . 1:1(0) ack 1
++0 ioctl(4, SIOCINQ, [0]) = 0
++0 < P. 1:4(3) ack 1 win 65535
++0 > . 1:1(0) ack 7
++0 ioctl(4, SIOCINQ, [6]) = 0
++0 ioctl(4, SIOCINQ, [6]) = 0
++0 read(4, ..., 2) = 2
++0 ioctl(4, SIOCINQ, [4]) = 0
++0 < F. 7:7(0) ack 1 win 65535
++0 > . 1:1(0) ack 8
++0 ioctl(4, SIOCINQ, [4]) = 0
++0 read(4, ..., 8) = 4
++0 ioctl(4, SIOCINQ, [0]) = 0
++0 read(4, ..., 8) = 0
++0 ioctl(4, SIOCINQ, [0]) = 0
++0 close(4) = 0
++0 > F. 1:1(0) ack 8
++0 < . 8:8(0) ack 2 win 65535
++0 close(3) = 0

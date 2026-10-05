@@ -410,3 +410,153 @@ fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
         assert_eq!(owner.endpoint.buffer_bytes(), count * per_connection);
     }
 }
+
+fn execute_value(owner: &mut Owner, op: i32, fd: i32, key: i32, value: i32) -> Result<i64> {
+    let (mut r, _) = request(op, fd, key, vec![], 0);
+    r.b = value;
+    owner.execute(&mut r).map(|r| r.unwrap().value)
+}
+
+#[test]
+fn user_timeout_preconnect_updates_reset_and_deadlines() {
+    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
+    assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(300000));
+    assert_eq!(execute_value(&mut owner, 11, fd, 5, -1), Err(EINVAL));
+    assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(300000));
+    execute_value(&mut owner, 11, fd, 5, i32::MAX).unwrap();
+    assert_eq!(user_timeout_us(i32::MAX), Ok(2_147_483_647_000));
+    execute_value(&mut owner, 11, fd, 5, 1234).unwrap();
+    let (mut connect, _) = request(
+        5,
+        fd,
+        0,
+        encode_addr(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080)),
+        0,
+    );
+    assert_eq!(owner.execute(&mut connect).err(), Some(EINPROGRESS));
+    assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(1234));
+    let mut tcp = [0; 1500];
+    let sent_at = owner.now();
+    let tx = owner
+        .endpoint
+        .poll_transmit(sent_at, &mut tcp, BUDGET)
+        .unwrap()
+        .packet
+        .unwrap();
+    let syn = ntcp::wire::parse(tx.ip, &tcp[..tx.len]).unwrap().header;
+    let ip = IpMetadata {
+        source: tx.ip.destination,
+        destination: tx.ip.source,
+    };
+    let header = ntcp::wire::Header {
+        source_port: syn.destination_port,
+        destination_port: syn.source_port,
+        sequence: 100,
+        acknowledgment: syn.sequence.wrapping_add(1),
+        flags: ntcp::wire::SYN | ntcp::wire::ACK,
+        window: 65535,
+        urgent_pointer: 0,
+    };
+    let n = ntcp::wire::encode(ip, header, &[], &[], &mut tcp).unwrap();
+    let established_at = owner.now();
+    owner.endpoint.input(established_at, ip, &tcp[..n]).unwrap();
+    let id = owner.connection(fd).unwrap();
+    owner.endpoint.write(id, b"data").unwrap();
+    owner
+        .endpoint
+        .poll_transmit(owner.now(), &mut tcp, BUDGET)
+        .unwrap();
+    execute_value(&mut owner, 11, fd, 5, 1).unwrap();
+    assert_eq!(owner.endpoint.next_deadline(), Some(established_at + 1000));
+    execute_value(&mut owner, 11, fd, 5, 0).unwrap();
+    assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(300000));
+    assert!(owner.endpoint.next_deadline().unwrap() > established_at + 1000);
+    assert_eq!(execute_value(&mut owner, 11, fd, 99, 1), Err(ENOSYS));
+    assert_eq!(execute_value(&mut owner, 17, -1, 0, 0), Err(EBADF));
+    assert_eq!(execute_value(&mut owner, 17, fd, 0, 0), Ok(0));
+}
+
+#[test]
+fn listener_timeout_inheritance_and_queued_payload_gap_urgent_fin() {
+    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let listener = owner.alloc(Socket::new(0)).unwrap();
+    execute_value(&mut owner, 11, listener, 5, 1).unwrap();
+    let (mut bind, _) = request(
+        2,
+        listener,
+        0,
+        encode_addr(SocketAddr::new(local().into(), 8080)),
+        0,
+    );
+    owner.execute(&mut bind).unwrap();
+    execute_value(&mut owner, 3, listener, 1, 0).unwrap();
+    assert_eq!(execute_value(&mut owner, 17, listener, 0, 0), Err(EINVAL));
+    let (ip, tcp) = parse_frame(&syn(100, 8080))
+        .map(|(ip, tcp)| (ip, tcp.to_vec()))
+        .unwrap();
+    owner.endpoint.input(0, ip, &tcp).unwrap();
+    let mut out = [0; 1500];
+    let tx = owner
+        .endpoint
+        .poll_transmit(0, &mut out, BUDGET)
+        .unwrap()
+        .packet
+        .unwrap();
+    let ack = ntcp::wire::parse(tx.ip, &out[..tx.len])
+        .unwrap()
+        .header
+        .sequence
+        .wrapping_add(1);
+    let mut inject = |owner: &mut Owner, seq, flags, urgent, payload: &[u8]| {
+        let header = ntcp::wire::Header {
+            source_port: 50000,
+            destination_port: 8080,
+            sequence: seq,
+            acknowledgment: ack,
+            flags,
+            window: 65535,
+            urgent_pointer: urgent,
+        };
+        let n = ntcp::wire::encode(ip, header, &[], payload, &mut out).unwrap();
+        owner.endpoint.input(0, ip, &out[..n]).unwrap();
+    };
+    inject(&mut owner, 101, ntcp::wire::ACK, 0, &[]);
+    let fd = execute_value(&mut owner, 4, listener, 0, 0).unwrap() as i32;
+    let id = owner.connection(fd).unwrap();
+    assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(1));
+    execute_value(&mut owner, 11, listener, 5, 3456).unwrap();
+    assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(1));
+    owner.endpoint.write(id, b"x").unwrap();
+    let mut outgoing = [0; 1500];
+    owner
+        .endpoint
+        .poll_transmit(0, &mut outgoing, BUDGET)
+        .unwrap();
+    assert_eq!(owner.endpoint.next_deadline(), Some(1000));
+    assert_eq!(owner.endpoint.readable_bytes(id), Ok(0));
+    inject(
+        &mut owner,
+        104,
+        ntcp::wire::ACK | ntcp::wire::FIN | ntcp::wire::URG,
+        3,
+        b"def",
+    );
+    assert_eq!(execute_value(&mut owner, 17, fd, 0, 0), Ok(0));
+    inject(&mut owner, 101, ntcp::wire::ACK, 0, b"abc");
+    for _ in 0..2 {
+        assert_eq!(execute_value(&mut owner, 17, fd, 0, 0), Ok(6));
+    }
+    assert_eq!(owner.endpoint.urgent_remaining(id), Ok(6));
+    let (mut read, _) = request(6, fd, 0, vec![], 2);
+    let response = owner.execute(&mut read).unwrap().unwrap();
+    assert_eq!(response.bytes, b"ab");
+    assert_eq!(execute_value(&mut owner, 17, fd, 0, 0), Ok(4));
+    execute_value(&mut owner, 11, fd, 5, 4567).unwrap();
+    assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(4567));
+    read.capacity = 8;
+    assert_eq!(owner.execute(&mut read).unwrap().unwrap().bytes, b"cdef");
+    assert_eq!(execute_value(&mut owner, 17, fd, 0, 0), Ok(0));
+    assert_eq!(owner.execute(&mut read).unwrap().unwrap().value, 0);
+    assert_eq!(execute_value(&mut owner, 17, fd, 0, 0), Ok(0));
+}

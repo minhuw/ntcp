@@ -58,6 +58,7 @@ struct Socket {
     cloexec: bool,
     reuse: bool,
     nodelay: bool,
+    user_timeout_ms: i32,
     readable: Option<bool>,
     acceptable: Option<bool>,
     error: i32,
@@ -74,6 +75,7 @@ impl Socket {
             cloexec: flags & SOCK_CLOEXEC != 0,
             reuse: false,
             nodelay: false,
+            user_timeout_ms: default_user_timeout_ms(),
             readable: Some(false),
             acceptable: Some(false),
             error: 0,
@@ -82,6 +84,15 @@ impl Socket {
             connected: false,
         }
     }
+}
+fn default_user_timeout_ms() -> i32 {
+    i32::try_from(ntcp::ConnectionConfig::default().user_timeout_us / 1000).unwrap()
+}
+fn user_timeout_us(milliseconds: i32) -> Result<u64> {
+    u64::try_from(milliseconds)
+        .ok()
+        .and_then(|ms| ms.checked_mul(1000))
+        .ok_or(EINVAL)
 }
 struct Owner {
     endpoint: Endpoint,
@@ -448,6 +459,7 @@ impl Owner {
                 };
                 let nodelay = socket.nodelay;
                 let reuse = socket.reuse;
+                let user_timeout_ms = socket.user_timeout_ms;
                 match self.endpoint.accept(id) {
                     Ok(id) => {
                         let tuple = self.endpoint.tuple(id).map_err(error)?;
@@ -457,6 +469,10 @@ impl Owner {
                         socket.local = Some(tuple.local);
                         socket.nodelay = nodelay;
                         socket.reuse = reuse;
+                        self.endpoint
+                            .set_user_timeout(id, user_timeout_us(user_timeout_ms)?)
+                            .map_err(error)?;
+                        socket.user_timeout_ms = user_timeout_ms;
                         socket.readable = None;
                         socket.connected = true;
                         response.value = self.alloc(socket)? as i64;
@@ -501,6 +517,9 @@ impl Owner {
                     let id = self.endpoint.connect(now, local, remote).map_err(error)?;
                     self.endpoint
                         .set_nagle(id, !socket.nodelay)
+                        .map_err(error)?;
+                    self.endpoint
+                        .set_user_timeout(id, user_timeout_us(socket.user_timeout_ms)?)
                         .map_err(error)?;
                     socket.local = Some(local);
                     socket.handle = Handle::Connection(id);
@@ -649,6 +668,18 @@ impl Owner {
                             }
                             socket.nodelay = r.b != 0;
                         }
+                        5 => {
+                            let milliseconds = if r.b == 0 {
+                                default_user_timeout_ms()
+                            } else {
+                                r.b
+                            };
+                            let timeout = user_timeout_us(milliseconds)?;
+                            if let Handle::Connection(id) = socket.handle {
+                                self.endpoint.set_user_timeout(id, timeout).map_err(error)?;
+                            }
+                            socket.user_timeout_ms = milliseconds;
+                        }
                         _ => return Err(ENOSYS),
                     }
                 } else {
@@ -661,6 +692,7 @@ impl Owner {
                             e as i64
                         }
                         4 => SOCK_STREAM as i64,
+                        5 => socket.user_timeout_ms as i64,
                         _ => return Err(ENOSYS),
                     };
                 }
@@ -758,6 +790,15 @@ impl Owner {
             16 => {
                 let id = self.connection(r.fd)?;
                 response.bytes = encode_addr(self.endpoint.tuple(id).map_err(error)?.remote);
+            }
+            17 => {
+                let socket = self.sockets.get(&r.fd).ok_or(EBADF)?;
+                let bytes = match socket.handle {
+                    Handle::Fresh => 0,
+                    Handle::Listener(_) => return Err(EINVAL),
+                    Handle::Connection(id) => self.endpoint.readable_bytes(id).map_err(error)?,
+                };
+                response.value = i32::try_from(bytes).map_err(|_| EOVERFLOW)? as i64;
             }
             _ => return Err(unsupported("unknown adapter operation")),
         }

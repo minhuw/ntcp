@@ -486,6 +486,17 @@ impl Connection {
         self.rcv_up.unwrap_or(0).saturating_sub(self.received_read)
     }
 
+    pub(crate) fn readable_bytes(&self) -> usize {
+        if self.read_closed
+            || matches!(self.state, State::SynSent | State::SynReceived)
+            || self.state == State::Closed
+                && (self.reason != Some(CloseReason::Normal) || !self.receive.eof())
+        {
+            return 0;
+        }
+        self.receive.readable()
+    }
+
     pub(crate) fn take_route_advice(&mut self) -> bool {
         core::mem::take(&mut self.route_advice_pending)
     }
@@ -3362,6 +3373,32 @@ mod tests {
         assert_eq!(&out[..6], b"abcdef");
         assert_eq!(b.read(&mut out), Ok(0));
         assert_eq!(b.take_events().urgent, None);
+    }
+
+    #[test]
+    fn readable_bytes_defers_syn_payload_and_matches_inline_reads() {
+        let metadata = ip(tuple());
+        let header = Header {
+            source_port: 1000,
+            destination_port: 2000,
+            sequence: 100,
+            acknowledgment: 0,
+            flags: SYN | URG,
+            window: 64,
+            urgent_pointer: 4,
+        };
+        let mut bytes = [0; 64];
+        let n = wire::encode(metadata, header, &[], b"abc", &mut bytes).unwrap();
+        let syn = wire::parse(metadata, &bytes[..n]).unwrap();
+        let mut b = Connection::passive(reverse(tuple()), config(64, 8), 900, 0, &syn).unwrap();
+        assert_eq!(b.readable_bytes(), 0);
+        packet(&mut b, 10);
+        inject(&mut b, 20, Seq(104), Seq(901), ACK, 64, b"");
+        assert_eq!(b.readable_bytes(), 3);
+        assert_eq!(b.read(&mut [0; 1]), Ok(1));
+        assert_eq!(b.readable_bytes(), 2);
+        b.abort();
+        assert_eq!(b.readable_bytes(), 0);
     }
 
     #[test]

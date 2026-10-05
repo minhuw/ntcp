@@ -1372,6 +1372,9 @@ impl Endpoint {
     pub fn tuple(&self, id: ConnectionId) -> Result<Tuple, EndpointError> {
         Ok(self.slot(id)?.connection.tuple())
     }
+    pub fn readable_bytes(&self, id: ConnectionId) -> Result<usize, EndpointError> {
+        Ok(self.slot(id)?.connection.readable_bytes())
+    }
     pub fn urgent_remaining(&self, id: ConnectionId) -> Result<u64, EndpointError> {
         Ok(self.slot(id)?.connection.urgent_remaining())
     }

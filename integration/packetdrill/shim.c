@@ -6,6 +6,8 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdarg.h>
+#include <linux/sockios.h>
+#include <sys/ioctl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -124,23 +126,31 @@ static int fcntl_socket(void *u, int fd, int cmd, ...) {
     else if (cmd != F_GETFL && cmd != F_GETFD) return unsupported("fcntl command");
     return SIMPLE(10, fd, cmd, arg);
 }
-static int ioctl_socket(void *u, int fd, unsigned long request, ...) { return unsupported("ioctl"); }
+static int ioctl_socket(void *u, int fd, unsigned long request, ...) {
+    if (request != SIOCINQ) return unsupported("ioctl request");
+    va_list ap; va_start(ap, request); int *out = va_arg(ap, int *); va_end(ap);
+    // Validate the fd/state before touching the caller's output, as Linux does.
+    int value = SIMPLE(17, fd, 0, 0);
+    if (value < 0) return -1;
+    if (!out) return bad(EFAULT);
+    memcpy(out, &value, sizeof(value)); return 0;
+}
 static int close_socket(void *u, int fd) { return SIMPLE(8, fd, 0, 0); }
 static int shutdown_socket(void *u, int fd, int how) {
     if (how != SHUT_WR) return unsupported("shutdown: only SHUT_WR");
     return SIMPLE(9, fd, how, 0);
 }
 static int setopt(void *u, int fd, int level, int name, const void *p, socklen_t n) {
-    if (!((level == SOL_SOCKET && name == SO_REUSEADDR) || (level == IPPROTO_TCP && name == TCP_NODELAY))) return unsupported("setsockopt option");
+    if (!((level == SOL_SOCKET && name == SO_REUSEADDR) || (level == IPPROTO_TCP && (name == TCP_NODELAY || name == TCP_USER_TIMEOUT)))) return unsupported("setsockopt option");
     if (!p) return bad(EFAULT);
     if (n < sizeof(int)) return bad(EINVAL);
     int value; memcpy(&value, p, sizeof(value));
-    return SIMPLE(11, fd, level == SOL_SOCKET ? 1 : 2, value);
+    return SIMPLE(11, fd, level == SOL_SOCKET ? 1 : name == TCP_NODELAY ? 2 : 5, value);
 }
 static int getopt_socket(void *u, int fd, int level, int name, void *p, socklen_t *n) {
-    if (!((level == SOL_SOCKET && (name == SO_REUSEADDR || name == SO_ERROR || name == SO_TYPE)) || (level == IPPROTO_TCP && name == TCP_NODELAY))) return unsupported("getsockopt option (including TCP_INFO)");
+    if (!((level == SOL_SOCKET && (name == SO_REUSEADDR || name == SO_ERROR || name == SO_TYPE)) || (level == IPPROTO_TCP && (name == TCP_NODELAY || name == TCP_USER_TIMEOUT)))) return unsupported("getsockopt option (including TCP_INFO)");
     if (!p || !n) return bad(EFAULT);
-    int key = level == IPPROTO_TCP ? 2 : name == SO_REUSEADDR ? 1 : name == SO_ERROR ? 3 : 4;
+    int key = level == IPPROTO_TCP ? (name == TCP_NODELAY ? 2 : 5) : name == SO_REUSEADDR ? 1 : name == SO_ERROR ? 3 : 4;
     int value = SIMPLE(12, fd, key, 0);
     if (value < 0) return -1;
     size_t size = *n < sizeof(value) ? *n : sizeof(value); memcpy(p, &value, size); *n = size; return 0;
@@ -211,6 +221,26 @@ void ntcp_abi_check(void *u) {
     assert(p.fcntl(u, fd, F_GETFL) == O_RDWR);
     assert(p.fcntl(u, fd, F_SETFL, O_RDWR | O_NONBLOCK) == 0);
     assert(p.fcntl(u, fd, F_GETFL) == (O_RDWR | O_NONBLOCK));
+    int queued = -1;
+    assert(p.ioctl(u, -1, SIOCINQ, &queued) == -1 && errno == EBADF && queued == -1);
+    assert(p.ioctl(u, fd, SIOCINQ, NULL) == -1 && errno == EFAULT);
+    assert(p.ioctl(u, fd, SIOCINQ, &queued) == 0 && queued == 0);
+    int value = 1234; socklen_t size = sizeof(value);
+    assert(p.setsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, NULL, size) == -1 && errno == EFAULT);
+    assert(p.setsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, 3) == -1 && errno == EINVAL);
+    value = -1;
+    assert(p.setsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, size) == -1 && errno == EINVAL);
+    value = 1234;
+    assert(p.setsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, size) == 0);
+    value = 0;
+    assert(p.getsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, &size) == 0 && value == 1234 && size == sizeof(value));
+    assert(p.getsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, NULL, &size) == -1 && errno == EFAULT);
+    assert(p.getsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, NULL) == -1 && errno == EFAULT);
+    value = 0;
+    assert(p.setsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, sizeof(value)) == 0);
+    assert(p.getsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, &size) == 0 && value == 300000);
+    size = 1; unsigned char byte = 0;
+    assert(p.getsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &byte, &size) == 0 && size == 1 && byte == ((unsigned char *)&value)[0]);
     assert(p.close(u, fd) == 0);
     struct timeval tv;
     assert(p.gettimeofday(u, &tv, NULL) == 0 && tv.tv_sec > 1700000000);
