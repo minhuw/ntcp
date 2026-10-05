@@ -2024,7 +2024,7 @@ impl Connection {
             .min(self.config.receive_ip_payload_limit - 20)
             .to_be_bytes();
         let mut options = [0; 20];
-        options[..8].copy_from_slice(&[2, 4, mss[0], mss[1], 3, 3, self.local_scale, 1]);
+        options[..8].copy_from_slice(&[2, 4, mss[0], mss[1], 1, 3, 3, self.local_scale]);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
         //# TCP implementations SHOULD send an MSS Option in every SYN segment when its
         //# receive MSS differs from the default 536 for IPv4 or 1220 for IPv6 (SHLD-5),
@@ -2055,8 +2055,6 @@ impl Connection {
             options[option_len + 4..option_len + 8].copy_from_slice(&value.to_be_bytes());
             options[option_len + 8..option_len + 12].copy_from_slice(&echo.to_be_bytes());
             option_len += 12;
-        } else if option_len == 8 {
-            options[7] = 0; // Preserve the opt-out wire representation.
         }
         let ip = IpMetadata {
             source: self.tuple.local.ip(),
@@ -2809,6 +2807,112 @@ mod tests {
             assert_ne!(segment.header.flags & PSH, 0);
         }
         assert_eq!(a.transmit(40, &mut [0; 64]), Ok(None));
+    }
+
+    #[test]
+    fn syn_option_layout_and_short_output_are_transactional() {
+        for (synack, scaling) in [(false, true), (true, false), (true, true)] {
+            for local_ts in [false, true] {
+                for peer_ts in [false, true] {
+                    if !synack && peer_ts {
+                        continue;
+                    }
+                    let mut cfg = config(131072, 300);
+                    cfg.ecn = false;
+                    cfg.receive_ip_payload_limit = 200;
+                    cfg.send_ip_payload_limit = if local_ts { 40 } else { 28 };
+                    cfg.timestamps = local_ts;
+                    let mut c = if synack {
+                        let mut options = vec![2, 4, 1, 44];
+                        if scaling {
+                            options.extend_from_slice(&[1, 3, 3, 7]);
+                        }
+                        if peer_ts {
+                            options.extend_from_slice(&[1, 1, 8, 10, 0, 0, 0, 2, 0, 0, 0, 0]);
+                        }
+                        let mut input = [0; 40];
+                        let size = wire::encode(
+                            ip(reverse(tuple())),
+                            Header {
+                                source_port: tuple().remote.port(),
+                                destination_port: tuple().local.port(),
+                                sequence: 900,
+                                acknowledgment: 0,
+                                flags: SYN,
+                                window: 65535,
+                                urgent_pointer: 0,
+                            },
+                            &options,
+                            &[],
+                            &mut input,
+                        )
+                        .unwrap();
+                        let syn = wire::parse(ip(reverse(tuple())), &input[..size]).unwrap();
+                        Connection::passive(tuple(), cfg, 100, 3_000, &syn).unwrap()
+                    } else {
+                        Connection::active(tuple(), cfg, 100, 3_000).unwrap()
+                    };
+                    let timestamps = local_ts && (!synack || peer_ts);
+                    let mut expected = vec![2, 4, 0, 180];
+                    if scaling {
+                        expected.extend_from_slice(&[1, 3, 3, 2]);
+                    }
+                    if timestamps {
+                        let echo = if synack { 2 } else { 0 };
+                        expected.extend_from_slice(&[1, 1, 8, 10, 0, 0, 0, 4, 0, 0, 0, echo]);
+                    }
+                    let size = 20 + expected.len();
+                    let before = (
+                        c.now,
+                        c.snd_nxt,
+                        c.last_sent,
+                        c.last_ack_sent,
+                        c.advertised_edge,
+                        c.ts_recent,
+                        c.last_timestamp_sent_at,
+                        c.sample,
+                        c.next_deadline(),
+                        c.syn_pending,
+                        c.ack_pending,
+                    );
+                    for len in 0..size {
+                        let mut short = vec![0xa5; len];
+                        assert_eq!(c.transmit(4_000, &mut short), Err(Error::OutputTooSmall));
+                        assert_eq!(short, vec![0xa5; len]);
+                        assert_eq!(
+                            (
+                                c.now,
+                                c.snd_nxt,
+                                c.last_sent,
+                                c.last_ack_sent,
+                                c.advertised_edge,
+                                c.ts_recent,
+                                c.last_timestamp_sent_at,
+                                c.sample,
+                                c.next_deadline(),
+                                c.syn_pending,
+                                c.ack_pending,
+                            ),
+                            before
+                        );
+                    }
+                    let mut out = vec![0; size];
+                    assert_eq!(c.transmit(4_000, &mut out), Ok(Some(size)));
+                    let segment = wire::parse(ip(tuple()), &out).unwrap();
+                    assert_eq!(segment.raw_options, expected);
+                    assert_eq!(segment.header.flags, SYN | if synack { ACK } else { 0 });
+                    assert_eq!(segment.header.window, 65535);
+                    assert_eq!(segment.options.mss, Some(180));
+                    assert_eq!(segment.options.window_scale, scaling.then_some(2));
+                    assert_eq!(
+                        segment.options.timestamps,
+                        timestamps.then_some((4, if synack { 2 } else { 0 }))
+                    );
+                    assert!(segment.payload.is_empty());
+                    assert!(!c.syn_pending);
+                }
+            }
+        }
     }
 
     #[test]
