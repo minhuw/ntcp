@@ -799,6 +799,54 @@ fn warning_reports_can_be_disabled_without_suppressing_route_advice() {
     }
 }
 
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8
+//= type=test
+//# However, the conditions that are reported asynchronously to the application MUST include:
+#[test]
+fn asynchronous_reports_include_urgent_icmp_and_retransmission_warning() {
+    let (mut a, mut b, listener, id) = endpoints();
+    pump(&mut a, &mut b, 0);
+    let peer = b.accept(listener).unwrap();
+    while a.next_event().is_some() {}
+    b.write_urgent(peer, b"!").unwrap();
+    deliver(&mut a, 0, packets(&mut b, 0));
+    assert!(
+        matches!(a.next_event(), Some(Event::Connection(event_id, events))
+        if event_id == id && events.readable && events.urgent == Some(1))
+    );
+    assert_eq!(a.read(id, &mut [0; 1]).unwrap(), 1);
+    a.write(id, b"lost").unwrap();
+    let data = packets(&mut a, 0);
+    let seq = wire::parse(data[0].0, &data[0].1).unwrap().header.sequence;
+    let (local, remote) = addresses();
+    assert!(
+        a.network_error(
+            0,
+            Tuple { local, remote },
+            seq,
+            NetworkError::SoftUnreachable
+        )
+        .unwrap()
+    );
+    assert!(
+        matches!(a.next_event(), Some(Event::Connection(event_id, events))
+        if event_id == id && events.network_error == Some(NetworkError::SoftUnreachable))
+    );
+    for attempt in 0..3 {
+        let deadline = a.next_deadline().unwrap();
+        a.on_timeout(deadline, 64).unwrap();
+        packets(&mut a, deadline);
+        let mut warned = false;
+        while let Some(event) = a.next_event() {
+            if let Event::Connection(event_id, events) = event {
+                assert_eq!(event_id, id);
+                warned |= events.retransmission_warning;
+            }
+        }
+        assert_eq!(warned, attempt == 2);
+    }
+}
+
 fn passive_quote(a: &mut Endpoint, b: &mut Endpoint) -> (Tuple, u32) {
     deliver(b, 0, packets(a, 0));
     let reply = packets(b, 0);

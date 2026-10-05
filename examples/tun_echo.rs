@@ -328,6 +328,8 @@ mod linux {
                 send_capacity: 65536,
                 receive_capacity: 65536,
                 mss: 1460,
+                receive_ip_payload_limit: (MTU - IP_HEADER) as u16,
+                send_ip_payload_limit: (MTU - IP_HEADER) as u16,
                 ..ConnectionConfig::default()
             },
         };

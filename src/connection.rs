@@ -16,9 +16,18 @@ pub type Instant = u64;
 pub struct ConnectionConfig {
     pub send_capacity: usize,
     pub receive_capacity: usize,
-    // RFC 9293 MUST-67 remains partial: this configured offer has no explicit MMS_R
-    // input; stream receive capacity is not the IP reassembly limit.
     pub mss: u16,
+    // Maximum TCP segment bytes after IP headers/extensions are subtracted from
+    // the reassembly bound; use the smallest bound if it varies.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.3
+    //# As a result, when the effective MTU of an interface varies packet-to-
+    //# packet, TCP implementations SHOULD use the smallest effective MTU of
+    //# the interface to calculate the value to advertise in the MSS Option
+    //# (SHLD-6).
+    pub receive_ip_payload_limit: u16,
+    // Maximum TCP segment bytes after IP headers/extensions are subtracted from
+    // the transmission bound; must fit our 28-byte SYN with MSS and WS.
+    pub send_ip_payload_limit: u16,
     pub nagle: bool,
     pub delayed_ack_us: u64,
     pub user_timeout_us: u64,
@@ -55,6 +64,8 @@ impl Default for ConnectionConfig {
             send_capacity: 65536,
             receive_capacity: 65536,
             mss: 1460,
+            receive_ip_payload_limit: u16::MAX,
+            send_ip_payload_limit: u16::MAX,
             nagle: true,
             delayed_ack_us: 200_000,
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
@@ -163,6 +174,7 @@ pub(crate) struct Connection {
     scratch: Vec<u8>,
     iss: Seq,
     irs: Option<Seq>,
+    passive_open: bool,
     snd_una: Seq,
     snd_nxt: Seq,
     send_base: Seq,
@@ -212,6 +224,7 @@ pub(crate) struct Connection {
     persist_deadline: Option<Instant>,
     persist_interval: u64,
     persist_unanswered_since: Option<Instant>,
+    shrink_unanswered_since: Option<Instant>,
     sws_deadline: Option<Instant>,
     sws_override: bool,
     time_wait_deadline: Option<Instant>,
@@ -225,7 +238,7 @@ pub(crate) struct Connection {
 impl Connection {
     pub(crate) fn active(
         tuple: Tuple,
-        config: ConnectionConfig,
+        mut config: ConnectionConfig,
         iss: u32,
         now: Instant,
     ) -> Result<Self, Error> {
@@ -233,6 +246,8 @@ impl Connection {
             || config.send_capacity >= 1 << 30
             || config.receive_capacity == 0
             || config.receive_capacity > (65535usize << 14)
+            || config.receive_ip_payload_limit < 21
+            || config.send_ip_payload_limit < 28
             || config.mss == 0
             || config.mss > if tuple.local.is_ipv4() { 65495 } else { 65515 }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.3
@@ -252,6 +267,10 @@ impl Connection {
         {
             return Err(Error::InvalidArgument);
         }
+        // Non-jumbo family limits include the TCP header, not the IP header.
+        let family_limit = if tuple.local.is_ipv4() { 65515 } else { 65535 };
+        config.receive_ip_payload_limit = config.receive_ip_payload_limit.min(family_limit);
+        config.send_ip_payload_limit = config.send_ip_payload_limit.min(family_limit);
         let send = SendBuffer::new(config.send_capacity).map_err(|_| Error::NoMemory)?;
         let receive =
             ReceiveBuffer::new(Seq(0), config.receive_capacity).map_err(|_| Error::NoMemory)?;
@@ -264,7 +283,7 @@ impl Connection {
             .find(|&shift| config.receive_capacity <= (65535usize << shift))
             .unwrap_or(14);
         let syn_window = config.receive_capacity.min(65535) as u16;
-        let mss = config.mss as usize;
+        let mss = config.mss.min(config.send_ip_payload_limit - 20) as usize;
         Ok(Self {
             tuple,
             config,
@@ -277,6 +296,7 @@ impl Connection {
             scratch,
             iss: Seq(iss),
             irs: None,
+            passive_open: false,
             snd_una: Seq(iss),
             snd_nxt: Seq(iss),
             send_base: Seq(iss).wrapping_add(1),
@@ -319,6 +339,7 @@ impl Connection {
             persist_deadline: None,
             persist_interval: 0,
             persist_unanswered_since: None,
+            shrink_unanswered_since: None,
             sws_deadline: None,
             sws_override: false,
             time_wait_deadline: None,
@@ -341,6 +362,7 @@ impl Connection {
             return Err(Error::InvalidArgument);
         }
         let mut connection = Self::active(tuple, config, iss, now)?;
+        connection.passive_open = true;
         connection.learn_syn(syn);
         connection.state = State::SynReceived;
         Ok(connection)
@@ -505,10 +527,21 @@ impl Connection {
         } else {
             1220
         };
-        // RFC 9293 MUST-16: peer MSS is capped here, but the configured/lowered MSS
-        // still depends on adapter IP limits and options overhead.
-        self.mss =
-            (syn.options.mss.unwrap_or(default_mss).max(1) as usize).min(self.config.mss as usize);
+        // The configured MSS remains the scratch/buffer ceiling, independently of
+        // the receive offer. IP has already subtracted its actual header overhead.
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
+        //# The maximum size of a segment that a TCP endpoint really sends, the
+        //# "effective send MSS", MUST be the smaller (MUST-16) of the send MSS
+        //# (that reflects the available reassembly buffer size at the remote
+        //# host, the EMTU_R [19]) and the largest transmission size permitted by
+        //# the IP layer (EMTU_S [19]):
+        self.mss = syn
+            .options
+            .mss
+            .unwrap_or(default_mss)
+            .max(1)
+            .min(self.config.mss)
+            .min(self.config.send_ip_payload_limit - 20) as usize;
         self.congestion.set_mss(self.mss as u32);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
         //# The window size MUST be treated as an unsigned number, or else large window
@@ -593,6 +626,7 @@ impl Connection {
         self.rto_deadline = None;
         self.ack_deadline = None;
         self.persist_deadline = None;
+        self.shrink_unanswered_since = None;
         self.sws_deadline = None;
         self.time_wait_deadline = None;
         self.keepalive_deadline = None;
@@ -634,9 +668,14 @@ impl Connection {
     //# As long as the receiving TCP peer continues to send acknowledgments in response
     //# to the probe segments, the sending TCP peer MUST allow the connection to stay
     //# open (MUST-37).
-    // RFC 9293 MUST-34/SHLD-17 remain partial: responsive zero-window persist is
-    // exempt, but nonzero-window shrink recovery is untested and has no dedicated
-    // timeout exemption.
+    // Nonzero shrink keeps normal in-window RTO retransmission. Like persist,
+    // intentional backoff is not peer failure: only a committed, unanswered
+    // retransmission starts the liveness clock. Current ACK/window feedback
+    // clears it; reopening starts a fresh ordinary progress timeout.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
+    //# but SHOULD NOT
+    //# time out the connection if data beyond the right window edge is not
+    //# acknowledged (SHLD-17).
     fn user_deadline(&self) -> Option<Instant> {
         if !self.user_timer_needed() {
             return None;
@@ -651,6 +690,11 @@ impl Connection {
             // liveness timeout once a probe has actually gone unanswered.
             return self
                 .persist_unanswered_since
+                .map(|sent| sent.saturating_add(self.user_timeout()));
+        }
+        if self.synchronized() && self.snd_wnd != 0 && self.flight() > self.snd_wnd {
+            return self
+                .shrink_unanswered_since
                 .map(|sent| sent.saturating_add(self.user_timeout()));
         }
         Some(self.progress_at.saturating_add(self.user_timeout()))
@@ -915,6 +959,7 @@ impl Connection {
         // Simultaneous open: the SYN has already consumed receive sequence
         // space. Only the identical SYN+ACK can finish this handshake here.
         if self.state == State::SynReceived
+            && !self.passive_open
             && self.irs == Some(seq)
             && h.flags & (SYN | ACK | RST | FIN) == (SYN | ACK)
             && ack == self.iss.wrapping_add(1)
@@ -956,7 +1001,10 @@ impl Connection {
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4
         //# A TCP receiver MUST process the RST and URG fields of all incoming segments,
         //# even when the receive window is zero (MUST-66).
-        let acceptable = if window == 0 {
+        let acceptable = if h.flags & RST != 0 {
+            // RST validation uses SEG.SEQ, never the end of accompanying text.
+            seq == next || seq.in_window(next, window) == Some(true)
+        } else if window == 0 {
             // Even when accompanying text has no receive credit, exact-sequence
             // ACK/RST/URG controls must still be processed (RFC 9293 MUST-66).
             seq == next && (len == 0 || h.flags & (ACK | RST | URG) != 0)
@@ -988,18 +1036,40 @@ impl Connection {
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
         //# After sending the challenge ACK, TCP endpoints MUST drop the unacceptable
         //# segment and stop processing the incoming packet further.
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+        //# 2)  If the RST bit is set and the sequence number exactly
+        //# matches the next expected sequence number (RCV.NXT), then
+        //# TCP endpoints MUST reset the connection in the manner
+        //# prescribed below according to the connection state.
         if h.flags & RST != 0 {
             if seq == next {
+                let passive = self.state == State::SynReceived && self.passive_open;
                 self.terminal(CloseReason::Reset);
+                if passive {
+                    self.events = ConnectionEvents::default();
+                }
             } else {
                 self.immediate_ack();
             }
             return Ok(());
         }
-        // RFC 9293 section 3.10.7.4 gap: passive SYN-RECEIVED unexpected SYN is
-        // challenged without returning the child to LISTEN.
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+        //# RFC 5961 recommends that in
+        //# these synchronized states, if the SYN bit is set,
+        //# irrespective of the sequence number, TCP endpoints MUST send
+        //# a "challenge ACK" to the remote peer:
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+        //# o  After sending the acknowledgment, TCP implementations MUST
+        //# drop the unacceptable segment and stop processing further.
         if h.flags & SYN != 0 {
-            self.immediate_ack();
+            if self.state == State::SynReceived && self.passive_open {
+                // Endpoint owns LISTEN independently; closing this unaccepted
+                // child releases its slot without notifying the application.
+                self.terminal(CloseReason::Reset);
+                self.events = ConnectionEvents::default();
+            } else {
+                self.immediate_ack();
+            }
             return Ok(());
         }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
@@ -1017,12 +1087,12 @@ impl Connection {
         let oldest_ack = self
             .snd_una
             .wrapping_add(0u32.wrapping_sub(self.max_snd_wnd));
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+        //# All incoming segments
+        //# whose ACK value doesn't satisfy the above condition MUST be
+        //# discarded and an ACK sent back.
         if !at_or_after(self.snd_nxt, ack) || !at_or_after(ack, oldest_ack) {
-            if self.state == State::SynReceived {
-                self.pending_rst = Some((ack, false));
-            } else {
-                self.immediate_ack();
-            }
+            self.immediate_ack();
             return Ok(());
         }
         if self.state == State::SynReceived {
@@ -1040,12 +1110,8 @@ impl Connection {
         self.keepalive_probes = 0;
         self.keepalive_pending = false;
         self.keepalive_deadline = None;
-        // A responsive zero-window peer must not be killed for backpressure.
-        if self.snd_wnd == 0 {
-            self.progress_at = now;
-            self.persist_unanswered_since = None;
-        }
         let old_window = self.snd_wnd;
+        let was_blocked = old_window == 0 || self.flight() > old_window;
         let advancing = after(ack, self.snd_una);
         if advancing {
             self.accept_ack(ack);
@@ -1063,6 +1129,14 @@ impl Connection {
             self.max_snd_wnd = self.max_snd_wnd.max(self.snd_wnd);
             self.wl1 = seq;
             self.wl2 = ack;
+            self.shrink_unanswered_since = None;
+            // Only current, acceptable ACK/window feedback proves responsiveness.
+            // Old ACKs, stale window updates and rejected controls cannot prolong
+            // persist or shrink liveness. Reopening also gets a fresh timeout.
+            if was_blocked || self.flight() > self.snd_wnd {
+                self.progress_at = now;
+                self.persist_unanswered_since = None;
+            }
         }
         if !advancing
             && ack == self.snd_una
@@ -1268,7 +1342,12 @@ impl Connection {
                 || flags & FIN != 0
                 || self.receive_window() == 0
                 || self.full_segments >= 2
-                || self.unacked_bytes >= 2 * u32::from(self.config.mss)
+                || self.unacked_bytes
+                    >= 2 * u32::from(
+                        self.config
+                            .mss
+                            .min(self.config.receive_ip_payload_limit - 20),
+                    )
                 || self.config.delayed_ack_us == 0
             {
                 self.immediate_ack();
@@ -1365,7 +1444,6 @@ impl Connection {
                 1
             } else {
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
-                //= reason=Retransmit is bounded by offered window; no direct shrinking-window regression test.
                 //# but SHOULD retransmit normally the old unacknowledged data between
                 //# SND.UNA and SND.UNA+SND.WND (SHLD-16).
                 self.mss
@@ -1407,6 +1485,10 @@ impl Connection {
             };
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
             //# If this happens, the sender SHOULD NOT send new data (SHLD-15),
+            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
+            //# However, a sending TCP peer MUST
+            //# be robust against window shrinking, which may cause the "usable
+            //# window" (see Section 3.8.6.2.1) to become negative (MUST-34).
             let usable = self.snd_wnd.min(cwnd_limit).saturating_sub(self.flight()) as usize;
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
             //# However, a TCP implementation SHOULD send a maximum-sized segment
@@ -1490,7 +1572,14 @@ impl Connection {
         //= reason=Transmit supplies MSS on SYN; learn_syn consumes the decoded peer MSS.
         //# TCP endpoints MUST implement both sending and receiving the MSS Option
         //# (MUST-14).
-        let mss = self.config.mss.to_be_bytes();
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
+        //# where MMS_R is the maximum size for a transport-layer message that
+        //# can be received (and reassembled at the IP layer) (MUST-67).
+        let mss = self
+            .config
+            .mss
+            .min(self.config.receive_ip_payload_limit - 20)
+            .to_be_bytes();
         let options = [2, 4, mss[0], mss[1], 3, 3, self.local_scale, 0];
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
         //# TCP implementations SHOULD send an MSS Option in every SYN segment when its
@@ -1509,6 +1598,10 @@ impl Connection {
             source: self.tuple.local.ip(),
             destination: self.tuple.remote.ip(),
         };
+        // Include TCP options on every output path, before committing any state.
+        if 20 + option_len + count > self.config.send_ip_payload_limit as usize {
+            return Err(Error::InvalidArgument);
+        }
         let size = wire::encode(
             ip,
             header,
@@ -1580,6 +1673,11 @@ impl Connection {
         }
         if retransmit {
             self.retx_pending = false;
+            if length != 0 && self.snd_wnd != 0 && self.flight() > self.snd_wnd {
+                // Commit only after encode succeeds; retries cannot postpone
+                // the deadline for the oldest still-unanswered retransmission.
+                self.shrink_unanswered_since.get_or_insert(now);
+            }
         }
         if probe {
             self.probe_pending = false;
@@ -2287,7 +2385,12 @@ mod tests {
     }
 
     #[test]
-    fn future_ack_during_passive_handshake_gets_a_reset_not_an_ack() {
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //# All incoming segments
+    //# whose ACK value doesn't satisfy the above condition MUST be
+    //# discarded and an ACK sent back.
+    fn passive_handshake_applies_blind_ack_check_before_state_specific_reset() {
         let mut active = Connection::active(tuple(), config(64, 8), 100, 0).unwrap();
         let syn = packet(&mut active, 0);
         let syn = wire::parse(ip(tuple()), &syn).unwrap();
@@ -2297,9 +2400,15 @@ mod tests {
         inject(&mut passive, 1, Seq(101), Seq(202), ACK, 64, &[]);
         let response = packet(&mut passive, 1);
         let response = wire::parse(ip(reverse(tuple())), &response).unwrap();
-        assert_eq!(response.header.flags, RST);
-        assert_eq!(response.header.sequence, 202);
+        assert_eq!(response.header.flags, ACK);
+        assert_eq!(response.header.sequence, 201);
         assert_eq!(passive.state(), State::SynReceived);
+        // Within the RFC 5961 range, but not an ACK of our SYN: state-specific RST.
+        inject(&mut passive, 2, Seq(101), Seq(200), ACK, 64, &[]);
+        let response = packet(&mut passive, 2);
+        let response = wire::parse(ip(reverse(tuple())), &response).unwrap();
+        assert_eq!(response.header.flags, RST);
+        assert_eq!(response.header.sequence, 200);
     }
 
     #[test]
@@ -2744,6 +2853,10 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
+    //= type=test
+    //# A TCP receiver SHOULD NOT shrink the window, i.e., move the right
+    //# window edge to the left (SHLD-14).
     fn scaled_window_rounding_never_overruns_storage_or_revokes_old_credit() {
         let (mut a, mut b) = pair(config(65536, 1460), 100);
         let backing = b.receive.right_edge();
@@ -3115,7 +3228,6 @@ mod tests {
     //# and MAY send it always (MAY-3).
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
     //= type=test
-    //= reason=Asserts peer versus configured payload ceiling; adapter IP limits and options overhead remain adapter responsibilities.
     //# The maximum size of a segment that a TCP endpoint really sends, the
     //# "effective send MSS", MUST be the smaller (MUST-16) of the send MSS
     //# (that reflects the available reassembly buffer size at the remote
@@ -3229,5 +3341,648 @@ mod tests {
         assert_eq!(events.closed, Some(CloseReason::Reset));
         assert_eq!(a.close_reason(), Some(CloseReason::Reset));
         assert_eq!(a.read(&mut [0; 1]), Err(Error::InvalidState));
+    }
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
+    //= type=test
+    //# However, a sending TCP peer MUST
+    //# be robust against window shrinking, which may cause the "usable
+    //# window" (see Section 3.8.6.2.1) to become negative (MUST-34).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
+    //= type=test
+    //# If this happens, the sender SHOULD NOT send new data (SHLD-15), but
+    //# SHOULD retransmit normally the old unacknowledged data between
+    //# SND.UNA and SND.UNA+SND.WND (SHLD-16).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
+    //= type=test
+    //# but SHOULD NOT
+    //# time out the connection if data beyond the right window edge is not
+    //# acknowledged (SHLD-17).
+    fn nonzero_shrink_below_flight_retains_bytes_retransmits_inside_and_reopens() {
+        for iss in [100, u32::MAX - 4] {
+            let mut cfg = config(64, 8);
+            cfg.user_timeout_us = 5_000_000;
+            let (mut a, _) = pair(cfg, iss);
+            a.write(b"abcdefghijkl").unwrap();
+            packet(&mut a, 40);
+            let next = a.receive.next();
+            let una = a.snd_una;
+            let high = a.snd_nxt;
+            inject(&mut a, 50, next, una, ACK, 3, b"");
+            assert_eq!(a.flight(), 8);
+            assert_eq!(a.send.len(), 12);
+            assert_eq!(a.transmit(60, &mut [0; 64]), Ok(None));
+            let when = a.rto_deadline.unwrap();
+            a.timeout(when).unwrap();
+            let before = (a.snd_nxt, a.rto_deadline, a.now, a.retx_pending);
+            assert_eq!(
+                a.transmit(when + 1, &mut [0; 22]),
+                Err(Error::OutputTooSmall)
+            );
+            assert_eq!((a.snd_nxt, a.rto_deadline, a.now, a.retx_pending), before);
+            let bytes = packet(&mut a, when + 1);
+            let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(seg.header.sequence, una.0);
+            assert_eq!(seg.payload, b"abc");
+            assert_eq!(a.snd_nxt, high);
+            // No ACK progress for longer than the user timeout, but validated
+            // window feedback proves the shrunken peer is still responsive.
+            for now in [4_000_000, 8_000_000, 12_000_000, 16_000_000] {
+                inject(&mut a, now, next, una, ACK, 3, b"");
+                assert_eq!(a.user_deadline(), None);
+                a.timeout(now).unwrap();
+                assert_eq!(a.state(), State::Established);
+                if a.retx_pending && now != 16_000_000 {
+                    let bytes = packet(&mut a, now);
+                    assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, b"abc");
+                }
+                assert_eq!(a.snd_nxt, high);
+                assert_eq!(a.send.len(), 12);
+            }
+            inject(&mut a, 16_000_001, next, una, ACK, 64, b"");
+            assert_eq!(a.user_deadline(), Some(21_000_001));
+            // Reopening lets the pending retransmission recover the entire flight.
+            let bytes = packet(&mut a, 16_000_001);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().payload,
+                b"abcdefgh"
+            );
+            assert_eq!(a.snd_nxt, high);
+            // ACK only the original flight; the unsent tail survived the shrink.
+            inject(&mut a, 16_000_002, next, high, ACK, 64, b"");
+            assert_eq!(a.acknowledged(), 8);
+            let bytes = packet(&mut a, 16_000_003);
+            assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, b"ijkl");
+            let end = a.snd_nxt;
+            inject(&mut a, 16_000_004, next, end, ACK, 64, b"");
+            assert_eq!(a.acknowledged(), 12);
+            assert_eq!(a.send.len(), 0);
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
+    //= type=test
+    //# but SHOULD NOT
+    //# time out the connection if data beyond the right window edge is not
+    //# acknowledged (SHLD-17).
+    fn shrink_liveness_rejects_stale_feedback_and_keeps_ordinary_boundary_timeout() {
+        for iss in [100, u32::MAX - 4] {
+            for window in [1, 7, 8, 9] {
+                let mut cfg = config(64, 8);
+                cfg.user_timeout_us = 5_000_000;
+                let (mut a, _) = pair(cfg, iss);
+                a.write(b"abcdefgh").unwrap();
+                packet(&mut a, 40);
+                let seq = a.receive.next().wrapping_add(1);
+                let una = a.snd_una;
+                inject(&mut a, 50, seq, una, ACK, window, b"");
+                let baseline = a.user_deadline();
+                inject(&mut a, 100, seq, una, ACK, window, b"");
+                if window < 8 {
+                    assert_eq!(a.user_deadline(), None);
+                    let when = a.rto_deadline.unwrap();
+                    a.timeout(when).unwrap();
+                    packet(&mut a, when);
+                    assert_eq!(a.user_deadline(), Some(when + 5_000_000));
+                } else {
+                    assert_eq!(a.user_deadline(), baseline);
+                }
+                let deadline = a.user_deadline().unwrap();
+                let feedback_at = a.now + 1;
+                // Acceptable old ACK, stale SEQ/window, future ACK, RST and SYN
+                // cannot reset the liveness clock or update the send window.
+                for (seq, ack, flags) in [
+                    (seq, una.wrapping_add(u32::MAX), ACK),
+                    (a.receive.next(), una, ACK),
+                    (seq, a.snd_nxt.wrapping_add(1), ACK),
+                    (seq, una, RST | ACK),
+                    (seq, una, SYN | ACK),
+                ] {
+                    inject(&mut a, feedback_at, seq, ack, flags, 64, b"");
+                    assert_eq!(a.user_deadline(), Some(deadline));
+                    assert_eq!(a.snd_wnd, window as u32);
+                }
+                a.timeout(deadline - 1).unwrap();
+                assert_eq!(a.state(), State::Established);
+                a.timeout(deadline).unwrap();
+                assert_eq!(a.close_reason(), Some(CloseReason::TimedOut));
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
+    //= type=test
+    //# The maximum size of a segment that a TCP endpoint really sends, the
+    //# "effective send MSS", MUST be the smaller (MUST-16) of the send MSS
+    //# (that reflects the available reassembly buffer size at the remote
+    //# host, the EMTU_R [19]) and the largest transmission size permitted by
+    //# the IP layer (EMTU_S [19]):
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
+    //= type=test
+    //# where MMS_R is the maximum size for a transport-layer message that
+    //# can be received (and reassembled at the IP layer) (MUST-67).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.3
+    //= type=test
+    //# As a result, when the effective MTU of an interface varies packet-to-
+    //# packet, TCP implementations SHOULD use the smallest effective MTU of
+    //# the interface to calculate the value to advertise in the MSS Option
+    //# (SHLD-6).
+    fn ip_limits_bound_receive_offer_send_payload_options_and_allocations() {
+        let v6 = Tuple {
+            local: "[2001:db8::1]:1000".parse().unwrap(),
+            remote: "[2001:db8::2]:2000".parse().unwrap(),
+        };
+        for tuple in [tuple(), v6] {
+            let family_limit = if tuple.local.is_ipv4() { 65515 } else { 65535 };
+            let max_mss = family_limit - 20;
+            for (configured, receive, send, peer) in [
+                (64, 25, 40, 64),
+                (64, 100, 40, 9),
+                (64, 21, 28, 64),
+                (8, 100, 100, 64),
+                (max_mss, u16::MAX, u16::MAX, max_mss),
+            ] {
+                let mut cfg = config(131072, configured);
+                cfg.receive_ip_payload_limit = receive;
+                cfg.send_ip_payload_limit = send;
+                let mut a = Connection::active(tuple, cfg, 100, 0).unwrap();
+                let storage = (a.scratch.as_ptr(), a.scratch.capacity());
+                assert_eq!(a.scratch.len(), configured as usize);
+                let before = (a.snd_nxt, a.now, a.next_deadline());
+                assert_eq!(a.transmit(1, &mut [0; 27]), Err(Error::OutputTooSmall));
+                assert_eq!((a.snd_nxt, a.now, a.next_deadline()), before);
+                assert!(a.syn_pending);
+                let bytes = packet(&mut a, 1);
+                assert_eq!(bytes.len(), 28);
+                assert!(bytes.len() <= send as usize);
+                let syn = wire::parse(ip(tuple), &bytes).unwrap();
+                assert_eq!(
+                    syn.options.mss,
+                    Some(configured.min(receive.min(family_limit) - 20))
+                );
+                assert!(syn.options.window_scale.is_some());
+                let mut b =
+                    Connection::passive(reverse(tuple), config(131072, peer), 900, 10, &syn)
+                        .unwrap();
+                deliver(&mut b, &mut a, 20);
+                let ack = deliver(&mut a, &mut b, 30);
+                assert_eq!(ack.len(), 20);
+                let effective = configured.min(peer).min(send.min(family_limit) - 20) as usize;
+                assert_eq!(a.mss, effective);
+                a.write(&vec![42; effective + 1]).unwrap();
+                let before = (a.snd_nxt, a.now, a.next_deadline());
+                assert_eq!(
+                    a.transmit(40, &mut vec![0; 19 + effective]),
+                    Err(Error::OutputTooSmall)
+                );
+                assert_eq!((a.snd_nxt, a.now, a.next_deadline()), before);
+                let bytes = packet(&mut a, 40);
+                assert_eq!(bytes.len(), 20 + effective);
+                assert!(bytes.len() <= send.min(family_limit) as usize);
+                assert_eq!(
+                    wire::parse(ip(tuple), &bytes).unwrap().payload.len(),
+                    effective
+                );
+                a.lower_mss(1).unwrap();
+                assert_eq!((a.scratch.as_ptr(), a.scratch.capacity()), storage);
+                assert_eq!(packet(&mut a, 50).len(), 21);
+                a.abort();
+                assert_eq!(packet(&mut a, 60).len(), 20);
+            }
+            for (receive, send) in [
+                (0, 100),
+                (20, 100),
+                (100, 0),
+                (100, 20),
+                (100, 21),
+                (100, 27),
+            ] {
+                let mut cfg = config(64, 8);
+                cfg.receive_ip_payload_limit = receive;
+                cfg.send_ip_payload_limit = send;
+                assert!(matches!(
+                    Connection::active(tuple, cfg, 100, 0),
+                    Err(Error::InvalidArgument)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //# o  RFC 5961 [9], Section 5 describes a potential blind data
+    //# injection attack, and mitigation that implementations MAY
+    //# choose to include (MAY-12).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //# TCP stacks that implement RFC
+    //# 5961 MUST add an input check that the ACK value is
+    //# acceptable only if it is in the range of ((SND.UNA -
+    //# MAX.SND.WND) =< SEG.ACK =< SND.NXT).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //# All incoming segments
+    //# whose ACK value doesn't satisfy the above condition MUST be
+    //# discarded and an ACK sent back.
+    fn rfc5961_ack_bounds_are_inclusive_and_reject_all_incoming_side_effects() {
+        for iss in [100, u32::MAX - 4] {
+            for bound in 0..4 {
+                let (mut a, _) = pair(config(64, 8), iss);
+                a.write(b"retained").unwrap();
+                packet(&mut a, 40);
+                let oldest = a.snd_una.wrapping_add(0u32.wrapping_sub(a.max_snd_wnd));
+                let high = a.snd_nxt;
+                let ack = [
+                    oldest,
+                    high,
+                    oldest.wrapping_add(u32::MAX),
+                    high.wrapping_add(1),
+                ][bound];
+                let next = a.receive.next();
+                let seq = next.wrapping_add(1); // URG offset zero still advances the mark.
+                let before = (
+                    a.snd_una,
+                    a.snd_wnd,
+                    a.wl1,
+                    a.wl2,
+                    a.progress_at,
+                    a.last_received,
+                    a.rto_deadline,
+                );
+                inject(&mut a, 50, seq, ack, ACK | URG | FIN, 1, b"bad");
+                if bound < 2 {
+                    assert_eq!(a.urgent_remaining(), 1);
+                    assert_eq!(a.send.len(), if bound == 0 { 8 } else { 0 });
+                    // The accepted out-of-order text and FIN become visible on filling the gap.
+                    inject(&mut a, 60, next, high, ACK, 64, b"x");
+                    let mut data = [0; 4];
+                    assert_eq!(a.read(&mut data), Ok(4));
+                    assert_eq!(&data, b"xbad");
+                    assert_eq!(a.state(), State::CloseWait);
+                } else {
+                    assert_eq!(
+                        (
+                            a.snd_una,
+                            a.snd_wnd,
+                            a.wl1,
+                            a.wl2,
+                            a.progress_at,
+                            a.last_received,
+                            a.rto_deadline
+                        ),
+                        before
+                    );
+                    assert_eq!(a.urgent_remaining(), 0);
+                    assert_eq!(a.send.len(), 8);
+                    assert_eq!(a.receive.next(), next);
+                    assert_eq!(a.state(), State::Established);
+                    assert!(!a.events_pending());
+                    let bytes = packet(&mut a, 50);
+                    let response = wire::parse(ip(tuple()), &bytes).unwrap();
+                    assert_eq!(response.header.flags, ACK);
+                    assert_eq!(response.header.sequence, high.0);
+                    assert_eq!(response.header.acknowledgment, next.0);
+                    inject(&mut a, 60, next, high, ACK, 64, b"x");
+                    assert_eq!(a.read(&mut [0; 8]), Ok(1));
+                    assert_eq!(a.state(), State::Established);
+                }
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //# 2)  If the RST bit is set and the sequence number exactly
+    //# matches the next expected sequence number (RCV.NXT), then
+    //# TCP endpoints MUST reset the connection in the manner
+    //# prescribed below according to the connection state.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //# RFC 5961 recommends that in
+    //# these synchronized states, if the SYN bit is set,
+    //# irrespective of the sequence number, TCP endpoints MUST send
+    //# a "challenge ACK" to the remote peer:
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //# o  After sending the acknowledgment, TCP implementations MUST
+    //# drop the unacceptable segment and stop processing further.
+    fn rfc5961_reset_and_syn_state_matrix_drops_text_urgent_fin_and_ack() {
+        for state in [
+            State::SynReceived,
+            State::Established,
+            State::FinWait1,
+            State::FinWait2,
+            State::CloseWait,
+            State::Closing,
+            State::LastAck,
+            State::TimeWait,
+        ] {
+            for control in [RST, SYN] {
+                for offset in [0, 1, 64, u32::MAX] {
+                    let (mut a, _) = pair(config(64, 8), u32::MAX - 4);
+                    a.write(b"retained").unwrap();
+                    packet(&mut a, 40);
+                    a.state = state;
+                    // Exercise receive wrap as well as send wrap.
+                    a.receive = ReceiveBuffer::new(Seq(u32::MAX), 64).unwrap();
+                    a.advertised_edge = Seq(63);
+                    let next = a.receive.next();
+                    let high = a.snd_nxt;
+                    let before = (
+                        a.snd_una,
+                        a.snd_wnd,
+                        a.wl1,
+                        a.wl2,
+                        a.progress_at,
+                        a.last_received,
+                    );
+                    inject(
+                        &mut a,
+                        50,
+                        next.wrapping_add(offset),
+                        high,
+                        control | ACK | URG | FIN,
+                        0,
+                        b"bad",
+                    );
+                    if control == RST && offset == 0 {
+                        assert_eq!(a.state(), State::Closed);
+                        assert_eq!(a.close_reason(), Some(CloseReason::Reset));
+                        assert_eq!(a.next_deadline(), None);
+                    } else {
+                        assert_eq!(a.state(), state);
+                        assert_eq!(
+                            (
+                                a.snd_una,
+                                a.snd_wnd,
+                                a.wl1,
+                                a.wl2,
+                                a.progress_at,
+                                a.last_received
+                            ),
+                            before
+                        );
+                        assert_eq!(a.ack_pending, control == SYN || offset == 1);
+                        if a.ack_pending {
+                            let bytes = packet(&mut a, 50);
+                            let ack = wire::parse(ip(tuple()), &bytes).unwrap();
+                            assert_eq!(ack.header.flags, ACK);
+                            assert_eq!(ack.header.sequence, high.0);
+                            assert_eq!(ack.header.acknowledgment, next.0);
+                        }
+                    }
+                    assert_eq!(a.receive.next(), next);
+                    assert_eq!(a.receive.readable(), 0);
+                    assert!(!a.receive.eof());
+                    assert_eq!(a.rcv_up, None);
+                    assert_eq!(a.send.len(), 8);
+                }
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //# 2)  If the RST bit is set and the sequence number exactly
+    //# matches the next expected sequence number (RCV.NXT), then
+    //# TCP endpoints MUST reset the connection in the manner
+    //# prescribed below according to the connection state.
+    fn passive_syn_received_exception_releases_child_without_user_notification() {
+        for control in [RST, SYN] {
+            let mut a = Connection::active(tuple(), config(64, 8), 100, 0).unwrap();
+            let bytes = packet(&mut a, 0);
+            let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+            let mut b =
+                Connection::passive(reverse(tuple()), config(64, 8), 900, 10, &syn).unwrap();
+            packet(&mut b, 20);
+            let next = b.receive.next();
+            let high = b.snd_nxt;
+            inject(
+                &mut b,
+                30,
+                next,
+                high,
+                control | ACK | URG | FIN,
+                0,
+                b"ignored",
+            );
+            assert_eq!(b.state(), State::Closed);
+            assert!(!b.events_pending());
+            assert_eq!(b.receive.readable(), 0);
+            assert_eq!(b.rcv_up, None);
+            assert_eq!(b.next_deadline(), None);
+            assert_eq!(b.transmit(40, &mut [0; 64]), Ok(None));
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
+    //= type=test
+    //# A TCP implementation MAY keep its offered receive window closed
+    //# indefinitely (MAY-8).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
+    //= type=test
+    //# A TCP receiver SHOULD NOT shrink the window, i.e., move the right
+    //# window edge to the left (SHLD-14).
+    fn receiver_zero_window_persists_without_reads_and_sender_probes_after_shrink() {
+        let (mut a, mut b) = pair(config(4, 4), u32::MAX - 2);
+        a.write(b"abcd").unwrap();
+        let edge = b.advertised_edge;
+        deliver(&mut a, &mut b, 40);
+        let bytes = deliver(&mut b, &mut a, 50);
+        assert_eq!(
+            wire::parse(ip(reverse(tuple())), &bytes)
+                .unwrap()
+                .header
+                .window,
+            0
+        );
+        assert_eq!(b.advertised_edge, edge);
+        a.write(b"efgh").unwrap();
+        for _ in 0..10 {
+            let deadline = a.persist_deadline.unwrap();
+            a.timeout(deadline).unwrap();
+            let bytes = deliver(&mut a, &mut b, deadline);
+            assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 1);
+            b.timeout(deadline).unwrap();
+            let bytes = deliver(&mut b, &mut a, deadline);
+            assert_eq!(
+                wire::parse(ip(reverse(tuple())), &bytes)
+                    .unwrap()
+                    .header
+                    .window,
+                0
+            );
+            assert_eq!(b.receive.readable(), 4);
+            assert_eq!(b.advertised_edge, edge);
+            assert_eq!(b.user_deadline(), None);
+            assert_eq!(a.state(), State::Established);
+        }
+        // No response to the next probe: retain the resource/liveness bound.
+        let when = a.persist_deadline.unwrap();
+        a.timeout(when).unwrap();
+        packet(&mut a, when);
+        let deadline = a.user_deadline().unwrap();
+        a.timeout(deadline).unwrap();
+        assert_eq!(a.close_reason(), Some(CloseReason::TimedOut));
+        b.timeout(deadline).unwrap();
+        assert_eq!(b.state(), State::Established);
+        assert_eq!(b.advertised_window(false), 0);
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
+    //= type=test
+    //# If the window shrinks to zero, the TCP
+    //# implementation MUST probe it in the standard way (described below)
+    //# (MUST-35).
+    fn shrink_to_zero_with_outstanding_bytes_probes_and_validates_liveness_feedback() {
+        for iss in [100, u32::MAX - 4] {
+            let (mut a, _) = pair(config(64, 8), iss);
+            a.write(b"abcdefgh").unwrap();
+            packet(&mut a, 40);
+            let seq = a.receive.next();
+            let una = a.snd_una;
+            let high = a.snd_nxt;
+            inject(&mut a, 50, seq, una, ACK, 0, b"");
+            assert_eq!(a.rto_deadline, None);
+            assert_eq!(a.user_deadline(), None);
+            let when = a.persist_deadline.unwrap();
+            a.timeout(when).unwrap();
+            let bytes = packet(&mut a, when);
+            let probe = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(probe.header.sequence, una.0);
+            assert_eq!(probe.payload, b"a");
+            assert_eq!(a.snd_nxt, high);
+            assert_eq!(a.send.len(), 8);
+            let deadline = a.user_deadline();
+            inject(
+                &mut a,
+                when + 1,
+                seq,
+                una.wrapping_add(u32::MAX),
+                ACK,
+                64,
+                b"",
+            );
+            assert_eq!(a.user_deadline(), deadline);
+            assert_eq!(a.snd_wnd, 0);
+            inject(&mut a, when + 2, seq, una, ACK, 0, b"");
+            assert_eq!(a.user_deadline(), None);
+            inject(&mut a, when + 3, seq, una, ACK, 64, b"");
+            assert_eq!(a.persist_deadline, None);
+            assert_eq!(a.user_deadline(), Some(when + 3 + a.user_timeout()));
+            let when = a.rto_deadline.unwrap();
+            a.timeout(when).unwrap();
+            let bytes = packet(&mut a, when);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().payload,
+                b"abcdefgh"
+            );
+        }
+    }
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
+    //= type=test
+    //# but SHOULD NOT
+    //# time out the connection if data beyond the right window edge is not
+    //# acknowledged (SHLD-17).
+    fn shrink_peer_replying_only_to_retransmissions_survives_long_backoff() {
+        for iss in [100, u32::MAX - 4] {
+            let mut cfg = config(64, 8);
+            cfg.user_timeout_us = 5_000_000;
+            let (mut a, _) = pair(cfg, iss);
+            a.write(b"abcdefgh").unwrap();
+            packet(&mut a, 40);
+            let seq = a.receive.next();
+            let una = a.snd_una;
+            inject(&mut a, 50, seq, una, ACK, 3, b"");
+            for _ in 0..6 {
+                assert_eq!(a.user_deadline(), None);
+                let when = a.next_deadline().unwrap();
+                assert_eq!(Some(when), a.rto_deadline);
+                a.timeout(when).unwrap();
+                assert_eq!(a.state(), State::Established);
+                let bytes = packet(&mut a, when);
+                let retransmit = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(retransmit.header.sequence, una.0);
+                assert_eq!(retransmit.payload, b"abc");
+                assert_eq!(a.user_deadline(), Some(when + 5_000_000));
+                // No unsolicited feedback between emitted retransmissions.
+                inject(&mut a, when + 1, seq, una, ACK, 3, b"");
+                assert_eq!(a.shrink_unanswered_since, None);
+                assert_eq!(a.flight(), 8);
+                assert_eq!(a.send.len(), 8);
+            }
+            assert!(a.rto() > a.user_timeout());
+            let when = a.next_deadline().unwrap();
+            a.timeout(when).unwrap();
+            packet(&mut a, when);
+            // Reopening to exactly flight restores the ordinary progress timer.
+            inject(&mut a, when + 1, seq, una, ACK, 8, b"");
+            assert_eq!(a.shrink_unanswered_since, None);
+            assert_eq!(a.user_deadline(), Some(when + 1 + 5_000_000));
+            a.timeout(a.user_deadline().unwrap()).unwrap();
+            assert_eq!(a.close_reason(), Some(CloseReason::TimedOut));
+        }
+    }
+
+    #[test]
+    fn shrink_silence_times_out_from_first_committed_unanswered_retransmission() {
+        for iss in [100, u32::MAX - 4] {
+            let mut cfg = config(64, 8);
+            cfg.user_timeout_us = 5_000_000;
+            let (mut a, _) = pair(cfg, iss);
+            a.write(b"abcdefgh").unwrap();
+            packet(&mut a, 40);
+            let seq = a.receive.next().wrapping_add(1);
+            let una = a.snd_una;
+            inject(&mut a, 50, seq, una, ACK, 3, b"");
+            assert_eq!(a.transmit(60, &mut [0; 64]), Ok(None));
+            assert_eq!(a.shrink_unanswered_since, None);
+            let when = a.next_deadline().unwrap();
+            a.timeout(when).unwrap();
+            assert_eq!(a.user_deadline(), None);
+            let before = (a.now, a.next_deadline(), a.retx_pending);
+            assert_eq!(
+                a.transmit(when + 1, &mut [0; 22]),
+                Err(Error::OutputTooSmall)
+            );
+            assert_eq!((a.now, a.next_deadline(), a.retx_pending), before);
+            assert_eq!(a.shrink_unanswered_since, None);
+            // Adapter backpressure is not peer silence either.
+            let sent = when + 6_000_000;
+            a.timeout(sent).unwrap();
+            assert_eq!(a.state(), State::Established);
+            packet(&mut a, sent);
+            let deadline = sent + 5_000_000;
+            assert_eq!(a.shrink_unanswered_since, Some(sent));
+            assert_eq!(a.user_deadline(), Some(deadline));
+            let when = a.next_deadline().unwrap();
+            assert!(when < deadline);
+            a.timeout(when).unwrap();
+            packet(&mut a, when);
+            assert_eq!(a.shrink_unanswered_since, Some(sent));
+            assert_eq!(a.user_deadline(), Some(deadline));
+            // Both an old ACK and a stale window SEQ must leave the first
+            // unanswered timestamp intact, even if they advertise reopening.
+            for (seq, ack) in [(seq, una.wrapping_add(u32::MAX)), (a.receive.next(), una)] {
+                inject(&mut a, when + 1, seq, ack, ACK, 64, b"");
+                assert_eq!(a.shrink_unanswered_since, Some(sent));
+                assert_eq!(a.user_deadline(), Some(deadline));
+                assert_eq!(a.snd_wnd, 3);
+            }
+            assert_eq!(a.next_deadline(), Some(deadline));
+            a.timeout(deadline - 1).unwrap();
+            assert_eq!(a.state(), State::Established);
+            a.timeout(deadline).unwrap();
+            assert_eq!(a.close_reason(), Some(CloseReason::TimedOut));
+            assert_eq!(a.shrink_unanswered_since, None);
+        }
     }
 }

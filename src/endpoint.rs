@@ -1045,6 +1045,8 @@ impl Endpoint {
     //# There MUST be a mechanism for reporting soft TCP error conditions to
     //# the application (MUST-47).
 
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8
+    //# However, the conditions that are reported asynchronously to the application MUST include:
     pub fn next_event(&mut self) -> Option<Event> {
         if let Some(event) = self.passive_errors.pop_front() {
             return Some(event);
