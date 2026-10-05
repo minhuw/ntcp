@@ -2,7 +2,7 @@
 name = "ntcp"
 version = "0.0.1"
 edition = "2024"
-description = "A standards-first, event-driven TCP stack in Rust (early development; not yet implemented)"
+description = "A standards-first, event-driven TCP stack in Rust"
 license = "MIT"
 repository = "https://github.com/minhuw/ntcp"
 readme = "README.md"
