@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from run import HERE, PIN, adapt_source, invoke, main, outcome, preflight, variants
+from run import HERE, PIN, adapt_source, invoke, main, outcome, preflight, select_cases, variants
 
 
 class RunnerChecks(unittest.TestCase):
@@ -61,6 +61,134 @@ class RunnerChecks(unittest.TestCase):
             code, expired, _ = invoke([str(Path(cwd) / 'missing')], cwd, 1)
             self.assertIsNone(code)
             self.assertFalse(expired)
+
+
+class SelectionChecks(unittest.TestCase):
+    def test_selection_combinations_and_exclusion_reasons(self):
+        directory = Path('/tests')
+        scripts = [directory / name for name in ('basic.pkt', 'only-v4.pkt', 'only-v6.pkt')]
+        for suite in ('upstream', 'adapted'):
+            for variant_filter, script_filter, expected in (
+                (None, None, 6),
+                (['ipv4'], None, 2),
+                (['ipv4', 'ipv6'], None, 4),
+                (None, ['basic.pkt'], 3),
+                (['ipv4'], ['basic.pkt', 'only-v4.pkt'], 2),
+                (['ipv4', 'ipv4'], ['basic.pkt', 'basic.pkt'], 1),
+            ):
+                with self.subTest(suite=suite, variants=variant_filter, scripts=script_filter):
+                    selected, excluded = select_cases(scripts, directory, suite,
+                                                      variant_filter, script_filter)
+                    self.assertEqual(len(selected), expected)
+                    self.assertEqual(len(selected) + len(excluded), 6)
+                    for row in excluded:
+                        reasons = []
+                        if script_filter is not None and row['script'] not in script_filter:
+                            reasons.append('excluded by --script selection')
+                        if variant_filter is not None and row['variant'] not in variant_filter:
+                            reasons.append('excluded by --variant selection')
+                        self.assertEqual(row['reasons'], reasons)
+                        self.assertTrue(reasons)
+        selected, excluded = select_cases(scripts, directory, 'smoke',
+                                          ['native-ipv4'], ['basic.pkt'])
+        self.assertEqual(selected, [(scripts[0], 'native-ipv4', [])])
+        self.assertEqual(len(excluded), 2)
+
+    def test_invalid_and_empty_selections(self):
+        directory = Path('/tests')
+        scripts = [directory / 'only-v6.pkt']
+        for suite, variant_filter, script_filter in (
+            ('smoke', ['ipv4'], None),
+            ('upstream', ['native-ipv4'], None),
+            ('adapted', ['unknown'], None),
+            ('upstream', [''], None),
+            ('upstream', [], None),
+            ('upstream', ['ipv4'], ['only-v6.pkt']),
+            ('upstream', None, []),
+            *[('upstream', None, [name]) for name in
+              ('', 'missing.pkt', '*.pkt', '/tests/only-v6.pkt',
+               './only-v6.pkt', '../tests/only-v6.pkt', 'only-v6.pkt/')],
+        ):
+            with self.subTest(suite=suite, variants=variant_filter, scripts=script_filter):
+                with self.assertRaises(ValueError):
+                    select_cases(scripts, directory, suite, variant_filter, script_filter)
+        with self.assertRaises(ValueError):
+            select_cases([], directory, 'smoke')
+
+    def test_main_smoke_and_upstream_reporting_status_and_argument_errors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            runner = checkout / PIN['runner']
+            runner.parent.mkdir(parents=True)
+            runner.write_text('runner')
+            runner.chmod(0o700)
+            plugin = checkout / 'plugin.so'
+            plugin.write_text('plugin')
+            report = checkout / 'report.json'
+            for suite in ('smoke', 'upstream'):
+                directory = checkout / ('tests' if suite == 'smoke' else PIN['tcp_tests'])
+                directory.mkdir(parents=True, exist_ok=True)
+                for name in ('basic.pkt', 'other.pkt'):
+                    (directory / name).write_text('0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3')
+                tracked = '\0'.join(str(Path(PIN['tcp_tests']) / name)
+                                    for name in ('basic.pkt', 'other.pkt'))
+                argv = ['run.py', '--checkout', str(checkout), '--plugin', str(plugin),
+                        '--suite', suite, '--report', str(report)]
+                variant = 'native-ipv4' if suite == 'smoke' else 'ipv4'
+                filters = ['--variant', variant, '--script', 'basic.pkt']
+                with patch('run.HERE', checkout), \
+                        patch('run.check_checkout', return_value=PIN['revision']), \
+                        patch('run.subprocess.check_output', return_value=tracked):
+                    for code, expired, log, status in (
+                        (0, False, '', 'passed'),
+                        (1, False, 'packet mismatch', 'failed'),
+                        (0, False, 'NTCP_PACKETDRILL_UNSUPPORTED: test', 'unsupported'),
+                        (1, False, 'unshare: unshare failed', 'environment_error'),
+                        (-9, True, '', 'timeout'),
+                    ):
+                        with patch.object(sys, 'argv', argv + filters), patch('run.invoke',
+                                side_effect=[(0, False, ''), (code, expired, log)]) as execute:
+                            self.assertEqual(main(), 0 if status == 'passed' else 1)
+                        data = json.loads(report.read_text())
+                        self.assertEqual(data['all_passed'], status == 'passed')
+                        self.assertEqual(data['counts'], {status: 1})
+                        self.assertEqual(data['eligible_script_files'], 2)
+                        self.assertEqual(data['script_files'], 1)
+                        self.assertEqual(data['eligible_total'], 2 if suite == 'smoke' else 6)
+                        self.assertEqual(data['selected_total'], 1)
+                        self.assertEqual(data['excluded_total'], data['eligible_total'] - 1)
+                        self.assertEqual(len(data['excluded_cases']), data['excluded_total'])
+                        self.assertEqual(data['selection'], {'variants': [variant],
+                                                            'scripts': ['basic.pkt']})
+                        self.assertTrue(data['results'][0]['behavior_executed'])
+                        self.assertEqual(execute.call_args_list[1].args[0][:4],
+                                         ['unshare', '--user', '--map-root-user', '--net'])
+                    with patch.object(sys, 'argv', argv), \
+                            patch('run.invoke', return_value=(0, False, '')):
+                        self.assertEqual(main(), 0 if suite == 'smoke' else 1)
+                    data = json.loads(report.read_text())
+                    self.assertEqual(data['selected_total'], data['eligible_total'])
+                    self.assertEqual(data['excluded_cases'], [])
+                    self.assertEqual(data['selection'], {'variants': None, 'scripts': None})
+                    if suite == 'upstream':
+                        self.assertEqual(data['counts'], {'passed': 2, 'unsupported': 4})
+                        self.assertEqual(data['behavior_executed'], 2)
+                    with patch.object(sys, 'argv', argv + filters), \
+                            patch('run.invoke', return_value=(1, False, 'bad syntax')) as execute:
+                        self.assertEqual(main(), 1)
+                    self.assertEqual(execute.call_count, 1)
+                    data = json.loads(report.read_text())
+                    self.assertFalse(data['all_passed'])
+                    self.assertEqual(data['behavior_executed'], 0)
+                    for invalid in (['--variant', 'unknown'], ['--variant', ''],
+                                    ['--variant', 'ipv4' if suite == 'smoke' else 'native-ipv4'],
+                                    ['--script', ''], ['--script', 'missing.pkt']):
+                        with patch.object(sys, 'argv', argv + invalid), \
+                                patch('run.invoke') as execute:
+                            with self.assertRaises(SystemExit) as error:
+                                main()
+                            self.assertEqual(error.exception.code, 2)
+                            execute.assert_not_called()
 
 
 class AdaptationChecks(unittest.TestCase):
@@ -180,9 +308,41 @@ class AdaptationChecks(unittest.TestCase):
             self.assertIn('generated_sha256', row['adaptation'])
             self.assertEqual(row['behavior_executed'], row['variant'] == 'ipv4')
             self.assertEqual(row['adapted'], row['variant'] == 'ipv4')
-        for argv in calls[1::2]:
-            self.assertEqual(argv[:4], ['unshare', '--user', '--map-root-user', '--net'])
-            self.assertIn(f'--so_filename={plugin}', argv)
+        for invocation in calls[1::2]:
+            self.assertEqual(invocation[:4], ['unshare', '--user', '--map-root-user', '--net'])
+            self.assertIn(f'--so_filename={plugin}', invocation)
+        for filters, expected_counts, expected_calls in (
+            (['--variant', 'ipv4', '--script', self.name], {'passed': 1}, 2),
+            (['--variant', 'ipv4'], {'passed': 1, 'failed': 2}, 6),
+            (['--variant', 'ipv6', '--script', self.name], {'unsupported': 1}, 0),
+            (['--variant', 'ipv4', '--variant', 'ipv6', '--script', self.name],
+             {'passed': 1, 'unsupported': 1}, 2),
+            (['--variant', 'ipv4', '--script', self.name,
+              '--script', 'blocking/blocking-read.pkt'], {'passed': 1, 'failed': 1}, 4),
+        ):
+            calls.clear()
+            with patch('run.HERE', manifest_dir), \
+                    patch('run.check_checkout', return_value=PIN['revision']), \
+                    patch('run.subprocess.check_output', return_value=tracked), \
+                    patch('run.invoke', side_effect=execute), \
+                    patch.object(sys, 'argv', argv + filters):
+                self.assertEqual(main(), 0 if expected_counts == {'passed': 1} else 1)
+            data = json.loads(report.read_text())
+            self.assertEqual(data['counts'], expected_counts)
+            self.assertEqual(data['all_passed'], expected_counts == {'passed': 1})
+            self.assertEqual(data['eligible_total'], 9)
+            self.assertEqual(data['eligible_script_files'], 3)
+            self.assertEqual(data['selected_total'], sum(expected_counts.values()))
+            self.assertEqual(data['excluded_total'], 9 - data['selected_total'])
+            self.assertEqual(len(calls), expected_calls)
+            self.assertEqual(data['adaptation_manifest_sha256'],
+                             hashlib.sha256((manifest_dir / 'adaptations.json').read_bytes()).hexdigest())
+            self.assertEqual(data['runner_sha256'], hashlib.sha256(runner.read_bytes()).hexdigest())
+            self.assertEqual(data['plugin_sha256'], hashlib.sha256(plugin.read_bytes()).hexdigest())
+            for row in data['results']:
+                self.assertEqual(row['adaptation']['source_sha256'],
+                                 self.manifest['scripts'][row['script']]['source_sha256'])
+                self.assertEqual(row['effective_flags']['packetdrill'], PIN['variants'][row['variant']])
         # An override cannot execute with settings different from the audit claim.
         with patch('run.HERE', manifest_dir), patch('run.check_checkout', return_value=PIN['revision']), \
                 patch('run.subprocess.check_output', return_value=tracked), \

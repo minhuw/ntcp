@@ -133,12 +133,45 @@ def variants(script, upstream):
             and not (script.name.endswith('v4.pkt') and name == 'ipv6')]
 
 
+def select_cases(scripts, directory, suite, selected_variants=None, selected_scripts=None):
+    known_variants = {'native-ipv4'} if suite == 'smoke' else set(PIN['variants'])
+    for variant in selected_variants or []:
+        if variant not in known_variants:
+            raise ValueError(f'--variant {variant!r} is invalid for suite {suite}')
+    names = {str(script.relative_to(directory)) for script in scripts}
+    for script in selected_scripts or []:
+        if script not in names:
+            raise ValueError(f'--script {script!r} is not an exact eligible relative path')
+    selected, excluded = [], []
+    for script in scripts:
+        relative = str(script.relative_to(directory))
+        for variant, flags in variants(script, suite != 'smoke'):
+            reasons = []
+            if selected_scripts is not None and relative not in selected_scripts:
+                reasons.append('excluded by --script selection')
+            if selected_variants is not None and variant not in selected_variants:
+                reasons.append('excluded by --variant selection')
+            if reasons:
+                excluded.append({'script': relative, 'variant': variant,
+                                 'suite': suite, 'reasons': reasons})
+            else:
+                selected.append((script, variant, flags))
+    if not selected:
+        raise ValueError('selection matches no eligible packetdrill cases')
+    return selected, excluded
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkout', required=True, type=Path)
     parser.add_argument('--plugin', type=Path,
                         default=ROOT / 'target/debug/libntcp_packetdrill.so')
     parser.add_argument('--suite', choices=['smoke', 'upstream', 'adapted'], default='smoke')
+    parser.add_argument('--variant', action='append',
+                        choices=['native-ipv4', *PIN['variants']],
+                        help='select a suite variant (repeatable; default: all eligible variants)')
+    parser.add_argument('--script', action='append',
+                        help='select an exact suite-relative script path (repeatable)')
     parser.add_argument('--report', type=Path,
                         default=ROOT / 'workbench/packetdrill/report.json')
     parser.add_argument('--timeout', type=float, default=15)
@@ -179,8 +212,12 @@ def main():
     if not scripts:
         parser.error(f'no .pkt tests found in {directory}')
     results = []
-    cases = [(script, variant, flags) for script in scripts
-             for variant, flags in variants(script, args.suite != 'smoke')]
+    try:
+        cases, excluded = select_cases(scripts, directory, args.suite,
+                                       args.variant, args.script)
+    except ValueError as error:
+        parser.error(str(error))
+    selected_script_files = len({script for script, _, _ in cases})
     with tempfile.TemporaryDirectory(prefix='ntcp-packetdrill-') as temporary:
         for script, variant, flags in cases:
             source = script.read_bytes()
@@ -235,15 +272,22 @@ def main():
             print(f'{row["status"]}: {row["script"]} ({variant}, {args.suite})', flush=True)
     counts = dict(collections.Counter(row['status'] for row in results))
     report = {'upstream_revision': revision, 'suite': args.suite,
-              'adapter_flags': args.so_flags, 'script_files': len(scripts),
+              'adapter_flags': args.so_flags, 'script_files': selected_script_files,
+              'eligible_script_files': len(scripts),
+              'eligible_total': len(cases) + len(excluded),
+              'selected_total': len(cases), 'excluded_total': len(excluded),
+              'selection': {'variants': args.variant, 'scripts': args.script},
+              'excluded_cases': excluded,
               'syntax_valid': sum(row['syntax_returncode'] == 0 for row in results),
               'behavior_executed': sum(row['behavior_executed'] for row in results),
               'runner_sha256': hashlib.sha256(runner.read_bytes()).hexdigest(),
               'plugin_sha256': hashlib.sha256(plugin.read_bytes()).hexdigest(),
               'counts': counts, 'total': len(results), 'results': results,
-              'all_passed': all(row['status'] == 'passed' for row in results)}
+              'all_passed': bool(results) and len(results) == len(cases) and all(
+                  row['status'] == 'passed' and row['behavior_executed']
+                  for row in results)}
     if args.suite != 'smoke':
-        report['coverage'] = {'selected_script_files': len(scripts),
+        report['coverage'] = {'selected_script_files': selected_script_files,
                               'upstream_script_files': len(upstream_scripts),
                               'selection': 'adaptation_allowlist' if manifest is not None
                               else 'all_tracked_upstream_scripts'}
