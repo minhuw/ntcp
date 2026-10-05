@@ -1,0 +1,446 @@
+# Machine-readable unresolved evidence; TODOs are not conformance exceptions.
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1"
+tags = ["MAY-1"]
+reason = "MAY-1 [optional_omitted]: Uses full-duplex half-close: shutdown stops sending but preserves reading. Optional half-duplex close is not selected."
+quote = '''
+A host MAY implement a "half-duplex" TCP close sequence, so that an
+application that has called CLOSE cannot continue to read data from
+the connection (MAY-1).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1"
+tags = ["MAY-2"]
+reason = "MAY-2 [optional_omitted]: No direct reopening from TIME-WAIT; tuple remains reserved until expiry."
+quote = '''
+However, it MAY accept a new SYN from the remote TCP endpoint to
+reopen the connection directly from TIME-WAIT state (MAY-2), if it:
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.1"
+tags = ["MAY-4"]
+reason = "MAY-4 [conditional_outside_profile]: IPv4 Identification allocation/reuse belongs to the packet adapter. No additional TCP-core API is required for this optional behavior."
+quote = '''
+RFC 1122 allows that if a retransmitted packet is identical to the
+original packet (which implies not only that the data boundaries have
+not changed, but also that none of the headers have changed), then
+the same IPv4 Identification field MAY be used (see Section 3.2.1.5
+of RFC 1122) (MAY-4).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4"
+tags = ["MAY-6"]
+reason = "MAY-6 [optional_omitted]: One-octet compatibility probes are optional."
+quote = '''
+An implementation SHOULD send a keep-alive segment with no data
+(SHLD-12); however, it MAY be configurable to send a keep-alive
+segment containing one garbage octet (MAY-6), for compatibility with
+erroneous TCP implementations.
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6"
+tags = ["MAY-7", "SHLD-17"]
+reason = "MAY-7 [optional_omitted]: Beyond-window retransmission is omitted except separately required zero-window probes. SHLD-17 [partial]: No direct test establishes timeout behavior for outstanding data beyond a shrunken nonzero right edge; no dedicated nonzero-shrink exemption is apparent."
+quote = '''
+The sender MAY also
+retransmit old data beyond SND.UNA+SND.WND (MAY-7), but SHOULD NOT
+time out the connection if data beyond the right window edge is not
+acknowledged (SHLD-17).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.9"
+tags = ["MAY-9"]
+reason = "MAY-9 [optional_omitted]: Received Diffserv values are not exposed."
+quote = '''
+TCP implementations MAY pass the most recently received
+Differentiated Services field up to the application (MAY-9).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2"
+tags = ["MAY-10", "MAY-11"]
+reason = "MAY-10 [optional_omitted]: Optional IP Timestamp support is absent; unrelated to TCP timestamps. MAY-11 [optional_omitted]: Optional Record Route support is absent."
+quote = '''
+A TCP implementation MAY support the Timestamp (MAY-10) and Record
+Route (MAY-11) Options.
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.7"
+tags = ["MAY-14"]
+reason = "MAY-14 [optional_omitted]: Optional unsent-data flush is absent."
+quote = '''
+The FLUSH call MAY be implemented
+(MAY-14).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2"
+tags = ["MAY-15"]
+reason = "MAY-15 [optional_omitted]: Optional application-controlled PUSH is absent; MUST-60/61 consequently apply."
+quote = '''
+A TCP endpoint MAY implement PUSH flags on SEND calls (MAY-15).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2"
+tags = ["MAY-16"]
+reason = "MAY-16 [optional_omitted]: Optional PUSH-controlled aggregation is absent; ordinary stream buffering and Nagle are separate mechanisms."
+quote = '''
+When an application
+issues a series of SEND calls without setting the PUSH flag, the TCP
+implementation MAY aggregate the data internally without sending it
+(MAY-16).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.3"
+tags = ["MAY-17"]
+reason = "MAY-17 [optional_omitted]: Optional received-PSH reporting is absent."
+quote = '''
+A TCP receiver MAY pass a received PSH bit to the application layer
+via the PUSH flag in the interface (MAY-17), but it is not required
+(this was clarified in RFC 1122, Section 4.2.2.2).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.2"
+tags = ["MAY-18"]
+reason = "MAY-18 [optional_omitted]: Additional congestion-control families are optional; their omission is not a violation."
+quote = '''
+An endpoint MAY implement such alternative
+algorithms provided that the algorithms are conformant with the TCP
+specifications from the IETF Standards Track as described in RFC
+2914, RFC 5033 [7], and RFC 8961 [15] (MAY-18).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1"
+tags = ["MUST-9"]
+reason = "MUST-9 [partial]: Secret and tuple sensitivity now have direct regression tests. HMAC uses a caller-supplied secret and TUN reads /dev/urandom; embeddings must still supply an unpredictable secret. Unit tests establish key dependence, not secrecy of caller key material."
+quote = '''
+F() MUST NOT be computable from the outside (MUST-9), or
+an attacker could still guess at sequence numbers from the ISN used
+for some other connection.
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1"
+tags = ["MUST-16"]
+reason = "MUST-16 [partial]: IPv4/IPv6 asymmetric peer/configured-MSS packetization tests now pass. Generic adapters still need an explicit IP transmission ceiling and extension/options-overhead contract; configured MSS alone does not supply that metadata."
+quote = '''
+The maximum size of a segment that a TCP endpoint really sends, the
+"effective send MSS", MUST be the smaller (MUST-16) of the send MSS
+(that reflects the available reassembly buffer size at the remote
+host, the EMTU_R [19]) and the largest transmission size permitted by
+the IP layer (EMTU_S [19]):
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6"
+tags = ["MUST-34"]
+reason = "MUST-34 [partial]: No direct inspected test shrinks a nonzero window below existing flight and exercises subsequent recovery."
+quote = '''
+However, a sending TCP peer MUST
+be robust against window shrinking, which may cause the "usable
+window" (see Section 3.8.6.2.1) to become negative (MUST-34).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1"
+tags = ["MUST-46"]
+reason = "MUST-46 [partial]: OPEN now rejects broadcasts in configured ipv4_subnets, with /0-/32 and address-family tests. TUN supplies its actual interface prefix. Embeddings must configure every relevant subnet; unknown remote subnet broadcasts cannot be inferred from an IP address alone."
+quote = '''
+A TCP implementation MUST reject as an error a local OPEN call for an
+invalid remote IP address (e.g., a broadcast or multicast address)
+(MUST-46).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.1"
+tags = ["MUST-51", "MUST-52"]
+reason = "MUST-51 [conditional_outside_profile]: Disabled-source-routing profile only. If IPv4 source routing is supported, the mandatory active-OPEN source-route API is missing; rejection does not implement it. MUST-52 [conditional_outside_profile]: Application-route precedence must be implemented if source routing enters the profile."
+quote = '''
+An application MUST be able to specify a source route when it
+actively opens a TCP connection (MUST-51), and this MUST take
+precedence over a source route received in a datagram (MUST-52).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.1"
+tags = ["MUST-53"]
+reason = "MUST-53 [conditional_outside_profile]: Saving and using passive return routes is absent; required if such connections are supported."
+quote = '''
+When a TCP connection is OPENed passively and a packet arrives with a
+completed IP Source Route Option (containing a return route), TCP
+implementations MUST save the return route and use it for all
+segments sent on this connection (MUST-53).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3"
+tags = ["MUST-57"]
+reason = "MUST-57 [partial]: Endpoint drops configured-subnet broadcast destinations before tuple lookup, with direct tests. TUN supplies its interface prefix; other adapters must provide their subnet knowledge. An empty prefix list cannot classify unknown subnet broadcasts."
+quote = '''
+|
+|  A TCP implementation MUST silently discard an incoming SYN segment
+|  that is addressed to a broadcast or multicast address [(MUST-57)].
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3"
+tags = ["MUST-63"]
+reason = "MUST-63 [partial]: Endpoint drops configured-subnet broadcast sources before tuple lookup, with direct tests. Classification of unknown remote subnet broadcasts still requires lower-layer subnet knowledge."
+quote = '''
+|  An incoming SYN with an invalid source address MUST be ignored
+|  either by TCP or by the IP layer [(MUST-63)] (see
+|  Section 3.2.1.3).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1"
+tags = ["MUST-67"]
+reason = "MUST-67 [partial]: Advertised MSS is caller-configured with protocol-length validation. TUN's 1460 offer fits its 1500-byte profile. No explicit MMS_R input or test binding the advertised offer to the adapter receive limit found; stream-buffer capacity is not MMS_R."
+quote = '''
+where MMS_R is the maximum size for a transport-layer message that
+can be received (and reassembled at the IP layer) (MUST-67).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1"
+tags = ["SHLD-3"]
+reason = "SHLD-3 [conditional_outside_profile]: Conditional on half-duplex close. This implementation retains the receive direction after shutdown."
+quote = '''
+If such a host issues a CLOSE call while
+received data is still pending in the TCP connection, or if new data
+is received after CLOSE is called, its TCP implementation SHOULD send
+a RST to show that data was lost (SHLD-3).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1"
+tags = ["SHLD-4"]
+reason = "SHLD-4 [conditional_outside_profile]: Timestamp negotiation is not implemented. Timestamp-assisted TIME-WAIT reduction is consequently unavailable, not a baseline MUST failure."
+quote = '''
+This algorithm for reducing TIME-WAIT is a Best
+Current Practice that SHOULD be implemented since Timestamp Options
+are commonly used, and using them to reduce TIME-WAIT provides
+benefits for busy Internet servers (SHLD-4).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.3"
+tags = ["SHLD-6"]
+reason = "SHLD-6 [conditional_outside_profile]: TUN profile uses fixed MTU 1500, not packet-to-packet variable compression. A variable-MTU adapter must supply its smallest effective receive MTU when selecting the offer."
+quote = '''
+As a result, when the effective MTU of an interface varies packet-to-
+packet, TCP implementations SHOULD use the smallest effective MTU of
+the interface to calculate the value to advertise in the MSS Option
+(SHLD-6).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.2"
+tags = ["SHLD-8"]
+reason = "SHLD-8 [gap]: ECN is not implemented. This requires TCP state/congestion handling and an IP ECN metadata interface; adapter responsibility alone is insufficient."
+quote = '''
+A TCP endpoint SHOULD implement ECN as described in RFC 3168 (SHLD-
+8).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5"
+tags = ["SHLD-13"]
+reason = "SHLD-13 [conditional_outside_profile]: This recommendation governs new application designs, not whether the TCP core must expose urgent support."
+quote = '''
+As a result of implementation differences and middlebox interactions,
+new applications SHOULD NOT employ the TCP urgent mechanism (SHLD-
+13).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6"
+tags = ["SHLD-15", "SHLD-16"]
+reason = "SHLD-15 [partial]: No direct negative-usable-window transmission test found. SHLD-16 [partial]: The inspected test does not exercise a shrunk window."
+quote = '''
+If this happens, the sender SHOULD NOT send new data (SHLD-15), but
+SHOULD retransmit normally the old unacknowledged data between
+SND.UNA and SND.UNA+SND.WND (SHLD-16).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.1"
+tags = ["SHLD-24"]
+reason = "SHLD-24 [conditional_outside_profile]: Later-route replacement is not implemented; SHOULD, not an unconditional MUST."
+quote = '''
+If a different source
+route arrives in a later segment, the later definition SHOULD
+override the earlier one (SHLD-24).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3"
+tags = ["unnumbered"]
+reason = "SYN-SENT validates ACK before RST; exact RCV.NXT checking for the optional RFC5961 mitigation in this state has not been established. Do not infer it from synchronized-state checks."
+quote = '''
+A TCP
+implementation that supports the mitigation described in RFC
+5961 SHOULD first check that the sequence number exactly
+matches RCV.NXT prior to executing the action in the next
+paragraph.
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3"
+tags = ["unnumbered"]
+reason = "Optional piggybacking on handshake completion is not claimed; inspect queued SEND behavior before adding an implementation citation."
+quote = '''
+Data or controls that were queued for
+transmission MAY be included.
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+tags = ["unnumbered"]
+reason = "No verified implementation citation for this extracted span yet; inspect the state-specific behavior and add matching regression evidence before marking implemented."
+quote = '''
+2)  If the RST bit is set and the sequence number exactly
+matches the next expected sequence number (RCV.NXT), then
+TCP endpoints MUST reset the connection in the manner
+prescribed below according to the connection state.
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+tags = ["unnumbered"]
+reason = "No verified implementation citation for this extracted span yet; inspect the state-specific behavior and add matching regression evidence before marking implemented."
+quote = '''
+RFC 5961 recommends that in
+these synchronized states, if the SYN bit is set,
+irrespective of the sequence number, TCP endpoints MUST send
+a "challenge ACK" to the remote peer:
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+tags = ["unnumbered"]
+reason = "No verified implementation citation for this extracted span yet; inspect the state-specific behavior and add matching regression evidence before marking implemented."
+quote = '''
+o  After sending the acknowledgment, TCP implementations MUST
+drop the unacceptable segment and stop processing further.
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+tags = ["MAY-12"]
+reason = "Implementation is cited, but no direct test annotation is linked to this extracted requirement span. Validate specific assertions before adding a test citation; this is an evidence gap, not a claim that no relevant test exists."
+quote = '''
+o  RFC 5961 [9], Section 5 describes a potential blind data
+injection attack, and mitigation that implementations MAY
+choose to include (MAY-12).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+tags = ["unnumbered"]
+reason = "Implementation is cited, but no direct test annotation is linked to this extracted requirement span. Validate specific assertions before adding a test citation; this is an evidence gap, not a claim that no relevant test exists."
+quote = '''
+TCP stacks that implement RFC
+5961 MUST add an input check that the ACK value is
+acceptable only if it is in the range of ((SND.UNA -
+MAX.SND.WND) =< SEG.ACK =< SND.NXT).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+tags = ["unnumbered"]
+reason = "No verified implementation citation for this extracted span yet; inspect the state-specific behavior and add matching regression evidence before marking implemented."
+quote = '''
+All incoming segments
+whose ACK value doesn't satisfy the above condition MUST be
+discarded and an ACK sent back.
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1"
+tags = ["MAY-8"]
+reason = "Implementation is cited, but no direct test annotation is linked to this extracted requirement span. Validate specific assertions before adding a test citation; this is an evidence gap, not a claim that no relevant test exists."
+quote = '''
+A TCP implementation MAY keep its offered receive window closed
+indefinitely (MAY-8).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6"
+tags = ["SHLD-14"]
+reason = "Implementation is cited, but no direct test annotation is linked to this extracted requirement span. Validate specific assertions before adding a test citation; this is an evidence gap, not a claim that no relevant test exists."
+quote = '''
+A TCP receiver SHOULD NOT shrink the window, i.e., move the right
+window edge to the left (SHLD-14).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6"
+tags = ["MUST-35"]
+reason = "Implementation is cited, but no direct test annotation is linked to this extracted requirement span. Validate specific assertions before adding a test citation; this is an evidence gap, not a claim that no relevant test exists."
+quote = '''
+If the window shrinks to zero, the TCP
+implementation MUST probe it in the standard way (described below)
+(MUST-35).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2"
+tags = ["MUST-60", "MUST-61"]
+reason = "Implementation is cited, but no direct test annotation is linked to this extracted requirement span. Validate specific assertions before adding a test citation; this is an evidence gap, not a claim that no relevant test exists."
+quote = '''
+If
+PUSH flags are not implemented, then the sending TCP peer: (1) MUST
+NOT buffer data indefinitely (MUST-60), and (2) MUST set the PSH bit
+in the last buffered segment (i.e., when there is no more queued data
+to be sent) (MUST-61).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2"
+tags = ["SHLD-13"]
+reason = "Application guidance: the echo adapter uses ordinary writes. Not a transport prohibition on urgent-data support; application-profile evidence is not a core compliance claim."
+quote = '''
+New applications SHOULD NOT set the URGENT flag [39] due to
+implementation differences and middlebox issues (SHLD-13).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8"
+tags = ["unnumbered"]
+reason = "Required report categories need end-to-end validation. Passive half-open soft ICMP reports are currently withheld and can be lost on failed setup (MUST-47 / SHLD-25)."
+quote = '''
+However, the conditions that are reported
+asynchronously to the application MUST include:
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8"
+tags = ["SHLD-20"]
+reason = "Pull-based event polling lets applications ignore reports, but no per-category suppression exists. Validate whether this is effective disablement before marking this recommendation implemented."
+quote = '''
+However, an application program that does not want to receive such
+ERROR_REPORT calls SHOULD be able to effectively disable these calls
+(SHLD-20).
+'''
+
+[[todo]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2"
+tags = ["SHLD-23"]
+reason = "Application guidance: example uses fixed DSCP, while API permits explicit changes. Caller behavior must be assessed separately; no core conformance credit."
+quote = '''
+Generally, an application
+SHOULD NOT change the Diffserv field value during the course of
+a connection (SHLD-23).
+'''

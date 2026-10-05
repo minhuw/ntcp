@@ -8,4 +8,11 @@ repository = "https://github.com/minhuw/ntcp"
 readme = "README.md"
 keywords = ["tcp", "networking", "event-driven"]
 categories = ["network-programming"]
-include = ["src/**", "Cargo.toml", "README.md", "LICENSE"]
+include = ["src/**", "examples/**", "tests/**", "Cargo.toml", "README.md", "LICENSE"]
+
+[dependencies]
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+libc = "0.2"

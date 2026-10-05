@@ -1,0 +1,48 @@
+# Duvet 0.4.3 stops its extracted ISN requirement at the colon, before the
+# formula and SHLD-1 label. Keep the complete recommendation in scope.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1"
+level = "SHOULD"
+quote = '''
+SHOULD
+generate its initial sequence numbers with the expression:
+
+ISN = M + F(localip, localport, remoteip, remoteport, secretkey)
+
+where M is the 4 microsecond timer, and F() is a pseudorandom
+function (PRF) of the connection's identifying parameters ("localip,
+localport, remoteip, remoteport") and a secret key ("secretkey")
+(SHLD-1).
+'''
+
+# Unnumbered event rules implicated by the lifecycle audit. These are
+# separate from the automatically extracted BCP 14 requirements.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4"
+quote = '''
+Delete the TCB and return "error: closing" responses to any queued
+SENDs, or RECEIVEs.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5"
+quote = '''
+All queued SENDs and RECEIVEs should be given "connection reset"
+notification; all segments queued for transmission (except for the
+RST formed above) or retransmission should be flushed.  Delete the
+TCB, enter CLOSED state, and return.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5"
+quote = '''
+All queued SENDs and RECEIVEs should be given "connection reset"
+notification.  Delete the TCB, enter CLOSED state, and return.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5"
+quote = '''
+Respond with "ok" and delete the TCB, enter CLOSED state, and
+return.
+'''

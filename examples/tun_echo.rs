@@ -1,0 +1,680 @@
+// Run as: tun_echo TUN_NAME LOCAL_IPV4 TCP_PORT [PEER_IPV4:PORT].
+// The caller must configure the TUN interface (MTU 1500) and routes beforehand.
+// This adapter exchanges IP packets, not Ethernet frames; it does not configure
+// the host or implement ARP, routing, IP fragmentation, or ICMP.
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use ntcp::{
+        ConnectionConfig, ConnectionId, Endpoint, EndpointConfig, EndpointError, Error, Event,
+        IpMetadata, State,
+    };
+    use std::{
+        fs::{File, OpenOptions},
+        io::{self, Read, Write},
+        net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+        os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+        time::Instant,
+    };
+
+    const MTU: usize = 1500;
+    const IP_HEADER: usize = 20;
+    const MAX_FLOWS: usize = 128;
+    const BUDGET: usize = 32;
+    const TICK_US: u64 = 10_000;
+
+    fn invalid(message: &str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidInput, message)
+    }
+
+    fn engine(error: EndpointError) -> io::Error {
+        io::Error::other(format!("TCP engine: {error:?}"))
+    }
+
+    fn checksum(bytes: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        for pair in bytes.chunks(2) {
+            sum += u32::from(pair[0]) << 8 | u32::from(*pair.get(1).unwrap_or(&0));
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
+    //#   A TCP implementation MUST silently discard an incoming SYN segment
+    //# |  that is addressed to a broadcast or multicast address [(MUST-57)].
+
+    // This parser rejects address classes; Endpoint additionally validates the
+    // configured interface subnet before processing TCP.
+    fn unicast(ip: Ipv4Addr) -> bool {
+        // Reject unspecified, multicast and reserved IPs.
+        ip.octets()[0] != 0 && ip.octets()[0] < 224
+    }
+
+    fn parse_ipv4(packet: &[u8], local: Ipv4Addr) -> Option<(IpMetadata, &[u8])> {
+        if packet.len() < IP_HEADER || packet[0] >> 4 != 4 {
+            return None;
+        }
+        let header_len = usize::from(packet[0] & 15) * 4;
+        let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+        if header_len < IP_HEADER
+            || header_len > total_len
+            || total_len > packet.len()
+            || packet[9] != 6
+            // Reject reserved flag, MF and every nonzero fragment offset; allow DF.
+            || u16::from_be_bytes([packet[6], packet[7]]) & !0x4000 != 0
+            || checksum(&packet[..header_len]) != 0
+        {
+            return None;
+        }
+        let mut options = &packet[IP_HEADER..header_len];
+        while let Some(&kind) = options.first() {
+            match kind {
+                0 => break,
+                1 => options = &options[1..],
+                131 | 137 => return None, // Source routing is disabled in this adapter.
+                //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
+                //# When received options are passed up to TCP from the IP layer, a TCP
+                //# implementation MUST ignore options that it does not understand (MUST-
+                //# 50).
+
+                // Well-formed unknown options are skipped; source routing is disabled.
+                _ => {
+                    let len = usize::from(*options.get(1)?);
+                    if len < 2 || len > options.len() {
+                        return None;
+                    }
+                    options = &options[len..];
+                }
+            }
+        }
+        let source = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+        let destination = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
+        //# |  An incoming SYN with an invalid source address MUST be ignored
+        //# |  either by TCP or by the IP layer [(MUST-63)] (see
+        //# |  Section 3.2.1.3).
+
+        // Subnet-directed broadcasts are checked by Endpoint using interface_prefix.
+        if destination != local || !unicast(source) || !unicast(destination) {
+            return None;
+        }
+        Some((
+            IpMetadata {
+                source: source.into(),
+                destination: destination.into(),
+            },
+            &packet[header_len..total_len],
+        ))
+    }
+
+    fn build_ipv4(
+        packet: &mut [u8],
+        ip: IpMetadata,
+        tcp_len: usize,
+        hop_limit: u8,
+        dscp: u8,
+    ) -> io::Result<usize> {
+        let (IpAddr::V4(source), IpAddr::V4(destination)) = (ip.source, ip.destination) else {
+            return Err(invalid("TUN adapter only supports IPv4"));
+        };
+        let total_len = tcp_len
+            .checked_add(IP_HEADER)
+            .ok_or_else(|| invalid("IP length overflow"))?;
+        if total_len > MTU || total_len > packet.len() || !unicast(source) || !unicast(destination)
+        {
+            return Err(invalid("invalid outgoing IPv4 packet or MTU exceeded"));
+        }
+        let header = &mut packet[..IP_HEADER];
+        header.fill(0);
+        header[0] = 0x45;
+        header[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        header[6] = 0x40; // DF: this example never fragments.
+
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
+        //# Time to Live (TTL):  The TTL value used to send TCP segments MUST be
+        //# configurable (MUST-49).
+        header[8] = hop_limit;
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.9
+        //# TCP implementations
+        //# SHOULD pass the current Differentiated Services field value without
+        //# change to the IP layer, when it sends segments on the connection
+        //# (SHLD-22).
+        header[1] = dscp << 2;
+        header[9] = 6;
+        header[12..16].copy_from_slice(&source.octets());
+        header[16..20].copy_from_slice(&destination.octets());
+        let sum = checksum(header);
+        header[10..12].copy_from_slice(&sum.to_be_bytes());
+        Ok(total_len)
+    }
+
+    fn open_tun(name: &str) -> io::Result<File> {
+        if name.is_empty() || name.len() >= libc::IFNAMSIZ || name.as_bytes().contains(&0) {
+            return Err(invalid(
+                "TUN name must be nonempty, NUL-free and shorter than IFNAMSIZ",
+            ));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open("/dev/net/tun")?;
+        // SAFETY: zero is valid for ifreq's integer, byte and pointer fields;
+        // it also supplies the trailing name terminator.
+        let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+        for (out, byte) in request.ifr_name.iter_mut().zip(name.bytes()) {
+            *out = byte as libc::c_char;
+        }
+        request.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
+        // SAFETY: the fd is live and request is a writable, correctly sized ifreq.
+        if unsafe { libc::ioctl(file.as_raw_fd(), libc::TUNSETIFF, &mut request) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(file)
+    }
+
+    fn prefix_length(mask: u32) -> io::Result<u8> {
+        let prefix = mask.leading_ones();
+        if mask != u32::MAX.checked_shl(32 - prefix).unwrap_or(0) {
+            return Err(invalid("noncontiguous interface netmask"));
+        }
+        Ok(prefix as u8)
+    }
+
+    fn interface_prefix(tun: &File) -> io::Result<u8> {
+        // SAFETY: zero initializes every ifreq union member and the name buffer.
+        let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+        // SAFETY: live TUN fd and writable, correctly sized ifreq. Querying the
+        // actual name also handles kernel-expanded names such as tun%d.
+        if unsafe { libc::ioctl(tun.as_raw_fd(), libc::TUNGETIFF, &mut request) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        // SAFETY: the socket is live and request contains the kernel's interface name.
+        if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFNETMASK, &mut request) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful SIOCGIFNETMASK initialized this union member.
+        let mask = unsafe { request.ifr_ifru.ifru_netmask };
+        if i32::from(mask.sa_family) != libc::AF_INET {
+            return Err(invalid("expected an IPv4 interface netmask"));
+        }
+        // sockaddr_in's network-order address follows its two-byte port.
+        prefix_length(u32::from_be_bytes([
+            mask.sa_data[2] as u8,
+            mask.sa_data[3] as u8,
+            mask.sa_data[4] as u8,
+            mask.sa_data[5] as u8,
+        ]))
+    }
+
+    struct Flow {
+        id: ConnectionId,
+        pending: [u8; 4096],
+        start: usize,
+        end: usize,
+        shutdown: bool,
+    }
+
+    impl Flow {
+        fn new(id: ConnectionId) -> Self {
+            Self {
+                id,
+                pending: [0; 4096],
+                start: 0,
+                end: 0,
+                shutdown: false,
+            }
+        }
+
+        // One bounded chunk per flow. Never read again until all pending bytes
+        // have been accepted by TCP, even when peer FIN has already arrived.
+        fn drive(&mut self, endpoint: &mut Endpoint) -> io::Result<bool> {
+            if self.shutdown {
+                return Ok(false);
+            }
+            let mut progress = false;
+            if self.start == self.end {
+                match endpoint.read(self.id, &mut self.pending) {
+                    Ok(0) => {
+                        endpoint.shutdown(self.id).map_err(engine)?;
+                        self.shutdown = true;
+                        return Ok(true);
+                    }
+                    Ok(count) => {
+                        self.start = 0;
+                        self.end = count;
+                        progress = true;
+                    }
+                    Err(EndpointError::Connection(Error::WouldBlock)) => return Ok(false),
+                    Err(error) => return Err(engine(error)),
+                }
+            }
+            match endpoint.write(self.id, &self.pending[self.start..self.end]) {
+                Ok(count) => {
+                    self.start += count;
+                    progress |= count != 0;
+                }
+                Err(EndpointError::Connection(Error::WouldBlock)) => {}
+                Err(error) => return Err(engine(error)),
+            }
+            Ok(progress)
+        }
+    }
+
+    fn now(start: Instant) -> u64 {
+        start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+    }
+
+    fn wait(tun: &File, timeout_ms: i32) -> io::Result<()> {
+        let mut fd = libc::pollfd {
+            fd: tun.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: fd points to one initialized pollfd for the duration of poll.
+        if unsafe { libc::poll(&mut fd, 1, timeout_ms) } < 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::Interrupted {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        if fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(io::Error::other("TUN poll reported device failure"));
+        }
+        Ok(())
+    }
+
+    pub fn run() -> io::Result<()> {
+        let args: Vec<_> = std::env::args().collect();
+        if !matches!(args.len(), 4 | 5) {
+            return Err(invalid(
+                "usage: tun_echo TUN_NAME LOCAL_IPV4 TCP_PORT [PEER_IPV4:PORT]",
+            ));
+        }
+        let local: Ipv4Addr = args[2]
+            .parse()
+            .map_err(|_| invalid("invalid local IPv4 address"))?;
+        let port: u16 = args[3].parse().map_err(|_| invalid("invalid TCP port"))?;
+        if !unicast(local) || port == 0 {
+            return Err(invalid("expected a unicast IPv4 address and nonzero port"));
+        }
+        let mut secret = [0u8; 32];
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1
+        //# F() MUST NOT be computable from the outside (MUST-9), or
+        //# an attacker could still guess at sequence numbers from the ISN used
+        //# for some other connection.
+
+        // Traceability limitation: This adapter supplies OS randomness; other
+        // embeddings must supply their own unpredictable secret.
+        File::open("/dev/urandom")?.read_exact(&mut secret)?;
+        let mut tun = open_tun(&args[1])?;
+        let start = Instant::now();
+        let config = EndpointConfig {
+            max_connections: MAX_FLOWS,
+            max_listeners: 1,
+            max_control_packets: BUDGET,
+            max_buffer_bytes: MAX_FLOWS * (3 * 65536 + 1460),
+            hop_limit: 64,
+            dscp: 0,
+            ipv4_subnets: vec![(local, interface_prefix(&tun)?)],
+            connection: ConnectionConfig {
+                send_capacity: 65536,
+                receive_capacity: 65536,
+                mss: 1460,
+                ..ConnectionConfig::default()
+            },
+        };
+        let mut endpoint = Endpoint::new(config, secret, now(start)).map_err(engine)?;
+        let listener = endpoint
+            .listen(SocketAddr::new(local.into(), port), MAX_FLOWS)
+            .map_err(engine)?;
+        let mut flows = Vec::with_capacity(MAX_FLOWS);
+        if let Some(peer) = args.get(4) {
+            let peer: std::net::SocketAddrV4 =
+                peer.parse().map_err(|_| invalid("invalid IPv4 peer"))?;
+            let id = endpoint
+                .connect(now(start), SocketAddr::new(local.into(), port), peer.into())
+                .map_err(engine)?;
+            flows.push(Flow::new(id));
+        }
+        // Enough input space for any IPv4 datagram, so read cannot silently turn
+        // an oversized datagram into a seemingly valid truncated packet.
+        let mut input = [0u8; 65536];
+        // Reserve all output storage BEFORE polling: generation commits a send.
+        let mut output = [0u8; MTU];
+        let mut accepting = false;
+        eprintln!(
+            "echo listening on {local}:{port} via {} (caller-configured TUN)",
+            args[1]
+        );
+        loop {
+            let mut immediate = false;
+            for _ in 0..BUDGET {
+                match tun.read(&mut input) {
+                    Ok(0) => {
+                        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "TUN closed"));
+                    }
+                    Ok(len) => {
+                        if let Some((ip, tcp)) = parse_ipv4(&input[..len], local) {
+                            endpoint.input(now(start), ip, tcp).map_err(engine)?;
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            immediate |= endpoint.on_timeout(now(start), BUDGET).map_err(engine)?;
+            for _ in 0..=MAX_FLOWS {
+                match endpoint.next_event() {
+                    Some(Event::Acceptable(id)) if id == listener => accepting = true,
+                    Some(Event::RouteAdvice(tuple)) => {
+                        // This adapter has one caller-configured, fixed TUN route.
+                        // A routing adapter would invalidate/reselect its path here.
+                        eprintln!("negative route advice for {tuple:?}; no alternate TUN route");
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            if accepting {
+                for _ in 0..BUDGET {
+                    match endpoint.accept(listener) {
+                        Ok(id) => {
+                            if flows.len() == MAX_FLOWS {
+                                return Err(io::Error::other("application flow limit exceeded"));
+                            }
+                            flows.push(Flow::new(id));
+                        }
+                        Err(EndpointError::Connection(Error::WouldBlock)) => {
+                            accepting = false;
+                            break;
+                        }
+                        Err(error) => return Err(engine(error)),
+                    }
+                }
+                immediate |= accepting;
+            }
+            // ponytail: bounded application scan of at most 128 accepted flows;
+            // use an application ready queue if increasing that cap substantially.
+            // Buffered writes are retried independently of edge-like TCP events.
+            let mut index = 0;
+            while index < flows.len() {
+                let id = flows[index].id;
+                if matches!(
+                    endpoint.state(id).map_err(engine)?,
+                    State::Closed | State::TimeWait
+                ) {
+                    endpoint.release(id).map_err(engine)?; // Engine still owns TIME-WAIT.
+                    flows.swap_remove(index);
+                } else {
+                    immediate |= flows[index].drive(&mut endpoint)?;
+                    index += 1;
+                }
+            }
+            // Each call spends one engine work unit, at most 32 units/packets.
+            for _ in 0..BUDGET {
+                let polled = endpoint
+                    .poll_transmit(now(start), &mut output[IP_HEADER..], 1)
+                    .map_err(engine)?;
+                if let Some(packet) = polled.packet {
+                    let len = build_ipv4(
+                        &mut output,
+                        packet.ip,
+                        packet.len,
+                        packet.hop_limit,
+                        packet.dscp,
+                    )?;
+                    match tun.write(&output[..len]) {
+                        Ok(written) if written == len => {}
+                        // Generation already committed: drop locally and let TCP
+                        // recover. Do not stage indefinitely or pretend peer ACK.
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                        Ok(_) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "short TUN packet write",
+                            ));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                if !polled.more_work {
+                    break;
+                }
+            }
+            immediate |= endpoint.has_pending_output();
+            let current = now(start);
+            let delay = endpoint.next_deadline().map_or(TICK_US, |deadline| {
+                deadline.saturating_sub(current).min(TICK_US)
+            });
+            let timeout_ms = if immediate {
+                0
+            } else {
+                delay.div_ceil(1000) as i32
+            };
+            wait(&tun, timeout_ms)?;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packet() -> ([u8; MTU], usize, Ipv4Addr) {
+            let local = Ipv4Addr::new(10, 0, 0, 2);
+            let mut bytes = [0; MTU];
+            bytes[20..40].fill(0x5a);
+            let len = build_ipv4(
+                &mut bytes,
+                IpMetadata {
+                    source: Ipv4Addr::new(10, 0, 0, 1).into(),
+                    destination: local.into(),
+                },
+                20,
+                64,
+                0,
+            )
+            .unwrap();
+            (bytes, len, local)
+        }
+
+        fn reseal(bytes: &mut [u8]) {
+            bytes[10..12].fill(0);
+            let len = usize::from(bytes[0] & 15) * 4;
+            let sum = checksum(&bytes[..len]);
+            bytes[10..12].copy_from_slice(&sum.to_be_bytes());
+        }
+
+        #[test]
+        fn source_routing_and_malformed_ip_options_are_rejected() {
+            for option in [[131, 4, 0, 0], [137, 4, 0, 0], [7, 0, 0, 0], [7, 5, 0, 0]] {
+                let (mut bytes, len, local) = packet();
+                bytes.copy_within(20..len, 24);
+                bytes[0] = 0x46;
+                bytes[2..4].copy_from_slice(&((len + 4) as u16).to_be_bytes());
+                bytes[20..24].copy_from_slice(&option);
+                reseal(&mut bytes);
+                assert!(parse_ipv4(&bytes[..len + 4], local).is_none());
+            }
+        }
+
+        #[test]
+        fn interface_netmask_requires_contiguous_prefix() {
+            for prefix in 0..=32 {
+                let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+                assert_eq!(prefix_length(mask).unwrap(), prefix as u8);
+            }
+            for mask in [0xff00ff00, 0xffffff01, 1, 0x7fffffff] {
+                assert!(prefix_length(mask).is_err());
+            }
+        }
+
+        #[test]
+        fn checksum_known_header() {
+            let header = [
+                0x45, 0, 0, 0x73, 0, 0, 0x40, 0, 0x40, 0x11, 0xb8, 0x61, 0xc0, 0xa8, 0, 1, 0xc0,
+                0xa8, 0, 0xc7,
+            ];
+            assert_eq!(checksum(&header), 0);
+        }
+
+        #[test]
+        fn ipv4_roundtrip_and_options() {
+            let (mut bytes, len, local) = packet();
+            assert_eq!(bytes[0], 0x45);
+            assert_eq!(&bytes[6..10], &[0x40, 0, 64, 6]);
+            assert_eq!(checksum(&bytes[..20]), 0);
+            let (ip, tcp) = parse_ipv4(&bytes, local).unwrap();
+            assert_eq!(ip.destination, IpAddr::V4(local));
+            assert_eq!(tcp, &[0x5a; 20]); // Ignores bytes beyond IP total length.
+            bytes.copy_within(20..len, 24);
+            bytes[20..24].fill(1); // Four IPv4 NOP options.
+            bytes[0] = 0x46;
+            bytes[2..4].copy_from_slice(&((len + 4) as u16).to_be_bytes());
+            reseal(&mut bytes);
+            assert_eq!(parse_ipv4(&bytes[..len + 4], local).unwrap().1, &[0x5a; 20]);
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
+        //= type=test
+        //# When received options are passed up to TCP from the IP layer, a TCP
+        //# implementation MUST ignore options that it does not understand (MUST-
+        //# 50).
+        #[test]
+        fn unknown_ipv4_options_preserve_tcp_payload() {
+            for option in [[158, 4, 0xa5, 0x5a], [30, 2, 1, 0]] {
+                let (mut bytes, len, local) = packet();
+                bytes.copy_within(20..len, 24);
+                bytes[0] = 0x46;
+                bytes[2..4].copy_from_slice(&((len + 4) as u16).to_be_bytes());
+                bytes[20..24].copy_from_slice(&option);
+                reseal(&mut bytes);
+                let (ip, tcp) = parse_ipv4(&bytes[..len + 4], local).unwrap();
+                assert_eq!(ip.destination, IpAddr::V4(local));
+                assert_eq!(tcp, &[0x5a; 20]);
+            }
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.9
+        //= type=test
+        //# TCP implementations
+        //# SHOULD pass the current Differentiated Services field value without
+        //# change to the IP layer, when it sends segments on the connection
+        //# (SHLD-22).
+        #[test]
+        fn outgoing_dscp_and_ttl_are_preserved() {
+            let (mut bytes, _, local) = packet();
+            let ip = IpMetadata {
+                source: local.into(),
+                destination: local.into(),
+            };
+            for dscp in 0..64 {
+                for ttl in [1, 64, 255] {
+                    build_ipv4(&mut bytes, ip, 20, ttl, dscp).unwrap();
+                    assert_eq!(bytes[1], dscp << 2);
+                    assert_eq!(bytes[8], ttl);
+                    assert_eq!(checksum(&bytes[..20]), 0);
+                    assert_eq!(&bytes[20..40], &[0x5a; 20]);
+                }
+            }
+        }
+
+        #[test]
+        fn rejects_bad_lengths_checksum_and_fragments() {
+            let (bytes, len, local) = packet();
+            for truncated in 0..len {
+                assert!(parse_ipv4(&bytes[..truncated], local).is_none());
+            }
+            for (offset, value) in [(0, 0x65), (0, 0x44), (0, 0x4f), (2, 1), (3, 19), (9, 17)] {
+                let mut bad = bytes;
+                bad[offset] = value;
+                assert!(parse_ipv4(&bad[..len], local).is_none());
+            }
+            let mut bad = bytes;
+            bad[8] ^= 1;
+            assert!(parse_ipv4(&bad[..len], local).is_none());
+            for flags in [0x2000u16, 1, 0x8000, 0x4001] {
+                let mut bad = bytes;
+                bad[6..8].copy_from_slice(&flags.to_be_bytes());
+                reseal(&mut bad);
+                assert!(parse_ipv4(&bad[..len], local).is_none());
+            }
+        }
+
+        #[test]
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
+        //= type=test
+        //#   A TCP implementation MUST silently discard an incoming SYN segment
+        //# |  that is addressed to a broadcast or multicast address [(MUST-57)].
+
+        // Traceability limitation: Assertions cover multicast and limited broadcast
+        // destinations only; no subnet-directed broadcast case.
+        fn rejects_wrong_destination_and_nonunicast() {
+            let (bytes, len, local) = packet();
+            assert!(parse_ipv4(&bytes[..len], Ipv4Addr::new(10, 0, 0, 3)).is_none());
+            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
+            //= type=test
+            //# |  An incoming SYN with an invalid source address MUST be ignored
+            //# |  either by TCP or by the IP layer [(MUST-63)] (see
+            //# |  Section 3.2.1.3).
+
+            // Traceability limitation: Assertions cover listed invalid IPv4 sources,
+            // not prefix-directed broadcasts.
+            for address in [
+                [0, 0, 0, 0],
+                [224, 0, 0, 1],
+                [255, 255, 255, 255],
+                [240, 0, 0, 1],
+            ] {
+                for offset in [12, 16] {
+                    let mut bad = bytes;
+                    bad[offset..offset + 4].copy_from_slice(&address);
+                    reseal(&mut bad);
+                    let destination = if offset == 16 {
+                        Ipv4Addr::from(address)
+                    } else {
+                        local
+                    };
+                    assert!(parse_ipv4(&bad[..len], destination).is_none());
+                }
+            }
+        }
+
+        #[test]
+        fn output_mtu_and_capacity() {
+            let (mut bytes, _, local) = packet();
+            let ip = IpMetadata {
+                source: local.into(),
+                destination: local.into(),
+            };
+            assert_eq!(build_ipv4(&mut bytes, ip, 1480, 64, 0).unwrap(), MTU);
+            assert_eq!(checksum(&bytes[..20]), 0);
+            assert!(build_ipv4(&mut bytes, ip, 1481, 64, 0).is_err());
+            assert!(build_ipv4(&mut bytes, ip, usize::MAX, 64, 0).is_err());
+            assert!(build_ipv4(&mut bytes[..19], ip, 0, 64, 0).is_err());
+            assert!(open_tun("").is_err());
+            assert!(open_tun(&"x".repeat(libc::IFNAMSIZ)).is_err());
+            assert!(open_tun("bad\0name").is_err());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn main() -> std::io::Result<()> {
+    linux::run()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "tun_echo requires Linux /dev/net/tun (IFF_TUN | IFF_NO_PI)",
+    ))
+}

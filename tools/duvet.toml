@@ -1,0 +1,31 @@
+'$schema' = "https://awslabs.github.io/duvet/config/v0.4.json"
+
+[[source]]
+pattern = "src/**/*.rs"
+
+[[source]]
+pattern = "examples/**/*.rs"
+
+# Section 2.1 defines keywords; Appendix B repeats the functional requirements.
+[[requirement]]
+pattern = "workbench/duvet/requirements/**/section-3*.toml"
+
+[[requirement]]
+pattern = "tools/rfc9293-additions.toml"
+
+[[requirement]]
+pattern = "tools/rfc9293-todos.toml"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc9293"
+format = "ietf"
+
+[report.html]
+enabled = false
+
+[report.snapshot]
+enabled = false
+
+[report.json]
+enabled = true
+path = "workbench/duvet/report.json"
