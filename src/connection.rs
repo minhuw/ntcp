@@ -30,6 +30,7 @@ pub struct ConnectionConfig {
     pub send_ip_payload_limit: u16,
     pub nagle: bool,
     pub ecn: bool,
+    pub retransmit_beyond_window: bool,
     pub delayed_ack_us: u64,
     pub user_timeout_us: u64,
     pub time_wait_us: u64,
@@ -71,6 +72,7 @@ impl Default for ConnectionConfig {
             send_ip_payload_limit: u16::MAX,
             nagle: true,
             ecn: true,
+            retransmit_beyond_window: false,
             delayed_ack_us: 200_000,
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
             //= reason=Default R2; applications may override the per-connection timeout.
@@ -1675,9 +1677,14 @@ impl Connection {
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
                 //# but SHOULD retransmit normally the old unacknowledged data between
                 //# SND.UNA and SND.UNA+SND.WND (SHLD-16).
-                self.mss
-                    .min(self.snd_wnd as usize)
-                    .min(self.flight() as usize)
+                //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
+                //# The sender MAY also retransmit old data beyond SND.UNA+SND.WND (MAY-7),
+                let window = if self.config.retransmit_beyond_window && self.snd_wnd != 0 {
+                    self.flight()
+                } else {
+                    self.snd_wnd
+                };
+                self.mss.min(window as usize).min(self.flight() as usize)
             };
             count = self.send.copy(offset, &mut self.scratch[..limit]);
             retransmitted = seq != self.snd_nxt;
@@ -4251,6 +4258,45 @@ mod tests {
             assert_eq!(a.user_deadline(), Some(when + 1 + 5_000_000));
             a.timeout(a.user_deadline().unwrap()).unwrap();
             assert_eq!(a.close_reason(), Some(CloseReason::TimedOut));
+        }
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
+    //= type=test
+    //# The sender MAY also retransmit old data beyond SND.UNA+SND.WND (MAY-7),
+    #[test]
+    fn optional_beyond_window_retransmission_never_sends_new_bytes() {
+        for iss in [100, u32::MAX - 3] {
+            for enabled in [false, true] {
+                let mut cfg = config(64, 8);
+                cfg.retransmit_beyond_window = enabled;
+                let (mut a, _) = pair(cfg, iss);
+                a.write(b"abcdefghijklmnop").unwrap();
+                packet(&mut a, 40); // Only the first eight bytes have been sent.
+                let seq = a.receive.next();
+                let una = a.snd_una;
+                let next = a.snd_nxt;
+                inject(&mut a, 50, seq, una, ACK, 3, b"");
+                assert_eq!(a.transmit(60, &mut [0; 64]), Ok(None));
+                let deadline = a.rto_deadline.unwrap();
+                a.timeout(deadline).unwrap();
+                let retry = packet(&mut a, deadline);
+                let segment = wire::parse(ip(tuple()), &retry).unwrap();
+                assert_eq!(segment.header.sequence, una.0);
+                assert_eq!(
+                    segment.payload,
+                    if enabled { &b"abcdefgh"[..] } else { b"abc" }
+                );
+                assert_eq!(a.last_output_ecn(), 0);
+                assert_eq!(a.snd_nxt, next);
+                assert_eq!(a.send.len(), 16);
+                inject(&mut a, deadline + 1, seq, una, ACK, 0, b"");
+                let deadline = a.persist_deadline.unwrap();
+                a.timeout(deadline).unwrap();
+                let probe = packet(&mut a, deadline);
+                assert_eq!(wire::parse(ip(tuple()), &probe).unwrap().payload, b"a");
+                assert_eq!(a.snd_nxt, next);
+            }
         }
     }
 

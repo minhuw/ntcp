@@ -10,17 +10,6 @@ reopen the connection directly from TIME-WAIT state (MAY-2), if it:
 '''
 
 [[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6"
-tags = ["MAY-7"]
-reason = "MAY-7 [optional_omitted]: Beyond-window retransmission remains omitted except zero-window probes. SHLD-17 now has validated-response liveness accounting and deadline-driven regressions."
-quote = '''
-The sender MAY also
-retransmit old data beyond SND.UNA+SND.WND (MAY-7), but SHOULD NOT
-time out the connection if data beyond the right window edge is not
-acknowledged (SHLD-17).
-'''
-
-[[todo]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2"
 tags = ["MAY-10", "MAY-11"]
 reason = "MAY-10 [optional_omitted]: Optional IP Timestamp support is absent; unrelated to TCP timestamps. MAY-11 [optional_omitted]: Optional Record Route support is absent."
