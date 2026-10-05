@@ -427,12 +427,9 @@ fn user_timeout_preconnect_updates_reset_and_deadlines() {
     assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(0));
     assert_eq!(execute_value(&mut owner, 11, fd, 5, -1), Err(EINVAL));
     assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(0));
-    assert_eq!(
-        user_timeout_us(0),
-        Ok(ntcp::ConnectionConfig::default().user_timeout_us)
-    );
+    assert_eq!(user_timeout_us(0), Ok(None));
     execute_value(&mut owner, 11, fd, 5, i32::MAX).unwrap();
-    assert_eq!(user_timeout_us(i32::MAX), Ok(2_147_483_647_000));
+    assert_eq!(user_timeout_us(i32::MAX), Ok(Some(2_147_483_647_000)));
     execute_value(&mut owner, 11, fd, 5, 1234).unwrap();
     let (mut connect, _) = request(
         5,
@@ -482,13 +479,23 @@ fn user_timeout_preconnect_updates_reset_and_deadlines() {
     assert_eq!(execute_value(&mut owner, 11, fd, 99, 1), Err(ENOSYS));
     assert_eq!(execute_value(&mut owner, 17, -1, 0, 0), Err(EBADF));
     assert_eq!(execute_value(&mut owner, 17, fd, 0, 0), Ok(0));
+    execute_value(&mut owner, 11, fd, 5, 1).unwrap();
+    owner
+        .endpoint
+        .on_timeout(established_at + 1000, BUDGET)
+        .unwrap();
+    owner.events();
+    assert_eq!(
+        execute_value(&mut owner, 12, fd, 3, 0),
+        Ok(ETIMEDOUT as i64)
+    );
 }
 
 #[test]
 fn listener_timeout_inheritance_and_queued_payload_gap_urgent_fin() {
     let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
     let listener = owner.alloc(Socket::new(0)).unwrap();
-    execute_value(&mut owner, 11, listener, 5, 1).unwrap();
+    execute_value(&mut owner, 11, listener, 5, 1234).unwrap();
     let (mut bind, _) = request(
         2,
         listener,
@@ -529,18 +536,20 @@ fn listener_timeout_inheritance_and_queued_payload_gap_urgent_fin() {
         owner.endpoint.input(0, ip, &out[..n]).unwrap();
     };
     inject(&mut owner, 101, ntcp::wire::ACK, 0, &[]);
+    execute_value(&mut owner, 11, listener, 5, 3456).unwrap();
     let fd = execute_value(&mut owner, 4, listener, 0, 0).unwrap() as i32;
     let id = owner.connection(fd).unwrap();
-    assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(1));
+    assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(1234));
     execute_value(&mut owner, 11, listener, 5, 3456).unwrap();
-    assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(1));
+    assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(1234));
     owner.endpoint.write(id, b"x").unwrap();
     let mut outgoing = [0; 1500];
     owner
         .endpoint
         .poll_transmit(0, &mut outgoing, BUDGET)
         .unwrap();
-    assert_eq!(owner.endpoint.next_deadline(), Some(1000));
+    assert_eq!(owner.endpoint.application_timeout(id), Ok(Some(1_234_000)));
+    assert!(owner.endpoint.next_deadline().unwrap() <= 1_234_000);
     assert_eq!(owner.endpoint.readable_bytes(id), Ok(0));
     inject(
         &mut owner,

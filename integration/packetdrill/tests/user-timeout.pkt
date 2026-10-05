@@ -12,13 +12,14 @@
 +0 < S 0:0(0) win 65535 <mss 1460,nop,wscale 0>
 +0 > S. 0:0(0) ack 1 win 65535 <mss 1460,nop,wscale 0>
 +0 < . 1:1(0) ack 1 win 65535
++0 setsockopt(3, SOL_TCP, TCP_USER_TIMEOUT, [3456], 4) = 0
 +0 accept(3, ..., ...) = 4
 +0 getsockopt(4, SOL_TCP, TCP_USER_TIMEOUT, [2345], [4]) = 0
 +0 setsockopt(4, SOL_TCP, TCP_USER_TIMEOUT, [4567], 4) = 0
 +0 getsockopt(4, SOL_TCP, TCP_USER_TIMEOUT, [4567], [4]) = 0
 +0 setsockopt(4, SOL_TCP, TCP_USER_TIMEOUT, [0], 4) = 0
 +0 getsockopt(4, SOL_TCP, TCP_USER_TIMEOUT, [0], [4]) = 0
-+0 getsockopt(3, SOL_TCP, TCP_USER_TIMEOUT, [2345], [4]) = 0
++0 getsockopt(3, SOL_TCP, TCP_USER_TIMEOUT, [3456], [4]) = 0
 +0 close(4) = 0
 +0 > F. 1:1(0) ack 1
 +0 < F. 1:1(0) ack 2 win 65535

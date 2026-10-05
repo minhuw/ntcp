@@ -261,6 +261,8 @@ pub(crate) struct Connection {
     sws_override: bool,
     time_wait_deadline: Option<Instant>,
     progress_at: Instant,
+    application_timeout_us: Option<u64>,
+    application_progress_at: Instant,
     last_received: Instant,
     last_sent: Instant,
     keepalive_deadline: Option<Instant>,
@@ -396,6 +398,8 @@ impl Connection {
             sws_override: false,
             time_wait_deadline: None,
             progress_at: now,
+            application_timeout_us: None,
+            application_progress_at: now,
             last_received: now,
             last_sent: now,
             keepalive_deadline: None,
@@ -536,6 +540,18 @@ impl Connection {
         }
         self.config.user_timeout_us = timeout_us;
         Ok(())
+    }
+
+    pub(crate) fn set_application_timeout(&mut self, timeout_us: Option<u64>) -> Result<(), Error> {
+        if timeout_us == Some(0) {
+            return Err(Error::InvalidArgument);
+        }
+        self.application_timeout_us = timeout_us;
+        Ok(())
+    }
+
+    pub(crate) fn application_timeout(&self) -> Option<u64> {
+        self.application_timeout_us
     }
 
     pub(crate) fn network_error(
@@ -847,6 +863,22 @@ impl Connection {
         Some(self.progress_at.saturating_add(self.user_timeout()))
     }
 
+    // Explicit application resource policy is separate from transport R2 liveness
+    // (RFC 6429 section 4). Responsive probes do not constitute output progress.
+    fn application_timer_needed(&self) -> bool {
+        matches!(self.state, State::SynSent | State::SynReceived)
+            || (self.synchronized()
+                && (self.send.len() != 0
+                    || self.flight() != 0
+                    || self.shutdown && self.fin_sequence.is_none()))
+    }
+
+    fn application_deadline(&self) -> Option<Instant> {
+        self.application_timeout_us
+            .filter(|_| self.application_timer_needed())
+            .map(|timeout| self.application_progress_at.saturating_add(timeout))
+    }
+
     fn arm_work(&mut self) {
         if !self.synchronized() {
             return;
@@ -940,6 +972,7 @@ impl Connection {
             }
             return Ok(0);
         }
+        let application_idle = !self.application_timer_needed();
         let idle = !self.user_timer_needed();
         let count = self.send.write(data);
         if count == 0 {
@@ -950,6 +983,9 @@ impl Connection {
         }
         if idle {
             self.progress_at = self.now;
+        }
+        if application_idle {
+            self.application_progress_at = self.now;
         }
         self.arm_work();
         Ok(count)
@@ -1109,6 +1145,9 @@ impl Connection {
         }
         if !self.user_timer_needed() {
             self.progress_at = self.now;
+        }
+        if !self.application_timer_needed() {
+            self.application_progress_at = self.now;
         }
         self.shutdown = true;
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
@@ -1569,6 +1608,7 @@ impl Connection {
             self.advertised_snd_up = None;
         }
         self.progress_at = self.now;
+        self.application_progress_at = self.now;
         self.consecutive_timeouts = 0;
         self.retx_pending = false;
         if let Some((end, sent)) = self.sample
@@ -2238,6 +2278,7 @@ impl Connection {
             self.time_wait_deadline,
             self.keepalive_deadline,
             self.user_deadline(),
+            self.application_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -2257,7 +2298,7 @@ impl Connection {
             self.ack_pending = false;
             return Ok(());
         }
-        if due(self.user_deadline(), now) {
+        if due(self.user_deadline(), now) || due(self.application_deadline(), now) {
             self.terminal(CloseReason::TimedOut);
             return Ok(());
         }
@@ -6460,5 +6501,72 @@ mod tests {
         assert!(a.reuse_syn(40, &syn, true));
         assert!(!a.reuse_syn(40, &syn, false));
         assert!(!a.reuse_syn(240_000_030, &syn, true));
+    }
+    #[test]
+    fn application_stall_bounds_responsive_persist_and_window_shrink() {
+        for window in [0, 3] {
+            for explicit in [false, true] {
+                let (mut a, _) = pair(config(64, 8), 100);
+                if explicit {
+                    a.set_application_timeout(Some(5_000_000)).unwrap();
+                }
+                a.write(b"abcdefgh").unwrap();
+                packet(&mut a, 40);
+                let seq = a.receive.next();
+                let una = a.snd_una;
+                inject(&mut a, 50, seq, una, ACK, window, b"");
+                let deadline = 30 + 5_000_000;
+                for now in [1_000_000, 2_000_000, 4_000_000, deadline - 1] {
+                    a.timeout(now).unwrap();
+                    // Actual retransmission/probe feedback remains responsive.
+                    a.transmit(now, &mut [0; 128]).unwrap();
+                    inject(&mut a, now, seq, una, ACK, window, b"");
+                    assert_eq!(a.user_deadline(), None);
+                    assert_eq!(a.application_deadline(), explicit.then_some(deadline));
+                    assert_eq!(a.state(), State::Established);
+                }
+                a.timeout(deadline).unwrap();
+                if explicit {
+                    assert_eq!(a.close_reason(), Some(CloseReason::TimedOut));
+                    assert_eq!(a.take_events().closed, Some(CloseReason::TimedOut));
+                } else {
+                    assert_eq!(a.state(), State::Established);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn application_progress_requires_cumulative_ack_not_output_or_window_feedback() {
+        let (mut a, _) = pair(config(64, 8), 100);
+        assert_eq!(
+            a.set_application_timeout(Some(0)),
+            Err(Error::InvalidArgument)
+        );
+        a.set_application_timeout(Some(1_000)).unwrap();
+        a.write(b"abcdefgh").unwrap();
+        assert_eq!(a.application_deadline(), Some(1_030));
+        assert_eq!(a.transmit(100, &mut [0; 1]), Err(Error::OutputTooSmall));
+        assert_eq!(a.application_deadline(), Some(1_030));
+        assert_eq!(a.acknowledged, 0);
+        packet(&mut a, 100);
+        assert_eq!(a.application_deadline(), Some(1_030));
+        let seq = a.receive.next();
+        let una = a.snd_una;
+        inject(&mut a, 200, seq, una.wrapping_add(4), ACK, 64, b"");
+        assert_eq!(a.acknowledged, 4);
+        assert_eq!(a.application_deadline(), Some(1_200));
+        inject(&mut a, 300, seq, una.wrapping_add(4), ACK, 0, b"");
+        inject(&mut a, 400, seq, una.wrapping_add(4), ACK, 64, b"");
+        assert_eq!(a.application_deadline(), Some(1_200));
+        inject(&mut a, 500, seq, una.wrapping_add(8), ACK, 64, b"");
+        assert_eq!(a.application_deadline(), None);
+        assert_eq!(a.acknowledged, 8);
+        a.timeout(2_000).unwrap();
+        a.write(b"new").unwrap();
+        assert_eq!(a.application_deadline(), Some(3_000));
+        a.set_application_timeout(None).unwrap();
+        assert_eq!(a.application_deadline(), None);
+        assert_eq!(a.user_deadline(), Some(2_000 + a.config.user_timeout_us));
     }
 }

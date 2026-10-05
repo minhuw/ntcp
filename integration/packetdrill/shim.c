@@ -227,7 +227,9 @@ void ntcp_abi_check(void *u) {
     assert(p.ioctl(u, -1, SIOCINQ, &queued) == -1 && errno == EBADF && queued == -1);
     assert(p.ioctl(u, fd, SIOCINQ, NULL) == -1 && errno == EFAULT);
     assert(p.ioctl(u, fd, SIOCINQ, &queued) == 0 && queued == 0);
-    int value = 1234; socklen_t size = sizeof(value);
+    int value = -1; socklen_t size = sizeof(value);
+    assert(p.getsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, &size) == 0 && value == 0 && size == sizeof(value));
+    value = 1234;
     assert(p.setsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, NULL, size) == -1 && errno == EFAULT);
     assert(p.setsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, 3) == -1 && errno == EINVAL);
     value = -1;

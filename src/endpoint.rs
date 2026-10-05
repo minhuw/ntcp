@@ -224,6 +224,7 @@ struct Slot {
     received_ipv4_options: Option<Ipv4Options>,
 }
 struct Listener {
+    application_timeout_us: Option<u64>,
     address: SocketAddr,
     backlog: usize,
     children: Vec<ConnectionId>,
@@ -523,6 +524,7 @@ impl Endpoint {
             .try_reserve_exact(backlog)
             .map_err(|_| Error::NoMemory)?;
         self.listeners[slot] = Some(Listener {
+            application_timeout_us: None,
             address,
             backlog,
             children,
@@ -1151,7 +1153,8 @@ impl Endpoint {
             if record.children.len() >= record.backlog || self.resource_admission(tuple).is_err() {
                 return Ok(InputDisposition::Dropped);
             }
-            let connection = match Connection::passive(
+            let application_timeout = record.application_timeout_us;
+            let mut connection = match Connection::passive(
                 tuple,
                 self.config.connection.clone(),
                 self.isn(tuple),
@@ -1162,6 +1165,7 @@ impl Endpoint {
                 Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),
                 Err(error) => return Err(error.into()),
             };
+            connection.set_application_timeout(application_timeout)?;
             match self.insert(connection, Some(listener), None) {
                 Ok(id) => {
                     let slot = self.slots[id.slot].as_mut().unwrap();
@@ -1214,6 +1218,7 @@ impl Endpoint {
         {
             return Ok(InputDisposition::Dropped);
         }
+        let application_timeout = record.application_timeout_us;
         let candidate = self.isn(tuple);
         let iss = self.slots[index]
             .as_ref()
@@ -1222,12 +1227,13 @@ impl Endpoint {
             .reuse_iss(candidate);
         // Allocate the entire bounded child before transferring tuple ownership.
         // The old timer/record survives independently until its original expiry.
-        let connection =
+        let mut connection =
             match Connection::passive(tuple, self.config.connection.clone(), iss, self.now, syn) {
                 Ok(connection) => connection,
                 Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),
                 Err(error) => return Err(error.into()),
             };
+        connection.set_application_timeout(application_timeout)?;
         let id = self.insert(connection, Some(listener), Some(self.id(index)))?;
         let slot = self.slots[id.slot].as_mut().unwrap();
         slot.received_dscp = Some(traffic_class >> 2);
@@ -1354,6 +1360,38 @@ impl Endpoint {
         self.refresh(id.slot);
         Ok(())
     }
+    pub fn set_application_timeout(
+        &mut self,
+        id: ConnectionId,
+        timeout_us: Option<u64>,
+    ) -> Result<(), EndpointError> {
+        self.slot_mut(id)?
+            .connection
+            .set_application_timeout(timeout_us)?;
+        self.refresh(id.slot);
+        Ok(())
+    }
+
+    pub fn application_timeout(&self, id: ConnectionId) -> Result<Option<u64>, EndpointError> {
+        Ok(self.slot(id)?.connection.application_timeout())
+    }
+
+    pub fn set_listener_application_timeout(
+        &mut self,
+        id: ListenerId,
+        timeout_us: Option<u64>,
+    ) -> Result<(), EndpointError> {
+        self.listener(id)?;
+        if timeout_us == Some(0) {
+            return Err(Error::InvalidArgument.into());
+        }
+        self.listeners[id.slot]
+            .as_mut()
+            .unwrap()
+            .application_timeout_us = timeout_us;
+        Ok(())
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4
     //# keep-alives are included, the application MUST be able to turn them
     //# on or off for each TCP connection (MUST-24),

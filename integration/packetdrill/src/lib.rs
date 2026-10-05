@@ -140,16 +140,9 @@ impl Socket {
         }
     }
 }
-fn user_timeout_us(milliseconds: i32) -> Result<u64> {
-    // The socket value 0 selects the default policy; it does not mean zero
-    // protocol timeout, and getsockopt must still report the configured 0.
-    if milliseconds == 0 {
-        return Ok(ntcp::ConnectionConfig::default().user_timeout_us);
-    }
-    u64::try_from(milliseconds)
-        .ok()
-        .and_then(|ms| ms.checked_mul(1000))
-        .ok_or(EINVAL)
+fn user_timeout_us(milliseconds: i32) -> Result<Option<u64>> {
+    let ms = u64::try_from(milliseconds).map_err(|_| EINVAL)?;
+    Ok((ms != 0).then_some(ms * 1000))
 }
 struct Owner {
     endpoint: Endpoint,
@@ -517,11 +510,14 @@ impl Owner {
                 let address = socket
                     .local
                     .ok_or_else(|| unsupported("listen without bind"))?;
-                socket.handle = Handle::Listener(
-                    self.endpoint
-                        .listen(address, r.a.clamp(1, LIMIT as i32) as usize)
-                        .map_err(error)?,
-                );
+                let id = self
+                    .endpoint
+                    .listen(address, r.a.clamp(1, LIMIT as i32) as usize)
+                    .map_err(error)?;
+                self.endpoint
+                    .set_listener_application_timeout(id, user_timeout_us(socket.user_timeout_ms)?)
+                    .map_err(error)?;
+                socket.handle = Handle::Listener(id);
             }
             4 => {
                 if self.sockets.len() == LIMIT {
@@ -533,7 +529,6 @@ impl Owner {
                 };
                 let nodelay = socket.nodelay;
                 let reuse = socket.reuse;
-                let user_timeout_ms = socket.user_timeout_ms;
                 // Allocate before consuming an accepted connection: OS allocation
                 // failure must leave the connection in the listener queue.
                 let token = Token::new()?;
@@ -546,10 +541,11 @@ impl Owner {
                         socket.local = Some(tuple.local);
                         socket.nodelay = nodelay;
                         socket.reuse = reuse;
-                        self.endpoint
-                            .set_user_timeout(id, user_timeout_us(user_timeout_ms)?)
-                            .map_err(error)?;
-                        socket.user_timeout_ms = user_timeout_ms;
+                        socket.user_timeout_ms = self
+                            .endpoint
+                            .application_timeout(id)
+                            .map_err(error)?
+                            .map_or(0, |us| (us / 1000) as i32);
                         socket.readable = None;
                         socket.connected = true;
                         response.value = self.alloc_token(socket, token)? as i64;
@@ -605,7 +601,7 @@ impl Owner {
                         .set_nagle(id, !socket.nodelay)
                         .map_err(error)?;
                     self.endpoint
-                        .set_user_timeout(id, user_timeout_us(socket.user_timeout_ms)?)
+                        .set_application_timeout(id, user_timeout_us(socket.user_timeout_ms)?)
                         .map_err(error)?;
                     socket.local = Some(local);
                     socket.handle = Handle::Connection(id);
@@ -766,8 +762,16 @@ impl Owner {
                         5 => {
                             let milliseconds = r.b;
                             let timeout = user_timeout_us(milliseconds)?;
-                            if let Handle::Connection(id) = socket.handle {
-                                self.endpoint.set_user_timeout(id, timeout).map_err(error)?;
+                            match socket.handle {
+                                Handle::Connection(id) => self
+                                    .endpoint
+                                    .set_application_timeout(id, timeout)
+                                    .map_err(error)?,
+                                Handle::Listener(id) => self
+                                    .endpoint
+                                    .set_listener_application_timeout(id, timeout)
+                                    .map_err(error)?,
+                                Handle::Fresh => (),
                             }
                             socket.user_timeout_ms = milliseconds;
                         }

@@ -2670,9 +2670,14 @@ fn timestamps_two_endpoints_reopen_and_transfer_after_time_wait() {
     assert_eq!(b.state(old), Ok(State::TimeWait));
     a.release(first).unwrap();
     b.release(old).unwrap();
+    b.set_listener_application_timeout(listener, Some(1_234_000))
+        .unwrap();
     let second = a.connect(10_000, local, remote).unwrap();
     pump(&mut a, &mut b, 11_000);
+    b.set_listener_application_timeout(listener, Some(3_456_000))
+        .unwrap();
     let new = b.accept(listener).unwrap();
+    assert_eq!(b.application_timeout(new), Ok(Some(1_234_000)));
     assert_ne!(old, new);
     assert_eq!(a.state(second), Ok(State::Established));
     a.write(second, b"new stream").unwrap();
@@ -3072,4 +3077,97 @@ fn readable_bytes_is_a_pure_payload_getter_and_rejects_stale_handles() {
     b.abort(server).unwrap();
     b.release(server).unwrap();
     assert_eq!(b.readable_bytes(server), Err(EndpointError::InvalidHandle));
+}
+
+#[test]
+fn application_timeout_listener_snapshot_and_preaccept_stall() {
+    let (mut a, mut b, listener, _) = endpoints();
+    assert_eq!(
+        b.set_listener_application_timeout(listener, Some(0)),
+        Err(EndpointError::Connection(Error::InvalidArgument))
+    );
+    b.set_listener_application_timeout(listener, Some(1_234_000))
+        .unwrap();
+    pump(&mut a, &mut b, 0);
+    b.set_listener_application_timeout(listener, Some(3_456_000))
+        .unwrap();
+    let child = b.accept(listener).unwrap();
+    assert_eq!(b.application_timeout(child), Ok(Some(1_234_000)));
+    let (local, remote) = addresses();
+    let baseline = b.buffer_bytes();
+    let another = a
+        .connect(
+            10,
+            core::net::SocketAddr::new(local.ip(), local.port() + 1),
+            remote,
+        )
+        .unwrap();
+    // Deliver SYN only: the passive child's inherited policy runs before accept.
+    deliver(&mut b, 10, packets(&mut a, 10));
+    packets(&mut b, 10);
+    assert!(!b.on_timeout(10 + 3_456_000 - 1, 64).unwrap());
+    packets(&mut b, 10 + 3_456_000 - 1);
+    assert!(b.buffer_bytes() > baseline);
+    assert!(!b.on_timeout(10 + 3_456_000, 64).unwrap());
+    packets(&mut b, 10 + 3_456_000);
+    // Unaccepted terminal children are reclaimed, not exposed as handles/events.
+    assert_eq!(b.buffer_bytes(), baseline);
+    assert_eq!(
+        b.accept(listener),
+        Err(EndpointError::Connection(Error::WouldBlock))
+    );
+    assert_eq!(b.state(child), Ok(State::Established));
+    assert_eq!(a.state(another), Ok(State::SynSent));
+}
+
+#[test]
+fn application_timeout_syn_policy_is_not_r2_and_reset_preserves_r2_floor() {
+    let (mut a, _, _, client) = endpoints();
+    assert_eq!(a.application_timeout(client), Ok(None));
+    assert_eq!(
+        a.set_application_timeout(client, Some(0)),
+        Err(EndpointError::Connection(Error::InvalidArgument))
+    );
+    a.set_user_timeout(client, 1_000).unwrap();
+    a.set_application_timeout(client, Some(10_000)).unwrap();
+    assert_eq!(a.next_deadline(), Some(10_000));
+    a.set_application_timeout(client, None).unwrap();
+    packets(&mut a, 0);
+    a.on_timeout(10_000, 64).unwrap();
+    assert_eq!(a.state(client), Ok(State::SynSent));
+    a.on_timeout(179_999_999, 64).unwrap();
+    assert_eq!(a.state(client), Ok(State::SynSent));
+    a.on_timeout(180_000_000, 64).unwrap();
+    assert_eq!(a.close_reason(client), Ok(Some(CloseReason::TimedOut)));
+
+    let (mut a, _, _, client) = endpoints();
+    a.set_application_timeout(client, Some(10_000)).unwrap();
+    packets(&mut a, 0);
+    a.on_timeout(10_000, 64).unwrap();
+    assert_eq!(a.close_reason(client), Ok(Some(CloseReason::TimedOut)));
+    assert!(
+        matches!(a.next_event(), Some(Event::Connection(id, events)) if id == client && events.closed == Some(CloseReason::TimedOut))
+    );
+}
+
+#[test]
+fn application_timeout_does_not_close_healthy_fin_wait2_receive_half() {
+    let (mut a, mut b, listener, client) = endpoints();
+    pump(&mut a, &mut b, 0);
+    let server = b.accept(listener).unwrap();
+    a.set_application_timeout(client, Some(1_000)).unwrap();
+    a.shutdown(client).unwrap();
+    pump(&mut a, &mut b, 0);
+    assert_eq!(a.state(client), Ok(State::FinWait2));
+    a.on_timeout(2_000, 64).unwrap();
+    assert_eq!(a.state(client), Ok(State::FinWait2));
+    b.write(server, b"reply").unwrap();
+    pump(&mut a, &mut b, 2_000);
+    let mut bytes = [0; 8];
+    assert_eq!(a.read(client, &mut bytes), Ok(5));
+    assert_eq!(&bytes[..5], b"reply");
+    // The original FIN-WAIT-2 R2 cleanup remains active.
+    a.on_timeout(2_000 + config().connection.user_timeout_us, 64)
+        .unwrap();
+    assert_eq!(a.close_reason(client), Ok(Some(CloseReason::TimedOut)));
 }
