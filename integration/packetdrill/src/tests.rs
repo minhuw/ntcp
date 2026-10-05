@@ -44,6 +44,9 @@ fn local() -> Ipv4Addr {
     Ipv4Addr::new(192, 0, 2, 1)
 }
 fn syn(sequence: u32, destination_port: u16) -> Vec<u8> {
+    syn_with_options(sequence, destination_port, &[])
+}
+fn syn_with_options(sequence: u32, destination_port: u16, options: &[u8]) -> Vec<u8> {
     let ip = IpMetadata {
         source: Ipv4Addr::new(192, 0, 2, 2).into(),
         destination: local().into(),
@@ -58,7 +61,7 @@ fn syn(sequence: u32, destination_port: u16) -> Vec<u8> {
         urgent_pointer: 0,
     };
     let mut tcp = [0; 64];
-    let n = ntcp::wire::encode(ip, header, &[], &[], &mut tcp).unwrap();
+    let n = ntcp::wire::encode(ip, header, options, &[], &mut tcp).unwrap();
     frame(
         ntcp::Transmit {
             ip,
@@ -78,7 +81,7 @@ fn abi_table_null_counts_vectors_variadics_and_host_clock() {
     unsafe extern "C" {
         fn ntcp_abi_check(userdata: *mut c_void);
     }
-    let mut adapter = Adapter::start(local()).unwrap();
+    let mut adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
     unsafe {
         ntcp_abi_check((&mut adapter as *mut Adapter).cast());
     }
@@ -106,13 +109,16 @@ fn ipv4_validation_and_address_roundtrip() {
     let address = SocketAddr::new(local().into(), 8080);
     assert_eq!(decode_addr(&encode_addr(address)).unwrap(), address);
     assert!(profile("").is_err());
-    assert_eq!(profile("baseline,local=192.0.2.1").unwrap(), local());
+    assert_eq!(
+        profile("baseline,local=192.0.2.1").unwrap(),
+        (local(), Profile::Baseline)
+    );
     assert!(profile("baseline,local=192.0.2.1,sack").is_err());
 }
 
 #[test]
 fn owner_constructs_endpoint_and_preserves_output_under_backpressure() {
-    let adapter = Adapter::start(local()).unwrap();
+    let adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
     for i in 0..LIMIT + 4 {
         // Respect Endpoint's separate 128-control-replies/second rate limit.
         if i == LIMIT {
@@ -134,7 +140,7 @@ fn owner_constructs_endpoint_and_preserves_output_under_backpressure() {
 
 #[test]
 fn pending_accept_does_not_block_packets_and_stop_joins() {
-    let adapter = Adapter::start(local()).unwrap();
+    let adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
     let fd = call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap().value as i32;
     call(
         &adapter,
@@ -167,7 +173,7 @@ fn pending_accept_does_not_block_packets_and_stop_joins() {
 
 #[test]
 fn descriptor_and_request_limits_fail_without_hanging() {
-    let adapter = Adapter::start(local()).unwrap();
+    let adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
     for _ in 0..LIMIT {
         call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap();
     }
@@ -194,7 +200,7 @@ fn descriptor_and_request_limits_fail_without_hanging() {
 
 #[test]
 fn pending_limit_and_poll_timeout() {
-    let mut owner = Owner::new(local()).unwrap();
+    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
     let fd = owner.alloc(Socket::new(0)).unwrap();
     let p = pollfd {
         fd,
@@ -210,7 +216,7 @@ fn pending_limit_and_poll_timeout() {
     assert_eq!(owner.execute(&mut r).unwrap().unwrap().value, 0);
     owner.sockets.get_mut(&fd).unwrap().readable = None;
     assert_eq!(owner.execute(&mut r).err(), Some(ENOSYS));
-    let adapter = Adapter::start(local()).unwrap();
+    let adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
     let mut replies = Vec::new();
     for _ in 0..LIMIT {
         let (r, rx) = request(13, 0, -1, vec![], 0);
@@ -233,7 +239,7 @@ fn pending_limit_and_poll_timeout() {
 
 #[test]
 fn reuseaddr_allows_rebinding_connected_socket_but_not_listener() {
-    let mut owner = Owner::new(local()).unwrap();
+    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
     let address = SocketAddr::new(local().into(), 40000);
     let id = owner
         .endpoint
@@ -263,7 +269,7 @@ fn reuseaddr_allows_rebinding_connected_socket_but_not_listener() {
 
 #[test]
 fn socket_sends_wait_for_handshake_without_core_buffering() {
-    let mut owner = Owner::new(local()).unwrap();
+    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
     let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
     let remote = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080);
     let (mut connect, _) = request(5, fd, 0, encode_addr(remote), 0);
@@ -315,4 +321,92 @@ fn socket_sends_wait_for_handshake_without_core_buffering() {
         ntcp::wire::parse(tx.ip, &tcp[..tx.len]).unwrap().payload,
         &[1, 2, 3, 4]
     );
+}
+
+#[test]
+fn profiles_require_one_selection_and_one_ipv4_address() {
+    assert_eq!(
+        profile("local=192.0.2.1,upstream-window8").unwrap(),
+        (local(), Profile::UpstreamWindow8)
+    );
+    for flags in [
+        "",
+        "baseline",
+        "upstream-window8",
+        "local=192.0.2.1",
+        "baseline,baseline,local=192.0.2.1",
+        "upstream-window8,upstream-window8,local=192.0.2.1",
+        "baseline,upstream-window8,local=192.0.2.1",
+        "upstream-window8,baseline,local=192.0.2.1",
+        "baseline,local=192.0.2.1,local=192.0.2.1",
+        "upstream-window8,local=192.0.2.1,local=192.0.2.2",
+        "upstream-window8,local=::1",
+        "baseline,local=invalid",
+        "upstream-window8,local=192.0.2.1,sack",
+        "upstream-window8,local=192.0.2.1,",
+    ] {
+        assert_eq!(profile(flags), Err(ENOSYS), "{flags}");
+    }
+}
+
+#[test]
+fn profiles_emit_real_synack_scale_through_owner_thread() {
+    for (name, scale) in [("baseline", 0), ("upstream-window8", 8)] {
+        let adapter = Adapter::start(profile(&format!("{name},local=192.0.2.1")).unwrap()).unwrap();
+        let fd = call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap().value as i32;
+        call(
+            &adapter,
+            2,
+            fd,
+            0,
+            encode_addr(SocketAddr::new(local().into(), 8080)),
+            0,
+        )
+        .unwrap();
+        call(&adapter, 3, fd, 1, vec![], 0).unwrap();
+        // MSS and WS only, matching the upstream tests' lack of SACK/TS negotiation.
+        let syn = syn_with_options(100, 8080, &[2, 4, 5, 180, 1, 3, 3, 7]);
+        call(&adapter, 14, 0, 0, syn, 0).unwrap();
+        let response = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap();
+        let (ip, tcp) = parse_frame(&response.bytes).unwrap();
+        let segment = ntcp::wire::parse(ip, tcp).unwrap();
+        assert_eq!(segment.header.flags, ntcp::wire::SYN | ntcp::wire::ACK);
+        assert_eq!(segment.header.window, 65535);
+        assert_eq!(segment.options.window_scale, Some(scale));
+        assert_eq!(segment.options.mss, Some(1460));
+        assert_eq!(segment.options.timestamps, None);
+        assert_eq!(segment.raw_options, &[2, 4, 5, 180, 3, 3, scale, 0]);
+    }
+}
+
+#[test]
+fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
+    for (name, receive_capacity) in [("baseline", 65535), ("upstream-window8", 8 * 1024 * 1024)] {
+        let mut owner = Owner::new(profile(&format!("{name},local=192.0.2.1")).unwrap()).unwrap();
+        // Core accounts for receive data/presence/urgent maps, send storage and MSS scratch.
+        let per_connection = 3 * receive_capacity + 2 * 65536 + 1460;
+        let max_bytes = 32 * 1024 * 1024;
+        let count = LIMIT.min(max_bytes / per_connection);
+        for i in 0..count {
+            owner
+                .endpoint
+                .connect(
+                    0,
+                    SocketAddr::new(local().into(), 40000 + i as u16),
+                    SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080),
+                )
+                .unwrap();
+            assert_eq!(owner.endpoint.buffer_bytes(), (i + 1) * per_connection);
+            assert!(owner.endpoint.buffer_bytes() <= max_bytes);
+        }
+        assert_eq!(
+            owner.endpoint.connect(
+                0,
+                SocketAddr::new(local().into(), 50000),
+                SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080),
+            ),
+            Err(EndpointError::LimitReached)
+        );
+        assert_eq!(owner.endpoint.buffer_bytes(), count * per_connection);
+    }
 }

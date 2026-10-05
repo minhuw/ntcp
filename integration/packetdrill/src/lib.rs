@@ -124,28 +124,41 @@ fn reason(r: CloseReason) -> i32 {
         CloseReason::Normal => 0,
     }
 }
-fn profile(flags: &str) -> Result<Ipv4Addr> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Profile {
+    Baseline,
+    UpstreamWindow8,
+}
+fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
     let mut local = None;
-    let mut baseline = false;
+    let mut selected = None;
     for flag in flags.split(',') {
-        if flag == "baseline" {
-            baseline = true;
-        } else if let Some(ip) = flag.strip_prefix("local=") {
+        if let Some(ip) = flag.strip_prefix("local=") {
+            if local.is_some() {
+                return Err(unsupported("duplicate local in so_flags"));
+            }
             local = Some(
                 ip.parse()
                     .map_err(|_| unsupported("invalid local IPv4 in so_flags"))?,
             );
         } else {
-            return Err(unsupported("unknown so_flags token"));
+            let profile = match flag {
+                "baseline" => Profile::Baseline,
+                "upstream-window8" => Profile::UpstreamWindow8,
+                _ => return Err(unsupported("unknown so_flags token")),
+            };
+            if selected.replace(profile).is_some() {
+                return Err(unsupported("duplicate or conflicting profiles in so_flags"));
+            }
         }
     }
-    if !baseline {
-        return Err(unsupported("so_flags requires baseline,local=<IPv4>"));
-    }
-    local.ok_or_else(|| unsupported("so_flags requires local=<IPv4>"))
+    Ok((
+        local.ok_or_else(|| unsupported("so_flags requires local=<IPv4>"))?,
+        selected.ok_or_else(|| unsupported("so_flags requires exactly one profile"))?,
+    ))
 }
 impl Adapter {
-    fn start(local: Ipv4Addr) -> Result<Self> {
+    fn start(settings: (Ipv4Addr, Profile)) -> Result<Self> {
         let (tx, rx) = mpsc::sync_channel(LIMIT);
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
@@ -154,7 +167,7 @@ impl Adapter {
             .name("ntcp-packetdrill".into())
             .spawn(move || {
                 // Endpoint is deliberately constructed here: its policy closure is !Send.
-                let result = catch_unwind(AssertUnwindSafe(|| match Owner::new(local) {
+                let result = catch_unwind(AssertUnwindSafe(|| match Owner::new(settings) {
                     Ok(mut owner) => {
                         let _ = ready_tx.send(Ok(()));
                         owner.run(rx, &stopping);
@@ -202,7 +215,7 @@ impl Drop for Adapter {
     }
 }
 impl Owner {
-    fn new(local: Ipv4Addr) -> Result<Self> {
+    fn new((local, profile): (Ipv4Addr, Profile)) -> Result<Self> {
         let mut config = EndpointConfig {
             max_connections: LIMIT,
             max_listeners: LIMIT,
@@ -210,7 +223,14 @@ impl Owner {
             max_buffer_bytes: 32 * 1024 * 1024,
             ..EndpointConfig::default()
         };
-        config.connection.receive_capacity = 65535;
+        config.connection.receive_capacity = match profile {
+            Profile::Baseline => 65535,
+            // Real receive storage: 8 MiB requires scale 8, not 7 (65535 << 7).
+            Profile::UpstreamWindow8 => 8 * 1024 * 1024,
+        };
+        config.connection.mss = 1460;
+        config.connection.timestamps = false;
+        config.connection.recovery_algorithm = ntcp::RecoveryAlgorithm::NewReno;
         config.connection.receive_ip_payload_limit = 65515;
         config.connection.send_ip_payload_limit = 65515;
         config.connection.ecn = false;

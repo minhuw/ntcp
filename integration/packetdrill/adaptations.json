@@ -1,0 +1,90 @@
+{
+  "upstream_revision": "83f72d3f9085d0e26eb4d206fe4d7cfab5b6d872",
+  "scripts": {
+    "close/close-on-syn-sent.pkt": {
+      "source_sha256": "54c6393fbb4e6a751ebe46cd965d1a06d01ed6e359dde5d1f679e98406aca5f4",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "mapping": {
+        "ntcp_settings": {
+          "ecn": false,
+          "timestamps": false,
+          "congestion_control": "NewReno",
+          "receive_capacity": 65535,
+          "mss": 1460
+        },
+        "linux_defaults_reproduced": false,
+        "claim": "SYN_SENT cancellation assertions only: close sends no immediate RST; a later SYN-ACK elicits RST. Not complete Linux defaults equivalence.",
+        "reasons": [
+          "The outgoing SYN uses wildcard options; packet and syscall assertions remain byte-for-byte unchanged.",
+          "The peer SYN-ACK negotiates neither SACK nor timestamps, so Linux enabling them is not reproduced or required for this claim.",
+          "No data is transferred; Linux CUBIC is not reproduced by ntcp NewReno and congestion-control equivalence is not claimed.",
+          "The baseline disables ECN and timestamps, uses receive capacity 65535 and MSS 1460; Linux buffer sizing and other defaults.sh sysctls, metrics flush and qdisc setup are not reproduced."
+        ]
+      },
+      "adapter_flags": "baseline,local=192.168.0.1"
+    },
+    "blocking/blocking-read.pkt": {
+      "source_sha256": "31e0650e72459d1cc3b46a8013136dd7184bc05856626af09f574eca718e8744",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "mapping": {
+        "ntcp_settings": {
+          "ecn": false,
+          "timestamps": false,
+          "congestion_control": "NewReno",
+          "receive_capacity": 8388608,
+          "mss": 1460,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432
+        },
+        "linux_defaults_reproduced": false,
+        "claim": "Blocking read syscall and packet assertions only; not complete Linux defaults equivalence.",
+        "reasons": [
+          "A real 8 MiB receive capacity yields window scale 8; the endpoint aggregate buffer budget remains 32 MiB. Packet and syscall assertions remain byte-for-byte unchanged.",
+          "The peer SYN negotiates neither SACK nor timestamps. ECN and timestamps remain off, NewReno and MSS 1460 remain unchanged.",
+          "These cases do not measure CUBIC recovery; Linux CUBIC and the remaining defaults.sh sysctls, metrics flush and qdisc setup are not reproduced.",
+          "ACK timing and greater-than-MSS output aggregation assertions are retained; failures are not weakened or reclassified as passes."
+        ]
+      },
+      "adapter_flags": "upstream-window8,local=192.168.0.1"
+    },
+    "blocking/blocking-accept.pkt": {
+      "source_sha256": "51c4ebaf56bfd15fb35f98725c27cc448b91886791d57869e86a76b9ed007ea7",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "mapping": {
+        "ntcp_settings": {
+          "ecn": false,
+          "timestamps": false,
+          "congestion_control": "NewReno",
+          "receive_capacity": 8388608,
+          "mss": 1460,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432
+        },
+        "linux_defaults_reproduced": false,
+        "claim": "Blocking accept syscall and packet assertions only; not complete Linux defaults equivalence.",
+        "reasons": [
+          "A real 8 MiB receive capacity yields window scale 8; the endpoint aggregate buffer budget remains 32 MiB. Packet and syscall assertions remain byte-for-byte unchanged.",
+          "The peer SYN negotiates neither SACK nor timestamps. ECN and timestamps remain off, NewReno and MSS 1460 remain unchanged.",
+          "These cases do not measure CUBIC recovery; Linux CUBIC and the remaining defaults.sh sysctls, metrics flush and qdisc setup are not reproduced.",
+          "ACK timing and greater-than-MSS output aggregation assertions are retained; failures are not weakened or reclassified as passes."
+        ]
+      },
+      "adapter_flags": "upstream-window8,local=192.168.0.1"
+    }
+  }
+}

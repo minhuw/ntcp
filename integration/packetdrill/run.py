@@ -37,6 +37,40 @@ def preflight(text):
     return sorted(set(reasons))
 
 
+def adapt_source(directory, relative, manifest, so_flags):
+    """Replace only the audited setup line; never rewrite packet/syscall text."""
+    if manifest['upstream_revision'] != PIN['revision']:
+        raise ValueError('adaptation revision differs from upstream pin')
+    if relative not in manifest['scripts']:
+        raise ValueError('script is not adaptation-allowlisted')
+    entry = manifest['scripts'][relative]
+    if so_flags != entry['adapter_flags']:
+        raise ValueError('adapter flags differ from audited mapping')
+    source = (directory / relative).read_bytes()
+    setup = (directory / entry['setup_path']).read_bytes()
+    for label, data, expected in (
+        ('source', source, entry['source_sha256']),
+        ('setup', setup, entry['setup_sha256']),
+    ):
+        if hashlib.sha256(data).hexdigest() != expected:
+            raise ValueError(f'{label} hash differs from audited adaptation')
+    command = entry['command_line'].encode()
+    replacement = entry['replacement_line'].encode()
+    # This is deliberately a single known setup mapping, not a shell scrubber.
+    if (entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
+            or command != b'`../common/defaults.sh`\n'
+            or replacement != b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n'
+            or entry['expected_command_count'] != 1
+            or source.splitlines(keepends=True).count(command) != 1
+            or source.count(b'`') != 2):
+        raise ValueError('expected exactly one audited setup command and replacement')
+    generated = source.replace(command, replacement, 1)
+    reasons = preflight(generated.decode())
+    if reasons:
+        raise ValueError('; '.join(reasons))
+    return generated, {**entry, 'generated_sha256': hashlib.sha256(generated).hexdigest()}
+
+
 def invoke(argv, cwd, timeout):
     # Kill the whole process group on timeout; packetdrill has worker threads and
     # may spawn helper processes. Never leave an external test running behind CI.
@@ -104,14 +138,14 @@ def main():
     parser.add_argument('--checkout', required=True, type=Path)
     parser.add_argument('--plugin', type=Path,
                         default=ROOT / 'target/debug/libntcp_packetdrill.so')
-    parser.add_argument('--suite', choices=['smoke', 'upstream'], default='smoke')
+    parser.add_argument('--suite', choices=['smoke', 'upstream', 'adapted'], default='smoke')
     parser.add_argument('--report', type=Path,
                         default=ROOT / 'workbench/packetdrill/report.json')
     parser.add_argument('--timeout', type=float, default=15)
     parser.add_argument('--so-flags')
     args = parser.parse_args()
-    if args.so_flags is None:
-        args.so_flags = ('baseline,local=192.168.0.1' if args.suite == 'upstream'
+    if args.so_flags is None and args.suite != 'adapted':
+        args.so_flags = ('baseline,local=192.168.0.1' if args.suite != 'smoke'
                          else 'baseline,local=192.0.2.1')
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error('--timeout must be finite and positive')
@@ -126,48 +160,79 @@ def main():
         parser.error(f'build the pinned external runner first: {runner}')
     if not plugin.is_file():
         parser.error(f'build ntcp-packetdrill first: {plugin}')
-    directory = checkout / PIN['tcp_tests'] if args.suite == 'upstream' else HERE / 'tests'
-    if args.suite == 'upstream':
+    manifest_bytes = (HERE / 'adaptations.json').read_bytes() if args.suite == 'adapted' else None
+    manifest = json.loads(manifest_bytes) if manifest_bytes is not None else None
+    directory = checkout / PIN['tcp_tests'] if args.suite != 'smoke' else HERE / 'tests'
+    upstream_scripts = []
+    if args.suite != 'smoke':
         tracked = subprocess.check_output(
             ['git', '-C', str(checkout), 'ls-files', '-z', '--', PIN['tcp_tests']],
             text=True,
         ).split('\0')
-        scripts = sorted(checkout / path for path in tracked if path.endswith('.pkt'))
+        upstream_scripts = sorted(checkout / path for path in tracked if path.endswith('.pkt'))
+        scripts = (sorted(directory / path for path in manifest['scripts'])
+                   if manifest is not None else upstream_scripts)
+        if any(script not in upstream_scripts for script in scripts):
+            parser.error('adaptation allowlist contains an untracked upstream script')
     else:
         scripts = sorted(directory.rglob('*.pkt'))
     if not scripts:
         parser.error(f'no .pkt tests found in {directory}')
     results = []
     cases = [(script, variant, flags) for script in scripts
-             for variant, flags in variants(script, args.suite == 'upstream')]
-    for script, variant, flags in cases:
-        text = script.read_text()
-        row = {'script': str(script.relative_to(directory)), 'variant': variant,
-               'sha256': hashlib.sha256(script.read_bytes()).hexdigest(),
-               'behavior_executed': False}
-        code, expired, log = invoke([str(runner), '--dry_run', *flags, str(script)],
-                                    script.parent, args.timeout)
-        row['syntax_returncode'] = code
-        if code != 0 or expired:
-            row.update(status='syntax_error' if code is not None and not expired
-                       else 'environment_error', log=log)
-        else:
-            reasons = preflight(text)
-            if variant not in ('native-ipv4', 'ipv4'):
-                reasons.append('the adapter implements IPv4 only')
-            if reasons:
-                row.update(status='unsupported', reasons=reasons,
-                           behavior_executed=False)
-            else:
-                # Namespace isolation is required, never silently fall back to host.
-                argv = ['unshare', '--user', '--map-root-user', '--net',
-                        str(runner), f'--so_filename={plugin}',
-                        f'--so_flags={args.so_flags}', *flags, str(script)]
-                code, expired, log = invoke(argv, script.parent, args.timeout)
-                row.update(status=outcome(code, expired, log), returncode=code,
-                           behavior_executed=True, log=log)
-        results.append(row)
-        print(f'{row["status"]}: {row["script"]} ({variant})', flush=True)
+             for variant, flags in variants(script, args.suite != 'smoke')]
+    with tempfile.TemporaryDirectory(prefix='ntcp-packetdrill-') as temporary:
+        for script, variant, flags in cases:
+            source = script.read_bytes()
+            text = source.decode()
+            row = {'script': str(script.relative_to(directory)), 'variant': variant,
+                   'suite': args.suite, 'adapted': False,
+                   'sha256': hashlib.sha256(source).hexdigest(),
+                   'effective_flags': {'adapter': args.so_flags, 'packetdrill': flags},
+                   'syntax_returncode': None, 'behavior_executed': False}
+            so_flags = args.so_flags
+            if manifest is not None and so_flags is None:
+                so_flags = manifest['scripts'][row['script']]['adapter_flags']
+            row['effective_flags']['adapter'] = so_flags
+            execution_script = script
+            if manifest is not None:
+                try:
+                    generated, audit = adapt_source(directory, row['script'], manifest,
+                                                    so_flags)
+                    row['adaptation'] = audit
+                    if variant != 'ipv4':
+                        row.update(status='unsupported', reasons=['adaptation supports IPv4 only'])
+                    else:
+                        execution_script = Path(temporary) / script.name
+                        execution_script.write_bytes(generated)
+                        text = generated.decode()
+                        row['adapted'] = True
+                except (ValueError, OSError) as error:
+                    row.update(status='adaptation_rejected', reasons=[str(error)])
+            if 'status' not in row:
+                code, expired, log = invoke(
+                    [str(runner), '--dry_run', *flags, str(execution_script)],
+                    execution_script.parent, args.timeout)
+                row['syntax_returncode'] = code
+                if code != 0 or expired:
+                    row.update(status='syntax_error' if code is not None and not expired
+                               else 'environment_error', log=log)
+                else:
+                    reasons = preflight(text)
+                    if variant not in ('native-ipv4', 'ipv4'):
+                        reasons.append('the adapter implements IPv4 only')
+                    if reasons:
+                        row.update(status='unsupported', reasons=reasons)
+                    else:
+                        # Namespace isolation is required, never fall back to host.
+                        argv = ['unshare', '--user', '--map-root-user', '--net',
+                                str(runner), f'--so_filename={plugin}',
+                                f'--so_flags={so_flags}', *flags, str(execution_script)]
+                        code, expired, log = invoke(argv, execution_script.parent, args.timeout)
+                        row.update(status=outcome(code, expired, log), returncode=code,
+                                   behavior_executed=True, log=log)
+            results.append(row)
+            print(f'{row["status"]}: {row["script"]} ({variant}, {args.suite})', flush=True)
     counts = dict(collections.Counter(row['status'] for row in results))
     report = {'upstream_revision': revision, 'suite': args.suite,
               'adapter_flags': args.so_flags, 'script_files': len(scripts),
@@ -177,6 +242,13 @@ def main():
               'plugin_sha256': hashlib.sha256(plugin.read_bytes()).hexdigest(),
               'counts': counts, 'total': len(results), 'results': results,
               'all_passed': all(row['status'] == 'passed' for row in results)}
+    if args.suite != 'smoke':
+        report['coverage'] = {'selected_script_files': len(scripts),
+                              'upstream_script_files': len(upstream_scripts),
+                              'selection': 'adaptation_allowlist' if manifest is not None
+                              else 'all_tracked_upstream_scripts'}
+    if manifest is not None:
+        report['adaptation_manifest_sha256'] = hashlib.sha256(manifest_bytes).hexdigest()
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(counts, sort_keys=True))
