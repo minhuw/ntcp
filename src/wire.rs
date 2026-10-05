@@ -34,6 +34,8 @@ pub struct Options {
     pub mss: Option<u16>,
     pub window_scale: Option<u8>,
     pub timestamps: Option<(u32, u32)>,
+    pub sack_permitted: bool,
+    pub sack_blocks: [Option<(u32, u32)>; 4],
 }
 
 pub struct Segment<'a> {
@@ -156,13 +158,30 @@ fn read_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> 
                         }
                         options.window_scale = Some(bytes[2].min(14));
                     }
+                    4 if len == 2 => options.sack_permitted = true,
+                    // RFC 2018 section 3: "A SACK option that specifies n blocks
+                    // will have a length of 8*n+2 bytes" (at most four blocks).
+                    5 if matches!(len, 10 | 18 | 26 | 34) && options.sack_blocks[0].is_none() => {
+                        // Preserve wire order, including a possible DSACK first block.
+                        // Range validity needs connection state; wrapping edges are valid.
+                        for (slot, block) in options
+                            .sack_blocks
+                            .iter_mut()
+                            .zip(bytes[2..len].chunks_exact(8))
+                        {
+                            *slot = Some((
+                                u32::from_be_bytes(block[..4].try_into().unwrap()),
+                                u32::from_be_bytes(block[4..].try_into().unwrap()),
+                            ));
+                        }
+                    }
                     8 if len == 10 && options.timestamps.is_none() => {
                         options.timestamps = Some((
                             u32::from_be_bytes(bytes[2..6].try_into().unwrap()),
                             u32::from_be_bytes(bytes[6..10].try_into().unwrap()),
                         ));
                     }
-                    2 | 3 | 8 => return Err(WireError::InvalidOption),
+                    2 | 3 | 4 | 5 | 8 => return Err(WireError::InvalidOption),
                     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
                     //# A TCP implementation MUST (MUST-6) ignore without error any TCP
                     //# Option it does not implement, assuming that the option has a length
@@ -241,8 +260,11 @@ pub fn encode(
     //# This field may be sent in the initial connection request (i.e., in
     //# segments with the SYN control bit set) and MUST NOT be sent in other
     //# segments (MUST-65).
+    // RFC 2018 section 2: "It MUST NOT be sent on non-SYN segments."
     if header.flags & SYN == 0
-        && (parsed_options.mss.is_some() || parsed_options.window_scale.is_some())
+        && (parsed_options.mss.is_some()
+            || parsed_options.window_scale.is_some()
+            || parsed_options.sack_permitted)
     {
         return Err(WireError::InvalidOption);
     }
@@ -722,6 +744,196 @@ mod tests {
             assert_eq!(out, [0xa5; 80]);
         }
     }
+    fn sack_option(blocks: &[(u32, u32)]) -> Vec<u8> {
+        let mut raw = vec![5, (8 * blocks.len() + 2) as u8];
+        for &(left, right) in blocks {
+            raw.extend(left.to_be_bytes());
+            raw.extend(right.to_be_bytes());
+        }
+        raw
+    }
+
+    #[test]
+    fn sack_round_trip_preserves_full_edges_and_dsack_order() {
+        // First block below the cumulative ACK is deliberately left first (DSACK).
+        let blocks = [
+            (0x01234567, 0x89abcdef),
+            (u32::MAX - 7, 8),
+            (0xf1234567, 0xf2345678),
+            (0, u32::MAX),
+        ];
+        for ip in ips() {
+            for count in 1..=4 {
+                for prefix in 0..4 {
+                    let mut raw = vec![1; prefix];
+                    raw.extend(sack_option(&blocks[..count]));
+                    let mut h = header();
+                    h.flags = ACK;
+                    let mut out = [0xa5; 80];
+                    let len = encode(ip, h, &raw, b"odd", &mut out).unwrap();
+                    let parsed = parse(ip, &out[..len]).unwrap();
+                    let mut expected = Options::default();
+                    for (slot, &block) in expected.sack_blocks.iter_mut().zip(&blocks[..count]) {
+                        *slot = Some(block);
+                    }
+                    assert_eq!(parsed.options, expected);
+                    assert_eq!(&parsed.raw_options[..raw.len()], raw);
+                    assert_eq!(parsed.payload, b"odd");
+                    assert_eq!(reference(ip, &out[..len]), 0);
+                    let mut small = vec![0xa5; len - 1];
+                    assert_eq!(
+                        encode(ip, h, &raw, b"odd", &mut small),
+                        Err(WireError::OutputTooSmall)
+                    );
+                    assert!(small.iter().all(|&byte| byte == 0xa5));
+                }
+            }
+        }
+        // The wire codec does not decide whether zero-width or reversed ranges
+        // are meaningful to the connection.
+        let raw = sack_option(&[(7, 7), (9, 3)]);
+        assert_eq!(
+            read_options(&raw, false).unwrap().sack_blocks[..2],
+            [Some((7, 7)), Some((9, 3))]
+        );
+    }
+
+    #[test]
+    fn sack_permitted_syn_only_on_output_and_idempotent() {
+        let raw = [4, 2, 4, 2];
+        for ip in ips() {
+            let mut bytes = packet(ip, &raw, &[]);
+            assert!(parse(ip, &bytes).unwrap().options.sack_permitted);
+            bytes[13] = ACK;
+            seal(ip, &mut bytes);
+            assert!(parse(ip, &bytes).unwrap().options.sack_permitted);
+            let mut h = header();
+            h.flags = ACK;
+            let mut out = [0xa5; 80];
+            assert_eq!(
+                encode(ip, h, &raw, &[], &mut out),
+                Err(WireError::InvalidOption)
+            );
+            assert_eq!(out, [0xa5; 80]);
+        }
+    }
+
+    #[test]
+    fn sack_malformed_lengths_truncation_and_repeated_option() {
+        let ip = ips()[0];
+        let mut malformed = vec![
+            vec![4],
+            vec![4, 0],
+            vec![4, 1],
+            vec![4, 3, 0],
+            vec![5],
+            vec![5, 2],
+        ];
+        for len in [3, 9, 11, 18, 26, 34] {
+            let mut raw = vec![5, len];
+            raw.resize(
+                if len % 8 == 2 {
+                    len as usize - 1
+                } else {
+                    len as usize
+                },
+                1,
+            );
+            malformed.push(raw);
+        }
+        let block = sack_option(&[(1, 2)]);
+        let mut repeated = block.clone();
+        repeated.extend(&block);
+        malformed.push(repeated);
+        for raw in malformed {
+            for outgoing in [false, true] {
+                assert_eq!(read_options(&raw, outgoing), Err(WireError::InvalidOption));
+            }
+            let mut out = [0xa5; 80];
+            assert_eq!(
+                encode(ip, header(), &raw, &[], &mut out),
+                Err(WireError::InvalidOption)
+            );
+            assert_eq!(out, [0xa5; 80]);
+            let prefix = (4 - raw.len() % 4) % 4;
+            let mut bytes = packet(ip, &vec![1; prefix + raw.len()], &[]);
+            bytes[20 + prefix..].copy_from_slice(&raw);
+            seal(ip, &mut bytes);
+            parse_error(ip, &bytes, WireError::InvalidOption);
+        }
+        let extra = sack_option(&[(1, 2); 5]);
+        assert_eq!(read_options(&extra, false), Err(WireError::InvalidOption));
+        let mut out = [0xa5; 80];
+        assert_eq!(
+            encode(ip, header(), &extra, &[], &mut out),
+            Err(WireError::TooLong)
+        );
+        assert_eq!(out, [0xa5; 80]);
+    }
+
+    #[test]
+    fn sack_timestamp_option_budget() {
+        let ip = ips()[0];
+        for count in 1..=4 {
+            let mut raw = vec![1, 1, 8, 10, 0, 0, 0, 7, 0, 0, 0, 9];
+            raw.extend(sack_option(&[(u32::MAX, 1); 4][..count]));
+            let mut out = [0xa5; 80];
+            let mut h = header();
+            h.flags = ACK;
+            if count == 4 {
+                assert_eq!(encode(ip, h, &raw, &[], &mut out), Err(WireError::TooLong));
+                assert_eq!(out, [0xa5; 80]);
+            } else {
+                let len = encode(ip, h, &raw, &[], &mut out).unwrap();
+                let parsed = parse(ip, &out[..len]).unwrap();
+                assert_eq!(parsed.options.timestamps, Some((7, 9)));
+                assert_eq!(parsed.options.sack_blocks.iter().flatten().count(), count);
+                assert!(parsed.raw_options.len() <= 40);
+                if count == 3 {
+                    assert_eq!(parsed.raw_options.len(), 40);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sack_parser_deterministic_bounds() {
+        // Exhaust declared lengths against every available bounded option size.
+        for kind in [4, 5] {
+            for len in 0..=255u8 {
+                for available in 2..=40 {
+                    let mut raw = vec![1; available];
+                    raw[0] = kind;
+                    raw[1] = len;
+                    let valid = len as usize <= available
+                        && if kind == 4 {
+                            len == 2
+                        } else {
+                            (10..=34).contains(&len) && (len - 2) % 8 == 0
+                        };
+                    for outgoing in [false, true] {
+                        assert_eq!(read_options(&raw, outgoing).is_ok(), valid);
+                    }
+                }
+            }
+        }
+        // Mixed arbitrary options, with checksum repaired so parsing reaches them.
+        let ip = ips()[0];
+        let mut state = 0x12345678u32;
+        for size in 0..=40 {
+            for _ in 0..64 {
+                let mut bytes = packet(ip, &vec![1; size], &[]);
+                for byte in &mut bytes[20..] {
+                    state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                    *byte = (state >> 24) as u8;
+                }
+                seal(ip, &mut bytes);
+                let decoded = read_options(&bytes[20..], false);
+                assert_eq!(parse(ip, &bytes).map(|segment| segment.options), decoded);
+            }
+        }
+    }
+
     #[test]
     fn timestamp_option_parses_and_rejects_malformed_or_duplicate_values() {
         let option = [8, 10, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 7];
