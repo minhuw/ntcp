@@ -1018,14 +1018,19 @@ impl Connection {
                 Ok(())
             };
         }
-        if self.shutdown
-            || !matches!(
+        if !(matches!(
+            self.state,
+            State::SynSent | State::SynReceived | State::Established | State::CloseWait
+        ) || self.shutdown
+            && matches!(
                 self.state,
-                State::SynSent | State::SynReceived | State::Established | State::CloseWait
-            )
+                State::FinWait1 | State::FinWait2 | State::Closing | State::LastAck
+            ))
         {
             return Err(Error::InvalidState);
         }
+        // Closing the reader after write shutdown must not send a second FIN;
+        // unread accepted bytes still take the existing data-loss abort path.
         self.read_closed = true;
         self.events.readable = false;
         self.events.pushed = false;
@@ -5748,6 +5753,81 @@ mod tests {
         inject(&mut a, 50, Seq(901), Seq(102), ACK | FIN, 16, b"");
         assert_eq!(a.state(), State::TimeWait);
         assert!(!a.take_events().readable);
+    }
+
+    #[test]
+    fn close_after_write_shutdown_preserves_fin_or_resets_unread_data() {
+        for passive in [false, true] {
+            let (mut a, _) = pair(config(16, 8), 100);
+            if passive {
+                inject(&mut a, 40, Seq(901), Seq(101), ACK | FIN, 16, b"");
+            }
+            a.shutdown().unwrap();
+            packet(&mut a, 50);
+            if !passive {
+                inject(&mut a, 60, Seq(901), Seq(101), ACK | FIN, 16, b"");
+                packet(&mut a, 60); // Drain the FIN acknowledgment before close.
+            }
+            let state = if passive {
+                State::LastAck
+            } else {
+                State::Closing
+            };
+            assert_eq!(a.state(), state);
+            a.close().unwrap();
+            a.close().unwrap();
+            assert_eq!(a.state(), state);
+            assert_eq!(a.snd_nxt, Seq(102));
+            assert_eq!(a.transmit(70, &mut [0; 128]), Ok(None));
+        }
+        for phase in 0..3 {
+            for unread in [false, true] {
+                let (mut a, _) = pair(config(16, 8), 100);
+                a.shutdown().unwrap();
+                if phase >= 1 {
+                    let bytes = packet(&mut a, 40);
+                    assert_ne!(
+                        wire::parse(ip(tuple()), &bytes).unwrap().header.flags & FIN,
+                        0
+                    );
+                    assert_eq!(a.state(), State::FinWait1);
+                }
+                if phase == 2 {
+                    inject(&mut a, 50, Seq(901), Seq(102), ACK, 16, b"");
+                    assert_eq!(a.state(), State::FinWait2);
+                }
+                if unread {
+                    let ack = a.snd_nxt;
+                    inject(&mut a, 60, Seq(901), ack, ACK, 16, b"x");
+                }
+                let state = a.state();
+                let next = a.snd_nxt;
+                a.close().unwrap();
+                assert_eq!(a.read(&mut [0]), Err(Error::InvalidState));
+                if unread {
+                    assert_eq!(a.state(), State::Closed);
+                    assert_eq!(a.close_reason(), Some(CloseReason::Aborted));
+                    let bytes = packet(&mut a, 70);
+                    assert_ne!(
+                        wire::parse(ip(tuple()), &bytes).unwrap().header.flags & RST,
+                        0
+                    );
+                } else {
+                    assert_eq!(a.state(), state);
+                    assert_eq!(a.snd_nxt, next);
+                    a.close().unwrap();
+                    if phase == 0 {
+                        let bytes = packet(&mut a, 70);
+                        assert_ne!(
+                            wire::parse(ip(tuple()), &bytes).unwrap().header.flags & FIN,
+                            0
+                        );
+                    }
+                    assert_eq!(a.snd_nxt, Seq(102));
+                    assert_eq!(a.transmit(70, &mut [0; 128]), Ok(None));
+                }
+            }
+        }
     }
 
     #[test]

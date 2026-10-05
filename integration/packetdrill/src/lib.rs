@@ -603,11 +603,6 @@ impl Owner {
                             self.endpoint.state(id).map_err(error)?,
                             State::Closed | State::TimeWait
                         ) {
-                            if socket.write_shutdown {
-                                return Err(unsupported(
-                                    "close after SHUT_WR before terminal state",
-                                ));
-                            }
                             self.endpoint.close(id).map_err(error)?;
                         }
                         self.detached.push_back(id);
