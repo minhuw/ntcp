@@ -375,7 +375,7 @@ fn profiles_emit_real_synack_scale_through_owner_thread() {
         assert_eq!(segment.options.window_scale, Some(scale));
         assert_eq!(segment.options.mss, Some(1460));
         assert_eq!(segment.options.timestamps, None);
-        assert_eq!(segment.raw_options, &[2, 4, 5, 180, 3, 3, scale, 0]);
+        assert_eq!(segment.raw_options, &[2, 4, 5, 180, 1, 3, 3, scale]);
     }
 }
 

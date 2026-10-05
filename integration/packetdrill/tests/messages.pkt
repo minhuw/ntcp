@@ -7,7 +7,7 @@
 +0 bind(3, ..., ...) = 0
 +0 listen(3, 1) = 0
 +0 < S 0:0(0) win 65535 <mss 1460,nop,wscale 0>
-+0 > S. 0:0(0) ack 1 win 65535 <mss 1460,wscale 0,eol>
++0 > S. 0:0(0) ack 1 win 65535 <mss 1460,nop,wscale 0>
 +0 < . 1:1(0) ack 1 win 65535
 +0 accept(3, ..., ...) = 4
 +0 sendmsg(4, {msg_name(...)=..., msg_iov(2)=[{..., 2}, {..., 2}], msg_flags=0}, 0) = 4
