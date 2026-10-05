@@ -1,0 +1,22 @@
+--ip_version=ipv4
+--local_ip=192.0.2.1
+--remote_ip=192.0.2.2
+
+0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
++0 setsockopt(3, IPPROTO_TCP, TCP_NODELAY, [1], 4) = 0
++0...0.010 connect(3, ..., ...) = 0
++0 > S 0:0(0) win 65535 <mss 1460,wscale 0,eol>
++.01 < S. 0:0(0) ack 1 win 65535 <mss 1460,nop,wscale 0>
++0 > . 1:1(0) ack 1 win 65535
++0 fcntl(3, F_SETFL, O_RDWR|O_NONBLOCK) = 0
++0 recv(3, ..., 4, 0) = -1 EAGAIN (Resource temporarily unavailable)
++0 poll([{fd=3, events=POLLIN|POLLOUT, revents=POLLOUT}], 1, 0) = 1
++0 send(3, ..., 4, 0) = 4
++0 > P. 1:5(4) ack 1 win 65535
++0 < . 1:1(0) ack 5 win 65535
++0 < R. 1:1(0) ack 5 win 65535
++0 poll([{fd=3, events=POLLOUT, revents=POLLOUT|POLLERR|POLLHUP}], 1, 0) = 1
++0 read(3, ..., 4) = -1 ECONNRESET (Connection reset by peer)
++0 poll([{fd=3, events=POLLOUT, revents=POLLOUT|POLLHUP}], 1, 0) = 1
++0 send(3, ..., 1, MSG_NOSIGNAL) = -1 EPIPE (Broken pipe)
++0 close(3) = 0

@@ -1,0 +1,13 @@
+[package]
+name = "ntcp-packetdrill"
+version = "0.0.1"
+edition = "2024"
+publish = false
+license = "GPL-2.0-or-later"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ntcp = { path = "../..", version = "0.0.1" }
+libc = "0.2"

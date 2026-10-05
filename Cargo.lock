@@ -82,6 +82,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ntcp-packetdrill"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "ntcp",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

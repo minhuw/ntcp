@@ -1,0 +1,27 @@
+--ip_version=ipv4
+--local_ip=192.0.2.1
+--remote_ip=192.0.2.2
+
+0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
++0 bind(3, ..., ...) = 0
++0 listen(3, 1) = 0
++0...0.020 accept(3, ..., ...) = 4
++.01 < S 0:0(0) win 65535 <mss 1460,nop,wscale 0>
++0 > S. 0:0(0) ack 1 win 65535 <mss 1460,wscale 0,eol>
++.01 < . 1:1(0) ack 1 win 65535
++0...0.010 read(4, ..., 4) = 4
++.01 < P. 1:5(4) ack 1 win 65535
++.2 > . 1:1(0) ack 5 win 65531
++0 shutdown(4, SHUT_WR) = 0
++0 > F. 1:1(0) ack 5 win 65531
++0 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 0) = 1
++0 send(4, ..., 1, MSG_NOSIGNAL) = -1 EPIPE (Broken pipe)
++0 < F. 5:5(0) ack 2 win 65535
++0 > . 2:2(0) ack 6 win 0
++0 read(4, ..., 4) = 0
++0 poll([{fd=4, events=POLLIN|POLLOUT, revents=POLLIN|POLLOUT|POLLHUP}], 1, 0) = 1
++0 read(4, ..., 4) = 0
++0 poll([{fd=4, events=POLLIN, revents=POLLIN|POLLHUP}], 1, 0) = 1
++0 poll([{fd=4, events=0, revents=POLLHUP}], 1, 0) = 1
++0 close(4) = 0
++0 close(3) = 0

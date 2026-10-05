@@ -8,7 +8,11 @@ repository = "https://github.com/minhuw/ntcp"
 readme = "README.md"
 keywords = ["tcp", "networking", "event-driven"]
 categories = ["network-programming"]
-include = ["src/**", "examples/**", "tests/**", "Cargo.toml", "README.md", "LICENSE"]
+include = ["/src/**", "/examples/**", "/tests/**", "/Cargo.toml", "/README.md", "/LICENSE"]
+
+[workspace]
+members = ["integration/packetdrill"]
+resolver = "3"
 
 [dependencies]
 hmac = { version = "0.12", default-features = false }
