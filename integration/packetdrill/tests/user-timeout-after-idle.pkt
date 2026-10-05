@@ -1,0 +1,13 @@
+--ip_version=ipv4
+--local_ip=192.0.2.1
+--remote_ip=192.0.2.2
+
+0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
++0...0.010 connect(3, ..., ...) = 0
++0 > S 0:0(0) win 65535 <mss 1460,nop,wscale 0>
++.01 < S. 0:0(0) ack 1 win 0 <mss 1460,nop,wscale 0>
++0 > . 1:1(0) ack 1 win 65535
++0 setsockopt(3, SOL_TCP, TCP_USER_TIMEOUT, [100], 4) = 0
++.2 write(3, ..., 4) = 4
++0...0.100 read(3, ..., 1) = -1 ETIMEDOUT (Connection timed out)
++.1 close(3) = 0

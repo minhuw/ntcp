@@ -357,9 +357,7 @@ impl Owner {
     fn run(&mut self, rx: Receiver<Request>, stop: &AtomicBool) {
         while !stop.load(Ordering::Acquire) {
             let now = self.now();
-            if self.endpoint.next_deadline().is_some_and(|d| d <= now)
-                && self.endpoint.on_timeout(now, BUDGET).is_err()
-            {
+            if self.endpoint.on_timeout(now, BUDGET).is_err() {
                 diagnostic("FAILURE", "endpoint timeout processing failed");
                 break;
             }
@@ -408,7 +406,7 @@ impl Owner {
             }
             for _ in 0..self.pending.len().min(BUDGET) {
                 let mut request = self.pending.pop_front().unwrap();
-                match self.execute(&mut request) {
+                match self.execute_at_now(&mut request) {
                     Ok(Some(response)) => {
                         let _ = request.reply.send(Ok(response));
                     }
@@ -431,7 +429,7 @@ impl Owner {
                         let _ = request.reply.send(Err(EAGAIN));
                         continue;
                     }
-                    match self.execute(&mut request) {
+                    match self.execute_at_now(&mut request) {
                         Ok(Some(response)) => {
                             let _ = request.reply.send(Ok(response));
                         }
@@ -476,6 +474,12 @@ impl Owner {
                 }
             }
         }
+    }
+    fn execute_at_now(&mut self, r: &mut Request) -> Result<Option<Response>> {
+        // Application operations must not inherit the clock of an old packet.
+        // Budget zero advances time without bypassing the loop's timeout budget.
+        self.endpoint.on_timeout(self.now(), 0).map_err(error)?;
+        self.execute(r)
     }
     fn execute(&mut self, r: &mut Request) -> Result<Option<Response>> {
         let mut response = Response::default();
