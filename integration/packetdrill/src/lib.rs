@@ -75,7 +75,7 @@ impl Socket {
             cloexec: flags & SOCK_CLOEXEC != 0,
             reuse: false,
             nodelay: false,
-            user_timeout_ms: default_user_timeout_ms(),
+            user_timeout_ms: 0,
             readable: Some(false),
             acceptable: Some(false),
             error: 0,
@@ -85,10 +85,12 @@ impl Socket {
         }
     }
 }
-fn default_user_timeout_ms() -> i32 {
-    i32::try_from(ntcp::ConnectionConfig::default().user_timeout_us / 1000).unwrap()
-}
 fn user_timeout_us(milliseconds: i32) -> Result<u64> {
+    // The socket value 0 selects the default policy; it does not mean zero
+    // protocol timeout, and getsockopt must still report the configured 0.
+    if milliseconds == 0 {
+        return Ok(ntcp::ConnectionConfig::default().user_timeout_us);
+    }
     u64::try_from(milliseconds)
         .ok()
         .and_then(|ms| ms.checked_mul(1000))
@@ -669,11 +671,7 @@ impl Owner {
                             socket.nodelay = r.b != 0;
                         }
                         5 => {
-                            let milliseconds = if r.b == 0 {
-                                default_user_timeout_ms()
-                            } else {
-                                r.b
-                            };
+                            let milliseconds = r.b;
                             let timeout = user_timeout_us(milliseconds)?;
                             if let Handle::Connection(id) = socket.handle {
                                 self.endpoint.set_user_timeout(id, timeout).map_err(error)?;
@@ -713,12 +711,28 @@ impl Owner {
                             None => p.revents = POLLNVAL,
                             Some(s) => {
                                 if p.events & POLLIN != 0 {
-                                    let ready = if matches!(s.handle, Handle::Listener(_)) {
-                                        s.acceptable
-                                    } else {
-                                        s.readable
+                                    let ready = match s.handle {
+                                        Handle::Connection(id) => Some(
+                                            self.endpoint.readable_bytes(id).map_err(error)? != 0
+                                                || matches!(
+                                                    self.endpoint.state(id).map_err(error)?,
+                                                    State::CloseWait
+                                                        | State::Closing
+                                                        | State::LastAck
+                                                        | State::TimeWait
+                                                        | State::Closed
+                                                ),
+                                        ),
+                                        Handle::Listener(_) => s.acceptable,
+                                        Handle::Fresh => s.readable,
                                     };
-                                    if ready.ok_or_else(|| unsupported("poll read readiness after accept/exact-sized read is not exposed by ntcp"))? { p.revents |= POLLIN; }
+                                    if ready.ok_or_else(|| {
+                                        unsupported(
+                                            "poll readiness is not exposed for this socket state",
+                                        )
+                                    })? {
+                                        p.revents |= POLLIN;
+                                    }
                                 }
                                 if let Handle::Connection(id) = s.handle
                                     && p.events & POLLOUT != 0

@@ -238,7 +238,7 @@ void ntcp_abi_check(void *u) {
     assert(p.getsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, NULL) == -1 && errno == EFAULT);
     value = 0;
     assert(p.setsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, sizeof(value)) == 0);
-    assert(p.getsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, &size) == 0 && value == 300000);
+    assert(p.getsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, &size) == 0 && value == 0);
     size = 1; unsigned char byte = 0;
     assert(p.getsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &byte, &size) == 0 && size == 1 && byte == ((unsigned char *)&value)[0]);
     assert(p.close(u, fd) == 0);

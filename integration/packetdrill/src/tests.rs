@@ -421,9 +421,13 @@ fn execute_value(owner: &mut Owner, op: i32, fd: i32, key: i32, value: i32) -> R
 fn user_timeout_preconnect_updates_reset_and_deadlines() {
     let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
     let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
-    assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(300000));
+    assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(0));
     assert_eq!(execute_value(&mut owner, 11, fd, 5, -1), Err(EINVAL));
-    assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(300000));
+    assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(0));
+    assert_eq!(
+        user_timeout_us(0),
+        Ok(ntcp::ConnectionConfig::default().user_timeout_us)
+    );
     execute_value(&mut owner, 11, fd, 5, i32::MAX).unwrap();
     assert_eq!(user_timeout_us(i32::MAX), Ok(2_147_483_647_000));
     execute_value(&mut owner, 11, fd, 5, 1234).unwrap();
@@ -470,7 +474,7 @@ fn user_timeout_preconnect_updates_reset_and_deadlines() {
     execute_value(&mut owner, 11, fd, 5, 1).unwrap();
     assert_eq!(owner.endpoint.next_deadline(), Some(established_at + 1000));
     execute_value(&mut owner, 11, fd, 5, 0).unwrap();
-    assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(300000));
+    assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(0));
     assert!(owner.endpoint.next_deadline().unwrap() > established_at + 1000);
     assert_eq!(execute_value(&mut owner, 11, fd, 99, 1), Err(ENOSYS));
     assert_eq!(execute_value(&mut owner, 17, -1, 0, 0), Err(EBADF));
