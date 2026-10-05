@@ -31,6 +31,53 @@ mod linux {
         io::Error::other(format!("TCP engine: {error:?}"))
     }
 
+    fn fill_secret(mut read: impl FnMut(&mut [u8]) -> io::Result<usize>) -> io::Result<[u8; 32]> {
+        let mut secret = [0; 32];
+        let mut filled = 0;
+        while filled < secret.len() {
+            match read(&mut secret[filled..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "getrandom made no progress",
+                    ));
+                }
+                Ok(count) if count <= secret.len() - filled => filled += count,
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "getrandom returned an invalid length",
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(secret)
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1
+    //= type=implementation
+    //= reason=Bounded evidence: initialized OS CSPRNG acquisition with error propagation, combined with core HMAC key dependence; tests do not prove entropy or confidentiality.
+    //# F() MUST NOT be computable from the outside (MUST-9), or
+    //# an attacker could still guess at sequence numbers from the ISN used
+    //# for some other connection.
+
+    // The runtime must provide a confidential, unpredictable key. Flags 0 waits
+    // for Linux's CSPRNG to initialize; errors abort startup without fallback.
+    fn acquire_secret() -> io::Result<[u8; 32]> {
+        fill_secret(|buffer| {
+            // SAFETY: buffer is exclusively borrowed and writable for exactly
+            // buffer.len() bytes throughout the syscall; getrandom retains no pointer.
+            let count = unsafe { libc::getrandom(buffer.as_mut_ptr().cast(), buffer.len(), 0) };
+            if count < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(count as usize)
+            }
+        })
+    }
+
     fn checksum(bytes: &[u8]) -> u16 {
         let mut sum = 0u32;
         for pair in bytes.chunks(2) {
@@ -401,15 +448,7 @@ mod linux {
             Err(std::env::VarError::NotPresent) => false,
             _ => return Err(invalid("NTCP_TIMESTAMPS must be exactly 1 or unset")),
         };
-        let mut secret = [0u8; 32];
-        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1
-        //# F() MUST NOT be computable from the outside (MUST-9), or
-        //# an attacker could still guess at sequence numbers from the ISN used
-        //# for some other connection.
-
-        // Traceability limitation: This adapter supplies OS randomness; other
-        // embeddings must supply their own unpredictable secret.
-        File::open("/dev/urandom")?.read_exact(&mut secret)?;
+        let secret = acquire_secret()?;
         let mut tun = open_tun(&args[1])?;
         let start = Instant::now();
         let config = EndpointConfig {
@@ -577,6 +616,83 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1
+        //= type=test
+        //= reason=Bounded evidence: full/partial fills, EINTR, zero progress, error propagation and live initialized OS CSPRNG acquisition complement core isn_depends_on_secret_and_each_tuple_component HMAC key-dependence coverage; tests do not prove entropy or confidentiality.
+        //# F() MUST NOT be computable from the outside (MUST-9), or
+        //# an attacker could still guess at sequence numbers from the ISN used
+        //# for some other connection.
+        #[test]
+        fn secret_acquisition() {
+            let secret = fill_secret(|buffer| {
+                assert_eq!(buffer.len(), 32);
+                buffer.fill(0xa5);
+                Ok(buffer.len())
+            })
+            .unwrap();
+            assert_eq!(secret, [0xa5; 32]);
+
+            let mut calls = 0;
+            let secret = fill_secret(|buffer| {
+                calls += 1;
+                match calls {
+                    1 => {
+                        assert_eq!(buffer.len(), 32);
+                        buffer[..7].fill(0x11);
+                        Ok(7)
+                    }
+                    2 => {
+                        assert_eq!(buffer.len(), 25);
+                        Err(io::Error::from_raw_os_error(libc::EINTR))
+                    }
+                    3 => {
+                        assert_eq!(buffer.len(), 25);
+                        buffer.fill(0x22);
+                        Ok(buffer.len())
+                    }
+                    _ => panic!("read after full fill"),
+                }
+            })
+            .unwrap();
+            assert_eq!(calls, 3);
+            assert_eq!(&secret[..7], &[0x11; 7]);
+            assert_eq!(&secret[7..], &[0x22; 25]);
+
+            for errno in [libc::EIO, libc::ENOSYS, libc::EAGAIN] {
+                let mut calls = 0;
+                let error = fill_secret(|buffer| {
+                    calls += 1;
+                    match calls {
+                        1 => {
+                            buffer[..1].fill(0x33);
+                            Ok(1)
+                        }
+                        2 => Err(io::Error::from_raw_os_error(errno)),
+                        _ => panic!("retried hard error"),
+                    }
+                })
+                .unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(errno));
+                assert_eq!(calls, 2);
+            }
+            for (count, kind) in [
+                (0, io::ErrorKind::UnexpectedEof),
+                (33, io::ErrorKind::InvalidData),
+            ] {
+                let mut calls = 0;
+                let error = fill_secret(|_| {
+                    calls += 1;
+                    assert_eq!(calls, 1, "retried invalid progress");
+                    Ok(count)
+                })
+                .unwrap_err();
+                assert_eq!(error.kind(), kind);
+            }
+
+            // Exercise the real OS path, not a statistical entropy test.
+            let _secret = acquire_secret().unwrap();
+        }
 
         #[test]
         fn enabled_option_profile_header_mtu_and_timestamp_roundtrip() {
