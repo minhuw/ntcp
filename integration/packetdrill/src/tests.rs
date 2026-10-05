@@ -162,8 +162,10 @@ fn pending_accept_does_not_block_packets_and_stop_joins() {
         ntcp::wire::parse(ip, tcp).unwrap().header.flags,
         ntcp::wire::SYN | ntcp::wire::ACK
     );
+    let inode = identity(fd).unwrap();
     let before = Instant::now();
     drop(adapter);
+    assert_ne!(identity(fd), Some(inode));
     assert!(before.elapsed() < Duration::from_secs(1));
     assert_eq!(
         waiting.recv_timeout(Duration::from_secs(1)).unwrap().err(),
@@ -174,14 +176,15 @@ fn pending_accept_does_not_block_packets_and_stop_joins() {
 #[test]
 fn descriptor_and_request_limits_fail_without_hanging() {
     let adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
+    let mut fds = Vec::new();
     for _ in 0..LIMIT {
-        call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap();
+        fds.push(call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap().value as i32);
     }
     assert_eq!(
         call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).err(),
         Some(EMFILE)
     );
-    call(&adapter, 8, 10000, 0, vec![], 0).unwrap();
+    call(&adapter, 8, fds[0], 0, vec![], 0).unwrap();
     assert!(call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).is_ok());
     assert_eq!(call(&adapter, 6, -1, 0, vec![], 10).err(), Some(EBADF));
     let (tx, _rx) = mpsc::sync_channel(1);
@@ -563,4 +566,113 @@ fn listener_timeout_inheritance_and_queued_payload_gap_urgent_fin() {
     assert_eq!(execute_value(&mut owner, 17, fd, 0, 0), Ok(0));
     assert_eq!(owner.execute(&mut read).unwrap().unwrap().value, 0);
     assert_eq!(execute_value(&mut owner, 17, fd, 0, 0), Ok(0));
+}
+
+fn identity(fd: i32) -> Option<(dev_t, ino_t)> {
+    let mut info: stat = unsafe { std::mem::zeroed() };
+    (unsafe { fstat(fd, &mut info) } == 0).then_some((info.st_dev, info.st_ino))
+}
+
+#[test]
+fn token_explicit_close_host_close_and_foreign_replacement() {
+    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let fd = owner.alloc(Socket::new(0)).unwrap();
+    let inode = identity(fd).unwrap();
+    let retained = owner.sockets[&fd]
+        .token
+        .as_ref()
+        .unwrap()
+        .retained
+        .as_raw_fd();
+    assert_eq!(identity(retained), Some(inode));
+    execute_value(&mut owner, 8, fd, 0, 0).unwrap();
+    assert_ne!(identity(fd), Some(inode));
+    assert_ne!(identity(retained), Some(inode));
+    assert_eq!(execute_value(&mut owner, 8, fd, 0, 0), Err(EBADF));
+
+    let token = Token::new().unwrap();
+    let inode = identity(token.fd).unwrap();
+    let retained = token.retained.as_raw_fd();
+    unsafe {
+        assert_eq!(libc::close(token.fd), 0);
+    }
+    assert_eq!(identity(retained), Some(inode));
+    drop(token);
+    assert_ne!(identity(retained), Some(inode));
+
+    let fd = owner.alloc(Socket::new(0)).unwrap();
+    let foreign = std::fs::File::open("/dev/null").unwrap();
+    assert_eq!(
+        execute_value(&mut owner, 8, foreign.as_raw_fd(), 0, 0),
+        Err(EBADF)
+    );
+    // dup2 atomically models host close followed by reuse, avoiding a test race
+    // with other tests' allocations in the freed-fd interval.
+    unsafe {
+        assert_eq!(dup2(foreign.as_raw_fd(), fd), fd);
+    }
+    let replacement = unsafe { OwnedFd::from_raw_fd(fd) };
+    assert_eq!(execute_value(&mut owner, 8, -1, 0, 0), Err(EBADF));
+    drop(owner);
+    assert_eq!(
+        identity(replacement.as_raw_fd()),
+        identity(foreign.as_raw_fd())
+    );
+}
+
+#[test]
+fn token_partial_allocation_failure_closes_first_descriptor() {
+    let mut allocated = None;
+    let result = Token::with_duplicate(|fd| {
+        allocated = Some((fd, identity(fd).unwrap()));
+        unsafe {
+            *__errno_location() = EMFILE;
+        }
+        -1
+    });
+    assert_eq!(result.err(), Some(EMFILE));
+    let (fd, inode) = allocated.unwrap();
+    assert_ne!(identity(fd), Some(inode));
+}
+
+#[test]
+fn logical_ephemeral_ports_do_not_follow_reused_os_descriptors() {
+    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let remote = encode_addr(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080));
+    for port in 40000..40004 {
+        let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
+        let (mut connect, _) = request(5, fd, 0, remote.clone(), 0);
+        assert_eq!(owner.execute(&mut connect).err(), Some(EINPROGRESS));
+        assert_eq!(owner.sockets[&fd].local.unwrap().port(), port);
+        execute_value(&mut owner, 8, fd, 0, 0).unwrap();
+    }
+    owner.next_port = 60000;
+    let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
+    let (mut connect, _) = request(5, fd, 0, remote, 0);
+    assert_eq!(owner.execute(&mut connect).err(), Some(EADDRNOTAVAIL));
+}
+
+#[test]
+fn explicit_close_cancels_pending_accept_before_descriptor_reuse() {
+    let adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
+    let fd = call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap().value as i32;
+    call(
+        &adapter,
+        2,
+        fd,
+        0,
+        encode_addr(SocketAddr::new(local().into(), 8080)),
+        0,
+    )
+    .unwrap();
+    call(&adapter, 3, fd, 1, vec![], 0).unwrap();
+    let (r, waiting) = request(4, fd, 0, vec![], 16);
+    adapter.tx.send(r).unwrap();
+    assert!(waiting.recv_timeout(Duration::from_millis(5)).is_err());
+    call(&adapter, 8, fd, 0, vec![], 0).unwrap();
+    assert_eq!(
+        waiting.recv_timeout(Duration::from_secs(1)).unwrap().err(),
+        Some(EBADF)
+    );
+    call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap();
 }

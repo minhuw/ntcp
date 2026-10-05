@@ -218,6 +218,8 @@ void ntcp_abi_check(void *u) {
     assert(p.poll(u, NULL, 1, 0) == -1 && errno == EFAULT);
     int fd = p.socket(u, AF_INET, SOCK_STREAM, IPPROTO_TCP);
     assert(fd >= 0);
+    int domain = 0; socklen_t domain_size = sizeof(domain);
+    assert(getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &domain_size) == 0 && domain == AF_UNIX);
     assert(p.fcntl(u, fd, F_GETFL) == O_RDWR);
     assert(p.fcntl(u, fd, F_SETFL, O_RDWR | O_NONBLOCK) == 0);
     assert(p.fcntl(u, fd, F_GETFL) == (O_RDWR | O_NONBLOCK));
@@ -242,6 +244,9 @@ void ntcp_abi_check(void *u) {
     size = 1; unsigned char byte = 0;
     assert(p.getsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &byte, &size) == 0 && size == 1 && byte == ((unsigned char *)&value)[0]);
     assert(p.close(u, fd) == 0);
+    // Stock socket_close uses libc, not the plugin callback, for open sockets.
+    fd = p.socket(u, AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert(fd >= 0 && close(fd) == 0);
     struct timeval tv;
     assert(p.gettimeofday(u, &tv, NULL) == 0 && tv.tv_sec > 1700000000);
     assert(p.usleep(u, 1) == 0);

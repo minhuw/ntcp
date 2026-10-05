@@ -8,6 +8,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     ffi::CStr,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
     panic::{AssertUnwindSafe, catch_unwind},
     ptr, slice,
     sync::{
@@ -51,7 +52,60 @@ enum Handle {
     Listener(ListenerId),
     Connection(ConnectionId),
 }
+// Stock packetdrill owns the exposed descriptor until explicit plugin close or
+// close_all_fds. Keep a duplicate alive so the AF_UNIX socket inode cannot be
+// recycled before we check identity. These sockets never carry TCP traffic.
+struct Token {
+    fd: i32,
+    retained: OwnedFd,
+}
+impl Token {
+    fn new() -> Result<Self> {
+        Self::with_duplicate(|fd| unsafe { fcntl(fd, F_DUPFD_CLOEXEC, 0) })
+    }
+    fn with_duplicate(duplicate: impl FnOnce(i32) -> i32) -> Result<Self> {
+        let fd = unsafe { libc::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(EIO));
+        }
+        let exposed = unsafe { OwnedFd::from_raw_fd(fd) };
+        let retained = duplicate(fd);
+        if retained < 0 {
+            return Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(EIO));
+        }
+        Ok(Self {
+            fd: exposed.into_raw_fd(),
+            retained: unsafe { OwnedFd::from_raw_fd(retained) },
+        })
+    }
+}
+impl Drop for Token {
+    fn drop(&mut self) {
+        // This check/close is NOT atomic against arbitrary host fd mutation.
+        // Pinned runner serializes explicit closes on its syscall thread and
+        // stops that thread before host close_all_fds; adapterDrop follows host
+        // cleanup. The owner never allocates/closes tokens for netdev callbacks.
+        // Thus no host close/reuse races this cleanup under that runner contract.
+        let mut live: stat = unsafe { std::mem::zeroed() };
+        let mut retained: stat = unsafe { std::mem::zeroed() };
+        unsafe {
+            if fstat(self.fd, &mut live) == 0
+                && fstat(self.retained.as_raw_fd(), &mut retained) == 0
+                && live.st_dev == retained.st_dev
+                && live.st_ino == retained.st_ino
+                && live.st_mode == retained.st_mode
+            {
+                libc::close(self.fd);
+            }
+        }
+    }
+}
 struct Socket {
+    token: Option<Token>,
     handle: Handle,
     local: Option<SocketAddr>,
     nonblock: bool,
@@ -69,6 +123,7 @@ struct Socket {
 impl Socket {
     fn new(flags: i32) -> Self {
         Self {
+            token: None,
             handle: Handle::Fresh,
             local: None,
             nonblock: flags & SOCK_NONBLOCK != 0,
@@ -99,7 +154,7 @@ fn user_timeout_us(milliseconds: i32) -> Result<u64> {
 struct Owner {
     endpoint: Endpoint,
     sockets: BTreeMap<i32, Socket>,
-    next_fd: i32,
+    next_port: u32,
     local: Ipv4Addr,
     epoch: Instant,
     output: VecDeque<Response>,
@@ -183,7 +238,17 @@ impl Adapter {
                 let result = catch_unwind(AssertUnwindSafe(|| match Owner::new(settings) {
                     Ok(mut owner) => {
                         let _ = ready_tx.send(Ok(()));
-                        owner.run(rx, &stopping);
+                        // Keep descriptor ownership alive even if the owner loop
+                        // fails: stock host cleanup still precedes adapterDrop.
+                        if catch_unwind(AssertUnwindSafe(|| owner.run(rx, &stopping))).is_err() {
+                            diagnostic("FAILURE", "endpoint owner panicked; adapter stopped");
+                            for request in owner.pending.drain(..) {
+                                let _ = request.reply.send(Err(EIO));
+                            }
+                        }
+                        while !stopping.load(Ordering::Acquire) {
+                            thread::sleep(Duration::from_millis(1));
+                        }
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -263,7 +328,7 @@ impl Owner {
         Ok(Self {
             endpoint,
             sockets: BTreeMap::new(),
-            next_fd: 10000,
+            next_port: 40000,
             local,
             epoch: Instant::now(),
             output: VecDeque::new(),
@@ -275,11 +340,17 @@ impl Owner {
         self.epoch.elapsed().as_micros() as u64
     }
     fn alloc(&mut self, socket: Socket) -> Result<i32> {
-        if self.sockets.len() == LIMIT || self.next_fd == i32::MAX {
+        if self.sockets.len() == LIMIT {
             return Err(EMFILE);
         }
-        let fd = self.next_fd;
-        self.next_fd += 1;
+        self.alloc_token(socket, Token::new()?)
+    }
+    fn alloc_token(&mut self, mut socket: Socket, token: Token) -> Result<i32> {
+        if self.sockets.len() == LIMIT || self.sockets.contains_key(&token.fd) {
+            return Err(EMFILE);
+        }
+        let fd = token.fd;
+        socket.token = Some(token);
         self.sockets.insert(fd, socket);
         Ok(fd)
     }
@@ -462,6 +533,9 @@ impl Owner {
                 let nodelay = socket.nodelay;
                 let reuse = socket.reuse;
                 let user_timeout_ms = socket.user_timeout_ms;
+                // Allocate before consuming an accepted connection: OS allocation
+                // failure must leave the connection in the listener queue.
+                let token = Token::new()?;
                 match self.endpoint.accept(id) {
                     Ok(id) => {
                         let tuple = self.endpoint.tuple(id).map_err(error)?;
@@ -477,7 +551,7 @@ impl Owner {
                         socket.user_timeout_ms = user_timeout_ms;
                         socket.readable = None;
                         socket.connected = true;
-                        response.value = self.alloc(socket)? as i64;
+                        response.value = self.alloc_token(socket, token)? as i64;
                         response.bytes = encode_addr(tuple.remote);
                         self.sockets.get_mut(&r.fd).unwrap().acceptable = None;
                     }
@@ -508,10 +582,19 @@ impl Owner {
                         }
                         Handle::Listener(_) => return Err(EINVAL),
                     }
-                    let mut local = socket.local.unwrap_or(SocketAddr::new(
-                        self.local.into(),
-                        40000 + ((r.fd - 10000) % 20000) as u16,
-                    ));
+                    let mut local = match socket.local {
+                        Some(local) => local,
+                        None => {
+                            // Logical ephemeral ports must not depend on reusable OS fds.
+                            // Never wrap and accidentally reuse a previous allocation.
+                            if self.next_port >= 60000 {
+                                return Err(EADDRNOTAVAIL);
+                            }
+                            let port = self.next_port as u16;
+                            self.next_port += 1;
+                            SocketAddr::new(self.local.into(), port)
+                        }
+                    };
                     if local.ip().is_unspecified() {
                         local.set_ip(self.local.into());
                     }
@@ -629,6 +712,15 @@ impl Owner {
                         self.detached.push_back(id);
                     }
                 }
+                // Cancel old-fd waiters before the OS can reuse this descriptor.
+                self.pending.retain(|pending| {
+                    if pending.fd == r.fd && !matches!(pending.op, 13..=15) {
+                        let _ = pending.reply.send(Err(EBADF));
+                        false
+                    } else {
+                        true
+                    }
+                });
                 self.sockets.remove(&r.fd);
             }
             9 => {
