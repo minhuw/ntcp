@@ -396,6 +396,11 @@ mod linux {
             Err(std::env::VarError::NotPresent) => options_enabled(None)?,
             Err(_) => return Err(invalid("invalid NTCP_IPV4_OPTIONS")),
         };
+        let timestamps = match std::env::var("NTCP_TIMESTAMPS") {
+            Ok(value) if value == "1" => true,
+            Err(std::env::VarError::NotPresent) => false,
+            _ => return Err(invalid("NTCP_TIMESTAMPS must be exactly 1 or unset")),
+        };
         let mut secret = [0u8; 32];
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1
         //# F() MUST NOT be computable from the outside (MUST-9), or
@@ -420,7 +425,9 @@ mod linux {
             ipv4_options_enabled,
             ipv4_subnets: vec![interface_subnet(&tun, local)?],
             error_reports: true,
+            reuse_time_wait: false,
             connection: ConnectionConfig {
+                timestamps,
                 send_capacity: 65536,
                 receive_capacity: 65536,
                 mss: 1460,

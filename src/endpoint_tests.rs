@@ -2157,3 +2157,490 @@ fn ipv4_outgoing_requests_and_received_owned_snapshot() {
     let server = b.accept(listener).unwrap();
     assert_eq!(b.received_ipv4_options(server).unwrap(), Some(options));
 }
+
+fn time_wait_endpoint(
+    mut cfg: EndpointConfig,
+) -> (
+    Endpoint,
+    ListenerId,
+    ConnectionId,
+    IpMetadata,
+    wire::Header,
+    u32,
+) {
+    let (local, remote) = addresses();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
+    cfg.reuse_time_wait = true;
+    let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let client = a.connect(0, local, remote).unwrap();
+    pump(&mut a, &mut b, 1_000);
+    let server = b.accept(listener).unwrap();
+    b.shutdown(server).unwrap();
+    pump(&mut a, &mut b, 2_000);
+    a.shutdown(client).unwrap();
+    let fin = packets(&mut a, 3_000);
+    let peer_ts = wire::parse(fin[0].0, &fin[0].1)
+        .unwrap()
+        .options
+        .timestamps
+        .map_or(0, |ts| ts.0);
+    deliver(&mut b, 3_000, fin);
+    let final_ack = packets(&mut b, 3_000);
+    assert_eq!(final_ack.len(), 1);
+    let header = wire::parse(final_ack[0].0, &final_ack[0].1).unwrap().header;
+    let incoming_ip = IpMetadata {
+        source: local.ip(),
+        destination: remote.ip(),
+    };
+    assert_eq!(b.state(server).unwrap(), State::TimeWait);
+    (b, listener, server, incoming_ip, header, peer_ts)
+}
+
+fn tw_segment(
+    ip: IpMetadata,
+    old: wire::Header,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    ts: Option<(u32, u32)>,
+) -> Vec<u8> {
+    let mut options = [1, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0];
+    if let Some((value, echo)) = ts {
+        options[4..8].copy_from_slice(&value.to_be_bytes());
+        options[8..].copy_from_slice(&echo.to_be_bytes());
+    }
+    let mut bytes = vec![0; 32];
+    let len = wire::encode(
+        ip,
+        wire::Header {
+            source_port: old.destination_port,
+            destination_port: old.source_port,
+            sequence: seq,
+            acknowledgment: ack,
+            flags,
+            window: 1024,
+            urgent_pointer: 0,
+        },
+        if ts.is_some() { &options } else { &[] },
+        &[],
+        &mut bytes,
+    )
+    .unwrap();
+    bytes.truncate(len);
+    bytes
+}
+
+// The fixture exchanges real endpoint SYN/data-control/FIN packets, not synthetic
+// state changes; reopening packets below isolate the RFC freshness boundaries.
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
+//= type=test
+//# This algorithm for reducing TIME-WAIT is a Best
+//# Current Practice that SHOULD be implemented since Timestamp Options
+//# are commonly used, and using them to reduce TIME-WAIT provides
+//# benefits for busy Internet servers (SHLD-4).
+#[test]
+fn time_wait_reuse_timestamp_and_sequence_freshness() {
+    for old_ts in [false, true] {
+        for case in 0..8 {
+            let mut cfg = config();
+            cfg.connection.timestamps = old_ts;
+            let (mut b, listener, old, ip, h, last_ts) = time_wait_endpoint(cfg);
+            let newer_seq = h.acknowledgment.wrapping_add(100);
+            let older_seq = h.acknowledgment.wrapping_sub(100);
+            let (seq, ts, expected) = match case {
+                0 => (older_seq, Some(last_ts.wrapping_add(1)), old_ts),
+                1 => (newer_seq, Some(last_ts), true),
+                2 => (older_seq, Some(last_ts), false),
+                3 => (newer_seq, Some(last_ts.wrapping_sub(1)), !old_ts),
+                4 => (newer_seq, None, true),
+                5 => (older_seq, None, false),
+                6 => (newer_seq, Some(last_ts.wrapping_add(1 << 31)), !old_ts),
+                _ => (h.acknowledgment.wrapping_add(1 << 31), None, false),
+            };
+            let syn = tw_segment(ip, h, seq, 0, wire::SYN, ts.map(|v| (v, 0)));
+            let disposition = b.input(4_000, ip, &syn).unwrap();
+            assert_eq!(
+                disposition,
+                if expected {
+                    InputDisposition::Processed
+                } else {
+                    InputDisposition::Dropped
+                },
+                "old_ts={old_ts} case={case}"
+            );
+            assert_eq!(b.state(old), Ok(State::TimeWait));
+            assert_eq!(
+                b.accept(listener),
+                Err(EndpointError::Connection(Error::WouldBlock))
+            );
+            let output = packets(&mut b, 4_000);
+            assert_eq!(output.len(), usize::from(expected));
+            if expected {
+                let synack = wire::parse(output[0].0, &output[0].1).unwrap();
+                assert_eq!(
+                    crate::seq::Seq(synack.header.sequence).serial_cmp(crate::seq::Seq(h.sequence)),
+                    Some(core::cmp::Ordering::Greater)
+                );
+                assert_eq!(
+                    synack.header.flags & (wire::SYN | wire::ACK),
+                    wire::SYN | wire::ACK
+                );
+            }
+        }
+    }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
+//= type=test
+//# However, it MAY accept a new SYN from the remote TCP endpoint to
+//# reopen the connection directly from TIME-WAIT state (MAY-2), if it:
+//#
+//# (1)  assigns its initial sequence number for the new connection to be
+//#      larger than the largest sequence number it used on the previous
+//#      connection incarnation, and
+//#
+//# (2)  returns to TIME-WAIT state if the SYN turns out to be an old
+//#      duplicate.
+#[test]
+fn time_wait_duplicate_rollback_preserves_deadline_released_and_retained_handles() {
+    for released in [false, true] {
+        let mut cfg = config();
+        cfg.connection.timestamps = true;
+        let (mut b, listener, old, ip, h, ts) = time_wait_endpoint(cfg);
+        let baseline = b.buffer_bytes();
+        if released {
+            b.release(old).unwrap();
+        }
+        let seq = h.acknowledgment.wrapping_add(100);
+        let syn = tw_segment(ip, h, seq, 0, wire::SYN, Some((ts + 1, 0)));
+        b.input(4_000, ip, &syn).unwrap();
+        assert_eq!(b.buffer_bytes(), baseline * 2);
+        let output = packets(&mut b, 4_000);
+        let new_iss = wire::parse(output[0].0, &output[0].1)
+            .unwrap()
+            .header
+            .sequence;
+        // An old SYN's originator rejects the unexpected SYNACK. RST deliberately
+        // has no timestamps: RFC 7323 forbids applying PAWS to it.
+        let rst = tw_segment(ip, h, seq + 1, new_iss + 1, wire::RST, None);
+        b.input(5_000, ip, &rst).unwrap();
+        assert_eq!(
+            b.accept(listener),
+            Err(EndpointError::Connection(Error::WouldBlock))
+        );
+        packets(&mut b, 5_000);
+        assert_eq!(b.buffer_bytes(), baseline);
+        let tuple = Tuple {
+            local: addresses().1,
+            remote: addresses().0,
+        };
+        assert_eq!(
+            b.connect(5_000, tuple.local, tuple.remote),
+            Err(EndpointError::AddressInUse)
+        );
+        b.on_timeout(240_002_999, 64).unwrap();
+        assert_eq!(
+            b.connect(240_002_999, tuple.local, tuple.remote),
+            Err(EndpointError::AddressInUse)
+        );
+        b.on_timeout(240_003_000, 64).unwrap();
+        packets(&mut b, 240_003_000);
+        if released {
+            assert_eq!(b.state(old), Err(EndpointError::InvalidHandle));
+            assert_eq!(b.buffer_bytes(), 0);
+        } else {
+            assert_eq!(b.state(old), Ok(State::Closed));
+        }
+        assert!(b.connect(240_003_000, tuple.local, tuple.remote).is_ok());
+    }
+}
+
+#[test]
+fn time_wait_old_expiry_and_slot_generation_do_not_remove_or_restore_replacement() {
+    for establish in [false, true] {
+        let mut cfg = config();
+        cfg.connection.timestamps = true;
+        let (mut b, listener, old, ip, h, ts) = time_wait_endpoint(cfg);
+        let baseline = b.buffer_bytes();
+        b.release(old).unwrap();
+        let seq = h.acknowledgment.wrapping_add(100);
+        let syn = tw_segment(ip, h, seq, 0, wire::SYN, Some((ts + 1, 0)));
+        b.input(240_002_000, ip, &syn).unwrap();
+        let output = packets(&mut b, 240_002_000);
+        let new_iss = wire::parse(output[0].0, &output[0].1)
+            .unwrap()
+            .header
+            .sequence;
+        b.on_timeout(240_003_000, 64).unwrap();
+        packets(&mut b, 240_003_000);
+        assert_eq!(b.buffer_bytes(), baseline);
+        assert_eq!(b.state(old), Err(EndpointError::InvalidHandle));
+        // Reuse the expired slot for another tuple before candidate resolution.
+        let spare = b
+            .connect(
+                240_003_000,
+                "192.0.2.2:8081".parse().unwrap(),
+                addresses().0,
+            )
+            .unwrap();
+        let resolution = tw_segment(
+            ip,
+            h,
+            seq + 1,
+            new_iss.wrapping_add(1),
+            if establish { wire::ACK } else { wire::RST },
+            Some((ts + 2, 240002)),
+        );
+        b.input(240_003_001, ip, &resolution).unwrap();
+        packets(&mut b, 240_003_001);
+        assert_eq!(b.state(spare), Ok(State::SynSent));
+        if establish {
+            let child = b.accept(listener).unwrap();
+            assert_eq!(b.state(child), Ok(State::Established));
+            assert_ne!(child, old);
+            assert_eq!(
+                b.connect(240_003_001, addresses().1, addresses().0),
+                Err(EndpointError::AddressInUse)
+            );
+        } else {
+            assert_eq!(
+                b.accept(listener),
+                Err(EndpointError::Connection(Error::WouldBlock))
+            );
+            assert!(b.connect(240_003_001, addresses().1, addresses().0).is_ok());
+        }
+    }
+}
+
+#[test]
+fn time_wait_reuse_capacity_and_listener_pressure_leave_old_record_unchanged() {
+    for pressure in 0..4 {
+        let mut cfg = config();
+        cfg.connection.timestamps = true;
+        if pressure == 0 {
+            cfg.max_connections = 4;
+        }
+        if pressure == 1 {
+            cfg.max_buffer_bytes = 5 * 1024 + 64;
+        }
+        let (mut b, listener, old, ip, h, ts) = time_wait_endpoint(cfg);
+        if pressure == 0 {
+            for port in 8081..8084 {
+                b.connect(
+                    3_000,
+                    core::net::SocketAddr::new(ip.destination, port),
+                    addresses().0,
+                )
+                .unwrap();
+            }
+        }
+        if pressure == 2 {
+            b.close_listener(listener).unwrap();
+        }
+        if pressure == 3 {
+            for port in 40001..40005 {
+                let mut header = h;
+                header.destination_port = port;
+                let syn = tw_segment(ip, header, 99, 0, wire::SYN, Some((4, 0)));
+                b.input(3_000, ip, &syn).unwrap();
+            }
+        }
+        packets(&mut b, 3_000);
+        let bytes = b.buffer_bytes();
+        let syn = tw_segment(
+            ip,
+            h,
+            h.acknowledgment + 100,
+            0,
+            wire::SYN,
+            Some((ts + 1, 0)),
+        );
+        assert_eq!(b.input(4_000, ip, &syn).unwrap(), InputDisposition::Dropped);
+        assert_eq!(b.buffer_bytes(), bytes);
+        assert_eq!(b.state(old), Ok(State::TimeWait));
+        assert!(packets(&mut b, 4_000).is_empty());
+    }
+}
+
+#[test]
+fn timestamps_two_endpoints_reopen_and_transfer_after_time_wait() {
+    let mut cfg = config();
+    cfg.connection.timestamps = true;
+    cfg.reuse_time_wait = true;
+    let (local, remote) = addresses();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let first = a.connect(0, local, remote).unwrap();
+    pump(&mut a, &mut b, 1_000);
+    let old = b.accept(listener).unwrap();
+    b.write(old, b"old stream").unwrap();
+    b.shutdown(old).unwrap();
+    pump(&mut a, &mut b, 2_000);
+    a.shutdown(first).unwrap();
+    pump(&mut a, &mut b, 3_000);
+    assert_eq!(b.state(old), Ok(State::TimeWait));
+    a.release(first).unwrap();
+    b.release(old).unwrap();
+    let second = a.connect(10_000, local, remote).unwrap();
+    pump(&mut a, &mut b, 11_000);
+    let new = b.accept(listener).unwrap();
+    assert_ne!(old, new);
+    assert_eq!(a.state(second), Ok(State::Established));
+    a.write(second, b"new stream").unwrap();
+    pump(&mut a, &mut b, 12_000);
+    let mut bytes = [0; 16];
+    assert_eq!(b.read(new, &mut bytes), Ok(10));
+    assert_eq!(&bytes[..10], b"new stream");
+    b.on_timeout(240_003_000, 64).unwrap();
+    packets(&mut b, 240_003_000);
+    assert_eq!(b.state(new), Ok(State::Established));
+    assert_eq!(b.state(old), Err(EndpointError::InvalidHandle));
+}
+
+#[test]
+fn time_wait_pending_candidate_timeout_restores_original_tuple() {
+    let mut cfg = config();
+    cfg.connection.timestamps = true;
+    cfg.connection.user_timeout_us = 180_000_000;
+    let (mut b, listener, old, ip, h, ts) = time_wait_endpoint(cfg);
+    let baseline = b.buffer_bytes();
+    let syn = tw_segment(
+        ip,
+        h,
+        h.acknowledgment.wrapping_add(100),
+        0,
+        wire::SYN,
+        Some((ts + 1, 0)),
+    );
+    b.input(4_000, ip, &syn).unwrap();
+    packets(&mut b, 4_000);
+    b.on_timeout(180_004_000, 64).unwrap();
+    packets(&mut b, 180_004_000);
+    assert_eq!(b.buffer_bytes(), baseline);
+    assert_eq!(b.state(old), Ok(State::TimeWait));
+    assert_eq!(
+        b.accept(listener),
+        Err(EndpointError::Connection(Error::WouldBlock))
+    );
+    assert_eq!(
+        b.connect(180_004_000, addresses().1, addresses().0),
+        Err(EndpointError::AddressInUse)
+    );
+    assert_eq!(b.next_deadline(), Some(240_003_000));
+}
+
+#[test]
+fn timestamps_endpoint_config_and_control_reset_budgets() {
+    let mut cfg = config();
+    cfg.connection.timestamps = true;
+    cfg.connection.send_ip_payload_limit = 39;
+    assert!(matches!(
+        Endpoint::new(cfg.clone(), [1; 32], 0),
+        Err(EndpointError::Connection(Error::InvalidArgument))
+    ));
+    cfg.connection.send_ip_payload_limit = 40;
+    let mut b = Endpoint::new(cfg, [1; 32], 0).unwrap();
+    let (local, remote) = addresses();
+    let ip = IpMetadata {
+        source: local.ip(),
+        destination: remote.ip(),
+    };
+    let h = wire::Header {
+        source_port: remote.port(),
+        destination_port: local.port(),
+        sequence: 0,
+        acknowledgment: 0,
+        flags: 0,
+        window: 0,
+        urgent_pointer: 0,
+    };
+    let syn = tw_segment(ip, h, 123, 0, wire::SYN, Some((77, 0)));
+    b.input(1_000, ip, &syn).unwrap();
+    assert!(b.poll_transmit(1_000, &mut [0; 31], 16).is_err());
+    let reset = packets(&mut b, 1_000);
+    assert_eq!(reset.len(), 1);
+    let reset = wire::parse(reset[0].0, &reset[0].1).unwrap();
+    assert_eq!(reset.options.timestamps, Some((0, 77)));
+    assert_eq!(reset.header.flags, wire::RST | wire::ACK);
+}
+
+#[test]
+fn timestamp_ipv4_option_budget_and_paws_gate_route_updates() {
+    let (local, remote) = addresses();
+    let mut cfg = config();
+    cfg.connection.timestamps = true;
+    cfg.ipv4_options_enabled = true;
+    cfg.connection.send_ip_payload_limit = 79;
+    assert!(matches!(
+        Endpoint::new(cfg.clone(), [1; 32], 0),
+        Err(EndpointError::Connection(Error::InvalidArgument))
+    ));
+    cfg.connection.send_ip_payload_limit = 80;
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let client = a.connect(0, local, remote).unwrap();
+    let route = completed_route(&[8, 9]);
+    let (syn, bytes) = option_packet(&mut a, 1_000);
+    assert_eq!(syn.len, 40);
+    b.input_with_ipv4_options(1_000, syn.ip, 0, route, &bytes)
+        .unwrap();
+    let (synack, bytes) = option_packet(&mut b, 1_000);
+    assert_eq!(synack.len, 40);
+    a.input(1_000, synack.ip, &bytes).unwrap();
+    let (ack, bytes) = option_packet(&mut a, 1_000);
+    b.input_with_ipv4_options(1_000, ack.ip, 0, route, &bytes)
+        .unwrap();
+    let server = b.accept(listener).unwrap();
+    let header = wire::parse(ack.ip, &bytes).unwrap().header;
+    let changed = completed_route(&[10, 11]);
+    for (value, accepted) in [(0u32, false), (2, true)] {
+        let mut options = [1, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 1];
+        options[4..8].copy_from_slice(&value.to_be_bytes());
+        let mut packet = [0; 32];
+        let n = wire::encode(ack.ip, header, &options, &[], &mut packet).unwrap();
+        b.input_with_ipv4_options(2_000, ack.ip, 0, changed, &packet[..n])
+            .unwrap();
+        assert_eq!(
+            b.received_ipv4_options(server).unwrap(),
+            Some(if accepted { changed } else { route })
+        );
+    }
+    a.write(client, &[42; 64]).unwrap();
+    for (ip, bytes) in packets(&mut a, 2_000) {
+        assert!(bytes.len() <= 40);
+        let segment = wire::parse(ip, &bytes).unwrap();
+        assert!(segment.payload.len() <= 8);
+        assert!(segment.options.timestamps.is_some());
+    }
+}
+
+#[test]
+fn time_wait_reuse_keeps_new_syn_return_route_and_timestamp_options() {
+    let mut cfg = config();
+    cfg.connection.timestamps = true;
+    cfg.ipv4_options_enabled = true;
+    let (mut b, _, old, ip, h, last_ts) = time_wait_endpoint(cfg);
+    let syn = tw_segment(
+        ip,
+        h,
+        h.acknowledgment.wrapping_add(100),
+        0,
+        wire::SYN,
+        Some((last_ts.wrapping_add(1), 0)),
+    );
+    b.input_with_ipv4_options(4_000, ip, 0, completed_route(&[8, 9]), &syn)
+        .unwrap();
+    let (synack, bytes) = option_packet(&mut b, 4_000);
+    assert_route(synack, &bytes, &[9, 8]);
+    assert!(
+        wire::parse(synack.ip, &bytes)
+            .unwrap()
+            .options
+            .timestamps
+            .is_some()
+    );
+    assert_eq!(b.state(old).unwrap(), State::TimeWait);
+}

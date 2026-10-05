@@ -11,9 +11,15 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
+def assert_timestamp_negotiation(sock):
+    info = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 8)
+    assert bool(info[5] & 1) == (os.environ.get('NTCP_TIMESTAMPS') == '1'), info
+
+
 def isolated_test(parent_namespace):
     if str(os.stat('/proc/self/ns/net').st_ino) == parent_namespace:
         raise RuntimeError('refusing to change the parent network namespace')
+    subprocess.run(['sysctl', '-qw', 'net.ipv4.tcp_timestamps=1'], check=True)
     subprocess.run(['ip', 'link', 'set', 'lo', 'up'], check=True)
     subprocess.run(['ip', 'tuntap', 'add', 'dev', 'ntcp-test', 'mode', 'tun'], check=True)
     subprocess.run(['ip', 'addr', 'add', '10.73.0.1/24', 'dev', 'ntcp-test'], check=True)
@@ -41,6 +47,7 @@ def isolated_test(parent_namespace):
                 payload = bytes(i % 251 for i in range(size))
                 with socket.create_connection(('10.73.0.2', 8080), timeout=10) as client:
                     client.settimeout(30)
+                    assert_timestamp_negotiation(client)
                     errors = []
                     def send():
                         try:
@@ -69,6 +76,7 @@ def isolated_test(parent_namespace):
                         client.settimeout(10)
                         client.setsockopt(socket.IPPROTO_IP, socket.IP_OPTIONS, options)
                         client.connect(('10.73.0.2', 8080))
+                        assert_timestamp_negotiation(client)
                         client.sendall(b'ipv4-options')
                         client.shutdown(socket.SHUT_WR)
                         received = bytearray()
@@ -98,6 +106,7 @@ def isolated_test(parent_namespace):
                 peer, _ = listener.accept()
                 with peer:
                     peer.settimeout(10)
+                    assert_timestamp_negotiation(peer)
                     payload = bytes(i % 247 for i in range(32768))
                     peer.sendall(payload)
                     peer.shutdown(socket.SHUT_WR)

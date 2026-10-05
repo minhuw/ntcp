@@ -29,6 +29,7 @@ pub struct EndpointConfig {
     pub ipv4_options_enabled: bool,
     pub ipv4_subnets: Vec<(Ipv4Addr, u8)>,
     pub error_reports: bool,
+    pub reuse_time_wait: bool,
     pub max_listeners: usize,
     pub max_control_packets: usize,
     pub max_buffer_bytes: usize,
@@ -44,6 +45,7 @@ impl Default for EndpointConfig {
             ipv4_options_enabled: false,
             ipv4_subnets: Vec::new(),
             error_reports: true,
+            reuse_time_wait: false,
             max_listeners: 64,
             max_control_packets: 64,
             max_buffer_bytes: 256 * 1024 * 1024,
@@ -151,6 +153,24 @@ impl TupleTable {
         }
         Err(EndpointError::LimitReached)
     }
+    fn replace(&mut self, hash: usize, tuple: Tuple, old: usize, new: usize) -> bool {
+        for probe in 0..self.entries.len().min(64) {
+            let position = hash.wrapping_add(probe) & (self.entries.len() - 1);
+            match self.entries[position] {
+                Entry::Occupied(key, slot) if key == tuple => {
+                    if slot != old {
+                        return false;
+                    }
+                    self.entries[position] = Entry::Occupied(tuple, new);
+                    return true;
+                }
+                Entry::Empty => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn remove(&mut self, hash: usize, tuple: Tuple) {
         for probe in 0..self.entries.len().min(64) {
             let position = hash.wrapping_add(probe) & (self.entries.len() - 1);
@@ -177,6 +197,7 @@ struct Slot {
     released: bool,
     closed_output_drained: bool,
     mapped: bool,
+    fallback: Option<ConnectionId>,
     hop_limit: u8,
     dscp: u8,
     received_dscp: Option<u8>,
@@ -209,7 +230,7 @@ pub struct Endpoint {
     advice: ReadyQueue,
     cleanup: ReadyQueue,
     deadlines: Deadlines,
-    control: VecDeque<(IpMetadata, Header, OutgoingIpv4Options)>,
+    control: VecDeque<(IpMetadata, Header, OutgoingIpv4Options, Option<u32>)>,
     passive_errors: VecDeque<Event>,
     control_epoch: Instant,
     control_count: usize,
@@ -243,6 +264,8 @@ impl Endpoint {
         now: Instant,
     ) -> Result<Self, EndpointError> {
         if config.max_connections == 0
+            || config.connection.send_ip_payload_limit
+                < if config.connection.timestamps { 40 } else { 28 }
             || config.max_listeners == 0
             || config.hop_limit == 0
             || config.dscp > 63
@@ -258,7 +281,7 @@ impl Endpoint {
                 .send_ip_payload_limit
                 .min(65515)
                 .checked_sub(40)
-                .filter(|&budget| budget >= 28)
+                .filter(|&budget| budget >= if config.connection.timestamps { 40 } else { 28 })
                 .ok_or(Error::InvalidArgument)?;
         }
         let count = config.max_connections;
@@ -535,26 +558,41 @@ impl Endpoint {
         //# If there is
         //# no room to create a new connection, return "error: insufficient
         //# resources".
-        if self.free.is_empty()
-            || self.per_connection_bytes
-                > self
-                    .config
-                    .max_buffer_bytes
-                    .saturating_sub(self.buffer_bytes)
-        {
+        if !self.has_capacity() {
             return Err(EndpointError::LimitReached);
         }
         Ok(())
+    }
+
+    fn has_capacity(&self) -> bool {
+        !self.free.is_empty()
+            && self.per_connection_bytes
+                <= self
+                    .config
+                    .max_buffer_bytes
+                    .saturating_sub(self.buffer_bytes)
     }
 
     fn insert(
         &mut self,
         connection: Connection,
         listener: Option<ListenerId>,
+        fallback: Option<ConnectionId>,
     ) -> Result<ConnectionId, EndpointError> {
         let tuple = connection.tuple();
         let index = *self.free.last().ok_or(EndpointError::LimitReached)?;
-        self.tuples.insert(self.hash(tuple), tuple, index)?;
+        if let Some(old) = fallback {
+            if !self
+                .tuples
+                .replace(self.hash(tuple), tuple, old.slot, index)
+            {
+                return Err(EndpointError::AddressInUse);
+            }
+            self.slots[old.slot].as_mut().unwrap().mapped = false;
+            self.output.remove(old.slot);
+        } else {
+            self.tuples.insert(self.hash(tuple), tuple, index)?;
+        }
         self.free.pop();
         self.slots[index] = Some(Slot {
             connection,
@@ -563,6 +601,7 @@ impl Endpoint {
             released: false,
             closed_output_drained: false,
             mapped: true,
+            fallback,
             hop_limit: self.config.hop_limit,
             dscp: self.config.dscp,
             received_dscp: None,
@@ -594,7 +633,7 @@ impl Endpoint {
         self.admission(tuple)?;
         let connection =
             Connection::active(tuple, self.config.connection.clone(), self.isn(tuple), now)?;
-        self.insert(connection, None)
+        self.insert(connection, None, None)
     }
 
     fn validate_ipv4_options(
@@ -742,6 +781,31 @@ impl Endpoint {
     }
 
     fn refresh(&mut self, index: usize) {
+        if let Some(slot) = self.slots[index].as_ref()
+            && slot.connection.state() != State::SynReceived
+            && let Some(old) = slot.fallback
+        {
+            let failed = slot.connection.state() == State::Closed;
+            let tuple = slot.connection.tuple();
+            self.slots[index].as_mut().unwrap().fallback = None;
+            // Released handles are intentionally eligible; generation, tuple,
+            // state, deadline and current mapping ownership must all still match.
+            if failed
+                && self.generations.get(old.slot) == Some(&old.generation)
+                && self.slots[old.slot].as_ref().is_some_and(|slot| {
+                    !slot.mapped
+                        && slot.connection.tuple() == tuple
+                        && slot.connection.time_wait_valid(self.now)
+                })
+                && self
+                    .tuples
+                    .replace(self.hash(tuple), tuple, index, old.slot)
+            {
+                self.slots[index].as_mut().unwrap().mapped = false;
+                self.slots[old.slot].as_mut().unwrap().mapped = true;
+                self.output.push(old.slot);
+            }
+        }
         if self.slots[index]
             .as_mut()
             .is_some_and(|slot| slot.connection.take_route_advice())
@@ -799,7 +863,9 @@ impl Endpoint {
         if slot.listener.is_none() && !slot.released && slot.connection.events_pending() {
             self.events.push(index);
         }
-        self.output.push(index);
+        if slot.mapped || state == State::Closed {
+            self.output.push(index);
+        }
     }
 
     pub fn accept(&mut self, listener: ListenerId) -> Result<ConnectionId, EndpointError> {
@@ -909,6 +975,10 @@ impl Endpoint {
                 source_route: route,
                 ..OutgoingIpv4Options::default()
             },
+            segment.options.timestamps.map(|ts| ts.0).filter(|_| {
+                self.config.connection.timestamps
+                    && self.config.connection.send_ip_payload_limit >= 32
+            }),
         ));
         self.control_count += 1;
     }
@@ -988,6 +1058,13 @@ impl Endpoint {
             remote: SocketAddr::new(ip.source, segment.header.source_port),
         };
         if let Some(index) = self.tuples.find(self.hash(tuple), tuple) {
+            if self.config.reuse_time_wait
+                && self.slots[index].as_ref().unwrap().connection.state() == State::TimeWait
+                && segment.header.flags & !(wire::ECE | wire::CWR) == SYN
+                && segment.payload.is_empty()
+            {
+                return self.reopen_time_wait(index, tuple, traffic_class, options, &segment);
+            }
             let slot = self.slots[index].as_mut().unwrap();
             slot.received_dscp = Some(traffic_class >> 2);
             slot.connection
@@ -1032,7 +1109,7 @@ impl Endpoint {
                 Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),
                 Err(error) => return Err(error.into()),
             };
-            match self.insert(connection, Some(listener)) {
+            match self.insert(connection, Some(listener), None) {
                 Ok(id) => {
                     let slot = self.slots[id.slot].as_mut().unwrap();
                     slot.received_dscp = Some(traffic_class >> 2);
@@ -1045,6 +1122,69 @@ impl Endpoint {
         }
         self.reset_for(ip, &segment, route);
         Ok(InputDisposition::Dropped)
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
+    //# However, it MAY accept a new SYN from the remote TCP endpoint to
+    //# reopen the connection directly from TIME-WAIT state (MAY-2), if it:
+    //#
+    //# (1)  assigns its initial sequence number for the new connection to be
+    //#      larger than the largest sequence number it used on the previous
+    //#      connection incarnation, and
+    //#
+    //# (2)  returns to TIME-WAIT state if the SYN turns out to be an old
+    //#      duplicate.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
+    //# This algorithm for reducing TIME-WAIT is a Best
+    //# Current Practice that SHOULD be implemented since Timestamp Options
+    //# are commonly used, and using them to reduce TIME-WAIT provides
+    //# benefits for busy Internet servers (SHLD-4).
+    fn reopen_time_wait(
+        &mut self,
+        index: usize,
+        tuple: Tuple,
+        traffic_class: u8,
+        options: Ipv4Options,
+        syn: &wire::Segment<'_>,
+    ) -> Result<InputDisposition, EndpointError> {
+        let Some(listener) = self.match_listener(tuple.local) else {
+            return Ok(InputDisposition::Dropped);
+        };
+        let record = self.listeners[listener.slot].as_ref().unwrap();
+        if record.children.len() >= record.backlog
+            || !self.has_capacity()
+            || !self.slots[index].as_ref().unwrap().connection.reuse_syn(
+                self.now,
+                syn,
+                self.config.connection.timestamps,
+            )
+        {
+            return Ok(InputDisposition::Dropped);
+        }
+        let candidate = self.isn(tuple);
+        let iss = self.slots[index]
+            .as_ref()
+            .unwrap()
+            .connection
+            .reuse_iss(candidate);
+        // Allocate the entire bounded child before transferring tuple ownership.
+        // The old timer/record survives independently until its original expiry.
+        let connection =
+            match Connection::passive(tuple, self.config.connection.clone(), iss, self.now, syn) {
+                Ok(connection) => connection,
+                Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),
+                Err(error) => return Err(error.into()),
+            };
+        let id = self.insert(connection, Some(listener), Some(self.id(index)))?;
+        let slot = self.slots[id.slot].as_mut().unwrap();
+        slot.received_dscp = Some(traffic_class >> 2);
+        // Input validated the route before selecting the TIME-WAIT reuse path.
+        let route = match tuple.remote.ip() {
+            IpAddr::V4(source) => options.return_route(source),
+            _ => None,
+        };
+        Self::save_ipv4_options(slot, options, route);
+        Ok(InputDisposition::Processed)
     }
 
     pub fn write(&mut self, id: ConnectionId, bytes: &[u8]) -> Result<usize, EndpointError> {
@@ -1349,8 +1489,13 @@ impl Endpoint {
                 self.cleanup_one();
             }
             if !self.control.is_empty() && (self.control_turn || self.output.is_empty()) {
-                let (ip, header, ipv4_options) = *self.control.front().unwrap();
-                let len = wire::encode(ip, header, &[], &[], out).map_err(Error::Wire)?;
+                let (ip, header, ipv4_options, echo) = *self.control.front().unwrap();
+                let mut options = [1, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0];
+                if let Some(echo) = echo {
+                    options[8..].copy_from_slice(&echo.to_be_bytes());
+                }
+                let options = if echo.is_some() { &options[..] } else { &[] };
+                let len = wire::encode(ip, header, options, &[], out).map_err(Error::Wire)?;
                 self.control.pop_front();
                 self.control_turn = false;
                 return Ok(PollTransmit {

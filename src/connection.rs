@@ -26,11 +26,12 @@ pub struct ConnectionConfig {
     //# (SHLD-6).
     pub receive_ip_payload_limit: u16,
     // Maximum TCP segment bytes after IP headers/extensions are subtracted from
-    // the transmission bound; must fit our 28-byte SYN with MSS and WS.
+    // the transmission bound; must fit SYN with MSS/WS (28 bytes, or 40 with TS).
     pub send_ip_payload_limit: u16,
     pub nagle: bool,
     pub ecn: bool,
     pub recovery_algorithm: RecoveryAlgorithm,
+    pub timestamps: bool,
     pub retransmit_beyond_window: bool,
     pub delayed_ack_us: u64,
     pub user_timeout_us: u64,
@@ -74,6 +75,7 @@ impl Default for ConnectionConfig {
             nagle: true,
             ecn: true,
             recovery_algorithm: RecoveryAlgorithm::default(),
+            timestamps: false,
             retransmit_beyond_window: false,
             delayed_ack_us: 200_000,
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
@@ -202,6 +204,13 @@ pub(crate) struct Connection {
     local_scale: u8,
     peer_scale: u8,
     scaling: bool,
+    timestamps: bool,
+    ts_recent: u32,
+    ts_latest: u32,
+    ts_recent_at: Instant,
+    last_ack_sent: Seq,
+    reset_echo: Option<u32>,
+    last_timestamp_sent_at: Option<Instant>,
     mss: usize,
     advertised_edge: Seq,
     syn_window: u16,
@@ -269,7 +278,7 @@ impl Connection {
             || config.receive_capacity == 0
             || config.receive_capacity > (65535usize << 14)
             || config.receive_ip_payload_limit < 21
-            || config.send_ip_payload_limit < 28
+            || config.send_ip_payload_limit < if config.timestamps { 40 } else { 28 }
             || config.mss == 0
             || config.mss > if tuple.local.is_ipv4() { 65495 } else { 65515 }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.3
@@ -330,6 +339,13 @@ impl Connection {
             local_scale,
             peer_scale: 0,
             scaling: false,
+            timestamps: false,
+            ts_recent: 0,
+            ts_latest: 0,
+            ts_recent_at: now,
+            last_ack_sent: Seq(0),
+            reset_echo: None,
+            last_timestamp_sent_at: None,
             mss,
             advertised_edge: Seq(0),
             syn_window,
@@ -409,6 +425,40 @@ impl Connection {
     pub(crate) fn state(&self) -> State {
         self.state
     }
+    pub(crate) fn time_wait_valid(&self, now: Instant) -> bool {
+        self.state == State::TimeWait && self.time_wait_deadline.is_some_and(|end| now < end)
+    }
+
+    pub(crate) fn reuse_syn(&self, now: Instant, syn: &Segment<'_>, timestamps: bool) -> bool {
+        if !self.time_wait_valid(now) {
+            return false;
+        }
+        // RFC 6191 section 2: receive.next() is one beyond the peer's FIN.
+        // Conservatively require strictly beyond that frontier for sequence reuse.
+        let newer_sequence = after(Seq(syn.header.sequence), self.receive.next());
+        match (
+            self.timestamps,
+            timestamps.then_some(syn.options.timestamps).flatten(),
+        ) {
+            (true, Some((value, _))) => {
+                after(Seq(value), Seq(self.ts_latest)) || value == self.ts_latest && newer_sequence
+            }
+            (false, Some(_)) => true,
+            (_, None) => newer_sequence,
+        }
+    }
+
+    pub(crate) fn reuse_iss(&self, candidate: u32) -> u32 {
+        // Preserve secret-derived entropy, projecting into the forward serial
+        // half-space only when necessary. Include pure ACKs at snd_nxt in
+        // the old frontier: offsets 1..2^31-1 are strictly serially greater.
+        if after(Seq(candidate), self.snd_nxt) {
+            candidate
+        } else {
+            self.snd_nxt.wrapping_add(1 + candidate % 0x7fff_ffff).0
+        }
+    }
+
     pub(crate) fn acknowledged(&self) -> u64 {
         self.acknowledged
     }
@@ -508,17 +558,20 @@ impl Connection {
     }
 
     pub(crate) fn lower_mss(&mut self, mss: u16) -> Result<(), Error> {
-        if mss == 0 || mss as usize > self.mss {
+        let effective = mss
+            .saturating_sub(if self.timestamps { 12 } else { 0 })
+            .max(1);
+        if mss == 0 || effective as usize > self.mss {
             return Err(Error::InvalidArgument);
         }
-        if mss as usize == self.mss {
+        if effective as usize == self.mss {
             return Ok(());
         }
-        self.mss = mss as usize;
+        self.mss = effective as usize;
         // Also constrain future SYN offers and negotiation if this occurs
         // before the peer's SYN; the scratch allocation never changes.
         self.config.mss = self.config.mss.min(mss);
-        self.congestion.set_mss(mss as u32);
+        self.congestion.set_mss(effective as u32);
         if self.flight() != 0 {
             if matches!(self.state, State::SynSent | State::SynReceived) {
                 self.syn_pending = true;
@@ -569,12 +622,19 @@ impl Connection {
 
     fn learn_syn(&mut self, syn: &Segment<'_>) {
         self.learn_ecn(syn.header.flags);
+        self.timestamps = self.config.timestamps && syn.options.timestamps.is_some();
+        if self.timestamps {
+            self.ts_recent = syn.options.timestamps.unwrap().0;
+            self.ts_latest = self.ts_recent;
+            self.ts_recent_at = self.now;
+        }
         self.irs = Some(Seq(syn.header.sequence));
         let start = Seq(syn.header.sequence).wrapping_add(1);
         self.receive
             .reset_start(start)
             .expect("handshake receive buffer is empty");
         self.advertised_edge = start.wrapping_add(self.syn_window as u32);
+        self.last_ack_sent = start;
         self.scaling = syn.options.window_scale.is_some();
         self.peer_scale = syn.options.window_scale.unwrap_or(0).min(14);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
@@ -600,7 +660,10 @@ impl Connection {
             .unwrap_or(default_mss)
             .max(1)
             .min(self.config.mss)
-            .min(self.config.send_ip_payload_limit - 20) as usize;
+            .saturating_sub(if self.timestamps { 12 } else { 0 })
+            .max(1)
+            .min(self.config.send_ip_payload_limit - 20 - if self.timestamps { 12 } else { 0 })
+            as usize;
         self.congestion.set_mss(self.mss as u32);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
         //# The window size MUST be treated as an unsigned number, or else large window
@@ -1102,6 +1165,11 @@ impl Connection {
             if h.flags & ACK != 0 && !valid_ack {
                 if h.flags & RST == 0 {
                     self.pending_rst = Some((ack, false));
+                    self.reset_echo = segment
+                        .options
+                        .timestamps
+                        .filter(|_| self.config.timestamps)
+                        .map(|ts| ts.0);
                 }
                 return Ok(());
             }
@@ -1120,7 +1188,7 @@ impl Connection {
             self.learn_syn(segment);
             self.last_received = now;
             if valid_ack {
-                self.accept_ack(ack, false);
+                self.accept_ack(ack, false, segment.options.timestamps.map(|ts| ts.1));
                 self.establish();
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
                 //# Data or controls that were queued for transmission MAY be included.
@@ -1133,6 +1201,19 @@ impl Connection {
             }
             self.arm_work();
             return Ok(());
+        }
+
+        // RFC 7323 sections 3.2 and 5.2: RST bypasses PAWS, and its
+        // timestamps never update connection state. Missing TS is silent loss.
+        let recent_valid = now.saturating_sub(self.ts_recent_at) <= 24 * 86_400_000_000;
+        if self.timestamps && h.flags & RST == 0 {
+            let Some((value, _)) = segment.options.timestamps else {
+                return Ok(());
+            };
+            if recent_valid && !at_or_after(Seq(value), Seq(self.ts_recent)) {
+                self.immediate_ack();
+                return Ok(());
+            }
         }
 
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.5
@@ -1148,7 +1229,14 @@ impl Connection {
         {
             self.accepted_metadata = true;
             self.learn_ecn(h.flags);
-            self.accept_ack(ack, false);
+            if self.timestamps
+                && let Some((value, _)) = segment.options.timestamps
+            {
+                self.ts_recent = value;
+                self.ts_latest = value;
+                self.ts_recent_at = now;
+            }
+            self.accept_ack(ack, false, segment.options.timestamps.map(|ts| ts.1));
             self.establish();
             self.last_received = now;
             self.immediate_ack();
@@ -1172,6 +1260,12 @@ impl Connection {
                 .wrapping_add(1)
                 == self.receive.next()
         {
+            if self.timestamps
+                && let Some((value, _)) = segment.options.timestamps
+                && (!recent_valid || after(Seq(value), Seq(self.ts_latest)))
+            {
+                self.ts_latest = value;
+            }
             self.immediate_ack();
             self.time_wait_deadline = Some(now.saturating_add(self.config.time_wait_us));
             return Ok(());
@@ -1239,6 +1333,20 @@ impl Connection {
             }
             return Ok(());
         }
+        if self.timestamps
+            && let Some((value, _)) = segment.options.timestamps
+            && (!recent_valid || after(Seq(value), Seq(self.ts_latest)))
+        {
+            self.ts_latest = value;
+        }
+        if self.timestamps
+            && at_or_after(self.last_ack_sent, seq)
+            && let Some((value, _)) = segment.options.timestamps
+            && (!recent_valid || at_or_after(Seq(value), Seq(self.ts_recent)))
+        {
+            self.ts_recent = value;
+            self.ts_recent_at = now;
+        }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
         //# RFC 5961 recommends that in
         //# these synchronized states, if the SYN bit is set,
@@ -1284,9 +1392,14 @@ impl Connection {
         if self.state == State::SynReceived {
             if !after(ack, self.snd_una) {
                 self.pending_rst = Some((ack, false));
+                self.reset_echo = segment
+                    .options
+                    .timestamps
+                    .filter(|_| self.config.timestamps)
+                    .map(|ts| ts.0);
                 return Ok(());
             }
-            self.accept_ack(ack, false);
+            self.accept_ack(ack, false, segment.options.timestamps.map(|ts| ts.1));
             self.establish();
         }
         if self.state == State::TimeWait {
@@ -1326,7 +1439,7 @@ impl Connection {
             self.reset_limited_transmit();
         }
         if advancing {
-            self.accept_ack(ack, ece);
+            self.accept_ack(ack, ece, segment.options.timestamps.map(|ts| ts.1));
         }
         if ecn_one {
             let deadline = now.saturating_add(self.rto());
@@ -1392,7 +1505,7 @@ impl Connection {
         self.limited_sent = 0;
     }
 
-    fn accept_ack(&mut self, ack: Seq, ece: bool) {
+    fn accept_ack(&mut self, ack: Seq, ece: bool, echo: Option<u32>) {
         self.reset_limited_transmit();
         let syn_ack =
             self.snd_una == self.iss && matches!(self.state, State::SynSent | State::SynReceived);
@@ -1431,11 +1544,15 @@ impl Connection {
         if let Some((end, sent)) = self.sample
             && at_or_after(ack, end)
         {
-            self.rtt.sample(self.now.saturating_sub(sent));
-            self.sample = None;
-            if !syn_ack {
-                self.syn_timed_out = false;
+            // One bounded sample per flight. Never infer a transmission time
+            // from an unvalidated echo, and retain Karn's exclusion on retransmit.
+            if !self.timestamps || echo == Some((sent / 1_000) as u32) {
+                self.rtt.sample(self.now.saturating_sub(sent));
+                if !syn_ack {
+                    self.syn_timed_out = false;
+                }
             }
+            self.sample = None;
         }
         if !syn_ack
             && self
@@ -1877,12 +1994,13 @@ impl Connection {
             .mss
             .min(self.config.receive_ip_payload_limit - 20)
             .to_be_bytes();
-        let options = [2, 4, mss[0], mss[1], 3, 3, self.local_scale, 0];
+        let mut options = [0; 20];
+        options[..8].copy_from_slice(&[2, 4, mss[0], mss[1], 3, 3, self.local_scale, 1]);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
         //# TCP implementations SHOULD send an MSS Option in every SYN segment when its
         //# receive MSS differs from the default 536 for IPv4 or 1220 for IPv6 (SHLD-5),
         //# and MAY send it always (MAY-3).
-        let option_len = if syn {
+        let mut option_len = if syn {
             if self.state == State::SynSent || self.scaling {
                 8
             } else {
@@ -1891,6 +2009,26 @@ impl Connection {
         } else {
             0
         };
+        let timestamp = if reset.is_some() && self.reset_echo.is_some() {
+            self.reset_echo.map(|echo| (0, echo))
+        } else if self.timestamps || syn && self.state == State::SynSent && self.config.timestamps {
+            Some((
+                (now / 1_000) as u32,
+                if flags & ACK != 0 { self.ts_recent } else { 0 },
+            ))
+        } else {
+            None
+        };
+        if let Some((value, echo)) =
+            timestamp.filter(|_| reset.is_none() || self.config.send_ip_payload_limit >= 32)
+        {
+            options[option_len..option_len + 4].copy_from_slice(&[1, 1, 8, 10]);
+            options[option_len + 4..option_len + 8].copy_from_slice(&value.to_be_bytes());
+            options[option_len + 8..option_len + 12].copy_from_slice(&echo.to_be_bytes());
+            option_len += 12;
+        } else if option_len == 8 {
+            options[7] = 0; // Preserve the opt-out wire representation.
+        }
         let ip = IpMetadata {
             source: self.tuple.local.ip(),
             destination: self.tuple.remote.ip(),
@@ -1938,6 +2076,7 @@ impl Connection {
         }
         if reset.is_some() {
             self.pending_rst = None;
+            self.reset_echo = None;
             return Ok(Some(size));
         }
         if !keepalive
@@ -1950,6 +2089,7 @@ impl Connection {
         self.last_sent = now;
         self.syn_pending = false;
         if flags & ACK != 0 {
+            self.last_ack_sent = self.receive.next();
             self.ack_pending = false;
             self.ack_deadline = None;
             self.full_segments = 0;
@@ -1979,7 +2119,12 @@ impl Connection {
                 // Fresh sequence space sent afterwards may start a new sample;
                 // its ACK cannot predate its first transmission.
                 self.sample = None;
-            } else if self.sample.is_none() {
+            } else if self.sample.is_none()
+                && (timestamp.is_none()
+                    || self
+                        .last_timestamp_sent_at
+                        .is_none_or(|sent| sent / 1_000 != now / 1_000))
+            {
                 self.sample = Some((end, now));
             }
             if after(end, self.snd_nxt) {
@@ -1988,6 +2133,9 @@ impl Connection {
             if (self.rto_deadline.is_none() || retransmitted) && !probe {
                 self.rto_deadline = Some(now.saturating_add(self.rto()));
             }
+        }
+        if timestamp.is_some() {
+            self.last_timestamp_sent_at = Some(now);
         }
         if new_fin {
             self.fin_sequence = Some(seq.wrapping_add(count as u32));
@@ -5358,5 +5506,417 @@ mod tests {
             deliver(&mut b, &mut a, deadline);
             assert_eq!(a.acknowledged, 0);
         }
+    }
+    fn timestamp_input(
+        c: &mut Connection,
+        now: u64,
+        sequence: Seq,
+        acknowledgment: Seq,
+        flags: u8,
+        ts: Option<(u32, u32)>,
+        payload: &[u8],
+    ) {
+        let mut options = [1, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0];
+        if let Some((value, echo)) = ts {
+            options[4..8].copy_from_slice(&value.to_be_bytes());
+            options[8..].copy_from_slice(&echo.to_be_bytes());
+        }
+        let mut bytes = vec![0; 32 + payload.len()];
+        let ip = ip(reverse(c.tuple));
+        let n = wire::encode(
+            ip,
+            Header {
+                source_port: c.tuple.remote.port(),
+                destination_port: c.tuple.local.port(),
+                sequence: sequence.0,
+                acknowledgment: acknowledgment.0,
+                flags,
+                window: 1024,
+                urgent_pointer: 0,
+            },
+            if ts.is_some() { &options } else { &[] },
+            payload,
+            &mut bytes,
+        )
+        .unwrap();
+        c.input(now, &wire::parse(ip, &bytes[..n]).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn timestamps_negotiate_fallback_and_atomic_output() {
+        for active_ts in [false, true] {
+            for passive_ts in [false, true] {
+                let mut ac = config(1024, 128);
+                ac.timestamps = active_ts;
+                let mut bc = ac.clone();
+                bc.timestamps = passive_ts;
+                let mut a = Connection::active(tuple(), ac, 10, 1_000).unwrap();
+                let syn = packet(&mut a, 2_000);
+                let syn = wire::parse(ip(tuple()), &syn).unwrap();
+                assert_eq!(syn.options.timestamps, active_ts.then_some((2, 0)));
+                let mut b = Connection::passive(reverse(tuple()), bc, 20, 3_000, &syn).unwrap();
+                let old = (
+                    b.now,
+                    b.snd_nxt,
+                    b.last_ack_sent,
+                    b.ts_recent,
+                    b.sample,
+                    b.next_deadline(),
+                );
+                assert_eq!(b.transmit(4_000, &mut [0; 23]), Err(Error::OutputTooSmall));
+                assert_eq!(
+                    (
+                        b.now,
+                        b.snd_nxt,
+                        b.last_ack_sent,
+                        b.ts_recent,
+                        b.sample,
+                        b.next_deadline()
+                    ),
+                    old
+                );
+                let synack = deliver(&mut b, &mut a, 4_000);
+                assert_eq!(
+                    wire::parse(ip(reverse(tuple())), &synack)
+                        .unwrap()
+                        .options
+                        .timestamps,
+                    (active_ts && passive_ts).then_some((4, 2))
+                );
+                let ack = deliver(&mut a, &mut b, 5_000);
+                assert_eq!(
+                    wire::parse(ip(tuple()), &ack).unwrap().options.timestamps,
+                    (active_ts && passive_ts).then_some((5, 4))
+                );
+                assert_eq!(b.state, State::Established);
+                assert_eq!(a.timestamps, active_ts && passive_ts);
+                assert_eq!(b.timestamps, a.timestamps);
+                b.write(b"hello").unwrap();
+                let data = deliver(&mut b, &mut a, 6_000);
+                assert_eq!(
+                    wire::parse(ip(reverse(tuple())), &data)
+                        .unwrap()
+                        .options
+                        .timestamps
+                        .is_some(),
+                    a.timestamps
+                );
+            }
+        }
+        let mut cfg = config(1024, 128);
+        cfg.timestamps = true;
+        cfg.send_ip_payload_limit = 39;
+        assert!(matches!(
+            Connection::active(tuple(), cfg, 0, 0),
+            Err(Error::InvalidArgument)
+        ));
+    }
+
+    #[test]
+    fn timestamps_paws_echo_order_wrap_idle_and_rst_exemption() {
+        let mut cfg = config(1024, 128);
+        cfg.timestamps = true;
+        let (mut a, _) = pair(cfg.clone(), 10);
+        a.ts_recent = u32::MAX - 2;
+        a.ts_latest = a.ts_recent;
+        let next = a.receive.next();
+        let ack = a.snd_nxt;
+        timestamp_input(&mut a, 1_000, next, ack, ACK, None, b"missing");
+        assert_eq!(a.receive.next(), next);
+        assert!(!a.ack_pending);
+        timestamp_input(
+            &mut a,
+            2_000,
+            next,
+            ack,
+            ACK,
+            Some((u32::MAX - 3, 0)),
+            b"stale",
+        );
+        assert_eq!(a.receive.next(), next);
+        assert!(a.ack_pending);
+        packet(&mut a, 2_000);
+        timestamp_input(&mut a, 3_000, next, ack, ACK, Some((u32::MAX - 1, 0)), b"a");
+        timestamp_input(
+            &mut a,
+            4_000,
+            next.wrapping_add(1),
+            ack,
+            ACK,
+            Some((1, 0)),
+            b"b",
+        );
+        assert_eq!(a.ts_recent, u32::MAX - 1); // Earliest unacknowledged segment.
+        a.immediate_ack();
+        let bytes = packet(&mut a, 4_000);
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes).unwrap().options.timestamps,
+            Some((4, u32::MAX - 1))
+        );
+        assert_eq!(a.last_ack_sent, next.wrapping_add(2));
+        timestamp_input(
+            &mut a,
+            5_000,
+            next.wrapping_add(3),
+            ack,
+            ACK,
+            Some((4, 0)),
+            b"d",
+        );
+        assert_eq!(a.ts_recent, u32::MAX - 1); // Hole must not advance echo.
+        packet(&mut a, 5_000);
+        timestamp_input(
+            &mut a,
+            6_000,
+            next.wrapping_add(2),
+            ack,
+            ACK,
+            Some((3, 0)),
+            b"c",
+        );
+        assert_eq!(a.ts_recent, 3); // Filling the hole replaces the echo.
+        assert_eq!(a.receive.next(), next.wrapping_add(4));
+        packet(&mut a, 6_000);
+        let idle = 6_000 + 24 * 86_400_000_000 + 1;
+        timestamp_input(
+            &mut a,
+            idle,
+            next.wrapping_add(4),
+            ack,
+            ACK,
+            Some((0x8000_0003, 0)),
+            b"e",
+        );
+        assert_eq!(a.ts_recent, 0x8000_0003);
+        assert_eq!(a.receive.next(), next.wrapping_add(5));
+        let recent = a.ts_recent;
+        timestamp_input(
+            &mut a,
+            idle + 1,
+            next.wrapping_add(5),
+            ack,
+            RST,
+            Some((0, 0)),
+            b"",
+        );
+        assert_eq!(a.state, State::Closed);
+        assert_eq!(a.ts_recent, recent);
+        let (mut a, _) = pair(cfg, 10);
+        let next = a.receive.next();
+        let ack = a.snd_nxt;
+        timestamp_input(&mut a, 40, next, ack, RST, None, b"");
+        assert_eq!(a.state, State::Closed);
+    }
+
+    #[test]
+    fn timestamps_rtt_validated_echo_and_karn() {
+        let mut cfg = config(1024, 128);
+        cfg.timestamps = true;
+        cfg.nagle = false;
+        for valid in [false, true] {
+            let (mut a, _) = pair(cfg.clone(), 10);
+            a.rtt = RttEstimator::new();
+            a.write(b"sample").unwrap();
+            packet(&mut a, 2_000_000);
+            assert!(a.sample.is_some());
+            let next = a.receive.next();
+            let ack = a.snd_nxt;
+            timestamp_input(
+                &mut a,
+                2_600_000,
+                next,
+                ack,
+                ACK,
+                Some((5, if valid { 2000 } else { 1999 })),
+                b"",
+            );
+            assert_eq!(a.rtt.rto(), if valid { 1_800_000 } else { 1_000_000 });
+            assert!(a.sample.is_none());
+        }
+        let (mut a, _) = pair(cfg, 10);
+        a.write(b"lost").unwrap();
+        packet(&mut a, 2_000_000);
+        a.timeout(3_000_000).unwrap();
+        let bytes = packet(&mut a, 3_000_000);
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes)
+                .unwrap()
+                .options
+                .timestamps
+                .unwrap()
+                .0,
+            3000
+        );
+        assert!(a.sample.is_none());
+        let rto = a.rtt.rto();
+        let next = a.receive.next();
+        let ack = a.snd_nxt;
+        timestamp_input(&mut a, 3_600_000, next, ack, ACK, Some((6, 3000)), b"");
+        assert_eq!(a.rtt.rto(), rto);
+    }
+
+    #[test]
+    fn timestamps_ip_budget_data_fin_keepalive_and_clock_wrap() {
+        for v6 in [false, true] {
+            let mut cfg = config(1024, 128);
+            cfg.timestamps = true;
+            cfg.send_ip_payload_limit = 40;
+            cfg.nagle = false;
+            cfg.keepalive = Some(KeepaliveConfig {
+                idle_us: 100_000,
+                ..KeepaliveConfig::default()
+            });
+            let t = if v6 {
+                Tuple {
+                    local: "[2001:db8::1]:1000".parse().unwrap(),
+                    remote: "[2001:db8::2]:2000".parse().unwrap(),
+                }
+            } else {
+                tuple()
+            };
+            let now = (u32::MAX as u64) * 1000;
+            let mut a = Connection::active(t, cfg.clone(), 10, now).unwrap();
+            let syn = packet(&mut a, now);
+            assert_eq!(syn.len(), 40);
+            let mut b =
+                Connection::passive(reverse(t), cfg, 20, now, &wire::parse(ip(t), &syn).unwrap())
+                    .unwrap();
+            deliver(&mut b, &mut a, now + 1_000);
+            let ack = deliver(&mut a, &mut b, now + 2_000);
+            assert_eq!(
+                wire::parse(ip(t), &ack)
+                    .unwrap()
+                    .options
+                    .timestamps
+                    .unwrap()
+                    .0,
+                1
+            );
+            a.write(b"12345678").unwrap();
+            let before = (a.now, a.snd_nxt, a.last_ack_sent, a.sample);
+            assert_eq!(
+                a.transmit(now + 3_000, &mut [0; 39]),
+                Err(Error::OutputTooSmall)
+            );
+            assert_eq!((a.now, a.snd_nxt, a.last_ack_sent, a.sample), before);
+            let data = deliver(&mut a, &mut b, now + 3_000);
+            assert_eq!(data.len(), 40);
+            b.immediate_ack();
+            deliver(&mut b, &mut a, now + 4_000);
+            a.timeout(now + 104_000).unwrap();
+            assert_eq!(packet(&mut a, now + 104_000).len(), 32);
+            a.shutdown().unwrap();
+            let fin = packet(&mut a, now + 105_000);
+            assert_eq!(fin.len(), 32);
+            assert_ne!(wire::parse(ip(t), &fin).unwrap().header.flags & FIN, 0);
+        }
+    }
+
+    #[test]
+    fn time_wait_iss_projection_is_strict_serial_and_secret_candidate_dependent() {
+        let (mut a, _) = pair(config(1024, 128), 10);
+        for frontier in [0, 1, 0x7fff_ffff, 0x8000_0000, u32::MAX] {
+            a.snd_nxt = Seq(frontier);
+            for candidate in [0, 1, 12345, 0x7fff_ffff, 0x8000_0000, u32::MAX] {
+                let iss = a.reuse_iss(candidate);
+                assert!(after(Seq(iss), Seq(frontier)));
+                if after(Seq(candidate), Seq(frontier)) {
+                    assert_eq!(iss, candidate);
+                }
+            }
+        }
+        a.snd_nxt = Seq(100_000);
+        assert_ne!(a.reuse_iss(1), a.reuse_iss(2));
+    }
+    #[test]
+    fn timestamps_lower_mss_probe_garbage_keepalive_abort_and_simultaneous_open() {
+        let mut cfg = config(1024, 128);
+        cfg.timestamps = true;
+        cfg.nagle = false;
+        let (mut a, _) = pair(cfg.clone(), 10);
+        a.lower_mss(64).unwrap();
+        assert_eq!(a.mss, 52);
+        a.write(&[1; 100]).unwrap();
+        let bytes = packet(&mut a, 1_000);
+        assert_eq!(bytes.len(), 84); // 64-byte MSS plus fixed TCP header.
+        a.probe_pending = true;
+        a.snd_wnd = 0;
+        let probe = packet(&mut a, 2_000);
+        assert_eq!(probe.len(), 33);
+        assert!(
+            wire::parse(ip(tuple()), &probe)
+                .unwrap()
+                .options
+                .timestamps
+                .is_some()
+        );
+        let (mut a, _) = pair(cfg.clone(), 10);
+        a.config.keepalive = Some(KeepaliveConfig {
+            send_garbage: true,
+            ..KeepaliveConfig::default()
+        });
+        a.keepalive_pending = true;
+        assert_eq!(packet(&mut a, 1_000).len(), 33);
+        a.abort();
+        let reset = packet(&mut a, 2_000);
+        let reset = wire::parse(ip(tuple()), &reset).unwrap();
+        assert_ne!(reset.header.flags & RST, 0);
+        assert_eq!(reset.options.timestamps.unwrap().0, 2);
+
+        let mut a = Connection::active(tuple(), cfg.clone(), 10, 0).unwrap();
+        let mut b = Connection::active(reverse(tuple()), cfg, 20, 0).unwrap();
+        let a_syn = packet(&mut a, 1_000);
+        let b_syn = packet(&mut b, 1_000);
+        a.input(2_000, &wire::parse(ip(reverse(tuple())), &b_syn).unwrap())
+            .unwrap();
+        b.input(2_000, &wire::parse(ip(tuple()), &a_syn).unwrap())
+            .unwrap();
+        let a_synack = packet(&mut a, 3_000);
+        let b_synack = packet(&mut b, 3_000);
+        a.input(
+            4_000,
+            &wire::parse(ip(reverse(tuple())), &b_synack).unwrap(),
+        )
+        .unwrap();
+        b.input(4_000, &wire::parse(ip(tuple()), &a_synack).unwrap())
+            .unwrap();
+        assert_eq!((a.state, b.state), (State::Established, State::Established));
+        assert_eq!((a.ts_recent, b.ts_recent), (3, 3));
+    }
+    #[test]
+    fn time_wait_timestamp_freshness_uses_latest_not_echo_and_handles_wrap() {
+        let (mut a, _) = pair(config(1024, 128), 10);
+        a.time_wait();
+        a.timestamps = true;
+        a.ts_recent = 1;
+        a.ts_latest = 9;
+        let mut syn = Segment {
+            header: Header {
+                source_port: 2000,
+                destination_port: 1000,
+                sequence: 1,
+                acknowledgment: 0,
+                flags: SYN,
+                window: 1024,
+                urgent_pointer: 0,
+            },
+            options: wire::Options {
+                timestamps: Some((8, 0)),
+                ..wire::Options::default()
+            },
+            raw_options: &[],
+            payload: &[],
+        };
+        assert!(!a.reuse_syn(40, &syn, true));
+        a.ts_latest = u32::MAX;
+        syn.options.timestamps = Some((0, 0));
+        assert!(a.reuse_syn(40, &syn, true));
+        syn.options.timestamps = Some((0x7fff_ffff, 0));
+        assert!(!a.reuse_syn(40, &syn, true));
+        a.timestamps = false;
+        assert!(a.reuse_syn(40, &syn, true));
+        assert!(!a.reuse_syn(40, &syn, false));
+        assert!(!a.reuse_syn(240_000_030, &syn, true));
     }
 }

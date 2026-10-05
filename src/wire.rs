@@ -33,6 +33,7 @@ pub struct Header {
 pub struct Options {
     pub mss: Option<u16>,
     pub window_scale: Option<u8>,
+    pub timestamps: Option<(u32, u32)>,
 }
 
 pub struct Segment<'a> {
@@ -155,7 +156,13 @@ fn read_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> 
                         }
                         options.window_scale = Some(bytes[2].min(14));
                     }
-                    2 | 3 => return Err(WireError::InvalidOption),
+                    8 if len == 10 && options.timestamps.is_none() => {
+                        options.timestamps = Some((
+                            u32::from_be_bytes(bytes[2..6].try_into().unwrap()),
+                            u32::from_be_bytes(bytes[6..10].try_into().unwrap()),
+                        ));
+                    }
+                    2 | 3 | 8 => return Err(WireError::InvalidOption),
                     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
                     //# A TCP implementation MUST (MUST-6) ignore without error any TCP
                     //# Option it does not implement, assuming that the option has a length
@@ -384,7 +391,8 @@ mod tests {
                     parsed.options,
                     Options {
                         mss: Some(1460),
-                        window_scale: Some(14)
+                        window_scale: Some(14),
+                        ..Options::default()
                     }
                 );
                 // Odd and even payloads have a valid independent checksum and no
@@ -485,7 +493,8 @@ mod tests {
                 parsed.options,
                 Options {
                     mss: Some(0x1234),
-                    window_scale: Some(7)
+                    window_scale: Some(7),
+                    ..Options::default()
                 }
             );
             assert!(
@@ -689,5 +698,24 @@ mod tests {
             );
             assert_eq!(out, [0xa5; 80]);
         }
+    }
+    #[test]
+    fn timestamp_option_parses_and_rejects_malformed_or_duplicate_values() {
+        let option = [8, 10, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 7];
+        assert_eq!(
+            read_options(&option, false).unwrap().timestamps,
+            Some((u32::MAX, 7))
+        );
+        assert_eq!(
+            read_options(&option[..9], false),
+            Err(WireError::InvalidOption)
+        );
+        assert_eq!(read_options(&[8, 2], false), Err(WireError::InvalidOption));
+        let mut duplicate = option.to_vec();
+        duplicate.extend_from_slice(&option);
+        assert_eq!(
+            read_options(&duplicate, false),
+            Err(WireError::InvalidOption)
+        );
     }
 }

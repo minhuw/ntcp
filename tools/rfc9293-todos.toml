@@ -1,15 +1,6 @@
 # Machine-readable unresolved evidence; TODOs are not conformance exceptions.
 
 [[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1"
-tags = ["MAY-2"]
-reason = "MAY-2 [optional_omitted]: No direct reopening from TIME-WAIT; tuple remains reserved until expiry."
-quote = '''
-However, it MAY accept a new SYN from the remote TCP endpoint to
-reopen the connection directly from TIME-WAIT state (MAY-2), if it:
-'''
-
-[[todo]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.4.1"
 tags = ["MUST-9"]
 reason = "MUST-9 [partial]: Secret and tuple sensitivity now have direct regression tests. HMAC uses a caller-supplied secret and TUN reads /dev/urandom; embeddings must still supply an unpredictable secret. Unit tests establish key dependence, not secrecy of caller key material."
@@ -47,15 +38,4 @@ quote = '''
 |  An incoming SYN with an invalid source address MUST be ignored
 |  either by TCP or by the IP layer [(MUST-63)] (see
 |  Section 3.2.1.3).
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1"
-tags = ["SHLD-4"]
-reason = "SHLD-4 [conditional_outside_profile]: Timestamp negotiation is not implemented. Timestamp-assisted TIME-WAIT reduction is consequently unavailable, not a baseline MUST failure."
-quote = '''
-This algorithm for reducing TIME-WAIT is a Best
-Current Practice that SHOULD be implemented since Timestamp Options
-are commonly used, and using them to reduce TIME-WAIT provides
-benefits for busy Internet servers (SHLD-4).
 '''
