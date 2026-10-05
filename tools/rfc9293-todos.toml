@@ -110,15 +110,3 @@ If a different source
 route arrives in a later segment, the later definition SHOULD
 override the earlier one (SHLD-24).
 '''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3"
-tags = ["unnumbered"]
-reason = "SYN-SENT validates ACK before RST; exact RCV.NXT checking for the optional RFC5961 mitigation in this state has not been established. Do not infer it from synchronized-state checks."
-quote = '''
-A TCP
-implementation that supports the mitigation described in RFC
-5961 SHOULD first check that the sequence number exactly
-matches RCV.NXT prior to executing the action in the next
-paragraph.
-'''

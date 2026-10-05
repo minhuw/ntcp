@@ -1,3 +1,15 @@
+# Verified technical erratum, not an implementation waiver.
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3"
+reason = "Verified RFC 9293 erratum 8167 (2025-03-19) removes this entire bullet: RFC 5961 adds no RST handling rules in SYN-SENT. Preserve ACK-based validation per RFC 5961 section 3.2 and RFC 9293 section 3.5.3. https://www.rfc-editor.org/errata/eid8167"
+quote = '''
+A TCP
+implementation that supports the mitigation described in RFC
+5961 SHOULD first check that the sequence number exactly
+matches RCV.NXT prior to executing the action in the next
+paragraph.
+'''
+
 # Duvet 0.4.3 stops its extracted ISN requirement at the colon, before the
 # formula and SHLD-1 label. Keep the complete recommendation in scope.
 [[spec]]

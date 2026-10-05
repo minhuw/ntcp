@@ -2633,14 +2633,36 @@ mod tests {
     //= type=test
     //# Otherwise (no ACK), drop the segment and return.
     fn syn_sent_resets_require_ack_and_abort_outputs_once() {
-        let mut a = Connection::active(tuple(), config(64, 8), 100, 0).unwrap();
-        packet(&mut a, 0);
-        inject(&mut a, 10, Seq(0), Seq(101), RST, 0, b"");
-        assert_eq!(a.state(), State::SynSent);
-        inject(&mut a, 20, Seq(0), Seq(102), RST | ACK, 0, b"");
-        assert_eq!(a.state(), State::SynSent);
-        inject(&mut a, 30, Seq(0), Seq(101), RST | ACK, 0, b"");
-        assert_eq!(a.close_reason(), Some(CloseReason::Reset));
+        // Verified erratum 8167 removes the SYN-SENT RCV.NXT check:
+        // https://www.rfc-editor.org/errata/eid8167
+        // No peer sequence has been learned; only acknowledgment of our SYN matters.
+        for iss in [100u32, u32::MAX] {
+            for sequence in [0, 0x1234_5678, u32::MAX] {
+                let mut a = Connection::active(tuple(), config(64, 8), iss, 0).unwrap();
+                packet(&mut a, 0);
+                for (flags, ack) in [
+                    (RST, iss.wrapping_add(1)),
+                    (RST | ACK, iss),
+                    (RST | ACK, iss.wrapping_add(2)),
+                ] {
+                    inject(&mut a, 10, Seq(sequence), Seq(ack), flags, 0, b"");
+                    assert_eq!(a.state(), State::SynSent);
+                    assert_eq!(a.transmit(10, &mut [0; 64]), Ok(None));
+                }
+                inject(
+                    &mut a,
+                    20,
+                    Seq(sequence),
+                    Seq(iss.wrapping_add(1)),
+                    RST | ACK,
+                    0,
+                    b"",
+                );
+                assert_eq!(a.state(), State::Closed);
+                assert_eq!(a.close_reason(), Some(CloseReason::Reset));
+                assert_eq!(a.transmit(20, &mut [0; 64]), Ok(None));
+            }
+        }
         let (mut a, mut b) = pair(config(64, 8), 100);
         a.abort();
         assert_eq!(a.state(), State::Closed);
