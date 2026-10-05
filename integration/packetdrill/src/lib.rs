@@ -242,9 +242,10 @@ impl Adapter {
                         // fails: stock host cleanup still precedes adapterDrop.
                         if catch_unwind(AssertUnwindSafe(|| owner.run(rx, &stopping))).is_err() {
                             diagnostic("FAILURE", "endpoint owner panicked; adapter stopped");
-                            for request in owner.pending.drain(..) {
-                                let _ = request.reply.send(Err(EIO));
-                            }
+                        }
+                        // Also cover non-panicking early error returns from run().
+                        for request in owner.pending.drain(..) {
+                            let _ = request.reply.send(Err(EIO));
                         }
                         while !stopping.load(Ordering::Acquire) {
                             thread::sleep(Duration::from_millis(1));
