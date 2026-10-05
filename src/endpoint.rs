@@ -246,8 +246,14 @@ impl Endpoint {
         let per_connection_bytes = config
             .connection
             .receive_capacity
-            .checked_mul(2)
-            .and_then(|n| n.checked_add(config.connection.send_capacity))
+            .checked_mul(3)
+            .and_then(|n| {
+                config
+                    .connection
+                    .send_capacity
+                    .checked_mul(2)
+                    .and_then(|send| n.checked_add(send))
+            })
             .and_then(|n| n.checked_add(usize::from(config.connection.mss)))
             .ok_or(EndpointError::LimitReached)?;
         let mut slots = reserved_vec(count)?;
@@ -895,6 +901,26 @@ impl Endpoint {
         let count = self.slot_mut(id)?.connection.write(bytes)?;
         self.refresh(id.slot);
         Ok(count)
+    }
+    pub fn write_with_push(
+        &mut self,
+        id: ConnectionId,
+        bytes: &[u8],
+        push: bool,
+    ) -> Result<usize, EndpointError> {
+        let count = self.slot_mut(id)?.connection.write_with_push(bytes, push)?;
+        self.refresh(id.slot);
+        Ok(count)
+    }
+    pub fn flush(&mut self, id: ConnectionId) -> Result<usize, EndpointError> {
+        let count = self.slot_mut(id)?.connection.flush()?;
+        self.refresh(id.slot);
+        Ok(count)
+    }
+    pub fn close(&mut self, id: ConnectionId) -> Result<(), EndpointError> {
+        self.slot_mut(id)?.connection.close()?;
+        self.refresh(id.slot);
+        Ok(())
     }
     pub fn write_urgent(&mut self, id: ConnectionId, bytes: &[u8]) -> Result<usize, EndpointError> {
         let count = self.slot_mut(id)?.connection.write_urgent(bytes)?;

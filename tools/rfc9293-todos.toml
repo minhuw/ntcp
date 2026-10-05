@@ -2,44 +2,11 @@
 
 [[todo]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1"
-tags = ["MAY-1"]
-reason = "MAY-1 [optional_omitted]: Uses full-duplex half-close: shutdown stops sending but preserves reading. Optional half-duplex close is not selected."
-quote = '''
-A host MAY implement a "half-duplex" TCP close sequence, so that an
-application that has called CLOSE cannot continue to read data from
-the connection (MAY-1).
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1"
 tags = ["MAY-2"]
 reason = "MAY-2 [optional_omitted]: No direct reopening from TIME-WAIT; tuple remains reserved until expiry."
 quote = '''
 However, it MAY accept a new SYN from the remote TCP endpoint to
 reopen the connection directly from TIME-WAIT state (MAY-2), if it:
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.1"
-tags = ["MAY-4"]
-reason = "MAY-4 [conditional_outside_profile]: IPv4 Identification allocation/reuse belongs to the packet adapter. No additional TCP-core API is required for this optional behavior."
-quote = '''
-RFC 1122 allows that if a retransmitted packet is identical to the
-original packet (which implies not only that the data boundaries have
-not changed, but also that none of the headers have changed), then
-the same IPv4 Identification field MAY be used (see Section 3.2.1.5
-of RFC 1122) (MAY-4).
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4"
-tags = ["MAY-6"]
-reason = "MAY-6 [optional_omitted]: One-octet compatibility probes are optional."
-quote = '''
-An implementation SHOULD send a keep-alive segment with no data
-(SHLD-12); however, it MAY be configurable to send a keep-alive
-segment containing one garbage octet (MAY-6), for compatibility with
-erroneous TCP implementations.
 '''
 
 [[todo]]
@@ -54,59 +21,12 @@ acknowledged (SHLD-17).
 '''
 
 [[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.9"
-tags = ["MAY-9"]
-reason = "MAY-9 [optional_omitted]: Received Diffserv values are not exposed."
-quote = '''
-TCP implementations MAY pass the most recently received
-Differentiated Services field up to the application (MAY-9).
-'''
-
-[[todo]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2"
 tags = ["MAY-10", "MAY-11"]
 reason = "MAY-10 [optional_omitted]: Optional IP Timestamp support is absent; unrelated to TCP timestamps. MAY-11 [optional_omitted]: Optional Record Route support is absent."
 quote = '''
 A TCP implementation MAY support the Timestamp (MAY-10) and Record
 Route (MAY-11) Options.
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.7"
-tags = ["MAY-14"]
-reason = "MAY-14 [optional_omitted]: Optional unsent-data flush is absent."
-quote = '''
-The FLUSH call MAY be implemented
-(MAY-14).
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2"
-tags = ["MAY-15"]
-reason = "MAY-15 [optional_omitted]: Optional application-controlled PUSH is absent; MUST-60/61 consequently apply."
-quote = '''
-A TCP endpoint MAY implement PUSH flags on SEND calls (MAY-15).
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2"
-tags = ["MAY-16"]
-reason = "MAY-16 [optional_omitted]: Optional PUSH-controlled aggregation is absent; ordinary stream buffering and Nagle are separate mechanisms."
-quote = '''
-When an application
-issues a series of SEND calls without setting the PUSH flag, the TCP
-implementation MAY aggregate the data internally without sending it
-(MAY-16).
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.3"
-tags = ["MAY-17"]
-reason = "MAY-17 [optional_omitted]: Optional received-PSH reporting is absent."
-quote = '''
-A TCP receiver MAY pass a received PSH bit to the application layer
-via the PUSH flag in the interface (MAY-17), but it is not required
-(this was clarified in RFC 1122, Section 4.2.2.2).
 '''
 
 [[todo]]
@@ -183,17 +103,6 @@ quote = '''
 
 [[todo]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1"
-tags = ["SHLD-3"]
-reason = "SHLD-3 [conditional_outside_profile]: Conditional on half-duplex close. This implementation retains the receive direction after shutdown."
-quote = '''
-If such a host issues a CLOSE call while
-received data is still pending in the TCP connection, or if new data
-is received after CLOSE is called, its TCP implementation SHOULD send
-a RST to show that data was lost (SHLD-3).
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1"
 tags = ["SHLD-4"]
 reason = "SHLD-4 [conditional_outside_profile]: Timestamp negotiation is not implemented. Timestamp-assisted TIME-WAIT reduction is consequently unavailable, not a baseline MUST failure."
 quote = '''
@@ -201,25 +110,6 @@ This algorithm for reducing TIME-WAIT is a Best
 Current Practice that SHOULD be implemented since Timestamp Options
 are commonly used, and using them to reduce TIME-WAIT provides
 benefits for busy Internet servers (SHLD-4).
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.2"
-tags = ["SHLD-8"]
-reason = "SHLD-8 [gap]: ECN is not implemented. This requires TCP state/congestion handling and an IP ECN metadata interface; adapter responsibility alone is insufficient."
-quote = '''
-A TCP endpoint SHOULD implement ECN as described in RFC 3168 (SHLD-
-8).
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5"
-tags = ["SHLD-13"]
-reason = "SHLD-13 [conditional_outside_profile]: This recommendation governs new application designs, not whether the TCP core must expose urgent support."
-quote = '''
-As a result of implementation differences and middlebox interactions,
-new applications SHOULD NOT employ the TCP urgent mechanism (SHLD-
-13).
 '''
 
 [[todo]]
@@ -242,44 +132,4 @@ implementation that supports the mitigation described in RFC
 5961 SHOULD first check that the sequence number exactly
 matches RCV.NXT prior to executing the action in the next
 paragraph.
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3"
-tags = ["unnumbered"]
-reason = "Optional piggybacking on handshake completion is not claimed; inspect queued SEND behavior before adding an implementation citation."
-quote = '''
-Data or controls that were queued for
-transmission MAY be included.
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2"
-tags = ["MUST-60", "MUST-61"]
-reason = "Implementation is cited, but no direct test annotation is linked to this extracted requirement span. Validate specific assertions before adding a test citation; this is an evidence gap, not a claim that no relevant test exists."
-quote = '''
-If
-PUSH flags are not implemented, then the sending TCP peer: (1) MUST
-NOT buffer data indefinitely (MUST-60), and (2) MUST set the PSH bit
-in the last buffered segment (i.e., when there is no more queued data
-to be sent) (MUST-61).
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2"
-tags = ["SHLD-13"]
-reason = "Application guidance: the echo adapter uses ordinary writes. Not a transport prohibition on urgent-data support; application-profile evidence is not a core compliance claim."
-quote = '''
-New applications SHOULD NOT set the URGENT flag [39] due to
-implementation differences and middlebox issues (SHLD-13).
-'''
-
-[[todo]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2"
-tags = ["SHLD-23"]
-reason = "Application guidance: example uses fixed DSCP, while API permits explicit changes. Caller behavior must be assessed separately; no core conformance credit."
-quote = '''
-Generally, an application
-SHOULD NOT change the Diffserv field value during the course of
-a connection (SHLD-23).
 '''

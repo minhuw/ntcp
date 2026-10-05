@@ -44,6 +44,7 @@ pub struct KeepaliveConfig {
     pub idle_us: u64,
     pub interval_us: u64,
     pub probes: u32,
+    pub send_garbage: bool,
 }
 
 impl Default for KeepaliveConfig {
@@ -55,6 +56,7 @@ impl Default for KeepaliveConfig {
             idle_us: 7_200_000_000,
             interval_us: 75_000_000,
             probes: 9,
+            send_garbage: false,
         }
     }
 }
@@ -137,6 +139,10 @@ pub enum Error {
 pub struct ConnectionEvents {
     pub connected: bool,
     pub readable: bool,
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.3
+    //# A TCP receiver MAY pass a received PSH bit to the application layer via
+    //# the PUSH flag in the interface (MAY-17), but it is not required
+    pub pushed: bool,
     pub writable: bool,
     pub acknowledged: Option<u64>,
     pub half_closed: bool,
@@ -199,8 +205,10 @@ pub(crate) struct Connection {
     received_read: u64,
     received_total: u64,
     snd_up: Option<Seq>,
+    advertised_snd_up: Option<Seq>,
     rcv_up: Option<u64>,
     shutdown: bool,
+    read_closed: bool,
     fin_sequence: Option<Seq>,
     syn_pending: bool,
     ack_pending: bool,
@@ -323,8 +331,10 @@ impl Connection {
             received_read: 0,
             received_total: 0,
             snd_up: None,
+            advertised_snd_up: None,
             rcv_up: None,
             shutdown: false,
+            read_closed: false,
             fin_sequence: None,
             syn_pending: true,
             ack_pending: false,
@@ -594,7 +604,12 @@ impl Connection {
         self.wl2 = Seq(syn.header.acknowledgment);
         let count = syn.payload.len().min(self.syn_window as usize);
         let fin = syn.header.flags & FIN != 0 && syn.payload.len() < self.syn_window as usize;
-        let outcome = self.receive.insert(start, &syn.payload[..count], fin);
+        let outcome = self.receive.insert_with_push(
+            start,
+            &syn.payload[..count],
+            fin,
+            syn.header.flags & PSH != 0 && count == syn.payload.len(),
+        );
         self.received_total = count as u64;
         if outcome.fin {
             self.syn_window = 0;
@@ -639,8 +654,10 @@ impl Connection {
         self.syn_pending = false;
         self.events.connected = true;
         self.events.writable = !self.shutdown && self.send.remaining() != 0;
-        self.events.readable = self.receive.readable() != 0 || self.receive.eof();
-        self.events.urgent = self.rcv_up;
+        self.events.readable =
+            !self.read_closed && (self.receive.readable() != 0 || self.receive.eof());
+        self.events.pushed |= self.receive.take_push();
+        self.events.urgent = if self.read_closed { None } else { self.rcv_up };
         if self.receive.eof() {
             self.events.half_closed = true;
             self.state = State::CloseWait;
@@ -812,6 +829,12 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.2
     //# Return "error: connection closing" and do not service request.
     pub(crate) fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
+        self.write_with_push(data, true)
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
+    //# A TCP endpoint MAY implement PUSH flags on SEND calls (MAY-15).
+    pub(crate) fn write_with_push(&mut self, data: &[u8], push: bool) -> Result<usize, Error> {
         if self.shutdown
             || !matches!(
                 self.state,
@@ -821,12 +844,18 @@ impl Connection {
             return Err(Error::InvalidState);
         }
         if data.is_empty() {
+            if push {
+                self.send.mark_push();
+            }
             return Ok(0);
         }
         let idle = !self.user_timer_needed();
         let count = self.send.write(data);
         if count == 0 {
             return Err(Error::WouldBlock);
+        }
+        if push {
+            self.send.mark_push();
         }
         if idle {
             self.progress_at = self.now;
@@ -849,7 +878,91 @@ impl Connection {
         Ok(count)
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.7
+    //# The FLUSH call MAY be implemented (MAY-14).
+    pub(crate) fn flush(&mut self) -> Result<usize, Error> {
+        // FIN and SYN occupy sequence space, not buffer slots.
+        if self.shutdown
+            || !matches!(
+                self.state,
+                State::SynSent | State::SynReceived | State::Established | State::CloseWait
+            )
+        {
+            return Err(Error::InvalidState);
+        }
+        let sent = if matches!(self.state, State::SynSent | State::SynReceived) {
+            0
+        } else {
+            (self.snd_nxt.distance_from(self.send_base) as usize).min(self.send.len())
+        };
+        // An on-wire urgent endpoint cannot be retracted: retain even unsent
+        // bytes covered by it beyond the offered window.
+        let advertised = self
+            .advertised_snd_up
+            .map_or(0, |end| end.distance_from(self.send_base) as usize);
+        // FLUSH discards only to the right of the offered send window, not
+        // all unsent data (which may merely be waiting for congestion control).
+        let edge = self.snd_una.wrapping_add(self.snd_wnd);
+        let window_prefix = if after(edge, self.send_base) {
+            (edge.distance_from(self.send_base) as usize).min(self.send.len())
+        } else {
+            0
+        };
+        let retained = sent.max(advertised).max(window_prefix).min(self.send.len());
+        let discarded = self.send.len() - retained;
+        self.send.truncate(retained);
+        let end = self.send_base.wrapping_add(retained as u32);
+        if self.snd_up.is_some_and(|up| after(up, end)) {
+            self.snd_up = (retained != 0).then_some(end);
+        }
+        if discarded != 0 {
+            self.events.writable = true;
+        }
+        self.arm_work();
+        Ok(discarded)
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
+    //# A host MAY implement a "half-duplex" TCP close sequence, so that an
+    //# application that has called CLOSE cannot continue to read data from
+    //# the connection (MAY-1).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
+    //# If such a host issues a CLOSE call while received data is still pending in
+    //# the TCP connection, or if new data is received after CLOSE is called, its
+    //# TCP implementation SHOULD send a RST to show that data was lost (SHLD-3).
+    pub(crate) fn close(&mut self) -> Result<(), Error> {
+        if self.read_closed {
+            return if self.state == State::Closed && self.reason != Some(CloseReason::Normal) {
+                Err(Error::InvalidState)
+            } else {
+                Ok(())
+            };
+        }
+        if self.shutdown
+            || !matches!(
+                self.state,
+                State::SynSent | State::SynReceived | State::Established | State::CloseWait
+            )
+        {
+            return Err(Error::InvalidState);
+        }
+        self.read_closed = true;
+        self.events.readable = false;
+        self.events.pushed = false;
+        self.events.urgent = None;
+        self.events.writable = false;
+        if self.receive.has_data() {
+            self.abort();
+            Ok(())
+        } else {
+            self.shutdown()
+        }
+    }
+
     pub(crate) fn read(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+        if self.read_closed {
+            return Err(Error::InvalidState);
+        }
         if out.is_empty() {
             return Err(Error::InvalidArgument);
         }
@@ -1000,6 +1113,9 @@ impl Connection {
             if valid_ack {
                 self.accept_ack(ack, false);
                 self.establish();
+                //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
+                //# Data or controls that were queued for transmission MAY be included.
+                // Pending ACKs share the output path with queued stream data.
                 self.immediate_ack();
             } else {
                 self.state = State::SynReceived;
@@ -1292,6 +1408,12 @@ impl Connection {
         if self.snd_up.is_some_and(|end| at_or_after(ack, end)) {
             self.snd_up = None;
         }
+        if self
+            .advertised_snd_up
+            .is_some_and(|end| at_or_after(ack, end))
+        {
+            self.advertised_snd_up = None;
+        }
         self.progress_at = self.now;
         self.consecutive_timeouts = 0;
         self.retx_pending = false;
@@ -1353,7 +1475,7 @@ impl Connection {
         }
         let next = self.receive.next();
         let window = self.receive_window();
-        if flags & URG != 0 {
+        if flags & URG != 0 && !self.read_closed {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5
             //# The urgent pointer MUST point to the sequence number of the octet
             //# following the urgent data (MUST-62).
@@ -1397,17 +1519,27 @@ impl Connection {
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
         //# Segments with higher beginning sequence numbers SHOULD be held for later
         //# processing (SHLD-31).
-        let outcome = self.receive.insert(
+        let outcome = self.receive.insert_with_push(
             start,
             &payload[skip..skip + count],
             fin && skip + count == payload.len(),
+            flags & PSH != 0 && skip + count == payload.len(),
         );
+        if self.read_closed && outcome.new_bytes != 0 {
+            self.events.readable = false;
+            self.events.pushed = false;
+            self.events.urgent = None;
+            self.events.writable = false;
+            self.abort();
+            return;
+        }
+        self.events.pushed |= self.receive.take_push();
         let advanced = self.receive.next().distance_from(next);
         self.received_total = self
             .received_total
             .saturating_add(advanced.saturating_sub(u32::from(outcome.fin)) as u64);
         if outcome.advanced {
-            self.events.readable = true;
+            self.events.readable = !self.read_closed;
             if self.state == State::FinWait2 {
                 self.progress_at = self.now;
             }
@@ -1561,6 +1693,17 @@ impl Connection {
         //# An implementation SHOULD send a keep-alive segment with no data (SHLD-12);
         } else if keepalive {
             seq = self.snd_nxt.wrapping_add(u32::MAX);
+            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4
+            //# it MAY be configurable to send a keep-alive segment containing one
+            //# garbage octet (MAY-6), for compatibility with erroneous TCP implementations.
+            if self
+                .config
+                .keepalive
+                .is_some_and(|config| config.send_garbage)
+            {
+                self.scratch[0] = 0;
+                count = 1;
+            }
         } else if live {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
             //= reason=SendBuffer coalesces writes; packetization is independent of application write boundaries.
@@ -1603,7 +1746,13 @@ impl Connection {
                 //# sender (MUST-38).
                 let sws =
                     !self.sws_override && count < unsent && count < (self.max_snd_wnd / 2) as usize;
-                if nagle || sws {
+                //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
+                //# When an application issues a series of SEND calls without setting
+                //# the PUSH flag, the TCP implementation MAY aggregate the data
+                //# internally without sending it (MAY-16).
+                let aggregate =
+                    !self.shutdown && !self.sws_override && !self.send.pushed(offset, unsent);
+                if nagle || sws || aggregate {
                     count = 0;
                 }
             }
@@ -1624,7 +1773,12 @@ impl Connection {
                 new_fin = true;
             }
         }
-        if count != 0 {
+        if count != 0
+            && !keepalive
+            && self
+                .send
+                .pushed(seq.distance_from(self.send_base) as usize, count)
+        {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
             //# MUST set the PSH bit in the last buffered segment (i.e., when there is
             //# no more queued data to be sent) (MUST-61).
@@ -1743,6 +1897,20 @@ impl Connection {
                 Error::Wire(error)
             }
         })?;
+        // Commit only the encoded (possibly clamped) urgent coverage, and only
+        // after successful output. Retransmissions must not move it backwards.
+        if flags & URG != 0 {
+            let end = seq.wrapping_add(urgent_pointer as u32);
+            if self.advertised_snd_up.is_none_or(|old| after(end, old)) {
+                self.advertised_snd_up = Some(end);
+            }
+        }
+        // Commit the on-wire endpoint only after output succeeds. A partial ACK
+        // past an earlier collapsed mark must not lose PSH on retransmission.
+        if flags & PSH != 0 {
+            self.send
+                .collapse_push(seq.distance_from(self.send_base) as usize, count);
+        }
         self.now = now;
         self.last_output_ecn = ecn;
         if syn {
@@ -1756,7 +1924,11 @@ impl Connection {
             self.pending_rst = None;
             return Ok(Some(size));
         }
-        if self.flight() == 0 && now.saturating_sub(self.last_sent) >= self.rto() && count != 0 {
+        if !keepalive
+            && self.flight() == 0
+            && now.saturating_sub(self.last_sent) >= self.rto()
+            && count != 0
+        {
             self.congestion.restart_after_idle();
         }
         self.last_sent = now;
@@ -1777,7 +1949,7 @@ impl Connection {
             }
         }
         let length = count as u32 + u32::from(flags & SYN != 0) + u32::from(flags & FIN != 0);
-        if length != 0 {
+        if length != 0 && !keepalive {
             let end = seq.wrapping_add(length);
             if retransmitted {
                 if !syn && !probe {
@@ -1834,7 +2006,7 @@ impl Connection {
                 .keepalive
                 .map(|k| now.saturating_add(k.interval_us));
         }
-        if count != 0 {
+        if count != 0 && !keepalive {
             if self.limited_pending && !retransmit && !probe {
                 self.limited_sent = self.limited_sent.saturating_add(count as u32);
                 self.limited_pending = false;
@@ -2639,6 +2811,7 @@ mod tests {
             idle_us: 7_200_000_000,
             interval_us: 1_000_000,
             probes: 2,
+            send_garbage: false,
         });
         let (mut a, mut b) = pair(cfg, 100);
         let deadline = a.keepalive_deadline.unwrap();
@@ -2694,7 +2867,7 @@ mod tests {
             destination_port: 2000,
             sequence: u32::MAX - 1,
             acknowledgment: 0,
-            flags: SYN | URG,
+            flags: SYN | URG | PSH,
             window: 64,
             urgent_pointer: 4,
         };
@@ -2714,6 +2887,7 @@ mod tests {
         let events = b.take_events();
         assert!(events.connected && events.readable);
         assert_eq!(events.urgent, Some(3));
+        assert!(events.pushed);
         assert_eq!(b.urgent_remaining(), 3);
         let mut out = [0; 8];
         assert_eq!(b.read(&mut out[..1]), Ok(1));
@@ -3124,6 +3298,7 @@ mod tests {
             idle_us: 100,
             interval_us: 50,
             probes: 2,
+            send_garbage: false,
         };
         a.set_keepalive(Some(keepalive)).unwrap();
         assert_eq!(a.next_deadline(), Some(1_000_100));
@@ -3434,6 +3609,7 @@ mod tests {
             idle_us: 100,
             interval_us: 50,
             probes: 2,
+            send_garbage: false,
         }))
         .unwrap();
         a.timeout(a.keepalive_deadline.unwrap()).unwrap();
@@ -4533,5 +4709,533 @@ mod tests {
         b.input_with_traffic_class(40, 3, &control).unwrap();
         assert!(!b.ecn_echo);
         assert_eq!(b.ecn_ce_end, None);
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
+    //= type=test
+    //# A TCP endpoint MAY implement PUSH flags on SEND calls (MAY-15).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
+    //= type=test
+    //# When an application issues a series of SEND calls without setting the PUSH
+    //# flag, the TCP implementation MAY aggregate the data internally without
+    //# sending it (MAY-16).
+    fn explicit_push_aggregates_crosses_marks_and_retransmits_after_partial_ack() {
+        let (mut a, _) = pair(config(16, 8), u32::MAX - 3);
+        a.set_nagle(false);
+        a.write_with_push(b"ab", false).unwrap();
+        assert_eq!(a.transmit(40, &mut [0; 64]), Ok(None));
+        a.write_with_push(b"cd", true).unwrap();
+        a.write_with_push(b"efghij", false).unwrap();
+        let before = (a.snd_nxt, a.send.len(), a.next_deadline());
+        assert_eq!(a.transmit(40, &mut [0; 27]), Err(Error::OutputTooSmall));
+        assert_eq!((a.snd_nxt, a.send.len(), a.next_deadline()), before);
+        let bytes = packet(&mut a, 40);
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(segment.payload, b"abcdefgh");
+        assert_ne!(segment.header.flags & PSH, 0); // Crossed cd, not a record boundary.
+        let ack = a.send_base.wrapping_add(2);
+        inject(&mut a, 50, Seq(901), ack, ACK, 16, b"");
+        a.retx_pending = true;
+        let bytes = packet(&mut a, 60);
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(segment.payload, b"cdefgh");
+        assert_ne!(segment.header.flags & PSH, 0);
+        let ack = a.send_base.wrapping_add(4); // Past original PUSH, before wire PSH.
+        inject(&mut a, 65, Seq(901), ack, ACK, 16, b"");
+        a.retx_pending = true;
+        let bytes = packet(&mut a, 66);
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(segment.payload, b"gh");
+        assert_ne!(segment.header.flags & PSH, 0);
+        let ack = a.snd_nxt;
+        inject(&mut a, 70, Seq(901), ack, ACK, 16, b"");
+        assert_eq!(a.transmit(80, &mut [0; 64]), Ok(None));
+        a.write_with_push(b"", true).unwrap();
+        let bytes = packet(&mut a, 80);
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(segment.payload, b"ij");
+        assert_ne!(segment.header.flags & PSH, 0);
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
+    //= type=test
+    //# MUST NOT buffer data indefinitely (MUST-60),
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
+    //= type=test
+    //# MUST set the PSH bit in the last buffered segment (i.e., when there is
+    //# no more queued data to be sent) (MUST-61).
+    fn automatic_push_final_segment_partial_write_and_bounded_aggregation() {
+        let (mut a, _) = pair(config(10, 8), 100);
+        a.set_nagle(false);
+        assert_eq!(a.write(b"abcdefghijkl"), Ok(10));
+        assert_eq!(a.write_with_push(b"x", false), Err(Error::WouldBlock));
+        for (expected, pushed) in [(&b"abcdefgh"[..], false), (&b"ij"[..], true)] {
+            let bytes = packet(&mut a, 40);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.payload, expected);
+            assert_eq!(segment.header.flags & PSH != 0, pushed);
+        }
+        let (mut a, _) = pair(config(16, 8), 100);
+        a.write_with_push(b"abc", false).unwrap();
+        assert_eq!(a.transmit(40, &mut [0; 64]), Ok(None));
+        let deadline = a.sws_deadline.unwrap();
+        a.timeout(deadline).unwrap();
+        let bytes = packet(&mut a, deadline);
+        assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, b"abc");
+
+        let (mut a, _) = pair(config(16, 8), 100);
+        a.write_with_push(b"abc", false).unwrap();
+        a.shutdown().unwrap();
+        let bytes = packet(&mut a, 40);
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(segment.payload, b"abc");
+        assert_ne!(segment.header.flags & FIN, 0);
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.7
+    //= type=test
+    //# The FLUSH call MAY be implemented (MAY-14).
+    fn flush_retains_advertised_urgency_and_push_after_partial_ack() {
+        let (mut a, _) = pair(config(16, 8), u32::MAX - 3);
+        a.write_with_push(b"ab", true).unwrap();
+        a.write_urgent(b"cdefghijklmnop").unwrap();
+        packet(&mut a, 40);
+        let ack = a.send_base.wrapping_add(2);
+        inject(&mut a, 50, Seq(901), ack, ACK, 6, b"");
+        let next = a.snd_nxt;
+        let urgent_end = a.send_base.wrapping_add(14);
+        assert_eq!(a.flush(), Ok(0));
+        assert_eq!(a.send.len(), 14);
+        assert_eq!(a.snd_nxt, next);
+        assert_eq!(a.snd_up, Some(urgent_end));
+        assert_eq!(a.advertised_snd_up, Some(urgent_end));
+        assert!(a.take_events().writable);
+        a.retx_pending = true;
+        let bytes = packet(&mut a, 60);
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(segment.payload, b"cdefgh");
+        assert_ne!(segment.header.flags & PSH, 0); // Retained on-wire mark survives the partial ACK.
+        assert_eq!(segment.header.urgent_pointer, 14);
+        inject(&mut a, 70, Seq(901), next, ACK, 16, b"");
+        let bytes = packet(&mut a, 71);
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes).unwrap().payload,
+            b"ijklmnop"
+        );
+        inject(&mut a, 72, Seq(901), urgent_end, ACK, 16, b"");
+        assert_eq!(a.advertised_snd_up, None);
+        let next = a.snd_nxt;
+        a.write(b"new").unwrap();
+        let bytes = packet(&mut a, 80);
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(segment.header.sequence, next.0);
+        assert_eq!(segment.payload, b"new");
+        assert_ne!(segment.header.flags & PSH, 0);
+        assert_eq!(segment.header.flags & URG, 0);
+        a.shutdown().unwrap();
+        assert_eq!(a.flush(), Err(Error::InvalidState));
+        a.abort();
+        assert_eq!(a.flush(), Err(Error::InvalidState));
+
+        let mut a = Connection::active(tuple(), config(16, 8), 100, 0).unwrap();
+        a.write_urgent(b"queued").unwrap();
+        assert_eq!(a.flush(), Ok(6));
+        assert_eq!(a.snd_nxt, Seq(100));
+        assert_eq!(a.snd_up, None);
+        a.write(b"new").unwrap();
+        packet(&mut a, 0); // Flushing SYN-SENT must not discard or advance SYN.
+        assert_eq!(a.snd_nxt, Seq(101));
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.7
+    //= type=test
+    //# The FLUSH call MAY be implemented (MAY-14).
+    fn flush_cannot_reclassify_replacement_bytes_as_urgent_at_peer() {
+        for iss in [100, u32::MAX - 3] {
+            let (mut a, mut b) = pair(config(16, 8), iss);
+            a.write_urgent(b"abcdefghijklmnop").unwrap();
+            let bytes = deliver(&mut a, &mut b, 40);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes)
+                    .unwrap()
+                    .header
+                    .urgent_pointer,
+                16
+            );
+            assert_eq!(a.flush(), Ok(0));
+            assert_eq!(a.write(b"ordinary"), Err(Error::WouldBlock));
+            let mut out = [0; 8];
+            assert_eq!(b.read(&mut out), Ok(8));
+            assert_eq!(&out, b"abcdefgh");
+            assert_eq!(b.urgent_remaining(), 8);
+            deliver(&mut b, &mut a, 50);
+            assert_eq!(a.write(b"ordinary"), Ok(8));
+            let bytes = deliver(&mut a, &mut b, 60);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().payload,
+                b"ijklmnop"
+            );
+            assert_eq!(b.read(&mut out), Ok(8));
+            assert_eq!(b.urgent_remaining(), 0);
+            deliver(&mut b, &mut a, 70);
+            let bytes = deliver(&mut a, &mut b, 80);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.payload, b"ordinary");
+            assert_eq!(segment.header.flags & URG, 0);
+            assert_eq!(b.urgent_remaining(), 0);
+            assert_eq!(b.read(&mut out), Ok(8));
+            assert_eq!(&out, b"ordinary");
+            assert_eq!(a.send.capacity(), 16);
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.7
+    //= type=test
+    //# The FLUSH call MAY be implemented (MAY-14).
+    fn flush_retains_offered_window_not_congestion_window() {
+        for (window, discarded) in [(8, 4), (12, 0), (16, 0), (0, 12)] {
+            let (mut a, _) = pair(config(16, 2), u32::MAX - 3);
+            let base = a.send_base;
+            inject(&mut a, 40, Seq(901), base, ACK, window, b"");
+            assert_eq!(a.snd_wnd, window as u32);
+            assert!(a.congestion.cwnd() < 12);
+            a.write(b"abcdefghijkl").unwrap();
+            assert_eq!(a.flight(), 0);
+            a.take_events();
+            assert_eq!(a.flush(), Ok(discarded));
+            assert_eq!(a.send.len(), 12 - discarded);
+            assert_eq!(a.snd_nxt, base);
+            assert_eq!(a.take_events().writable, discarded != 0);
+            // Reopening and replacing the suffix must not create a sequence hole.
+            inject(&mut a, 50, Seq(901), base, ACK, 16, b"");
+            a.write(b"XY").unwrap();
+            let bytes = packet(&mut a, 60);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.header.sequence, base.0);
+            assert_eq!(segment.payload, if window == 0 { b"XY" } else { b"ab" });
+        }
+    }
+
+    #[test]
+    fn flush_shrunk_window_retains_flight_after_partial_ack_and_wrap() {
+        for window in [0, 2, 8] {
+            let (mut a, _) = pair(config(16, 8), u32::MAX - 3);
+            a.write(b"abcdefgh").unwrap();
+            a.write(b"ijklmnop").unwrap();
+            packet(&mut a, 40);
+            let next = a.snd_nxt;
+            let ack = a.send_base.wrapping_add(5);
+            assert_eq!(ack, Seq(2));
+            inject(&mut a, 50, Seq(901), ack, ACK, window, b"");
+            let retained = 3usize.max(window as usize);
+            assert_eq!(a.flush(), Ok(11 - retained));
+            assert_eq!(a.send.len(), retained);
+            assert_eq!(a.snd_nxt, next);
+            inject(&mut a, 60, Seq(901), ack, ACK, 16, b"");
+            a.retx_pending = true;
+            let bytes = packet(&mut a, 61);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.header.sequence, ack.0);
+            assert_eq!(segment.payload, b"fgh");
+            assert_ne!(segment.header.flags & PSH, 0);
+            inject(&mut a, 70, Seq(901), next, ACK, 16, b"");
+            a.write(b"XY").unwrap();
+            let bytes = packet(&mut a, 71);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.header.sequence, next.0);
+            assert_eq!(
+                segment.payload,
+                if window == 8 { &b"ijklmXY"[..] } else { b"XY" }
+            );
+        }
+    }
+
+    #[test]
+    fn flush_handshake_window_accounts_for_syn_sequence_space() {
+        for iss in [100, u32::MAX] {
+            for sent_syn in [false, true] {
+                let mut a = Connection::active(tuple(), config(16, 8), iss, 0).unwrap();
+                if sent_syn {
+                    packet(&mut a, 0);
+                }
+                a.write(b"queued").unwrap();
+                let next = a.snd_nxt;
+                assert_eq!(a.flush(), Ok(6)); // No window offered in SYN-SENT.
+                assert_eq!(a.snd_nxt, next);
+                assert_eq!(a.send_base, Seq(iss).wrapping_add(1));
+
+                for window in [0, 1, 8] {
+                    let mut peer = Connection::active(tuple(), config(16, 8), 900, 0).unwrap();
+                    let bytes = packet(&mut peer, 0);
+                    let mut syn = wire::parse(ip(tuple()), &bytes).unwrap();
+                    syn.header.window = window;
+                    let mut b =
+                        Connection::passive(reverse(tuple()), config(16, 8), iss, 0, &syn).unwrap();
+                    if sent_syn {
+                        packet(&mut b, 0);
+                    }
+                    assert_eq!(b.state(), State::SynReceived);
+                    b.write(b"abcdefghijkl").unwrap();
+                    let next = b.snd_nxt;
+                    let retained = window.saturating_sub(1) as usize;
+                    assert_eq!(b.flush(), Ok(12 - retained));
+                    assert_eq!(b.send.len(), retained);
+                    assert_eq!(b.snd_nxt, next);
+                    assert_eq!(b.send_base, Seq(iss).wrapping_add(1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flush_discards_only_unadvertised_suffix_even_after_failed_output() {
+        let (mut a, _) = pair(config(24, 8), u32::MAX - 3);
+        a.write_urgent(b"abcdefghijklmnop").unwrap();
+        packet(&mut a, 40); // Commits coverage of sixteen bytes, only eight sent.
+        let committed = a.advertised_snd_up;
+        a.write_urgent(b"qrstuvwx").unwrap();
+        assert_eq!(a.transmit(50, &mut [0; 27]), Err(Error::OutputTooSmall));
+        assert_eq!(a.advertised_snd_up, committed);
+        let ack = a.snd_una;
+        inject(&mut a, 51, Seq(901), ack, ACK, 8, b"");
+        assert_eq!(a.flush(), Ok(8));
+        assert_eq!(a.send.len(), 16);
+        assert_eq!(a.snd_up, committed);
+        assert_eq!(a.send.capacity(), 24);
+
+        let (mut a, _) = pair(config(16, 8), 100);
+        a.write_urgent(b"abcdefghijklmnop").unwrap();
+        assert_eq!(a.transmit(40, &mut [0; 27]), Err(Error::OutputTooSmall));
+        let ack = a.snd_una;
+        inject(&mut a, 41, Seq(901), ack, ACK, 0, b"");
+        assert_eq!(a.flush(), Ok(16)); // Outside the window, urgency never committed.
+        assert_eq!(a.snd_up, None);
+        assert_eq!(a.advertised_snd_up, None);
+        inject(&mut a, 42, Seq(901), ack, ACK, 16, b"");
+        a.write(b"ordinary").unwrap();
+        let bytes = packet(&mut a, 50);
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes).unwrap().header.flags & URG,
+            0
+        );
+
+        let (mut a, _) = pair(config(131072, 1460), u32::MAX - 100);
+        a.write_urgent(&vec![42; 70000]).unwrap();
+        packet(&mut a, 40);
+        packet(&mut a, 50); // Advances the capped wire endpoint by one MSS.
+        a.retx_pending = true;
+        packet(&mut a, 60); // Older retransmission cannot retract that endpoint.
+        let ack = a.snd_una;
+        inject(&mut a, 61, Seq(901), ack, ACK, 0, b"");
+        assert_eq!(a.flush(), Ok(70000 - 65535 - 1460));
+        assert_eq!(a.send.len(), 65535 + 1460);
+        assert_eq!(a.snd_up, a.advertised_snd_up);
+        assert_eq!(a.send.capacity(), 131072);
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.3
+    //= type=test
+    //# A TCP receiver MAY pass a received PSH bit to the application layer via
+    //# the PUSH flag in the interface (MAY-17), but it is not required
+    fn receive_push_waits_for_gap_and_ignores_duplicate_empty_and_trimmed_marks() {
+        let (_, mut b) = pair(config(16, 8), u32::MAX - 2);
+        let start = b.receive.next();
+        inject(
+            &mut b,
+            40,
+            start.wrapping_add(2),
+            Seq(901),
+            ACK | PSH,
+            16,
+            b"cd",
+        );
+        assert!(!b.take_events().pushed);
+        inject(&mut b, 50, start, Seq(901), ACK, 16, b"ab");
+        let events = b.take_events();
+        assert!(events.pushed && events.readable);
+        inject(
+            &mut b,
+            60,
+            start.wrapping_add(2),
+            Seq(901),
+            ACK | PSH,
+            16,
+            b"cd",
+        );
+        assert!(!b.take_events().pushed);
+        let next = b.receive.next();
+        inject(&mut b, 70, next, Seq(901), ACK | PSH, 16, b"");
+        assert!(!b.take_events().pushed);
+        inject(&mut b, 80, next, Seq(901), ACK | PSH, 16, b"efghijklmnopq");
+        assert!(!b.take_events().pushed); // PSH endpoint was outside the window.
+        assert_eq!(b.read(&mut [0; 16]), Ok(16));
+        packet(&mut b, 80); // Advertise the newly freed receive credit.
+        let next = b.receive.next();
+        inject(&mut b, 90, next, Seq(901), ACK | PSH, 16, b"x");
+        inject(
+            &mut b,
+            100,
+            next.wrapping_add(1),
+            Seq(901),
+            ACK | PSH,
+            16,
+            b"y",
+        );
+        assert!(b.take_events().pushed); // Coalesced, not a queue of records.
+        assert!(!b.take_events().pushed);
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
+    //= type=test
+    //# A host MAY implement a "half-duplex" TCP close sequence, so that an
+    //# application that has called CLOSE cannot continue to read data from
+    //# the connection (MAY-1).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.6.1
+    //= type=test
+    //# If such a host issues a CLOSE call while received data is still pending in
+    //# the TCP connection, or if new data is received after CLOSE is called, its
+    //# TCP implementation SHOULD send a RST to show that data was lost (SHLD-3).
+    fn optional_close_resets_only_accepted_data_loss_shutdown_still_reads() {
+        for offset in [0, 2] {
+            let (mut a, _) = pair(config(16, 8), 100);
+            inject(&mut a, 40, Seq(901 + offset), Seq(101), ACK | PSH, 16, b"x");
+            a.close().unwrap();
+            assert_eq!(a.read(&mut [0]), Err(Error::InvalidState));
+            let events = a.take_events();
+            assert_eq!(events.closed, Some(CloseReason::Aborted));
+            assert!(!events.readable && !events.pushed);
+            let bytes = packet(&mut a, 50);
+            assert_ne!(
+                wire::parse(ip(tuple()), &bytes).unwrap().header.flags & RST,
+                0
+            );
+        }
+        let (mut a, _) = pair(config(16, 8), 100);
+        inject(&mut a, 40, Seq(901), Seq(101), ACK, 16, b"x");
+        assert_eq!(a.read(&mut [0]), Ok(1));
+        a.take_events();
+        a.close().unwrap();
+        let bytes = packet(&mut a, 50);
+        assert_ne!(
+            wire::parse(ip(tuple()), &bytes).unwrap().header.flags & FIN,
+            0
+        );
+        // Old data, out-of-window data, missing ACK, and unacceptable ACK do not reset.
+        for (seq, ack, flags) in [
+            (901, 102, ACK),
+            (950, 102, ACK),
+            (902, 102, PSH),
+            (902, 999, ACK),
+        ] {
+            inject(&mut a, 60, Seq(seq), Seq(ack), flags, 16, b"x");
+            assert_ne!(a.state(), State::Closed);
+        }
+        inject(&mut a, 70, Seq(904), Seq(102), ACK | PSH, 16, b"x");
+        assert_eq!(a.state(), State::Closed); // Accepted out-of-order bytes also lose data.
+        assert_eq!(a.take_events().closed, Some(CloseReason::Aborted));
+        let bytes = packet(&mut a, 80);
+        assert_ne!(
+            wire::parse(ip(tuple()), &bytes).unwrap().header.flags & RST,
+            0
+        );
+
+        let (mut a, _) = pair(config(16, 8), 100);
+        a.shutdown().unwrap();
+        packet(&mut a, 40);
+        inject(&mut a, 50, Seq(901), Seq(102), ACK | FIN, 16, b"reply");
+        let mut out = [0; 8];
+        assert_eq!(a.read(&mut out), Ok(5));
+        assert_eq!(&out[..5], b"reply");
+        assert_eq!(a.read(&mut out), Ok(0));
+
+        let (mut a, _) = pair(config(16, 8), 100);
+        a.close().unwrap();
+        packet(&mut a, 40);
+        inject(&mut a, 50, Seq(901), Seq(102), ACK | FIN, 16, b"");
+        assert_eq!(a.state(), State::TimeWait);
+        assert!(!a.take_events().readable);
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4
+    //= type=test
+    //# it MAY be configurable to send a keep-alive segment containing one garbage
+    //# octet (MAY-6), for compatibility with erroneous TCP implementations.
+    fn keepalive_garbage_is_initialized_atomic_and_outside_stream_accounting() {
+        assert!(!KeepaliveConfig::default().send_garbage);
+        for garbage in [false, true] {
+            let (mut a, mut b) = pair(config(16, 8), u32::MAX);
+            a.set_keepalive(Some(KeepaliveConfig {
+                idle_us: 100,
+                interval_us: 50,
+                probes: 2,
+                send_garbage: garbage,
+            }))
+            .unwrap();
+            let deadline = a.keepalive_deadline.unwrap();
+            a.timeout(deadline).unwrap();
+            let before = (
+                a.snd_nxt,
+                a.snd_una,
+                a.acknowledged,
+                a.sample,
+                a.rto_deadline,
+                a.keepalive_probes,
+                a.next_deadline(),
+                a.last_sent,
+            );
+            assert_eq!(
+                a.transmit(deadline, &mut [0; 19]),
+                Err(Error::OutputTooSmall)
+            );
+            if garbage {
+                assert_eq!(
+                    a.transmit(deadline, &mut [0; 20]),
+                    Err(Error::OutputTooSmall)
+                );
+            }
+            assert_eq!(
+                (
+                    a.snd_nxt,
+                    a.snd_una,
+                    a.acknowledged,
+                    a.sample,
+                    a.rto_deadline,
+                    a.keepalive_probes,
+                    a.next_deadline(),
+                    a.last_sent
+                ),
+                before
+            );
+            assert!(a.keepalive_pending);
+            let bytes = deliver(&mut a, &mut b, deadline);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.header.sequence, u32::MAX);
+            assert_eq!(segment.payload, if garbage { &b"\0"[..] } else { &b""[..] });
+            assert_eq!(segment.header.flags, ACK);
+            assert_eq!(
+                (
+                    a.snd_nxt,
+                    a.snd_una,
+                    a.acknowledged,
+                    a.sample,
+                    a.rto_deadline
+                ),
+                (before.0, before.1, before.2, before.3, before.4)
+            );
+            assert_eq!(a.send.len(), 0);
+            assert_eq!(a.keepalive_probes, 1);
+            assert_eq!(b.read(&mut [0]), Err(Error::WouldBlock));
+            assert!(!b.take_events().pushed);
+            deliver(&mut b, &mut a, deadline);
+            assert_eq!(a.acknowledged, 0);
+        }
     }
 }

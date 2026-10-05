@@ -458,6 +458,7 @@ fn source_selection_and_keepalive_are_per_connection_controls() {
     a.set_keepalive(
         client,
         Some(KeepaliveConfig {
+            send_garbage: false,
             idle_us: 10_000_000,
             interval_us: 1_000_000,
             probes: 3,
@@ -845,6 +846,27 @@ fn asynchronous_reports_include_urgent_icmp_and_retransmission_warning() {
         }
         assert_eq!(warned, attempt == 2);
     }
+}
+
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
+//= type=test
+//# Data or controls that were queued for transmission MAY be included.
+#[test]
+fn queued_application_data_piggybacks_on_the_final_handshake_ack() {
+    let (mut a, mut b, listener, client) = endpoints();
+    assert_eq!(a.write(client, b"queued before connect completes"), Ok(31));
+    deliver(&mut b, 0, packets(&mut a, 0));
+    deliver(&mut a, 0, packets(&mut b, 0));
+    let reply = packets(&mut a, 0);
+    assert_eq!(reply.len(), 1);
+    let segment = wire::parse(reply[0].0, &reply[0].1).unwrap();
+    assert_eq!(segment.header.flags & (wire::SYN | wire::ACK), wire::ACK);
+    assert_eq!(segment.payload, b"queued before connect completes");
+    deliver(&mut b, 0, reply);
+    let server = b.accept(listener).unwrap();
+    let mut received = [0; 64];
+    let count = b.read(server, &mut received).unwrap();
+    assert_eq!(&received[..count], b"queued before connect completes");
 }
 
 fn passive_quote(a: &mut Endpoint, b: &mut Endpoint) -> (Tuple, u32) {
@@ -1713,4 +1735,72 @@ fn received_dscp_is_validated_per_connection_and_independent_of_send_dscp() {
     packets(&mut a, 0);
     a.release(client).unwrap();
     assert_eq!(a.received_dscp(client), Err(EndpointError::InvalidHandle));
+}
+
+#[test]
+fn optional_stream_controls_refresh_endpoint_work_and_charge_marker_storage() {
+    let (mut a, mut b, listener, client) = endpoints();
+    assert_eq!(a.buffer_bytes(), 3 * 1024 + 2 * 1024 + 64);
+    pump(&mut a, &mut b, 0);
+    let server = b.accept(listener).unwrap();
+    while a.next_event().is_some() {}
+    while b.next_event().is_some() {}
+    a.write_with_push(client, b"retain!", false).unwrap();
+    assert!(packets(&mut a, 0).is_empty());
+    assert_eq!(a.flush(client), Ok(0));
+    a.write_with_push(client, b"ab", false).unwrap();
+    assert!(packets(&mut a, 0).is_empty());
+    a.write_with_push(client, b"cd", true).unwrap();
+    pump(&mut a, &mut b, 0);
+    assert!(matches!(b.next_event(), Some(Event::Connection(id, events))
+        if id == server && events.readable && events.pushed));
+    let mut retained = [0; 7];
+    assert_eq!(b.read(server, &mut retained), Ok(7));
+    assert_eq!(&retained, b"retain!");
+    b.close(server).unwrap(); // Unread abcd: schedule RST, not FIN.
+    assert_eq!(
+        b.read(server, &mut [0]),
+        Err(EndpointError::Connection(Error::InvalidState))
+    );
+    assert!(matches!(b.next_event(), Some(Event::Connection(id, events))
+        if id == server && events.closed == Some(CloseReason::Aborted)));
+    pump(&mut a, &mut b, 0);
+    assert_eq!(a.close_reason(client), Ok(Some(CloseReason::Reset)));
+    assert_eq!(
+        a.flush(client),
+        Err(EndpointError::Connection(Error::InvalidState))
+    );
+
+    let mut limited = config();
+    limited.max_buffer_bytes = 3 * 1024 + 2 * 1024 + 64 - 1;
+    let mut endpoint = Endpoint::new(limited, [3; 32], 0).unwrap();
+    let (local, remote) = addresses();
+    assert_eq!(
+        endpoint.connect(0, local, remote),
+        Err(EndpointError::LimitReached)
+    );
+}
+
+#[test]
+fn flush_discards_unsent_data_after_peer_advertises_zero_window() {
+    let (mut a, mut b, listener, client) = endpoints();
+    pump(&mut a, &mut b, 0);
+    let server = b.accept(listener).unwrap();
+    a.write(client, &[42; 1024]).unwrap();
+    pump(&mut a, &mut b, 0);
+    for t in 1..=8 {
+        tick(&mut a, &mut b, t * 200_000);
+    }
+    assert_eq!(a.acknowledged(client), Ok(1024));
+    a.write_with_push(client, b"discard", false).unwrap();
+    assert!(packets(&mut a, 1_600_000).is_empty());
+    assert_eq!(a.flush(client), Ok(7));
+    let mut received = [0; 1024];
+    assert_eq!(b.read(server, &mut received), Ok(1024));
+    assert_eq!(received, [42; 1024]);
+    pump(&mut a, &mut b, 1_600_000);
+    a.write(client, b"replacement").unwrap();
+    pump(&mut a, &mut b, 1_600_000);
+    assert_eq!(b.read(server, &mut received), Ok(11));
+    assert_eq!(&received[..11], b"replacement");
 }

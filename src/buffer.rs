@@ -6,7 +6,8 @@ use crate::seq::Seq;
 
 #[derive(Debug)]
 pub(crate) struct SendBuffer {
-    data: VecDeque<u8>,
+    // One bounded push mark per byte; ACK and truncation move marks with data.
+    data: VecDeque<(u8, bool)>,
     capacity: usize,
 }
 
@@ -32,8 +33,32 @@ impl SendBuffer {
 
     pub(crate) fn write(&mut self, input: &[u8]) -> usize {
         let count = input.len().min(self.remaining());
-        self.data.extend(input[..count].iter().copied());
+        self.data
+            .extend(input[..count].iter().map(|&byte| (byte, false)));
         count
+    }
+
+    pub(crate) fn mark_push(&mut self) {
+        if let Some(last) = self.data.back_mut() {
+            last.1 = true;
+        }
+    }
+
+    pub(crate) fn pushed(&self, offset: usize, count: usize) -> bool {
+        self.data.iter().skip(offset).take(count).any(|byte| byte.1)
+    }
+
+    pub(crate) fn collapse_push(&mut self, offset: usize, count: usize) {
+        for byte in self.data.iter_mut().skip(offset).take(count) {
+            byte.1 = false;
+        }
+        if let Some(last) = self.data.get_mut(offset + count - 1) {
+            last.1 = true;
+        }
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.data.truncate(len);
     }
 
     // Storage only: the caller validates SEG.ACK and converts its advance into a data-byte
@@ -53,7 +78,7 @@ impl SendBuffer {
     pub(crate) fn copy(&self, offset: usize, out: &mut [u8]) -> usize {
         let count = out.len().min(self.len().saturating_sub(offset));
         for (dst, src) in out[..count].iter_mut().zip(self.data.iter().skip(offset)) {
-            *dst = *src;
+            *dst = src.0;
         }
         count
     }
@@ -72,8 +97,9 @@ pub(crate) struct ReceiveOutcome {
 
 #[derive(Debug)]
 pub(crate) struct ReceiveBuffer {
-    // Vec<bool> is byte-sized in Rust: two capacity-byte allocations in total.
-    data: Vec<u8>,
+    // Data and push marks share fixed slots; presence includes out-of-order data.
+    data: Vec<(u8, bool)>,
+    pushed: bool,
     present: Vec<bool>,
     read_base: Seq,
     head: usize,
@@ -89,12 +115,13 @@ impl ReceiveBuffer {
         }
         let mut data = Vec::new();
         data.try_reserve_exact(capacity).map_err(|_| ())?;
-        data.resize(capacity, 0);
+        data.resize(capacity, (0, false));
         let mut present = Vec::new();
         present.try_reserve_exact(capacity).map_err(|_| ())?;
         present.resize(capacity, false);
         Ok(Self {
             data,
+            pushed: false,
             present,
             read_base: start,
             head: 0,
@@ -132,6 +159,14 @@ impl ReceiveBuffer {
         self.contiguous_len
     }
 
+    pub(crate) fn has_data(&self) -> bool {
+        self.present.iter().any(|&present| present)
+    }
+
+    pub(crate) fn take_push(&mut self) -> bool {
+        core::mem::take(&mut self.pushed)
+    }
+
     pub(crate) fn eof(&self) -> bool {
         self.eof
     }
@@ -144,7 +179,7 @@ impl ReceiveBuffer {
         let count = out.len().min(self.contiguous_len);
         for (offset, dst) in out[..count].iter_mut().enumerate() {
             let index = self.index(offset);
-            *dst = self.data[index];
+            *dst = self.data[index].0;
             self.present[index] = false;
         }
         self.head = self.index(count);
@@ -158,7 +193,18 @@ impl ReceiveBuffer {
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
     //# Segments with higher beginning sequence numbers SHOULD be held for later processing
     //# (SHLD-31).
+    #[cfg(test)]
     pub(crate) fn insert(&mut self, sequence: Seq, payload: &[u8], fin: bool) -> ReceiveOutcome {
+        self.insert_with_push(sequence, payload, fin, false)
+    }
+
+    pub(crate) fn insert_with_push(
+        &mut self,
+        sequence: Seq,
+        payload: &[u8],
+        fin: bool,
+        push: bool,
+    ) -> ReceiveOutcome {
         let previous_next = self.next();
         let mut outcome = ReceiveOutcome {
             new_bytes: 0,
@@ -185,9 +231,20 @@ impl ReceiveBuffer {
             //# If a segment's contents straddle the boundary between old and new, only the
             //# new parts are processed.
             if !self.present[index] {
-                self.data[index] = byte;
+                self.data[index] = (byte, false);
                 self.present[index] = true;
                 outcome.new_bytes += 1;
+            }
+        }
+
+        if push && !payload.is_empty() {
+            let last = sequence.wrapping_add(payload.len() as u32 - 1);
+            let distance = last.distance_from(self.read_base) as usize;
+            // A duplicate may introduce PSH on buffered out-of-order text, but
+            // never re-notify a mark already passed by the contiguous frontier.
+            if distance >= self.contiguous_len && distance < data_limit {
+                let index = self.index(distance);
+                self.data[index].1 = true;
             }
         }
 
@@ -206,6 +263,8 @@ impl ReceiveBuffer {
             }
         }
         while self.contiguous_len < capacity && self.present[self.index(self.contiguous_len)] {
+            let index = self.index(self.contiguous_len);
+            self.pushed |= core::mem::take(&mut self.data[index].1);
             self.contiguous_len += 1;
         }
         // This buffer consumes FIN once after preceding data; SYN processing is in the
@@ -447,5 +506,83 @@ mod tests {
         assert!(!result.out_of_order);
         assert_eq!(recv.next(), Seq(8));
         assert_eq!(recv.read(&mut [0]), 0);
+    }
+    #[test]
+    fn push_marks_remain_bounded_across_gaps_overlaps_and_slot_reuse() {
+        let mut recv = ReceiveBuffer::new(Seq(u32::MAX - 1), 64).unwrap();
+        let storage = (recv.data.as_ptr(), recv.data.capacity());
+        for cycle in 0..3 {
+            let start = recv.next();
+            for offset in (1..64).step_by(2) {
+                recv.insert_with_push(start.wrapping_add(offset), b"x", false, true);
+                assert!(!recv.take_push());
+            }
+            for offset in (0..64).step_by(2) {
+                recv.insert_with_push(start.wrapping_add(offset), b"y", false, false);
+                assert!(recv.take_push());
+            }
+            assert!(!recv.take_push());
+            assert_eq!(recv.read(&mut [0; 64]), 64);
+            assert_eq!(
+                (recv.data.as_ptr(), recv.data.capacity()),
+                storage,
+                "cycle {cycle}"
+            );
+        }
+        let start = recv.next();
+        recv.insert_with_push(start.wrapping_add(3), b"d", false, false);
+        recv.insert_with_push(start.wrapping_add(2), b"cd", false, true);
+        assert!(!recv.take_push()); // New c carries a mark ending on already queued d.
+        recv.insert_with_push(start, b"ab", false, false);
+        assert!(recv.take_push());
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.3
+    //= type=test
+    //# A TCP receiver MAY pass a received PSH bit to the application layer via
+    //# the PUSH flag in the interface (MAY-17), but it is not required
+    fn duplicate_out_of_order_text_can_introduce_push() {
+        for start in [Seq(100), Seq(u32::MAX - 3)] {
+            let mut recv = ReceiveBuffer::new(start, 8).unwrap();
+            let storage = (recv.data.as_ptr(), recv.data.capacity());
+            recv.insert_with_push(start.wrapping_add(4), b"efgh", false, false);
+            let duplicate = recv.insert_with_push(start.wrapping_add(4), b"efgh", false, true);
+            assert_eq!(duplicate.new_bytes, 0);
+            assert!(!recv.take_push());
+            recv.insert_with_push(start, b"abcd", false, false);
+            assert!(recv.take_push());
+            assert!(!recv.take_push());
+            recv.insert_with_push(start.wrapping_add(4), b"efgh", false, true);
+            assert!(!recv.take_push()); // Already contiguous, even before read.
+            let mut out = [0; 8];
+            assert_eq!(recv.read(&mut out), 8);
+            assert_eq!(&out, b"abcdefgh");
+            recv.insert_with_push(start.wrapping_add(4), b"efgh", false, true);
+            recv.insert_with_push(recv.next(), b"", false, true);
+            assert!(!recv.take_push());
+            assert_eq!((recv.data.as_ptr(), recv.data.capacity()), storage);
+        }
+    }
+
+    #[test]
+    fn duplicate_push_ignores_trimmed_endpoints_and_preserves_fin_conflicts() {
+        let mut recv = ReceiveBuffer::new(Seq(100), 8).unwrap();
+        recv.insert(Seq(104), b"efgh", false);
+        recv.insert_with_push(Seq(104), b"efghi", false, true);
+        recv.insert_with_push(Seq(106), b"", true, true); // FIN conflicts with gh.
+        assert_eq!(recv.fin_sequence, None);
+        recv.insert(Seq(100), b"abcd", false);
+        assert!(!recv.take_push());
+        assert_eq!(recv.read(&mut [0; 8]), 8);
+
+        let mut recv = ReceiveBuffer::new(Seq(100), 8).unwrap();
+        recv.insert(Seq(104), b"ef", true); // Pending FIN at 106.
+        recv.insert_with_push(Seq(104), b"efgh", false, true);
+        assert_eq!(recv.fin_sequence, Some(Seq(106)));
+        recv.insert(Seq(100), b"abcd", false);
+        assert!(!recv.take_push()); // Endpoint beyond FIN was trimmed.
+        assert!(recv.eof());
+        assert_eq!(recv.read(&mut [0; 8]), 6);
     }
 }

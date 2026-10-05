@@ -132,6 +132,13 @@ mod linux {
         header.fill(0);
         header[0] = 0x45;
         header[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.1
+        //# RFC 1122 allows that if a retransmitted packet is identical to the
+        //# original packet (which implies not only that the data boundaries have
+        //# not changed, but also that none of the headers have changed), then
+        //# the same IPv4 Identification field MAY be used (see Section 3.2.1.5
+        //# of RFC 1122) (MAY-4).
+        // Atomic IPv4 datagrams need no unique ID (RFC 6864); ID remains zero.
         header[6] = 0x40; // DF: this example never fragments.
 
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
@@ -254,6 +261,12 @@ mod linux {
                     Err(error) => return Err(engine(error)),
                 }
             }
+            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5
+            //# As a result of implementation differences and middlebox interactions,
+            //# new applications SHOULD NOT employ the TCP urgent mechanism (SHLD-13).
+            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
+            //# New applications SHOULD NOT set the URGENT flag [39] due to
+            //# implementation differences and middlebox issues (SHLD-13).
             match endpoint.write(self.id, &self.pending[self.start..self.end]) {
                 Ok(count) => {
                     self.start += count;
@@ -320,8 +333,11 @@ mod linux {
             max_connections: MAX_FLOWS,
             max_listeners: 1,
             max_control_packets: BUDGET,
-            max_buffer_bytes: MAX_FLOWS * (3 * 65536 + 1460),
+            max_buffer_bytes: MAX_FLOWS * (5 * 65536 + 1460),
             hop_limit: 64,
+            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
+            //# Generally, an application SHOULD NOT change the Diffserv field value
+            //# during the course of a connection (SHLD-23).
             dscp: 0,
             ipv4_subnets: vec![(local, interface_prefix(&tun)?)],
             error_reports: true,
@@ -521,6 +537,92 @@ mod linux {
             }
             for mask in [0xff00ff00, 0xffffff01, 1, 0x7fffffff] {
                 assert!(prefix_length(mask).is_err());
+            }
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.1
+        //= type=test
+        //# RFC 1122 allows that if a retransmitted packet is identical to the
+        //# original packet (which implies not only that the data boundaries have
+        //# not changed, but also that none of the headers have changed), then
+        //# the same IPv4 Identification field MAY be used (see Section 3.2.1.5
+        //# of RFC 1122) (MAY-4).
+        #[test]
+        fn identical_atomic_datagrams_reuse_identification() {
+            let (mut bytes, len, local) = packet();
+            let original = bytes;
+            let ip = IpMetadata {
+                source: Ipv4Addr::new(10, 0, 0, 1).into(),
+                destination: local.into(),
+            };
+            assert_eq!(build_ipv4(&mut bytes, ip, 20, 64, 0, 0).unwrap(), len);
+            assert_eq!(&bytes[..len], &original[..len]);
+            assert_eq!(&bytes[4..8], &[0, 0, 0x40, 0]);
+        }
+
+        // These assertions apply to this example, not arbitrary embedding applications.
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5
+        //= type=test
+        //# As a result of implementation differences and middlebox interactions,
+        //# new applications SHOULD NOT employ the TCP urgent mechanism (SHLD-13).
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
+        //= type=test
+        //# New applications SHOULD NOT set the URGENT flag [39] due to
+        //# implementation differences and middlebox issues (SHLD-13).
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
+        //= type=test
+        //# Generally, an application SHOULD NOT change the Diffserv field value
+        //# during the course of a connection (SHLD-23).
+        #[test]
+        fn echo_flow_keeps_diffserv_stable_and_never_sends_urgent() {
+            fn transfer(from: &mut Endpoint, to: &mut Endpoint, echo: bool) -> usize {
+                let mut bytes = [0; MTU];
+                let mut data = 0;
+                for _ in 0..32 {
+                    let output = from.poll_transmit(0, &mut bytes, 16).unwrap();
+                    if let Some(packet) = output.packet {
+                        let segment = ntcp::wire::parse(packet.ip, &bytes[..packet.len]).unwrap();
+                        if echo {
+                            assert_eq!(packet.dscp, 37);
+                            assert_eq!(segment.header.flags & ntcp::wire::URG, 0);
+                            data += segment.payload.len();
+                        }
+                        to.input_with_traffic_class(
+                            0,
+                            packet.ip,
+                            (packet.dscp << 2) | packet.ecn,
+                            &bytes[..packet.len],
+                        )
+                        .unwrap();
+                    }
+                    if !output.more_work {
+                        return data;
+                    }
+                }
+                panic!("bounded echo transfer did not quiesce");
+            }
+            let mut cfg = EndpointConfig::default();
+            cfg.connection.nagle = false;
+            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
+            cfg.dscp = 37;
+            let mut server = Endpoint::new(cfg, [2; 32], 0).unwrap();
+            let local = "10.0.0.1:1234".parse().unwrap();
+            let remote = "10.0.0.2:8080".parse().unwrap();
+            let listener = server.listen(remote, 1).unwrap();
+            let id = client.connect(0, local, remote).unwrap();
+            for _ in 0..3 {
+                transfer(&mut client, &mut server, false);
+                transfer(&mut server, &mut client, true);
+            }
+            let mut flow = Flow::new(server.accept(listener).unwrap());
+            for input in [b"first".as_slice(), b"second".as_slice()] {
+                client.write_urgent(id, input).unwrap();
+                transfer(&mut client, &mut server, false);
+                assert!(flow.drive(&mut server).unwrap());
+                assert_eq!(transfer(&mut server, &mut client, true), input.len());
+                let mut echoed = [0; 16];
+                let count = client.read(id, &mut echoed).unwrap();
+                assert_eq!(&echoed[..count], input);
             }
         }
 
