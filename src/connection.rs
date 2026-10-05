@@ -2417,6 +2417,204 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.2
+    //= type=test
+    //# Queue the data for transmission after entering ESTABLISHED state.
+    fn handshake_queues_sends_until_established() {
+        let cfg = config(64, 8);
+        let mut a = Connection::active(tuple(), cfg.clone(), 100, 0).unwrap();
+        assert_eq!(a.write(b"active"), Ok(6));
+        let bytes = packet(&mut a, 0);
+        let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert!(syn.payload.is_empty());
+        assert_eq!(a.state(), State::SynSent);
+        assert_eq!(a.snd_nxt, Seq(101));
+        assert_eq!(a.transmit(1, &mut [0; 64]), Ok(None));
+        let mut b = Connection::passive(reverse(tuple()), cfg, 900, 10, &syn).unwrap();
+        assert_eq!(b.write(b"passive"), Ok(7));
+        let bytes = deliver(&mut b, &mut a, 20);
+        assert!(
+            wire::parse(ip(reverse(tuple())), &bytes)
+                .unwrap()
+                .payload
+                .is_empty()
+        );
+        assert_eq!(b.state(), State::SynReceived);
+        assert_eq!(b.snd_nxt, Seq(901));
+        assert_eq!(b.transmit(21, &mut [0; 64]), Ok(None));
+        assert_eq!(a.state(), State::Established);
+        let bytes = deliver(&mut a, &mut b, 30);
+        assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, b"active");
+        assert_eq!(b.state(), State::Established);
+        let bytes = deliver(&mut b, &mut a, 40);
+        assert_eq!(
+            wire::parse(ip(reverse(tuple())), &bytes).unwrap().payload,
+            b"passive"
+        );
+        let mut out = [0; 8];
+        assert_eq!(b.read(&mut out), Ok(6));
+        assert_eq!(&out[..6], b"active");
+        assert_eq!(a.read(&mut out), Ok(7));
+        assert_eq!(&out[..7], b"passive");
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
+    //= type=test
+    //# If there are other controls or text in the segment, queue them for
+    //# processing after the ESTABLISHED state has been reached, return.
+    fn simultaneous_open_defers_syn_text_and_push_until_established() {
+        let mut a = Connection::active(tuple(), config(64, 8), 100, 0).unwrap();
+        packet(&mut a, 0);
+        inject(&mut a, 10, Seq(u32::MAX - 1), Seq(0), SYN | PSH, 64, b"abc");
+        assert_eq!(a.state(), State::SynReceived);
+        assert_eq!(a.read(&mut [0; 8]), Err(Error::WouldBlock));
+        assert!(!a.events_pending());
+        let bytes = packet(&mut a, 20);
+        let synack = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(synack.header.flags & (SYN | ACK), SYN | ACK);
+        assert_eq!(synack.header.acknowledgment, 2);
+        inject(&mut a, 30, Seq(2), Seq(101), ACK, 64, b"");
+        assert_eq!(a.state(), State::Established);
+        let events = a.take_events();
+        assert!(events.connected && events.readable && events.pushed);
+        let mut out = [0; 8];
+        assert_eq!(a.read(&mut out), Ok(3));
+        assert_eq!(&out[..3], b"abc");
+        assert_eq!(a.read(&mut out), Err(Error::WouldBlock));
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
+    //= type=test
+    //# Queue this until all preceding SENDs have been segmentized, then form a
+    //# FIN segment and send it.
+    fn fin_follows_all_queued_sends_across_segments() {
+        let (mut a, mut b) = pair(config(64, 4), u32::MAX - 2);
+        a.set_nagle(false);
+        a.write(b"abcdef").unwrap();
+        a.write(b"ghij").unwrap();
+        a.shutdown().unwrap();
+        for (index, expected) in [b"abcd".as_slice(), b"efgh", b"ij"].into_iter().enumerate() {
+            let bytes = deliver(&mut a, &mut b, 40 + index as u64);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.payload, expected);
+            assert_eq!(
+                segment.header.sequence,
+                (u32::MAX - 1).wrapping_add(index as u32 * 4)
+            );
+            if index < 2 {
+                assert_eq!(segment.header.flags & FIN, 0);
+                assert_eq!(a.state(), State::Established);
+                assert_eq!(b.state(), State::Established);
+            } else {
+                assert_ne!(segment.header.flags & FIN, 0);
+                assert_eq!(a.state(), State::FinWait1);
+                assert_eq!(b.state(), State::CloseWait);
+            }
+        }
+        let mut out = [0; 16];
+        assert_eq!(b.read(&mut out), Ok(10));
+        assert_eq!(&out[..10], b"abcdefghij");
+        assert_eq!(b.read(&mut out), Ok(0));
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //# If (SND.WL1 < SEG.SEQ or (SND.WL1 = SEG.SEQ and SND.WL2 =< SEG.ACK)), set
+    //# SND.WND <- SEG.WND, set SND.WL1 <- SEG.SEQ, and set SND.WL2 <- SEG.ACK.
+    fn window_updates_order_by_sequence_then_ack() {
+        for iss in [100, u32::MAX - 4] {
+            let (mut a, _) = pair(config(64, 8), iss);
+            a.write(b"abcdefgh").unwrap();
+            packet(&mut a, 40);
+            let seq = a.receive.next();
+            let ack = a.snd_una;
+            // Newer SEQ; equal SEQ with equal, advancing, and stale ACK;
+            // older SEQ despite newer ACK; finally newer SEQ with equal ACK.
+            for (i, (seq, ack, window, accepted)) in [
+                (seq.wrapping_add(1), ack, 40, true),
+                (seq.wrapping_add(1), ack, 41, true),
+                (seq.wrapping_add(1), ack.wrapping_add(1), 42, true),
+                (seq.wrapping_add(1), ack, 43, false),
+                (seq, ack.wrapping_add(2), 44, false),
+                (seq.wrapping_add(2), ack.wrapping_add(2), 45, true),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let before = (a.snd_wnd, a.wl1, a.wl2);
+                inject(&mut a, 50 + i as u64, seq, ack, ACK, window, b"");
+                assert_eq!(
+                    (a.snd_wnd, a.wl1, a.wl2),
+                    if accepted {
+                        (u32::from(window), seq, ack)
+                    } else {
+                        before
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //# This should not occur since a FIN has been received from the remote side. Ignore
+    //# the segment text.
+    fn text_after_fin_is_ignored_in_closing_states() {
+        for closing in [false, true] {
+            let (mut a, mut b) = pair(config(64, 8), 100);
+            if closing {
+                a.shutdown().unwrap();
+                packet(&mut a, 40); // Peer has not acknowledged our FIN.
+            }
+            b.write(b"last").unwrap();
+            b.shutdown().unwrap();
+            deliver(&mut b, &mut a, 50);
+            assert_eq!(
+                a.state(),
+                if closing {
+                    State::Closing
+                } else {
+                    State::CloseWait
+                }
+            );
+            // Test CLOSE-WAIT (or CLOSING), then LAST-ACK (or TIME-WAIT).
+            for step in 0..2 {
+                a.take_events();
+                let next = a.receive.next();
+                let ack = a.snd_una;
+                let state = a.state();
+                let total = a.received_total;
+                inject(&mut a, 60 + step * 20, next, ack, ACK | PSH, 64, b"bad");
+                assert_eq!(a.state(), state);
+                assert_eq!(a.receive.next(), next);
+                assert_eq!(a.received_total, total);
+                assert_eq!(a.receive.readable(), if step == 0 { 4 } else { 0 });
+                let events = a.take_events();
+                assert!(!events.readable && !events.pushed);
+                let mut out = [0; 8];
+                if step == 0 {
+                    assert_eq!(a.read(&mut out), Ok(4));
+                    assert_eq!(&out[..4], b"last");
+                    if closing {
+                        let ack = a.snd_nxt;
+                        inject(&mut a, 70, next, ack, ACK, 64, b"");
+                        assert_eq!(a.state(), State::TimeWait);
+                    } else {
+                        a.shutdown().unwrap();
+                        packet(&mut a, 70);
+                        assert_eq!(a.state(), State::LastAck);
+                    }
+                }
+                assert_eq!(a.read(&mut out), Ok(0));
+            }
+        }
+    }
+
+    #[test]
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.2.2
     //= type=test
     //# A TCP implementation MUST include a SWS avoidance algorithm in the receiver
@@ -2636,6 +2834,11 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.8
+    //= type=test
+    //# For any state if the retransmission timeout expires on a segment in the
+    //# retransmission queue, send the segment at the front of the retransmission
+    //# queue again, reinitialize the retransmission timer, and return.
     fn retransmission_uses_partial_ack_base_and_never_sends_unsent_tail() {
         let (mut a, mut b) = pair(config(64, 8), u32::MAX - 4);
         a.set_nagle(false);
@@ -2664,6 +2867,7 @@ mod tests {
         assert_eq!(a.snd_nxt, high);
         assert!(a.sample.is_none());
         assert!(a.rto() >= 2_000_000);
+        assert_eq!(a.rto_deadline, Some(deadline + a.rto()));
         // Separately exercise actual two-peer loss recovery.
         let (mut c, mut d) = pair(config(64, 8), 100);
         c.write(b"lost").unwrap();
@@ -2694,6 +2898,13 @@ mod tests {
     //= type=test
     //# The only thing that can arrive in this state is a retransmission of the remote
     //# FIN. Acknowledge it, and restart the 2 MSL timeout.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //# If our FIN is now acknowledged, delete the TCB, enter the CLOSED
+    //# state, and return.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.2
+    //= type=test
+    //# Return "error: connection closing" and do not service request.
     fn fin_half_close_time_wait_and_duplicate_fin_restart() {
         let (mut a, mut b) = pair(config(64, 8), 100);
         a.write(b"last").unwrap();
@@ -2701,6 +2912,8 @@ mod tests {
         assert_eq!(a.write(b"no"), Err(Error::InvalidState));
         deliver(&mut a, &mut b, 40);
         assert_eq!(a.state(), State::FinWait1);
+        assert_eq!(a.write(b"no"), Err(Error::InvalidState));
+        assert_eq!(a.send.len(), 4);
         assert_eq!(b.state(), State::CloseWait);
         let events = b.take_events();
         assert!(events.readable && events.half_closed);
@@ -2708,11 +2921,17 @@ mod tests {
         assert_eq!(b.read(&mut [0; 8]), Ok(0));
         deliver(&mut b, &mut a, 50);
         assert_eq!(a.state(), State::FinWait2);
+        assert_eq!(a.write(b"no"), Err(Error::InvalidState));
+        assert_eq!(a.send.len(), 0);
         b.write(b"reply").unwrap();
         b.shutdown().unwrap();
         let fin = deliver(&mut b, &mut a, 60);
         assert_eq!(b.state(), State::LastAck);
+        assert_eq!(b.write(b"no"), Err(Error::InvalidState));
+        assert_eq!(b.send.len(), 5);
         assert_eq!(a.state(), State::TimeWait);
+        assert_eq!(a.write(b"no"), Err(Error::InvalidState));
+        assert_eq!(a.send.len(), 0);
         assert_eq!(a.take_events().closed, Some(CloseReason::Normal));
         let deadline = a.next_deadline().unwrap();
         a.input(70, &wire::parse(ip(reverse(tuple())), &fin).unwrap())
@@ -2721,6 +2940,9 @@ mod tests {
         assert_eq!(a.next_deadline(), Some(70 + 240_000_000));
         deliver(&mut a, &mut b, 80);
         assert_eq!(b.state(), State::Closed);
+        assert_eq!(b.close_reason(), Some(CloseReason::Normal));
+        assert_eq!(b.next_deadline(), None);
+        assert_eq!(b.transmit(80, &mut [0; 64]), Ok(None));
         assert_eq!(a.read(&mut [0; 8]), Ok(5));
         assert_eq!(a.read(&mut [0; 8]), Ok(0));
         a.timeout(deadline).unwrap();
@@ -2730,6 +2952,10 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //# if the ACK acknowledges our FIN, then enter the TIME-WAIT state;
+    //# otherwise, ignore the segment.
     fn simultaneous_close_and_fin_retransmission() {
         let (mut a, mut b) = pair(config(64, 8), 100);
         a.shutdown().unwrap();
@@ -2742,6 +2968,13 @@ mod tests {
             .unwrap();
         assert_eq!(a.state(), State::Closing);
         assert_eq!(b.state(), State::Closing);
+        assert_eq!(a.write(b"no"), Err(Error::InvalidState));
+        assert_eq!(a.send.len(), 0);
+        let next = a.receive.next();
+        let una = a.snd_una;
+        inject(&mut a, 55, next, una, ACK, 64, b"");
+        assert_eq!(a.state(), State::Closing);
+        assert_eq!(a.time_wait_deadline, None);
         let _lost = packet(&mut b, 60);
         deliver(&mut a, &mut b, 60);
         assert_eq!(b.state(), State::TimeWait);
@@ -2766,6 +2999,9 @@ mod tests {
     //= type=test
     //# After sending the challenge ACK, TCP endpoints MUST drop the unacceptable
     //# segment and stop processing the incoming packet further.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //# if the ACK bit is off, drop the segment and return
     fn invalid_ack_reset_and_unsynchronized_text_are_not_processed() {
         let (mut a, _) = pair(config(64, 8), 100);
         a.write(b"retained").unwrap();
@@ -2776,11 +3012,17 @@ mod tests {
         assert_eq!(a.send.len(), 8);
         assert_eq!(a.receive.readable(), 0);
         assert_eq!(a.snd_wnd, 64);
-        inject(&mut a, 60, next, high, 0, 0, b"bad");
+        packet(&mut a, 55); // Drain the invalid-ACK response before testing silent discard.
+        inject(&mut a, 60, next, high, FIN | PSH, 0, b"bad");
         assert_eq!(a.receive.readable(), 0);
+        assert_eq!(a.receive.next(), next);
+        assert_eq!(a.state(), State::Established);
+        assert_eq!(a.send.len(), 8);
+        assert_eq!(a.snd_wnd, 64);
+        assert!(!a.events_pending());
+        assert_eq!(a.transmit(60, &mut [0; 64]), Ok(None));
         inject(&mut a, 70, next.wrapping_add(64), high, RST | ACK, 0, b"");
         assert_eq!(a.state(), State::Established);
-        packet(&mut a, 75); // Consume the earlier invalid-ACK response.
         assert!(!a.ack_pending);
         inject(
             &mut a,
@@ -2816,6 +3058,10 @@ mod tests {
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
     //= type=test
     //# Otherwise (no ACK), drop the segment and return.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
+    //= type=test
+    //# If SEG.ACK =< ISS or SEG.ACK > SND.NXT, send a reset (unless the RST bit
+    //# is set, if so drop the segment and return)
     fn syn_sent_resets_require_ack_and_abort_outputs_once() {
         // Verified erratum 8167 removes the SYN-SENT RCV.NXT check:
         // https://www.rfc-editor.org/errata/eid8167
@@ -2832,6 +3078,21 @@ mod tests {
                     inject(&mut a, 10, Seq(sequence), Seq(ack), flags, 0, b"");
                     assert_eq!(a.state(), State::SynSent);
                     assert_eq!(a.transmit(10, &mut [0; 64]), Ok(None));
+                }
+                for ack in [iss.wrapping_sub(1), iss, iss.wrapping_add(2)] {
+                    inject(&mut a, 15, Seq(sequence), Seq(ack), SYN | ACK, 64, b"bad");
+                    let bytes = packet(&mut a, 15);
+                    let reset = wire::parse(ip(tuple()), &bytes).unwrap();
+                    assert_eq!(reset.header.flags, RST);
+                    assert_eq!(reset.header.sequence, ack);
+                    assert!(reset.payload.is_empty());
+                    assert_eq!(a.state(), State::SynSent);
+                    assert_eq!(a.snd_una, Seq(iss));
+                    assert_eq!(a.snd_nxt, Seq(iss.wrapping_add(1)));
+                    assert_eq!(a.irs, None);
+                    assert_eq!(a.receive.readable(), 0);
+                    assert!(!a.events_pending());
+                    assert_eq!(a.transmit(15, &mut [0; 64]), Ok(None));
                 }
                 inject(
                     &mut a,
@@ -3780,6 +4041,9 @@ mod tests {
     //= type=test
     //# When a connection is closed actively, it MUST linger in the TIME-WAIT
     //# state for a time 2xMSL (Maximum Segment Lifetime) (MUST-13).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.2
+    //= type=test
+    //# For this specification the MSL is taken to be 2 minutes.
     fn time_wait_configuration_enforces_two_msl_minimum() {
         for time_wait_us in [0, 1, 239_999_999, 240_000_000, 240_000_001] {
             let mut cfg = config(64, 8);
