@@ -116,6 +116,7 @@ mod linux {
         tcp_len: usize,
         hop_limit: u8,
         dscp: u8,
+        ecn: u8,
     ) -> io::Result<usize> {
         let (IpAddr::V4(source), IpAddr::V4(destination)) = (ip.source, ip.destination) else {
             return Err(invalid("TUN adapter only supports IPv4"));
@@ -142,7 +143,7 @@ mod linux {
         //# SHOULD pass the current Differentiated Services field value without
         //# change to the IP layer, when it sends segments on the connection
         //# (SHLD-22).
-        header[1] = dscp << 2;
+        header[1] = (dscp << 2) | (ecn & 3);
         header[9] = 6;
         header[12..16].copy_from_slice(&source.octets());
         header[16..20].copy_from_slice(&destination.octets());
@@ -365,7 +366,9 @@ mod linux {
                     }
                     Ok(len) => {
                         if let Some((ip, tcp)) = parse_ipv4(&input[..len], local) {
-                            endpoint.input(now(start), ip, tcp).map_err(engine)?;
+                            endpoint
+                                .input_with_traffic_class(now(start), ip, input[1], tcp)
+                                .map_err(engine)?;
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -433,6 +436,7 @@ mod linux {
                         packet.len,
                         packet.hop_limit,
                         packet.dscp,
+                        packet.ecn,
                     )?;
                     match tun.write(&output[..len]) {
                         Ok(written) if written == len => {}
@@ -482,6 +486,7 @@ mod linux {
                 },
                 20,
                 64,
+                0,
                 0,
             )
             .unwrap();
@@ -580,11 +585,28 @@ mod linux {
             };
             for dscp in 0..64 {
                 for ttl in [1, 64, 255] {
-                    build_ipv4(&mut bytes, ip, 20, ttl, dscp).unwrap();
+                    build_ipv4(&mut bytes, ip, 20, ttl, dscp, 0).unwrap();
                     assert_eq!(bytes[1], dscp << 2);
                     assert_eq!(bytes[8], ttl);
                     assert_eq!(checksum(&bytes[..20]), 0);
                     assert_eq!(&bytes[20..40], &[0x5a; 20]);
+                }
+            }
+        }
+
+        #[test]
+        fn ipv4_dscp_and_ecn_are_independent() {
+            let (mut bytes, _, local) = packet();
+            let ip = IpMetadata {
+                source: local.into(),
+                destination: local.into(),
+            };
+            for dscp in 0..64 {
+                for ecn in 0..4 {
+                    build_ipv4(&mut bytes, ip, 20, 64, dscp, ecn).unwrap();
+                    assert_eq!(bytes[1], (dscp << 2) | ecn);
+                    assert_eq!(checksum(&bytes[..20]), 0);
+                    assert!(parse_ipv4(&bytes, local).is_some());
                 }
             }
         }
@@ -657,11 +679,11 @@ mod linux {
                 source: local.into(),
                 destination: local.into(),
             };
-            assert_eq!(build_ipv4(&mut bytes, ip, 1480, 64, 0).unwrap(), MTU);
+            assert_eq!(build_ipv4(&mut bytes, ip, 1480, 64, 0, 0).unwrap(), MTU);
             assert_eq!(checksum(&bytes[..20]), 0);
-            assert!(build_ipv4(&mut bytes, ip, 1481, 64, 0).is_err());
-            assert!(build_ipv4(&mut bytes, ip, usize::MAX, 64, 0).is_err());
-            assert!(build_ipv4(&mut bytes[..19], ip, 0, 64, 0).is_err());
+            assert!(build_ipv4(&mut bytes, ip, 1481, 64, 0, 0).is_err());
+            assert!(build_ipv4(&mut bytes, ip, usize::MAX, 64, 0, 0).is_err());
+            assert!(build_ipv4(&mut bytes[..19], ip, 0, 64, 0, 0).is_err());
             assert!(open_tun("").is_err());
             assert!(open_tun(&"x".repeat(libc::IFNAMSIZ)).is_err());
             assert!(open_tun("bad\0name").is_err());

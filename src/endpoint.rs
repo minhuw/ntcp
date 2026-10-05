@@ -79,6 +79,7 @@ pub enum Event {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Transmit {
+    pub ecn: u8,
     pub ip: IpMetadata,
     pub len: usize,
     pub hop_limit: u8,
@@ -168,6 +169,7 @@ struct Slot {
     mapped: bool,
     hop_limit: u8,
     dscp: u8,
+    received_dscp: Option<u8>,
 }
 struct Listener {
     address: SocketAddr,
@@ -534,6 +536,7 @@ impl Endpoint {
             mapped: true,
             hop_limit: self.config.hop_limit,
             dscp: self.config.dscp,
+            received_dscp: None,
         });
         self.buffer_bytes += self.per_connection_bytes;
         let id = self.id(index);
@@ -790,6 +793,16 @@ impl Endpoint {
         ip: IpMetadata,
         bytes: &[u8],
     ) -> Result<InputDisposition, EndpointError> {
+        self.input_with_traffic_class(now, ip, 0, bytes)
+    }
+
+    pub fn input_with_traffic_class(
+        &mut self,
+        now: Instant,
+        ip: IpMetadata,
+        traffic_class: u8,
+        bytes: &[u8],
+    ) -> Result<InputDisposition, EndpointError> {
         self.clock(now)?;
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
         //# |  An incoming SYN with an invalid source address MUST be ignored
@@ -824,11 +837,10 @@ impl Endpoint {
             remote: SocketAddr::new(ip.source, segment.header.source_port),
         };
         if let Some(index) = self.tuples.find(self.hash(tuple), tuple) {
-            self.slots[index]
-                .as_mut()
-                .unwrap()
-                .connection
-                .input(now, &segment)?;
+            let slot = self.slots[index].as_mut().unwrap();
+            slot.received_dscp = Some(traffic_class >> 2);
+            slot.connection
+                .input_with_traffic_class(now, traffic_class, &segment)?;
             self.refresh(index);
             return Ok(InputDisposition::Processed);
         }
@@ -867,7 +879,10 @@ impl Endpoint {
                 Err(error) => return Err(error.into()),
             };
             match self.insert(connection, Some(listener)) {
-                Ok(_) => return Ok(InputDisposition::Processed),
+                Ok(id) => {
+                    self.slots[id.slot].as_mut().unwrap().received_dscp = Some(traffic_class >> 2);
+                    return Ok(InputDisposition::Processed);
+                }
                 Err(EndpointError::LimitReached) => return Ok(InputDisposition::Dropped),
                 Err(error) => return Err(error),
             }
@@ -1001,6 +1016,13 @@ impl Endpoint {
         self.slot_mut(id)?.hop_limit = hop_limit;
         Ok(())
     }
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.9
+    //# TCP implementations MAY pass the most recently received
+    //# Differentiated Services field up to the application (MAY-9).
+    pub fn received_dscp(&self, id: ConnectionId) -> Result<Option<u8>, EndpointError> {
+        Ok(self.slot(id)?.received_dscp)
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.9
     //# The application layer MUST be able to specify the Differentiated
     //# Services field for segments that are sent on a connection (MUST-48).
@@ -1157,6 +1179,7 @@ impl Endpoint {
                 self.control_turn = false;
                 return Ok(PollTransmit {
                     packet: Some(Transmit {
+                        ecn: 0,
                         ip,
                         len,
                         hop_limit: self.config.hop_limit,
@@ -1175,10 +1198,12 @@ impl Endpoint {
                     slot.closed_output_drained = slot.connection.state() == State::Closed;
                     let hop_limit = slot.hop_limit;
                     let dscp = slot.dscp;
+                    let ecn = slot.connection.last_output_ecn();
                     self.control_turn = true;
                     self.refresh(index);
                     return Ok(PollTransmit {
                         packet: Some(Transmit {
+                            ecn,
                             ip: IpMetadata {
                                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
                                 //# At all other times, a previous segment has either been sent or

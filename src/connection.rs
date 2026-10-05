@@ -7,7 +7,7 @@ use crate::{
     buffer::{ReceiveBuffer, SendBuffer},
     recovery::{Congestion, RttEstimator},
     seq::Seq,
-    wire::{self, ACK, FIN, Header, IpMetadata, PSH, RST, SYN, Segment, URG},
+    wire::{self, ACK, CWR, ECE, FIN, Header, IpMetadata, PSH, RST, SYN, Segment, URG},
 };
 
 pub type Instant = u64;
@@ -29,6 +29,7 @@ pub struct ConnectionConfig {
     // the transmission bound; must fit our 28-byte SYN with MSS and WS.
     pub send_ip_payload_limit: u16,
     pub nagle: bool,
+    pub ecn: bool,
     pub delayed_ack_us: u64,
     pub user_timeout_us: u64,
     pub time_wait_us: u64,
@@ -67,6 +68,7 @@ impl Default for ConnectionConfig {
             receive_ip_payload_limit: u16::MAX,
             send_ip_payload_limit: u16::MAX,
             nagle: true,
+            ecn: true,
             delayed_ack_us: 200_000,
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
             //= reason=Default R2; applications may override the per-connection timeout.
@@ -210,9 +212,16 @@ pub(crate) struct Connection {
     probe_pending: bool,
     keepalive_pending: bool,
     rtt: RttEstimator,
-    // RFC 9293 SHLD-8 gap: ECN negotiation and congestion responses are absent; IP
-    // CE/output ECN metadata is also missing.
     congestion: Congestion,
+    ecn_sent_setup: bool,
+    ecn_sent_plain: bool,
+    ecn_peer_setup: bool,
+    ecn_peer_plain: bool,
+    ecn_echo: bool,
+    ecn_ce_end: Option<Seq>,
+    ecn_cwr_pending: bool,
+    ecn_pause: Option<Instant>,
+    last_output_ecn: u8,
     sample: Option<(Seq, Instant)>,
     syn_timed_out: bool,
     consecutive_timeouts: u32,
@@ -328,6 +337,15 @@ impl Connection {
             keepalive_pending: false,
             rtt: RttEstimator::new(),
             congestion: Congestion::new(mss as u32),
+            ecn_sent_setup: false,
+            ecn_sent_plain: false,
+            ecn_peer_setup: false,
+            ecn_peer_plain: false,
+            ecn_echo: false,
+            ecn_ce_end: None,
+            ecn_cwr_pending: false,
+            ecn_pause: None,
+            last_output_ecn: 0,
             sample: None,
             syn_timed_out: false,
             consecutive_timeouts: 0,
@@ -509,7 +527,31 @@ impl Connection {
         }
     }
 
+    // Classic RFC 3168 only: setup offers remain binding for receive feedback even
+    // after a local fallback forbids sending ECT data.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.2
+    //# A TCP endpoint SHOULD implement ECN as described in RFC 3168 (SHLD-
+    //# 8).
+    fn learn_ecn(&mut self, flags: u8) {
+        let setup = flags & (ECE | CWR) == if flags & ACK != 0 { ECE } else { ECE | CWR };
+        self.ecn_peer_setup |= setup;
+        self.ecn_peer_plain |= !setup;
+    }
+
+    fn ecn_feedback(&self) -> bool {
+        self.ecn_sent_setup && self.ecn_peer_setup && !self.ecn_peer_plain
+    }
+
+    fn ecn_send(&self) -> bool {
+        self.ecn_feedback() && !self.ecn_sent_plain
+    }
+
+    pub(crate) fn last_output_ecn(&self) -> u8 {
+        self.last_output_ecn
+    }
+
     fn learn_syn(&mut self, syn: &Segment<'_>) {
+        self.learn_ecn(syn.header.flags);
         self.irs = Some(Seq(syn.header.sequence));
         let start = Seq(syn.header.sequence).wrapping_add(1);
         self.receive
@@ -613,6 +655,10 @@ impl Connection {
     //# whether it closed normally or was aborted (MUST-12).
     fn terminal(&mut self, reason: CloseReason) {
         self.state = State::Closed;
+        self.ecn_echo = false;
+        self.ecn_cwr_pending = false;
+        self.ecn_pause = None;
+        self.ecn_sent_setup = false;
         self.reason = Some(reason);
         self.events.closed = Some(reason);
         if reason != CloseReason::Aborted {
@@ -903,11 +949,21 @@ impl Connection {
         self.config.nagle = enabled;
     }
 
+    #[cfg(test)]
+    pub(crate) fn input(&mut self, now: Instant, segment: &Segment<'_>) -> Result<(), Error> {
+        self.input_with_traffic_class(now, 0, segment)
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
     //= reason=Core separates input and transmit; driver-owned batches must be fed before polling output.
     //# For example, if the TCP endpoint is processing a series of queued segments, it
     //# MUST process them all before sending any ACK segments (MUST-59).
-    pub(crate) fn input(&mut self, now: Instant, segment: &Segment<'_>) -> Result<(), Error> {
+    pub(crate) fn input_with_traffic_class(
+        &mut self,
+        now: Instant,
+        traffic_class: u8,
+        segment: &Segment<'_>,
+    ) -> Result<(), Error> {
         self.check_time(now)?;
         self.now = now;
         if self.state == State::Closed {
@@ -942,7 +998,7 @@ impl Connection {
             self.learn_syn(segment);
             self.last_received = now;
             if valid_ack {
-                self.accept_ack(ack);
+                self.accept_ack(ack, false);
                 self.establish();
                 self.immediate_ack();
             } else {
@@ -965,7 +1021,8 @@ impl Connection {
             && ack == self.iss.wrapping_add(1)
             && ack == self.snd_nxt
         {
-            self.accept_ack(ack);
+            self.learn_ecn(h.flags);
+            self.accept_ack(ack, false);
             self.establish();
             self.last_received = now;
             self.immediate_ack();
@@ -1019,6 +1076,9 @@ impl Connection {
         if !acceptable {
             if h.flags & RST == 0 {
                 if self.state == State::SynReceived && h.flags & SYN != 0 && self.irs == Some(seq) {
+                    if h.flags & (ACK | FIN) == 0 {
+                        self.learn_ecn(h.flags);
+                    }
                     self.syn_pending = true;
                 } else {
                     self.immediate_ack();
@@ -1100,7 +1160,7 @@ impl Connection {
                 self.pending_rst = Some((ack, false));
                 return Ok(());
             }
-            self.accept_ack(ack);
+            self.accept_ack(ack, false);
             self.establish();
         }
         if self.state == State::TimeWait {
@@ -1110,11 +1170,43 @@ impl Connection {
         self.keepalive_probes = 0;
         self.keepalive_pending = false;
         self.keepalive_deadline = None;
+        // ECN never bypasses sequence, RST/SYN, or ACK-range validation.
+        // Old ACKs cannot signal sender congestion, but their accepted duplex
+        // data still carries receive-side CE/CWR (RFC 3168 section 6.1.3).
+        let ece = self.ecn_feedback() && at_or_after(ack, self.snd_una) && h.flags & ECE != 0;
+        if self.ecn_feedback() {
+            if h.flags & CWR != 0 && self.ecn_ce_end.is_none_or(|end| at_or_after(seq, end)) {
+                self.ecn_echo = false;
+                self.ecn_ce_end = None;
+            }
+            if traffic_class & 3 == 3 && !segment.payload.is_empty() && window != 0 {
+                self.ecn_echo = true;
+                let end = seq.wrapping_add(segment.payload.len() as u32);
+                if self.ecn_ce_end.is_none_or(|old| after(end, old)) {
+                    self.ecn_ce_end = Some(end);
+                }
+                self.immediate_ack();
+            }
+        }
         let old_window = self.snd_wnd;
         let was_blocked = old_window == 0 || self.flight() > old_window;
         let advancing = after(ack, self.snd_una);
+        let ecn_one = ece && self.flight() != 0 && self.congestion.cwnd() <= self.mss as u32;
+        let ecn_reduced =
+            ece && self.flight() != 0 && self.congestion.on_ecn(ack, self.flight(), self.snd_nxt);
+        if ecn_reduced {
+            self.ecn_cwr_pending = true;
+            self.reset_limited_transmit();
+        }
         if advancing {
-            self.accept_ack(ack);
+            self.accept_ack(ack, ece);
+        }
+        if ecn_one {
+            let deadline = now.saturating_add(self.rto());
+            self.ecn_pause = Some(deadline);
+            if self.flight() != 0 {
+                self.rto_deadline = Some(deadline);
+            }
         }
         if self.state == State::Closed || self.state == State::TimeWait {
             return Ok(());
@@ -1155,6 +1247,7 @@ impl Connection {
                 self.snd_nxt,
             ) {
                 self.retx_pending = true;
+                self.ecn_cwr_pending |= self.ecn_feedback();
                 self.limited_pending = false;
             }
         } else if !advancing {
@@ -1172,7 +1265,7 @@ impl Connection {
         self.limited_sent = 0;
     }
 
-    fn accept_ack(&mut self, ack: Seq) {
+    fn accept_ack(&mut self, ack: Seq, ece: bool) {
         self.reset_limited_transmit();
         let syn_ack =
             self.snd_una == self.iss && matches!(self.state, State::SynSent | State::SynReceived);
@@ -1211,7 +1304,11 @@ impl Connection {
                 self.syn_timed_out = false;
             }
         }
-        if !syn_ack && bytes != 0 && self.congestion.on_ack(ack, bytes, self.flight()) {
+        if !syn_ack
+            && self
+                .congestion
+                .on_ack_with_ecn(ack, bytes, self.flight(), ece)
+        {
             self.retx_pending = true;
         }
         self.rto_deadline = if self.flight() == 0 {
@@ -1510,6 +1607,9 @@ impl Connection {
                     count = 0;
                 }
             }
+            if self.ecn_pause.is_some_and(|deadline| now < deadline) {
+                count = 0;
+            }
             self.send.copy(offset, &mut self.scratch[..count]);
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
             //# Queue this until all preceding SENDs have been segmentized, then form a
@@ -1556,6 +1656,33 @@ impl Connection {
                 //# A TCP implementation MUST support a sequence of urgent data of any
                 //# length (MUST-31) [19].
                 urgent_pointer = distance.min(65535) as u16;
+            }
+        }
+        let setup = syn
+            && self.config.ecn
+            && !self.syn_timed_out
+            && !self.ecn_sent_plain
+            && (self.state == State::SynSent || self.ecn_peer_setup && !self.ecn_peer_plain);
+        let fresh_data = reset.is_none()
+            && !syn
+            && !retransmitted
+            && !retransmit
+            && !probe
+            && !keepalive
+            && count != 0;
+        let idle_reduction = fresh_data
+            && self.flight() == 0
+            && now.saturating_sub(self.last_sent) >= self.rto()
+            && self.congestion.cwnd() > self.initial_window();
+        let ecn = if fresh_data && self.ecn_send() { 2 } else { 0 };
+        if setup {
+            flags |= ECE | if flags & ACK == 0 { CWR } else { 0 };
+        } else if reset.is_none() && !syn {
+            if self.ecn_echo {
+                flags |= ECE;
+            }
+            if fresh_data && (self.ecn_cwr_pending || idle_reduction && self.ecn_feedback()) {
+                flags |= CWR;
             }
         }
         let window = self.advertised_window(syn);
@@ -1617,6 +1744,14 @@ impl Connection {
             }
         })?;
         self.now = now;
+        self.last_output_ecn = ecn;
+        if syn {
+            self.ecn_sent_setup |= setup;
+            self.ecn_sent_plain |= !setup;
+        }
+        if fresh_data && flags & CWR != 0 {
+            self.ecn_cwr_pending = false;
+        }
         if reset.is_some() {
             self.pending_rst = None;
             return Ok(Some(size));
@@ -1645,6 +1780,9 @@ impl Connection {
         if length != 0 {
             let end = seq.wrapping_add(length);
             if retransmitted {
+                if !syn && !probe {
+                    self.congestion.on_retransmit(end);
+                }
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.1
                 //= reason=Sample invalidation here and accept_ack sampling integrate with recovery.rs RTT estimation.
                 //# The RTO MUST be computed according to the algorithm in [10],
@@ -1716,6 +1854,7 @@ impl Connection {
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         [
             self.rto_deadline,
+            self.ecn_pause,
             self.ack_deadline,
             self.persist_deadline,
             self.sws_deadline,
@@ -1754,6 +1893,9 @@ impl Connection {
         //# For any state if the retransmission timeout expires on a segment in the
         //# retransmission queue, send the segment at the front of the retransmission
         //# queue again, reinitialize the retransmission timer, and return.
+        if due(self.ecn_pause, now) {
+            self.ecn_pause = None;
+        }
         if due(self.rto_deadline, now) {
             self.reset_limited_transmit();
             self.rto_deadline = None;
@@ -1778,6 +1920,7 @@ impl Connection {
             //# slow start, congestion avoidance, and exponential backoff of RTO to
             //# avoid creating congestion collapse conditions (MUST-19).
             self.congestion.on_timeout(self.flight(), self.snd_nxt);
+            self.ecn_cwr_pending |= self.ecn_feedback();
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
             //# SYN retransmissions MUST be handled in the general way just described
             //# for data retransmissions, including notification of the application
@@ -2011,10 +2154,13 @@ mod tests {
         let sb = wire::parse(ip(reverse(tuple())), &b_synack).unwrap();
         assert_eq!(sa.header.sequence, 10);
         assert_eq!(sb.header.sequence, 50);
+        assert_eq!(sa.header.flags, SYN | ACK | ECE);
+        assert_eq!(sb.header.flags, SYN | ACK | ECE);
         a.input(30, &sb).unwrap();
         b.input(30, &sa).unwrap();
         assert_eq!(a.state(), State::Established);
         assert_eq!(b.state(), State::Established);
+        assert!(a.ecn_send() && b.ecn_send());
         let _lost = packet(&mut a, 40);
         a.input(50, &sb).unwrap();
         let ack = packet(&mut a, 50);
@@ -3933,6 +4079,311 @@ mod tests {
     }
 
     #[test]
+    fn ecn_duplex_reordering_old_ack_preserves_receive_feedback() {
+        for iss in [100, u32::MAX - 63] {
+            let (mut a, mut b) = pair(config(1024, 64), iss);
+            a.write(&[1; 192]).unwrap();
+            let old_cwr = packet(&mut a, 40);
+            let ce = packet(&mut a, 40);
+            let new_cwr = packet(&mut a, 40);
+            let old_ack = b.snd_una;
+            // Reverse-direction data is ACKed while the duplex packets are delayed.
+            b.write(&[2; 128]).unwrap();
+            deliver(&mut b, &mut a, 41);
+            packet(&mut b, 41); // Leave some reverse-direction data in flight.
+            a.immediate_ack();
+            deliver(&mut a, &mut b, 42);
+            assert_eq!(b.snd_una, old_ack.wrapping_add(64));
+            assert_eq!(b.flight(), 64);
+            let cwnd = b.congestion.cwnd();
+            let mut ce = wire::parse(ip(tuple()), &ce).unwrap();
+            assert_eq!(Seq(ce.header.acknowledgment), old_ack);
+            ce.header.flags |= ECE;
+            b.input_with_traffic_class(43, 3, &ce).unwrap();
+            assert!(b.ecn_echo);
+            assert_eq!(b.congestion.cwnd(), cwnd); // Stale ECE is still ignored.
+            assert!(!b.ecn_cwr_pending);
+            let echo = packet(&mut b, 43);
+            assert_ne!(
+                wire::parse(ip(reverse(tuple())), &echo)
+                    .unwrap()
+                    .header
+                    .flags
+                    & ECE,
+                0
+            );
+            // The earlier CWR is sequence-valid (fills the hole), but predates CE.
+            let mut old_cwr = wire::parse(ip(tuple()), &old_cwr).unwrap();
+            old_cwr.header.flags |= CWR;
+            b.input(44, &old_cwr).unwrap();
+            assert!(b.ecn_echo);
+            let echo = packet(&mut b, 44);
+            assert_ne!(
+                wire::parse(ip(reverse(tuple())), &echo)
+                    .unwrap()
+                    .header
+                    .flags
+                    & ECE,
+                0
+            );
+            // A later CWR clears CE even though its duplex ACK is also old.
+            let mut new_cwr = wire::parse(ip(tuple()), &new_cwr).unwrap();
+            new_cwr.header.flags |= CWR;
+            b.input(45, &new_cwr).unwrap();
+            assert!(!b.ecn_echo);
+            assert_eq!(b.ecn_ce_end, None);
+            assert_eq!(b.read(&mut [0; 192]), Ok(192));
+        }
+    }
+
+    #[test]
+    fn ecn_rto_distinguishes_emitted_retransmission_from_pending_original_loss() {
+        for iss in [100, u32::MAX - 20_000] {
+            for emit_partial_retransmission in [false, true] {
+                let (mut a, _) = pair(config(32_000, 1000), iss);
+                let seq = a.receive.next();
+                // Grow a real send window to sixteen MSS before inducing congestion.
+                for _ in 0..12 {
+                    a.write(&[1; 1000]).unwrap();
+                    packet(&mut a, 40);
+                    let ack = a.snd_nxt;
+                    inject(&mut a, 40, seq, ack, ACK, 32_000, b"");
+                }
+                a.write(&[2; 16_000]).unwrap();
+                for _ in 0..16 {
+                    packet(&mut a, 41);
+                }
+                assert_eq!(a.flight(), 16_000);
+                let una = a.snd_una;
+                for _ in 0..3 {
+                    inject(&mut a, 42, seq, una, ACK | ECE, 32_000, b"");
+                }
+                assert_eq!(a.congestion.ssthresh(), 8000);
+                assert!(a.retx_pending);
+                packet(&mut a, 43); // Fast retransmit is delivered; its ACK is partial.
+                inject(&mut a, 44, seq, una.wrapping_add(12_000), ACK, 32_000, b"");
+                assert_eq!(a.flight(), 4000);
+                assert!(a.retx_pending);
+                assert_eq!(a.transmit(45, &mut [0; 20]), Err(Error::OutputTooSmall));
+                if emit_partial_retransmission {
+                    let bytes = packet(&mut a, 45); // This retransmission is lost.
+                    let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+                    assert_eq!(segment.header.sequence, a.snd_una.0);
+                    assert_eq!(segment.payload.len(), 1000);
+                }
+                let deadline = a.rto_deadline.unwrap();
+                a.timeout(deadline).unwrap();
+                let threshold = if emit_partial_retransmission {
+                    2000
+                } else {
+                    8000
+                };
+                assert_eq!(a.congestion.ssthresh(), threshold);
+                assert_eq!(a.congestion.cwnd(), 1000);
+                packet(&mut a, deadline);
+                a.timeout(a.rto_deadline.unwrap()).unwrap();
+                assert_eq!(a.congestion.ssthresh(), threshold); // Repeated RTO.
+            }
+        }
+    }
+
+    #[test]
+    fn ecn_validation_wrap_repeated_marks_and_transactional_output() {
+        let (mut a, mut b) = pair(config(1024, 64), u32::MAX - 63);
+        a.write(&[1; 128]).unwrap();
+        let data = packet(&mut a, 40);
+        assert_eq!(a.last_output_ecn(), 2);
+        let data2 = packet(&mut a, 40);
+        let parsed = wire::parse(ip(tuple()), &data).unwrap();
+        let mut segment = wire::parse(ip(tuple()), &data).unwrap();
+        // Rejected sequence, missing ACK and out-of-range ACKs never latch CE.
+        for (seq, ack, flags) in [
+            (
+                parsed.header.sequence.wrapping_sub(64),
+                parsed.header.acknowledgment,
+                ACK,
+            ),
+            (
+                parsed.header.sequence.wrapping_add(4096),
+                parsed.header.acknowledgment,
+                ACK,
+            ),
+            (parsed.header.sequence, parsed.header.acknowledgment, 0),
+            (
+                parsed.header.sequence,
+                parsed.header.acknowledgment.wrapping_add(1),
+                ACK,
+            ),
+            (
+                parsed.header.sequence,
+                parsed.header.acknowledgment.wrapping_sub(b.max_snd_wnd + 1),
+                ACK,
+            ),
+        ] {
+            segment.header.sequence = seq;
+            segment.header.acknowledgment = ack;
+            segment.header.flags = flags;
+            b.input_with_traffic_class(40, 3, &segment).unwrap();
+            assert!(!b.ecn_echo);
+        }
+        b.input_with_traffic_class(40, 3, &parsed).unwrap();
+        assert!(b.ecn_echo);
+        let ece = packet(&mut b, 40);
+        let mut feedback = wire::parse(ip(reverse(tuple())), &ece).unwrap();
+        let cwnd = a.congestion.cwnd();
+        // ECE cannot bypass the future ACK check.
+        let valid_ack = feedback.header.acknowledgment;
+        feedback.header.acknowledgment = a.snd_nxt.wrapping_add(1).0;
+        a.input(40, &feedback).unwrap();
+        assert_eq!(a.congestion.cwnd(), cwnd);
+        assert!(!a.ecn_cwr_pending);
+        feedback.header.acknowledgment = valid_ack;
+        a.input(40, &feedback).unwrap();
+        let reduced = a.congestion.cwnd();
+        assert!(reduced < cwnd);
+        assert!(!a.retx_pending);
+        for _ in 0..2 {
+            a.input(40, &feedback).unwrap();
+            assert_eq!(a.congestion.cwnd(), reduced);
+        }
+        // Finish this flight with repeated CE; equality with the epoch end cannot reduce twice.
+        let parsed2 = wire::parse(ip(tuple()), &data2).unwrap();
+        b.input_with_traffic_class(40, 3, &parsed2).unwrap();
+        let ece = packet(&mut b, 40);
+        a.input(40, &wire::parse(ip(reverse(tuple())), &ece).unwrap())
+            .unwrap();
+        assert_eq!(a.congestion.cwnd(), reduced);
+        a.write(&[2; 64]).unwrap();
+        let before = (a.snd_nxt, a.last_output_ecn(), a.ecn_cwr_pending, a.now);
+        assert_eq!(a.transmit(41, &mut [0; 20]), Err(Error::OutputTooSmall));
+        assert_eq!(
+            (a.snd_nxt, a.last_output_ecn(), a.ecn_cwr_pending, a.now),
+            before
+        );
+        let cwr = packet(&mut a, 41);
+        let cwr = wire::parse(ip(tuple()), &cwr).unwrap();
+        assert_ne!(cwr.header.flags & CWR, 0);
+        // A newly marked CWR packet starts (or preserves) echo, rather than clearing CE.
+        b.input_with_traffic_class(41, 3, &cwr).unwrap();
+        assert!(b.ecn_echo);
+        let ece = packet(&mut b, 41);
+        a.input(41, &wire::parse(ip(reverse(tuple())), &ece).unwrap())
+            .unwrap();
+        assert!(a.ecn_cwr_pending); // Next flight can signal a new congestion episode.
+        a.write(&[3; 64]).unwrap();
+        let cwr2 = packet(&mut a, 42);
+        b.input(42, &wire::parse(ip(tuple()), &cwr2).unwrap())
+            .unwrap();
+        assert!(!b.ecn_echo);
+        assert_eq!(b.ecn_ce_end, None);
+        // An old CE/CWR retransmission is outside the receive window.
+        b.input_with_traffic_class(42, 3, &cwr).unwrap();
+        assert!(!b.ecn_echo);
+        a.abort();
+        packet(&mut a, 42);
+        assert_eq!(a.last_output_ecn(), 0);
+    }
+
+    #[test]
+    fn ecn_one_mss_waits_rto_and_zero_window_probe_is_not_ect() {
+        let (mut a, mut b) = pair(config(1024, 64), 10);
+        // Model a previous timeout followed by enough ACK progress to leave recovery.
+        a.congestion
+            .on_timeout(64, a.snd_una.wrapping_add(u32::MAX));
+        a.write(&[1; 128]).unwrap();
+        let data = packet(&mut a, 40);
+        b.input_with_traffic_class(40, 3, &wire::parse(ip(tuple()), &data).unwrap())
+            .unwrap();
+        deliver(&mut b, &mut a, 40);
+        assert_eq!(a.congestion.cwnd(), 64);
+        let pause = a.ecn_pause.unwrap();
+        assert_eq!(a.transmit(pause - 1, &mut [0; 2048]), Ok(None));
+        a.timeout(pause).unwrap();
+        let data = packet(&mut a, pause);
+        assert_eq!(a.last_output_ecn(), 2);
+        assert_ne!(
+            wire::parse(ip(tuple()), &data).unwrap().header.flags & CWR,
+            0
+        );
+        // Closed offered window; persist probes cannot carry ECT or CWR.
+        a.snd_wnd = 0;
+        a.ecn_cwr_pending = true;
+        a.arm_work();
+        let deadline = a.persist_deadline.unwrap();
+        a.timeout(deadline).unwrap();
+        let probe = packet(&mut a, deadline);
+        assert_eq!(a.last_output_ecn(), 0);
+        assert_eq!(
+            wire::parse(ip(tuple()), &probe).unwrap().header.flags & CWR,
+            0
+        );
+        assert!(a.ecn_cwr_pending);
+    }
+
+    #[test]
+    fn ecn_fallback_retains_receive_commitment() {
+        let cfg = config(1024, 64);
+        let mut a = Connection::active(tuple(), cfg.clone(), 10, 0).unwrap();
+        let syn = packet(&mut a, 0);
+        let mut b = Connection::passive(
+            reverse(tuple()),
+            cfg,
+            900,
+            0,
+            &wire::parse(ip(tuple()), &syn).unwrap(),
+        )
+        .unwrap();
+        let synack = packet(&mut b, 0);
+        a.timeout(1_000_000).unwrap();
+        packet(&mut a, 1_000_000); // Lost plain SYN, delayed ECN SYN-ACK arrives instead.
+        a.input(
+            1_000_000,
+            &wire::parse(ip(reverse(tuple())), &synack).unwrap(),
+        )
+        .unwrap();
+        deliver(&mut a, &mut b, 1_000_000);
+        assert!(!a.ecn_send());
+        assert!(a.ecn_feedback());
+        b.write(&[0; 64]).unwrap();
+        let data = packet(&mut b, 1_000_001);
+        assert_eq!(b.last_output_ecn(), 2);
+        a.input_with_traffic_class(
+            1_000_001,
+            3,
+            &wire::parse(ip(reverse(tuple())), &data).unwrap(),
+        )
+        .unwrap();
+        assert!(a.ecn_echo);
+    }
+    #[test]
+    fn ecn_setup_output_is_atomic_and_synack_flags_are_not_echoed_reserved_bits() {
+        for flags in [0, ECE, CWR, ECE | CWR] {
+            let cfg = config(1024, 64);
+            let mut a = Connection::active(tuple(), cfg.clone(), 10, 0).unwrap();
+            assert_eq!(a.transmit(1, &mut [0; 19]), Err(Error::OutputTooSmall));
+            assert!(!a.ecn_sent_setup && !a.ecn_sent_plain);
+            assert_eq!(a.last_output_ecn(), 0);
+            let syn = packet(&mut a, 1);
+            let mut b = Connection::passive(
+                reverse(tuple()),
+                cfg,
+                900,
+                1,
+                &wire::parse(ip(tuple()), &syn).unwrap(),
+            )
+            .unwrap();
+            let synack = packet(&mut b, 1);
+            let mut parsed = wire::parse(ip(reverse(tuple())), &synack).unwrap();
+            parsed.header.flags = SYN | ACK | flags;
+            a.input(1, &parsed).unwrap();
+            assert_eq!(a.ecn_send(), flags == ECE);
+            a.write(&[1; 64]).unwrap();
+            packet(&mut a, 1);
+            assert_eq!(a.last_output_ecn(), if flags == ECE { 2 } else { 0 });
+        }
+    }
+
+    #[test]
     fn shrink_silence_times_out_from_first_committed_unanswered_retransmission() {
         for iss in [100, u32::MAX - 4] {
             let mut cfg = config(64, 8);
@@ -3984,5 +4435,103 @@ mod tests {
             assert_eq!(a.close_reason(), Some(CloseReason::TimedOut));
             assert_eq!(a.shrink_unanswered_since, None);
         }
+    }
+
+    #[test]
+    fn ecn_synack_timeout_fallback_and_invalid_handshake_ack() {
+        let cfg = config(1024, 64);
+        let mut a = Connection::active(tuple(), cfg.clone(), 10, 0).unwrap();
+        let syn = packet(&mut a, 0);
+        let mut b = Connection::passive(
+            reverse(tuple()),
+            cfg,
+            900,
+            0,
+            &wire::parse(ip(tuple()), &syn).unwrap(),
+        )
+        .unwrap();
+        packet(&mut b, 0); // Lost setup SYN-ACK.
+        let mut invalid = wire::parse(ip(tuple()), &syn).unwrap();
+        invalid.header.flags = SYN | ACK;
+        invalid.header.acknowledgment = 123;
+        b.input(0, &invalid).unwrap();
+        assert!(!b.ecn_peer_plain);
+        b.timeout(1_000_000).unwrap();
+        let fallback = packet(&mut b, 1_000_000);
+        assert_eq!(
+            wire::parse(ip(reverse(tuple())), &fallback)
+                .unwrap()
+                .header
+                .flags,
+            SYN | ACK
+        );
+        a.input(
+            1_000_000,
+            &wire::parse(ip(reverse(tuple())), &fallback).unwrap(),
+        )
+        .unwrap();
+        deliver(&mut a, &mut b, 1_000_000);
+        assert!(!a.ecn_send() && !b.ecn_send());
+        assert!(b.ecn_feedback()); // Original receive promise is retained.
+    }
+
+    #[test]
+    fn ecn_reordered_cwr_cannot_clear_newer_ce() {
+        let (mut a, mut b) = pair(config(1024, 64), u32::MAX - 127);
+        a.write(&[1; 192]).unwrap();
+        packet(&mut a, 40); // Keep a receive hole so older CWR remains in-window.
+        let old = packet(&mut a, 40);
+        let marked = packet(&mut a, 40);
+        b.input_with_traffic_class(40, 3, &wire::parse(ip(tuple()), &marked).unwrap())
+            .unwrap();
+        let mut old = wire::parse(ip(tuple()), &old).unwrap();
+        old.header.flags |= CWR;
+        b.input(40, &old).unwrap();
+        assert!(b.ecn_echo);
+        let ack = packet(&mut b, 40);
+        assert_ne!(
+            wire::parse(ip(reverse(tuple())), &ack)
+                .unwrap()
+                .header
+                .flags
+                & ECE,
+            0
+        );
+    }
+    #[test]
+    fn ecn_idle_window_reduction_signals_cwr_on_committed_fresh_data() {
+        let (mut a, mut b) = pair(config(1024, 64), 10);
+        a.write(&[0; 64]).unwrap();
+        deliver(&mut a, &mut b, 40);
+        b.timeout(200_040).unwrap();
+        deliver(&mut b, &mut a, 200_040);
+        assert!(a.congestion.cwnd() > a.initial_window());
+        a.write(&[0; 64]).unwrap();
+        let now = 200_040 + a.rto();
+        let before = a.congestion.cwnd();
+        assert_eq!(a.transmit(now, &mut [0; 19]), Err(Error::OutputTooSmall));
+        assert_eq!(a.congestion.cwnd(), before);
+        let data = packet(&mut a, now);
+        assert_eq!(a.congestion.cwnd(), a.initial_window());
+        assert_ne!(
+            wire::parse(ip(tuple()), &data).unwrap().header.flags & CWR,
+            0
+        );
+        assert_eq!(a.last_output_ecn(), 2);
+    }
+    #[test]
+    fn ecn_valid_cwr_control_clears_echo_but_pure_ack_ce_does_not_set_it() {
+        let (mut a, mut b) = pair(config(1024, 64), 10);
+        a.write(&[0; 64]).unwrap();
+        let data = packet(&mut a, 40);
+        let mut control = wire::parse(ip(tuple()), &data).unwrap();
+        b.input_with_traffic_class(40, 3, &control).unwrap();
+        assert!(b.ecn_echo);
+        control.header.sequence = a.snd_nxt.0;
+        control.header.flags = ACK | CWR;
+        control.payload = &[];
+        b.input_with_traffic_class(40, 3, &control).unwrap();
+        assert!(!b.ecn_echo);
+        assert_eq!(b.ecn_ce_end, None);
     }
 }

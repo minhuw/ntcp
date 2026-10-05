@@ -852,7 +852,7 @@ fn passive_quote(a: &mut Endpoint, b: &mut Endpoint) -> (Tuple, u32) {
     let reply = packets(b, 0);
     assert_eq!(reply.len(), 1);
     let syn_ack = wire::parse(reply[0].0, &reply[0].1).unwrap();
-    assert_eq!(syn_ack.header.flags, wire::SYN | wire::ACK);
+    assert_eq!(syn_ack.header.flags, wire::SYN | wire::ACK | wire::ECE);
     let (local, remote) = addresses();
     (
         Tuple {
@@ -1455,4 +1455,262 @@ fn passive_report_backpressure_does_not_block_active_connection_errors() {
         matches!(b.next_event(), Some(Event::Connection(id, events)) if id == active && events.network_error == Some(NetworkError::HardUnreachable))
     );
     assert_eq!(b.next_event(), None);
+}
+
+fn ecn_packet(endpoint: &mut Endpoint, now: u64) -> (Transmit, Vec<u8>) {
+    let mut bytes = [0; 2048];
+    let packet = endpoint
+        .poll_transmit(now, &mut bytes, 64)
+        .unwrap()
+        .packet
+        .unwrap();
+    (packet, bytes[..packet.len].to_vec())
+}
+
+fn ecn_deliver(endpoint: &mut Endpoint, now: u64, packet: &(Transmit, Vec<u8>), ce: bool) {
+    endpoint
+        .input_with_traffic_class(
+            now,
+            packet.0.ip,
+            (packet.0.dscp << 2) | if ce { 3 } else { packet.0.ecn },
+            &packet.1,
+        )
+        .unwrap();
+}
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.2
+//= type=test
+//# A TCP endpoint SHOULD implement ECN as described in RFC 3168 (SHLD-
+//# 8).
+fn classic_ecn_duplex_feedback_loss_cwr_and_capacity() {
+    let (mut a, mut b, listener, client) = endpoints();
+    let syn = ecn_packet(&mut a, 0);
+    assert_eq!(syn.0.ecn, 0);
+    assert_eq!(
+        wire::parse(syn.0.ip, &syn.1).unwrap().header.flags,
+        wire::SYN | wire::ECE | wire::CWR
+    );
+    ecn_deliver(&mut b, 0, &syn, false);
+    let synack = ecn_packet(&mut b, 0);
+    assert_eq!(synack.0.ecn, 0);
+    assert_eq!(
+        wire::parse(synack.0.ip, &synack.1).unwrap().header.flags,
+        wire::SYN | wire::ACK | wire::ECE
+    );
+    ecn_deliver(&mut a, 0, &synack, false);
+    let ack = ecn_packet(&mut a, 0);
+    assert_eq!(ack.0.ecn, 0);
+    ecn_deliver(&mut b, 0, &ack, false);
+    let server = b.accept(listener).unwrap();
+    {
+        let (sender, receiver, id) = (&mut a, &mut b, client);
+        sender.write(id, &[1; 64]).unwrap();
+        let data = ecn_packet(sender, 1);
+        assert_eq!(data.0.ecn, 2);
+        let mut corrupt = data.1.clone();
+        corrupt[16] ^= 1;
+        assert_eq!(
+            receiver
+                .input_with_traffic_class(1, data.0.ip, 3, &corrupt)
+                .unwrap(),
+            InputDisposition::Dropped
+        );
+        assert!(
+            receiver
+                .poll_transmit(1, &mut [0; 2048], 64)
+                .unwrap()
+                .packet
+                .is_none()
+        );
+        ecn_deliver(receiver, 1, &data, true);
+        let lost_ece = ecn_packet(receiver, 1);
+        assert_eq!(lost_ece.0.ecn, 0);
+        assert_ne!(
+            wire::parse(lost_ece.0.ip, &lost_ece.1)
+                .unwrap()
+                .header
+                .flags
+                & wire::ECE,
+            0
+        );
+        // Duplicate old data does not create a new CE event but repeats existing echo.
+        ecn_deliver(receiver, 2, &data, false);
+        let ece = ecn_packet(receiver, 2);
+        assert_ne!(
+            wire::parse(ece.0.ip, &ece.1).unwrap().header.flags & wire::ECE,
+            0
+        );
+        ecn_deliver(sender, 2, &ece, false);
+        // ECE alone schedules no retransmission.
+        assert!(
+            sender
+                .poll_transmit(2, &mut [0; 2048], 64)
+                .unwrap()
+                .packet
+                .is_none()
+        );
+        sender.write(id, &[2; 64]).unwrap();
+        assert_eq!(
+            sender.poll_transmit(2, &mut [0; 19], 64),
+            Err(EndpointError::Connection(Error::OutputTooSmall))
+        );
+        let cwr = ecn_packet(sender, 2);
+        assert_eq!(cwr.0.ecn, 2);
+        assert_ne!(
+            wire::parse(cwr.0.ip, &cwr.1).unwrap().header.flags & wire::CWR,
+            0
+        );
+        // Lose CWR data; the RTO retransmission must be Not-ECT and have no CWR.
+        let deadline = sender.next_deadline().unwrap();
+        sender.on_timeout(deadline, 64).unwrap();
+        let retransmit = ecn_packet(sender, deadline);
+        assert_eq!(retransmit.0.ecn, 0);
+        assert_eq!(
+            wire::parse(retransmit.0.ip, &retransmit.1)
+                .unwrap()
+                .header
+                .flags
+                & wire::CWR,
+            0
+        );
+        ecn_deliver(receiver, deadline, &retransmit, false);
+        receiver.on_timeout(deadline + 200_000, 64).unwrap();
+        let ack = ecn_packet(receiver, deadline + 200_000);
+        assert_ne!(
+            wire::parse(ack.0.ip, &ack.1).unwrap().header.flags & wire::ECE,
+            0
+        );
+        ecn_deliver(sender, deadline + 200_000, &ack, false);
+        sender.write(id, &[3; 64]).unwrap();
+        // ECE at a one-MSS window after RTO delays fresh data for another RTO.
+        assert!(
+            sender
+                .poll_transmit(deadline + 200_000, &mut [0; 2048], 64)
+                .unwrap()
+                .packet
+                .is_none()
+        );
+        let now = deadline + 10_200_000;
+        sender.on_timeout(now, 64).unwrap();
+        let cwr = ecn_packet(sender, now);
+        assert_ne!(
+            wire::parse(cwr.0.ip, &cwr.1).unwrap().header.flags & wire::CWR,
+            0
+        );
+        ecn_deliver(receiver, now, &cwr, false);
+        receiver.on_timeout(now + 200_000, 64).unwrap();
+        let ack = ecn_packet(receiver, now + 200_000);
+        assert_eq!(
+            wire::parse(ack.0.ip, &ack.1).unwrap().header.flags & wire::ECE,
+            0
+        );
+        ecn_deliver(sender, now + 200_000, &ack, false);
+    }
+    b.write(server, &[4; 64]).unwrap();
+    let now = 20_000_000;
+    let data = ecn_packet(&mut b, now);
+    assert_eq!(data.0.ecn, 2);
+    ecn_deliver(&mut a, now, &data, true);
+    let ack = ecn_packet(&mut a, now);
+    assert_ne!(
+        wire::parse(ack.0.ip, &ack.1).unwrap().header.flags & wire::ECE,
+        0
+    );
+    ecn_deliver(&mut b, now, &ack, false);
+    b.write(server, &[5; 64]).unwrap();
+    let cwr = ecn_packet(&mut b, now);
+    assert_ne!(
+        wire::parse(cwr.0.ip, &cwr.1).unwrap().header.flags & wire::CWR,
+        0
+    );
+}
+
+#[test]
+fn classic_ecn_opt_out_and_syn_timeout_fallback() {
+    for (enabled, lost_syn) in [(false, false), (true, true)] {
+        let (local, remote) = addresses();
+        let mut cfg = config();
+        cfg.connection.ecn = enabled;
+        let mut a = Endpoint::new(config(), [1; 32], 0).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+        let listener = b.listen(remote, 4).unwrap();
+        let id = a.connect(0, local, remote).unwrap();
+        let first = ecn_packet(&mut a, 0);
+        let now = if lost_syn { 1_000_000 } else { 0 };
+        let syn = if lost_syn {
+            a.on_timeout(now, 64).unwrap();
+            assert!(a.poll_transmit(now, &mut [0; 19], 64).is_err());
+            let syn = ecn_packet(&mut a, now);
+            assert_eq!(
+                wire::parse(syn.0.ip, &syn.1).unwrap().header.flags,
+                wire::SYN
+            );
+            syn
+        } else {
+            first
+        };
+        ecn_deliver(&mut b, now, &syn, false);
+        let synack = ecn_packet(&mut b, now);
+        assert_eq!(
+            wire::parse(synack.0.ip, &synack.1).unwrap().header.flags,
+            wire::SYN | wire::ACK
+        );
+        ecn_deliver(&mut a, now, &synack, false);
+        pump(&mut a, &mut b, now);
+        let server = b.accept(listener).unwrap();
+        for (endpoint, id) in [(&mut a, id), (&mut b, server)] {
+            endpoint.write(id, &[0; 64]).unwrap();
+            assert_eq!(ecn_packet(endpoint, now).0.ecn, 0);
+        }
+    }
+}
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.9
+//= type=test
+//# TCP implementations MAY pass the most recently received
+//# Differentiated Services field up to the application (MAY-9).
+fn received_dscp_is_validated_per_connection_and_independent_of_send_dscp() {
+    let (mut a, mut b, listener, client) = endpoints();
+    assert_eq!(a.received_dscp(client).unwrap(), None);
+    a.set_dscp(client, 46).unwrap();
+    let syn = ecn_packet(&mut a, 0);
+    ecn_deliver(&mut b, 0, &syn, false);
+    let synack = ecn_packet(&mut b, 0);
+    a.input_with_traffic_class(0, synack.0.ip, 10 << 2 | 3, &synack.1)
+        .unwrap();
+    assert_eq!(a.received_dscp(client).unwrap(), Some(10));
+    let mut corrupt = synack.1.clone();
+    corrupt[16] ^= 1;
+    assert_eq!(
+        a.input_with_traffic_class(0, synack.0.ip, 63 << 2, &corrupt)
+            .unwrap(),
+        InputDisposition::Dropped
+    );
+    assert_eq!(a.received_dscp(client).unwrap(), Some(10));
+    let unknown = IpMetadata {
+        source: "192.0.2.99".parse().unwrap(),
+        ..synack.0.ip
+    };
+    let parsed = wire::parse(synack.0.ip, &synack.1).unwrap();
+    let mut bytes = [0; 128];
+    let len = wire::encode(unknown, parsed.header, &[], &[], &mut bytes).unwrap();
+    a.input_with_traffic_class(0, unknown, 63 << 2, &bytes[..len])
+        .unwrap();
+    assert_eq!(a.received_dscp(client).unwrap(), Some(10));
+    // Drain the unknown tuple's reset, then the handshake ACK.
+    let mut ack = ecn_packet(&mut a, 0);
+    if wire::parse(ack.0.ip, &ack.1).unwrap().header.flags & wire::RST != 0 {
+        ack = ecn_packet(&mut a, 0);
+    }
+    assert_eq!(ack.0.dscp, 46);
+    ecn_deliver(&mut b, 0, &ack, false);
+    let server = b.accept(listener).unwrap();
+    assert_eq!(b.received_dscp(server).unwrap(), Some(46));
+    assert_eq!(synack.0.dscp, 0);
+    a.abort(client).unwrap();
+    packets(&mut a, 0);
+    a.release(client).unwrap();
+    assert_eq!(a.received_dscp(client), Err(EndpointError::InvalidHandle));
 }

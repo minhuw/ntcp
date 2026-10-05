@@ -73,7 +73,10 @@ pub(crate) struct Congestion {
     // Exclusive SND.NXT, not the inclusive highest byte used in RFC 6582.
     recover: Option<Seq>,
     fast_recovery: bool,
+    ecn_end: Option<Seq>,
     timeout_retransmitted: bool,
+    // Exclusive end of successfully emitted, still-unacknowledged retransmissions.
+    retransmitted_end: Option<Seq>,
 }
 
 impl Congestion {
@@ -88,7 +91,9 @@ impl Congestion {
             duplicate_acks: 0,
             recover: None,
             fast_recovery: false,
+            ecn_end: None,
             timeout_retransmitted: false,
+            retransmitted_end: None,
         }
     }
 
@@ -120,6 +125,11 @@ impl Congestion {
         self.acknowledged = 0;
     }
 
+    #[cfg(test)]
+    pub(crate) fn on_ack(&mut self, ack: Seq, acked: u32, flight_after_ack: u32) -> bool {
+        self.on_ack_with_ecn(ack, acked, flight_after_ack, false)
+    }
+
     // Call only for advancing cumulative ACKs; acked counts new data bytes.
     // True requests retransmission of the first unacknowledged segment.
     // Partial evidence: slow start and congestion avoidance on validated new ACKs. Flight
@@ -129,7 +139,21 @@ impl Congestion {
     //# A TCP endpoint MUST implement the basic congestion control algorithms slow start,
     //# congestion avoidance, and exponential backoff of RTO to avoid creating congestion
     //# collapse conditions (MUST-19).
-    pub(crate) fn on_ack(&mut self, ack: Seq, acked: u32, flight_after_ack: u32) -> bool {
+    pub(crate) fn on_ack_with_ecn(
+        &mut self,
+        ack: Seq,
+        acked: u32,
+        flight_after_ack: u32,
+        ece: bool,
+    ) -> bool {
+        if self.retransmitted_end.is_some_and(|end| {
+            matches!(
+                ack.serial_cmp(end),
+                Some(Ordering::Equal | Ordering::Greater)
+            )
+        }) {
+            self.retransmitted_end = None;
+        }
         if acked == 0 {
             return false;
         }
@@ -163,6 +187,15 @@ impl Congestion {
             }
             return false; // Half-space comparisons are not valid TCP ACKs.
         }
+        if self
+            .ecn_end
+            .is_some_and(|end| ack.serial_cmp(end) == Some(Ordering::Greater))
+        {
+            self.ecn_end = None;
+        }
+        if ece {
+            return false;
+        }
         if self.cwnd < self.ssthresh {
             self.cwnd = self
                 .cwnd
@@ -189,7 +222,9 @@ impl Congestion {
         if self.duplicate_acks != 3 || self.recover.is_some() {
             return false;
         }
-        self.reduce_threshold(flight);
+        if self.ecn_end.is_none() {
+            self.reduce_threshold(flight);
+        }
         self.cwnd = self
             .ssthresh
             .saturating_add(self.mss.saturating_mul(3))
@@ -200,15 +235,50 @@ impl Congestion {
         true
     }
 
+    // A separate ECN epoch must not suppress fast retransmission of real losses.
+    // Loss recovery and ECN share the threshold reduction, not retransmit state.
+    pub(crate) fn on_ecn(&mut self, ack: Seq, flight: u32, highest_sent: Seq) -> bool {
+        if self
+            .ecn_end
+            .is_some_and(|end| ack.serial_cmp(end) != Some(Ordering::Greater))
+            || self
+                .recover
+                .is_some_and(|end| ack.serial_cmp(end) != Some(Ordering::Greater))
+        {
+            return false;
+        }
+        self.reduce_threshold(flight);
+        self.cwnd = (self.cwnd / 2).max(self.mss).min(self.ssthresh);
+        self.acknowledged = 0;
+        self.ecn_end = Some(highest_sent);
+        true
+    }
+
     fn reduce_threshold(&mut self, flight: u32) {
         self.ssthresh = (flight / 2).max(self.mss.saturating_mul(2)).min(MAX_WINDOW);
     }
 
+    // Called only after successful output, not when retransmission is scheduled.
+    // All retransmissions start at SND.UNA; retain the furthest end if MSS shrinks.
+    pub(crate) fn on_retransmit(&mut self, end: Seq) {
+        if self
+            .retransmitted_end
+            .is_none_or(|old| end.serial_cmp(old) == Some(Ordering::Greater))
+        {
+            self.retransmitted_end = Some(end);
+        }
+    }
+
     pub(crate) fn on_timeout(&mut self, flight: u32, highest_sent: Seq) {
         // Repeated RTOs for the same unacknowledged segment retain ssthresh.
-        if !self.timeout_retransmitted {
+        // RFC 3168 section 6.1.2: loss of a retransmission is new congestion,
+        // even inside the ECN epoch. An original-flight loss shares its reduction.
+        if !self.timeout_retransmitted
+            && (self.ecn_end.is_none() || self.retransmitted_end.is_some())
+        {
             self.reduce_threshold(flight);
         }
+        self.ecn_end = None;
         self.timeout_retransmitted = true;
         self.recover = Some(highest_sent);
         self.fast_recovery = false;
@@ -418,5 +488,75 @@ mod tests {
     #[should_panic]
     fn zero_mss_update_rejected() {
         Congestion::new(1_000).set_mss(0);
+    }
+    #[test]
+    fn ecn_retransmission_loss_and_ack_boundaries_wrap() {
+        for base in [Seq(100), Seq(u32::MAX - 12_499)] {
+            for acked_retransmission in [0, 500, 1000] {
+                let end = base.wrapping_add(16_000);
+                let mut c = Congestion::new(1000);
+                assert!(c.on_ecn(base, 16_000, end));
+                assert_eq!(c.ssthresh(), 8000);
+                assert!(three_duplicates(&mut c, 16_000, end));
+                c.on_retransmit(base.wrapping_add(1000));
+                assert!(c.on_ack(base.wrapping_add(12_000), 12_000, 4000));
+                c.on_retransmit(base.wrapping_add(13_000));
+                // A shorter retransmission must not forget still-outstanding bytes.
+                c.on_retransmit(base.wrapping_add(12_500));
+                if acked_retransmission != 0 {
+                    assert!(c.on_ack(
+                        base.wrapping_add(12_000 + acked_retransmission),
+                        acked_retransmission,
+                        4000 - acked_retransmission
+                    ));
+                }
+                c.on_timeout(4000 - acked_retransmission, end);
+                let threshold = if acked_retransmission == 1000 {
+                    8000
+                } else {
+                    2000
+                };
+                assert_eq!(c.ssthresh(), threshold);
+                c.on_timeout(4000 - acked_retransmission, end);
+                assert_eq!(c.ssthresh(), threshold);
+            }
+        }
+    }
+
+    #[test]
+    fn ecn_loss_recovery_shares_reduction_but_not_retransmission() {
+        for base in [Seq(0), Seq(u32::MAX - 3_999)] {
+            let end = base.wrapping_add(4_000);
+            let mut c = Congestion::new(1_000);
+            assert!(c.on_ecn(base, 4_000, end));
+            assert_eq!((c.cwnd(), c.ssthresh()), (2_000, 2_000));
+            assert!(!c.on_ecn(end, 4_000, end));
+            // A real loss in the ECN window still fast retransmits, without
+            // a second threshold reduction (flight is intentionally smaller).
+            assert!(three_duplicates(&mut c, 2_000, end));
+            assert_eq!(c.ssthresh(), 2_000);
+            assert!(!c.on_ecn(base, 2_000, end));
+            assert!(c.on_ack_with_ecn(base.wrapping_add(1_000), 1_000, 1_000, true));
+            assert!(!c.on_ack_with_ecn(end, 1_000, 0, true));
+            assert!(!c.fast_recovery);
+            assert!(!c.on_ecn(end, 2_000, end));
+            assert!(c.on_ecn(end.wrapping_add(1), 2_000, end.wrapping_add(2_000)));
+
+            let mut c = Congestion::new(1_000);
+            assert!(three_duplicates(&mut c, 8_000, end));
+            let threshold = c.ssthresh();
+            assert!(!c.on_ecn(end, 8_000, end));
+            assert_eq!(c.ssthresh(), threshold);
+            c.on_timeout(2_000, end);
+            assert_eq!(c.cwnd(), 1_000);
+            assert!(!c.on_ecn(end, 2_000, end));
+
+            let mut c = Congestion::new(1_000);
+            assert!(c.on_ecn(base, 8_000, end));
+            let threshold = c.ssthresh();
+            c.on_timeout(2_000, end);
+            assert_eq!(c.ssthresh(), threshold);
+            assert_eq!(c.cwnd(), 1_000);
+        }
     }
 }
