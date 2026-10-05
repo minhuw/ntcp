@@ -4,6 +4,39 @@ use crate::wire;
 use crate::*;
 use std::{vec, vec::Vec};
 
+// Synthetic documentation networks only; this is a test policy, not runtime configuration.
+fn test_policy(request: AddressValidation) -> bool {
+    test_subnet_policy(24)(request)
+}
+
+fn test_subnet_policy(prefix: u8) -> impl Fn(AddressValidation) -> bool {
+    assert!(prefix <= 32);
+    move |request| {
+        let valid = |address: core::net::IpAddr| match address {
+            core::net::IpAddr::V4(ip) => {
+                ip.octets()[..3] == [192, 0, 2]
+                    && (prefix > 30
+                        || u32::from(ip)
+                            != (u32::from_be_bytes([192, 0, 2, 254]) | (u32::MAX >> prefix)))
+            }
+            core::net::IpAddr::V6(ip) => ip.segments()[..2] == [0x2001, 0xdb8],
+        };
+        match request {
+            AddressValidation::Bind { local } => local.is_unspecified() || valid(local),
+            AddressValidation::Open { local, remote } => valid(local) && valid(remote),
+            AddressValidation::Incoming {
+                source,
+                destination,
+            } => valid(source) && valid(destination),
+            AddressValidation::Route {
+                source,
+                destination,
+                hop,
+            } => valid(source) && valid(destination) && valid(hop),
+        }
+    }
+}
+
 fn addresses() -> (core::net::SocketAddr, core::net::SocketAddr) {
     (
         "192.0.2.1:40000".parse().unwrap(),
@@ -28,8 +61,8 @@ fn config() -> EndpointConfig {
 
 fn endpoints() -> (Endpoint, Endpoint, ListenerId, ConnectionId) {
     let (local, remote) = addresses();
-    let mut a = Endpoint::new(config(), [1; 32], 0).unwrap();
-    let mut b = Endpoint::new(config(), [2; 32], 0).unwrap();
+    let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let client = a.connect(0, local, remote).unwrap();
     (a, b, listener, client)
@@ -199,7 +232,7 @@ fn output_failure_stale_handles_and_memory_limits_are_explicit() {
     assert_eq!(a.write(client, b"bad"), Err(EndpointError::InvalidHandle));
     let mut limited = config();
     limited.max_buffer_bytes = 1;
-    let mut endpoint = Endpoint::new(limited, [3; 32], 0).unwrap();
+    let mut endpoint = Endpoint::new(limited, [3; 32], 0, test_policy).unwrap();
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.1
     //= type=test
     //# If there is
@@ -443,8 +476,8 @@ fn half_open_retransmissions_report_route_advice_without_accepting() {
 //# before sending the (first) SYN (MUST-44).
 fn source_selection_and_keepalive_are_per_connection_controls() {
     let (local, remote) = addresses();
-    let mut a = Endpoint::new(config(), [1; 32], 0).unwrap();
-    let mut b = Endpoint::new(config(), [2; 32], 0).unwrap();
+    let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let client = a
         .connect_with_source(0, None, remote, |destination| {
@@ -481,7 +514,7 @@ fn source_selection_and_keepalive_are_per_connection_controls() {
 #[test]
 fn ipv6_metadata_is_rejected_instead_of_silently_misrouting() {
     use core::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
-    let mut endpoint = Endpoint::new(config(), [1; 32], 0).unwrap();
+    let mut endpoint = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
     let ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
     for (flow, scope) in [(1, 0), (0, 3)] {
         let address = SocketAddr::V6(SocketAddrV6::new(ip, 8080, flow, scope));
@@ -612,7 +645,7 @@ fn lower_layer_errors_require_a_matching_outstanding_quote() {
 
 #[test]
 fn unknown_connection_reset_has_correct_sequence_and_never_answers_reset() {
-    let mut b = Endpoint::new(config(), [4; 32], 0).unwrap();
+    let mut b = Endpoint::new(config(), [4; 32], 0, test_policy).unwrap();
     let (local, remote) = addresses();
     let ip = IpMetadata {
         source: local.ip(),
@@ -723,8 +756,8 @@ fn disabling_error_reports_keeps_data_and_terminal_events() {
     let (local, remote) = addresses();
     let mut cfg = config();
     cfg.error_reports = false;
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
-    let mut b = Endpoint::new(cfg.clone(), [2; 32], 0).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg.clone(), [2; 32], 0, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     a.connect(0, local, remote).unwrap();
     let (tuple, seq) = passive_quote(&mut a, &mut b);
@@ -745,8 +778,8 @@ fn disabling_error_reports_keeps_data_and_terminal_events() {
         Err(EndpointError::Connection(Error::WouldBlock))
     );
 
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let id = a.connect(0, local, remote).unwrap();
     pump(&mut a, &mut b, 0);
@@ -794,7 +827,7 @@ fn warning_reports_can_be_disabled_without_suppressing_route_advice() {
     for enabled in [false, true] {
         let mut cfg = config();
         cfg.error_reports = enabled;
-        let mut a = Endpoint::new(cfg, [1; 32], 0).unwrap();
+        let mut a = Endpoint::new(cfg, [1; 32], 0, test_policy).unwrap();
         let id = a.connect(0, local, remote).unwrap();
         packets(&mut a, 0);
         for attempt in 0..3 {
@@ -1057,7 +1090,7 @@ fn opened_isn(endpoint: &mut Endpoint, now: u64, tuple: Tuple) -> u32 {
 fn isn_four_microsecond_clock_progresses_and_wraps() {
     let (local, remote) = addresses();
     let tuple = Tuple { local, remote };
-    let mut endpoint = Endpoint::new(config(), [7; 32], 0).unwrap();
+    let mut endpoint = Endpoint::new(config(), [7; 32], 0, test_policy).unwrap();
     let first = opened_isn(&mut endpoint, 0, tuple);
     use hmac::{Hmac, Mac};
     let mut prf = Hmac::<sha2::Sha256>::new_from_slice(&[7; 32]).unwrap();
@@ -1072,7 +1105,7 @@ fn isn_four_microsecond_clock_progresses_and_wraps() {
     let third = opened_isn(&mut endpoint, 44, tuple);
     assert_eq!(third, second.wrapping_add(10));
     let start = u64::from(u32::MAX - 1) * 4;
-    let mut endpoint = Endpoint::new(config(), [7; 32], start).unwrap();
+    let mut endpoint = Endpoint::new(config(), [7; 32], start, test_policy).unwrap();
     let before_wrap = opened_isn(&mut endpoint, start, tuple);
     let after_wrap = opened_isn(&mut endpoint, start + 12, tuple);
     assert_eq!(after_wrap, before_wrap.wrapping_add(3));
@@ -1093,8 +1126,13 @@ fn isn_four_microsecond_clock_progresses_and_wraps() {
 fn isn_depends_on_secret_and_each_tuple_component() {
     let (local, remote) = addresses();
     let tuple = Tuple { local, remote };
-    let sample =
-        |secret, tuple| opened_isn(&mut Endpoint::new(config(), secret, 0).unwrap(), 0, tuple);
+    let sample = |secret, tuple| {
+        opened_isn(
+            &mut Endpoint::new(config(), secret, 0, test_policy).unwrap(),
+            0,
+            tuple,
+        )
+    };
     let initial = sample([7; 32], tuple);
     assert_eq!(initial, sample([7; 32], tuple));
     // Key sensitivity is regression evidence, not a proof of MUST-9 secrecy.
@@ -1235,8 +1273,8 @@ fn duplicate_listen_and_pending_open_port_sharing_preserve_existing_records() {
 #[test]
 fn explicit_source_and_wildcard_listener_bind_and_reuse_actual_local_address() {
     let (local, remote) = addresses();
-    let mut a = Endpoint::new(config(), [1; 32], 0).unwrap();
-    let mut b = Endpoint::new(config(), [2; 32], 0).unwrap();
+    let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
     let listener = b.listen("0.0.0.0:8080".parse().unwrap(), 4).unwrap();
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
     //= type=test
@@ -1326,18 +1364,27 @@ fn listener_cleanup_retries_unaccepted_child_reset() {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
 //= type=test
-//= reason=Directed-broadcast validation requires configured subnet knowledge.
+//= reason=The synthetic policy is bound to a /24 ingress context; directed-broadcast knowledge is supplied explicitly, not inferred.
 //# A TCP implementation MUST reject as an error a local OPEN call for an
 //# invalid remote IP address (e.g., a broadcast or multicast address)
 //# (MUST-46).
-fn configured_directed_broadcasts_are_rejected_before_open_or_input() {
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
+//= type=test
+//= reason=Checksummed SYNs exercise source and destination rejection under the required /24 context policy, with a unicast positive control.
+//# |  An incoming SYN with an invalid source address MUST be ignored
+//# |  either by TCP or by the IP layer [(MUST-63)] (see
+//# |  Section 3.2.1.3).
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
+//= type=test
+//= reason=Checksummed directed-broadcast SYNs are silently dropped before allocation or output in this explicit /24 context.
+//# |
+//# |  A TCP implementation MUST silently discard an incoming SYN segment
+//# |  that is addressed to a broadcast or multicast address [(MUST-57)].
+fn scoped_directed_broadcasts_are_rejected_before_open_or_input() {
     let (local, remote) = addresses();
     let broadcast = "192.0.2.255:8080".parse().unwrap();
     let host: core::net::SocketAddr = "192.0.2.254:8080".parse().unwrap();
-    let mut cfg = config();
-    // A host address is accepted as the subnet specification, as with interface addresses.
-    cfg.ipv4_subnets.push(("192.0.2.17".parse().unwrap(), 24));
-    let mut endpoint = Endpoint::new(cfg, [1; 32], 0).unwrap();
+    let mut endpoint = Endpoint::new(config(), [1; 32], 0, test_subnet_policy(24)).unwrap();
     assert_eq!(
         endpoint.connect(0, local, broadcast),
         Err(EndpointError::InvalidAddress)
@@ -1351,6 +1398,7 @@ fn configured_directed_broadcasts_are_rejected_before_open_or_input() {
         Err(EndpointError::Connection(Error::InvalidArgument))
     );
     assert_eq!(endpoint.buffer_bytes(), 0);
+    assert!(packets(&mut endpoint, 0).is_empty());
     endpoint.listen("0.0.0.0:8080".parse().unwrap(), 4).unwrap();
     let syn = wire::Header {
         source_port: local.port(),
@@ -1396,14 +1444,21 @@ fn configured_directed_broadcasts_are_rejected_before_open_or_input() {
 }
 
 #[test]
-fn subnet_prefix_bounds_point_to_point_and_ipv6_behavior() {
-    let (local, _) = addresses();
+fn distinct_ingress_contexts_24_broadcast_31_host_and_ipv6_behavior() {
+    let local = "192.0.2.254:40000".parse().unwrap();
     let remote = "192.0.2.255:8080".parse().unwrap();
-    for prefix in [31, 32] {
-        let mut cfg = config();
-        cfg.ipv4_subnets
-            .push(("192.0.2.254".parse().unwrap(), prefix));
-        let mut endpoint = Endpoint::new(cfg, [1; 32], 0).unwrap();
+    for prefix in [24, 31, 32] {
+        let mut endpoint = Endpoint::new(config(), [1; 32], 0, test_subnet_policy(prefix)).unwrap();
+        if prefix == 24 {
+            assert_eq!(
+                endpoint.connect(0, local, remote),
+                Err(EndpointError::InvalidAddress)
+            );
+            assert!(endpoint.listen(remote, 1).is_err());
+            assert_eq!(endpoint.buffer_bytes(), 0);
+            assert!(packets(&mut endpoint, 0).is_empty());
+            continue;
+        }
         assert!(endpoint.connect(0, local, remote).is_ok());
         assert!(endpoint.listen(remote, 1).is_ok());
         // The .255 point-to-point/host address is also valid on input.
@@ -1433,24 +1488,7 @@ fn subnet_prefix_bounds_point_to_point_and_ipv6_behavior() {
                 .any(|(ip, _)| ip.source == remote.ip())
         );
     }
-    for cfg in [
-        EndpointConfig {
-            ipv4_subnets: vec![("192.0.2.1".parse().unwrap(), 33)],
-            ..config()
-        },
-        EndpointConfig {
-            ipv4_subnets: vec![("192.0.2.1".parse().unwrap(), 24); 65],
-            ..config()
-        },
-    ] {
-        assert!(matches!(
-            Endpoint::new(cfg, [1; 32], 0),
-            Err(EndpointError::Connection(Error::InvalidArgument))
-        ));
-    }
-    let mut cfg = config();
-    cfg.ipv4_subnets = vec![("0.0.0.0".parse().unwrap(), 0); 64];
-    let mut endpoint = Endpoint::new(cfg, [1; 32], 0).unwrap();
+    let mut endpoint = Endpoint::new(config(), [1; 32], 0, test_subnet_policy(0)).unwrap();
     assert!(endpoint.connect(0, local, remote).is_ok()); // /0 has only 255.255.255.255 broadcast.
     assert_eq!(
         endpoint.connect(0, local, "255.255.255.255:8080".parse().unwrap()),
@@ -1464,9 +1502,6 @@ fn subnet_prefix_bounds_point_to_point_and_ipv6_behavior() {
         endpoint.connect(0, v6_local, "[ff02::1]:8080".parse().unwrap()),
         Err(EndpointError::InvalidAddress)
     );
-    // No prefix knowledge is inferred from addresses when the list is empty.
-    let mut endpoint = Endpoint::new(config(), [1; 32], 0).unwrap();
-    assert!(endpoint.connect(0, local, remote).is_ok());
 }
 
 #[test]
@@ -1686,8 +1721,8 @@ fn classic_ecn_opt_out_and_syn_timeout_fallback() {
         let (local, remote) = addresses();
         let mut cfg = config();
         cfg.connection.ecn = enabled;
-        let mut a = Endpoint::new(config(), [1; 32], 0).unwrap();
-        let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+        let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
         let listener = b.listen(remote, 4).unwrap();
         let id = a.connect(0, local, remote).unwrap();
         let first = ecn_packet(&mut a, 0);
@@ -1805,7 +1840,7 @@ fn optional_stream_controls_refresh_endpoint_work_and_charge_marker_storage() {
 
     let mut limited = config();
     limited.max_buffer_bytes = 3 * 1024 + 2 * 1024 + 64 - 1;
-    let mut endpoint = Endpoint::new(limited, [3; 32], 0).unwrap();
+    let mut endpoint = Endpoint::new(limited, [3; 32], 0, test_policy).unwrap();
     let (local, remote) = addresses();
     assert_eq!(
         endpoint.connect(0, local, remote),
@@ -1905,8 +1940,8 @@ fn ipv4_passive_owned_return_route_replacement_and_rejected_tcp_metadata() {
     let (local, remote) = addresses();
     let mut cfg = config();
     cfg.ipv4_options_enabled = true;
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     a.connect(0, local, remote).unwrap();
     let (syn, bytes) = option_packet(&mut a, 0);
@@ -1971,8 +2006,8 @@ fn ipv4_active_route_precedence_and_unoverridden_active_learning() {
         let (local, remote) = addresses();
         let mut cfg = config();
         cfg.ipv4_options_enabled = true;
-        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
-        let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
         b.listen(remote, 4).unwrap();
         let options = OutgoingIpv4Options {
             source_route: explicit
@@ -2015,15 +2050,14 @@ fn ipv4_options_security_profile_validation_and_control_route() {
         source_route: Some(route),
         ..Default::default()
     };
-    let mut a = Endpoint::new(config(), [1; 32], 0).unwrap();
+    let mut a = Endpoint::new(config(), [1; 32], 0, test_policy).unwrap();
     assert!(
         a.connect_with_ipv4_options(0, local, remote, options)
             .is_err()
     );
     let mut cfg = config();
     cfg.ipv4_options_enabled = true;
-    cfg.ipv4_subnets.push((Ipv4Addr::new(192, 0, 2, 0), 24));
-    let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
     let mut bad = options;
     bad.source_route = Some(SourceRoute::new(&[Ipv4Addr::new(192, 0, 2, 255)], false).unwrap());
     assert!(b.connect_with_ipv4_options(0, local, remote, bad).is_err());
@@ -2080,8 +2114,8 @@ fn ipv4_options_reserve_send_budget_without_lowering_receive_mss() {
         cfg.connection.receive_capacity = 65536;
         cfg.connection.send_ip_payload_limit = base;
         cfg.connection.receive_ip_payload_limit = 1480;
-        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
-        let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
         b.listen(remote, 4).unwrap();
         let client = a.connect(0, local, remote).unwrap();
         let (syn, bytes) = option_packet(&mut a, 0);
@@ -2097,7 +2131,7 @@ fn ipv4_options_reserve_send_budget_without_lowering_receive_mss() {
         let mut cfg = config();
         cfg.ipv4_options_enabled = true;
         cfg.connection.send_ip_payload_limit = base;
-        assert!(Endpoint::new(cfg, [1; 32], 0).is_err());
+        assert!(Endpoint::new(cfg, [1; 32], 0, test_policy).is_err());
     }
 }
 
@@ -2111,8 +2145,8 @@ fn ipv4_outgoing_requests_and_received_owned_snapshot() {
     let (local, remote) = addresses();
     let mut cfg = config();
     cfg.ipv4_options_enabled = true;
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let request = OutgoingIpv4Options {
         source_route: Some(SourceRoute::new(&[], false).unwrap()),
@@ -2179,9 +2213,9 @@ fn time_wait_endpoint(
     u32,
 ) {
     let (local, remote) = addresses();
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
     cfg.reuse_time_wait = true;
-    let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let client = a.connect(0, local, remote).unwrap();
     pump(&mut a, &mut b, 1_000);
@@ -2479,8 +2513,8 @@ fn timestamps_two_endpoints_reopen_and_transfer_after_time_wait() {
     cfg.connection.timestamps = true;
     cfg.reuse_time_wait = true;
     let (local, remote) = addresses();
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let first = a.connect(0, local, remote).unwrap();
     pump(&mut a, &mut b, 1_000);
@@ -2547,11 +2581,11 @@ fn timestamps_endpoint_config_and_control_reset_budgets() {
     cfg.connection.timestamps = true;
     cfg.connection.send_ip_payload_limit = 39;
     assert!(matches!(
-        Endpoint::new(cfg.clone(), [1; 32], 0),
+        Endpoint::new(cfg.clone(), [1; 32], 0, test_policy),
         Err(EndpointError::Connection(Error::InvalidArgument))
     ));
     cfg.connection.send_ip_payload_limit = 40;
-    let mut b = Endpoint::new(cfg, [1; 32], 0).unwrap();
+    let mut b = Endpoint::new(cfg, [1; 32], 0, test_policy).unwrap();
     let (local, remote) = addresses();
     let ip = IpMetadata {
         source: local.ip(),
@@ -2584,12 +2618,12 @@ fn timestamp_ipv4_option_budget_and_paws_gate_route_updates() {
     cfg.ipv4_options_enabled = true;
     cfg.connection.send_ip_payload_limit = 79;
     assert!(matches!(
-        Endpoint::new(cfg.clone(), [1; 32], 0),
+        Endpoint::new(cfg.clone(), [1; 32], 0, test_policy),
         Err(EndpointError::Connection(Error::InvalidArgument))
     ));
     cfg.connection.send_ip_payload_limit = 80;
-    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
-    let mut b = Endpoint::new(cfg, [2; 32], 0).unwrap();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
     let client = a.connect(0, local, remote).unwrap();
     let route = completed_route(&[8, 9]);
@@ -2653,4 +2687,218 @@ fn time_wait_reuse_keeps_new_syn_return_route_and_timestamp_options() {
             .is_some()
     );
     assert_eq!(b.state(old).unwrap(), State::TimeWait);
+}
+
+#[test]
+fn address_policy_roles_owned_context_and_source_selection() {
+    use std::{cell::RefCell, rc::Rc};
+    let (local, remote) = addresses();
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let observed = calls.clone();
+    // Owned state, with passive-only admission and no wildcard binding.
+    let locals = [remote.ip()];
+    let mut endpoint = Endpoint::new(config(), [1; 32], 0, move |request| {
+        observed.borrow_mut().push(request);
+        match request {
+            AddressValidation::Bind { local } => locals.contains(&local),
+            AddressValidation::Incoming {
+                source,
+                destination,
+            } => source == local.ip() && locals.contains(&destination),
+            AddressValidation::Open { .. } => false,
+            AddressValidation::Route { .. } => false,
+        }
+    })
+    .unwrap();
+    assert!(endpoint.listen("0.0.0.0:8080".parse().unwrap(), 1).is_err());
+    assert!(endpoint.listen(local, 1).is_err());
+    endpoint.listen(remote, 1).unwrap();
+    assert_eq!(
+        endpoint.connect_with_source(0, None, local, |_| Ok(remote)),
+        Err(EndpointError::InvalidAddress)
+    );
+    assert_eq!(
+        calls.borrow().last(),
+        Some(&AddressValidation::Open {
+            local: remote.ip(),
+            remote: local.ip()
+        })
+    );
+    assert_eq!(endpoint.buffer_bytes(), 0);
+    assert!(packets(&mut endpoint, 0).is_empty());
+    calls.borrow_mut().clear();
+    let header = wire::Header {
+        source_port: local.port(),
+        destination_port: remote.port(),
+        sequence: 1,
+        acknowledgment: 0,
+        flags: wire::SYN,
+        window: 1024,
+        urgent_pointer: 0,
+    };
+    let ip = IpMetadata {
+        source: local.ip(),
+        destination: remote.ip(),
+    };
+    // Incoming admission succeeds even though this endpoint forbids active OPEN.
+    assert_eq!(
+        input_header(&mut endpoint, ip, header),
+        InputDisposition::Processed
+    );
+    assert!(endpoint.buffer_bytes() > 0);
+    assert_eq!(packets(&mut endpoint, 0).len(), 1);
+    assert_eq!(
+        *calls.borrow(),
+        vec![AddressValidation::Incoming {
+            source: ip.source,
+            destination: ip.destination
+        }]
+    );
+    calls.borrow_mut().clear();
+    // Existing tuples still pass the incoming boundary before lookup.
+    assert_eq!(
+        input_header(&mut endpoint, ip, header),
+        InputDisposition::Processed
+    );
+    assert_eq!(
+        *calls.borrow(),
+        vec![AddressValidation::Incoming {
+            source: ip.source,
+            destination: ip.destination
+        }]
+    );
+}
+
+#[test]
+fn route_policy_receives_logical_pair_for_hops_and_prespecified_timestamps() {
+    use core::net::Ipv4Addr;
+    use std::{cell::RefCell, rc::Rc};
+    let (local, remote) = addresses();
+    let hop = Ipv4Addr::new(192, 0, 2, 7);
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let observed = calls.clone();
+    let mut cfg = config();
+    cfg.ipv4_options_enabled = true;
+    let mut endpoint = Endpoint::new(cfg, [1; 32], 0, move |request| {
+        observed.borrow_mut().push(request);
+        test_policy(request) && !matches!(request, AddressValidation::Route { .. })
+    })
+    .unwrap();
+    for options in [
+        OutgoingIpv4Options {
+            source_route: Some(SourceRoute::new(&[hop], false).unwrap()),
+            ..Default::default()
+        },
+        OutgoingIpv4Options {
+            source_route: Some(SourceRoute::new(&[], false).unwrap()),
+            timestamp: Some(TimestampRequest::Prespecified {
+                addresses: [hop; 4],
+                len: 1,
+            }),
+            ..Default::default()
+        },
+    ] {
+        calls.borrow_mut().clear();
+        assert_eq!(
+            endpoint.connect_with_ipv4_options(0, local, remote, options),
+            Err(EndpointError::InvalidAddress)
+        );
+        assert_eq!(
+            *calls.borrow(),
+            vec![AddressValidation::Route {
+                source: local.ip(),
+                destination: remote.ip(),
+                hop: hop.into()
+            }]
+        );
+        assert_eq!(endpoint.buffer_bytes(), 0);
+        assert!(packets(&mut endpoint, 0).is_empty());
+    }
+    let mut sender = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+    sender.connect(0, local, remote).unwrap();
+    let (ip, bytes) = packets(&mut sender, 0).pop().unwrap();
+    calls.borrow_mut().clear();
+    assert_eq!(
+        endpoint
+            .input_with_ipv4_options(0, ip, 0, completed_route(&[7]), &bytes)
+            .unwrap(),
+        InputDisposition::Dropped
+    );
+    assert_eq!(
+        *calls.borrow(),
+        vec![
+            AddressValidation::Incoming {
+                source: local.ip(),
+                destination: remote.ip()
+            },
+            AddressValidation::Route {
+                source: remote.ip(),
+                destination: local.ip(),
+                hop: hop.into()
+            },
+        ]
+    );
+    assert_eq!(endpoint.buffer_bytes(), 0);
+    assert!(packets(&mut endpoint, 0).is_empty());
+}
+
+#[test]
+fn base_invalid_addresses_never_reach_policy() {
+    let (local, remote) = addresses();
+    let mut cfg = config();
+    cfg.ipv4_options_enabled = true;
+    let mut endpoint = Endpoint::new(cfg, [1; 32], 0, |_| {
+        panic!("base checks must precede policy")
+    })
+    .unwrap();
+    for invalid in [
+        "0.0.0.0",
+        "0.1.2.3",
+        "224.0.0.1",
+        "255.255.255.255",
+        "::",
+        "ff02::1",
+    ] {
+        let address = invalid.parse().unwrap();
+        let socket = core::net::SocketAddr::new(address, 8080);
+        assert_eq!(
+            endpoint.connect(0, local, socket),
+            Err(EndpointError::InvalidAddress)
+        );
+        assert_eq!(
+            endpoint.connect(0, socket, remote),
+            Err(EndpointError::InvalidAddress)
+        );
+        if !address.is_unspecified() {
+            assert!(endpoint.listen(socket, 1).is_err());
+        }
+        for ip in [
+            IpMetadata {
+                source: address,
+                destination: remote.ip(),
+            },
+            IpMetadata {
+                source: local.ip(),
+                destination: address,
+            },
+        ] {
+            assert_eq!(
+                endpoint.input(0, ip, &[]).unwrap(),
+                InputDisposition::Dropped
+            );
+        }
+    }
+    let options = OutgoingIpv4Options {
+        timestamp: Some(TimestampRequest::Prespecified {
+            addresses: [core::net::Ipv4Addr::BROADCAST; 4],
+            len: 1,
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        endpoint.connect_with_ipv4_options(0, local, remote, options),
+        Err(EndpointError::InvalidAddress)
+    );
+    assert_eq!(endpoint.buffer_bytes(), 0);
+    assert!(packets(&mut endpoint, 0).is_empty());
 }

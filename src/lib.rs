@@ -25,8 +25,8 @@ pub use connection::{
     State, Tuple,
 };
 pub use endpoint::{
-    ConnectionId, Endpoint, EndpointConfig, EndpointError, Event, InputDisposition, ListenerId,
-    PollTransmit, Transmit,
+    AddressValidation, ConnectionId, Endpoint, EndpointConfig, EndpointError, Event,
+    InputDisposition, ListenerId, PollTransmit, Transmit,
 };
 pub use ipv4_options::{
     Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options, SourceRoute, TimestampRequest,

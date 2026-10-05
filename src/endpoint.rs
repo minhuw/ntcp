@@ -1,7 +1,7 @@
 extern crate alloc;
 
-use alloc::{collections::VecDeque, vec::Vec};
-use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
+use core::net::{IpAddr, SocketAddr};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -23,11 +23,30 @@ pub struct ListenerId {
     generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AddressValidation {
+    Bind {
+        local: IpAddr,
+    },
+    Open {
+        local: IpAddr,
+        remote: IpAddr,
+    },
+    Incoming {
+        source: IpAddr,
+        destination: IpAddr,
+    },
+    Route {
+        source: IpAddr,
+        destination: IpAddr,
+        hop: IpAddr,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct EndpointConfig {
     pub max_connections: usize,
     pub ipv4_options_enabled: bool,
-    pub ipv4_subnets: Vec<(Ipv4Addr, u8)>,
     pub error_reports: bool,
     pub reuse_time_wait: bool,
     pub max_listeners: usize,
@@ -43,7 +62,6 @@ impl Default for EndpointConfig {
         Self {
             max_connections: 1024,
             ipv4_options_enabled: false,
-            ipv4_subnets: Vec::new(),
             error_reports: true,
             reuse_time_wait: false,
             max_listeners: 64,
@@ -213,7 +231,12 @@ struct Listener {
     closing: bool,
 }
 
+// An endpoint and its policy are bound to one ingress network context. Policies
+// may select routes using the address pair and capture owned network state.
+// Ambiguous overlapping ingress domains need separate endpoints, not implicit
+// context guessing from addresses.
 pub struct Endpoint {
+    address_policy: Box<dyn Fn(AddressValidation) -> bool>,
     config: EndpointConfig,
     secret: [u8; 32],
     now: Instant,
@@ -258,10 +281,14 @@ fn valid_address(address: IpAddr) -> bool {
 }
 
 impl Endpoint {
-    pub fn new(
+    // The caller must supply a confidential, unpredictable 32-byte key from an
+    // initialized CSPRNG. The required callback captures authoritative network
+    // context for this endpoint; the endpoint cannot prove the caller's policy true.
+    pub fn new<F: Fn(AddressValidation) -> bool + 'static>(
         mut config: EndpointConfig,
         secret: [u8; 32],
         now: Instant,
+        address_policy: F,
     ) -> Result<Self, EndpointError> {
         if config.max_connections == 0
             || config.connection.send_ip_payload_limit
@@ -269,8 +296,6 @@ impl Endpoint {
             || config.max_listeners == 0
             || config.hop_limit == 0
             || config.dscp > 63
-            || config.ipv4_subnets.len() > 64
-            || config.ipv4_subnets.iter().any(|(_, prefix)| *prefix > 32)
         {
             return Err(Error::InvalidArgument.into());
         }
@@ -321,6 +346,7 @@ impl Endpoint {
             .try_reserve_exact(count)
             .map_err(|_| Error::NoMemory)?;
         Ok(Self {
+            address_policy: Box::new(address_policy),
             passive_errors,
             tuples: TupleTable::new(count)?,
             output: ReadyQueue::new(count).map_err(|_| Error::NoMemory)?,
@@ -347,17 +373,15 @@ impl Endpoint {
         })
     }
 
-    // Only configured subnets can be checked for directed broadcast; an empty
-    // list leaves that validation to the embedding IP layer.
-    fn valid_address(&self, address: IpAddr) -> bool {
-        valid_address(address)
-            && !matches!(address, IpAddr::V4(ip) if self.config.ipv4_subnets.iter().any(|&(network, prefix)| {
-                if prefix > 30 {
-                    return false;
-                }
-                let host_mask = u32::MAX >> prefix;
-                u32::from(ip) == (u32::from(network) | host_mask)
-            }))
+    fn valid_route(&self, source: IpAddr, destination: IpAddr, hop: IpAddr) -> bool {
+        valid_address(source)
+            && valid_address(destination)
+            && valid_address(hop)
+            && (self.address_policy)(AddressValidation::Route {
+                source,
+                destination,
+                hop,
+            })
     }
 
     fn clock(&mut self, now: Instant) -> Result<(), EndpointError> {
@@ -465,7 +489,10 @@ impl Endpoint {
             return Err(EndpointError::InvalidAddress);
         }
         if address.port() == 0
-            || (!address.ip().is_unspecified() && !self.valid_address(address.ip()))
+            || (!address.ip().is_unspecified() && !valid_address(address.ip()))
+            || !(self.address_policy)(AddressValidation::Bind {
+                local: address.ip(),
+            })
             || backlog == 0
             || backlog > self.config.max_connections
         {
@@ -537,20 +564,32 @@ impl Endpoint {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
+    //= reason=Base checks are unconditional; directed broadcasts and local ownership use the required policy bound to one ingress network context.
     //# A TCP implementation MUST reject as an error a local OPEN call for an
     //# invalid remote IP address (e.g., a broadcast or multicast address)
     //# (MUST-46).
 
-    // Directed-broadcast checks require the relevant subnet in ipv4_subnets.
+    // Scoped to the embedding policy's bound network; base invalid addresses cannot be allowed.
     fn admission(&self, tuple: Tuple) -> Result<(), EndpointError> {
         if !supported_socket(tuple.local)
             || !supported_socket(tuple.remote)
             || tuple.local.port() == 0
             || tuple.remote.port() == 0
-            || !self.valid_address(tuple.local.ip())
-            || !self.valid_address(tuple.remote.ip())
+            || !valid_address(tuple.local.ip())
+            || !valid_address(tuple.remote.ip())
             || tuple.local.is_ipv4() != tuple.remote.is_ipv4()
+            || !(self.address_policy)(AddressValidation::Open {
+                local: tuple.local.ip(),
+                remote: tuple.remote.ip(),
+            })
         {
+            return Err(EndpointError::InvalidAddress);
+        }
+        self.resource_admission(tuple)
+    }
+
+    fn resource_admission(&self, tuple: Tuple) -> Result<(), EndpointError> {
+        if tuple.local.port() == 0 || tuple.remote.port() == 0 {
             return Err(EndpointError::InvalidAddress);
         }
         if self.tuples.find(self.hash(tuple), tuple).is_some() {
@@ -652,17 +691,18 @@ impl Endpoint {
         if !self.config.ipv4_options_enabled {
             return Err(Ipv4OptionsError::SourceRouteDisabled.into());
         }
-        if options
-            .source_route
-            .is_some_and(|r| r.hops().iter().any(|&a| !self.valid_address(a.into())))
-        {
+        if options.source_route.is_some_and(|r| {
+            r.hops()
+                .iter()
+                .any(|&a| !self.valid_route(ip.source, ip.destination, a.into()))
+        }) {
             return Err(EndpointError::InvalidAddress);
         }
         if let Some(TimestampRequest::Prespecified { addresses, len }) = options.timestamp
             && (usize::from(len) > addresses.len()
                 || addresses[..usize::from(len)]
                     .iter()
-                    .any(|&a| !self.valid_address(a.into())))
+                    .any(|&a| !self.valid_route(ip.source, ip.destination, a.into())))
         {
             return Err(EndpointError::InvalidAddress);
         }
@@ -1020,29 +1060,40 @@ impl Endpoint {
         {
             return Ok(InputDisposition::Dropped);
         }
-        let route = match ip.source {
-            IpAddr::V4(source) => options.return_route(source),
-            _ => None,
-        };
-        if route.is_some_and(|r| r.hops().iter().any(|&a| !self.valid_address(a.into()))) {
-            return Ok(InputDisposition::Dropped);
-        }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
+        //= reason=Base checks are unconditional; directed broadcasts and local ownership use the required policy bound to one ingress network context.
         //# |  An incoming SYN with an invalid source address MUST be ignored
         //# |  either by TCP or by the IP layer [(MUST-63)] (see
         //# |  Section 3.2.1.3).
 
-        // Directed-broadcast checks cover configured subnets only.
+        // Scoped to the required ingress-context policy; no subnet is inferred.
         // Jumbo-link TCP is not supported by this endpoint profile.
         if bytes.len() > u16::MAX as usize
-            || !self.valid_address(ip.source)
+            || !valid_address(ip.source)
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
-            //#   A TCP implementation MUST silently discard an incoming SYN segment
+            //= reason=Base checks are unconditional; directed broadcasts and local ownership use the required policy bound to one ingress network context.
+            //# |
+            //# |  A TCP implementation MUST silently discard an incoming SYN segment
             //# |  that is addressed to a broadcast or multicast address [(MUST-57)].
 
-            // Directed-broadcast checks cover configured subnets only.
-            || !self.valid_address(ip.destination)
+            // Scoped to the required ingress-context policy; no subnet is inferred.
+            || !valid_address(ip.destination)
+            || ip.source.is_ipv4() != ip.destination.is_ipv4()
+            || !(self.address_policy)(AddressValidation::Incoming {
+                source: ip.source, destination: ip.destination,
+            })
         {
+            return Ok(InputDisposition::Dropped);
+        }
+        let route = match ip.source {
+            IpAddr::V4(source) => options.return_route(source),
+            _ => None,
+        };
+        if route.is_some_and(|r| {
+            r.hops()
+                .iter()
+                .any(|&a| !self.valid_route(ip.destination, ip.source, a.into()))
+        }) {
             return Ok(InputDisposition::Dropped);
         }
         let segment = match wire::parse(ip, bytes) {
@@ -1097,7 +1148,7 @@ impl Endpoint {
                 return Ok(InputDisposition::Dropped);
             }
             let record = self.listeners[listener.slot].as_ref().unwrap();
-            if record.children.len() >= record.backlog || self.admission(tuple).is_err() {
+            if record.children.len() >= record.backlog || self.resource_admission(tuple).is_err() {
                 return Ok(InputDisposition::Dropped);
             }
             let connection = match Connection::passive(

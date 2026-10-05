@@ -6,8 +6,8 @@
 #[cfg(target_os = "linux")]
 mod linux {
     use ntcp::{
-        ConnectionConfig, ConnectionId, Endpoint, EndpointConfig, EndpointError, Error, Event,
-        IpMetadata, Ipv4Options, State,
+        AddressValidation, ConnectionConfig, ConnectionId, Endpoint, EndpointConfig, EndpointError,
+        Error, Event, IpMetadata, Ipv4Options, State,
     };
     use std::{
         fs::{File, OpenOptions},
@@ -151,7 +151,7 @@ mod linux {
         //# |  either by TCP or by the IP layer [(MUST-63)] (see
         //# |  Section 3.2.1.3).
 
-        // Subnet-directed broadcasts are checked by Endpoint using interface_subnet.
+        // The required endpoint policy checks directed broadcasts in this TUN context.
         if destination != local || !unicast(source) || !unicast(destination) {
             return None;
         }
@@ -294,6 +294,38 @@ mod linux {
             ));
         }
         Ok((address, prefix))
+    }
+
+    fn tun_address_policy(
+        local: Ipv4Addr,
+        subnet: (Ipv4Addr, u8),
+    ) -> impl Fn(AddressValidation) -> bool {
+        // The subnet is queried from this TUN, not a union of unrelated interfaces.
+        // checked_interface_subnet validates the prefix and local/subnet relationship.
+        let (address, prefix) = subnet;
+        let valid = move |ip: IpAddr| match ip {
+            IpAddr::V4(ip) => {
+                unicast(ip)
+                    && (prefix > 30 || u32::from(ip) != (u32::from(address) | (u32::MAX >> prefix)))
+            }
+            IpAddr::V6(_) => false,
+        };
+        move |request| match request {
+            AddressValidation::Bind { local: bind } => bind == IpAddr::V4(local) && valid(bind),
+            AddressValidation::Open {
+                local: source,
+                remote: destination,
+            } => source == IpAddr::V4(local) && valid(source) && valid(destination),
+            AddressValidation::Route {
+                source,
+                destination,
+                hop,
+            } => source == IpAddr::V4(local) && valid(source) && valid(destination) && valid(hop),
+            AddressValidation::Incoming {
+                source,
+                destination,
+            } => destination == IpAddr::V4(local) && valid(source) && valid(destination),
+        }
     }
 
     fn interface_subnet(tun: &File, local: Ipv4Addr) -> io::Result<(Ipv4Addr, u8)> {
@@ -451,6 +483,7 @@ mod linux {
         let secret = acquire_secret()?;
         let mut tun = open_tun(&args[1])?;
         let start = Instant::now();
+        let address_policy = tun_address_policy(local, interface_subnet(&tun, local)?);
         let config = EndpointConfig {
             max_connections: MAX_FLOWS,
             max_listeners: 1,
@@ -462,7 +495,6 @@ mod linux {
             //# during the course of a connection (SHLD-23).
             dscp: 0,
             ipv4_options_enabled,
-            ipv4_subnets: vec![interface_subnet(&tun, local)?],
             error_reports: true,
             reuse_time_wait: false,
             connection: ConnectionConfig {
@@ -475,7 +507,8 @@ mod linux {
                 ..ConnectionConfig::default()
             },
         };
-        let mut endpoint = Endpoint::new(config, secret, now(start)).map_err(engine)?;
+        let mut endpoint =
+            Endpoint::new(config, secret, now(start), address_policy).map_err(engine)?;
         let listener = endpoint
             .listen(SocketAddr::new(local.into(), port), MAX_FLOWS)
             .map_err(engine)?;
@@ -694,6 +727,87 @@ mod linux {
             let _secret = acquire_secret().unwrap();
         }
 
+        fn test_policy(local: Ipv4Addr) -> impl Fn(AddressValidation) -> bool {
+            tun_address_policy(
+                local,
+                checked_interface_subnet(local, local, 0xffff_ff00).unwrap(),
+            )
+        }
+
+        #[test]
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
+        //= type=test
+        //= reason=The actual TUN policy rejects a checksummed broadcast-source SYN after IP parsing in an explicit /24 context; no kernel filtering is assumed.
+        //# |  An incoming SYN with an invalid source address MUST be ignored
+        //# |  either by TCP or by the IP layer [(MUST-63)] (see
+        //# |  Section 3.2.1.3).
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
+        //= type=test
+        //= reason=The adapter rejects the broadcast destination before TCP under its configured-local-address restriction.
+        //#   A TCP implementation MUST silently discard an incoming SYN segment
+        //# |  that is addressed to a broadcast or multicast address [(MUST-57)].
+        fn tun_policy_rejects_broadcast_syn_without_kernel_filtering() {
+            let local = Ipv4Addr::new(192, 0, 2, 2);
+            let broadcast = Ipv4Addr::new(192, 0, 2, 255);
+            let host = Ipv4Addr::new(192, 0, 2, 1);
+            let mut endpoint =
+                Endpoint::new(EndpointConfig::default(), [1; 32], 0, test_policy(local)).unwrap();
+            endpoint
+                .listen(SocketAddr::new(local.into(), 8080), 1)
+                .unwrap();
+            for (source, destination) in [(broadcast, local), (host, broadcast), (host, local)] {
+                let ip = IpMetadata {
+                    source: source.into(),
+                    destination: destination.into(),
+                };
+                let mut packet = [0; MTU];
+                let tcp_len = ntcp::wire::encode(
+                    ip,
+                    ntcp::wire::Header {
+                        source_port: 40000,
+                        destination_port: 8080,
+                        sequence: 1,
+                        acknowledgment: 0,
+                        flags: ntcp::wire::SYN,
+                        window: 1024,
+                        urgent_pointer: 0,
+                    },
+                    &[],
+                    &[],
+                    &mut packet[IP_HEADER..],
+                )
+                .unwrap();
+                let len = build_ipv4(&mut packet, ip, tcp_len, 64, 0, 0).unwrap();
+                let parsed = parse_ipv4_options(&packet[..len], local, false, 0);
+                if destination == broadcast {
+                    assert!(parsed.is_none());
+                } else {
+                    let (ip, tcp, options) = parsed.unwrap();
+                    assert!(ntcp::wire::parse(ip, tcp).is_ok());
+                    let result = endpoint
+                        .input_with_ipv4_options(0, ip, 0, options, tcp)
+                        .unwrap();
+                    assert_eq!(
+                        result,
+                        if source == broadcast {
+                            ntcp::InputDisposition::Dropped
+                        } else {
+                            ntcp::InputDisposition::Processed
+                        }
+                    );
+                }
+                let output = endpoint.poll_transmit(0, &mut [0; MTU], BUDGET).unwrap();
+                if source == broadcast || destination == broadcast {
+                    assert_eq!(endpoint.buffer_bytes(), 0);
+                    assert!(output.packet.is_none());
+                    assert!(!output.more_work);
+                } else {
+                    assert!(endpoint.buffer_bytes() > 0);
+                    assert!(output.packet.is_some());
+                }
+            }
+        }
+
         #[test]
         fn enabled_option_profile_header_mtu_and_timestamp_roundtrip() {
             use ntcp::{OutgoingIpv4Options, SourceRoute, TimestampRequest};
@@ -903,9 +1017,16 @@ mod linux {
             }
             let mut cfg = EndpointConfig::default();
             cfg.connection.nagle = false;
-            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0).unwrap();
+            let mut client = Endpoint::new(
+                cfg.clone(),
+                [1; 32],
+                0,
+                test_policy(Ipv4Addr::new(10, 0, 0, 1)),
+            )
+            .unwrap();
             cfg.dscp = 37;
-            let mut server = Endpoint::new(cfg, [2; 32], 0).unwrap();
+            let mut server =
+                Endpoint::new(cfg, [2; 32], 0, test_policy(Ipv4Addr::new(10, 0, 0, 2))).unwrap();
             let local = "10.0.0.1:1234".parse().unwrap();
             let remote = "10.0.0.2:8080".parse().unwrap();
             let listener = server.listen(remote, 1).unwrap();
