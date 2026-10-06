@@ -6,7 +6,7 @@
 +0 bind(3, ..., ...) = 0
 +0 listen(3, 1) = 0
 +0 < S 0:0(0) win 65535 <mss 1460,nop,wscale 0,nop,nop,sackOK>
-+0 > S. 0:0(0) ack 1 win 65535 <mss 1460,nop,wscale 0,nop,nop,sackOK>
++0 > S. 0:0(0) ack 1 win 65535 <mss 1460,nop,nop,sackOK,nop,wscale 0>
 +0 < . 1:1(0) ack 1 win 65535
 +0 accept(3, ..., ...) = 4
 +0 write(4, ..., 7300) = 7300

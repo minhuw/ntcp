@@ -301,12 +301,13 @@ class AdaptationChecks(unittest.TestCase):
             self.assertEqual(main(), 1)
         data = json.loads(report.read_text())
         self.assertEqual(data['suite'], 'adapted')
-        self.assertEqual(data['coverage'], {'selected_script_files': 3,
-                                          'upstream_script_files': 4,
+        count = len(self.manifest['scripts'])
+        self.assertEqual(data['coverage'], {'selected_script_files': count,
+                                          'upstream_script_files': count + 1,
                                           'selection': 'adaptation_allowlist'})
-        self.assertEqual(data['counts'], {'failed': 2, 'passed': 1, 'unsupported': 6})
+        self.assertEqual(data['counts'], {'failed': count - 1, 'passed': 1, 'unsupported': 2 * count})
         self.assertFalse(data['all_passed'])
-        self.assertEqual(len(calls), 6)
+        self.assertEqual(len(calls), 2 * count)
         for row in data['results']:
             self.assertEqual(row['suite'], 'adapted')
             self.assertEqual(row['effective_flags']['adapter'],
@@ -319,7 +320,7 @@ class AdaptationChecks(unittest.TestCase):
             self.assertIn(f'--so_filename={plugin}', invocation)
         for filters, expected_counts, expected_calls in (
             (['--variant', 'ipv4', '--script', self.name], {'passed': 1}, 2),
-            (['--variant', 'ipv4'], {'passed': 1, 'failed': 2}, 6),
+            (['--variant', 'ipv4'], {'passed': 1, 'failed': count - 1}, 2 * count),
             (['--variant', 'ipv6', '--script', self.name], {'unsupported': 1}, 0),
             (['--variant', 'ipv4', '--variant', 'ipv6', '--script', self.name],
              {'passed': 1, 'unsupported': 1}, 2),
@@ -336,10 +337,10 @@ class AdaptationChecks(unittest.TestCase):
             data = json.loads(report.read_text())
             self.assertEqual(data['counts'], expected_counts)
             self.assertEqual(data['all_passed'], expected_counts == {'passed': 1})
-            self.assertEqual(data['eligible_total'], 9)
-            self.assertEqual(data['eligible_script_files'], 3)
+            self.assertEqual(data['eligible_total'], 3 * count)
+            self.assertEqual(data['eligible_script_files'], count)
             self.assertEqual(data['selected_total'], sum(expected_counts.values()))
-            self.assertEqual(data['excluded_total'], 9 - data['selected_total'])
+            self.assertEqual(data['excluded_total'], 3 * count - data['selected_total'])
             self.assertEqual(len(calls), expected_calls)
             self.assertEqual(data['adaptation_manifest_sha256'],
                              hashlib.sha256((manifest_dir / 'adaptations.json').read_bytes()).hexdigest())
@@ -357,7 +358,7 @@ class AdaptationChecks(unittest.TestCase):
                      '--suite', 'adapted', '--report', str(report), '--so-flags', 'baseline']):
             self.assertEqual(main(), 1)
             execute.assert_not_called()
-        self.assertEqual(json.loads(report.read_text())['counts'], {'adaptation_rejected': 9})
+        self.assertEqual(json.loads(report.read_text())['counts'], {'adaptation_rejected': 3 * count})
 
 
 if __name__ == '__main__':

@@ -190,6 +190,7 @@ enum Profile {
     Baseline,
     UpstreamWindow8,
     Sack,
+    UpstreamSack,
 }
 fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
     let mut local = None;
@@ -208,6 +209,7 @@ fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
                 "baseline" => Profile::Baseline,
                 "upstream-window8" => Profile::UpstreamWindow8,
                 "sack" => Profile::Sack,
+                "upstream-sack" => Profile::UpstreamSack,
                 _ => return Err(unsupported("unknown so_flags token")),
             };
             if selected.replace(profile).is_some() {
@@ -300,11 +302,11 @@ impl Owner {
         config.connection.receive_capacity = match profile {
             Profile::Baseline | Profile::Sack => 65535,
             // Real receive storage: 8 MiB requires scale 8, not 7 (65535 << 7).
-            Profile::UpstreamWindow8 => 8 * 1024 * 1024,
+            Profile::UpstreamWindow8 | Profile::UpstreamSack => 8 * 1024 * 1024,
         };
         config.connection.mss = 1460;
-        config.connection.timestamps = false;
-        config.connection.sack = profile == Profile::Sack;
+        config.connection.timestamps = profile == Profile::UpstreamSack;
+        config.connection.sack = matches!(profile, Profile::Sack | Profile::UpstreamSack);
         config.connection.recovery_algorithm = ntcp::RecoveryAlgorithm::NewReno;
         config.connection.receive_ip_payload_limit = 65515;
         config.connection.send_ip_payload_limit = 65515;

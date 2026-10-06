@@ -336,8 +336,15 @@ fn profiles_require_one_selection_and_one_ipv4_address() {
         profile("sack,local=192.0.2.1").unwrap(),
         (local(), Profile::Sack)
     );
+    assert_eq!(
+        profile("upstream-sack,local=192.0.2.1").unwrap(),
+        (local(), Profile::UpstreamSack)
+    );
     for flags in [
         "",
+        "upstream-sack",
+        "upstream-sack,sack,local=192.0.2.1",
+        "upstream-sack,upstream-sack,local=192.0.2.1",
         "sack",
         "sack,sack,local=192.0.2.1",
         "baseline",
@@ -360,7 +367,11 @@ fn profiles_require_one_selection_and_one_ipv4_address() {
 
 #[test]
 fn profiles_emit_real_synack_scale_through_owner_thread() {
-    for (name, scale) in [("baseline", 0), ("upstream-window8", 8)] {
+    for (name, scale) in [
+        ("baseline", 0),
+        ("upstream-window8", 8),
+        ("upstream-sack", 8),
+    ] {
         let adapter = Adapter::start(profile(&format!("{name},local=192.0.2.1")).unwrap()).unwrap();
         let fd = call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap().value as i32;
         call(
@@ -415,8 +426,66 @@ fn sack_profile_negotiation_reaches_owner_thread() {
 }
 
 #[test]
+fn upstream_sack_profile_negotiates_combined_options_and_peer_fallback() {
+    for (sack, timestamps, options) in [
+        (
+            true,
+            true,
+            &[
+                2, 4, 5, 180, 4, 2, 8, 10, 0, 0, 0, 100, 0, 0, 0, 0, 1, 3, 3, 7,
+            ][..],
+        ),
+        (
+            false,
+            true,
+            &[
+                2, 4, 5, 180, 1, 1, 8, 10, 0, 0, 0, 100, 0, 0, 0, 0, 1, 3, 3, 7,
+            ][..],
+        ),
+        (true, false, &[2, 4, 5, 180, 1, 1, 4, 2, 1, 3, 3, 7][..]),
+        (false, false, &[2, 4, 5, 180, 1, 3, 3, 7][..]),
+    ] {
+        let adapter = Adapter::start((local(), Profile::UpstreamSack)).unwrap();
+        let fd = call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap().value as i32;
+        call(
+            &adapter,
+            2,
+            fd,
+            0,
+            encode_addr(SocketAddr::new(local().into(), 8080)),
+            0,
+        )
+        .unwrap();
+        call(&adapter, 3, fd, 1, vec![], 0).unwrap();
+        call(&adapter, 14, 0, 0, syn_with_options(100, 8080, options), 0).unwrap();
+        let response = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap();
+        let (ip, tcp) = parse_frame(&response.bytes).unwrap();
+        let segment = ntcp::wire::parse(ip, tcp).unwrap();
+        assert_eq!(segment.options.sack_permitted, sack);
+        assert_eq!(segment.options.window_scale, Some(8));
+        assert_eq!(segment.options.mss, Some(1460));
+        assert_eq!(segment.header.window, 65535);
+        assert_eq!(
+            segment.options.timestamps.map(|pair| pair.1),
+            timestamps.then_some(100)
+        );
+        let mut expected = options.to_vec();
+        *expected.last_mut().unwrap() = 8;
+        if let Some((value, _)) = segment.options.timestamps {
+            expected[8..12].copy_from_slice(&value.to_be_bytes());
+            expected[12..16].copy_from_slice(&100u32.to_be_bytes());
+        }
+        assert_eq!(segment.raw_options, expected);
+    }
+}
+
+#[test]
 fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
-    for (name, receive_capacity) in [("baseline", 65535), ("upstream-window8", 8 * 1024 * 1024)] {
+    for (name, receive_capacity) in [
+        ("baseline", 65535),
+        ("upstream-window8", 8 * 1024 * 1024),
+        ("upstream-sack", 8 * 1024 * 1024),
+    ] {
         let mut owner = Owner::new(profile(&format!("{name},local=192.0.2.1")).unwrap()).unwrap();
         // Core accounts for receive data/presence/urgent maps, send storage and MSS scratch.
         let per_connection = 3 * receive_capacity + 2 * 65536 + 1460;
