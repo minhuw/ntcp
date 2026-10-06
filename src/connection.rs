@@ -16,6 +16,14 @@ use crate::{
 // No wall/system clock is sampled. Resolution is declared and validated below.
 pub type Instant = u64;
 
+// Linux 22430ae5d90ab288b0ee2ad99ae941f4a666b694, include/net/tcp.h:
+// TCP_PAWS_WRAP = INT_MAX / USEC_PER_SEC; tcp_paws_check expires at >=2147s.
+// Peer units are unknown: support clocks <=1MHz, independent of local ticks.
+// 2147s exceeds the configured MSL maximum (255s) and precedes sign-bit wrap.
+// Linux compares floor-seconds (up to <1s earlier); we use exact elapsed us,
+// retaining the same conservative bound, not identical quantized deadlines.
+const PAWS_RECENT_EXPIRY_US: u64 = 2_147_000_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CallerTimebase {
     pub units_per_second: u64,
@@ -43,9 +51,9 @@ impl CallerTimebase {
 pub enum TimestampGranularity {
     #[default]
     Milliseconds,
-    // Opt-in fast clock requires a peer-aware idle policy or peer-received traffic
-    // refreshing TS.Recent before half-range (~35.8min); ordinary 24-day PAWS
-    // can reject data after 40min idle, even with continuously serviced local clocks.
+    // Explicit policy exception to RFC7323's chosen 1ms..1s range, like Linux
+    // tcp_usec_ts. External legacy 24-day PAWS peers may reject after ~35.8min
+    // idle; ntcp receivers expire independently at 2147s in either local mode.
     Microseconds,
 }
 
@@ -418,7 +426,7 @@ pub(crate) struct Connection {
     sack_data_turn: bool,
     ts_recent: u32,
     ts_latest: u32,
-    ts_recent_at: Instant,
+    ts_recent_at: Instant, // Last R3/handshake refresh; pending ACKs do not extend PAWS age.
     last_ack_sent: Seq,
     reset_echo: Option<u32>,
     last_timestamp_sent_at: Option<Instant>,
@@ -1382,9 +1390,9 @@ impl Connection {
         Ok(())
     }
 
-    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; fixed tick cadence and opt-in microsecond frequency are explicit policy exceptions, not literal conformance. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
-    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; fixed tick cadence and opt-in microsecond frequency are explicit policy exceptions, not literal conformance. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //# Values of this
     //# clock MUST be at least approximately proportional to real time, in
     //# order to measure actual RTT.
@@ -2523,9 +2531,9 @@ impl Connection {
         //# It is important to note that the timestamp MUST be checked only when
         //# a segment first arrives at the receiver, regardless of whether it is
         //# in sequence or it must be queued for later delivery.
-        // Scope: Stores ts_recent_at whenever TS.Recent changes, treating baseline invalid after 24 days; synthetic boundary+1 test accepts otherwise stale value.
+        // Scope: Stores ts_recent_at on eligible TS.Recent refresh, not pending ACKs; 2147s expiry boundary tests reject at -1us and accept at equality/+1us in both local modes.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.5
-        //= reason=Stores ts_recent_at whenever TS.Recent changes, treating baseline invalid after 24 days; synthetic boundary+1 test accepts otherwise stale value.
+        //= reason=Stores ts_recent_at on eligible TS.Recent refresh, not pending ACKs; 2147s expiry boundary tests reject at -1us and accept at equality/+1us in both local modes.
         //# To detect how long the connection has been idle, the TCP MAY update a
         //# clock or timestamp value associated with the connection whenever
         //# TS.Recent is updated, for example.
@@ -2534,9 +2542,9 @@ impl Connection {
         //= reason=R1 stale negotiated non-RST schedules immediate ACK and returns without accepting data; missing TS is silent per section 3.2.
         //# Send an acknowledgment in reply as specified in Section 3.9
         //# of [RFC0793], page 69, and drop the segment.
-        // Scope: Tracks last TS.Recent update time and bypasses stale comparison after 24 days, then replaces echo baseline on eligible arrival.
+        // Scope: Tracks last TS.Recent refresh and invalidates at 2147s, before the RFC 24-day maximum; peer clocks <=1MHz are supported independent of local ticks, with TCP validation and R3 refresh retained.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.5
-        //= reason=Tracks last TS.Recent update time and bypasses stale comparison after 24 days, then replaces echo baseline on eligible arrival.
+        //= reason=Tracks last TS.Recent refresh and invalidates at 2147s, before the RFC 24-day maximum; peer clocks <=1MHz are supported independent of local ticks, with TCP validation and R3 refresh retained.
         //# We therefore require that an implementation of PAWS include a
         //# mechanism to "invalidate" the TS.Recent value when a connection is
         //# idle for more than 24 days.
@@ -2562,14 +2570,14 @@ impl Connection {
         //# R5)  Otherwise, treat the segment as a normal in-window,
         //# out-of-sequence TCP segment (e.g., queue it for later delivery
         //# to the user).
-        // Scope: 24-day expired baseline does not reject older/half-space value; eligible in-sequence arrival replaces TS.Recent and receive frontier advances.
+        // Scope: 2147s expired baseline does not reject older/half-space value; sequence/ACK validation still gates R3 refresh and receive frontier advance.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.5
-        //= reason=24-day expired baseline does not reject older/half-space value; eligible in-sequence arrival replaces TS.Recent and receive frontier advances.
+        //= reason=2147s expired baseline does not reject older/half-space value; sequence/ACK validation still gates R3 refresh and receive frontier advance.
         //# If
         //# TS.Recent is found to be invalid, then the segment is accepted,
         //# regardless of the failure of the timestamp check, and rule R3 updates
         //# TS.Recent with the TSval from the new segment.
-        let recent_valid = now.saturating_sub(self.ts_recent_at) <= 24 * 86_400_000_000;
+        let recent_valid = now.saturating_sub(self.ts_recent_at) < PAWS_RECENT_EXPIRY_US;
         if self.timestamps && h.flags & RST == 0 {
             let Some((value, _)) = segment.options.timestamps else {
                 // Narrow SHOULD departure: SYN is never accepted; selected RFC5961
@@ -2828,59 +2836,6 @@ impl Connection {
             }
             return Ok(());
         }
-        if self.timestamps
-            && let Some((value, _)) = segment.options.timestamps
-            && (!recent_valid || after(Seq(value), Seq(self.ts_latest)))
-        {
-            self.ts_latest = value;
-        }
-        if self.timestamps
-            // Scope: Cross-reference to section 4.3: earliest delayed echo, OOO retained echo and hole-fill replacement use TS.Recent/Last.ACK.sent algorithm.
-            //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
-            //= reason=Cross-reference to section 4.3: earliest delayed echo, OOO retained echo and hole-fill replacement use TS.Recent/Last.ACK.sent algorithm.
-            //# The exact rules on which TSval MUST be echoed are given in
-            //# Section 4.3.
-            // Scope: TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
-            //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
-            //= reason=TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
-            //# Thus,
-            //# when delayed ACKs are in use, the receiver SHOULD reply with the
-            //# TSval field from the earliest unacknowledged segment.
-            // Scope: TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
-            //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
-            //= reason=TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
-            //# An <ACK> for an out-of-order segment
-            //# SHOULD, therefore, contain the timestamp from the most recent
-            //# segment that advanced RCV.NXT.
-            // Scope: TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
-            //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
-            //= reason=TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
-            //# Thus, the timestamp from the
-            //# latest segment (which filled the hole) MUST be echoed.
-            // Scope: Valid TS.Recent uses modular serial nondecrease; expiry explicitly invalidates old baseline after 24 days; same SYN initializes it.
-            //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
-            //= reason=Valid TS.Recent uses modular serial nondecrease; expiry explicitly invalidates old baseline after 24 days; same SYN initializes it.
-            //# The choice of incoming timestamps to be saved for this comparison
-            //# MUST guarantee a value that is monotonically non-decreasing.
-            // Scope: Synchronized valid baseline uses serial timestamp comparison and last ACK sequence gate; expired baseline handled by section5.5 exception to stale test.
-            //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
-            //= reason=Synchronized valid baseline uses serial timestamp comparison and last ACK sequence gate; expired baseline handled by section5.5 exception to stale test.
-            //# SEG.TSval >= TS.Recent and SEG.SEQ <= Last.ACK.sent
-            //#
-            //# then SEG.TSval is copied to TS.Recent; otherwise, it is ignored.
-            // Scope: Accepted synchronized non-RST traffic uses serial nondecrease and last successful ACK gate; expired baseline is separate section5.5 path.
-            //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
-            //= reason=Accepted synchronized non-RST traffic uses serial nondecrease and last successful ACK gate; expired baseline is separate section5.5 path.
-            //# R3)  If an arriving segment satisfies SEG.TSval >= TS.Recent and
-            //# SEG.SEQ <= Last.ACK.sent (see Section 4.3), then record its
-            //# timestamp in TS.Recent.
-            && at_or_after(self.last_ack_sent, seq)
-            && let Some((value, _)) = segment.options.timestamps
-            && (!recent_valid || at_or_after(Seq(value), Seq(self.ts_recent)))
-        {
-            self.ts_recent = value;
-            self.ts_recent_at = now;
-        }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
         //# if the ACK bit is off, drop the segment and return
         if h.flags & ACK == 0 {
@@ -2934,6 +2889,60 @@ impl Connection {
         if !at_or_after(self.snd_nxt, ack) || !at_or_after(ack, oldest_ack) {
             self.immediate_ack();
             return Ok(());
+        }
+        // TCP sequence and ACK validation must precede timestamp refresh.
+        if self.timestamps
+            && let Some((value, _)) = segment.options.timestamps
+            && (!recent_valid || after(Seq(value), Seq(self.ts_latest)))
+        {
+            self.ts_latest = value;
+        }
+        if self.timestamps
+            // Scope: Cross-reference to section 4.3: earliest delayed echo, OOO retained echo and hole-fill replacement use TS.Recent/Last.ACK.sent algorithm.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+            //= reason=Cross-reference to section 4.3: earliest delayed echo, OOO retained echo and hole-fill replacement use TS.Recent/Last.ACK.sent algorithm.
+            //# The exact rules on which TSval MUST be echoed are given in
+            //# Section 4.3.
+            // Scope: TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+            //= reason=TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+            //# Thus,
+            //# when delayed ACKs are in use, the receiver SHOULD reply with the
+            //# TSval field from the earliest unacknowledged segment.
+            // Scope: TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+            //= reason=TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+            //# An <ACK> for an out-of-order segment
+            //# SHOULD, therefore, contain the timestamp from the most recent
+            //# segment that advanced RCV.NXT.
+            // Scope: TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+            //= reason=TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+            //# Thus, the timestamp from the
+            //# latest segment (which filled the hole) MUST be echoed.
+            // Scope: Valid TS.Recent uses modular serial nondecrease; expiry explicitly invalidates old baseline at 2147s; same SYN initializes it.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+            //= reason=Valid TS.Recent uses modular serial nondecrease; expiry explicitly invalidates old baseline at 2147s; same SYN initializes it.
+            //# The choice of incoming timestamps to be saved for this comparison
+            //# MUST guarantee a value that is monotonically non-decreasing.
+            // Scope: Synchronized valid baseline uses serial timestamp comparison and last ACK sequence gate; expired baseline handled by section5.5 exception to stale test.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+            //= reason=Synchronized valid baseline uses serial timestamp comparison and last ACK sequence gate; expired baseline handled by section5.5 exception to stale test.
+            //# SEG.TSval >= TS.Recent and SEG.SEQ <= Last.ACK.sent
+            //#
+            //# then SEG.TSval is copied to TS.Recent; otherwise, it is ignored.
+            // Scope: Accepted synchronized non-RST traffic uses serial nondecrease and last successful ACK gate; expired baseline is separate section5.5 path.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+            //= reason=Accepted synchronized non-RST traffic uses serial nondecrease and last successful ACK gate; expired baseline is separate section5.5 path.
+            //# R3)  If an arriving segment satisfies SEG.TSval >= TS.Recent and
+            //# SEG.SEQ <= Last.ACK.sent (see Section 4.3), then record its
+            //# timestamp in TS.Recent.
+            && at_or_after(self.last_ack_sent, seq)
+            && let Some((value, _)) = segment.options.timestamps
+            && (!recent_valid || at_or_after(Seq(value), Seq(self.ts_recent)))
+        {
+            self.ts_recent = value;
+            self.ts_recent_at = now;
         }
         if self.handshake_pending() {
             if !after(ack, self.snd_una) {
@@ -4443,17 +4452,17 @@ impl Connection {
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
         //= reason=Successful TS-bearing sequence-space bytes (including retransmitted copies and SYN/FIN) are transactionally limited by configured nonzero timestamp_bytes_per_tick <2^31. Exhaustion returns TimestampBudgetExceeded with caller time and protocol state unchanged; next tick resets credit. Boundary/wrap/output rollback tests verify the gate. Physical clock truth remains separately external.
         //# It MUST tick at least once for each 2^31 bytes sent.
-        // Scope: Successful TS-bearing sequence-space bytes (including retransmitted copies and SYN/FIN) are transactionally limited by configured nonzero timestamp_bytes_per_tick <2^31. Exhaustion returns TimestampBudgetExceeded with caller time and protocol state unchanged; next tick resets credit. Boundary/wrap/output rollback tests verify the gate. Physical clock truth remains separately external.
+        // Scope: Approved fixed-tick SHOULD policy exception: default1ms and opt-in1us clocks preserve network-rate behavior without per-window pacing or synthetic ticks. A1byte/10us path can carry100000B/s instead of the1000B/s imposed by window/1ms pacing. Local Karn-safe RTT sampling preserves estimator cadence independently of TSecr. Separate <2^31-byte per-tick MUST credit remains enforced and tested; this exception does not waive it or physical clock evidence.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
-        //= reason=Successful TS-bearing sequence-space bytes (including retransmitted copies and SYN/FIN) are transactionally limited by configured nonzero timestamp_bytes_per_tick <2^31. Exhaustion returns TimestampBudgetExceeded with caller time and protocol state unchanged; next tick resets credit. Boundary/wrap/output rollback tests verify the gate. Physical clock truth remains separately external.
+        //= reason=Approved fixed-tick SHOULD policy exception: default1ms and opt-in1us clocks preserve network-rate behavior without per-window pacing or synthetic ticks. A1byte/10us path can carry100000B/s instead of the1000B/s imposed by window/1ms pacing. Local Karn-safe RTT sampling preserves estimator cadence independently of TSecr. Separate <2^31-byte per-tick MUST credit remains enforced and tested; this exception does not waive it or physical clock evidence.
         //# In fact,
         //# in order to be useful to the sender for round-trip timing, the
         //# clock SHOULD tick at least once per window's worth of data, and
         //# even with the window extension defined in Section 2.2, 2^31
         //# bytes must be at least two windows.
-        // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+        // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; fixed tick cadence and opt-in microsecond frequency are explicit policy exceptions, not literal conformance. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
-        //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+        //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; fixed tick cadence and opt-in microsecond frequency are explicit policy exceptions, not literal conformance. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
         //# The recycling time of the timestamp clock MUST be greater than
         //# MSL seconds.
         // Scope: Endpoint derives offset using HMAC-SHA256 secret, tuple and ISS nonce in the separate ntcp timestamp offset domain before first output; ISS is an input, never the offset. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset so peer PAWS sees no random jump; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, echo/RTT/wrap and reuse rollback tests cover the policy.
@@ -4480,9 +4489,9 @@ impl Connection {
         //= reason=Negotiated ordinary ACK output echoes single retained TS.Recent; reactive RST overrides follow section 5.2.
         //# (3)  When a TSopt is sent, its TSecr field is set to the current
         //# TS.Recent value.
-        // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+        // Scope: Approved timestamp frequency policy exception: default1ms is within the quoted chosen1ms..1s range; explicit opt-in1us is outside it, like Linux tcp_usec_ts at pinned22430ae5d90ab288b0ee2ad99ae941f4a666b694 include/net/tcp.h. No literal range compliance is claimed for microseconds. Declared resolution validation and independent2147s peer PAWS expiry remain; physical proportionality/drift/MSL obligations are separate TODOs.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
-        //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+        //= reason=Approved timestamp frequency policy exception: default1ms is within the quoted chosen1ms..1s range; explicit opt-in1us is outside it, like Linux tcp_usec_ts at pinned22430ae5d90ab288b0ee2ad99ae941f4a666b694 include/net/tcp.h. No literal range compliance is claimed for microseconds. Declared resolution validation and independent2147s peer PAWS expiry remain; physical proportionality/drift/MSL obligations are separate TODOs.
         //# Based upon these considerations, we choose a timestamp clock
         //# frequency in the range 1 ms to 1 sec per tick.
         let timestamp = if reset.is_some() && self.reset_echo.is_some() {
@@ -20497,10 +20506,10 @@ mod tests {
     //= reason=TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
     //# Thus, the timestamp from the
     //# latest segment (which filled the hole) MUST be echoed.
-    // Scope: Valid TS.Recent uses modular serial nondecrease; expiry explicitly invalidates old baseline after 24 days; same SYN initializes it.
+    // Scope: Valid TS.Recent uses modular serial nondecrease; expiry explicitly invalidates old baseline at 2147s; same SYN initializes it.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
     //= type=test
-    //= reason=Valid TS.Recent uses modular serial nondecrease; expiry explicitly invalidates old baseline after 24 days; same SYN initializes it.
+    //= reason=Valid TS.Recent uses modular serial nondecrease; expiry explicitly invalidates old baseline at 2147s; same SYN initializes it.
     //# The choice of incoming timestamps to be saved for this comparison
     //# MUST guarantee a value that is monotonically non-decreasing.
     // Scope: RST bypasses PAWS and terminates/challenges before TS.Recent/ts_latest updates; no timestamp or stale timestamp cannot veto sequence-valid RST.
@@ -20531,10 +20540,10 @@ mod tests {
     //# It is important to note that the timestamp MUST be checked only when
     //# a segment first arrives at the receiver, regardless of whether it is
     //# in sequence or it must be queued for later delivery.
-    // Scope: Stores ts_recent_at whenever TS.Recent changes, treating baseline invalid after 24 days; synthetic boundary+1 test accepts otherwise stale value.
+    // Scope: Stores ts_recent_at on eligible TS.Recent refresh, not pending ACKs; 2147s expiry boundary tests reject at -1us and accept at equality/+1us in both local modes.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.5
     //= type=test
-    //= reason=Stores ts_recent_at whenever TS.Recent changes, treating baseline invalid after 24 days; synthetic boundary+1 test accepts otherwise stale value.
+    //= reason=Stores ts_recent_at on eligible TS.Recent refresh, not pending ACKs; 2147s expiry boundary tests reject at -1us and accept at equality/+1us in both local modes.
     //# To detect how long the connection has been idle, the TCP MAY update a
     //# clock or timestamp value associated with the connection whenever
     //# TS.Recent is updated, for example.
@@ -20550,10 +20559,10 @@ mod tests {
     //= reason=R1 stale negotiated non-RST schedules immediate ACK and returns without accepting data; missing TS is silent per section 3.2.
     //# Send an acknowledgment in reply as specified in Section 3.9
     //# of [RFC0793], page 69, and drop the segment.
-    // Scope: Tracks last TS.Recent update time and bypasses stale comparison after 24 days, then replaces echo baseline on eligible arrival.
+    // Scope: Tracks last TS.Recent refresh and invalidates at 2147s, before the RFC 24-day maximum; peer clocks <=1MHz are supported independent of local ticks, with TCP validation and R3 refresh retained.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.5
     //= type=test
-    //= reason=Tracks last TS.Recent update time and bypasses stale comparison after 24 days, then replaces echo baseline on eligible arrival.
+    //= reason=Tracks last TS.Recent refresh and invalidates at 2147s, before the RFC 24-day maximum; peer clocks <=1MHz are supported independent of local ticks, with TCP validation and R3 refresh retained.
     //# We therefore require that an implementation of PAWS include a
     //# mechanism to "invalidate" the TS.Recent value when a connection is
     //# idle for more than 24 days.
@@ -20605,10 +20614,10 @@ mod tests {
     //# R5)  Otherwise, treat the segment as a normal in-window,
     //# out-of-sequence TCP segment (e.g., queue it for later delivery
     //# to the user).
-    // Scope: 24-day expired baseline does not reject older/half-space value; eligible in-sequence arrival replaces TS.Recent and receive frontier advances.
+    // Scope: 2147s expired baseline does not reject older/half-space value; sequence/ACK validation still gates R3 refresh and receive frontier advance.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.5
     //= type=test
-    //= reason=24-day expired baseline does not reject older/half-space value; eligible in-sequence arrival replaces TS.Recent and receive frontier advances.
+    //= reason=2147s expired baseline does not reject older/half-space value; sequence/ACK validation still gates R3 refresh and receive frontier advance.
     //# If
     //# TS.Recent is found to be invalid, then the segment is accepted,
     //# regardless of the failure of the timestamp check, and rule R3 updates
@@ -20682,11 +20691,11 @@ mod tests {
             assert_eq!(a.ts_recent, 3); // Filling the hole replaces the echo.
             assert_eq!(a.receive.next(), next.wrapping_add(4));
             packet(&mut a, 6_000);
-            // Beyond the microsecond local half-range, but far short of the
-            // independent physical 24-day peer PAWS expiry: stale peer TS drops.
+            // Fresh baseline still rejects the oldest stale peer timestamp;
+            // receiver expiry is independent of local timestamp granularity.
             timestamp_input(
                 &mut a,
-                6_000 + 3_000_000_000,
+                6_000 + PAWS_RECENT_EXPIRY_US - 1,
                 next.wrapping_add(4),
                 ack,
                 ACK,
@@ -20695,7 +20704,7 @@ mod tests {
             );
             assert_eq!(a.receive.next(), next.wrapping_add(4));
             assert_eq!(a.ts_recent, 3);
-            let idle = 6_000 + 24 * 86_400_000_000 + 1;
+            let idle = 6_000 + PAWS_RECENT_EXPIRY_US;
             timestamp_input(
                 &mut a,
                 idle,
@@ -20812,17 +20821,17 @@ mod tests {
     //# <SYN,ACK> contain TSopt, the TSopt MUST be sent in every non-<RST>
     //# segment for the duration of the connection, and SHOULD be sent in an
     //# <RST> segment (see Section 5.2 for details).
-    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; fixed tick cadence and opt-in microsecond frequency are explicit policy exceptions, not literal conformance. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
     //= type=test
-    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; fixed tick cadence and opt-in microsecond frequency are explicit policy exceptions, not literal conformance. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //# Values of this
     //# clock MUST be at least approximately proportional to real time, in
     //# order to measure actual RTT.
-    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; fixed tick cadence and opt-in microsecond frequency are explicit policy exceptions, not literal conformance. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
     //= type=test
-    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; fixed tick cadence and opt-in microsecond frequency are explicit policy exceptions, not literal conformance. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //# The recycling time of the timestamp clock MUST be greater than
     //# MSL seconds.
     // Scope: Wire TS fields u32 network-order; TSval uses selected local ticks (default milliseconds) modulo 32 bits. Physical rate guarantees separately TODO.
@@ -20832,10 +20841,10 @@ mod tests {
     //# The Timestamps option carries two four-byte timestamp fields.  The
     //# TSval field contains the current value of the timestamp clock of the
     //# TCP sending the option.
-    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    // Scope: Approved timestamp frequency policy exception: default1ms is within the quoted chosen1ms..1s range; explicit opt-in1us is outside it, like Linux tcp_usec_ts at pinned22430ae5d90ab288b0ee2ad99ae941f4a666b694 include/net/tcp.h. No literal range compliance is claimed for microseconds. Declared resolution validation and independent2147s peer PAWS expiry remain; physical proportionality/drift/MSL obligations are separate TODOs.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
     //= type=test
-    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    //= reason=Approved timestamp frequency policy exception: default1ms is within the quoted chosen1ms..1s range; explicit opt-in1us is outside it, like Linux tcp_usec_ts at pinned22430ae5d90ab288b0ee2ad99ae941f4a666b694 include/net/tcp.h. No literal range compliance is claimed for microseconds. Declared resolution validation and independent2147s peer PAWS expiry remain; physical proportionality/drift/MSL obligations are separate TODOs.
     //# Based upon these considerations, we choose a timestamp clock
     //# frequency in the range 1 ms to 1 sec per tick.
     fn timestamps_ip_budget_data_fin_keepalive_and_clock_wrap() {
@@ -21207,6 +21216,11 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
+    //= type=test
+    //= reason=Approved frequency exception: default milliseconds lies in the chosen1ms..1s range, explicit microseconds lies outside it. Both local/peer modes, secret-offset wrap, mixed echoes and resolution validation are asserted, not universal literal range compliance or physical clock evidence.
+    //# Based upon these considerations, we choose a timestamp clock
+    //# frequency in the range 1 ms to 1 sec per tick.
     fn timestamp_units_mixed_peer_echo_wrap_and_resolution() {
         use crate::{Endpoint, EndpointConfig};
         assert_eq!(
@@ -21664,7 +21678,149 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_mixed_units_idle_half_range_is_known_paws_limitation() {
+    fn timestamp_paws_expiry_boundary_preserves_tcp_validation_and_refresh() {
+        for granularity in [
+            TimestampGranularity::Milliseconds,
+            TimestampGranularity::Microseconds,
+        ] {
+            for offset in [0, u32::MAX] {
+                for recent in [3u32, u32::MAX - 2] {
+                    for age in [
+                        PAWS_RECENT_EXPIRY_US - 1,
+                        PAWS_RECENT_EXPIRY_US,
+                        PAWS_RECENT_EXPIRY_US + 1,
+                    ] {
+                        let cfg = ConnectionConfig {
+                            timestamps: true,
+                            timestamp_granularity: granularity,
+                            ..config(256, 64)
+                        };
+                        let (mut a, _) = pair(cfg, u32::MAX - 2);
+                        a.set_timestamp_offset(offset);
+                        a.ts_recent = recent;
+                        a.ts_latest = recent;
+                        // Use a non-second-aligned refresh to test elapsed microseconds,
+                        // not Linux's floor-second comparison or connection creation time.
+                        a.ts_recent_at = 123_456;
+                        let now = a.ts_recent_at + age;
+                        let next = a.receive.next();
+                        let ack = a.snd_nxt;
+                        let stale = recent.wrapping_sub(4);
+                        let before = (a.ts_recent, a.ts_recent_at, a.ts_latest);
+                        timestamp_input(
+                            &mut a,
+                            now,
+                            next.wrapping_add(10_000),
+                            ack,
+                            ACK,
+                            Some((stale, 0)),
+                            b"x",
+                        );
+                        assert_eq!(a.receive.next(), next);
+                        assert_eq!((a.ts_recent, a.ts_recent_at, a.ts_latest), before);
+                        for invalid_ack in [
+                            ack.wrapping_add(1),
+                            a.snd_una
+                                .wrapping_add(0u32.wrapping_sub(a.max_snd_wnd))
+                                .wrapping_add(u32::MAX),
+                        ] {
+                            timestamp_input(
+                                &mut a,
+                                now,
+                                next,
+                                invalid_ack,
+                                ACK,
+                                Some((stale, 0)),
+                                b"x",
+                            );
+                            assert_eq!(a.receive.next(), next);
+                            assert_eq!((a.ts_recent, a.ts_recent_at, a.ts_latest), before);
+                        }
+                        // Missing TS still drops after expiry; pending ACK transmission
+                        // must not extend ts_recent_at or turn an expired baseline fresh.
+                        timestamp_input(&mut a, now, next, ack, ACK, None, b"x");
+                        assert_eq!(a.receive.next(), next);
+                        a.immediate_ack();
+                        let bytes = packet(&mut a, now);
+                        let ts = wire::parse(ip(tuple()), &bytes)
+                            .unwrap()
+                            .options
+                            .timestamps
+                            .unwrap();
+                        assert_eq!(ts, (a.timestamp_value(now), recent));
+                        assert_eq!((a.ts_recent, a.ts_recent_at, a.ts_latest), before);
+                        timestamp_input(&mut a, now, next, ack, ACK, Some((stale, 0)), b"x");
+                        if age < PAWS_RECENT_EXPIRY_US {
+                            assert_eq!(a.receive.next(), next);
+                            assert_eq!((a.ts_recent, a.ts_recent_at, a.ts_latest), before);
+                        } else {
+                            assert_eq!(a.receive.next(), next.wrapping_add(1));
+                            assert_eq!(
+                                (a.ts_recent, a.ts_recent_at, a.ts_latest),
+                                (stale, now, stale)
+                            );
+                            // Expiry only discards the old baseline; the refreshed one
+                            // must reject subsequent stale arrivals immediately.
+                            timestamp_input(
+                                &mut a,
+                                now + 1,
+                                next.wrapping_add(1),
+                                ack,
+                                ACK,
+                                Some((stale.wrapping_sub(1), 0)),
+                                b"y",
+                            );
+                            assert_eq!(a.receive.next(), next.wrapping_add(1));
+                            assert_eq!(
+                                (a.ts_recent, a.ts_recent_at, a.ts_latest),
+                                (stale, now, stale)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
+    //= type=test
+    //= reason=Approved fixed-tick SHOULD exception preserves network-rate small-window output: two one-byte windows in one default1ms tick with local Karn-safe RTT updates. Separate per-2^31-byte MUST credit remains enforced; no pacing or synthetic ticks.
+    //# In fact,
+    //# in order to be useful to the sender for round-trip timing, the
+    //# clock SHOULD tick at least once per window's worth of data, and
+    //# even with the window extension defined in Section 2.2, 2^31
+    //# bytes must be at least two windows.
+    fn timestamp_fixed_tick_preserves_small_window_network_rate_and_local_rtt() {
+        let cfg = ConnectionConfig {
+            timestamps: true,
+            nagle: false,
+            receive_capacity: 1,
+            ..config(256, 64)
+        };
+        let (mut a, mut b) = pair(cfg, 100);
+        let mut expected_rtt = a.rtt.clone();
+        let mut values = Vec::new();
+        for now in [100, 110] {
+            assert_eq!(a.snd_wnd, 1);
+            a.write(b"x").unwrap();
+            let bytes = deliver(&mut a, &mut b, now);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.payload, b"x");
+            values.push(segment.options.timestamps.unwrap().0);
+            assert_eq!(b.read(&mut [0; 1]).unwrap(), 1);
+            b.immediate_ack();
+            deliver(&mut b, &mut a, now + 10);
+            assert_eq!(a.send.len(), 0);
+            expected_rtt.sample(10);
+            assert_eq!(a.rtt.updates, expected_rtt.updates);
+            assert_eq!(a.rtt.srtt(), expected_rtt.srtt());
+        }
+        assert_eq!(values[0], values[1]);
+    }
+
+    #[test]
+    fn timestamp_mixed_units_idle_half_range_resumes_after_paws_expiry() {
         let minute = 60_000_000;
         assert_timestamp_interop_on_serviced_clocks(
             TimestampGranularity::Microseconds,
@@ -21672,13 +21828,13 @@ mod tests {
             1,
             true,
         );
-        // 2.4e9 microsecond ticks compare stale against the peer's still-valid
-        // TS.Recent. Servicing clocks does not fix ordinary 24-day PAWS.
+        // 2.4e9 microsecond ticks compare stale, but the ntcp receiver baseline
+        // has expired independently of its own millisecond timestamp mode.
         assert_timestamp_interop_on_serviced_clocks(
             TimestampGranularity::Microseconds,
             40 * minute,
             1,
-            false,
+            true,
         );
         assert_timestamp_interop_on_serviced_clocks(
             ConnectionConfig::default().timestamp_granularity,
@@ -21702,8 +21858,8 @@ mod tests {
     }
 
     #[test]
-    // At 26 days the peer's PAWS baseline has expired; this is not evidence
-    // that microsecond timestamps resume safely after an ordinary 40min idle.
+    // Long idle expires peer PAWS and local RTT history; separate 40min
+    // coverage verifies mixed-unit expiry without bypassing endpoint servicing.
     fn timestamp_long_idle_connections_resume_on_serviced_endpoint_clock() {
         for granularity in [
             TimestampGranularity::Milliseconds,

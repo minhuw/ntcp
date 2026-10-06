@@ -250,3 +250,22 @@ quote = '''
 Mechanisms to protect the TCP header from modification should also
 protect the TCP options.
 '''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.4"
+reason = "Approved fixed-tick SHOULD policy exception: default1ms and opt-in1us clocks preserve network-rate behavior without per-window pacing or synthetic ticks. A1byte/10us path can carry100000B/s instead of the1000B/s imposed by window/1ms pacing. Local Karn-safe RTT sampling preserves estimator cadence independently of TSecr. Separate <2^31-byte per-tick MUST credit remains enforced and tested; this exception does not waive it or physical clock evidence."
+quote = '''
+In fact,
+in order to be useful to the sender for round-trip timing, the
+clock SHOULD tick at least once per window's worth of data, and
+even with the window extension defined in Section 2.2, 2^31
+bytes must be at least two windows.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.4"
+reason = "Approved timestamp frequency policy exception: default1ms is within the quoted chosen1ms..1s range; explicit opt-in1us is outside it, like Linux tcp_usec_ts at pinned22430ae5d90ab288b0ee2ad99ae941f4a666b694 include/net/tcp.h. No literal range compliance is claimed for microseconds. Declared resolution validation and independent2147s peer PAWS expiry remain; physical proportionality/drift/MSL obligations are separate TODOs."
+quote = '''
+Based upon these considerations, we choose a timestamp clock
+frequency in the range 1 ms to 1 sec per tick.
+'''
