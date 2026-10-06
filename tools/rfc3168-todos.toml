@@ -1,127 +1,17 @@
 # Open behavior/evidence gaps; partial annotations are not waivers.
 
-# 3168-G031 | TCP sender/congestion controller | accepted ECE ACK
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2"
-reason = "Partial evidence: on_ack_with_ecn suppresses growth for advancing ECE ACKs, including recovery exit. Accepted duplicate ECE ACKs instead reach on_duplicate_ack, which adds MSS during recovery. Add an integrated duplicate-ECE recovery test and suppress that growth or record a justified SHOULD departure; advancing-ACK helper assertions do not close the duplicate path."
-quote = '''
-The sending
-TCP SHOULD NOT increase the congestion window in response to the
-receipt of an ECN-Echo ACK packet.
-'''
-
-# 3168-G004 | TCP sender and IP adapter | all ECT outputs
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.2"
-reason = "Fresh-data predicate and Not-ECT ACK/retransmit/persist assertions are partial evidence. No complete assertion inventory covers every special ECT output path (including TLP original versus retransmission), nor end-to-end loss interpretation for every ECT-marked output. Retain universal reliability-of-congestion-indication requirement open; router marking is not claimed."
-quote = '''
-To ensure the reliable delivery of the congestion indication
-of the CE codepoint, an ECT codepoint MUST NOT be set in a packet
-unless the loss of that packet in the network would be detected by
-the end nodes and interpreted as an indication of congestion.
-'''
-
-# 3168-G006 | IP sender/adapter | optional DF policy
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.3"
-reason = "Example build_ipv4 sets DF, but no inspected assertion specifically proves DF for an ECN packet. Add assertion-bearing DF output evidence; do not infer testing from an unrelated ECN byte roundtrip."
-quote = '''
-ECN-capable packets MAY have the DF (Don't Fragment) bit set.
-'''
-
-# 3168-G025 | TCP sender | ever transmitted ECT within this connection
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1"
-reason = "First fresh CWR and retransmit/probe no-CWR assertions provide partial evidence, but universal all-subsequent-packets/loss-reduction paths lack complete existing assertions (e.g. every TLP/recovery mode). Keep mandatory CWR consistency open rather than waive untested branches."
-quote = '''
-* If a host ever sets the ECT codepoint on a data packet, then
-that host MUST correctly set/clear the CWR TCP bit on all
-subsequent packets in the connection.
-'''
-
-# 3168-G026 | TCP receiver | sent setup and received no plain setup; ECN data received
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1"
-reason = "Existing data/feedback and fallback promise assertions are partial evidence. CE-marked zero-window probe is currently excluded by window != 0; clause depends on all applicable ECN receive processing, so retain mandatory negotiated-connection processing open alongside section 6.1.6 TODO."
-quote = '''
-* If a host has sent at least one ECN-setup SYN or ECN-setup SYN-
-ACK packet, and has received no non-ECN-setup SYN or non-ECN-
-setup SYN-ACK packet, then if that host receives TCP data
-packets with ECT and CE codepoints set in the IP header, then
-that host MUST process these packets as specified for an ECN-
-capable connection.
-'''
-
-# 3168-G039 | TCP receiver | CE-marked zero-window probe
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.6"
-reason = "Receive ECN processing explicitly requires window != 0; CE-marked exact-sequence zero-window probe is therefore ACKed without latching ECE. No existing assertion proves probe CE feedback. Implement/test the section 6.1.6 SHOULD response without setting sender probe ECT/CWR."
-quote = '''
-Therefore, if
-a window probe arrives with the CE codepoint set, then the receiver
-SHOULD respond to the ECN indications.
-'''
-
 # 3168-A021 | IP adapter | IPv4 and IPv6 traffic class encoding
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc3168#section-5"
-reason = "IPv4 adapter ECN/DSCP/checksum roundtrip is asserted. The example adapter has no IPv6 packet path; core metadata permits IPv6 but no current assertion proves IPv6 traffic class ECN plumbing. Mandatory adapter evidence remains open."
+reason = "IPv4 adapter ECN/DSCP/checksum/DF matrix is asserted. The example has no IPv6 packet encoder/parser: core IpMetadata support alone cannot prove IPv6 Traffic Class plumbing. Full IPv6 adapter implementation and end-to-end evidence are outside this bounded TCP ECN fix; mandatory obligation remains open, not waived."
 quote = '''
 Bits 6 and 7 in the IPv4 TOS octet are designated as the ECN field. The IPv4 TOS octet corresponds to the Traffic Class octet in IPv6, and the ECN field is defined identically in both cases.
-'''
-
-# 3168-A025 | TCP endpoint | terminal state/reused tuple
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1"
-reason = "Fresh Connection construction clears ECN state, but no existing assertion specifically verifies old ECN negotiation ignored across TIME-WAIT/CLOSED tuple reuse. Add lifecycle assertions; do not infer from timestamps-only reuse tests."
-quote = '''
-When a TCP host enters TIME-WAIT or CLOSED state, it should ignore any previous state about the negotiation of ECN for that connection.
-'''
-
-# 3168-A026 | TCP endpoint | ECT packet without bilateral setup
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1.1"
-reason = "learn_ecn observes setup flags, not incoming IP ECT. No existing assertion explicitly injects ECT on a non-negotiated connection and proves no implicit ECN enablement. Add a negative assertion."
-quote = '''
-a host is forbidden from using the reception of ECT data packets as an implicit signal that the other host is ECN- capable.
-'''
-
-# 3168-A029 | TCP endpoint | any reduction cause including timeout, fast retransmit and ECN
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2"
-reason = "Endpoint loss/CWR and idle-reduction tests are partial evidence. Every recovery mode/TLP output cause has not been asserted for first-fresh CWR. Keep universal reduction-cause obligation open."
-quote = '''
-When an ECN-Capable TCP sender reduces its congestion window for any reason (because of a retransmit timeout, a Fast Retransmit, or in response to an ECN Notification), the TCP sender sets the CWR flag in the TCP header of the first new data packet sent after the window reduction.
-'''
-
-# 3168-A030 | TCP endpoint | CE data including delayed-ACK aggregation
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.3"
-reason = "Immediate CE feedback and repeated ECE assertions exist, but no inspected assertion covers CE on either of a two-packet delayed-ACK aggregate. Add explicit aggregate assertion; keep this unextracted receiver instruction visible."
-quote = '''
-When TCP receives a CE data packet at the destination end-system, the TCP data receiver sets the ECN-Echo flag in the TCP header of the subsequent ACK packet. If there is any ACK withholding implemented, as in current "delayed-ACK" TCP implementations where the TCP receiver can send an ACK for two arriving data packets, then the ECN-Echo flag in the ACK packet will be set to '1' if the CE codepoint is set in any of the data packets being acknowledged. That is, if any of the received data packets are CE packets, then the returning ACK has the ECN-Echo flag set.
-'''
-
-# 3168-A032 | TCP endpoint | ACKs without ECE
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2"
-reason = "Normal ACK growth is implemented in Congestion::on_ack_with_ecn, but no focused inspected assertion contrasts non-ECE growth with otherwise identical ECE ACK at the connection boundary. Add targeted evidence; ECN feedback tests alone do not prove this clause."
-quote = '''
-TCP also follows the normal procedures for increasing the congestion window when it receives ACK packets without the ECN-Echo bit set [RFC2581].
-'''
-
-# 3168-A038 | TCP endpoint | loss of corrupted CE data
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.2"
-reason = "Endpoint test drops corrupted CE data and checks no feedback, but does not trace resulting sender RTO/reduction for that specific corrupted packet. Add actual loss-to-congestion assertion; no corruption-versus-congestion reinterpretation is waived."
-quote = '''
-Similarly, if a CE packet is dropped later in the network due to corruption (bit errors), the end nodes should still invoke congestion control, just as TCP would today in response to a dropped data packet.
 '''
 
 # 3168-A039 | TCP endpoint | packet not sent as ECN-capable
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1"
-reason = "Sender Not-ECT policy is asserted, but receiver cannot infer an overwritten original Not-ECT from CE alone. Clarify applicable receiver connection/probe handling and add a non-negotiated CE assertion; rejected errata 3636/3680 do not remove the original prose obligation."
+reason = "ECN-off CE/ECT receive tests now prove no implicit enablement or echo; negotiated exact-sequence probes explicitly honor section 6.1.6. Sender Not-ECT outputs are asserted. A receiver cannot recover an overwritten original Not-ECT from CE alone, so universal per-packet ignore applicability is not proven. Rejected errata 3636/3680 do not waive the original text; retain this unresolved interpretation/evidence obligation."
 quote = '''
 If the TCP connection does not wish to use ECN notification for a particular packet, the sending TCP sets the ECN codepoint to not-ECT, and the TCP receiver ignores the CE codepoint in the received packet.
 '''
@@ -129,7 +19,7 @@ If the TCP connection does not wish to use ECN notification for a particular pac
 # 3168-A043 | TCP endpoint | normal ACK/duplicate ACK/timeout output
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2"
-reason = "Ordinary congestion/recovery implementation exists, but this bounded audit has not established all referenced RFC2581 algorithm obligations across all selectable modes. Preserve as explicit integration TODO rather than infer full compliance from ECN tests."
+reason = "Integrated ECN traces preserve retransmission, Limited Transmit and non-ECE Reno/NewReno behavior; SACK/RACK/PRR/TLP tests exercise selectable paths. Full inherited RFC2581/5681 algorithm compliance is a separate umbrella audit, including its still-open congestion TODOs. Outside this bounded ECN fix; no inferred compliance or waiver."
 quote = '''
 TCP follows existing algorithms for sending data packets in response to incoming ACKs, multiple duplicate acknowledgments, or retransmit timeouts [RFC2581].
 '''

@@ -492,6 +492,9 @@ impl Congestion {
     //# increasing the congestion window based on the number of bytes newly acknowledged in each
     //# arriving ACK rather than by a particular constant on each arriving ACK (as outlined in
     //# section 3.1).
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= reason=Connection-boundary otherwise-identical ACK traces contrast ordinary MSS growth with advancing ECE suppression and non-ECE duplicate recovery inflation, for Reno/NewReno and ECN on/off.
+    //# TCP also follows the normal procedures for increasing the congestion window when it receives ACK packets without the ECN-Echo bit set [RFC2581].
     pub(crate) fn on_ack_with_ecn(
         &mut self,
         ack: Seq,
@@ -791,19 +794,26 @@ impl Congestion {
     //# The TCP sender SHOULD use the "fast retransmit" algorithm to detect and repair loss,
     //# based on incoming duplicate ACKs.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
-    //= reason=Non-SACK Reno/NewReno fast entry: helper asserts cwnd=ssthresh+3SMSS (7000=4000+3000); wire test asserts SND.UNA retransmission. Negotiated SACK/RACK/PRR instead follow section4.3 modified recovery and do not use Reno inflation.
+    //= reason=Non-ECE non-SACK Reno/NewReno fast entry: helper asserts cwnd=ssthresh+3SMSS (7000=4000+3000); wire test asserts SND.UNA retransmission. Negotiated SACK/RACK/PRR instead follow section4.3 modified recovery and do not use Reno inflation.
     //# The lost segment starting at SND.UNA MUST be retransmitted and cwnd set to ssthresh plus
     //# 3*SMSS.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
-    //= reason=Non-SACK fast recovery only: helper fourth DupACK raises 7000 to 8000 at MSS1000. Negotiated SACK/RACK/PRR do not artificially inflate cwnd; see section4.3 obligations.
+    //= reason=Non-ECE non-SACK fast recovery only: helper fourth DupACK raises 7000 to 8000 at MSS1000; accepted ECE instead follows RFC3168 no-growth policy. Negotiated SACK/RACK/PRR do not artificially inflate cwnd; see section4.3 obligations.
     //# For each additional duplicate ACK received (after the third), cwnd MUST be incremented
     //# by SMSS.
-    pub(crate) fn on_duplicate_ack(&mut self, flight: u32, highest_sent: Seq) -> bool {
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= reason=Accepted negotiated ECE is propagated to shared duplicate-ACK recovery; connection Reno/NewReno traces assert no growth on third-entry or later ECE duplicates, preserved retransmission, and advancing/non-ECE contrasts. Recovery entry caps inflation and later ECE duplicates omit MSS growth.
+    //# The sending
+    //# TCP SHOULD NOT increase the congestion window in response to the
+    //# receipt of an ECN-Echo ACK packet.
+    pub(crate) fn on_duplicate_ack(&mut self, flight: u32, highest_sent: Seq, ece: bool) -> bool {
         if self.sack_recovery {
             return false;
         }
         if self.fast_recovery {
-            self.cwnd = self.cwnd.saturating_add(self.mss).min(MAX_WINDOW);
+            if !ece {
+                self.cwnd = self.cwnd.saturating_add(self.mss).min(MAX_WINDOW);
+            }
             return false;
         }
         self.duplicate_acks = self.duplicate_acks.saturating_add(1);
@@ -813,10 +823,15 @@ impl Congestion {
         if self.ecn_end.is_none() && self.tlp_reduction_end.is_none() {
             self.reduce_threshold(flight);
         }
-        self.cwnd = self
+        let inflated = self
             .ssthresh
             .saturating_add(self.mss.saturating_mul(3))
             .min(MAX_WINDOW);
+        self.cwnd = if ece {
+            self.cwnd.min(inflated)
+        } else {
+            inflated
+        };
         self.recover = Some(highest_sent);
         self.fast_recovery = true;
         self.acknowledged = 0;
@@ -833,7 +848,7 @@ impl Congestion {
     //# dropped packet.
     // Actor/condition: TCP sender/congestion controller; single CE indication in eligible original-flight epoch.
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
-    //= reason=Partial evidence only; TODO remains. on_ack_with_ecn suppresses growth on advancing ECE ACKs, including recovery exit. Accepted duplicate ECE ACKs reach on_duplicate_ack and can add MSS in recovery; integrated duplicate-ECE suppression or a justified SHOULD decision remains open.
+    //= reason=Accepted negotiated ECE is propagated to shared duplicate-ACK recovery; connection Reno/NewReno traces assert no growth on third-entry or later ECE duplicates, preserved retransmission, and advancing/non-ECE contrasts. Recovery entry caps inflation and later ECE duplicates omit MSS growth.
     //# The sending
     //# TCP SHOULD NOT increase the congestion window in response to the
     //# receipt of an ECN-Echo ACK packet.
@@ -938,6 +953,9 @@ impl Congestion {
     //= reason=IW10 loss window remains one effective MSS; helper and wire trace assert timeout reduction, one retransmit and denied next output.
     //# These changes do NOT change the loss window, which must remain 1 segment of MSS bytes
     //# (to permit the lowest possible window size in the case of severe congestion).
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-5.2
+    //= reason=Endpoint corrupts the checksum of actual ECT data and submits it with CE; receiver drops without feedback or bytes. Sender timeout reduces cwnd and retransmits that same sequence/payload Not-ECT without CWR.
+    //# Similarly, if a CE packet is dropped later in the network due to corruption (bit errors), the end nodes should still invoke congestion control, just as TCP would today in response to a dropped data packet.
     pub(crate) fn on_timeout(&mut self, flight: u32, highest_sent: Seq) {
         // Repeated RTOs for the same unacknowledged segment retain ssthresh.
         // RFC 3168 section 6.1.2: loss of a retransmission is new congestion,
@@ -1719,9 +1737,9 @@ mod tests {
     }
 
     fn three_duplicates(c: &mut Congestion, flight: u32, end: Seq) -> bool {
-        assert!(!c.on_duplicate_ack(flight, end));
-        assert!(!c.on_duplicate_ack(flight, end));
-        c.on_duplicate_ack(flight, end)
+        assert!(!c.on_duplicate_ack(flight, end, false));
+        assert!(!c.on_duplicate_ack(flight, end, false));
+        c.on_duplicate_ack(flight, end, false)
     }
 
     #[test]
@@ -2014,12 +2032,12 @@ mod tests {
     //# of an ack, or timeout) after this adjustment.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
     //= type=test
-    //= reason=Non-SACK Reno/NewReno fast entry: helper asserts cwnd=ssthresh+3SMSS (7000=4000+3000); wire test asserts SND.UNA retransmission. Negotiated SACK/RACK/PRR instead follow section4.3 modified recovery and do not use Reno inflation.
+    //= reason=Non-ECE non-SACK Reno/NewReno fast entry: helper asserts cwnd=ssthresh+3SMSS (7000=4000+3000); wire test asserts SND.UNA retransmission. Negotiated SACK/RACK/PRR instead follow section4.3 modified recovery and do not use Reno inflation.
     //# The lost segment starting at SND.UNA MUST be retransmitted and cwnd set to ssthresh plus
     //# 3*SMSS.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
     //= type=test
-    //= reason=Non-SACK fast recovery only: helper fourth DupACK raises 7000 to 8000 at MSS1000. Negotiated SACK/RACK/PRR do not artificially inflate cwnd; see section4.3 obligations.
+    //= reason=Non-ECE non-SACK fast recovery only: helper fourth DupACK raises 7000 to 8000 at MSS1000; accepted ECE instead follows RFC3168 no-growth policy. Negotiated SACK/RACK/PRR do not artificially inflate cwnd; see section4.3 obligations.
     //# For each additional duplicate ACK received (after the third), cwnd MUST be incremented
     //# by SMSS.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-4.3
@@ -2038,13 +2056,13 @@ mod tests {
         );
         assert!(three_duplicates(&mut c, 8_000, Seq(8_000)));
         assert_eq!((c.ssthresh(), c.cwnd()), (4_000, 7_000));
-        assert!(!c.on_duplicate_ack(8_000, Seq(8_000)));
+        assert!(!c.on_duplicate_ack(8_000, Seq(8_000), false));
         assert_eq!(c.cwnd(), 8_000);
         assert!(c.on_ack(Seq(2_000), 2_000, 6_000));
         assert_eq!(c.cwnd(), 7_000);
         assert!(c.on_ack(Seq(2_500), 500, 5_500));
         assert_eq!(c.cwnd(), 6_500);
-        assert!(!c.on_duplicate_ack(5_500, Seq(8_000)));
+        assert!(!c.on_duplicate_ack(5_500, Seq(8_000), false));
         assert_eq!(c.cwnd(), 7_500);
         assert!(!c.on_ack(Seq(8_000), 5_500, 0));
         assert_eq!(c.cwnd(), 2_000);
@@ -2330,14 +2348,14 @@ mod tests {
             c.on_ack(Seq(1), u32::MAX, u32::MAX);
             assert_eq!(c.cwnd(), MAX_WINDOW);
             assert!(three_duplicates(&mut c, u32::MAX, Seq(10)));
-            c.on_duplicate_ack(u32::MAX, Seq(10));
+            c.on_duplicate_ack(u32::MAX, Seq(10), false);
             assert_eq!((c.cwnd(), c.ssthresh()), (MAX_WINDOW, MAX_WINDOW));
             c.set_mss(u32::MAX);
             c.on_timeout(u32::MAX, Seq(10));
             assert_eq!((c.cwnd(), c.ssthresh()), (MAX_WINDOW, MAX_WINDOW));
             let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
-            c.on_duplicate_ack(4_000, Seq(4_000));
-            c.on_duplicate_ack(4_000, Seq(4_000));
+            c.on_duplicate_ack(4_000, Seq(4_000), false);
+            c.on_duplicate_ack(4_000, Seq(4_000), false);
             c.reset_duplicate_acks();
             assert!(three_duplicates(&mut c, 4_000, Seq(4_000)));
         }
@@ -2412,7 +2430,7 @@ mod tests {
     // Actor/condition: TCP sender/congestion controller; single CE indication in eligible original-flight epoch.
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Helper asserts on_ack_with_ecn growth suppression for advancing ECE ACKs, including recovery exit. It does not exercise accepted duplicate ECE routing to on_duplicate_ack or its MSS inflation during recovery.
+    //= reason=Accepted negotiated ECE is propagated to shared duplicate-ACK recovery; connection Reno/NewReno traces assert no growth on third-entry or later ECE duplicates, preserved retransmission, and advancing/non-ECE contrasts. Recovery entry caps inflation and later ECE duplicates omit MSS growth.
     //# The sending
     //# TCP SHOULD NOT increase the congestion window in response to the
     //# receipt of an ECN-Echo ACK packet.

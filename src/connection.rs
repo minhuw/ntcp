@@ -1191,7 +1191,7 @@ impl Connection {
     //# data packets.
     // Actor/condition: TCP sender; received any plain setup packet.
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
-    //= reason=Existing data/feedback and fallback promise assertions are partial evidence. CE-marked zero-window probe is currently excluded by window != 0; clause depends on all applicable ECN receive processing, so retain mandatory negotiated-connection processing open alongside section 6.1.6 TODO.
+    //= reason=Negotiated receive commitment gates CE handling after sequence/control/ACK validation, including exact-sequence zero-window probes without receive credit. Tests cover normal CE, repeated feedback, fallback commitment, invalid packets and ECN-off receive.
     //# * If a host has sent at least one ECN-setup SYN or ECN-setup SYN-
     //# ACK packet, and has received no non-ECN-setup SYN or non-ECN-
     //# setup SYN-ACK packet, then if that host receives TCP data
@@ -1215,7 +1215,7 @@ impl Connection {
     //# However, the commitment to respond appropriately to incoming packets with the CE codepoint set remains even if the TCP sender in a later transmission, within this TCP connection, sends a SYN packet without ECE and CWR set.
     // Actor/condition: TCP endpoint; ECN setup followed by local plain-SYN fallback.
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1.1
-    //= reason=learn_ecn observes setup flags, not incoming IP ECT. No existing assertion explicitly injects ECT on a non-negotiated connection and proves no implicit ECN enablement. Add a negative assertion.
+    //= reason=Setup flags alone establish ECN capability; explicit ECN-off receive tests inject CE and ECT without enabling ECN or ECE, then assert outgoing data remains Not-ECT.
     //# a host is forbidden from using the reception of ECT data packets as an implicit signal that the other host is ECN- capable.
     // Actor/condition: TCP endpoint; ECT packet without bilateral setup.
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1.2
@@ -1420,6 +1420,9 @@ impl Connection {
     //# responses. All segment queues should be flushed. Users should also receive an
     //# unsolicited general "connection reset" signal. Enter the CLOSED state, delete the TCB,
     //# and return.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= reason=Terminal entry disables receive/send ECN commitment and clears echo/CWR; TIME-WAIT/CLOSED tests assert ignored negotiation and fresh same-tuple connections require new setup.
+    //# When a TCP host enters TIME-WAIT or CLOSED state, it should ignore any previous state about the negotiation of ECN for that connection.
     fn terminal(&mut self, reason: CloseReason) {
         self.state = State::Closed;
         self.reset_tlp();
@@ -2597,7 +2600,7 @@ impl Connection {
         self.keepalive_pending = false;
         self.keepalive_deadline = None;
         //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
-        //= reason=Existing data/feedback and fallback promise assertions are partial evidence. CE-marked zero-window probe is currently excluded by window != 0; clause depends on all applicable ECN receive processing, so retain mandatory negotiated-connection processing open alongside section 6.1.6 TODO.
+        //= reason=Negotiated receive commitment gates CE handling after sequence/control/ACK validation, including exact-sequence zero-window probes without receive credit. Tests cover normal CE, repeated feedback, fallback commitment, invalid packets and ECN-off receive.
         //# * If a host has sent at least one ECN-setup SYN or ECN-setup SYN-
         //# ACK packet, and has received no non-ECN-setup SYN or non-ECN-
         //# setup SYN-ACK packet, then if that host receives TCP data
@@ -2625,7 +2628,7 @@ impl Connection {
         //# However, the commitment to respond appropriately to incoming packets with the CE codepoint set remains even if the TCP sender in a later transmission, within this TCP connection, sends a SYN packet without ECE and CWR set.
         // Actor/condition: TCP endpoint; ECN setup followed by local plain-SYN fallback.
         //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.3
-        //= reason=Immediate CE feedback and repeated ECE assertions exist, but no inspected assertion covers CE on either of a two-packet delayed-ACK aggregate. Add explicit aggregate assertion; keep this unextracted receiver instruction visible.
+        //= reason=Receive CE latch survives to the next ACK; two-packet aggregate tests mark either first or second segment, assert cumulative coverage of both and ECE, and contrast ECN-off. Immediate ACK scheduling on CE is retained.
         //# When TCP receives a CE data packet at the destination end-system, the TCP data receiver sets the ECN-Echo flag in the TCP header of the subsequent ACK packet. If there is any ACK withholding implemented, as in current "delayed-ACK" TCP implementations where the TCP receiver can send an ACK for two arriving data packets, then the ECN-Echo flag in the ACK packet will be set to '1' if the CE codepoint is set in any of the data packets being acknowledged. That is, if any of the received data packets are CE packets, then the returning ACK has the ECN-Echo flag set.
         // Actor/condition: TCP endpoint; CE data including delayed-ACK aggregation.
         //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.3
@@ -2633,7 +2636,7 @@ impl Connection {
         //# After a TCP receiver sends an ACK packet with the ECN-Echo bit set, that TCP receiver continues to set the ECN-Echo flag in all the ACK packets it sends (whether they acknowledge CE data packets or non-CE data packets) until it receives a CWR packet (a packet with the CWR flag set). After the receipt of the CWR packet, acknowledgments for subsequent non-CE data packets do not have the ECN-Echo flag set.
         // Actor/condition: TCP endpoint; echo persistence until CWR and later CE.
         //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
-        //= reason=Sender Not-ECT policy is asserted, but receiver cannot infer an overwritten original Not-ECT from CE alone. Clarify applicable receiver connection/probe handling and add a non-negotiated CE assertion; rejected errata 3636/3680 do not remove the original prose obligation.
+        //= reason=ECN-off CE/ECT receive tests now prove no implicit enablement or echo; negotiated exact-sequence probes explicitly honor section 6.1.6. Sender Not-ECT outputs are asserted. A receiver cannot recover an overwritten original Not-ECT from CE alone, so universal per-packet ignore applicability is not proven. Rejected errata 3636/3680 do not waive the original text; retain this unresolved interpretation/evidence obligation.
         //# If the TCP connection does not wish to use ECN notification for a particular packet, the sending TCP sets the ECN codepoint to not-ECT, and the TCP receiver ignores the CE codepoint in the received packet.
         // Actor/condition: TCP endpoint; packet not sent as ECN-capable.
         // ECN never bypasses sequence, RST/SYN, or ACK-range validation.
@@ -2645,9 +2648,20 @@ impl Connection {
                 self.ecn_echo = false;
                 self.ecn_ce_end = None;
             }
-            if traffic_class & 3 == 3 && !segment.payload.is_empty() && window != 0 {
+            //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.6
+            //= reason=Validated exact-sequence zero-window ACK probes latch CE and return ECE without admitting payload or granting receive credit; boundary tests assert invalid sequence/ACK rejection, ECN-off, failed output and unchanged receive stream. Sender probes remain Not-ECT without CWR.
+            //# Therefore, if
+            //# a window probe arrives with the CE codepoint set, then the receiver
+            //# SHOULD respond to the ECN indications.
+            if traffic_class & 3 == 3 && !segment.payload.is_empty() {
                 self.ecn_echo = true;
-                let end = seq.wrapping_add(segment.payload.len() as u32);
+                // Exact-sequence zero-window controls passed validation above;
+                // echo CE without accepting the probe's byte or receive credit.
+                let end = seq.wrapping_add(if window == 0 {
+                    0
+                } else {
+                    segment.payload.len() as u32
+                });
                 if self.ecn_ce_end.is_none_or(|old| after(end, old)) {
                     self.ecn_ce_end = Some(end);
                 }
@@ -2865,6 +2879,7 @@ impl Connection {
             if self.congestion.on_duplicate_ack(
                 self.flight().saturating_sub(self.limited_sent),
                 self.snd_nxt,
+                ece,
             ) {
                 self.retx_pending = true;
                 self.ecn_cwr_pending |= self.ecn_feedback();
@@ -4411,7 +4426,7 @@ impl Connection {
             && now.saturating_sub(self.last_sent) >= self.rto()
             && self.congestion.cwnd() > self.initial_window();
         //= https://www.rfc-editor.org/rfc/rfc3168#section-5.2
-        //= reason=Fresh-data predicate and Not-ECT ACK/retransmit/persist assertions are partial evidence. No complete assertion inventory covers every special ECT output path (including TLP original versus retransmission), nor end-to-end loss interpretation for every ECT-marked output. Retain universal reliability-of-congestion-indication requirement open; router marking is not claimed.
+        //= reason=Shared fresh-data output predicate excludes setup, pure ACK, reset, FIN-only, keepalive, persist and retransmitted packets. Fresh FIFO bytes (including Limited Transmit, recovery new data, data/FIN and original TLP) advance tracked sequence space and remain subject to loss recovery. Assertions cover special ECT/Not-ECT outputs, original TLP loss RTO and corrupted CE loss congestion response; no router marking claim.
         //# To ensure the reliable delivery of the congestion indication
         //# of the CE codepoint, an ECT codepoint MUST NOT be set in a packet
         //# unless the loss of that packet in the network would be detected by
@@ -4459,7 +4474,7 @@ impl Connection {
         //# data packets.
         // Actor/condition: TCP sender; received any plain setup packet.
         //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
-        //= reason=First fresh CWR and retransmit/probe no-CWR assertions provide partial evidence, but universal all-subsequent-packets/loss-reduction paths lack complete existing assertions (e.g. every TLP/recovery mode). Keep mandatory CWR consistency open rather than waive untested branches.
+        //= reason=Shared fresh-data-only CWR predicate and transactional commit preserve signaling through failed outputs, pure ACK, persist, keepalive, FIN-only and retransmissions; tests assert first-fresh CWR and clearing after ECN, RTO, Reno/NewReno, SACK, RACK/PRR, TLP repaired loss and idle reduction.
         //# * If a host ever sets the ECT codepoint on a data packet, then
         //# that host MUST correctly set/clear the CWR TCP bit on all
         //# subsequent packets in the connection.
@@ -4523,7 +4538,7 @@ impl Connection {
         //# or the CWR bit on window probe packets.
         // Actor/condition: TCP sender; zero-window probe output.
         //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
-        //= reason=Endpoint loss/CWR and idle-reduction tests are partial evidence. Every recovery mode/TLP output cause has not been asserted for first-fresh CWR. Keep universal reduction-cause obligation open.
+        //= reason=First-fresh CWR tests cover RTO, Reno/NewReno fast retransmit, SACK and RACK/PRR reductions; TLP repaired-loss trace asserts CWR only after actual reduction. ECN and idle tests plus shared successful fresh-data commit cover other causes and failed encoding.
         //# When an ECN-Capable TCP sender reduces its congestion window for any reason (because of a retransmit timeout, a Fast Retransmit, or in response to an ECN Notification), the TCP sender sets the CWR flag in the TCP header of the first new data packet sent after the window reduction.
         // Actor/condition: TCP endpoint; any reduction cause including timeout, fast retransmit and ECN.
         //= https://www.rfc-editor.org/rfc/rfc3168#section-21
@@ -4531,7 +4546,7 @@ impl Connection {
         //# the not-ECT codepoint should be the default.
         // Actor/condition: TCP endpoint; default IP/TCP output ECN policy.
         //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
-        //= reason=Sender Not-ECT policy is asserted, but receiver cannot infer an overwritten original Not-ECT from CE alone. Clarify applicable receiver connection/probe handling and add a non-negotiated CE assertion; rejected errata 3636/3680 do not remove the original prose obligation.
+        //= reason=ECN-off CE/ECT receive tests now prove no implicit enablement or echo; negotiated exact-sequence probes explicitly honor section 6.1.6. Sender Not-ECT outputs are asserted. A receiver cannot recover an overwritten original Not-ECT from CE alone, so universal per-packet ignore applicability is not proven. Rejected errata 3636/3680 do not waive the original text; retain this unresolved interpretation/evidence obligation.
         //# If the TCP connection does not wish to use ECN notification for a particular packet, the sending TCP sets the ECN codepoint to not-ECT, and the TCP receiver ignores the CE codepoint in the received packet.
         // Actor/condition: TCP endpoint; packet not sent as ECN-capable.
         //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
@@ -6888,9 +6903,11 @@ mod tests {
             assert_eq!(a.transmit(100_000, &mut [0; 1500]), Ok(None));
             a.timeout(300_000).unwrap();
             let bytes = packet(&mut a, 300_000);
+            assert_eq!(a.last_output_ecn(), 2); // Original TLP data is loss-detectable.
             let p = wire::parse(ip(tuple()), &bytes).unwrap();
             assert_eq!(p.header.sequence, base.wrapping_add(4000).0);
             assert_eq!(p.payload.len(), 1000);
+            assert_eq!(p.header.flags & CWR, 0); // No reduction on PTO alone.
             assert_eq!(a.flight(), 5000);
             assert_eq!(
                 a.tlp_end,
@@ -6940,6 +6957,10 @@ mod tests {
     //# the loss event the probe has repaired)
     //# Else If ACK is a DupAck without any SACK option:
     //# TLP.end_seq = None     /* Case 2, above */
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= type=test
+    //= reason=First-fresh CWR tests cover RTO, Reno/NewReno fast retransmit, SACK and RACK/PRR reductions; TLP repaired-loss trace asserts CWR only after actual reduction. ECN and idle tests plus shared successful fresh-data commit cover other causes and failed encoding.
+    //# When an ECN-Capable TCP sender reduces its congestion window for any reason (because of a retransmit timeout, a Fast Retransmit, or in response to an ECN Notification), the TCP sender sets the CWR flag in the TCP header of the first new data packet sent after the window reduction.
     fn tlp_retransmit_ack_equality_dsack_dupack_and_single_loss_response() {
         for iss in [0, u32::MAX - 1999] {
             // 0: ACK beyond probe = loss; 1: matching DSACK; 2: bare DupACK;
@@ -6951,7 +6972,12 @@ mod tests {
                     packet(&mut a, 100_000);
                 }
                 a.timeout(300_000).unwrap();
-                packet(&mut a, 300_000);
+                let probe = packet(&mut a, 300_000);
+                assert_eq!(a.last_output_ecn(), 0);
+                assert_eq!(
+                    wire::parse(ip(tuple()), &probe).unwrap().header.flags & CWR,
+                    0
+                );
                 let threshold = a.congestion.ssthresh();
                 rack_sack(
                     &mut a,
@@ -6987,7 +7013,13 @@ mod tests {
                 assert!(a.tlp_fresh_rtt);
                 assert_eq!(a.tlp_deadline, None);
                 a.write(&[0x77; 1000]).unwrap();
-                packet(&mut a, 500_003);
+                let fresh = packet(&mut a, 500_003);
+                assert_eq!(a.last_output_ecn(), 2);
+                assert_eq!(
+                    wire::parse(ip(tuple()), &fresh).unwrap().header.flags & CWR != 0,
+                    case == 0 || case == 3
+                );
+                assert!(!a.ecn_cwr_pending);
                 assert!(a.tlp_deadline.is_some()); // a genuinely new sampled flight
             }
         }
@@ -9770,6 +9802,11 @@ mod tests {
         sack_ack(&mut a, 200, una, &ranges);
         for (now, offset) in [(201, 0), (202, 256), (203, 384)] {
             let bytes = packet(&mut a, now);
+            assert_eq!(a.last_output_ecn(), 0);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().header.flags & CWR,
+                0
+            );
             assert_eq!(
                 wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
                 una.wrapping_add(offset).0
@@ -9782,6 +9819,9 @@ mod tests {
         let seg = wire::parse(ip(tuple()), &bytes).unwrap();
         assert_eq!(seg.header.sequence, point.0); // Rule 2 before rule 3.
         assert_eq!(seg.payload, &[9; 128]);
+        assert_eq!(a.last_output_ecn(), 2);
+        assert_ne!(seg.header.flags & CWR, 0);
+        assert!(!a.ecn_cwr_pending);
         assert_eq!(a.sack_recovery.unwrap().recovery_point, point);
         assert_eq!(a.snd_nxt, point.wrapping_add(128));
         assert_eq!(a.transmit(212, &mut [0; 1024]), Ok(None));
@@ -13772,6 +13812,455 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= type=test
+    //= reason=Accepted negotiated ECE is propagated to shared duplicate-ACK recovery; connection Reno/NewReno traces assert no growth on third-entry or later ECE duplicates, preserved retransmission, and advancing/non-ECE contrasts. Recovery entry caps inflation and later ECE duplicates omit MSS growth.
+    //# The sending
+    //# TCP SHOULD NOT increase the congestion window in response to the
+    //# receipt of an ECN-Echo ACK packet.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= type=test
+    //= reason=Connection-boundary otherwise-identical ACK traces contrast ordinary MSS growth with advancing ECE suppression and non-ECE duplicate recovery inflation, for Reno/NewReno and ECN on/off.
+    //# TCP also follows the normal procedures for increasing the congestion window when it receives ACK packets without the ECN-Echo bit set [RFC2581].
+    fn ecn_duplicate_and_advancing_ack_growth_boundaries() {
+        for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
+            for enabled in [false, true] {
+                for marked in [false, true] {
+                    let mut cfg = config(8192, 64);
+                    cfg.recovery_algorithm = algorithm;
+                    cfg.ecn = enabled;
+                    let (mut a, _) = pair(cfg.clone(), u32::MAX - 255);
+                    a.write(&[1; 256]).unwrap();
+                    for _ in 0..4 {
+                        packet(&mut a, 40);
+                    }
+                    let una = a.snd_una;
+                    let seq = a.receive.next();
+                    let flags = ACK | if marked { ECE } else { 0 };
+                    let accepted_ece = enabled && marked;
+                    for count in 1..=5 {
+                        let before = a.congestion.cwnd();
+                        inject(&mut a, 41, seq, una, flags, 8192, b"");
+                        if accepted_ece {
+                            assert!(a.congestion.cwnd() <= before);
+                        }
+                        if count == 3 {
+                            assert!(a.retx_pending);
+                            let threshold = a.congestion.ssthresh();
+                            assert_eq!(a.transmit(41, &mut [0; 20]), Err(Error::OutputTooSmall));
+                            assert!(a.retx_pending);
+                            let bytes = packet(&mut a, 41);
+                            let retry = wire::parse(ip(tuple()), &bytes).unwrap();
+                            assert_eq!(retry.header.sequence, una.0);
+                            assert_eq!(retry.header.flags & CWR, 0);
+                            assert_eq!(a.last_output_ecn(), 0);
+                            assert_eq!(a.congestion.ssthresh(), threshold);
+                        }
+                        if count > 3 && !accepted_ece {
+                            assert_eq!(a.congestion.cwnd(), before + 64);
+                        }
+                    }
+                    // Same accepted advancing ACK: ordinary growth versus ECE suppression.
+                    let (mut a, _) = pair(cfg, 10);
+                    a.write(&[1; 128]).unwrap();
+                    packet(&mut a, 40);
+                    packet(&mut a, 40);
+                    let before = a.congestion.cwnd();
+                    let seq = a.receive.next();
+                    let ack = a.snd_una.wrapping_add(64);
+                    inject(&mut a, 41, seq, ack, flags, 8192, b"");
+                    if accepted_ece {
+                        assert!(a.congestion.cwnd() < before);
+                    } else {
+                        assert_eq!(a.congestion.cwnd(), before + 64);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.6
+    //= type=test
+    //= reason=Validated exact-sequence zero-window ACK probes latch CE and return ECE without admitting payload or granting receive credit; boundary tests assert invalid sequence/ACK rejection, ECN-off, failed output and unchanged receive stream. Sender probes remain Not-ECT without CWR.
+    //# Therefore, if
+    //# a window probe arrives with the CE codepoint set, then the receiver
+    //# SHOULD respond to the ECN indications.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= type=test
+    //= reason=Negotiated receive commitment gates CE handling after sequence/control/ACK validation, including exact-sequence zero-window probes without receive credit. Tests cover normal CE, repeated feedback, fallback commitment, invalid packets and ECN-off receive.
+    //# * If a host has sent at least one ECN-setup SYN or ECN-setup SYN-
+    //# ACK packet, and has received no non-ECN-setup SYN or non-ECN-
+    //# setup SYN-ACK packet, then if that host receives TCP data
+    //# packets with ECT and CE codepoints set in the IP header, then
+    //# that host MUST process these packets as specified for an ECN-
+    //# capable connection.
+    fn ecn_zero_window_ce_probe_validation_and_no_receive_credit() {
+        for enabled in [false, true] {
+            let mut cfg = config(64, 64);
+            cfg.ecn = enabled;
+            let (mut a, mut b) = pair(cfg, u32::MAX - 63);
+            a.write(&[1; 64]).unwrap();
+            deliver(&mut a, &mut b, 40);
+            deliver(&mut b, &mut a, 40);
+            assert_eq!(b.receive_window(), 0);
+            a.write(&[2; 64]).unwrap();
+            let deadline = a.persist_deadline.unwrap();
+            a.timeout(deadline).unwrap();
+            a.ecn_cwr_pending = enabled;
+            let bytes = packet(&mut a, deadline);
+            let mut probe = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(probe.payload.len(), 1);
+            assert_eq!(a.last_output_ecn(), 0);
+            assert_eq!(probe.header.flags & CWR, 0);
+            assert_eq!(a.ecn_cwr_pending, enabled);
+            let next = b.receive.next();
+            assert_eq!(probe.header.sequence, next.0);
+            for (seq, ack, flags) in [
+                (next.wrapping_add(1).0, b.snd_una.0, ACK),
+                (next.wrapping_add(u32::MAX).0, b.snd_una.0, ACK),
+                (next.0, b.snd_nxt.wrapping_add(1).0, ACK),
+                (
+                    next.0,
+                    b.snd_una
+                        .wrapping_add(0u32.wrapping_sub(b.max_snd_wnd + 1))
+                        .0,
+                    ACK,
+                ),
+                (next.0, b.snd_una.0, 0),
+            ] {
+                probe.header.sequence = seq;
+                probe.header.acknowledgment = ack;
+                probe.header.flags = flags;
+                b.input_with_traffic_class(deadline, 3, &probe).unwrap();
+                assert!(!b.ecn_echo);
+                assert_eq!(b.receive.next(), next);
+            }
+            probe.header.sequence = next.0;
+            probe.header.acknowledgment = b.snd_una.0;
+            probe.header.flags = ACK;
+            b.input_with_traffic_class(deadline, 3, &probe).unwrap();
+            assert_eq!(b.ecn_echo, enabled);
+            assert_eq!(b.receive.next(), next);
+            assert_eq!(b.receive_window(), 0);
+            assert_eq!(
+                b.transmit(deadline, &mut [0; 19]),
+                Err(Error::OutputTooSmall)
+            );
+            assert_eq!(b.ecn_echo, enabled);
+            let ack = packet(&mut b, deadline);
+            let ack = wire::parse(ip(reverse(tuple())), &ack).unwrap();
+            assert_eq!(ack.header.acknowledgment, next.0);
+            assert_eq!(ack.header.window, 0);
+            assert_eq!(ack.header.flags & ECE != 0, enabled);
+            assert_eq!(b.last_output_ecn(), 0);
+            let mut read = [0; 128];
+            assert_eq!(b.read(&mut read), Ok(64));
+            assert_eq!(&read[..64], &[1; 64]);
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.3
+    //= type=test
+    //= reason=Receive CE latch survives to the next ACK; two-packet aggregate tests mark either first or second segment, assert cumulative coverage of both and ECE, and contrast ECN-off. Immediate ACK scheduling on CE is retained.
+    //# When TCP receives a CE data packet at the destination end-system, the TCP data receiver sets the ECN-Echo flag in the TCP header of the subsequent ACK packet. If there is any ACK withholding implemented, as in current "delayed-ACK" TCP implementations where the TCP receiver can send an ACK for two arriving data packets, then the ECN-Echo flag in the ACK packet will be set to '1' if the CE codepoint is set in any of the data packets being acknowledged. That is, if any of the received data packets are CE packets, then the returning ACK has the ECN-Echo flag set.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1.1
+    //= type=test
+    //= reason=Setup flags alone establish ECN capability; explicit ECN-off receive tests inject CE and ECT without enabling ECN or ECE, then assert outgoing data remains Not-ECT.
+    //# a host is forbidden from using the reception of ECT data packets as an implicit signal that the other host is ECN- capable.
+    fn ecn_delayed_ack_aggregate_and_nonnegotiated_ect() {
+        for enabled in [false, true] {
+            for marked in [0, 1] {
+                let mut cfg = config(1024, 64);
+                cfg.ecn = enabled;
+                let (mut a, mut b) = pair(cfg, 10);
+                a.write(&[1; 128]).unwrap();
+                let first = packet(&mut a, 40);
+                let second = packet(&mut a, 40);
+                for (index, bytes) in [first, second].iter().enumerate() {
+                    let segment = wire::parse(ip(tuple()), bytes).unwrap();
+                    b.input_with_traffic_class(40, if index == marked { 3 } else { 2 }, &segment)
+                        .unwrap();
+                    assert_eq!(b.ecn_send(), enabled);
+                    if index == 0 && marked == 1 {
+                        assert_eq!(b.transmit(40, &mut [0; 2048]), Ok(None));
+                    }
+                }
+                let bytes = packet(&mut b, 40);
+                let ack = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+                assert_eq!(ack.header.acknowledgment, a.snd_nxt.0);
+                assert_eq!(ack.header.flags & ECE != 0, enabled);
+                b.write(&[2; 64]).unwrap();
+                packet(&mut b, 41);
+                assert_eq!(b.last_output_ecn(), if enabled { 2 } else { 0 });
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= type=test
+    //= reason=Terminal entry disables receive/send ECN commitment and clears echo/CWR; TIME-WAIT/CLOSED tests assert ignored negotiation and fresh same-tuple connections require new setup.
+    //# When a TCP host enters TIME-WAIT or CLOSED state, it should ignore any previous state about the negotiation of ECN for that connection.
+    fn ecn_terminal_and_reused_tuple_require_new_negotiation() {
+        for timewait in [false, true] {
+            let (mut a, _) = pair(config(1024, 64), 10);
+            assert!(a.ecn_send());
+            a.ecn_echo = true;
+            a.ecn_cwr_pending = true;
+            if timewait {
+                a.time_wait();
+            } else {
+                a.terminal(CloseReason::Reset);
+            }
+            assert!(!a.ecn_send() && !a.ecn_feedback());
+            assert!(!a.ecn_echo && !a.ecn_cwr_pending);
+            let mut cfg = config(1024, 64);
+            cfg.ecn = false;
+            let (mut fresh, _) = pair(cfg, 1000);
+            assert_eq!(fresh.tuple(), a.tuple());
+            assert!(!fresh.ecn_send() && !fresh.ecn_feedback());
+            fresh.write(&[0; 64]).unwrap();
+            let bytes = packet(&mut fresh, 40);
+            assert_eq!(fresh.last_output_ecn(), 0);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().header.flags & (ECE | CWR),
+                0
+            );
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= type=test
+    //= reason=First-fresh CWR tests cover RTO, Reno/NewReno fast retransmit, SACK and RACK/PRR reductions; TLP repaired-loss trace asserts CWR only after actual reduction. ECN and idle tests plus shared successful fresh-data commit cover other causes and failed encoding.
+    //# When an ECN-Capable TCP sender reduces its congestion window for any reason (because of a retransmit timeout, a Fast Retransmit, or in response to an ECN Notification), the TCP sender sets the CWR flag in the TCP header of the first new data packet sent after the window reduction.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= type=test
+    //= reason=Shared fresh-data-only CWR predicate and transactional commit preserve signaling through failed outputs, pure ACK, persist, keepalive, FIN-only and retransmissions; tests assert first-fresh CWR and clearing after ECN, RTO, Reno/NewReno, SACK, RACK/PRR, TLP repaired loss and idle reduction.
+    //# * If a host ever sets the ECT codepoint on a data packet, then
+    //# that host MUST correctly set/clear the CWR TCP bit on all
+    //# subsequent packets in the connection.
+    fn ecn_first_fresh_cwr_after_each_loss_recovery_mode() {
+        for mode in 0..5 {
+            for iss in [100, u32::MAX - 20_000] {
+                let mut a = match mode {
+                    3 => sack_flight(1000, iss, 6),
+                    4 => rack_flight(iss),
+                    _ => {
+                        let mut cfg = config(32_000, 1000);
+                        cfg.recovery_algorithm = if mode == 1 {
+                            RecoveryAlgorithm::Reno
+                        } else {
+                            RecoveryAlgorithm::NewReno
+                        };
+                        let (mut a, _) = pair(cfg, iss);
+                        a.write(&[1; 4000]).unwrap();
+                        for _ in 0..4 {
+                            packet(&mut a, 100_000);
+                        }
+                        a
+                    }
+                };
+                let next = a.snd_nxt;
+                let seq = a.receive.next();
+                let una = a.snd_una;
+                let now = match mode {
+                    0 => {
+                        let d = a.rto_deadline.unwrap();
+                        a.timeout(d).unwrap();
+                        d
+                    }
+                    1 | 2 => {
+                        for _ in 0..3 {
+                            inject(&mut a, 200_000, seq, una, ACK, 32_000, b"");
+                        }
+                        200_000
+                    }
+                    3 => {
+                        sack_ack(&mut a, 200_000, una, &[(una.wrapping_add(1000).0, next.0)]);
+                        200_000
+                    }
+                    _ => {
+                        rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
+                        a.timeout(225_000).unwrap();
+                        225_000
+                    }
+                };
+                assert!(a.ecn_cwr_pending);
+                assert_eq!(a.transmit(now, &mut [0; 20]), Err(Error::OutputTooSmall));
+                assert!(a.ecn_cwr_pending);
+                let retry = packet(&mut a, now);
+                assert_eq!(
+                    wire::parse(ip(tuple()), &retry).unwrap().header.flags & CWR,
+                    0
+                );
+                assert_eq!(a.last_output_ecn(), 0);
+                if mode >= 3 {
+                    sack_ack(&mut a, now + 1, next, &[]);
+                } else {
+                    inject(&mut a, now + 1, seq, next, ACK, 32_000, b"");
+                }
+                a.write(&[2; 2000]).unwrap();
+                a.set_nagle(false);
+                assert_eq!(
+                    a.transmit(now + 2, &mut [0; 20]),
+                    Err(Error::OutputTooSmall)
+                );
+                assert!(a.ecn_cwr_pending);
+                let bytes = packet(&mut a, now + 2);
+                let first = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(first.header.sequence, next.0);
+                assert_ne!(first.header.flags & CWR, 0);
+                assert_eq!(a.last_output_ecn(), 2);
+                let ack = a.snd_nxt;
+                inject(&mut a, now + 3, seq, ack, ACK, 8192, b"");
+                let bytes = packet(&mut a, now + 4);
+                assert_eq!(
+                    wire::parse(ip(tuple()), &bytes).unwrap().header.flags & CWR,
+                    0
+                );
+                assert_eq!(a.last_output_ecn(), 2);
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-5.2
+    //= type=test
+    //= reason=Shared fresh-data output predicate excludes setup, pure ACK, reset, FIN-only, keepalive, persist and retransmitted packets. Fresh FIFO bytes (including Limited Transmit, recovery new data, data/FIN and original TLP) advance tracked sequence space and remain subject to loss recovery. Assertions cover special ECT/Not-ECT outputs, original TLP loss RTO and corrupted CE loss congestion response; no router marking claim.
+    //# To ensure the reliable delivery of the congestion indication
+    //# of the CE codepoint, an ECT codepoint MUST NOT be set in a packet
+    //# unless the loss of that packet in the network would be detected by
+    //# the end nodes and interpreted as an indication of congestion.
+    fn ecn_limited_transmit_and_original_tlp_loss_remain_congestion_signals() {
+        let (mut a, _) = pair(config(8192, 64), 10);
+        a.write(&[1; 384]).unwrap();
+        for _ in 0..4 {
+            packet(&mut a, 40);
+        }
+        let seq = a.receive.next();
+        let una = a.snd_una;
+        let cwnd = a.congestion.cwnd();
+        for _ in 0..2 {
+            inject(&mut a, 41, seq, una, ACK, 8192, b"");
+            let bytes = packet(&mut a, 41);
+            assert_eq!(a.last_output_ecn(), 2);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().header.flags & CWR,
+                0
+            );
+            assert_eq!(a.congestion.cwnd(), cwnd);
+        }
+        assert_eq!(a.limited_sent, 128);
+        inject(&mut a, 42, seq, una, ACK, 8192, b"");
+        assert_eq!(a.congestion.ssthresh(), 128); // Limited bytes excluded.
+        let retry = packet(&mut a, 42);
+        assert_eq!(a.last_output_ecn(), 0);
+        assert_eq!(
+            wire::parse(ip(tuple()), &retry).unwrap().header.flags & CWR,
+            0
+        );
+
+        let (mut a, _) = tlp_pair(u32::MAX - 1999);
+        a.write(&[1; 6000]).unwrap();
+        for _ in 0..4 {
+            packet(&mut a, 100_000);
+        }
+        a.timeout(300_000).unwrap();
+        packet(&mut a, 300_000);
+        assert_eq!(a.last_output_ecn(), 2);
+        assert!(a.tlp_end.is_some_and(|(_, _, retransmit)| !retransmit));
+        let before = a.congestion.cwnd();
+        let deadline = a.rto_deadline.unwrap();
+        a.timeout(deadline).unwrap();
+        assert!(a.congestion.cwnd() < before);
+        assert!(a.ecn_cwr_pending);
+        packet(&mut a, deadline);
+        assert_eq!(a.last_output_ecn(), 0);
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= type=test
+    //= reason=Shared fresh-data-only CWR predicate and transactional commit preserve signaling through failed outputs, pure ACK, persist, keepalive, FIN-only and retransmissions; tests assert first-fresh CWR and clearing after ECN, RTO, Reno/NewReno, SACK, RACK/PRR, TLP repaired loss and idle reduction.
+    //# * If a host ever sets the ECT codepoint on a data packet, then
+    //# that host MUST correctly set/clear the CWR TCP bit on all
+    //# subsequent packets in the connection.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-5.2
+    //= type=test
+    //= reason=Shared fresh-data output predicate excludes setup, pure ACK, reset, FIN-only, keepalive, persist and retransmitted packets. Fresh FIFO bytes (including Limited Transmit, recovery new data, data/FIN and original TLP) advance tracked sequence space and remain subject to loss recovery. Assertions cover special ECT/Not-ECT outputs, original TLP loss RTO and corrupted CE loss congestion response; no router marking claim.
+    //# To ensure the reliable delivery of the congestion indication
+    //# of the CE codepoint, an ECT codepoint MUST NOT be set in a packet
+    //# unless the loss of that packet in the network would be detected by
+    //# the end nodes and interpreted as an indication of congestion.
+    fn ecn_special_controls_preserve_cwr_for_fresh_fin_data() {
+        for garbage in [false, true] {
+            let (mut a, _) = pair(config(1024, 64), 10);
+            a.ecn_cwr_pending = true;
+            a.immediate_ack();
+            let bytes = packet(&mut a, 40);
+            assert_eq!(a.last_output_ecn(), 0);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().header.flags & CWR,
+                0
+            );
+            assert!(a.ecn_cwr_pending);
+            a.set_keepalive(Some(KeepaliveConfig {
+                idle_us: 100,
+                interval_us: 50,
+                probes: 2,
+                send_garbage: garbage,
+            }))
+            .unwrap();
+            let deadline = a.keepalive_deadline.unwrap();
+            a.timeout(deadline).unwrap();
+            let bytes = packet(&mut a, deadline);
+            assert_eq!(a.last_output_ecn(), 0);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().header.flags & CWR,
+                0
+            );
+            assert!(a.ecn_cwr_pending);
+            a.write(&[1; 64]).unwrap();
+            a.shutdown().unwrap();
+            let bytes = packet(&mut a, deadline + 1);
+            let data_fin = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(data_fin.payload, &[1; 64]);
+            assert_ne!(data_fin.header.flags & CWR, 0);
+            assert_ne!(data_fin.header.flags & FIN, 0);
+            assert_eq!(a.last_output_ecn(), 2);
+            assert!(!a.ecn_cwr_pending);
+            a.abort();
+            let bytes = packet(&mut a, deadline + 2);
+            assert_ne!(
+                wire::parse(ip(tuple()), &bytes).unwrap().header.flags & RST,
+                0
+            );
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().header.flags & CWR,
+                0
+            );
+            assert_eq!(a.last_output_ecn(), 0);
+        }
+        let (mut a, _) = pair(config(1024, 64), 10);
+        a.ecn_cwr_pending = true;
+        a.shutdown().unwrap();
+        let bytes = packet(&mut a, 40);
+        assert_ne!(
+            wire::parse(ip(tuple()), &bytes).unwrap().header.flags & FIN,
+            0
+        );
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes).unwrap().header.flags & CWR,
+            0
+        );
+        assert_eq!(a.last_output_ecn(), 0);
+        assert!(a.ecn_cwr_pending);
+    }
+
+    #[test]
     fn ecn_duplex_reordering_old_ack_preserves_receive_feedback() {
         for iss in [100, u32::MAX - 63] {
             let (mut a, mut b) = pair(config(1024, 64), iss);
@@ -13901,7 +14390,7 @@ mod tests {
     // Actor/condition: TCP sender/congestion controller; single CE indication in eligible original-flight epoch.
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
     //= type=test
-    //= reason=Existing data/feedback and fallback promise assertions are partial evidence. CE-marked zero-window probe is currently excluded by window != 0; clause depends on all applicable ECN receive processing, so retain mandatory negotiated-connection processing open alongside section 6.1.6 TODO.
+    //= reason=Negotiated receive commitment gates CE handling after sequence/control/ACK validation, including exact-sequence zero-window probes without receive credit. Tests cover normal CE, repeated feedback, fallback commitment, invalid packets and ECN-off receive.
     //# * If a host has sent at least one ECN-setup SYN or ECN-setup SYN-
     //# ACK packet, and has received no non-ECN-setup SYN or non-ECN-
     //# setup SYN-ACK packet, then if that host receives TCP data
@@ -13928,7 +14417,7 @@ mod tests {
     // Actor/condition: TCP sender and receiver; retransmitted data output and out-of-window received data.
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.3
     //= type=test
-    //= reason=Immediate CE feedback and repeated ECE assertions exist, but no inspected assertion covers CE on either of a two-packet delayed-ACK aggregate. Add explicit aggregate assertion; keep this unextracted receiver instruction visible.
+    //= reason=Receive CE latch survives to the next ACK; two-packet aggregate tests mark either first or second segment, assert cumulative coverage of both and ECE, and contrast ECN-off. Immediate ACK scheduling on CE is retained.
     //# When TCP receives a CE data packet at the destination end-system, the TCP data receiver sets the ECN-Echo flag in the TCP header of the subsequent ACK packet. If there is any ACK withholding implemented, as in current "delayed-ACK" TCP implementations where the TCP receiver can send an ACK for two arriving data packets, then the ECN-Echo flag in the ACK packet will be set to '1' if the CE codepoint is set in any of the data packets being acknowledged. That is, if any of the received data packets are CE packets, then the returning ACK has the ECN-Echo flag set.
     // Actor/condition: TCP endpoint; CE data including delayed-ACK aggregation.
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.3
@@ -14035,7 +14524,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc3168#section-5.2
     //= type=test
-    //= reason=Fresh-data predicate and Not-ECT ACK/retransmit/persist assertions are partial evidence. No complete assertion inventory covers every special ECT output path (including TLP original versus retransmission), nor end-to-end loss interpretation for every ECT-marked output. Retain universal reliability-of-congestion-indication requirement open; router marking is not claimed.
+    //= reason=Shared fresh-data output predicate excludes setup, pure ACK, reset, FIN-only, keepalive, persist and retransmitted packets. Fresh FIFO bytes (including Limited Transmit, recovery new data, data/FIN and original TLP) advance tracked sequence space and remain subject to loss recovery. Assertions cover special ECT/Not-ECT outputs, original TLP loss RTO and corrupted CE loss congestion response; no router marking claim.
     //# To ensure the reliable delivery of the congestion indication
     //# of the CE codepoint, an ECT codepoint MUST NOT be set in a packet
     //# unless the loss of that packet in the network would be detected by
@@ -14043,7 +14532,7 @@ mod tests {
     // Actor/condition: TCP sender and IP adapter; all ECT outputs.
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
     //= type=test
-    //= reason=First fresh CWR and retransmit/probe no-CWR assertions provide partial evidence, but universal all-subsequent-packets/loss-reduction paths lack complete existing assertions (e.g. every TLP/recovery mode). Keep mandatory CWR consistency open rather than waive untested branches.
+    //= reason=Shared fresh-data-only CWR predicate and transactional commit preserve signaling through failed outputs, pure ACK, persist, keepalive, FIN-only and retransmissions; tests assert first-fresh CWR and clearing after ECN, RTO, Reno/NewReno, SACK, RACK/PRR, TLP repaired loss and idle reduction.
     //# * If a host ever sets the ECT codepoint on a data packet, then
     //# that host MUST correctly set/clear the CWR TCP bit on all
     //# subsequent packets in the connection.
@@ -14120,7 +14609,7 @@ mod tests {
     // Actor/condition: TCP sender; received any plain setup packet.
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
     //= type=test
-    //= reason=Existing data/feedback and fallback promise assertions are partial evidence. CE-marked zero-window probe is currently excluded by window != 0; clause depends on all applicable ECN receive processing, so retain mandatory negotiated-connection processing open alongside section 6.1.6 TODO.
+    //= reason=Negotiated receive commitment gates CE handling after sequence/control/ACK validation, including exact-sequence zero-window probes without receive credit. Tests cover normal CE, repeated feedback, fallback commitment, invalid packets and ECN-off receive.
     //# * If a host has sent at least one ECN-setup SYN or ECN-setup SYN-
     //# ACK packet, and has received no non-ECN-setup SYN or non-ECN-
     //# setup SYN-ACK packet, then if that host receives TCP data
@@ -14372,7 +14861,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
     //= type=test
-    //= reason=Endpoint loss/CWR and idle-reduction tests are partial evidence. Every recovery mode/TLP output cause has not been asserted for first-fresh CWR. Keep universal reduction-cause obligation open.
+    //= reason=First-fresh CWR tests cover RTO, Reno/NewReno fast retransmit, SACK and RACK/PRR reductions; TLP repaired-loss trace asserts CWR only after actual reduction. ECN and idle tests plus shared successful fresh-data commit cover other causes and failed encoding.
     //# When an ECN-Capable TCP sender reduces its congestion window for any reason (because of a retransmit timeout, a Fast Retransmit, or in response to an ECN Notification), the TCP sender sets the CWR flag in the TCP header of the first new data packet sent after the window reduction.
     // Actor/condition: TCP endpoint; any reduction cause including timeout, fast retransmit and ECN.
     fn ecn_idle_window_reduction_signals_cwr_on_committed_fresh_data() {

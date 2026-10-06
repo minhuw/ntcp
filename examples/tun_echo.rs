@@ -231,6 +231,9 @@ mod linux {
         //# the same IPv4 Identification field MAY be used (see Section 3.2.1.5
         //# of RFC 1122) (MAY-4).
         // Atomic IPv4 datagrams need no unique ID (RFC 6864); ID remains zero.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-5.3
+        //= reason=IPv4 example sets DF for all packets; ECN/DSCP matrix explicitly asserts DF and no fragment offset, including both ECT codepoints.
+        //# ECN-capable packets MAY have the DF (Don't Fragment) bit set.
         header[6] = 0x40; // DF: this example never fragments.
 
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
@@ -1130,9 +1133,13 @@ mod linux {
         #[test]
         //= https://www.rfc-editor.org/rfc/rfc3168#section-5
         //= type=test
-        //= reason=IPv4 adapter ECN/DSCP/checksum roundtrip is asserted. The example adapter has no IPv6 packet path; core metadata permits IPv6 but no current assertion proves IPv6 traffic class ECN plumbing. Mandatory adapter evidence remains open.
+        //= reason=IPv4 adapter ECN/DSCP/checksum/DF matrix is asserted. The example has no IPv6 packet encoder/parser: core IpMetadata support alone cannot prove IPv6 Traffic Class plumbing. Full IPv6 adapter implementation and end-to-end evidence are outside this bounded TCP ECN fix; mandatory obligation remains open, not waived.
         //# Bits 6 and 7 in the IPv4 TOS octet are designated as the ECN field. The IPv4 TOS octet corresponds to the Traffic Class octet in IPv6, and the ECN field is defined identically in both cases.
         // Actor/condition: IP adapter; IPv4 and IPv6 traffic class encoding.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-5.3
+        //= type=test
+        //= reason=IPv4 example sets DF for all packets; ECN/DSCP matrix explicitly asserts DF and no fragment offset, including both ECT codepoints.
+        //# ECN-capable packets MAY have the DF (Don't Fragment) bit set.
         fn ipv4_dscp_and_ecn_are_independent() {
             let (mut bytes, _, local) = packet();
             let ip = IpMetadata {
@@ -1143,6 +1150,7 @@ mod linux {
                 for ecn in 0..4 {
                     build_ipv4(&mut bytes, ip, 20, 64, dscp, ecn).unwrap();
                     assert_eq!(bytes[1], (dscp << 2) | ecn);
+                    assert_eq!(u16::from_be_bytes([bytes[6], bytes[7]]), 0x4000); // DF, no fragments.
                     assert_eq!(checksum(&bytes[..20]), 0);
                     assert!(parse_ipv4(&bytes, local).is_some());
                 }
