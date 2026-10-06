@@ -2843,16 +2843,16 @@ impl Connection {
     //# For the purposes of the algorithm defined in this document, the scoreboard
     //# SHOULD implement the following functions:
     //= https://www.rfc-editor.org/rfc/rfc6675#section-4
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Ordinary full-SMSS-budget tests show lost/new/speculative/rescue priorities. Reduced packet budgets also lower the IsLost threshold incorrectly; see section-4 NextSeg/rule (1.c) TODOs.
+    //= reason=Negotiated non-RACK/non-PRR SACK; full-budget and piggybacked-SACK regressions exercise lost/new/speculative/rescue priority. IsLost uses SMSS independently of output clipping; markers commit only after encoding.
     //# NextSeg () MUST return the sequence number range of the next segment that is
     //# to be transmitted, per the following rules:
     //= https://www.rfc-editor.org/rfc/rfc6675#section-4
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. With packet budget equal to SMSS, the next lost hole at offset 256 skips SACKed offset 128 and output is <= SMSS. This does not establish correct loss classification with piggybacked SACK; see rule (1.c) TODO.
+    //= reason=Negotiated non-RACK/non-PRR SACK; lowest_hole uses SMSS for IsLost and output is clipped to the packet budget. Integrated 240/256/257-byte SACK cases verify the strict loss threshold and fresh-data priority with SMSS 128 and budget 116.
     //# (1) If there exists a smallest unSACKed sequence number 'S2' that meets the
     //# following three criteria for determining loss, the sequence range of one
     //# segment of up to SMSS octets starting with S2 MUST be returned.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-4
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Full-SMSS-budget test sends queued data before a speculative hole; snd_nxt advances and RecoveryPoint stays fixed. Reduced packet budgets can incorrectly promote a nonlost hole over new data; see rule (1.c) TODO.
+    //= reason=Negotiated non-RACK/non-PRR SACK; full-budget and budget-116 tests send fresh data before nonlost holes and keep RecoveryPoint fixed.
     //# (2) If no sequence number 'S2' per rule (1) exists but there exists
     //# available unsent data and the receiver's advertised window allows, the
     //# sequence range of one segment of up to SMSS octets of previously unsent data
@@ -2877,12 +2877,12 @@ impl Connection {
     //# (5) If the conditions for each of (1), (2), (3), and (4) are not met, then
     //# NextSeg () MUST indicate failure, and no segment is returned.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Limited-transmit test checks one new transmission per fresh-evidence ACK and exclusion from reduction, not exhaustion of multi-SMSS credit from one ACK; see (3.3) TODO.
+    //= reason=Negotiated non-RACK/non-PRR SACK; each output poll recomputes SetPipe and sends up to the packet budget while SMSS credit and peer window permit. Integrated tests exhaust two-SMSS credit from one ACK, check window/option limits and failed-output rollback.
     //# (3) The TCP MAY transmit previously unsent data segments as per Limited
     //# Transmit [RFC5681], except that the number of octets which may be sent is
     //# governed by pipe and cwnd as follows:
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. During active recovery, repeated output polls consume pipe/cwnd credit and stop below SMSS. This is not evidence for the pre-recovery limited-transmit loop; see (3.3) TODO.
+    //= reason=Negotiated non-RACK/non-PRR SACK; active recovery polls consume pipe/cwnd credit and stop below SMSS; separate limited-transmit regression checks the pre-recovery loop.
     //# (C) If cwnd - pipe >= 1 SMSS, the sender SHOULD transmit one or more
     //# segments as follows:
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
@@ -2938,22 +2938,22 @@ impl Connection {
     //# algorithm using the pipe estimate is often referred to as the "pipe
     //# algorithm".
     //= https://www.rfc-editor.org/rfc/rfc6675#section-4
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Full-SMSS-budget test selects offset 256 after entry, skipping SACKed bytes. Connection passes packet_mss to IsLost via lowest_hole; a reduced budget can falsely classify loss. Helper tests using SMSS remain valid; see rule (1.c) TODO.
+    //= reason=Negotiated non-RACK/non-PRR SACK; lowest_hole uses SMSS for IsLost and output is clipped to the packet budget. Integrated 240/256/257-byte SACK cases verify the strict loss threshold and fresh-data priority with SMSS 128 and budget 116.
     //# (1.a) S2 is greater than HighRxt.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-4
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Full-SMSS-budget test selects offset 256 after entry, skipping SACKed bytes. Connection passes packet_mss to IsLost via lowest_hole; a reduced budget can falsely classify loss. Helper tests using SMSS remain valid; see rule (1.c) TODO.
+    //= reason=Negotiated non-RACK/non-PRR SACK; lowest_hole uses SMSS for IsLost and output is clipped to the packet budget. Integrated 240/256/257-byte SACK cases verify the strict loss threshold and fresh-data priority with SMSS 128 and budget 116.
     //# (1.b) S2 is less than the highest octet covered by any received SACK.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-4
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Full-SMSS-budget test selects offset 256 after entry, skipping SACKed bytes. Connection passes packet_mss to IsLost via lowest_hole; a reduced budget can falsely classify loss. Helper tests using SMSS remain valid; see rule (1.c) TODO.
+    //= reason=Negotiated non-RACK/non-PRR SACK; lowest_hole uses SMSS for IsLost and output is clipped to the packet budget. Integrated 240/256/257-byte SACK cases verify the strict loss threshold and fresh-data priority with SMSS 128 and budget 116.
     //# (1.c) IsLost (S2) returns true.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
     //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Limited-transmit pipe passes snd_una (exclusive HighACK) as high_rxt.
     //# (3.1) Set HighRxt to HighACK.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. First limited-transmit output computes pipe for credit; limited_pending clearing prevents the required return to SetPipe when more credit remains (3.3 TODO).
+    //= reason=Negotiated non-RACK/non-PRR SACK; each output poll recomputes SetPipe and sends up to the packet budget while SMSS credit and peer window permit. Integrated tests exhaust two-SMSS credit from one ACK, check window/option limits and failed-output rollback.
     //# (3.2) Run SetPipe ().
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. First limited-transmit output checks pipe/cwnd and peer window, sends <=SMSS and advances snd_nxt. It clears limited_pending even if credit remains; repeated SetPipe/transmit for one ACK is not established (3.3 TODO).
+    //= reason=Negotiated non-RACK/non-PRR SACK; each output poll recomputes SetPipe and sends up to the packet budget while SMSS credit and peer window permit. Integrated tests exhaust two-SMSS credit from one ACK, check window/option limits and failed-output rollback.
     //# (3.3) If (cwnd - pipe) >= 1 SMSS, there exists previously unsent data, and
     //# the receiver's advertised window allows, transmit up to 1 SMSS of data
     //# starting with the octet HighData+1 and update HighData to reflect this
@@ -3193,14 +3193,14 @@ impl Connection {
                 || self.prr.is_none() && self.recovery_credit(recovery) >= self.mss as u32
             {
                 //= https://www.rfc-editor.org/rfc/rfc6675#section-4
-                //= reason=Full-SMSS-budget tests exercise NextSeg priorities; reduced packet budgets incorrectly lower the IsLost threshold (section-4 TODO). Markers commit only after encoding.
+                //= reason=Negotiated non-RACK/non-PRR SACK; full-budget and piggybacked-SACK regressions exercise lost/new/speculative/rescue priority. IsLost uses SMSS independently of output clipping; markers commit only after encoding.
                 //# NextSeg () MUST return the sequence number range of the next segment that is to be transmitted, per the following rules:
                 // RFC 6675 NextSeg: lost hole, new data, speculative hole,
                 // then one tail rescue. New data is selected by the live branch.
                 let lost = self.scoreboard.lowest_hole(
                     recovery.high_rxt,
                     self.data_high(),
-                    packet_mss as u32,
+                    self.mss as u32,
                     true,
                 );
                 let unsent = self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize;
@@ -3285,7 +3285,9 @@ impl Connection {
             let credit = self.prr.map_or(credit, |prr| credit.min(prr.credit()));
             count = self.send.copy(
                 seq.distance_from(self.send_base) as usize,
-                &mut self.scratch[..(right.distance_from(left) as usize).min(credit as usize)],
+                &mut self.scratch[..(right.distance_from(left) as usize)
+                    .min(packet_mss)
+                    .min(credit as usize)],
             );
             retransmitted = count != 0;
         } else if tlp {
@@ -3765,7 +3767,18 @@ impl Connection {
             if self.limited_pending && !retransmit && !probe {
                 self.limited_sent = self.limited_sent.saturating_add(count as u32);
                 self.limited_end = Some(seq.wrapping_add(count as u32));
-                self.limited_pending = false;
+                // RFC 6675 repeats SetPipe across output polls for this ACK.
+                // Reno and the RACK/PRR profiles retain one-packet credit.
+                self.limited_pending = self.sack_recovery_enabled()
+                    && !self.config.rack
+                    && !self.config.prr
+                    && self
+                        .congestion
+                        .cwnd()
+                        .saturating_sub(self.recovery_pipe(self.snd_una))
+                        >= self.mss as u32
+                    && self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize
+                    && self.snd_wnd > self.flight();
             }
             self.sws_deadline = None;
             self.sws_override = false;
@@ -5851,6 +5864,139 @@ mod tests {
         }
     }
 
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=SMSS 128 remains the loss threshold with a piggybacked-SACK budget of 116; 240 and 256 SACKed bytes do not outrank fresh data, but 257 do. Failed encoding does not advance recovery markers.
+    //# (1.c) IsLost (S2) returns true.
+    fn sack_nextseg_piggyback_budget_does_not_change_loss_threshold() {
+        for covered in [240, 256, 257] {
+            let mut a = sack_flight(128, 100, 12);
+            let una = a.snd_una;
+            let point = a.data_high();
+            let tail = (una.wrapping_add(1024).0, una.wrapping_add(1024 + covered).0);
+            sack_ack(
+                &mut a,
+                200,
+                una,
+                &[(una.wrapping_add(128).0, una.wrapping_add(896).0), tail],
+            );
+            packet(&mut a, 201); // Entry retransmission.
+            a.write(&[9; 128]).unwrap();
+            let next = a.receive.next();
+            inject_sack(
+                &mut a,
+                210,
+                next.wrapping_add(1),
+                una.wrapping_add(896),
+                ACK,
+                8192,
+                &[1], // Retained receive hole adds a 12-byte SACK option.
+                &[tail],
+            );
+            assert_eq!(a.scoreboard.is_lost(a.snd_una, 128), covered > 256);
+            let recovery = a.sack_recovery.unwrap();
+            let nxt = a.snd_nxt;
+            let deadline = a.rto_deadline;
+            assert_eq!(a.transmit(211, &mut [0; 8]), Err(Error::OutputTooSmall));
+            assert_eq!(a.snd_nxt, nxt);
+            assert_eq!(a.rto_deadline, deadline);
+            let unchanged = a.sack_recovery.unwrap();
+            assert_eq!(unchanged.high_rxt, recovery.high_rxt);
+            assert_eq!(unchanged.rescue_rxt, recovery.rescue_rxt);
+            assert_eq!(unchanged.pipe, recovery.pipe);
+            let bytes = packet(&mut a, 211);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.payload.len(), 116);
+            assert!(segment.options.sack_blocks[0].is_some());
+            assert_eq!(
+                segment.header.sequence,
+                if covered > 256 { a.snd_una.0 } else { point.0 }
+            );
+            assert_eq!(a.sack_recovery.unwrap().recovery_point, point);
+            if covered <= 256 {
+                assert_eq!(segment.payload, &[9; 116]);
+                assert_eq!(a.snd_nxt, point.wrapping_add(116));
+                assert_eq!(a.sack_recovery.unwrap().high_rxt, recovery.high_rxt);
+            } else {
+                assert_eq!(a.snd_nxt, point);
+                assert_eq!(
+                    a.sack_recovery.unwrap().high_rxt,
+                    a.snd_una.wrapping_add(116)
+                );
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=One SACK ACK leaves pipe 256 under cwnd 512; successive pulls send two packets and stop at credit or window limits. Options clip packets without lowering SMSS credit; failed output preserves pending work and accounting.
+    //# (3.3) If (cwnd - pipe) >= 1 SMSS, there exists previously unsent data, and
+    //# the receiver's advertised window allows, transmit up to 1 SMSS of data
+    //# starting with the octet HighData+1 and update HighData to reflect this
+    //# transmission, then return to (3.2).
+    fn sack_limited_transmit_repeats_setpipe_on_same_ack() {
+        for (piggyback, window, queued, packets) in [
+            (false, 8192, 1024, 2),
+            (true, 8192, 1024, 2),
+            (false, 640, 1024, 1),
+            (false, 8192, 640, 1),
+        ] {
+            let (mut a, _) = pair(sack_config(128), 100);
+            a.write(&vec![1; queued]).unwrap();
+            for now in 40..44 {
+                packet(&mut a, now);
+            }
+            let una = a.snd_una;
+            let end = a.snd_nxt;
+            assert_eq!(a.flight(), 512);
+            assert_eq!(a.congestion.cwnd(), 512);
+            let next = a.receive.next();
+            inject_sack(
+                &mut a,
+                50,
+                if piggyback {
+                    next.wrapping_add(1)
+                } else {
+                    next
+                },
+                una,
+                ACK,
+                window,
+                if piggyback { &[1] } else { &[] },
+                &[(una.wrapping_add(128).0, una.wrapping_add(384).0)],
+            );
+            assert_eq!(a.recovery_pipe(una), 256);
+            assert_eq!(a.duplicate_acks, 1);
+            assert!(a.limited_pending);
+            let budget = if piggyback { 116 } else { 128 };
+            for i in 0..packets {
+                let nxt = a.snd_nxt;
+                let sent = a.limited_sent;
+                let limited_end = a.limited_end;
+                let deadline = a.rto_deadline;
+                assert_eq!(a.transmit(51, &mut [0; 8]), Err(Error::OutputTooSmall));
+                assert_eq!(a.snd_nxt, nxt);
+                assert_eq!(a.limited_sent, sent);
+                assert_eq!(a.limited_end, limited_end);
+                assert_eq!(a.rto_deadline, deadline);
+                assert!(a.limited_pending);
+                let bytes = packet(&mut a, 51);
+                let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(segment.header.sequence, end.wrapping_add(i * budget).0);
+                assert_eq!(segment.payload.len(), budget as usize);
+                assert_eq!(a.limited_sent, (i + 1) * budget);
+                assert_eq!(a.limited_end, Some(a.snd_nxt));
+            }
+            assert!(!a.limited_pending);
+            assert_eq!(a.transmit(52, &mut [0; 1024]), Ok(None));
+            assert_eq!(a.duplicate_acks, 1);
+            assert!(a.recovery_pipe(una) <= a.congestion.cwnd());
+            assert!(a.flight() <= a.snd_wnd);
+        }
+    }
+
     fn sack_config(mss: u16) -> ConnectionConfig {
         ConnectionConfig {
             sack: true,
@@ -6117,7 +6263,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc6675#section-4
     //= type=test
-    //= reason=Full-SMSS-budget priority evidence only; reduced packet budgets can falsely promote loss (section-4 NextSeg/rule (1.c) TODOs).
+    //= reason=Negotiated non-RACK/non-PRR SACK; full-budget and piggybacked-SACK regressions exercise lost/new/speculative/rescue priority. IsLost uses SMSS independently of output clipping; markers commit only after encoding.
     //# NextSeg () MUST return the
     //# sequence number range of the next segment that is to be
     //# transmitted, per the following rules:
@@ -6140,7 +6286,7 @@ mod tests {
     //# acknowledged [RFC2018].
     //= https://www.rfc-editor.org/rfc/rfc6675#section-4
     //= type=test
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. With packet budget equal to SMSS, the next lost hole at offset 256 skips SACKed offset 128 and output is <= SMSS. This does not establish correct loss classification with piggybacked SACK; see rule (1.c) TODO.
+    //= reason=Negotiated non-RACK/non-PRR SACK; lowest_hole uses SMSS for IsLost and output is clipped to the packet budget. Integrated 240/256/257-byte SACK cases verify the strict loss threshold and fresh-data priority with SMSS 128 and budget 116.
     //# (1) If there exists a smallest unSACKed sequence number 'S2' that meets the
     //# following three criteria for determining loss, the sequence range of one
     //# segment of up to SMSS octets starting with S2 MUST be returned.
@@ -6173,15 +6319,15 @@ mod tests {
     //# edge is advanced over it.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-4
     //= type=test
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Full-SMSS-budget test selects offset 256 after entry, skipping SACKed bytes. Connection passes packet_mss to IsLost via lowest_hole; a reduced budget can falsely classify loss. Helper tests using SMSS remain valid; see rule (1.c) TODO.
+    //= reason=Negotiated non-RACK/non-PRR SACK; lowest_hole uses SMSS for IsLost and output is clipped to the packet budget. Integrated 240/256/257-byte SACK cases verify the strict loss threshold and fresh-data priority with SMSS 128 and budget 116.
     //# (1.a) S2 is greater than HighRxt.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-4
     //= type=test
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Full-SMSS-budget test selects offset 256 after entry, skipping SACKed bytes. Connection passes packet_mss to IsLost via lowest_hole; a reduced budget can falsely classify loss. Helper tests using SMSS remain valid; see rule (1.c) TODO.
+    //= reason=Negotiated non-RACK/non-PRR SACK; lowest_hole uses SMSS for IsLost and output is clipped to the packet budget. Integrated 240/256/257-byte SACK cases verify the strict loss threshold and fresh-data priority with SMSS 128 and budget 116.
     //# (1.b) S2 is less than the highest octet covered by any received SACK.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-4
     //= type=test
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Full-SMSS-budget test selects offset 256 after entry, skipping SACKed bytes. Connection passes packet_mss to IsLost via lowest_hole; a reduced budget can falsely classify loss. Helper tests using SMSS remain valid; see rule (1.c) TODO.
+    //= reason=Negotiated non-RACK/non-PRR SACK; lowest_hole uses SMSS for IsLost and output is clipped to the packet budget. Integrated 240/256/257-byte SACK cases verify the strict loss threshold and fresh-data priority with SMSS 128 and budget 116.
     //# (1.c) IsLost (S2) returns true.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
     //= type=test
@@ -6320,7 +6466,7 @@ mod tests {
     //# and take the following steps:
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
     //= type=test
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Limited-transmit test checks one new transmission per fresh-evidence ACK and exclusion from reduction, not exhaustion of multi-SMSS credit from one ACK; see (3.3) TODO.
+    //= reason=Negotiated non-RACK/non-PRR SACK; each output poll recomputes SetPipe and sends up to the packet budget while SMSS credit and peer window permit. Integrated tests exhaust two-SMSS credit from one ACK, check window/option limits and failed-output rollback.
     //# (3) The TCP MAY transmit previously unsent data segments as per Limited
     //# Transmit [RFC5681], except that the number of octets which may be sent is
     //# governed by pipe and cwnd as follows:
@@ -6349,11 +6495,11 @@ mod tests {
     //# (3.1) Set HighRxt to HighACK.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
     //= type=test
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. First limited-transmit output computes pipe for credit; limited_pending clearing prevents the required return to SetPipe when more credit remains (3.3 TODO).
+    //= reason=Negotiated non-RACK/non-PRR SACK; each output poll recomputes SetPipe and sends up to the packet budget while SMSS credit and peer window permit. Integrated tests exhaust two-SMSS credit from one ACK, check window/option limits and failed-output rollback.
     //# (3.2) Run SetPipe ().
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
     //= type=test
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. First limited-transmit output checks pipe/cwnd and peer window, sends <=SMSS and advances snd_nxt. It clears limited_pending even if credit remains; repeated SetPipe/transmit for one ACK is not established (3.3 TODO).
+    //= reason=Negotiated non-RACK/non-PRR SACK; each output poll recomputes SetPipe and sends up to the packet budget while SMSS credit and peer window permit. Integrated tests exhaust two-SMSS credit from one ACK, check window/option limits and failed-output rollback.
     //# (3.3) If (cwnd - pipe) >= 1 SMSS, there exists previously unsent data, and
     //# the receiver's advertised window allows, transmit up to 1 SMSS of data
     //# starting with the octet HighData+1 and update HighData to reflect this
@@ -6681,19 +6827,19 @@ mod tests {
     //# transmitted, per the following rules:
     //= https://www.rfc-editor.org/rfc/rfc6675#section-4
     //= type=test
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Ordinary full-SMSS-budget tests show lost/new/speculative/rescue priorities. Reduced packet budgets also lower the IsLost threshold incorrectly; see section-4 NextSeg/rule (1.c) TODOs.
+    //= reason=Negotiated non-RACK/non-PRR SACK; full-budget and piggybacked-SACK regressions exercise lost/new/speculative/rescue priority. IsLost uses SMSS independently of output clipping; markers commit only after encoding.
     //# NextSeg () MUST return the sequence number range of the next segment that is
     //# to be transmitted, per the following rules:
     //= https://www.rfc-editor.org/rfc/rfc6675#section-4
     //= type=test
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Full-SMSS-budget test sends queued data before a speculative hole; snd_nxt advances and RecoveryPoint stays fixed. Reduced packet budgets can incorrectly promote a nonlost hole over new data; see rule (1.c) TODO.
+    //= reason=Negotiated non-RACK/non-PRR SACK; full-budget and budget-116 tests send fresh data before nonlost holes and keep RecoveryPoint fixed.
     //# (2) If no sequence number 'S2' per rule (1) exists but there exists
     //# available unsent data and the receiver's advertised window allows, the
     //# sequence range of one segment of up to SMSS octets of previously unsent data
     //# starting with sequence number HighData+1 MUST be returned.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
     //= type=test
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. During active recovery, repeated output polls consume pipe/cwnd credit and stop below SMSS. This is not evidence for the pre-recovery limited-transmit loop; see (3.3) TODO.
+    //= reason=Negotiated non-RACK/non-PRR SACK; active recovery polls consume pipe/cwnd credit and stop below SMSS; separate limited-transmit regression checks the pre-recovery loop.
     //# (C) If cwnd - pipe >= 1 SMSS, the sender SHOULD transmit one or more
     //# segments as follows:
     //= https://www.rfc-editor.org/rfc/rfc6675#section-2
@@ -6765,7 +6911,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc6675#section-4
     //= type=test
-    //= reason=Full-SMSS-budget priority evidence only; reduced packet budgets can falsely promote loss (section-4 NextSeg/rule (1.c) TODOs).
+    //= reason=Negotiated non-RACK/non-PRR SACK; full-budget and piggybacked-SACK regressions exercise lost/new/speculative/rescue priority. IsLost uses SMSS independently of output clipping; markers commit only after encoding.
     //# NextSeg () MUST return the
     //# sequence number range of the next segment that is to be
     //# transmitted, per the following rules:

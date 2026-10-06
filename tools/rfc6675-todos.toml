@@ -61,38 +61,3 @@ retransmission of the same data or a premature rescue retransmission, set
 both HighRxt and RescueRxt to the highest sequence number in the
 retransmitted segment.
 '''
-
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6675#section-4"
-reason = "Connection passes packet_mss, not SMSS, to lowest_hole(..., true), which uses it for IsLost. Piggybacked SACK can reduce 128 to 116: 240 SACKed bytes then exceed 2*116 but not 2*128 and incorrectly promote a nonlost hole over unsent data. Full-SMSS helper/priority tests do not cover this integration gap. No production fix in this audit."
-quote = '''
-NextSeg () MUST return the sequence number range of the next segment that is
-to be transmitted, per the following rules:
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6675#section-4"
-reason = "Connection uses the output packet budget as the IsLost SMSS parameter via lowest_hole(..., true); reduced option budgets can fabricate a rule-(1) candidate. See NextSeg/rule (1.c) TODOs; ordinary full-SMSS-budget evidence is partial only."
-quote = '''
-(1) If there exists a smallest unSACKed sequence number 'S2' that meets the
-following three criteria for determining loss, the sequence range of one
-segment of up to SMSS octets starting with S2 MUST be returned.
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6675#section-4"
-reason = "lowest_hole helper correctly applies its supplied SMSS, but Connection supplies packet_mss. With SMSS=128 and piggyback budget=116, 240 covered bytes incorrectly satisfy the byte-loss threshold and outrank unsent data. Preserve helper SMSS tests; separate loss-threshold SMSS from output clipping in a future runtime fix."
-quote = '''
-(1.c) IsLost (S2) returns true.
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
-reason = "Successful first limited-transmit output clears limited_pending instead of repeating SetPipe while credit remains. With flight=cwnd=512, SMSS=128 and SACK [128,384), pipe=256 leaves two SMSS credit but only one sends. Existing test covers one send per fresh-evidence ACK, not this loop. No production fix or waiver."
-quote = '''
-(3.3) If (cwnd - pipe) >= 1 SMSS, there exists previously unsent data, and
-the receiver's advertised window allows, transmit up to 1 SMSS of data
-starting with the octet HighData+1 and update HighData to reflect this
-transmission, then return to (3.2).
-'''
