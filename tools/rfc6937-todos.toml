@@ -1,17 +1,3 @@
-# Remaining composition gaps; strict-policy evidence is not a legacy waiver.
-
-# entry
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
-reason = "Rfc6937Crb now initializes delivered=out=credit=0 and never floors entry credit; strict timer/ACK traces prove that contract. Unresolved composition: RFC 6675 requires an entry-SMSS retransmission even when strict sndcnt is zero or one byte (strict_prr_nonrack_entry_is_credit_limited_not_forced_smss). RACK uses RFC 8985 modified recovery instead. This exact entry TODO is retained for the non-RACK forced-entry conflict; LegacyInitialCredit deliberately preserves its unconditional MSS and is not RFC 6937 or RFC 9937 evidence."
-quote = '''
-At the beginning of recovery, initialize PRR state.
-'''
-
-# pipe
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
-reason = "Strict non-RACK PRR uses Scoreboard::pipe, but its credit-limited entry cannot universally satisfy RFC 6675 forced entry-SMSS. RACK must use modified recovery per RFC 8985 section 9.2: strict_prr_rack_pipe_reordered_originals_and_lost_retransmissions tests real reordered originals, committed copies, repeated copy loss and both equation branches. This establishes the modified estimator, not literal RFC 6675 composition; keep the exact pipe TODO rather than assert interchangeable estimators or waive the entry conflict."
-quote = '''
-pipe = (RFC 6675 pipe algorithm)
-'''
+# No remaining strict Rfc6937Crb TODOs in the negotiated-SACK/valid-ledger profile.
+# Non-RACK literal Scoreboard::pipe and RFC8985 modified Rack::pipe have separate evidence.
+# LegacyInitialCredit is compatibility-only, not RFC6937 conformance evidence.

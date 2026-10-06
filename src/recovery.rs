@@ -1173,16 +1173,16 @@ pub(crate) struct Prr {
 
 impl Prr {
     //= https://www.rfc-editor.org/rfc/rfc6937#section-3
-    //= reason=Rfc6937Crb initializes zero counters/credit and caller flight; only LegacyInitialCredit grants an unconditional MSS. Non-RACK forced entry-SMSS composition remains a TODO, not a waiver.
+    //= reason=Rfc6937Crb initializes zero counters/credit and caller flight; only LegacyInitialCredit grants an unconditional MSS. ACK-driven non-RACK entry counts only current ACK delivery; RFC6675 head selection permits sub-SMSS output under PRR credit.
     //# At the beginning of recovery, initialize PRR state.
     //= https://www.rfc-editor.org/rfc/rfc6937#section-3
-    //= reason=Rfc6937Crb initializes zero counters/credit and caller flight; only LegacyInitialCredit grants an unconditional MSS. Non-RACK forced entry-SMSS composition remains a TODO, not a waiver.
+    //= reason=Rfc6937Crb initializes zero counters/credit and caller flight; only LegacyInitialCredit grants an unconditional MSS. ACK-driven non-RACK entry counts only current ACK delivery; RFC6675 head selection permits sub-SMSS output under PRR credit.
     //# prr_delivered = 0         // Total bytes delivered during recovery
     //= https://www.rfc-editor.org/rfc/rfc6937#section-3
-    //= reason=Rfc6937Crb initializes zero counters/credit and caller flight; only LegacyInitialCredit grants an unconditional MSS. Non-RACK forced entry-SMSS composition remains a TODO, not a waiver.
+    //= reason=Rfc6937Crb initializes zero counters/credit and caller flight; only LegacyInitialCredit grants an unconditional MSS. ACK-driven non-RACK entry counts only current ACK delivery; RFC6675 head selection permits sub-SMSS output under PRR credit.
     //# prr_out = 0               // Total bytes sent during recovery
     //= https://www.rfc-editor.org/rfc/rfc6937#section-3
-    //= reason=Rfc6937Crb initializes zero counters/credit and caller flight; only LegacyInitialCredit grants an unconditional MSS. Non-RACK forced entry-SMSS composition remains a TODO, not a waiver.
+    //= reason=Rfc6937Crb initializes zero counters/credit and caller flight; only LegacyInitialCredit grants an unconditional MSS. ACK-driven non-RACK entry counts only current ACK delivery; RFC6675 head selection permits sub-SMSS output under PRR credit.
     //# RecoverFS = snd.nxt-snd.una // FlightSize at the start of recovery
     pub(crate) fn new(flight: u32, mss: u32, algorithm: PrrAlgorithm) -> Self {
         Self {
@@ -1276,7 +1276,7 @@ impl Prr {
     }
 
     // Entry policy, not an RFC 6937 CRB equation: this may permit out > delivered.
-    // Strict mode never applies this override; the forced-entry composition TODO remains.
+    // Strict mode never applies this compatibility override.
     pub(crate) fn guarantee_initial(&mut self, mss: u32) {
         if self.algorithm == PrrAlgorithm::LegacyInitialCredit {
             self.credit = self.credit.max(mss);

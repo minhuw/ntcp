@@ -1002,7 +1002,7 @@ impl Connection {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc6937#section-3
-    //= reason=Uses Scoreboard::pipe without RACK, Rack::pipe with RACK. The latter is not proof of the literal RFC 6675 estimator; TODO remains.
+    //= reason=Strict non-RACK uses literal Scoreboard::pipe, exercised by strict_prr_nonrack_ack_driven_entry_and_scoreboard_pipe. RACK uses Rack::pipe under RFC8985 section9.2 modified recovery, separately exercised by strict_prr_rack_pipe_reordered_originals_and_lost_retransmissions; the estimators are not interchangeable.
     //# pipe = (RFC 6675 pipe algorithm)
     fn recovery_pipe(&self, high_rxt: Seq) -> u32 {
         if self.rack_enabled() {
@@ -1064,13 +1064,13 @@ impl Connection {
     //# congestion control actions taken upon the losses detected by RACK-
     //# TLP.
     //= https://www.rfc-editor.org/rfc/rfc6937#section-3
-    //= reason=Scoped entry evidence: threshold selected by Congestion and flight passed to Prr::new. Does not justify the initial-MSS override or delayed-entry delivery policy; tracked TODOs remain.
+    //= reason=Strict Rfc6937Crb: threshold selected by Congestion, flight passed to zero-initialized Prr::new; ACK-driven non-RACK entry counts only current ACK delivery and timer entry grants zero credit. LegacyInitialCredit override/replay is not conformance evidence.
     //# At the beginning of recovery, initialize PRR state.
     //= https://www.rfc-editor.org/rfc/rfc6937#section-3
-    //= reason=Scoped entry evidence: threshold selected by Congestion and flight passed to Prr::new. Does not justify the initial-MSS override or delayed-entry delivery policy; tracked TODOs remain.
+    //= reason=Strict Rfc6937Crb: threshold selected by Congestion, flight passed to zero-initialized Prr::new; ACK-driven non-RACK entry counts only current ACK delivery and timer entry grants zero credit. LegacyInitialCredit override/replay is not conformance evidence.
     //# ssthresh = CongCtrlAlg()  // Target cwnd after recovery
     //= https://www.rfc-editor.org/rfc/rfc6937#section-3
-    //= reason=Scoped entry evidence: threshold selected by Congestion and flight passed to Prr::new. Does not justify the initial-MSS override or delayed-entry delivery policy; tracked TODOs remain.
+    //= reason=Strict Rfc6937Crb: threshold selected by Congestion, flight passed to zero-initialized Prr::new; ACK-driven non-RACK entry counts only current ACK delivery and timer entry grants zero credit. LegacyInitialCredit override/replay is not conformance evidence.
     //# RecoverFS = snd.nxt-snd.una // FlightSize at the start of recovery
     fn start_sack_recovery(&mut self) -> bool {
         if self.sack_guard.is_some()
@@ -4611,11 +4611,9 @@ impl Connection {
                 }
             } else if recovery.entry_pending {
                 // SACK is advisory: RFC 6675 entry starts at HighACK+1.
-                // With strict PRR this candidate is credit-clipped below, so
-                // the RFC 6675 forced entry-SMSS guarantee is NOT claimed.
-                // RFC 6937 governs quantity, not selection; RACK instead uses
-                // RFC 8985 section 9.2 modified recovery. Keep the composition
-                // TODO for non-RACK strict PRR, especially zero/tiny delivery.
+                // RFC 6937 replaces congestion control, not this selection:
+                // strict credit can clip the retransmission below SMSS.
+                // RACK uses RFC 8985 section 9.2 modified recovery instead.
                 let range = after(self.data_high(), self.snd_una).then_some((
                     self.snd_una,
                     self.snd_una.wrapping_add(
@@ -9454,6 +9452,12 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.2
+    //= type=test
+    //= reason=Strict PRR with modified RACK recovery: reordered originals, committed retransmissions and repeated copy loss exercise Rack::pipe and both credit branches. This is not literal RFC6675 Scoreboard::pipe evidence; the non-RACK ACK-driven trace covers that composition separately.
+    //# Therefore, the algorithm [RFC6675]
+    //# MUST NOT be used with RACK-TLP; instead, a modified recovery
+    //# algorithm that carefully addresses such a case is needed.
     fn strict_prr_rack_pipe_reordered_originals_and_lost_retransmissions() {
         for iss in [0, u32::MAX - 4999] {
             let mut a = strict_flight(iss);
@@ -9517,20 +9521,109 @@ mod tests {
     }
 
     #[test]
-    fn strict_prr_nonrack_entry_is_credit_limited_not_forced_smss() {
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Strict non-RACK ACK-driven entry: three fresh tiny SACK ACKs, one ACK with three discontiguous ranges, and full-size delivery. Exact current-ACK credit, HighACK+1 output, committed bytes/markers/SetPipe and accounted full-ACK exit across wrap. PRR replaces congestion control, not selection; no artificial MSS floor. LegacyInitialCredit is not covered.
+    //# At the beginning of recovery, initialize PRR state.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Strict non-RACK uses literal Scoreboard::pipe: proportional and CRB entry branches, exact pipe before/after committed head retransmission, failed-output stability and full-ACK exit. RACK instead uses RFC8985 modified Rack::pipe; its reordered-original/lost-copy evidence is separate.
+    //# pipe = (RFC 6675 pipe algorithm)
+    fn strict_prr_nonrack_ack_driven_entry_and_scoreboard_pipe() {
         for iss in [0, u32::MAX - 4999] {
-            let mut a = strict_flight(iss);
-            a.config.rack = false;
-            assert!(a.start_sack_recovery());
-            assert_eq!(a.prr.unwrap().credit(), 0);
-            assert_eq!(a.transmit(200_000, &mut [0; 1500]), Ok(None));
-            // One byte of fresh SACK delivery, no IsLost inference, pipe above
-            // target: CEIL(1*5000/10000)=1. RFC 6675's forced SMSS would exceed
-            // this budget. Preserve the composition TODO, not a conformance waiver.
-            strict_ack(&mut a, 200_001, 0, &[(9000, 9001)]);
-            assert_eq!(a.prr.unwrap().credit(), 1);
-            assert_eq!(prr_packet(&mut a, 200_001).1, 1);
-            assert_eq!(a.prr.unwrap().counters(), (10_000, 1, 1));
+            for (acks, delivered, credit, pipe, exit_delivered) in [
+                // The first two ACKs are outside the epoch, not replayed.
+                (
+                    vec![vec![(9000, 9001)], vec![(9000, 9002)], vec![(9000, 9003)]],
+                    1,
+                    1,
+                    9997,
+                    9998,
+                ),
+                // Three discontiguous ranges infer head loss on the first ACK.
+                (
+                    vec![vec![(3000, 3001), (6000, 6001), (9000, 9001)]],
+                    3,
+                    2,
+                    6997,
+                    10_000,
+                ),
+                // More than 2*SMSS delivered infers loss; pipe is below target.
+                (
+                    vec![vec![(7000, 8000)], vec![(7000, 9000)], vec![(7000, 10_000)]],
+                    1000,
+                    1000,
+                    0,
+                    8000,
+                ),
+            ] {
+                let mut a = strict_flight(iss);
+                a.config.rack = false;
+                let base = a.snd_una;
+                let point = a.data_high();
+                for (index, blocks) in acks.iter().enumerate() {
+                    assert!(a.sack_recovery.is_none());
+                    strict_ack(&mut a, 200_000 + index as u64, 0, blocks);
+                    if index + 1 < acks.len() {
+                        assert!(a.prr.is_none());
+                        assert!(a.sack_recovery.is_none());
+                    }
+                }
+                let now = 200_000 + acks.len() as u64;
+                let recovery = a.sack_recovery.unwrap();
+                assert!(recovery.entry_pending);
+                assert_eq!(recovery.recovery_point, point);
+                assert_eq!(recovery.high_rxt, base);
+                assert_eq!(recovery.rescue_rxt, None);
+                assert_eq!(recovery.pipe, pipe);
+                assert_eq!(a.recovery_pipe(base), pipe);
+                assert_eq!(a.congestion.ssthresh(), 5000);
+                assert_eq!(a.prr.unwrap().counters(), (10_000, delivered, 0));
+                assert_eq!(a.prr.unwrap().credit(), credit);
+
+                assert_eq!(a.transmit(now, &mut [0; 20]), Err(Error::OutputTooSmall));
+                let retry = a.sack_recovery.unwrap();
+                assert!(retry.entry_pending);
+                assert_eq!(retry.high_rxt, base);
+                assert_eq!(retry.rescue_rxt, None);
+                assert_eq!(retry.pipe, pipe);
+                assert_eq!(a.prr.unwrap().counters(), (10_000, delivered, 0));
+                assert_eq!(a.prr.unwrap().credit(), credit);
+                // RFC6675 step 4.3 selects HighACK+1 and permits sub-SMSS.
+                assert_eq!(prr_packet(&mut a, now), (base.0, credit as usize));
+                let committed = a.sack_recovery.unwrap();
+                let end = base.wrapping_add(credit);
+                assert!(!committed.entry_pending);
+                assert_eq!(committed.high_rxt, end);
+                assert_eq!(committed.rescue_rxt, Some(end));
+                assert_eq!(committed.recovery_point, point);
+                assert_eq!(committed.pipe, pipe + credit);
+                assert_eq!(a.recovery_pipe(end), pipe + credit);
+                assert_eq!(
+                    a.prr.unwrap().counters(),
+                    (10_000, delivered, u64::from(credit))
+                );
+                assert_eq!(a.prr.unwrap().credit(), 0);
+                assert_eq!(a.transmit(now, &mut [0; 1500]), Ok(None));
+
+                strict_ack(&mut a, now + 1, 0, acks.last().unwrap());
+                assert_eq!(
+                    a.prr.unwrap().counters(),
+                    (10_000, delivered, u64::from(credit))
+                );
+                assert_eq!(a.prr.unwrap().credit(), 0); // No repeated-ACK floor.
+                assert_eq!(a.sack_recovery.unwrap().pipe, pipe + credit);
+                assert_eq!(a.transmit(now + 1, &mut [0; 1500]), Ok(None));
+                strict_ack(&mut a, now + 2, 10_000, &[]);
+                assert_eq!(a.snd_una, point);
+                assert!(a.sack_recovery.is_none());
+                assert!(a.prr.is_none());
+                let exit = a.prr_exit_trace.unwrap();
+                assert_eq!(exit.counters(), (10_000, exit_delivered, u64::from(credit)));
+                assert_eq!(exit.credit(), 5000);
+                assert_eq!(a.recovery_pipe(end), 0);
+                assert_eq!(a.transmit(now + 2, &mut [0; 1500]), Ok(None));
+            }
         }
     }
 
