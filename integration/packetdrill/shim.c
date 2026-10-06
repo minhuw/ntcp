@@ -8,6 +8,7 @@
 #include <stdarg.h>
 #include <linux/sockios.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +16,7 @@
 
 extern long long ntcp_call(void *, int, int, int, int, const void *, size_t, void *, size_t, long long *);
 extern void ntcp_free(void *);
+extern long long ntcp_host_call(int, int, void *, size_t);
 static int unsupported(const char *why) {
     fprintf(stderr, "NTCP_PACKETDRILL_UNSUPPORTED: %s\n", why);
     errno = ENOSYS; return -1;
@@ -150,7 +152,37 @@ static int setopt(void *u, int fd, int level, int name, const void *p, socklen_t
     int key = level == IPPROTO_IP ? (name == IP_TOS ? 6 : 7) : level == SOL_SOCKET ? 1 : name == TCP_NODELAY ? 2 : 5;
     return SIMPLE(11, fd, key, value);
 }
+static int metric_option(int level, int name) {
+    if (level == IPPROTO_TCP && name == TCP_INFO) return 1;
+    if (level == IPPROTO_TCP && name == TCP_CC_INFO) return 2;
+    if (level == SOL_SOCKET && name == SO_MEMINFO) return 3;
+    return 0;
+}
+static int metric_getopt(void *u, int host, int fd, int option, void *p, socklen_t *n) {
+    if (!n) return bad(EFAULT);
+    socklen_t capacity; memcpy(&capacity, n, sizeof(capacity));
+    if (!p && capacity) return bad(EFAULT);
+    // Entire pinned ABI is initialized in Rust, never copied from Rust padding.
+    unsigned char data[280] = {0};
+    size_t size = capacity < sizeof(data) ? capacity : sizeof(data);
+    long long result = host ? ntcp_host_call(fd, option, data, size)
+        : CALL(18, fd, option, 0, NULL, 0, data, size, NULL);
+    if (result < 0) return -1;
+    if (result) memcpy(p, data, result);
+    capacity = result; memcpy(n, &capacity, sizeof(capacity));
+    return 0;
+}
+int ntcp_getsockopt_host(int fd, int level, int name, void *p, socklen_t *n) {
+    int option = metric_option(level, name);
+    if (option) {
+        int result = metric_getopt(NULL, 1, fd, option, p, n);
+        if (result >= 0 || errno != ENOENT) return result;
+    }
+    return syscall(SYS_getsockopt, fd, level, name, p, n);
+}
 static int getopt_socket(void *u, int fd, int level, int name, void *p, socklen_t *n) {
+    int option = metric_option(level, name);
+    if (option) return metric_getopt(u, 0, fd, option, p, n);
     if (!((level == SOL_SOCKET && (name == SO_REUSEADDR || name == SO_ERROR || name == SO_TYPE)) || (level == IPPROTO_TCP && (name == TCP_NODELAY || name == TCP_USER_TIMEOUT)) || (level == IPPROTO_IP && (name == IP_TOS || name == IP_MTU_DISCOVER)))) return unsupported("getsockopt option (including TCP_INFO)");
     if (!p || !n) return bad(EFAULT);
     int key = level == IPPROTO_IP ? (name == IP_TOS ? 6 : 7) : level == IPPROTO_TCP ? (name == TCP_NODELAY ? 2 : 5) : name == SO_REUSEADDR ? 1 : name == SO_ERROR ? 3 : 4;
@@ -203,7 +235,7 @@ void ntcp_abi_check(void *u) {
     assert(p.epoll_create && p.epoll_ctl && p.epoll_wait && p.pipe && p.splice);
     assert(p.socket(u, AF_INET6, SOCK_STREAM, 0) == -1 && errno == ENOSYS);
     assert(p.ioctl(u, -1, 0) == -1 && errno == ENOSYS);
-    assert(p.getsockopt(u, -1, IPPROTO_TCP, TCP_INFO, NULL, NULL) == -1 && errno == ENOSYS);
+    assert(p.getsockopt(u, -1, IPPROTO_TCP, TCP_INFO, NULL, NULL) == -1 && errno == EFAULT);
     assert(p.epoll_create(u, 1) == -1 && errno == ENOSYS);
     assert(p.epoll_ctl(u, -1, 0, -1, NULL) == -1 && errno == ENOSYS);
     assert(p.epoll_wait(u, -1, NULL, 0, 0) == -1 && errno == ENOSYS);

@@ -12,6 +12,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     ptr, slice,
     sync::{
+        RwLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
@@ -19,6 +20,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+static INSTANCE: RwLock<usize> = RwLock::new(0);
 const LIMIT: usize = 128;
 const BYTES: usize = 65535;
 const BUDGET: usize = 32;
@@ -60,6 +62,17 @@ struct Token {
     retained: OwnedFd,
 }
 impl Token {
+    fn matches(&self) -> bool {
+        let mut live: stat = unsafe { std::mem::zeroed() };
+        let mut retained: stat = unsafe { std::mem::zeroed() };
+        unsafe {
+            fstat(self.fd, &mut live) == 0
+                && fstat(self.retained.as_raw_fd(), &mut retained) == 0
+                && live.st_dev == retained.st_dev
+                && live.st_ino == retained.st_ino
+                && live.st_mode == retained.st_mode
+        }
+    }
     fn new() -> Result<Self> {
         Self::with_duplicate(|fd| unsafe { fcntl(fd, F_DUPFD_CLOEXEC, 0) })
     }
@@ -291,6 +304,9 @@ impl Adapter {
         })
     }
     fn call(&self, mut request: Request) -> Result<Response> {
+        if self.stop.load(Ordering::Acquire) {
+            return Err(ECANCELED);
+        }
         if self.failed.load(Ordering::Acquire) {
             return Err(EIO);
         }
@@ -333,6 +349,8 @@ impl Owner {
             ntcp::InitialWindow::Rfc5681
         };
         config.connection.timestamps = profile == Profile::UpstreamSack;
+        config.connection.rack = profile == Profile::UpstreamSack;
+        config.connection.prr = profile == Profile::UpstreamSack;
         config.connection.sack = matches!(profile, Profile::Sack | Profile::UpstreamSack);
         config.connection.recovery_algorithm = ntcp::RecoveryAlgorithm::NewReno;
         config.connection.receive_ip_payload_limit = 65515;
@@ -547,6 +565,20 @@ impl Owner {
     fn execute(&mut self, r: &mut Request) -> Result<Option<Response>> {
         let mut response = Response::default();
         match r.op {
+            18 | 19 => {
+                let owned = self
+                    .sockets
+                    .get(&r.fd)
+                    .is_some_and(|s| s.token.as_ref().is_some_and(Token::matches));
+                if !owned {
+                    return Err(if r.op == 19 { ENOENT } else { EBADF });
+                }
+                let id = self.connection(r.fd)?;
+                let info = self.endpoint.transport_info(id).map_err(error)?;
+                response.bytes = transport_option(info, r.a)?;
+                response.bytes.truncate(r.capacity);
+                response.value = response.bytes.len() as i64;
+            }
             1 => response.value = self.alloc(Socket::new(r.a))? as i64,
             2 => {
                 let address = decode_addr(&r.bytes)?;
@@ -1168,12 +1200,98 @@ fn encode_addr(addr: SocketAddr) -> Vec<u8> {
         .to_vec()
     }
 }
+// Pinned stock _tcp_info is 280 bytes. Only the fields explicitly written
+// below are supported; every other field is reserved zero, NOT a metric.
+// Embedded-code assertions require the runner's field capability allowlist.
+const TCP_INFO_SIZE: usize = 280;
+fn transport_option(info: ntcp::TransportInfo, option: i32) -> Result<Vec<u8>> {
+    if option == 2 {
+        return Ok(Vec::new());
+    } // Reno/NewReno have no CC-specific data.
+    let mut bytes = vec![0; if option == 3 { 9 * 4 } else { TCP_INFO_SIZE }];
+    let mut put = |offset: usize, value: u64| {
+        let value = value.min(u32::MAX as u64) as u32;
+        bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+    };
+    if option == 3 {
+        // Fixed core storage, not Linux skb accounting: RMEM_ALLOC
+        // is occupied receive bytes; RCVBUF/SNDBUF are allocated capacities;
+        // WMEM_QUEUED is retained send bytes. No skb/option/backlog/drop buckets.
+        put(0, info.receive_used as u64);
+        put(4, info.receive_capacity as u64);
+        put(12, info.send_capacity as u64);
+        put(20, info.send_used as u64);
+        return Ok(bytes);
+    }
+    if !info.ledger_valid {
+        return Err(unsupported(
+            "TCP_INFO segment counts: bounded transport ledger invalid",
+        ));
+    }
+    if info.mss == 0 {
+        return Err(EIO);
+    }
+    put(8, info.rto_us);
+    put(16, info.mss as u64);
+    put(24, info.unacked as u64);
+    put(28, info.sacked as u64);
+    put(32, info.lost as u64);
+    put(36, info.retransmitted as u64);
+    put(68, info.rtt_us.unwrap_or(0));
+    put(72, info.rttvar_us);
+    put(76, (info.ssthresh / info.mss) as u64);
+    put(80, (info.cwnd / info.mss) as u64);
+    put(88, info.reordering as u64);
+    bytes[0] = match info.state {
+        State::Established => 1,
+        State::SynSent => 2,
+        State::SynReceived => 3,
+        State::FinWait1 => 4,
+        State::FinWait2 => 5,
+        State::TimeWait => 6,
+        State::Closed => 7,
+        State::CloseWait => 8,
+        State::LastAck => 9,
+        State::Closing => 11,
+    };
+    bytes[1] = if info.loss {
+        4
+    } else if info.recovery {
+        3
+    } else if info.sacked > 0 {
+        1
+    } else {
+        0
+    };
+    Ok(bytes)
+}
 unsafe extern "C" {
     fn ntcp_fill(interface: *mut c_void, userdata: *mut c_void);
+    fn ntcp_getsockopt_host(
+        fd: i32,
+        level: i32,
+        name: i32,
+        p: *mut c_void,
+        n: *mut socklen_t,
+    ) -> i32;
+}
+#[unsafe(no_mangle)]
+unsafe extern "C" fn getsockopt(
+    fd: i32,
+    level: i32,
+    name: i32,
+    p: *mut c_void,
+    n: *mut socklen_t,
+) -> i32 {
+    unsafe { ntcp_getsockopt_host(fd, level, name, p, n) }
 }
 #[unsafe(no_mangle)]
 unsafe extern "C" fn packetdrill_interface_init(flags: *const c_char, interface: *mut c_void) {
+    let mut instance = INSTANCE.write().unwrap_or_else(|e| e.into_inner());
     let adapter = catch_unwind(AssertUnwindSafe(|| {
+        if *instance != 0 {
+            return Err(unsupported("only one plugin instance is supported"));
+        }
         if flags.is_null() {
             return Err(unsupported("missing so_flags"));
         }
@@ -1182,7 +1300,7 @@ unsafe extern "C" fn packetdrill_interface_init(flags: *const c_char, interface:
             .map_err(|_| EINVAL)?;
         Adapter::start(profile(flags)?)
     }));
-    let userdata = match adapter {
+    let userdata: *mut c_void = match adapter {
         Ok(Ok(adapter)) => Box::into_raw(Box::new(adapter)).cast(),
         Ok(Err(_)) => ptr::null_mut(),
         Err(_) => {
@@ -1191,6 +1309,9 @@ unsafe extern "C" fn packetdrill_interface_init(flags: *const c_char, interface:
         }
     };
     if !interface.is_null() {
+        if !userdata.is_null() {
+            *instance = userdata as usize;
+        }
         unsafe {
             ntcp_fill(interface, userdata);
         }
@@ -1203,7 +1324,19 @@ unsafe extern "C" fn packetdrill_interface_init(flags: *const c_char, interface:
 #[unsafe(no_mangle)]
 unsafe extern "C" fn ntcp_free(userdata: *mut c_void) {
     if catch_unwind(AssertUnwindSafe(|| {
-        if !userdata.is_null() {
+        // Wake blocking callbacks before waiting for their lifecycle read locks.
+        {
+            let instance = INSTANCE.read().unwrap_or_else(|e| e.into_inner());
+            if userdata.is_null() || *instance != userdata as usize {
+                return;
+            }
+            unsafe { &*userdata.cast::<Adapter>() }
+                .stop
+                .store(true, Ordering::Release);
+        }
+        let mut instance = INSTANCE.write().unwrap_or_else(|e| e.into_inner());
+        if !userdata.is_null() && *instance == userdata as usize {
+            *instance = 0;
             unsafe {
                 drop(Box::from_raw(userdata.cast::<Adapter>()));
             }
@@ -1216,6 +1349,56 @@ unsafe extern "C" fn ntcp_free(userdata: *mut c_void) {
 }
 #[unsafe(no_mangle)]
 unsafe extern "C" fn ntcp_call(
+    userdata: *mut c_void,
+    op: i32,
+    fd: i32,
+    a: i32,
+    b: i32,
+    input: *const c_void,
+    input_len: usize,
+    output: *mut c_void,
+    output_len: usize,
+    stamp: *mut i64,
+) -> i64 {
+    let instance = INSTANCE.read().unwrap_or_else(|e| e.into_inner());
+    if userdata.is_null() || *instance != userdata as usize {
+        unsafe {
+            *__errno_location() = EIO;
+        }
+        return -1;
+    }
+    unsafe {
+        call_inner(
+            userdata, op, fd, a, b, input, input_len, output, output_len, stamp,
+        )
+    }
+}
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ntcp_host_call(fd: i32, option: i32, output: *mut c_void, len: usize) -> i64 {
+    let instance = INSTANCE.read().unwrap_or_else(|e| e.into_inner());
+    if *instance == 0 {
+        unsafe {
+            *__errno_location() = ENOENT;
+        }
+        return -1;
+    }
+    unsafe {
+        call_inner(
+            *instance as *mut c_void,
+            19,
+            fd,
+            option,
+            0,
+            ptr::null(),
+            0,
+            output,
+            len,
+            ptr::null_mut(),
+        )
+    }
+}
+#[allow(clippy::too_many_arguments)]
+unsafe fn call_inner(
     userdata: *mut c_void,
     op: i32,
     fd: i32,

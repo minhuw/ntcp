@@ -83,8 +83,150 @@ fn abi_table_null_counts_vectors_variadics_and_host_clock() {
         fn ntcp_abi_check(userdata: *mut c_void);
     }
     let mut adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
+    let userdata = (&mut adapter as *mut Adapter).cast();
+    *INSTANCE.write().unwrap() = userdata as usize;
     unsafe {
-        ntcp_abi_check((&mut adapter as *mut Adapter).cast());
+        ntcp_abi_check(userdata);
+    }
+    *INSTANCE.write().unwrap() = 0;
+    drop(adapter);
+    let mut adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
+    let userdata = (&mut adapter as *mut Adapter).cast();
+    *INSTANCE.write().unwrap() = userdata as usize;
+    let fd = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+        .unwrap()
+        .value as i32;
+    assert_eq!(
+        call(
+            &adapter,
+            5,
+            fd,
+            0,
+            encode_addr(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080)),
+            0
+        )
+        .err(),
+        Some(EINPROGRESS)
+    );
+    let mut info = [0xa5u8; TCP_INFO_SIZE + 8];
+    let mut n = info.len() as socklen_t;
+    unsafe {
+        assert_eq!(
+            getsockopt(fd, IPPROTO_TCP, TCP_INFO, info.as_mut_ptr().cast(), &mut n),
+            0
+        );
+    }
+    assert_eq!(n as usize, TCP_INFO_SIZE);
+    assert_eq!((info[0], info[1]), (2, 0));
+    assert_eq!(&info[TCP_INFO_SIZE..], &[0xa5; 8]);
+    let expected = call(&adapter, 18, fd, 1, vec![], TCP_INFO_SIZE)
+        .unwrap()
+        .bytes;
+    assert_eq!(&info[..TCP_INFO_SIZE], expected);
+    for (option, length) in [(TCP_CC_INFO, 0), (TCP_INFO, TCP_INFO_SIZE)] {
+        for capacity in [0, 1, 7, TCP_INFO_SIZE + 8] {
+            info.fill(0xa5);
+            n = capacity as socklen_t;
+            unsafe {
+                assert_eq!(
+                    getsockopt(fd, IPPROTO_TCP, option, info.as_mut_ptr().cast(), &mut n),
+                    0
+                );
+            }
+            assert_eq!(n as usize, capacity.min(length));
+            assert!(info[n as usize..].iter().all(|b| *b == 0xa5));
+        }
+    }
+    n = 36;
+    unsafe {
+        assert_eq!(
+            getsockopt(fd, SOL_SOCKET, SO_MEMINFO, info.as_mut_ptr().cast(), &mut n),
+            0
+        );
+    }
+    assert_eq!(n, 36);
+    assert_eq!(u32::from_ne_bytes(info[4..8].try_into().unwrap()), 65535);
+    unsafe {
+        assert_eq!(
+            getsockopt(fd, IPPROTO_TCP, TCP_INFO, ptr::null_mut(), &mut n),
+            -1
+        );
+        assert_eq!(*__errno_location(), EFAULT);
+        assert_eq!(
+            getsockopt(
+                fd,
+                IPPROTO_TCP,
+                TCP_INFO,
+                info.as_mut_ptr().cast(),
+                ptr::null_mut()
+            ),
+            -1
+        );
+        assert_eq!(*__errno_location(), EFAULT);
+        assert_eq!(libc::close(fd), 0);
+    }
+    n = TCP_INFO_SIZE as socklen_t;
+    unsafe {
+        assert_eq!(
+            getsockopt(fd, IPPROTO_TCP, TCP_INFO, info.as_mut_ptr().cast(), &mut n),
+            -1
+        );
+        assert_eq!(*__errno_location(), EBADF);
+        let host = libc::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        assert!(host >= 0);
+        if host != fd {
+            assert_eq!(dup2(host, fd), fd);
+            libc::close(host);
+        }
+        assert_eq!(
+            getsockopt(fd, IPPROTO_TCP, TCP_INFO, info.as_mut_ptr().cast(), &mut n),
+            -1
+        );
+        assert_ne!(*__errno_location(), ENOTCONN);
+        let mut domain = 0;
+        n = 4;
+        assert_eq!(
+            getsockopt(
+                fd,
+                SOL_SOCKET,
+                SO_DOMAIN,
+                (&mut domain as *mut i32).cast(),
+                &mut n
+            ),
+            0
+        );
+        assert_eq!(domain, AF_UNIX);
+        assert_eq!(
+            call(&adapter, 18, fd, 1, vec![], TCP_INFO_SIZE).err(),
+            Some(EBADF)
+        );
+        libc::close(fd);
+    }
+    *INSTANCE.write().unwrap() = 0;
+    drop(adapter);
+    n = TCP_INFO_SIZE as socklen_t;
+    unsafe {
+        assert_eq!(
+            getsockopt(-1, IPPROTO_TCP, TCP_INFO, info.as_mut_ptr().cast(), &mut n),
+            -1
+        );
+        assert_eq!(*__errno_location(), EBADF);
+        assert_eq!(
+            ntcp_call(
+                userdata,
+                1,
+                0,
+                0,
+                0,
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut()
+            ),
+            -1
+        );
+        assert_eq!(*__errno_location(), EIO);
     }
 }
 
@@ -1308,4 +1450,171 @@ fn ip_metadata_limit_is_reserved_before_connect_and_reused_after_gc() {
     assert_eq!(owner.connection_ip.len(), LIMIT - 1);
     assert_eq!(owner.execute(&mut connect).err(), Some(EINPROGRESS));
     assert_eq!(owner.connection_ip.len(), LIMIT);
+}
+
+#[test]
+fn host_bridge_preloaded_process_and_lifecycle() {
+    use std::process::Command;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let library = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("libntcp_packetdrill.so");
+    // cargo test alone need not refresh its companion cdylib.
+    let mut build = Command::new("cargo");
+    build
+        .args(["build", "-p", "ntcp-packetdrill", "--manifest-path"])
+        .arg(root.join("Cargo.toml"));
+    if library
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        == "release"
+    {
+        build.arg("--release");
+    }
+    build.arg("--target-dir").arg(
+        library
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap(),
+    );
+    assert!(build.status().unwrap().success());
+    assert!(library.exists(), "missing cdylib: {}", library.display());
+    let dir = std::env::temp_dir().join(format!("ntcp-bridge-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("check.c");
+    std::fs::write(&source, r#"
+#define _GNU_SOURCE
+#include "packetdrill.h"
+#include <assert.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <pthread.h>
+static void *blocked(void *arg) {
+    struct packetdrill_interface *p = arg;
+    unsigned char packet[65535]; size_t n = sizeof(packet); long long t;
+    assert(p->netdev_receive(p->userdata, packet, &n, &t) == -1);
+    assert(errno == ECANCELED || errno == EIO);
+    return NULL;
+}
+int main(void) {
+    void (*init)(const char *, struct packetdrill_interface *) = dlsym(RTLD_DEFAULT, "packetdrill_interface_init");
+    assert(init);
+    struct packetdrill_interface p, other;
+    init("local=192.0.2.1,upstream-sack", &p); assert(p.userdata);
+    init("local=192.0.2.1,baseline", &other); assert(!other.userdata);
+    int fd = p.socket(p.userdata, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP); assert(fd >= 0);
+    struct sockaddr_in addr = {.sin_family=AF_INET, .sin_port=htons(8080), .sin_addr={htonl(0xc0000202)}};
+    assert(p.connect(p.userdata, fd, (void *)&addr, sizeof(addr)) == -1 && errno == EINPROGRESS);
+    unsigned char info[288], abi[280]; memset(info, 0xa5, sizeof(info)); socklen_t n = sizeof(info);
+    assert(getsockopt(fd, IPPROTO_TCP, TCP_INFO, info, &n) == 0 && n == 280 && info[0] == 2);
+    n = sizeof(abi); assert(p.getsockopt(p.userdata, fd, IPPROTO_TCP, TCP_INFO, abi, &n) == 0);
+    assert(memcmp(info, abi, sizeof(abi)) == 0 && info[280] == 0xa5);
+    n = sizeof(abi); assert(syscall(SYS_getsockopt, fd, IPPROTO_TCP, TCP_INFO, abi, &n) == -1);
+    n = sizeof(abi); assert(getsockopt(fd, IPPROTO_TCP, TCP_CC_INFO, abi, &n) == 0 && n == 0);
+    n = sizeof(abi); assert(getsockopt(fd, SOL_SOCKET, SO_MEMINFO, abi, &n) == 0 && n == 36);
+    int domain; n = sizeof(domain); assert(getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &n) == 0 && domain == AF_UNIX);
+    int host = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP); assert(host >= 0);
+    unsigned char kernel[104], forwarded[104]; socklen_t k = sizeof(kernel); n = sizeof(forwarded);
+    assert(syscall(SYS_getsockopt, host, IPPROTO_TCP, TCP_INFO, kernel, &k) == 0);
+    assert(getsockopt(host, IPPROTO_TCP, TCP_INFO, forwarded, &n) == 0 && k == n && !memcmp(kernel, forwarded, n)); close(host);
+    // Drain SYN output; next netdev callback blocks until teardown cancels it.
+    unsigned char packet[65535]; size_t size = sizeof(packet); long long t;
+    assert(p.netdev_receive(p.userdata, packet, &size, &t) == 0);
+    pthread_t thread; assert(!pthread_create(&thread, NULL, blocked, &p)); usleep(10000);
+    p.free(p.userdata); assert(!pthread_join(thread, NULL));
+    p.free(p.userdata); // Stale userdata never dereferenced.
+    n = sizeof(info); assert(getsockopt(fd, IPPROTO_TCP, TCP_INFO, info, &n) == -1 && errno == EBADF);
+    init("local=192.0.2.1,baseline", &p); assert(p.userdata); p.free(p.userdata);
+    return 0;
+}
+"#).unwrap();
+    let executable = dir.join("check");
+    assert!(
+        Command::new("cc")
+            .args(["-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg("-I")
+            .arg(root)
+            .arg(&source)
+            .args(["-ldl", "-o"])
+            .arg(&executable)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut child = Command::new(&executable)
+        .env("LD_PRELOAD", library)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("preload helper deadlocked");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn transport_encoding_counts_recovery_and_invalid_ledger() {
+    let mut owner = Owner::new((local(), Profile::UpstreamSack)).unwrap();
+    let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
+    let (mut req, _) = request(
+        5,
+        fd,
+        0,
+        encode_addr(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080)),
+        0,
+    );
+    assert_eq!(owner.execute(&mut req).err(), Some(EINPROGRESS));
+    let mut info = owner
+        .endpoint
+        .transport_info(owner.connection(fd).unwrap())
+        .unwrap();
+    let data = transport_option(info, 1).unwrap();
+    assert_eq!(data.len(), 280);
+    assert_eq!(
+        u32::from_ne_bytes(data[80..84].try_into().unwrap()),
+        info.cwnd / info.mss
+    );
+    // Exercise each ABI category independently of packet sequence fixtures.
+    info.unacked = 10;
+    info.sacked = 3;
+    info.lost = 2;
+    info.retransmitted = 1;
+    info.reordering = 7;
+    let data = transport_option(info, 1).unwrap();
+    for (offset, count) in [(24, 10), (28, 3), (32, 2), (36, 1), (88, 7)] {
+        assert_eq!(
+            u32::from_ne_bytes(data[offset..offset + 4].try_into().unwrap()),
+            count
+        );
+    }
+    assert_eq!(data[1], 1);
+    info.recovery = true;
+    assert_eq!(transport_option(info, 1).unwrap()[1], 3);
+    info.loss = true;
+    assert_eq!(transport_option(info, 1).unwrap()[1], 4);
+    info.ledger_valid = false;
+    assert_eq!(transport_option(info, 1).err(), Some(ENOSYS));
+    assert!(transport_option(info, 2).unwrap().is_empty());
+    assert_eq!(transport_option(info, 3).unwrap().len(), 36);
 }
