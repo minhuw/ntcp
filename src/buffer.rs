@@ -87,6 +87,7 @@ impl SendBuffer {
 #[derive(Debug)]
 pub(crate) struct ReceiveOutcome {
     pub new_bytes: usize,
+    pub sack_overflow: bool,
     // next() changed, including consumption of FIN.
     pub advanced: bool,
     // FIN became contiguous during this insertion, not merely accepted.
@@ -94,6 +95,22 @@ pub(crate) struct ReceiveOutcome {
     // Nonempty segment starts away from the previous next(), even if rejected.
     pub out_of_order: bool,
 }
+
+const MAX_OOO_RANGES: usize = 64;
+
+#[derive(Clone, Copy, Debug)]
+struct ReceiveRange {
+    start: Seq,
+    end: Seq,
+    // Dense ranks: zero is newest, so no arrival counter can wrap.
+    recency: u8,
+}
+
+const EMPTY_RANGE: ReceiveRange = ReceiveRange {
+    start: Seq(0),
+    end: Seq(0),
+    recency: 0,
+};
 
 #[derive(Debug)]
 pub(crate) struct ReceiveBuffer {
@@ -106,6 +123,9 @@ pub(crate) struct ReceiveBuffer {
     contiguous_len: usize,
     fin_sequence: Option<Seq>,
     eof: bool,
+    ranges: [ReceiveRange; MAX_OOO_RANGES],
+    range_count: usize,
+    dsack: Option<(Seq, Seq)>,
 }
 
 impl ReceiveBuffer {
@@ -128,6 +148,9 @@ impl ReceiveBuffer {
             contiguous_len: 0,
             fin_sequence: None,
             eof: false,
+            ranges: [EMPTY_RANGE; MAX_OOO_RANGES],
+            range_count: 0,
+            dsack: None,
         })
     }
 
@@ -136,6 +159,7 @@ impl ReceiveBuffer {
             return Err(());
         }
         self.read_base = start;
+        self.dsack = None;
         Ok(())
     }
 
@@ -169,6 +193,133 @@ impl ReceiveBuffer {
 
     pub(crate) fn eof(&self) -> bool {
         self.eof
+    }
+
+    // Call once on the raw packet, before trimming or inserting; insertion must not
+    // replace this record with one based on the trimmed payload. FIN is not data.
+    pub(crate) fn record_duplicate(&mut self, sequence: Seq, payload_len: usize) {
+        self.dsack = None;
+        if payload_len == 0 || payload_len >= 1usize << 31 {
+            return;
+        }
+        let frontier = self.read_base.wrapping_add(self.contiguous_len as u32);
+        let distance = sequence.distance_from(frontier);
+        if distance == 1 << 31 {
+            return;
+        }
+        let start = distance as i32 as i64;
+        let end = start + payload_len as i64;
+        if start < 0 {
+            self.dsack = Some((
+                sequence,
+                sequence.wrapping_add(payload_len.min((-start) as usize) as u32),
+            ));
+            return;
+        }
+        for range in &self.ranges[..self.range_count] {
+            let left = start.max(range.start.distance_from(frontier) as i64);
+            let right = end.min(range.end.distance_from(frontier) as i64);
+            if left < right {
+                self.dsack = Some((
+                    frontier.wrapping_add(left as u32),
+                    frontier.wrapping_add(right as u32),
+                ));
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn clear_dsack(&mut self) {
+        self.dsack = None;
+    }
+
+    pub(crate) fn sack_blocks(&self, max_blocks: usize) -> [Option<(u32, u32)>; 4] {
+        let mut blocks = [None; 4];
+        let limit = max_blocks.min(blocks.len());
+        if limit == 0 {
+            return blocks;
+        }
+        let mut count = 0;
+        let mut containing = None;
+        if let Some((start, end)) = self.dsack {
+            blocks[count] = Some((start.0, end.0));
+            count += 1;
+            containing = self.ranges[..self.range_count].iter().position(|range| {
+                let offset = start.distance_from(range.start);
+                offset < range.end.distance_from(range.start)
+                    && end.distance_from(range.start) <= range.end.distance_from(range.start)
+            });
+            if let Some(index) = containing {
+                if count < limit {
+                    let range = self.ranges[index];
+                    blocks[count] = Some((range.start.0, range.end.0));
+                    count += 1;
+                }
+            }
+        }
+        for recency in 0..self.range_count {
+            if count == limit {
+                break;
+            }
+            for (index, range) in self.ranges[..self.range_count].iter().enumerate() {
+                if range.recency as usize == recency && Some(index) != containing {
+                    blocks[count] = Some((range.start.0, range.end.0));
+                    count += 1;
+                    break;
+                }
+            }
+        }
+        blocks
+    }
+
+    fn remove_range(&mut self, index: usize) {
+        let recency = self.ranges[index].recency;
+        self.ranges.copy_within(index + 1..self.range_count, index);
+        self.range_count -= 1;
+        for range in &mut self.ranges[..self.range_count] {
+            if range.recency > recency {
+                range.recency -= 1;
+            }
+        }
+    }
+
+    // Preflight the union before touching presence/data. A span at the frontier
+    // consumes ranges instead of needing a temporary 65th slot.
+    fn track_range(&mut self, mut left: usize, mut right: usize) -> bool {
+        let mut first = 0;
+        while first < self.range_count
+            && (self.ranges[first].end.distance_from(self.read_base) as usize) < left
+        {
+            first += 1;
+        }
+        let mut last = first;
+        while last < self.range_count
+            && (self.ranges[last].start.distance_from(self.read_base) as usize) <= right
+        {
+            left = left.min(self.ranges[last].start.distance_from(self.read_base) as usize);
+            right = right.max(self.ranges[last].end.distance_from(self.read_base) as usize);
+            last += 1;
+        }
+        let contiguous = left == self.contiguous_len;
+        if self.range_count - (last - first) + usize::from(!contiguous) > MAX_OOO_RANGES {
+            return false;
+        }
+        for _ in first..last {
+            self.remove_range(first);
+        }
+        if !contiguous {
+            self.ranges.copy_within(first..self.range_count, first + 1);
+            for range in &mut self.ranges[..self.range_count + 1] {
+                range.recency += 1;
+            }
+            self.ranges[first] = ReceiveRange {
+                start: self.read_base.wrapping_add(left as u32),
+                end: self.read_base.wrapping_add(right as u32),
+                recency: 0,
+            };
+            self.range_count += 1;
+        }
+        true
     }
 
     fn index(&self, offset: usize) -> usize {
@@ -208,6 +359,7 @@ impl ReceiveBuffer {
         let previous_next = self.next();
         let mut outcome = ReceiveOutcome {
             new_bytes: 0,
+            sack_overflow: false,
             advanced: false,
             fin: false,
             out_of_order: (!payload.is_empty() || fin) && sequence != previous_next,
@@ -220,6 +372,12 @@ impl ReceiveBuffer {
         let data_limit = self
             .fin_sequence
             .map_or(capacity, |end| end.distance_from(self.read_base) as usize);
+        let start = sequence.distance_from(self.read_base) as i32 as i64;
+        let left = start.max(self.contiguous_len as i64);
+        let right = (start + payload.len() as i64).min(data_limit as i64);
+        if left < right {
+            outcome.sack_overflow = !self.track_range(left as usize, right as usize);
+        }
         for (offset, &byte) in payload.iter().enumerate() {
             let position = sequence.wrapping_add(offset as u32);
             let distance = position.distance_from(self.read_base) as usize;
@@ -230,7 +388,7 @@ impl ReceiveBuffer {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
             //# If a segment's contents straddle the boundary between old and new, only the
             //# new parts are processed.
-            if !self.present[index] {
+            if !outcome.sack_overflow && !self.present[index] {
                 self.data[index] = (byte, false);
                 self.present[index] = true;
                 outcome.new_bytes += 1;
@@ -244,7 +402,9 @@ impl ReceiveBuffer {
             // never re-notify a mark already passed by the contiguous frontier.
             if distance >= self.contiguous_len && distance < data_limit {
                 let index = self.index(distance);
-                self.data[index].1 = true;
+                if self.present[index] {
+                    self.data[index].1 = true;
+                }
             }
         }
 
@@ -284,6 +444,248 @@ impl ReceiveBuffer {
 mod tests {
     use super::*;
 
+    fn receive_packet(recv: &mut ReceiveBuffer, sequence: Seq, payload: &[u8]) -> ReceiveOutcome {
+        recv.record_duplicate(sequence, payload.len());
+        let behind = recv.next().distance_from(sequence);
+        let skip = if behind < 1 << 31 {
+            (behind as usize).min(payload.len())
+        } else {
+            0
+        };
+        recv.insert(sequence.wrapping_add(skip as u32), &payload[skip..], false)
+    }
+
+    fn assert_ranges(recv: &ReceiveBuffer) {
+        let mut expected = Vec::new();
+        let mut offset = recv.contiguous_len;
+        while offset < recv.data.len() {
+            if !recv.present[recv.index(offset)] {
+                offset += 1;
+                continue;
+            }
+            let start = offset;
+            while offset < recv.data.len() && recv.present[recv.index(offset)] {
+                offset += 1;
+            }
+            expected.push((
+                recv.read_base.wrapping_add(start as u32),
+                recv.read_base.wrapping_add(offset as u32),
+            ));
+        }
+        let actual: Vec<_> = recv.ranges[..recv.range_count]
+            .iter()
+            .map(|r| (r.start, r.end))
+            .collect();
+        assert_eq!(actual, expected);
+        let mut ranks: Vec<_> = recv.ranges[..recv.range_count]
+            .iter()
+            .map(|r| r.recency as usize)
+            .collect();
+        ranks.sort_unstable();
+        assert_eq!(ranks, (0..recv.range_count).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn sack_full_ranges_reorder_merge_read_and_wrap() {
+        for start in [Seq(0), Seq(u32::MAX - 9), Seq(u32::MAX - 65540)] {
+            let mut recv = ReceiveBuffer::new(start, 70000).unwrap();
+            for offset in [65536, 10, 30, 20, 40] {
+                receive_packet(&mut recv, start.wrapping_add(offset), b"ab");
+                assert_ranges(&recv);
+            }
+            let block =
+                |left, right| Some((start.wrapping_add(left).0, start.wrapping_add(right).0));
+            assert_eq!(recv.sack_blocks(0), [None; 4]);
+            assert_eq!(
+                recv.sack_blocks(3),
+                [block(40, 42), block(20, 22), block(30, 32), None]
+            );
+            assert_eq!(
+                recv.sack_blocks(99),
+                [block(40, 42), block(20, 22), block(30, 32), block(10, 12)]
+            );
+            receive_packet(&mut recv, start.wrapping_add(12), &[b'x'; 18]);
+            assert_eq!(
+                recv.sack_blocks(4),
+                [
+                    block(20, 22),
+                    block(10, 32),
+                    block(40, 42),
+                    block(65536, 65538)
+                ]
+            );
+            recv.clear_dsack();
+            assert_eq!(
+                recv.sack_blocks(4),
+                [block(10, 32), block(40, 42), block(65536, 65538), None]
+            );
+            receive_packet(&mut recv, start, &[b'y'; 10]);
+            assert_eq!(recv.next(), start.wrapping_add(32));
+            assert_eq!(
+                recv.sack_blocks(4),
+                [block(40, 42), block(65536, 65538), None, None]
+            );
+            assert_eq!(recv.read(&mut [0; 32]), 32);
+            assert_ranges(&recv);
+            receive_packet(&mut recv, start.wrapping_add(32), &[b'z'; 8]);
+            assert_eq!(recv.sack_blocks(4), [block(65536, 65538), None, None, None]);
+            assert_ranges(&recv);
+        }
+    }
+
+    #[test]
+    fn dsack_raw_prefix_after_read_latest_packet_and_commit() {
+        for start in [Seq(100), Seq(u32::MAX - 3)] {
+            let mut recv = ReceiveBuffer::new(start, 16).unwrap();
+            receive_packet(&mut recv, start, b"abcdefgh");
+            assert_eq!(recv.read(&mut [0; 8]), 8);
+            receive_packet(&mut recv, start, b"XXXXXXXX");
+            let old = Some((start.0, start.wrapping_add(8).0));
+            assert_eq!(recv.sack_blocks(4), [old, None, None, None]);
+            assert_eq!(recv.sack_blocks(4), [old, None, None, None]); // Failed send does not commit.
+            recv.clear_dsack();
+            assert_eq!(recv.sack_blocks(4), [None; 4]);
+            let mixed = receive_packet(&mut recv, start.wrapping_add(6), b"XXij");
+            assert_eq!(mixed.new_bytes, 2);
+            assert_eq!(
+                recv.sack_blocks(4),
+                [
+                    Some((start.wrapping_add(6).0, start.wrapping_add(8).0)),
+                    None,
+                    None,
+                    None
+                ]
+            );
+            let mut out = [0; 2];
+            assert_eq!(recv.read(&mut out), 2);
+            assert_eq!(&out, b"ij");
+            receive_packet(&mut recv, start.wrapping_add(1), b"XX");
+            assert_eq!(
+                recv.sack_blocks(1)[0],
+                Some((start.wrapping_add(1).0, start.wrapping_add(3).0))
+            );
+            receive_packet(&mut recv, start.wrapping_add(10), b"k");
+            assert_eq!(recv.sack_blocks(4), [None; 4]);
+            recv.insert(start.wrapping_add(11), b"", true);
+            recv.record_duplicate(start.wrapping_add(11), 1); // Received FIN is not data.
+            assert_eq!(recv.sack_blocks(4), [None; 4]);
+            recv.record_duplicate(start.wrapping_add(10), 2);
+            assert_eq!(
+                recv.sack_blocks(4)[0],
+                Some((start.wrapping_add(10).0, start.wrapping_add(11).0))
+            );
+            recv.record_duplicate(start, 0);
+            assert_eq!(recv.sack_blocks(4), [None; 4]);
+        }
+    }
+
+    #[test]
+    fn dsack_first_duplicate_region_and_containing_full_range() {
+        let mut recv = ReceiveBuffer::new(Seq(1000), 4000).unwrap();
+        receive_packet(&mut recv, Seq(3500), &[b'a'; 500]);
+        receive_packet(&mut recv, Seq(1500), &[b'b'; 500]);
+        // RFC2883 example 6, erratum 365: second delayed block is 2500-2999.
+        receive_packet(&mut recv, Seq(2500), &[b'c'; 500]);
+        receive_packet(&mut recv, Seq(1500), &[b'x'; 1500]);
+        assert_eq!(
+            recv.sack_blocks(3),
+            [
+                Some((1500, 2000)),
+                Some((1500, 3000)),
+                Some((3500, 4000)),
+                None
+            ]
+        );
+        assert_ranges(&recv);
+        recv.clear_dsack();
+        assert_eq!(
+            recv.sack_blocks(4),
+            [Some((1500, 3000)), Some((3500, 4000)), None, None]
+        );
+        receive_packet(&mut recv, Seq(1800), &[b'x'; 100]);
+        assert_eq!(
+            recv.sack_blocks(4),
+            [
+                Some((1800, 1900)),
+                Some((1500, 3000)),
+                Some((3500, 4000)),
+                None
+            ]
+        );
+        receive_packet(&mut recv, Seq(1000), &[b'y'; 600]);
+        assert_eq!(
+            recv.sack_blocks(4),
+            [Some((1500, 1600)), Some((3500, 4000)), None, None]
+        );
+        assert_ranges(&recv);
+        // An old prefix wins over a later, separate OOO duplicate region.
+        receive_packet(&mut recv, Seq(2800), &[b'z'; 800]);
+        assert_eq!(recv.sack_blocks(4)[0], Some((2800, 3000)));
+    }
+
+    #[test]
+    fn overflow_is_transactional_and_bridging_at_capacity_succeeds() {
+        let mut recv = ReceiveBuffer::new(Seq(u32::MAX - 64), 256).unwrap();
+        let start = recv.next();
+        for offset in (1..128).step_by(2) {
+            assert_eq!(
+                receive_packet(&mut recv, start.wrapping_add(offset), b"a").new_bytes,
+                1
+            );
+        }
+        assert_eq!(recv.range_count, 64);
+        let old_blocks = recv.sack_blocks(4);
+        let old_data = recv.data.clone();
+        let old_present = recv.present.clone();
+        recv.record_duplicate(start.wrapping_add(130), 3);
+        let rejected = recv.insert_with_push(start.wrapping_add(130), b"xyz", true, true);
+        assert!(rejected.sack_overflow);
+        assert_eq!(recv.fin_sequence, Some(start.wrapping_add(133)));
+        assert!(!rejected.fin && !rejected.advanced && !recv.take_push());
+        assert_eq!(rejected.new_bytes, 0);
+        assert_eq!(recv.data, old_data);
+        assert_eq!(recv.present, old_present);
+        assert_eq!(recv.sack_blocks(4), old_blocks);
+        let bridge = receive_packet(&mut recv, start.wrapping_add(2), b"z");
+        assert!(!bridge.sack_overflow);
+        assert_eq!(bridge.new_bytes, 1);
+        assert_eq!(recv.range_count, 63);
+        receive_packet(&mut recv, start.wrapping_add(130), b"x");
+        assert_eq!(recv.range_count, 64);
+        assert!(!receive_packet(&mut recv, start, b"b").sack_overflow);
+        assert_eq!(recv.next(), start.wrapping_add(4));
+        assert_ranges(&recv);
+        let result = receive_packet(&mut recv, start.wrapping_add(4), &[b'c'; 127]);
+        assert!(!result.sack_overflow);
+        assert_eq!(recv.range_count, 0);
+        assert_ranges(&recv);
+        let mut out = [0; 131];
+        assert_eq!(recv.read(&mut out), 131);
+        assert_eq!(&out[..4], b"baza");
+        for offset in (5..128).step_by(2) {
+            assert_eq!(out[offset], b'a');
+        }
+        assert_eq!(out[130], b'x');
+    }
+
+    #[test]
+    fn bounded_recency_survives_many_arrivals_and_metadata_matches_ring() {
+        let mut recv = ReceiveBuffer::new(Seq(u32::MAX - 10), 256).unwrap();
+        let mut random = 1u32;
+        for _ in 0..4000 {
+            random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+            let offset = random % 260;
+            let sequence = recv.next().wrapping_add(offset);
+            receive_packet(&mut recv, sequence, &[b'x'; 3]);
+            assert_ranges(&recv);
+            if random & 7 == 0 {
+                let next = recv.next();
+                receive_packet(&mut recv, next, b"abc");
+                recv.read(&mut [0; 16]);
+                assert_ranges(&recv);
+            }
+        }
+    }
     #[test]
     // Checks prefix removal by byte count, not wire ACK validation.
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4
