@@ -1,22 +1,6 @@
 # Agent-only annotation audit: official RFC quotes, whitespace reflow only.
 
 [[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.2"
-reason = "Optional zero exponent is emitted for capacity<=65535; no direct assertion of WS=Some(0) on SYN/SYN-ACK. Closure: assert zero offer and unscaled negotiated windows, rather than treating zero as no negotiation."
-quote = '''
-MAY be zero (offering to scale, while applying a scale factor of 1 to
-the receive window).
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.2"
-reason = "Implementation learns WS only in learn_syn and does not renegotiate from established options. No focused existing test injects WS on accepted non-SYN segment. Closure: inject changed exponent on data/ACK and assert both shift state and effective subsequent windows unchanged."
-quote = '''
-A Window Scale option in a segment
-without a SYN bit MUST be ignored.
-'''
-
-[[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.3"
 reason = "Mandatory clamp to 14 is implemented/tested; SHOULD log invalid exponent is absent (no event/diagnostic hook). Closure: provide bounded error notification/log integration and assert 15/255 trigger it while effective exponent remains 14. Do not waive logging merely because core is no_std."
 quote = '''
@@ -28,7 +12,7 @@ specified value.
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.4"
-reason = "Partial shrink robustness: bytes retained and initial new data constrained; general nonzero shrink regression passes. RFC 7323 first retransmission/sub-scale out-of-window rule is not implemented by default (see added item 4). Closure: implement/test scaled quantization-aware first and later retransmission policy as well as late data within previous receive promise."
+reason = "Bytes are retained and initial new data is constrained; nonzero shrink and delayed data within prior receive promise (wrap/batching) are tested. Scaled quantization-aware first/sub-scale retransmission policy remains unimplemented by default; opt-in beyond-window retry is not that policy. Closure requires bounded per-original retry knowledge and the exact first/sub-scale rule across SACK/RACK paths."
 quote = '''
 Implementations MUST ensure that they handle a shrinking
 window, as specified in Section 4.2.2.16 of [RFC1122].
@@ -36,27 +20,10 @@ window, as specified in Section 4.2.2.16 of [RFC1122].
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.4"
-reason = "Receiver preserves largest committed advertised_edge for acceptability, but current scaled rounding test only checks edge/storage inequalities, not arrival in wire-retracted interval. Closure: send delayed data within prior ACK edge but beyond latest encoded edge (wrap and batching included), assert acceptance/delivery and bounded backing; fixed 64-range rejection also requires retention/report policy qualification."
+reason = "Packet-level regression accepts and delivers a delayed byte beyond the latest floor-rounded encoded edge but within a prior committed ACK promise, including wrap and batched hole fill with storage bounded. General retention is still limited by the fixed 64-range metadata cap; closure requires capacity-accounted arbitrary fragmentation and retention/report policy, not a waiver based on ordinary contiguous tests."
 quote = '''
 1)  The receiver MUST honor, as in window, any segment that would
 have been in window for any <ACK> sent by the receiver.
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc7323#section-3.2"
-reason = "No-ACK paths never call accept_ack; simultaneous SYN path clears sample. Existing SYN tests use TSecr=0 only. Closure: inject nonzero/forged TSecr on SYN and non-ACK synchronized traffic and assert RTT/ACK state unchanged, with normal TSval negotiation unaffected."
-quote = '''
-When the ACK bit is not set, the receiver MUST ignore
-the value of the TSecr field.
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc7323#section-3.2"
-reason = "PAWS/TS.Recent gates use negotiated bool; ordinary RTT ignores echo when unnegotiated. Existing fallback tests omit TS on fallback data. Closure: inject TS on non-negotiated established ACK/data, verify payload/window processed normally, no late negotiation or TS.Recent/RTT echo dependence, and no outgoing TS."
-quote = '''
-If a TSopt is received on a connection where TSopt was not negotiated
-in the initial three-way handshake, the TSopt MUST be ignored and the
-packet processed normally.
 '''
 
 [[TODO]]
@@ -69,18 +36,8 @@ order to measure actual RTT.
 '''
 
 [[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc7323#section-4.1"
-reason = "Ordinary bounded TSecr-qualified RTT sample is called only on advancing ACK; existing test covers valid/forged advancing echoes, not a matching echo on non-advancing ACK with pending sample. Closure: test matching TSecr on duplicate and SACK-only ACK without consuming/updating the ordinary sample. Scope distinction: RACK ack_sample derives now-minus-local-send-time for original transmissions, not received TSecr, so its non-advancing SACK RTT updates are a different measurement mechanism, not evidence of violating this TSecr-only rule; test that separation under negotiated TS."
-quote = '''
-RTTM Rule: A TSecr value received in a segment MAY be used to update
-the averaged RTT measurement only if the segment advances
-the left edge of the send window, i.e., SND.UNA is
-increased.
-'''
-
-[[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7323#section-4.2"
-reason = "Ordinary RTTM retains only one outstanding original-transmission sample and rejects same-millisecond reuse; this conservatively declines per-packet and retransmission TS sampling rather than requiring unbounded metadata. Existing valid/forged echo test does not establish sustained-flight estimator history. Closure: test ordinary RTTM sampling cadence and effective RFC6298 history with many ACKs per RTT, plus mixed RACK local-send-time samples; adjust cadence/weights only if measured history truncates. RACK local-clock ACK samples are not TSecr RTTM. Appendix G is a suggestion, not a mandatory exact formula."
+reason = "Four eight-packet bulk flights verify exact RFC6298 estimator history with one ordinary RTTM sample per flight; a mixed original-transmission RACK SACK sample adds a second unweighted local-clock update. This is not a sustained sliding-flight/per-RTT cadence bound: arbitrary frequent RACK samples still use fixed alpha/beta and may truncate history. Closure requires worst-case sampling-cadence/history evidence and weights/cadence adjustment if needed. RACK local-clock sampling is distinct from TSecr RTTM; Appendix G is a suggestion, not a mandatory exact formula."
 quote = '''
 to update the RTT estimator, an implementation SHOULD try to adhere
 to the spirit of the history specified in [RFC6298].
@@ -103,15 +60,6 @@ quote = '''
 In the <RST> segment,
 SEG.TSecr SHOULD be set to SEG.TSval from the incoming segment and
 SEG.TSval SHOULD be set to zero.
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.3"
-reason = "Implementation tests TS only on raw arrival and ReceiveBuffer retains bytes/ranges, not timestamps. Existing hole-fill test has queued TSval=4 newer than filler=3 and does not distinguish rechecking old queued timestamps. Closure: queue accepted older TS before newer hole-fill, then assert queued bytes delivered/read without a second PAWS test; also assert raw retransmitted arrivals still checked."
-quote = '''
-It is important to note that the timestamp MUST be checked only when
-a segment first arrives at the receiver, regardless of whether it is
-in sequence or it must be queued for later delivery.
 '''
 
 [[TODO]]
@@ -166,15 +114,6 @@ It is therefore
 RECOMMENDED to generate a random, per-connection offset to be used
 with the clock source when generating the Timestamps option value
 (see Section 5.4).
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.1"
-reason = "SYN-only output is implemented/tested; ignored non-SYN WS and fixed exponent under malicious changed option lack direct regression. Closure: inject changed WS on established ACK/data and assert effective windows and stored shifts unchanged."
-quote = '''
-This option is sent only in a <SYN> segment (a
-segment with the SYN bit on), hence the window scale is fixed in each
-direction when a connection is opened.
 '''
 
 [[TODO]]

@@ -2079,6 +2079,10 @@ impl Connection {
     ) -> Result<(), Error> {
         self.accepted_metadata = false;
         self.check_time(now)?;
+        // Supersede the previous packet's D-SACK even when this checked arrival
+        // is later dropped. Endpoint rejects checksum-invalid packets before
+        // this boundary; output failure alone must not consume the report.
+        self.receive.clear_dsack();
         self.now = now;
         self.retransmit_burst = None;
         if self.state == State::Closed {
@@ -2091,9 +2095,9 @@ impl Connection {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
             //# If SEG.ACK =< ISS or SEG.ACK > SND.NXT, send a reset (unless the RST bit
             //# is set, if so drop the segment and return)
-            // Scope: No-ACK paths never call accept_ack; simultaneous SYN path clears sample. Existing SYN tests use TSecr=0 only. Closure: inject nonzero/forged TSecr on SYN and non-ACK synchronized traffic and assert RTT/ACK state unchanged, with normal TSval negotiation unaffected. Partial evidence; closure remains TODO.
+            // Scope: Nonzero forged TSecr on simultaneous SYN and synchronized non-ACK traffic cannot advance ACK state or update RTT; SYN TSval still initializes PAWS and simultaneous SYN deliberately cancels the pending sample.
             //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
-            //= reason=No-ACK paths never call accept_ack; simultaneous SYN path clears sample. Existing SYN tests use TSecr=0 only. Closure: inject nonzero/forged TSecr on SYN and non-ACK synchronized traffic and assert RTT/ACK state unchanged, with normal TSval negotiation unaffected. Partial evidence; closure remains TODO.
+            //= reason=Nonzero forged TSecr on simultaneous SYN and synchronized non-ACK traffic cannot advance ACK state or update RTT; SYN TSval still initializes PAWS and simultaneous SYN deliberately cancels the pending sample.
             //# When the ACK bit is not set, the receiver MUST ignore
             //# the value of the TSecr field.
             //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
@@ -2156,9 +2160,9 @@ impl Connection {
         //= reason=With negotiated TS, missing option silently returns, does not abort and later valid timestamp data succeeds; missing RST option is exempt.
         //# A TCP MUST NOT abort a TCP connection because any
         //# segment lacks an expected TSopt.
-        // Scope: PAWS/TS.Recent gates use negotiated bool; ordinary RTT ignores echo when unnegotiated. Existing fallback tests omit TS on fallback data. Closure: inject TS on non-negotiated established ACK/data, verify payload/window processed normally, no late negotiation or TS.Recent/RTT echo dependence, and no outgoing TS. Partial evidence; closure remains TODO.
+        // Scope: TS-bearing ACK/data on an established unnegotiated fallback connection is processed normally: payload/window and local-clock RTT progress, no late TS negotiation, TS.Recent/age/latest mutation, PAWS dependence or outgoing TS.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
-        //= reason=PAWS/TS.Recent gates use negotiated bool; ordinary RTT ignores echo when unnegotiated. Existing fallback tests omit TS on fallback data. Closure: inject TS on non-negotiated established ACK/data, verify payload/window processed normally, no late negotiation or TS.Recent/RTT echo dependence, and no outgoing TS. Partial evidence; closure remains TODO.
+        //= reason=TS-bearing ACK/data on an established unnegotiated fallback connection is processed normally: payload/window and local-clock RTT progress, no late TS negotiation, TS.Recent/age/latest mutation, PAWS dependence or outgoing TS.
         //# If a TSopt is received on a connection where TSopt was not negotiated
         //# in the initial three-way handshake, the TSopt MUST be ignored and the
         //# packet processed normally.
@@ -2180,9 +2184,9 @@ impl Connection {
         //# Also, PAWS processing MUST take precedence over the regular TCP
         //# acceptability check (Section 3.3 in [RFC0793]), which is performed
         //# after verification of the received Timestamps option:
-        // Scope: Implementation tests TS only on raw arrival and ReceiveBuffer retains bytes/ranges, not timestamps. Existing hole-fill test has queued TSval=4 newer than filler=3 and does not distinguish rechecking old queued timestamps. Closure: queue accepted older TS before newer hole-fill, then assert queued bytes delivered/read without a second PAWS test; also assert raw retransmitted arrivals still checked. Partial evidence; closure remains TODO.
+        // Scope: Older timestamp data queued before a newer hole filler is delivered/read without a second PAWS check; a fresh raw arrival with the same old TS is rejected after the baseline advances.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
-        //= reason=Implementation tests TS only on raw arrival and ReceiveBuffer retains bytes/ranges, not timestamps. Existing hole-fill test has queued TSval=4 newer than filler=3 and does not distinguish rechecking old queued timestamps. Closure: queue accepted older TS before newer hole-fill, then assert queued bytes delivered/read without a second PAWS test; also assert raw retransmitted arrivals still checked. Partial evidence; closure remains TODO.
+        //= reason=Older timestamp data queued before a newer hole filler is delivered/read without a second PAWS check; a fresh raw arrival with the same old TS is rejected after the baseline advances.
         //# It is important to note that the timestamp MUST be checked only when
         //# a segment first arrives at the receiver, regardless of whether it is
         //# in sequence or it must be queued for later delivery.
@@ -2817,9 +2821,9 @@ impl Connection {
         if at_or_after(ack, self.snd_una)
             && (after(seq, self.wl1) || seq == self.wl1 && at_or_after(ack, self.wl2))
         {
-            // Scope: Implementation learns WS only in learn_syn and does not renegotiate from established options. No focused existing test injects WS on accepted non-SYN segment. Closure: inject changed exponent on data/ACK and assert both shift state and effective subsequent windows unchanged. Partial evidence; closure remains TODO.
+            // Scope: Changed WS on established data and ACK is ignored: negotiated shifts and subsequent effective incoming/outgoing windows remain fixed, including zero, nonzero and absent negotiation.
             //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
-            //= reason=Implementation learns WS only in learn_syn and does not renegotiate from established options. No focused existing test injects WS on accepted non-SYN segment. Closure: inject changed exponent on data/ACK and assert both shift state and effective subsequent windows unchanged. Partial evidence; closure remains TODO.
+            //= reason=Changed WS on established data and ACK is ignored: negotiated shifts and subsequent effective incoming/outgoing windows remain fixed, including zero, nonzero and absent negotiation.
             //# A Window Scale option in a segment
             //# without a SYN bit MUST be ignored.
             // Scope: Incoming non-SYN SEG.WND is expanded with fixed negotiated peer_scale; raw SYN values stay unscaled.
@@ -3107,16 +3111,16 @@ impl Connection {
         {
             // One bounded sample per flight. Never infer a transmission time
             // from an unvalidated echo, and retain Karn's exclusion on retransmit.
-            // Scope: Ordinary bounded TSecr-qualified RTT sample is called only on advancing ACK; existing test covers valid/forged advancing echoes, not a matching echo on non-advancing ACK with pending sample. Closure: test matching TSecr on duplicate and SACK-only ACK without consuming/updating the ordinary sample. Scope distinction: RACK ack_sample derives now-minus-local-send-time for original transmissions, not received TSecr, so its non-advancing SACK RTT updates are a different measurement mechanism, not evidence of violating this TSecr-only rule; test that separation under negotiated TS. Partial evidence; closure remains TODO.
+            // Scope: Matching TSecr on duplicate and SACK-only ACK cannot consume/update the ordinary pending RTTM sample or advance UNA. Under negotiated TS, original-transmission RACK samples now-minus-local-send-time independently of matching/forged TSecr; only RACK-enabled connections feed that separate sample into RTO.
             //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
-            //= reason=Ordinary bounded TSecr-qualified RTT sample is called only on advancing ACK; existing test covers valid/forged advancing echoes, not a matching echo on non-advancing ACK with pending sample. Closure: test matching TSecr on duplicate and SACK-only ACK without consuming/updating the ordinary sample. Scope distinction: RACK ack_sample derives now-minus-local-send-time for original transmissions, not received TSecr, so its non-advancing SACK RTT updates are a different measurement mechanism, not evidence of violating this TSecr-only rule; test that separation under negotiated TS. Partial evidence; closure remains TODO.
+            //= reason=Matching TSecr on duplicate and SACK-only ACK cannot consume/update the ordinary pending RTTM sample or advance UNA. Under negotiated TS, original-transmission RACK samples now-minus-local-send-time independently of matching/forged TSecr; only RACK-enabled connections feed that separate sample into RTO.
             //# RTTM Rule: A TSecr value received in a segment MAY be used to update
             //# the averaged RTT measurement only if the segment advances
             //# the left edge of the send window, i.e., SND.UNA is
             //# increased.
-            // Scope: Ordinary RTTM retains only one outstanding original-transmission sample and rejects same-millisecond reuse; this conservatively declines per-packet and retransmission TS sampling rather than requiring unbounded metadata. Existing valid/forged echo test does not establish sustained-flight estimator history. Closure: test ordinary RTTM sampling cadence and effective RFC6298 history with many ACKs per RTT, plus mixed RACK local-send-time samples; adjust cadence/weights only if measured history truncates. RACK local-clock ACK samples are not TSecr RTTM. Appendix G is a suggestion, not a mandatory exact formula. Partial evidence; closure remains TODO.
+            // Scope: Four eight-packet bulk flights verify exact RFC6298 estimator history with one ordinary RTTM sample per flight; a mixed original-transmission RACK SACK sample adds a second unweighted local-clock update. This is not a sustained sliding-flight/per-RTT cadence bound: arbitrary frequent RACK samples still use fixed alpha/beta and may truncate history. Closure requires worst-case sampling-cadence/history evidence and weights/cadence adjustment if needed. RACK local-clock sampling is distinct from TSecr RTTM; Appendix G is a suggestion, not a mandatory exact formula. Partial evidence; closure remains TODO.
             //= https://www.rfc-editor.org/rfc/rfc7323#section-4.2
-            //= reason=Ordinary RTTM retains only one outstanding original-transmission sample and rejects same-millisecond reuse; this conservatively declines per-packet and retransmission TS sampling rather than requiring unbounded metadata. Existing valid/forged echo test does not establish sustained-flight estimator history. Closure: test ordinary RTTM sampling cadence and effective RFC6298 history with many ACKs per RTT, plus mixed RACK local-send-time samples; adjust cadence/weights only if measured history truncates. RACK local-clock ACK samples are not TSecr RTTM. Appendix G is a suggestion, not a mandatory exact formula. Partial evidence; closure remains TODO.
+            //= reason=Four eight-packet bulk flights verify exact RFC6298 estimator history with one ordinary RTTM sample per flight; a mixed original-transmission RACK SACK sample adds a second unweighted local-clock update. This is not a sustained sliding-flight/per-RTT cadence bound: arbitrary frequent RACK samples still use fixed alpha/beta and may truncate history. Closure requires worst-case sampling-cadence/history evidence and weights/cadence adjustment if needed. RACK local-clock sampling is distinct from TSecr RTTM; Appendix G is a suggestion, not a mandatory exact formula. Partial evidence; closure remains TODO.
             //# to update the RTT estimator, an implementation SHOULD try to adhere
             //# to the spirit of the history specified in [RFC6298].
             if !self.timestamps || echo == Some((sent / 1_000) as u32) {
@@ -3404,9 +3408,9 @@ impl Connection {
     //# o  The window field (SEG.WND) of every outgoing segment, with the
     //# exception of <SYN> segments, MUST be right-shifted by
     //# Rcv.Wind.Shift bits:
-    // Scope: Partial shrink robustness: bytes retained and initial new data constrained; general nonzero shrink regression passes. RFC 7323 first retransmission/sub-scale out-of-window rule is not implemented by default (see added item 4). Closure: implement/test scaled quantization-aware first and later retransmission policy as well as late data within previous receive promise. Partial evidence; closure remains TODO.
+    // Scope: Bytes are retained and initial new data is constrained; nonzero shrink and delayed data within prior receive promise (wrap/batching) are tested. Scaled quantization-aware first/sub-scale retransmission policy remains unimplemented by default; opt-in beyond-window retry is not that policy. Closure requires bounded per-original retry knowledge and the exact first/sub-scale rule across SACK/RACK paths. Partial evidence; closure remains TODO.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
-    //= reason=Partial shrink robustness: bytes retained and initial new data constrained; general nonzero shrink regression passes. RFC 7323 first retransmission/sub-scale out-of-window rule is not implemented by default (see added item 4). Closure: implement/test scaled quantization-aware first and later retransmission policy as well as late data within previous receive promise. Partial evidence; closure remains TODO.
+    //= reason=Bytes are retained and initial new data is constrained; nonzero shrink and delayed data within prior receive promise (wrap/batching) are tested. Scaled quantization-aware first/sub-scale retransmission policy remains unimplemented by default; opt-in beyond-window retry is not that policy. Closure requires bounded per-original retry knowledge and the exact first/sub-scale rule across SACK/RACK paths. Partial evidence; closure remains TODO.
     //# Implementations MUST ensure that they handle a shrinking
     //# window, as specified in Section 4.2.2.16 of [RFC1122].
     // Scope: Receive window bounded by explicit configured receive allocation, never rounds beyond backing; no speculative unlimited window growth.
@@ -3932,9 +3936,9 @@ impl Connection {
         //= reason=Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
         //# Thus, a TCP that is prepared to scale windows SHOULD send the option,
         //# even if its own scale factor is 1 and the exponent 0.
-        // Scope: Optional zero exponent is emitted for capacity<=65535; no direct assertion of WS=Some(0) on SYN/SYN-ACK. Closure: assert zero offer and unscaled negotiated windows, rather than treating zero as no negotiation. Partial evidence; closure remains TODO.
+        // Scope: Wire tests assert Some(0) on SYN and SYN-ACK for small receive buffers, distinct from absent negotiation; both use unscaled effective windows.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
-        //= reason=Optional zero exponent is emitted for capacity<=65535; no direct assertion of WS=Some(0) on SYN/SYN-ACK. Closure: assert zero offer and unscaled negotiated windows, rather than treating zero as no negotiation. Partial evidence; closure remains TODO.
+        //= reason=Wire tests assert Some(0) on SYN and SYN-ACK for small receive buffers, distinct from absent negotiation; both use unscaled effective windows.
         //# MAY be zero (offering to scale, while applying a scale factor of 1 to
         //# the receive window).
         // Scope: Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
@@ -3960,9 +3964,9 @@ impl Connection {
         //# o  The Window Scale option MUST be sent with shift.cnt = R, where R
         //# is the value that the TCP would like to use for its receive
         //# window.
-        // Scope: SYN-only output is implemented/tested; ignored non-SYN WS and fixed exponent under malicious changed option lack direct regression. Closure: inject changed WS on established ACK/data and assert effective windows and stored shifts unchanged. Partial evidence; closure remains TODO.
+        // Scope: Wire tests inject changed WS on established data/ACK, including zero/nonzero/absent negotiation, and assert fixed shifts, unchanged effective window expansion and no outgoing non-SYN WS.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-2.1
-        //= reason=SYN-only output is implemented/tested; ignored non-SYN WS and fixed exponent under malicious changed option lack direct regression. Closure: inject changed WS on established ACK/data and assert effective windows and stored shifts unchanged. Partial evidence; closure remains TODO.
+        //= reason=Wire tests inject changed WS on established data/ACK, including zero/nonzero/absent negotiation, and assert fixed shifts, unchanged effective window expansion and no outgoing non-SYN WS.
         //# This option is sent only in a <SYN> segment (a
         //# segment with the SYN bit on), hence the window scale is fixed in each
         //# direction when a connection is opened.
@@ -4717,9 +4721,9 @@ impl Connection {
                 0
             };
             let edge = self.receive.next().wrapping_add((window as u32) << shift);
-            // Scope: Receiver preserves largest committed advertised_edge for acceptability, but current scaled rounding test only checks edge/storage inequalities, not arrival in wire-retracted interval. Closure: send delayed data within prior ACK edge but beyond latest encoded edge (wrap and batching included), assert acceptance/delivery and bounded backing; fixed 64-range rejection also requires retention/report policy qualification. Partial evidence; closure remains TODO.
+            // Scope: Packet-level regression accepts and delivers a delayed byte beyond the latest floor-rounded encoded edge but within a prior committed ACK promise, including wrap and batched hole fill with storage bounded. General retention is still limited by the fixed 64-range metadata cap; closure requires capacity-accounted arbitrary fragmentation and retention/report policy, not a waiver based on ordinary contiguous tests. Partial evidence; closure remains TODO.
             //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
-            //= reason=Receiver preserves largest committed advertised_edge for acceptability, but current scaled rounding test only checks edge/storage inequalities, not arrival in wire-retracted interval. Closure: send delayed data within prior ACK edge but beyond latest encoded edge (wrap and batching included), assert acceptance/delivery and bounded backing; fixed 64-range rejection also requires retention/report policy qualification. Partial evidence; closure remains TODO.
+            //= reason=Packet-level regression accepts and delivers a delayed byte beyond the latest floor-rounded encoded edge but within a prior committed ACK promise, including wrap and batched hole fill with storage bounded. General retention is still limited by the fixed 64-range metadata cap; closure requires capacity-accounted arbitrary fragmentation and retention/report policy, not a waiver based on ordinary contiguous tests. Partial evidence; closure remains TODO.
             //# 1)  The receiver MUST honor, as in window, any segment that would
             //# have been in window for any <ACK> sent by the receiver.
             // Scope: Tracks maximum successful advertised edge independently of current quantized field; not advanced on failed output.
@@ -8946,10 +8950,10 @@ mod tests {
     //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Validated negotiated ACKs update in-flight ranges; stale/future/DSACK-only blocks cannot count as fresh delivery.
     //# Upon the receipt of any ACK containing SACK information, the scoreboard MUST
     //# be updated via the Update () routine.
-    // Scope: Prior-cycle ambiguity is not ruled out by DSACK; sender bounds interval validity and never counts DSACK as delivery, but RACK growth/TLP cancellation consume it without prior-cycle-specific assertion. Closure: inject stale prior-cycle duplicate report across sequence wrap and assert bounded advisory-only response, no release of send bytes, inappropriate congestion undo, or fresh RTT credit. Partial evidence; closure remains TODO.
+    // Scope: Wrapped prior-cycle D-SACK below UNA or within already-SACKed data remains advisory during RACK/PRR recovery: no send storage release, UNA advance, congestion undo, new delivery or RTT credit. Reordering adaptation is bounded; duplicate reports cannot authenticate a sequence cycle.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-4.3
     //= type=test
-    //= reason=Prior-cycle ambiguity is not ruled out by DSACK; sender bounds interval validity and never counts DSACK as delivery, but RACK growth/TLP cancellation consume it without prior-cycle-specific assertion. Closure: inject stale prior-cycle duplicate report across sequence wrap and assert bounded advisory-only response, no release of send bytes, inappropriate congestion undo, or fresh RTT credit. Partial evidence; closure remains TODO.
+    //= reason=Wrapped prior-cycle D-SACK below UNA or within already-SACKed data remains advisory during RACK/PRR recovery: no send storage release, UNA advance, congestion undo, new delivery or RTT credit. Reordering adaptation is bounded; duplicate reports cannot authenticate a sequence cycle.
     //# TCP senders receiving D-SACK blocks should be aware that a segment
     //# reported as a duplicate segment could possibly have been from a prior
     //# cycle through the sequence number space.
@@ -11053,10 +11057,10 @@ mod tests {
     //# o  The Window Scale option MUST be sent with shift.cnt = R, where R
     //# is the value that the TCP would like to use for its receive
     //# window.
-    // Scope: SYN-only output is implemented/tested; ignored non-SYN WS and fixed exponent under malicious changed option lack direct regression. Closure: inject changed WS on established ACK/data and assert effective windows and stored shifts unchanged. Partial evidence; closure remains TODO.
+    // Scope: Wire tests inject changed WS on established data/ACK, including zero/nonzero/absent negotiation, and assert fixed shifts, unchanged effective window expansion and no outgoing non-SYN WS.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-2.1
     //= type=test
-    //= reason=SYN-only output is implemented/tested; ignored non-SYN WS and fixed exponent under malicious changed option lack direct regression. Closure: inject changed WS on established ACK/data and assert effective windows and stored shifts unchanged. Partial evidence; closure remains TODO.
+    //= reason=Wire tests inject changed WS on established data/ACK, including zero/nonzero/absent negotiation, and assert fixed shifts, unchanged effective window expansion and no outgoing non-SYN WS.
     //# This option is sent only in a <SYN> segment (a
     //# segment with the SYN bit on), hence the window scale is fixed in each
     //# direction when a connection is opened.
@@ -12392,10 +12396,10 @@ mod tests {
     //# o  The window field (SEG.WND) of every outgoing segment, with the
     //# exception of <SYN> segments, MUST be right-shifted by
     //# Rcv.Wind.Shift bits:
-    // Scope: Receiver preserves largest committed advertised_edge for acceptability, but current scaled rounding test only checks edge/storage inequalities, not arrival in wire-retracted interval. Closure: send delayed data within prior ACK edge but beyond latest encoded edge (wrap and batching included), assert acceptance/delivery and bounded backing; fixed 64-range rejection also requires retention/report policy qualification. Partial evidence; closure remains TODO.
+    // Scope: Packet-level regression accepts and delivers a delayed byte beyond the latest floor-rounded encoded edge but within a prior committed ACK promise, including wrap and batched hole fill with storage bounded. General retention is still limited by the fixed 64-range metadata cap; closure requires capacity-accounted arbitrary fragmentation and retention/report policy, not a waiver based on ordinary contiguous tests. Partial evidence; closure remains TODO.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
     //= type=test
-    //= reason=Receiver preserves largest committed advertised_edge for acceptability, but current scaled rounding test only checks edge/storage inequalities, not arrival in wire-retracted interval. Closure: send delayed data within prior ACK edge but beyond latest encoded edge (wrap and batching included), assert acceptance/delivery and bounded backing; fixed 64-range rejection also requires retention/report policy qualification. Partial evidence; closure remains TODO.
+    //= reason=Packet-level regression accepts and delivers a delayed byte beyond the latest floor-rounded encoded edge but within a prior committed ACK promise, including wrap and batched hole fill with storage bounded. General retention is still limited by the fixed 64-range metadata cap; closure requires capacity-accounted arbitrary fragmentation and retention/report policy, not a waiver based on ordinary contiguous tests. Partial evidence; closure remains TODO.
     //# 1)  The receiver MUST honor, as in window, any segment that would
     //# have been in window for any <ACK> sent by the receiver.
     // Scope: Tracks maximum successful advertised edge independently of current quantized field; not advanced on failed output.
@@ -13020,10 +13024,10 @@ mod tests {
     //# but SHOULD NOT
     //# time out the connection if data beyond the right window edge is not
     //# acknowledged (SHLD-17).
-    // Scope: Partial shrink robustness: bytes retained and initial new data constrained; general nonzero shrink regression passes. RFC 7323 first retransmission/sub-scale out-of-window rule is not implemented by default (see added item 4). Closure: implement/test scaled quantization-aware first and later retransmission policy as well as late data within previous receive promise. Partial evidence; closure remains TODO.
+    // Scope: Bytes are retained and initial new data is constrained; nonzero shrink and delayed data within prior receive promise (wrap/batching) are tested. Scaled quantization-aware first/sub-scale retransmission policy remains unimplemented by default; opt-in beyond-window retry is not that policy. Closure requires bounded per-original retry knowledge and the exact first/sub-scale rule across SACK/RACK paths. Partial evidence; closure remains TODO.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
     //= type=test
-    //= reason=Partial shrink robustness: bytes retained and initial new data constrained; general nonzero shrink regression passes. RFC 7323 first retransmission/sub-scale out-of-window rule is not implemented by default (see added item 4). Closure: implement/test scaled quantization-aware first and later retransmission policy as well as late data within previous receive promise. Partial evidence; closure remains TODO.
+    //= reason=Bytes are retained and initial new data is constrained; nonzero shrink and delayed data within prior receive promise (wrap/batching) are tested. Scaled quantization-aware first/sub-scale retransmission policy remains unimplemented by default; opt-in beyond-window retry is not that policy. Closure requires bounded per-original retry knowledge and the exact first/sub-scale rule across SACK/RACK paths. Partial evidence; closure remains TODO.
     //# Implementations MUST ensure that they handle a shrinking
     //# window, as specified in Section 4.2.2.16 of [RFC1122].
     // Scope: Fresh-data branch saturates latest-window credit after flight subtraction; no new data after shrinking below flight; retransmit policy never sends unsent tail.
@@ -15588,6 +15592,659 @@ mod tests {
             assert_eq!(a.acknowledged, 0);
         }
     }
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc2883#section-4
+    //= type=test
+    //= reason=Latest checked arrival supersedes D-SACK before ACK-only, sequence/ACK rejection, missing TS and PAWS drops; failed output without new input preserves it. Cumulative and queued duplicates are exercised across wrap.
+    //# (1) A D-SACK block is only used to report a duplicate contiguous
+    //# sequence of data received by the receiver in the most recent packet.
+    fn dsack_latest_checked_arrival_supersedes_pending_report() {
+        for queued in [false, true] {
+            // None means output retry without another arrival.
+            for newer in [None, Some(0), Some(1), Some(2), Some(3), Some(4)] {
+                let cfg = ConnectionConfig {
+                    timestamps: true,
+                    ..sack_config(128)
+                };
+                let (mut a, mut b) = pair(cfg, u32::MAX - 4);
+                a.write(b"abcdefgh").unwrap();
+                let bytes = packet(&mut a, 2_000);
+                let mut data = wire::parse(ip(tuple()), &bytes).unwrap();
+                if queued {
+                    data.header.sequence = data.header.sequence.wrapping_add(2);
+                }
+                // Re-encode so both initial and duplicate arrivals are checked packets.
+                let mut bytes = [0; 128];
+                let n = wire::encode(
+                    ip(tuple()),
+                    data.header,
+                    data.raw_options,
+                    data.payload,
+                    &mut bytes,
+                )
+                .unwrap();
+                let data = wire::parse(ip(tuple()), &bytes[..n]).unwrap();
+                b.input(2_000, &data).unwrap();
+                packet(&mut b, 2_000);
+                b.input(3_000, &data).unwrap();
+                let duplicate = (data.header.sequence, data.header.sequence.wrapping_add(8));
+                assert_eq!(b.receive.sack_blocks(3)[0], Some(duplicate));
+                assert_eq!(b.transmit(3_000, &mut [0; 19]), Err(Error::OutputTooSmall));
+                assert_eq!(b.receive.sack_blocks(3)[0], Some(duplicate));
+                let next = b.receive.next();
+                let ack = b.snd_una;
+                let edge = b.receive.right_edge();
+                match newer {
+                    None => {}
+                    Some(0) => timestamp_input(&mut b, 4_000, next, ack, ACK, Some((4, 0)), b""),
+                    Some(1) => {
+                        timestamp_input(&mut b, 4_000, edge, ack, ACK, Some((4, 0)), b"rejected")
+                    }
+                    Some(2) => timestamp_input(
+                        &mut b,
+                        4_000,
+                        next,
+                        ack.wrapping_add(1),
+                        ACK,
+                        Some((4, 0)),
+                        b"bad ACK",
+                    ),
+                    Some(3) => timestamp_input(&mut b, 4_000, next, ack, ACK, None, b"missing"),
+                    Some(4) => timestamp_input(
+                        &mut b,
+                        4_000,
+                        next,
+                        ack,
+                        ACK,
+                        Some((u32::MAX, 0)),
+                        b"stale",
+                    ),
+                    _ => unreachable!(),
+                }
+                assert_eq!(b.transmit(4_000, &mut [0; 19]), Err(Error::OutputTooSmall));
+                let bytes = packet(&mut b, 4_000);
+                let report = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+                if newer.is_none() {
+                    assert_eq!(report.options.sack_blocks[0], Some(duplicate));
+                    assert_eq!(report.options.sack_blocks[1], queued.then_some(duplicate));
+                } else {
+                    assert_eq!(report.options.sack_blocks[0], queued.then_some(duplicate));
+                    assert_eq!(report.options.sack_blocks[1], None);
+                }
+                b.immediate_ack();
+                let bytes = packet(&mut b, 5_000);
+                assert_eq!(
+                    wire::parse(ip(reverse(tuple())), &bytes)
+                        .unwrap()
+                        .options
+                        .sack_blocks[1],
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc2883#section-4.3
+    //= type=test
+    //= reason=Prior-cycle reports with wrapped old or already-SACKed intervals are advisory even during RACK/PRR recovery: no UNA/storage release, congestion undo, fresh delivery or RTT credit.
+    //# TCP senders receiving D-SACK blocks should be aware that a segment
+    //# reported as a duplicate segment could possibly have been from a prior
+    //# cycle through the sequence number space.
+    fn dsack_prior_cycle_wrap_is_advisory_during_recovery() {
+        for above_ack in [false, true] {
+            let mut a = rack_flight(u32::MAX - 4999);
+            let base = a.send_base;
+            rack_sack(&mut a, 200_000, 6000, &[(8000, 10_000)]);
+            a.timeout(225_000).unwrap();
+            packet(&mut a, 225_000);
+            assert!(a.sack_recovery.is_some());
+            let before = (
+                a.snd_una,
+                a.send.len(),
+                a.congestion.cwnd(),
+                a.congestion.ssthresh(),
+                a.rtt.srtt(),
+                a.rtt.rto(),
+                a.sample,
+                a.prr.unwrap().counters(),
+            );
+            let blocks = if above_ack {
+                vec![
+                    (base.wrapping_add(8100).0, base.wrapping_add(8200).0),
+                    (base.wrapping_add(8000).0, base.wrapping_add(10_000).0),
+                ]
+            } else {
+                vec![(base.wrapping_add(4000).0, base.wrapping_add(6000).0)]
+            };
+            let una = a.snd_una;
+            sack_ack(&mut a, 226_000, una, &blocks);
+            assert_eq!(
+                (
+                    a.snd_una,
+                    a.send.len(),
+                    a.congestion.cwnd(),
+                    a.congestion.ssthresh(),
+                    a.rtt.srtt(),
+                    a.rtt.rto(),
+                    a.sample,
+                    a.prr.unwrap().counters()
+                ),
+                before
+            );
+            assert!(a.sack_recovery.is_some());
+            assert!(a.rack.ack_sample.is_none());
+            assert!(a.rack.adaptation().0 <= 2);
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+    //= type=test
+    //= reason=Forged nonzero SYN and synchronized no-ACK echoes cannot acknowledge data or consume/update RTT samples; SYN TSval still initializes PAWS.
+    //# When the ACK bit is not set, the receiver MUST ignore
+    //# the value of the TSecr field.
+    fn timestamps_non_ack_echo_is_ignored() {
+        let cfg = ConnectionConfig {
+            timestamps: true,
+            ..sack_config(128)
+        };
+        let mut a = Connection::active(tuple(), cfg.clone(), 100, 0).unwrap();
+        packet(&mut a, 1_000);
+        let before = (a.snd_una, a.rtt.srtt(), a.rtt.rto());
+        let end = a.snd_nxt;
+        timestamp_input(&mut a, 2_000, Seq(900), end, SYN, Some((9, 1)), b"");
+        assert_eq!((a.snd_una, a.rtt.srtt(), a.rtt.rto()), before);
+        assert_eq!(a.ts_recent, 9);
+        assert!(a.sample.is_none()); // Simultaneous SYN deliberately cancels sampling.
+        let (mut a, _) = pair(cfg, 100);
+        a.write(b"sample").unwrap();
+        packet(&mut a, 2_000);
+        let before = (
+            a.snd_una,
+            a.snd_wnd,
+            a.send.len(),
+            a.sample,
+            a.rtt.srtt(),
+            a.rtt.rto(),
+            a.receive.next(),
+        );
+        let next = a.receive.next();
+        let end = a.snd_nxt;
+        timestamp_input(&mut a, 3_000, next, end, 0, Some((3, 2)), b"ignored");
+        assert_eq!(
+            (
+                a.snd_una,
+                a.snd_wnd,
+                a.send.len(),
+                a.sample,
+                a.rtt.srtt(),
+                a.rtt.rto(),
+                a.receive.next()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+    //= type=test
+    //= reason=Established fallback accepts TS-bearing ACK/data normally without late negotiation, PAWS/echo state changes or outgoing TS; forged echo cannot suppress normal local-clock RTT.
+    //# If a TSopt is received on a connection where TSopt was not negotiated
+    //# in the initial three-way handshake, the TSopt MUST be ignored and the
+    //# packet processed normally.
+    fn timestamps_unnegotiated_established_options_are_ignored() {
+        let mut a = Connection::active(
+            tuple(),
+            ConnectionConfig {
+                timestamps: true,
+                ..sack_config(128)
+            },
+            100,
+            0,
+        )
+        .unwrap();
+        let syn_bytes = packet(&mut a, 0);
+        let syn = wire::parse(ip(tuple()), &syn_bytes).unwrap();
+        let mut b = Connection::passive(reverse(tuple()), sack_config(128), 900, 10, &syn).unwrap();
+        deliver(&mut b, &mut a, 20);
+        deliver(&mut a, &mut b, 30);
+        assert!(!a.timestamps && !b.timestamps);
+        a.rtt = RttEstimator::new(1_000_000);
+        a.write(b"sample").unwrap();
+        packet(&mut a, 2_000_000);
+        let before = (a.ts_recent, a.ts_recent_at, a.ts_latest);
+        let next = a.receive.next();
+        let ack = a.snd_nxt;
+        timestamp_input(
+            &mut a,
+            2_600_000,
+            next,
+            ack,
+            ACK,
+            Some((0x8000_0000, u32::MAX)),
+            b"normal",
+        );
+        assert_eq!(a.snd_una, ack);
+        assert_eq!(a.snd_wnd, 1024);
+        assert_eq!(a.rtt.rto(), 1_800_000);
+        assert_eq!((a.ts_recent, a.ts_recent_at, a.ts_latest), before);
+        assert!(!a.timestamps);
+        assert_eq!(a.read(&mut [0; 6]), Ok(6));
+        let bytes = packet(&mut a, 2_600_000);
+        assert!(
+            wire::parse(ip(tuple()), &bytes)
+                .unwrap()
+                .options
+                .timestamps
+                .is_none()
+        );
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+    //= type=test
+    //= reason=Older TS queued data is delivered after newer hole filler without second PAWS; a fresh raw arrival with the same old TS is still rejected.
+    //# It is important to note that the timestamp MUST be checked only when
+    //# a segment first arrives at the receiver, regardless of whether it is
+    //# in sequence or it must be queued for later delivery.
+    fn timestamps_queued_old_data_is_not_rechecked_after_hole_fill() {
+        let (mut a, _) = pair(
+            ConnectionConfig {
+                timestamps: true,
+                ..sack_config(128)
+            },
+            100,
+        );
+        let next = a.receive.next();
+        let ack = a.snd_una;
+        timestamp_input(
+            &mut a,
+            1_000,
+            next.wrapping_add(1),
+            ack,
+            ACK,
+            Some((1, 0)),
+            b"b",
+        );
+        assert_eq!(a.receive.next(), next);
+        packet(&mut a, 1_000);
+        timestamp_input(&mut a, 2_000, next, ack, ACK, Some((2, 0)), b"a");
+        assert_eq!(a.ts_recent, 2);
+        assert_eq!(a.receive.next(), next.wrapping_add(2));
+        let mut out = [0; 2];
+        assert_eq!(a.read(&mut out), Ok(2));
+        assert_eq!(&out, b"ab");
+        timestamp_input(
+            &mut a,
+            3_000,
+            next.wrapping_add(2),
+            ack,
+            ACK,
+            Some((1, 0)),
+            b"c",
+        );
+        assert_eq!(a.receive.next(), next.wrapping_add(2));
+        assert_eq!(a.read(&mut out), Err(Error::WouldBlock));
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+    //= type=test
+    //= reason=Equality at both TS.Recent and Last.ACK.sent refreshes timestamp age; later sequence cannot replace echo, older TS fails PAWS, serial wrap accepts zero.
+    //# SEG.TSval >= TS.Recent and SEG.SEQ <= Last.ACK.sent
+    //#
+    //# then SEG.TSval is copied to TS.Recent; otherwise, it is ignored.
+    fn timestamps_echo_predicates_are_inclusive() {
+        let (mut a, _) = pair(
+            ConnectionConfig {
+                timestamps: true,
+                ..sack_config(128)
+            },
+            100,
+        );
+        let next = a.receive.next();
+        let ack = a.snd_una;
+        a.ts_recent = u32::MAX;
+        a.ts_latest = u32::MAX;
+        timestamp_input(&mut a, 1_000, next, ack, ACK, Some((u32::MAX, 0)), b"");
+        assert_eq!(a.ts_recent_at, 1_000);
+        timestamp_input(
+            &mut a,
+            2_000,
+            next.wrapping_add(1),
+            ack,
+            ACK,
+            Some((0, 0)),
+            b"b",
+        );
+        assert_eq!(a.ts_recent, u32::MAX);
+        timestamp_input(&mut a, 3_000, next, ack, ACK, Some((0, 0)), b"a");
+        assert_eq!(a.ts_recent, 0);
+        let bytes = packet(&mut a, 3_000);
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes).unwrap().options.timestamps,
+            Some((3, 0))
+        );
+        timestamp_input(
+            &mut a,
+            4_000,
+            next.wrapping_add(2),
+            ack,
+            ACK,
+            Some((u32::MAX, 0)),
+            b"stale",
+        );
+        assert_eq!(a.ts_recent_at, 3_000);
+        assert_eq!(a.receive.next(), next.wrapping_add(2));
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+    //= type=test
+    //= reason=SYN and SYN-ACK explicitly encode Some(0) for small buffers, distinct from absent WS; both have unscaled effective windows.
+    //# MAY be zero (offering to scale, while applying a scale factor of 1 to
+    //# the receive window).
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+    //= type=test
+    //= reason=Changed WS on established data and ACK cannot change negotiated shifts or effective subsequent windows, with zero/nonzero and absent negotiation.
+    //# A Window Scale option in a segment
+    //# without a SYN bit MUST be ignored.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.1
+    //= type=test
+    //= reason=Established data/ACK WS does not renegotiate either direction or affect effective subsequent windows.
+    //# This option is sent only in a <SYN> segment (a
+    //# segment with the SYN bit on), hence the window scale is fixed in each
+    //# direction when a connection is opened.
+    fn window_scale_zero_offer_absence_and_non_syn_options() {
+        for capacity in [64, 131072] {
+            for offered in [false, true] {
+                let cfg = config(capacity, 128);
+                let mut a = Connection::active(tuple(), cfg.clone(), 100, 0).unwrap();
+                let bytes = packet(&mut a, 0);
+                let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+                let exponent = if capacity == 64 { 0 } else { 2 };
+                assert_eq!(syn.options.window_scale, Some(exponent));
+                let mut options = vec![2, 4, 0, 128];
+                if offered {
+                    options.extend_from_slice(&[1, 3, 3, exponent]);
+                }
+                let mut bytes = [0; 64];
+                let n = wire::encode(ip(tuple()), syn.header, &options, b"", &mut bytes).unwrap();
+                let syn = wire::parse(ip(tuple()), &bytes[..n]).unwrap();
+                let mut b = Connection::passive(reverse(tuple()), cfg, 900, 10, &syn).unwrap();
+                let bytes = deliver(&mut b, &mut a, 20);
+                assert_eq!(
+                    wire::parse(ip(reverse(tuple())), &bytes)
+                        .unwrap()
+                        .options
+                        .window_scale,
+                    offered.then_some(exponent)
+                );
+                deliver(&mut a, &mut b, 30);
+                assert_eq!((a.scaling, b.scaling), (offered, offered));
+                let before = (a.scaling, a.local_scale, a.peer_scale);
+                let shift = if offered { exponent } else { 0 };
+                let next = a.receive.next();
+                let ack = a.snd_una;
+                for (i, payload) in [b"x".as_slice(), b"".as_slice()].into_iter().enumerate() {
+                    let mut bytes = [0; 64];
+                    let n = wire::encode(
+                        ip(reverse(tuple())),
+                        Header {
+                            source_port: 2000,
+                            destination_port: 1000,
+                            sequence: next.wrapping_add(i as u32).0,
+                            acknowledgment: ack.0,
+                            flags: SYN | ACK,
+                            window: 7,
+                            urgent_pointer: 0,
+                        },
+                        &[1, 3, 3, 14],
+                        payload,
+                        &mut bytes,
+                    )
+                    .unwrap();
+                    // The encoder refuses illegal output options; inject peer input.
+                    bytes[13] = ACK;
+                    bytes[16..18].fill(0);
+                    let sum = wire::checksum(ip(reverse(tuple())), &bytes[..n]).unwrap();
+                    bytes[16..18].copy_from_slice(&sum.to_be_bytes());
+                    a.input(
+                        40 + i as u64,
+                        &wire::parse(ip(reverse(tuple())), &bytes[..n]).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!((a.scaling, a.local_scale, a.peer_scale), before);
+                    assert_eq!(a.snd_wnd, 7u32 << shift);
+                }
+                inject(&mut a, 42, next.wrapping_add(1), ack, ACK, 9, b"");
+                assert_eq!(a.snd_wnd, 9u32 << shift);
+                a.immediate_ack();
+                let expected = ((capacity - 1) >> shift).min(65535) as u16;
+                let bytes = packet(&mut a, 43);
+                let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(seg.header.window, expected);
+                assert!(seg.options.window_scale.is_none());
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
+    //= type=test
+    //= reason=Delayed byte beyond quantized latest edge but below prior committed ACK edge is accepted and delivered after batched hole fill across wrap; receive allocation stays bounded. Arbitrary 65-range fragmentation remains a separate TODO.
+    //# 1)  The receiver MUST honor, as in window, any segment that would
+    //# have been in window for any <ACK> sent by the receiver.
+    fn scaled_window_accepts_previously_promised_retracted_byte() {
+        for iss in [100, u32::MAX - 4] {
+            let (_, mut b) = pair(config(65536, 1460), iss);
+            b.immediate_ack();
+            packet(&mut b, 40);
+            let next = b.receive.next();
+            let ack = b.snd_una;
+            let promised = b.advertised_edge;
+            assert_eq!(promised.distance_from(next), 65536);
+            inject(&mut b, 41, next, ack, ACK, 8192, b"a");
+            b.immediate_ack();
+            let bytes = packet(&mut b, 42);
+            let seg = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+            assert_eq!(seg.header.window, 32767); // floor(65535 / 2), never round up.
+            let encoded_edge = Seq(seg.header.acknowledgment)
+                .wrapping_add(u32::from(seg.header.window) << b.local_scale);
+            assert_eq!(encoded_edge, promised.wrapping_add(u32::MAX));
+            assert_eq!(b.advertised_edge, promised);
+            inject(&mut b, 43, encoded_edge, ack, ACK, 8192, b"z");
+            assert_eq!(b.receive_used, 2);
+            assert_eq!(b.receive.next(), next.wrapping_add(1));
+            // Process the entire batch before output, including the retained tail.
+            inject(
+                &mut b,
+                44,
+                next.wrapping_add(1),
+                ack,
+                ACK,
+                8192,
+                &[b'b'; 32767],
+            );
+            inject(
+                &mut b,
+                44,
+                next.wrapping_add(32768),
+                ack,
+                ACK,
+                8192,
+                &[b'c'; 32767],
+            );
+            assert_eq!(b.receive.next(), promised);
+            assert_eq!(b.receive_used, b.config.receive_capacity);
+            assert_eq!(b.receive_window(), 0);
+            let mut out = vec![0; 65536];
+            assert_eq!(b.read(&mut out), Ok(65536));
+            assert_eq!(out[0], b'a');
+            assert!(out[1..32768].iter().all(|&v| v == b'b'));
+            assert!(out[32768..65535].iter().all(|&v| v == b'c'));
+            assert_eq!(out[65535], b'z');
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
+    //= type=test
+    //= reason=Matching echo on duplicate/SACK-only ACK leaves ordinary pending sample untouched; RACK samples local original send time independently of forged or matching TSecr, without advancing UNA.
+    //# RTTM Rule: A TSecr value received in a segment MAY be used to update
+    //# the averaged RTT measurement only if the segment advances
+    //# the left edge of the send window, i.e., SND.UNA is
+    //# increased.
+    fn timestamps_nonadvancing_echo_does_not_consume_ordinary_sample() {
+        for rack in [false, true] {
+            for echo in [2, u32::MAX] {
+                let cfg = ConnectionConfig {
+                    timestamps: true,
+                    rack,
+                    initial_window: InitialWindow::Iw10,
+                    ..sack_config(128)
+                };
+                let (mut a, _) = pair(cfg, 100);
+                a.rtt = RttEstimator::new(1_000_000);
+                a.write(&[1; 256]).unwrap();
+                packet(&mut a, 2_000);
+                let bytes = packet(&mut a, 2_000);
+                let second = Seq(wire::parse(ip(tuple()), &bytes).unwrap().header.sequence);
+                let end = a.snd_nxt;
+                let pending = a.sample;
+                let una = a.snd_una;
+                let next = a.receive.next();
+                timestamp_input(&mut a, 2_500, next, una, ACK, Some((2, echo)), b"");
+                assert_eq!(a.sample, pending);
+                assert_eq!(a.rtt.srtt(), None);
+                let options = [1, 1, 8, 10, 0, 0, 0, 3];
+                let mut options = options.to_vec();
+                options.extend_from_slice(&echo.to_be_bytes());
+                options.extend_from_slice(&[1, 1, 5, 10]);
+                options.extend_from_slice(&second.0.to_be_bytes());
+                options.extend_from_slice(&end.0.to_be_bytes());
+                let mut bytes = [0; 64];
+                let n = wire::encode(
+                    ip(reverse(tuple())),
+                    Header {
+                        source_port: 2000,
+                        destination_port: 1000,
+                        sequence: next.0,
+                        acknowledgment: una.0,
+                        flags: ACK,
+                        window: 8192,
+                        urgent_pointer: 0,
+                    },
+                    &options,
+                    b"",
+                    &mut bytes,
+                )
+                .unwrap();
+                a.input(
+                    3_000,
+                    &wire::parse(ip(reverse(tuple())), &bytes[..n]).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(a.snd_una, una);
+                assert_eq!(a.sample, pending);
+                assert_eq!(a.rtt.srtt(), rack.then_some(1_000));
+                assert_eq!(a.rack.ack_sample, Some(1_000)); // Consumed by RTO only with RACK enabled.
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-4.2
+    //= type=test
+    //= reason=Four eight-packet flights retain exact RFC6298 history with one ordinary RTTM sample per flight; a mixed local RACK SACK sample adds one unweighted update. Arbitrarily frequent RACK samples remain TODO, not a per-RTT cadence guarantee.
+    //# to update the RTT estimator, an implementation SHOULD try to adhere
+    //# to the spirit of the history specified in [RFC6298].
+    fn timestamps_bulk_flight_history_and_mixed_rack_samples() {
+        for rack in [false, true] {
+            let cfg = ConnectionConfig {
+                timestamps: true,
+                rack,
+                initial_window: InitialWindow::Iw10,
+                ..sack_config(128)
+            };
+            let (mut a, _) = pair(cfg, 100);
+            a.rtt = RttEstimator::new(1_000_000);
+            let mut expected = RttEstimator::new(1_000_000);
+            for round in 0..4u64 {
+                let sent = 2_000_000 + round * 2_000_000;
+                let latency = if round < 2 { 100_000 } else { 200_000 };
+                a.write(&[1; 8 * 116]).unwrap(); // MSS less the negotiated TS option.
+                let mut ends = vec![];
+                let mut last = None;
+                for _ in 0..8 {
+                    let bytes = packet(&mut a, sent);
+                    let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+                    assert_eq!(seg.payload.len(), 116);
+                    last = Some(seg.header);
+                    ends.push(Seq(seg.header.sequence).wrapping_add(116));
+                }
+                let pending = a.sample;
+                let next = a.receive.next();
+                let una = a.snd_una;
+                if rack {
+                    // A non-advancing original-transmission SACK adds a local-clock sample.
+                    let header = last.unwrap();
+                    let mut options = vec![1, 1, 8, 10];
+                    options.extend_from_slice(&((sent / 1000) as u32).to_be_bytes());
+                    options.extend_from_slice(&u32::MAX.to_be_bytes());
+                    options.extend_from_slice(&[1, 1, 5, 10]);
+                    options.extend_from_slice(&header.sequence.to_be_bytes());
+                    options.extend_from_slice(&ends[7].0.to_be_bytes());
+                    let mut bytes = [0; 64];
+                    let n = wire::encode(
+                        ip(reverse(tuple())),
+                        Header {
+                            source_port: 2000,
+                            destination_port: 1000,
+                            sequence: next.0,
+                            acknowledgment: una.0,
+                            flags: ACK,
+                            window: 8192,
+                            urgent_pointer: 0,
+                        },
+                        &options,
+                        b"",
+                        &mut bytes,
+                    )
+                    .unwrap();
+                    a.input(
+                        sent + latency,
+                        &wire::parse(ip(reverse(tuple())), &bytes[..n]).unwrap(),
+                    )
+                    .unwrap();
+                    expected.sample(latency);
+                    assert_eq!(a.sample, pending);
+                }
+                for (i, end) in ends.into_iter().enumerate() {
+                    timestamp_input(
+                        &mut a,
+                        sent + latency + 1000 + i as u64,
+                        next,
+                        end,
+                        ACK,
+                        Some(((sent / 1000) as u32, (sent / 1000) as u32)),
+                        b"",
+                    );
+                    if i == 0 {
+                        expected.sample(latency + 1000);
+                    }
+                    assert_eq!(a.sample, None);
+                    assert_eq!(
+                        (a.rtt.srtt(), a.rtt.variance(), a.rtt.rto()),
+                        (expected.srtt(), expected.variance(), expected.rto())
+                    );
+                }
+                assert_eq!(a.send.len(), 0);
+            }
+        }
+    }
+
     fn timestamp_input(
         c: &mut Connection,
         now: u64,
@@ -15803,10 +16460,10 @@ mod tests {
     //# Also, PAWS processing MUST take precedence over the regular TCP
     //# acceptability check (Section 3.3 in [RFC0793]), which is performed
     //# after verification of the received Timestamps option:
-    // Scope: Implementation tests TS only on raw arrival and ReceiveBuffer retains bytes/ranges, not timestamps. Existing hole-fill test has queued TSval=4 newer than filler=3 and does not distinguish rechecking old queued timestamps. Closure: queue accepted older TS before newer hole-fill, then assert queued bytes delivered/read without a second PAWS test; also assert raw retransmitted arrivals still checked. Partial evidence; closure remains TODO.
+    // Scope: Older timestamp data queued before a newer hole filler is delivered/read without a second PAWS check; a fresh raw arrival with the same old TS is rejected after the baseline advances.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
     //= type=test
-    //= reason=Implementation tests TS only on raw arrival and ReceiveBuffer retains bytes/ranges, not timestamps. Existing hole-fill test has queued TSval=4 newer than filler=3 and does not distinguish rechecking old queued timestamps. Closure: queue accepted older TS before newer hole-fill, then assert queued bytes delivered/read without a second PAWS test; also assert raw retransmitted arrivals still checked. Partial evidence; closure remains TODO.
+    //= reason=Older timestamp data queued before a newer hole filler is delivered/read without a second PAWS check; a fresh raw arrival with the same old TS is rejected after the baseline advances.
     //# It is important to note that the timestamp MUST be checked only when
     //# a segment first arrives at the receiver, regardless of whether it is
     //# in sequence or it must be queued for later delivery.
@@ -16000,18 +16657,18 @@ mod tests {
     //# That is, RTT samples MUST NOT be made using segments that were retransmitted (and thus
     //# for which it is ambiguous whether the reply was for the first instance of the packet
     //# or a later instance).
-    // Scope: Ordinary bounded TSecr-qualified RTT sample is called only on advancing ACK; existing test covers valid/forged advancing echoes, not a matching echo on non-advancing ACK with pending sample. Closure: test matching TSecr on duplicate and SACK-only ACK without consuming/updating the ordinary sample. Scope distinction: RACK ack_sample derives now-minus-local-send-time for original transmissions, not received TSecr, so its non-advancing SACK RTT updates are a different measurement mechanism, not evidence of violating this TSecr-only rule; test that separation under negotiated TS. Partial evidence; closure remains TODO.
+    // Scope: Matching TSecr on duplicate and SACK-only ACK cannot consume/update the ordinary pending RTTM sample or advance UNA. Under negotiated TS, original-transmission RACK samples now-minus-local-send-time independently of matching/forged TSecr; only RACK-enabled connections feed that separate sample into RTO.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
     //= type=test
-    //= reason=Ordinary bounded TSecr-qualified RTT sample is called only on advancing ACK; existing test covers valid/forged advancing echoes, not a matching echo on non-advancing ACK with pending sample. Closure: test matching TSecr on duplicate and SACK-only ACK without consuming/updating the ordinary sample. Scope distinction: RACK ack_sample derives now-minus-local-send-time for original transmissions, not received TSecr, so its non-advancing SACK RTT updates are a different measurement mechanism, not evidence of violating this TSecr-only rule; test that separation under negotiated TS. Partial evidence; closure remains TODO.
+    //= reason=Matching TSecr on duplicate and SACK-only ACK cannot consume/update the ordinary pending RTTM sample or advance UNA. Under negotiated TS, original-transmission RACK samples now-minus-local-send-time independently of matching/forged TSecr; only RACK-enabled connections feed that separate sample into RTO.
     //# RTTM Rule: A TSecr value received in a segment MAY be used to update
     //# the averaged RTT measurement only if the segment advances
     //# the left edge of the send window, i.e., SND.UNA is
     //# increased.
-    // Scope: Ordinary RTTM retains only one outstanding original-transmission sample and rejects same-millisecond reuse; this conservatively declines per-packet and retransmission TS sampling rather than requiring unbounded metadata. Existing valid/forged echo test does not establish sustained-flight estimator history. Closure: test ordinary RTTM sampling cadence and effective RFC6298 history with many ACKs per RTT, plus mixed RACK local-send-time samples; adjust cadence/weights only if measured history truncates. RACK local-clock ACK samples are not TSecr RTTM. Appendix G is a suggestion, not a mandatory exact formula. Partial evidence; closure remains TODO.
+    // Scope: Four eight-packet bulk flights verify exact RFC6298 estimator history with one ordinary RTTM sample per flight; a mixed original-transmission RACK SACK sample adds a second unweighted local-clock update. This is not a sustained sliding-flight/per-RTT cadence bound: arbitrary frequent RACK samples still use fixed alpha/beta and may truncate history. Closure requires worst-case sampling-cadence/history evidence and weights/cadence adjustment if needed. RACK local-clock sampling is distinct from TSecr RTTM; Appendix G is a suggestion, not a mandatory exact formula. Partial evidence; closure remains TODO.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-4.2
     //= type=test
-    //= reason=Ordinary RTTM retains only one outstanding original-transmission sample and rejects same-millisecond reuse; this conservatively declines per-packet and retransmission TS sampling rather than requiring unbounded metadata. Existing valid/forged echo test does not establish sustained-flight estimator history. Closure: test ordinary RTTM sampling cadence and effective RFC6298 history with many ACKs per RTT, plus mixed RACK local-send-time samples; adjust cadence/weights only if measured history truncates. RACK local-clock ACK samples are not TSecr RTTM. Appendix G is a suggestion, not a mandatory exact formula. Partial evidence; closure remains TODO.
+    //= reason=Four eight-packet bulk flights verify exact RFC6298 estimator history with one ordinary RTTM sample per flight; a mixed original-transmission RACK SACK sample adds a second unweighted local-clock update. This is not a sustained sliding-flight/per-RTT cadence bound: arbitrary frequent RACK samples still use fixed alpha/beta and may truncate history. Closure requires worst-case sampling-cadence/history evidence and weights/cadence adjustment if needed. RACK local-clock sampling is distinct from TSecr RTTM; Appendix G is a suggestion, not a mandatory exact formula. Partial evidence; closure remains TODO.
     //# to update the RTT estimator, an implementation SHOULD try to adhere
     //# to the spirit of the history specified in [RFC6298].
     fn timestamps_rtt_validated_echo_and_karn() {

@@ -4052,3 +4052,56 @@ fn early_fin_passive_accept_waits_for_handshake_ack_and_reuse_failure_rolls_back
     assert_eq!(b.connection_id(tuple), Some(old));
     assert!(!b.connection_exists(candidate));
 }
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc2883#section-4
+//= type=test
+//= reason=Checksum-invalid endpoint input never reaches the checked-arrival supersession boundary; failed output and corrupt arrival preserve the valid duplicate report for retry.
+//# (1) A D-SACK block is only used to report a duplicate contiguous
+//# sequence of data received by the receiver in the most recent packet.
+fn dsack_checksum_invalid_arrival_preserves_failed_output_report() {
+    let mut cfg = config();
+    cfg.connection.sack = true;
+    cfg.connection.delayed_ack_us = 0;
+    let (local, remote) = addresses();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let client = a.connect(0, local, remote).unwrap();
+    pump(&mut a, &mut b, 0);
+    b.accept(listener).unwrap();
+    a.write(client, b"duplicate").unwrap();
+    let data = packets(&mut a, 40);
+    assert_eq!(data.len(), 1);
+    let (ip, bytes) = &data[0];
+    let segment = wire::parse(*ip, bytes).unwrap();
+    let duplicate = (
+        segment.header.sequence,
+        segment
+            .header
+            .sequence
+            .wrapping_add(segment.payload.len() as u32),
+    );
+    b.input(40, *ip, bytes).unwrap();
+    packets(&mut b, 40);
+    b.input(41, *ip, bytes).unwrap();
+    assert_eq!(
+        b.poll_transmit(41, &mut [0; 19], 16),
+        Err(EndpointError::Connection(Error::OutputTooSmall))
+    );
+    let mut corrupt = bytes.clone();
+    corrupt[16] ^= 1;
+    assert_eq!(
+        b.input(42, *ip, &corrupt).unwrap(),
+        InputDisposition::Dropped
+    );
+    let reports = packets(&mut b, 42);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        wire::parse(reports[0].0, &reports[0].1)
+            .unwrap()
+            .options
+            .sack_blocks[0],
+        Some(duplicate)
+    );
+}
