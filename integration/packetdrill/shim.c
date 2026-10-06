@@ -141,18 +141,25 @@ static int shutdown_socket(void *u, int fd, int how) {
     return SIMPLE(9, fd, how, 0);
 }
 static int setopt(void *u, int fd, int level, int name, const void *p, socklen_t n) {
-    if (!((level == SOL_SOCKET && name == SO_REUSEADDR) || (level == IPPROTO_TCP && (name == TCP_NODELAY || name == TCP_USER_TIMEOUT)))) return unsupported("setsockopt option");
+    if (!((level == SOL_SOCKET && name == SO_REUSEADDR) || (level == IPPROTO_TCP && (name == TCP_NODELAY || name == TCP_USER_TIMEOUT)) || (level == IPPROTO_IP && (name == IP_TOS || name == IP_MTU_DISCOVER)))) return unsupported("setsockopt option");
     if (!p) return bad(EFAULT);
-    if (n < sizeof(int)) return bad(EINVAL);
-    int value; memcpy(&value, p, sizeof(value));
-    return SIMPLE(11, fd, level == SOL_SOCKET ? 1 : name == TCP_NODELAY ? 2 : 5, value);
+    if (level == IPPROTO_IP ? (n != 1 && n != sizeof(int)) : n < sizeof(int)) return bad(EINVAL);
+    int value = 0;
+    if (n == 1) value = *(const unsigned char *)p;
+    else memcpy(&value, p, sizeof(value));
+    int key = level == IPPROTO_IP ? (name == IP_TOS ? 6 : 7) : level == SOL_SOCKET ? 1 : name == TCP_NODELAY ? 2 : 5;
+    return SIMPLE(11, fd, key, value);
 }
 static int getopt_socket(void *u, int fd, int level, int name, void *p, socklen_t *n) {
-    if (!((level == SOL_SOCKET && (name == SO_REUSEADDR || name == SO_ERROR || name == SO_TYPE)) || (level == IPPROTO_TCP && (name == TCP_NODELAY || name == TCP_USER_TIMEOUT)))) return unsupported("getsockopt option (including TCP_INFO)");
+    if (!((level == SOL_SOCKET && (name == SO_REUSEADDR || name == SO_ERROR || name == SO_TYPE)) || (level == IPPROTO_TCP && (name == TCP_NODELAY || name == TCP_USER_TIMEOUT)) || (level == IPPROTO_IP && (name == IP_TOS || name == IP_MTU_DISCOVER)))) return unsupported("getsockopt option (including TCP_INFO)");
     if (!p || !n) return bad(EFAULT);
-    int key = level == IPPROTO_TCP ? (name == TCP_NODELAY ? 2 : 5) : name == SO_REUSEADDR ? 1 : name == SO_ERROR ? 3 : 4;
+    int key = level == IPPROTO_IP ? (name == IP_TOS ? 6 : 7) : level == IPPROTO_TCP ? (name == TCP_NODELAY ? 2 : 5) : name == SO_REUSEADDR ? 1 : name == SO_ERROR ? 3 : 4;
     int value = SIMPLE(12, fd, key, 0);
     if (value < 0) return -1;
+    // Linux's IPv4 integer options return a byte for short, nonzero buffers.
+    if (level == IPPROTO_IP && *n && *n < sizeof(value)) {
+        unsigned char byte = value; memcpy(p, &byte, 1); *n = 1; return 0;
+    }
     size_t size = *n < sizeof(value) ? *n : sizeof(value); memcpy(p, &value, size); *n = size; return 0;
 }
 static int poll_socket(void *u, struct pollfd *fds, nfds_t n, int timeout) {
@@ -245,10 +252,65 @@ void ntcp_abi_check(void *u) {
     assert(p.getsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, &size) == 0 && value == 0);
     size = 1; unsigned char byte = 0;
     assert(p.getsockopt(u, fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &byte, &size) == 0 && size == 1 && byte == ((unsigned char *)&value)[0]);
+    for (int option = 0; option < 2; option++) {
+        int name = option ? IP_MTU_DISCOVER : IP_TOS;
+        int expected = option ? IP_PMTUDISC_WANT : 0;
+        size = sizeof(value);
+        assert(p.getsockopt(u, fd, SOL_IP, name, &value, &size) == 0 && value == expected && size == sizeof(value));
+        assert(p.setsockopt(u, fd, SOL_IP, name, NULL, 1) == -1 && errno == EFAULT);
+        for (socklen_t length = 0; length <= 5; length++) {
+            if (length == 1 || length == sizeof(int)) continue;
+            assert(p.setsockopt(u, fd, SOL_IP, name, &value, length) == -1 && errno == EINVAL);
+        }
+        assert(p.setsockopt(u, -1, SOL_IP, name, &value, sizeof(value)) == -1 && errno == EBADF);
+        value = option ? IP_PMTUDISC_DONT : 7;
+        assert(p.setsockopt(u, fd, SOL_IP, name, &value, sizeof(value)) == 0);
+        expected = option ? IP_PMTUDISC_DONT : 4;
+        size = sizeof(value);
+        assert(p.getsockopt(u, fd, SOL_IP, name, &value, &size) == 0 && value == expected);
+        byte = option ? IP_PMTUDISC_DO : 255;
+        assert(p.setsockopt(u, fd, SOL_IP, name, &byte, 1) == 0);
+        expected = option ? IP_PMTUDISC_DO : 252;
+        size = sizeof(value);
+        assert(p.getsockopt(u, fd, SOL_IP, name, &value, &size) == 0 && value == expected);
+        byte = 0; size = 1;
+        assert(p.getsockopt(u, fd, SOL_IP, name, &byte, &size) == 0 && size == 1 && byte == expected);
+        unsigned char truncated[8];
+        for (socklen_t length = 1; length < sizeof(int); length++) {
+            memset(truncated, 0xa5, sizeof(truncated)); size = length;
+            assert(p.getsockopt(u, fd, SOL_IP, name, truncated, &size) == 0 && size == 1 && truncated[0] == expected && truncated[1] == 0xa5);
+        }
+        memset(truncated, 0xa5, sizeof(truncated));
+        size = 0;
+        assert(p.getsockopt(u, fd, SOL_IP, name, truncated, &size) == 0 && size == 0 && truncated[0] == 0xa5);
+        size = sizeof(truncated);
+        assert(p.getsockopt(u, fd, SOL_IP, name, truncated, &size) == 0 && size == sizeof(int) && truncated[4] == 0xa5);
+        assert(p.getsockopt(u, fd, SOL_IP, name, NULL, &size) == -1 && errno == EFAULT);
+        assert(p.getsockopt(u, fd, SOL_IP, name, &value, NULL) == -1 && errno == EFAULT);
+        size = sizeof(value);
+        if (option) {
+            for (int mode = -1; mode <= 6; mode++) {
+                if (mode >= IP_PMTUDISC_DONT && mode <= IP_PMTUDISC_DO) continue;
+                assert(p.setsockopt(u, fd, SOL_IP, name, &mode, sizeof(mode)) == -1 && errno == (mode >= 3 && mode <= 5 ? ENOSYS : EINVAL));
+                assert(p.getsockopt(u, fd, SOL_IP, name, &value, &size) == 0 && value == expected);
+            }
+        } else {
+            value = -1;
+            assert(p.setsockopt(u, fd, SOL_IP, name, &value, sizeof(value)) == 0);
+            assert(p.getsockopt(u, fd, SOL_IP, name, &value, &size) == 0 && value == 252);
+            value = 256;
+            assert(p.setsockopt(u, fd, SOL_IP, name, &value, sizeof(value)) == 0);
+            assert(p.getsockopt(u, fd, SOL_IP, name, &value, &size) == 0 && value == 0);
+        }
+    }
     assert(p.close(u, fd) == 0);
     // Stock socket_close uses libc, not the plugin callback, for open sockets.
     fd = p.socket(u, AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    assert(fd >= 0 && close(fd) == 0);
+    assert(fd >= 0);
+    size = sizeof(value);
+    assert(p.getsockopt(u, fd, SOL_IP, IP_TOS, &value, &size) == 0 && value == 0);
+    assert(p.getsockopt(u, fd, SOL_IP, IP_MTU_DISCOVER, &value, &size) == 0 && value == IP_PMTUDISC_WANT);
+    assert(close(fd) == 0);
     struct timeval tv;
     assert(p.gettimeofday(u, &tv, NULL) == 0 && tv.tv_sec > 1700000000);
     assert(p.usleep(u, 1) == 0);

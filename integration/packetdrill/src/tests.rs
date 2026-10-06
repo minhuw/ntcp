@@ -64,6 +64,7 @@ fn syn_with_options(sequence: u32, destination_port: u16, options: &[u8]) -> Vec
     let n = ntcp::wire::encode(ip, header, options, &[], &mut tcp).unwrap();
     frame(
         ntcp::Transmit {
+            connection: None,
             ip,
             len: n,
             hop_limit: 64,
@@ -607,14 +608,13 @@ fn listener_timeout_inheritance_and_queued_payload_gap_urgent_fin() {
     owner.execute(&mut bind).unwrap();
     execute_value(&mut owner, 3, listener, 1, 0).unwrap();
     assert_eq!(execute_value(&mut owner, 17, listener, 0, 0), Err(EINVAL));
-    let (ip, tcp) = parse_frame(&syn(100, 8080))
-        .map(|(ip, tcp)| (ip, tcp.to_vec()))
-        .unwrap();
-    owner.endpoint.input(0, ip, &tcp).unwrap();
+    let ip = parse_frame(&syn(100, 8080)).unwrap().0;
+    let (mut incoming, _) = request(14, 0, 0, syn(100, 8080), 0);
+    owner.execute(&mut incoming).unwrap();
     let mut out = [0; 1500];
     let tx = owner
         .endpoint
-        .poll_transmit(0, &mut out, BUDGET)
+        .poll_transmit(owner.now(), &mut out, BUDGET)
         .unwrap()
         .packet
         .unwrap();
@@ -634,7 +634,7 @@ fn listener_timeout_inheritance_and_queued_payload_gap_urgent_fin() {
             urgent_pointer: urgent,
         };
         let n = ntcp::wire::encode(ip, header, &[], payload, &mut out).unwrap();
-        owner.endpoint.input(0, ip, &out[..n]).unwrap();
+        owner.endpoint.input(owner.now(), ip, &out[..n]).unwrap();
     };
     inject(&mut owner, 101, ntcp::wire::ACK, 0, &[]);
     execute_value(&mut owner, 11, listener, 5, 3456).unwrap();
@@ -647,7 +647,7 @@ fn listener_timeout_inheritance_and_queued_payload_gap_urgent_fin() {
     let mut outgoing = [0; 1500];
     owner
         .endpoint
-        .poll_transmit(0, &mut outgoing, BUDGET)
+        .poll_transmit(owner.now(), &mut outgoing, BUDGET)
         .unwrap();
     assert_eq!(owner.endpoint.application_timeout(id), Ok(Some(1_234_000)));
     assert!(owner.endpoint.next_deadline().unwrap() <= 1_234_000);
@@ -844,4 +844,468 @@ fn only_upstream_sack_uses_iw10() {
         }
         assert_eq!(flight, expected, "{profile:?}");
     }
+}
+
+fn input_packet(owner: &mut Owner, ip: IpMetadata, header: ntcp::wire::Header, options: &[u8]) {
+    let mut tcp = [0; 64];
+    let len = ntcp::wire::encode(ip, header, options, &[], &mut tcp).unwrap();
+    let packet = frame(
+        ntcp::Transmit {
+            connection: None,
+            ip,
+            len,
+            hop_limit: 64,
+            dscp: 0,
+            ecn: 0,
+            ipv4_options: Default::default(),
+        },
+        &tcp[..len],
+    )
+    .unwrap();
+    let (mut r, _) = request(14, 0, 0, packet, 0);
+    owner.execute(&mut r).unwrap();
+}
+fn poll_frame(owner: &mut Owner) -> Option<(ntcp::Transmit, Vec<u8>)> {
+    let mut tcp = vec![0; BYTES - 20];
+    let tx = owner
+        .endpoint
+        .poll_transmit(owner.now(), &mut tcp, BUDGET)
+        .unwrap()
+        .packet?;
+    Some((tx, owner.frame(tx, &tcp[..tx.len]).unwrap()))
+}
+fn packet_header(bytes: &[u8]) -> ntcp::wire::Header {
+    let (ip, tcp) = parse_frame(bytes).unwrap();
+    ntcp::wire::parse(ip, tcp).unwrap().header
+}
+fn check_ip(bytes: &[u8], tos: u8, df: bool) {
+    assert_eq!(bytes[1], tos);
+    assert_eq!(
+        u16::from_be_bytes([bytes[6], bytes[7]]),
+        if df { 0x4000 } else { 0 }
+    );
+    assert_eq!(ip_checksum(&bytes[..20]), 0);
+    parse_frame(bytes).unwrap();
+}
+fn reverse_ack(
+    tx: ntcp::Transmit,
+    sent: ntcp::wire::Header,
+    ack: u32,
+) -> (IpMetadata, ntcp::wire::Header) {
+    (
+        IpMetadata {
+            source: tx.ip.destination,
+            destination: tx.ip.source,
+        },
+        ntcp::wire::Header {
+            source_port: sent.destination_port,
+            destination_port: sent.source_port,
+            sequence: 101,
+            acknowledgment: ack,
+            flags: ntcp::wire::ACK,
+            window: 65535,
+            urgent_pointer: 0,
+        },
+    )
+}
+fn active_ip_connection(
+    owner: &mut Owner,
+    tos: i32,
+    mode: i32,
+) -> (i32, ConnectionId, ntcp::Transmit, ntcp::wire::Header) {
+    let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
+    execute_value(owner, 11, fd, 6, tos).unwrap();
+    execute_value(owner, 11, fd, 7, mode).unwrap();
+    let (mut connect, _) = request(
+        5,
+        fd,
+        0,
+        encode_addr(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080)),
+        0,
+    );
+    assert_eq!(owner.execute(&mut connect).err(), Some(EINPROGRESS));
+    let id = owner.connection(fd).unwrap();
+    let (tx, bytes) = poll_frame(owner).unwrap();
+    check_ip(&bytes, tos as u8 & !3, mode != IP_PMTUDISC_DONT);
+    let sent = packet_header(&bytes);
+    let (ip, mut reply) = reverse_ack(tx, sent, sent.sequence.wrapping_add(1));
+    reply.sequence = 100;
+    reply.flags |= ntcp::wire::SYN;
+    input_packet(owner, ip, reply, &[2, 4, 5, 180, 1, 1, 4, 2]);
+    assert_eq!(owner.endpoint.state(id), Ok(State::Established));
+    let (_, bytes) = poll_frame(owner).unwrap();
+    check_ip(&bytes, tos as u8 & !3, mode != IP_PMTUDISC_DONT);
+    (fd, id, tx, sent)
+}
+
+#[test]
+fn ip_options_pending_connect_updates_and_engine_owned_ecn() {
+    let mut owner = Owner::new((local(), Profile::Sack)).unwrap();
+    let fd = owner.alloc(Socket::new(0)).unwrap();
+    assert_eq!(execute_value(&mut owner, 12, fd, 6, 0), Ok(0));
+    assert_eq!(
+        execute_value(&mut owner, 12, fd, 7, 0),
+        Ok(IP_PMTUDISC_WANT as i64)
+    );
+    execute_value(&mut owner, 11, fd, 6, 7).unwrap();
+    execute_value(&mut owner, 11, fd, 7, IP_PMTUDISC_DONT).unwrap();
+    let (mut connect, _) = request(
+        5,
+        fd,
+        0,
+        encode_addr(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080)),
+        0,
+    );
+    assert!(owner.execute(&mut connect).unwrap().is_none());
+    assert!(connect.started);
+    let (tx, bytes) = poll_frame(&mut owner).unwrap();
+    check_ip(&bytes, 4, false);
+    let sent = packet_header(&bytes);
+    for bad in [-1, 3, 4, 5, 6] {
+        assert_eq!(
+            execute_value(&mut owner, 11, fd, 7, bad),
+            Err(if (3..=5).contains(&bad) {
+                ENOSYS
+            } else {
+                EINVAL
+            })
+        );
+        assert_eq!(
+            execute_value(&mut owner, 12, fd, 7, 0),
+            Ok(IP_PMTUDISC_DONT as i64)
+        );
+    }
+    execute_value(&mut owner, 11, fd, 6, 255).unwrap();
+    execute_value(&mut owner, 11, fd, 7, IP_PMTUDISC_DO).unwrap();
+    let (ip, mut reply) = reverse_ack(tx, sent, sent.sequence.wrapping_add(1));
+    reply.flags |= ntcp::wire::SYN;
+    reply.sequence = 100;
+    input_packet(&mut owner, ip, reply, &[2, 4, 5, 180]);
+    assert!(owner.execute(&mut connect).unwrap().is_some());
+    let (_, bytes) = poll_frame(&mut owner).unwrap();
+    check_ip(&bytes, 252, true);
+    // Framing must preserve an engine-produced ECN codepoint, not socket ECN bits.
+    let mut tcp = [0; 64];
+    let len = ntcp::wire::encode(tx.ip, sent, &[], &[], &mut tcp).unwrap();
+    let engine_tx = ntcp::Transmit {
+        len,
+        dscp: 63,
+        ecn: 2,
+        ..tx
+    };
+    check_ip(&owner.frame(engine_tx, &tcp[..len]).unwrap(), 254, true);
+    let id = owner.connection(fd).unwrap();
+    for mode in [IP_PMTUDISC_WANT, IP_PMTUDISC_DONT, IP_PMTUDISC_DO] {
+        execute_value(&mut owner, 11, fd, 7, mode).unwrap();
+        execute_value(&mut owner, 11, fd, 6, 4).unwrap();
+        let before = owner.endpoint.buffer_bytes();
+        let (mut write, _) = request(7, fd, 0, b"data".to_vec(), 0);
+        assert_eq!(owner.execute(&mut write).unwrap().unwrap().value, 4);
+        let (_, bytes) = poll_frame(&mut owner).unwrap();
+        check_ip(&bytes, 4, mode != IP_PMTUDISC_DONT);
+        let header = packet_header(&bytes);
+        let acknowledged = owner.endpoint.acknowledged(id).unwrap();
+        let deadline = owner.endpoint.next_deadline();
+        execute_value(&mut owner, 11, fd, 6, 0).unwrap();
+        assert_eq!(owner.endpoint.buffer_bytes(), before);
+        assert_eq!(owner.endpoint.next_deadline(), deadline);
+        assert_eq!(owner.endpoint.acknowledged(id).unwrap(), acknowledged);
+        let (ip, reply) = reverse_ack(tx, header, header.sequence.wrapping_add(4));
+        input_packet(&mut owner, ip, reply, &[]);
+        assert_eq!(owner.endpoint.acknowledged(id).unwrap(), acknowledged + 4);
+    }
+    // A failed core update must not partially change either socket or IP policy.
+    let (ip, mut reset) = reverse_ack(tx, sent, sent.sequence.wrapping_add(13));
+    reset.flags = ntcp::wire::RST;
+    input_packet(&mut owner, ip, reset, &[]);
+    assert_eq!(owner.endpoint.state(id), Ok(State::Closed));
+    owner.endpoint.release(id).unwrap();
+    let previous = owner.sockets[&fd].ip_options;
+    assert_eq!(execute_value(&mut owner, 11, fd, 6, 40), Err(EBADF));
+    assert_eq!(
+        execute_value(&mut owner, 11, fd, 7, IP_PMTUDISC_DONT),
+        Err(EBADF)
+    );
+    assert_eq!(owner.sockets[&fd].ip_options, previous);
+    assert_eq!(
+        owner
+            .connection_ip
+            .iter()
+            .find(|p| p.id == id)
+            .unwrap()
+            .options,
+        previous
+    );
+}
+
+#[test]
+fn ip_options_listener_snapshot_accept_detached_fin_and_fd_reuse() {
+    let mut owner = Owner::new((local(), Profile::Sack)).unwrap();
+    let listener = owner.alloc(Socket::new(0)).unwrap();
+    execute_value(&mut owner, 11, listener, 6, 187).unwrap();
+    execute_value(&mut owner, 11, listener, 7, IP_PMTUDISC_DONT).unwrap();
+    let (mut bind, _) = request(
+        2,
+        listener,
+        0,
+        encode_addr(SocketAddr::new(local().into(), 8080)),
+        0,
+    );
+    owner.execute(&mut bind).unwrap();
+    execute_value(&mut owner, 3, listener, 1, 0).unwrap();
+    let (mut incoming, _) = request(14, 0, 0, syn(100, 8080), 0);
+    owner.execute(&mut incoming).unwrap();
+    let tuple = ntcp::Tuple {
+        local: SocketAddr::new(local().into(), 8080),
+        remote: SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 50000),
+    };
+    let id = owner.endpoint.connection_id(tuple).unwrap();
+    execute_value(&mut owner, 11, listener, 6, 4).unwrap();
+    execute_value(&mut owner, 11, listener, 7, IP_PMTUDISC_DO).unwrap();
+    // A duplicate SYN must not overwrite the original listener snapshot.
+    owner.execute(&mut incoming).unwrap();
+    assert_eq!(owner.connection_ip.len(), 1);
+    let (tx, bytes) = poll_frame(&mut owner).unwrap();
+    assert_eq!(tx.connection, Some(id));
+    check_ip(&bytes, 184, false);
+    let sent = packet_header(&bytes);
+    let (ip, reply) = reverse_ack(tx, sent, sent.sequence.wrapping_add(1));
+    input_packet(&mut owner, ip, reply, &[]);
+    let fd = execute_value(&mut owner, 4, listener, 0, 0).unwrap() as i32;
+    assert_eq!(execute_value(&mut owner, 12, fd, 6, 0), Ok(184));
+    assert_eq!(
+        execute_value(&mut owner, 12, fd, 7, 0),
+        Ok(IP_PMTUDISC_DONT as i64)
+    );
+    assert_eq!(owner.connection(fd), Ok(id));
+    // Pin the old exposed fd until dup2: no parallel test can allocate it.
+    let old_token = owner.sockets.get_mut(&fd).unwrap().token.take().unwrap();
+    execute_value(&mut owner, 8, fd, 0, 0).unwrap();
+    let replacement = Token::new().unwrap();
+    assert_eq!(unsafe { dup2(replacement.fd, fd) }, fd);
+    let token = Token {
+        fd,
+        retained: replacement.retained.try_clone().unwrap(),
+    };
+    drop(old_token);
+    drop(replacement);
+    owner.alloc_token(Socket::new(0), token).unwrap();
+    execute_value(&mut owner, 11, fd, 6, 4).unwrap();
+    execute_value(&mut owner, 11, fd, 7, IP_PMTUDISC_DO).unwrap();
+    let (fin_tx, bytes) = poll_frame(&mut owner).unwrap();
+    assert_eq!(fin_tx.connection, Some(id));
+    check_ip(&bytes, 184, false);
+    let fin = packet_header(&bytes);
+    assert_ne!(fin.flags & ntcp::wire::FIN, 0);
+    let (ip, mut reply) = reverse_ack(fin_tx, fin, fin.sequence.wrapping_add(1));
+    reply.flags |= ntcp::wire::FIN;
+    input_packet(&mut owner, ip, reply, &[]);
+    assert_eq!(owner.endpoint.state(id), Ok(State::TimeWait));
+    let retained_bytes = owner.endpoint.buffer_bytes();
+    owner.endpoint.release(id).unwrap();
+    assert!(owner.endpoint.state(id).is_err());
+    assert!(owner.endpoint.connection_exists(id));
+    owner.gc_ip_options();
+    assert_eq!(owner.connection_ip.len(), 1);
+    let (_, bytes) = poll_frame(&mut owner).unwrap();
+    check_ip(&bytes, 184, false);
+    // Even after its last ACK, a released TIME-WAIT record still owns policy
+    // and buffers. A repeated FIN must get the original policy, not the new fd's.
+    owner.gc_ip_options();
+    assert_eq!(owner.connection_ip.len(), 1);
+    assert_eq!(owner.endpoint.buffer_bytes(), retained_bytes);
+    input_packet(&mut owner, ip, reply, &[]);
+    let (ack_tx, bytes) = poll_frame(&mut owner).unwrap();
+    assert_eq!(ack_tx.connection, Some(id));
+    check_ip(&bytes, 184, false);
+    assert_eq!(owner.endpoint.buffer_bytes(), retained_bytes);
+    let expiry = owner.endpoint.next_deadline().unwrap().max(owner.now());
+    owner.endpoint.on_timeout(expiry, BUDGET).unwrap();
+    owner.epoch = Instant::now() - Duration::from_micros(expiry);
+    assert!(poll_frame(&mut owner).is_none());
+    assert!(!owner.endpoint.connection_exists(id));
+    owner.gc_ip_options();
+    assert!(owner.connection_ip.is_empty());
+    assert_eq!(owner.endpoint.buffer_bytes(), 0);
+    assert_eq!(execute_value(&mut owner, 12, fd, 6, 0), Ok(4));
+    assert_eq!(
+        execute_value(&mut owner, 12, fd, 7, 0),
+        Ok(IP_PMTUDISC_DO as i64)
+    );
+}
+
+#[test]
+fn ip_options_passive_expiry_gc_final_reset_and_unmatched_control() {
+    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let listener = owner.alloc(Socket::new(0)).unwrap();
+    execute_value(&mut owner, 11, listener, 6, 40).unwrap();
+    execute_value(&mut owner, 11, listener, 7, IP_PMTUDISC_DONT).unwrap();
+    execute_value(&mut owner, 11, listener, 5, 1).unwrap();
+    let (mut bind, _) = request(
+        2,
+        listener,
+        0,
+        encode_addr(SocketAddr::new(local().into(), 8080)),
+        0,
+    );
+    owner.execute(&mut bind).unwrap();
+    execute_value(&mut owner, 3, listener, 2, 0).unwrap();
+    let (mut incoming, _) = request(14, 0, 0, syn(100, 8080), 0);
+    owner.execute(&mut incoming).unwrap();
+    let (tx, bytes) = poll_frame(&mut owner).unwrap();
+    check_ip(&bytes, 40, false);
+    let old = tx.connection.unwrap();
+    let deadline = owner.now() + 2000;
+    owner.endpoint.on_timeout(deadline, BUDGET).unwrap();
+    // Avoid wall-clock regression in following application operations.
+    owner.epoch = Instant::now() - Duration::from_micros(deadline);
+    assert!(poll_frame(&mut owner).is_none());
+    assert!(owner.endpoint.state(old).is_err());
+    owner.gc_ip_options();
+    assert!(owner.connection_ip.is_empty());
+    execute_value(&mut owner, 11, listener, 5, 0).unwrap();
+    execute_value(&mut owner, 11, listener, 6, 80).unwrap();
+    owner.execute(&mut incoming).unwrap();
+    let (tx, bytes) = poll_frame(&mut owner).unwrap();
+    assert_ne!(tx.connection, Some(old));
+    check_ip(&bytes, 80, false);
+    let child = tx.connection.unwrap();
+    let tuple = owner.endpoint.tuple(child).unwrap();
+    owner.endpoint.abort(child).unwrap();
+    assert!(owner.endpoint.state(child).is_err());
+    assert!(owner.endpoint.connection_exists(child));
+    execute_value(&mut owner, 11, listener, 6, 120).unwrap();
+    execute_value(&mut owner, 11, listener, 7, IP_PMTUDISC_DO).unwrap();
+    owner.execute(&mut incoming).unwrap();
+    let replacement = owner.endpoint.connection_id(tuple).unwrap();
+    assert_ne!(replacement, child);
+    let mut reset_seen = false;
+    let mut synack_seen = false;
+    for _ in 0..2 {
+        let (tx, bytes) = poll_frame(&mut owner).unwrap();
+        if tx.connection == Some(child) {
+            assert_ne!(packet_header(&bytes).flags & ntcp::wire::RST, 0);
+            check_ip(&bytes, 80, false);
+            reset_seen = true;
+        } else {
+            assert_eq!(tx.connection, Some(replacement));
+            assert_ne!(packet_header(&bytes).flags & ntcp::wire::SYN, 0);
+            check_ip(&bytes, 120, true);
+            synack_seen = true;
+        }
+    }
+    assert!(reset_seen && synack_seen);
+    owner.gc_ip_options();
+    assert_eq!(owner.connection_ip.len(), 1);
+    let child = replacement;
+    execute_value(&mut owner, 8, listener, 0, 0).unwrap();
+    owner.endpoint.on_timeout(owner.now(), BUDGET).unwrap();
+    // Closed children must retain policy until their last RST is framed.
+    owner.gc_ip_options();
+    let (tx, bytes) = poll_frame(&mut owner).unwrap();
+    assert_eq!(tx.connection, Some(child));
+    assert_ne!(packet_header(&bytes).flags & ntcp::wire::RST, 0);
+    check_ip(&bytes, 120, true);
+    assert!(!owner.endpoint.connection_exists(child));
+    owner.gc_ip_options();
+    assert!(owner.connection_ip.is_empty());
+    let (mut unmatched, _) = request(14, 0, 0, syn(200, 9090), 0);
+    owner.execute(&mut unmatched).unwrap();
+    let (tx, bytes) = poll_frame(&mut owner).unwrap();
+    assert_eq!(tx.connection, None);
+    check_ip(&bytes, 0, true);
+}
+
+#[test]
+fn ip_options_changes_preserve_sack_holes_and_data_ack() {
+    let mut owner = Owner::new((local(), Profile::Sack)).unwrap();
+    let (fd, id, handshake_tx, _) = active_ip_connection(&mut owner, 0, IP_PMTUDISC_DONT);
+    let data: Vec<u8> = (0..4380).map(|i| (i % 251) as u8).collect();
+    let (mut write, _) = request(7, fd, 0, data.clone(), 0);
+    owner.execute(&mut write).unwrap();
+    let (_, bytes) = poll_frame(&mut owner).unwrap();
+    let first = packet_header(&bytes);
+    let base = first.sequence;
+    let (original_ip, original_tcp) = parse_frame(&bytes).unwrap();
+    let mut original_bytes = ntcp::wire::parse(original_ip, original_tcp)
+        .unwrap()
+        .payload
+        .len();
+    while let Some((_, bytes)) = poll_frame(&mut owner) {
+        let (ip, tcp) = parse_frame(&bytes).unwrap();
+        original_bytes += ntcp::wire::parse(ip, tcp).unwrap().payload.len();
+    }
+    assert_eq!(original_bytes, data.len());
+    let (ip, reply) = reverse_ack(handshake_tx, first, base);
+    let mut sack = vec![1, 1, 5, 10];
+    sack.extend_from_slice(&base.wrapping_add(1460).to_be_bytes());
+    sack.extend_from_slice(&base.wrapping_add(1940).to_be_bytes());
+    input_packet(&mut owner, ip, reply, &sack);
+    let bytes_reserved = owner.endpoint.buffer_bytes();
+    let deadline = owner.endpoint.next_deadline();
+    execute_value(&mut owner, 11, fd, 6, 4).unwrap();
+    execute_value(&mut owner, 11, fd, 6, 0).unwrap();
+    assert_eq!(execute_value(&mut owner, 11, fd, 7, 3), Err(ENOSYS));
+    assert_eq!(owner.endpoint.buffer_bytes(), bytes_reserved);
+    assert_eq!(owner.endpoint.next_deadline(), deadline);
+    assert_eq!(owner.endpoint.acknowledged(id), Ok(0));
+    for edge in [2420, 2920] {
+        sack[8..12].copy_from_slice(&base.wrapping_add(edge).to_be_bytes());
+        input_packet(&mut owner, ip, reply, &sack);
+    }
+    let mut retransmitted = 0;
+    while let Some((_, bytes)) = poll_frame(&mut owner) {
+        check_ip(&bytes, 0, false);
+        let (ip, tcp) = parse_frame(&bytes).unwrap();
+        let segment = ntcp::wire::parse(ip, tcp).unwrap();
+        if !segment.payload.is_empty() {
+            let start = segment.header.sequence.wrapping_sub(base) as usize;
+            let end = start + segment.payload.len();
+            assert!(end <= 1460 || start >= 2920, "retransmitted SACKed bytes");
+            assert_eq!(segment.payload, &data[start..end]);
+            retransmitted += segment.payload.len();
+        }
+    }
+    assert!(retransmitted >= 1460);
+    let (_, final_ack) = reverse_ack(handshake_tx, first, base.wrapping_add(data.len() as u32));
+    input_packet(&mut owner, ip, final_ack, &[]);
+    assert_eq!(owner.endpoint.acknowledged(id), Ok(data.len() as u64));
+}
+
+#[test]
+fn ip_metadata_limit_is_reserved_before_connect_and_reused_after_gc() {
+    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    // Small real buffers let this test reach all 128 slots, not the profile's
+    // separate aggregate byte cap. Production profile settings remain untouched.
+    let mut config = EndpointConfig {
+        max_connections: LIMIT,
+        ..EndpointConfig::default()
+    };
+    config.connection.receive_capacity = 128;
+    config.connection.send_capacity = 128;
+    config.connection.mss = 128;
+    owner.endpoint = Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+    let remote = encode_addr(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080));
+    let mut first = None;
+    for _ in 0..LIMIT {
+        let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
+        let (mut connect, _) = request(5, fd, 0, remote.clone(), 0);
+        assert_eq!(owner.execute(&mut connect).err(), Some(EINPROGRESS));
+        first.get_or_insert((fd, owner.connection(fd).unwrap()));
+        assert!(owner.connection_ip.len() <= LIMIT);
+    }
+    let (fd, old) = first.unwrap();
+    execute_value(&mut owner, 8, fd, 0, 0).unwrap();
+    let replacement = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
+    let port = owner.next_port;
+    let (mut connect, _) = request(5, replacement, 0, remote, 0);
+    assert_eq!(owner.execute(&mut connect).err(), Some(ENOBUFS));
+    assert_eq!(owner.next_port, port);
+    assert!(matches!(owner.sockets[&replacement].handle, Handle::Fresh));
+    owner.endpoint.release(old).unwrap();
+    while poll_frame(&mut owner).is_some() {}
+    owner.gc_ip_options();
+    assert_eq!(owner.connection_ip.len(), LIMIT - 1);
+    assert_eq!(owner.execute(&mut connect).err(), Some(EINPROGRESS));
+    assert_eq!(owner.connection_ip.len(), LIMIT);
 }

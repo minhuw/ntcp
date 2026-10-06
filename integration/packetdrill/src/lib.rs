@@ -113,6 +113,7 @@ struct Socket {
     reuse: bool,
     nodelay: bool,
     user_timeout_ms: i32,
+    ip_options: IpOptions,
     readable: Option<bool>,
     acceptable: Option<bool>,
     error: i32,
@@ -131,6 +132,7 @@ impl Socket {
             reuse: false,
             nodelay: false,
             user_timeout_ms: 0,
+            ip_options: IpOptions::default(),
             readable: Some(false),
             acceptable: Some(false),
             error: 0,
@@ -139,6 +141,25 @@ impl Socket {
             connected: false,
         }
     }
+}
+// Fixed synthetic IPv4 route, MTU 65535: no route lookup or ICMP PMTU updates.
+// WANT/DO set DF; DONT clears it. Every generated packet fits this route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IpOptions {
+    tos: u8,
+    discover: i32,
+}
+impl Default for IpOptions {
+    fn default() -> Self {
+        Self {
+            tos: 0,
+            discover: IP_PMTUDISC_WANT,
+        }
+    }
+}
+struct ConnectionIp {
+    id: ConnectionId,
+    options: IpOptions,
 }
 fn user_timeout_us(milliseconds: i32) -> Result<Option<u64>> {
     let ms = u64::try_from(milliseconds).map_err(|_| EINVAL)?;
@@ -153,6 +174,7 @@ struct Owner {
     output: VecDeque<Response>,
     pending: VecDeque<Request>,
     detached: VecDeque<ConnectionId>,
+    connection_ip: Vec<ConnectionIp>,
 }
 fn diagnostic(kind: &str, reason: &str) {
     let message = format!("NTCP_PACKETDRILL_{kind}: {reason}\n");
@@ -338,12 +360,14 @@ impl Owner {
             output: VecDeque::new(),
             pending: VecDeque::new(),
             detached: VecDeque::new(),
+            connection_ip: Vec::new(),
         })
     }
     fn now(&self) -> u64 {
         self.epoch.elapsed().as_micros() as u64
     }
     fn alloc(&mut self, socket: Socket) -> Result<i32> {
+        self.gc_ip_options();
         if self.sockets.len() == LIMIT {
             return Err(EMFILE);
         }
@@ -393,7 +417,7 @@ impl Owner {
                                 .unwrap()
                                 .as_micros() as i64;
                             buf.truncate(p.len);
-                            match frame(p, &buf) {
+                            match self.frame(p, &buf) {
                                 Ok(bytes) => self.output.push_back(Response {
                                     value: bytes.len() as i64,
                                     bytes,
@@ -414,6 +438,7 @@ impl Owner {
                     }
                 }
             }
+            self.gc_ip_options();
             for _ in 0..self.pending.len().min(BUDGET) {
                 let mut request = self.pending.pop_front().unwrap();
                 match self.execute_at_now(&mut request) {
@@ -456,6 +481,34 @@ impl Owner {
         for request in self.pending.drain(..) {
             let _ = request.reply.send(Err(ECANCELED));
         }
+    }
+    fn gc_ip_options(&mut self) {
+        // Released slots can still owe output or retain TIME-WAIT. Only reclaimed
+        // generations are stale; run GC after framing, never between poll/frame.
+        self.connection_ip
+            .retain(|p| self.endpoint.connection_exists(p.id));
+    }
+    fn reserve_ip_options(&mut self) -> Result<()> {
+        self.gc_ip_options();
+        if self.connection_ip.len() == LIMIT {
+            return Err(ENOBUFS);
+        }
+        Ok(())
+    }
+    fn frame(&self, tx: ntcp::Transmit, tcp: &[u8]) -> Result<Vec<u8>> {
+        // ponytail: bounded ID scan (128 entries); index if this adapter grows.
+        // poll_transmit may reclaim tx.connection before we frame its final RST.
+        let options = match tx.connection {
+            Some(id) => {
+                self.connection_ip
+                    .iter()
+                    .find(|p| p.id == id)
+                    .ok_or(EIO)?
+                    .options
+            }
+            None => IpOptions::default(),
+        };
+        frame_with_df(tx, tcp, options.discover != IP_PMTUDISC_DONT)
     }
     fn events(&mut self) {
         for _ in 0..BUDGET {
@@ -555,6 +608,12 @@ impl Owner {
                         socket.local = Some(tuple.local);
                         socket.nodelay = nodelay;
                         socket.reuse = reuse;
+                        socket.ip_options = self
+                            .connection_ip
+                            .iter()
+                            .find(|p| p.id == id)
+                            .ok_or(EIO)?
+                            .options;
                         socket.user_timeout_ms = self
                             .endpoint
                             .application_timeout(id)
@@ -576,7 +635,7 @@ impl Owner {
             5 => {
                 if !r.started {
                     let remote = decode_addr(&r.bytes)?;
-                    let socket = self.sockets.get_mut(&r.fd).ok_or(EBADF)?;
+                    let socket = self.sockets.get(&r.fd).ok_or(EBADF)?;
                     match socket.handle {
                         Handle::Fresh => (),
                         Handle::Connection(id) => {
@@ -593,6 +652,8 @@ impl Owner {
                         }
                         Handle::Listener(_) => return Err(EINVAL),
                     }
+                    self.reserve_ip_options()?;
+                    let socket = self.sockets.get_mut(&r.fd).unwrap();
                     let mut local = match socket.local {
                         Some(local) => local,
                         None => {
@@ -617,6 +678,13 @@ impl Owner {
                     self.endpoint
                         .set_application_timeout(id, user_timeout_us(socket.user_timeout_ms)?)
                         .map_err(error)?;
+                    self.endpoint
+                        .set_dscp(id, socket.ip_options.tos >> 2)
+                        .map_err(error)?;
+                    self.connection_ip.push(ConnectionIp {
+                        id,
+                        options: socket.ip_options,
+                    });
                     socket.local = Some(local);
                     socket.handle = Handle::Connection(id);
                     r.started = true;
@@ -714,6 +782,9 @@ impl Owner {
                     Handle::Fresh => (),
                     Handle::Listener(id) => self.endpoint.close_listener(id).map_err(error)?,
                     Handle::Connection(id) => {
+                        if self.detached.len() == LIMIT {
+                            return Err(ENOBUFS);
+                        }
                         if !matches!(
                             self.endpoint.state(id).map_err(error)?,
                             State::Closed | State::TimeWait
@@ -773,6 +844,37 @@ impl Owner {
                             }
                             socket.nodelay = r.b != 0;
                         }
+                        6 | 7 => {
+                            let mut options = socket.ip_options;
+                            if r.a == 6 {
+                                // Linux TCP truncates to u8 and masks ECN; the engine
+                                // alone controls ECT/CE, even on an established socket.
+                                options.tos = (r.b as u8) & !3;
+                            } else {
+                                match r.b {
+                                    IP_PMTUDISC_DONT | IP_PMTUDISC_WANT | IP_PMTUDISC_DO => (),
+                                    3..=5 => {
+                                        return Err(unsupported(
+                                            "IP_MTU_DISCOVER: PROBE/INTERFACE/OMIT require route features",
+                                        ));
+                                    }
+                                    _ => return Err(EINVAL),
+                                }
+                                options.discover = r.b;
+                            }
+                            if let Handle::Connection(id) = socket.handle {
+                                let metadata = self
+                                    .connection_ip
+                                    .iter_mut()
+                                    .find(|p| p.id == id)
+                                    .ok_or(EIO)?;
+                                self.endpoint
+                                    .set_dscp(id, options.tos >> 2)
+                                    .map_err(error)?;
+                                metadata.options = options;
+                            }
+                            socket.ip_options = options;
+                        }
                         5 => {
                             let milliseconds = r.b;
                             let timeout = user_timeout_us(milliseconds)?;
@@ -802,6 +904,8 @@ impl Owner {
                         }
                         4 => SOCK_STREAM as i64,
                         5 => socket.user_timeout_ms as i64,
+                        6 => socket.ip_options.tos as i64,
+                        7 => socket.ip_options.discover as i64,
                         _ => return Err(ENOSYS),
                     };
                 }
@@ -899,9 +1003,42 @@ impl Owner {
             }
             14 => {
                 let (ip, tcp) = parse_frame(&r.bytes)?;
+                let header = ntcp::wire::parse(ip, tcp).map_err(|_| EINVAL)?.header;
+                let tuple = ntcp::Tuple {
+                    local: SocketAddr::new(ip.destination, header.destination_port),
+                    remote: SocketAddr::new(ip.source, header.source_port),
+                };
+                let listener_options =
+                    if header.flags & (ntcp::wire::SYN | ntcp::wire::ACK) == ntcp::wire::SYN {
+                        self.sockets.values().find_map(|s| {
+                            (matches!(s.handle, Handle::Listener(_))
+                                && s.local.is_some_and(|a| a.port() == tuple.local.port()))
+                            .then_some(s.ip_options)
+                        })
+                    } else {
+                        None
+                    };
+                if listener_options.is_some()
+                    && self.endpoint.connection_id(tuple).is_none_or(|id| {
+                        matches!(self.endpoint.state(id), Ok(State::TimeWait) | Err(_))
+                    })
+                {
+                    // TIME-WAIT reuse can admit a new ID while the old ID survives.
+                    // Reserve before admission, not after consuming a SYN.
+                    self.reserve_ip_options()?;
+                }
                 self.endpoint
                     .input_with_traffic_class(self.now(), ip, r.bytes[1], tcp)
                     .map_err(error)?;
+                if let Some(options) = listener_options
+                    && let Some(id) = self.endpoint.connection_id(tuple)
+                    && !self.connection_ip.iter().any(|p| p.id == id)
+                {
+                    self.endpoint
+                        .set_dscp(id, options.tos >> 2)
+                        .map_err(error)?;
+                    self.connection_ip.push(ConnectionIp { id, options });
+                }
             }
             15 => {
                 let Some(front) = self.output.front() else {
@@ -972,7 +1109,11 @@ fn parse_frame(bytes: &[u8]) -> Result<(IpMetadata, &[u8])> {
     ntcp::wire::parse(ip, &bytes[20..]).map_err(|_| EINVAL)?;
     Ok((ip, &bytes[20..]))
 }
+#[cfg(test)]
 fn frame(tx: ntcp::Transmit, tcp: &[u8]) -> Result<Vec<u8>> {
+    frame_with_df(tx, tcp, true)
+}
+fn frame_with_df(tx: ntcp::Transmit, tcp: &[u8], df: bool) -> Result<Vec<u8>> {
     let (IpAddr::V4(source), IpAddr::V4(destination)) = (tx.ip.source, tx.ip.destination) else {
         return Err(EINVAL);
     };
@@ -984,7 +1125,7 @@ fn frame(tx: ntcp::Transmit, tcp: &[u8]) -> Result<Vec<u8>> {
     out[1] = tx.dscp << 2 | tx.ecn;
     let len = out.len() as u16;
     out[2..4].copy_from_slice(&len.to_be_bytes());
-    out[6] = 0x40;
+    out[6] = if df { 0x40 } else { 0 };
     out[8] = tx.hop_limit;
     out[9] = 6;
     out[12..16].copy_from_slice(&source.octets());
