@@ -177,6 +177,7 @@ mod linux {
         build_ipv4_options(
             packet,
             ntcp::Transmit {
+                connection: None,
                 ip,
                 len: tcp_len,
                 hop_limit,
@@ -200,6 +201,7 @@ mod linux {
             dscp,
             ecn,
             ipv4_options,
+            ..
         } = transmit;
         let (IpAddr::V4(source), IpAddr::V4(destination)) = (ip.source, ip.destination) else {
             return Err(invalid("TUN adapter only supports IPv4"));
@@ -831,6 +833,7 @@ mod linux {
             };
             let mut bytes = [0xa5; MTU];
             let mut transmit = ntcp::Transmit {
+                connection: None,
                 ip,
                 len: 1440,
                 hop_limit: 64,

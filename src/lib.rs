@@ -15,6 +15,7 @@ mod endpoint;
 #[cfg(test)]
 mod endpoint_tests;
 mod ipv4_options;
+mod rack;
 mod recovery;
 mod sack;
 mod schedule;
@@ -23,7 +24,7 @@ pub mod wire;
 
 pub use connection::{
     CloseReason, ConnectionConfig, ConnectionEvents, Error, Instant, KeepaliveConfig, NetworkError,
-    State, Tuple,
+    State, TransportInfo, Tuple,
 };
 pub use endpoint::{
     AddressValidation, ConnectionId, Endpoint, EndpointConfig, EndpointError, Event,

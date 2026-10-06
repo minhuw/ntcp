@@ -108,6 +108,8 @@ pub enum Event {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Transmit {
+    // Stable owner, including connection-associated final resets.
+    pub connection: Option<ConnectionId>,
     pub ipv4_options: OutgoingIpv4Options,
     pub ecn: u8,
     pub ip: IpMetadata,
@@ -1453,9 +1455,26 @@ impl Endpoint {
     ) -> Result<Option<crate::CloseReason>, EndpointError> {
         Ok(self.slot(id)?.connection.close_reason())
     }
+    // Observe an existing connection without transferring ownership.
+    pub fn connection_id(&self, tuple: Tuple) -> Option<ConnectionId> {
+        self.tuples
+            .find(self.hash(tuple), tuple)
+            .map(|index| self.id(index))
+    }
+
+    // Includes released records retained for final output or TIME-WAIT.
+    pub fn connection_exists(&self, id: ConnectionId) -> bool {
+        self.generations.get(id.slot) == Some(&id.generation)
+            && self.slots.get(id.slot).is_some_and(Option::is_some)
+    }
+
     pub fn state(&self, id: ConnectionId) -> Result<State, EndpointError> {
         Ok(self.slot(id)?.connection.state())
     }
+    pub fn transport_info(&self, id: ConnectionId) -> Result<crate::TransportInfo, EndpointError> {
+        Ok(self.slot(id)?.connection.transport_info())
+    }
+
     pub fn acknowledged(&self, id: ConnectionId) -> Result<u64, EndpointError> {
         Ok(self.slot(id)?.connection.acknowledged())
     }
@@ -1594,6 +1613,7 @@ impl Endpoint {
                 self.control_turn = false;
                 return Ok(PollTransmit {
                     packet: Some(Transmit {
+                        connection: None,
                         ecn: 0,
                         ipv4_options,
                         ip,
@@ -1607,6 +1627,7 @@ impl Endpoint {
             let Some(index) = self.output.pop() else {
                 continue;
             };
+            let connection = self.id(index);
             let slot = self.slots[index].as_mut().unwrap();
             let tuple = slot.connection.tuple();
             match slot.connection.transmit(now, out) {
@@ -1620,6 +1641,7 @@ impl Endpoint {
                     self.refresh(index);
                     return Ok(PollTransmit {
                         packet: Some(Transmit {
+                            connection: Some(connection),
                             ecn,
                             ipv4_options,
                             ip: IpMetadata {
@@ -1662,5 +1684,146 @@ impl Endpoint {
             packet: None,
             more_work: self.has_pending_output(),
         })
+    }
+}
+
+#[cfg(test)]
+mod recovery_observation_tests {
+    use super::*;
+    use crate::InitialWindow;
+    use alloc::vec;
+
+    fn packet(endpoint: &mut Endpoint, now: u64) -> (Transmit, Vec<u8>) {
+        let mut bytes = vec![0; 2000];
+        let packet = endpoint
+            .poll_transmit(now, &mut bytes, 16)
+            .unwrap()
+            .packet
+            .unwrap();
+        bytes.truncate(packet.len);
+        (packet, bytes)
+    }
+
+    #[test]
+    fn rack_deadline_budget_ready_queue_and_stable_owner() {
+        let config = EndpointConfig {
+            max_connections: 4,
+            max_listeners: 1,
+            connection: ConnectionConfig {
+                mss: 1000,
+                sack: true,
+                rack: true,
+                prr: true,
+                initial_window: InitialWindow::Iw10,
+                nagle: false,
+                ..ConnectionConfig::default()
+            },
+            ..EndpointConfig::default()
+        };
+        let tuple = Tuple {
+            local: "192.0.2.1:40000".parse().unwrap(),
+            remote: "192.0.2.2:8080".parse().unwrap(),
+        };
+        let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+        let listener = b.listen(tuple.remote, 4).unwrap();
+        let client = a.connect(0, tuple.local, tuple.remote).unwrap();
+        assert_eq!(a.connection_id(tuple), Some(client));
+        assert!(a.connection_exists(client));
+        assert!(!a.connection_exists(ConnectionId {
+            generation: client.generation + 1,
+            ..client
+        }));
+        let (tx, bytes) = packet(&mut a, 0);
+        assert_eq!(tx.connection, Some(client));
+        b.input(0, tx.ip, &bytes).unwrap();
+        let (tx, bytes) = packet(&mut b, 0);
+        let child = tx.connection.unwrap();
+        a.input(100_000, tx.ip, &bytes).unwrap();
+        let (tx, bytes) = packet(&mut a, 100_000);
+        b.input(100_000, tx.ip, &bytes).unwrap();
+        assert_eq!(b.accept(listener).unwrap(), child);
+        a.write(client, &[1; 10_000]).unwrap();
+        let mut sent = Vec::new();
+        for _ in 0..10 {
+            sent.push(packet(&mut a, 100_000));
+        }
+        let (tx, bytes) = &sent[7];
+        b.input(200_000, tx.ip, bytes).unwrap();
+        let (tx, bytes) = packet(&mut b, 200_000);
+        a.input(200_000, tx.ip, &bytes).unwrap();
+        assert_eq!(a.next_deadline(), Some(225_000));
+        assert!(!a.on_timeout(224_999, 1).unwrap());
+        assert!(a.on_timeout(225_000, 0).unwrap());
+        assert!(!a.on_timeout(225_000, 1).unwrap());
+        assert!(a.has_pending_output());
+        let info = a.transport_info(client).unwrap();
+        assert_eq!((info.recovery, info.lost, info.sacked), (true, 7, 1));
+        assert_eq!(b.transport_info(child).unwrap().receive_used, 1000);
+        let (tx, bytes) = packet(&mut a, 225_000);
+        assert_eq!(tx.connection, Some(client));
+        assert_eq!(
+            wire::parse(tx.ip, &bytes).unwrap().header.sequence,
+            wire::parse(sent[0].0.ip, &sent[0].1)
+                .unwrap()
+                .header
+                .sequence
+        );
+        a.abort(client).unwrap();
+        a.release(client).unwrap();
+        assert!(a.connection_exists(client));
+        assert_eq!(a.state(client), Err(EndpointError::InvalidHandle));
+        let (tx, bytes) = packet(&mut a, 225_000);
+        assert_eq!(tx.connection, Some(client));
+        assert_ne!(wire::parse(tx.ip, &bytes).unwrap().header.flags & RST, 0);
+        assert_eq!(a.connection_id(tuple), None);
+        assert!(!a.connection_exists(client));
+        assert_eq!(a.transport_info(client), Err(EndpointError::InvalidHandle));
+    }
+
+    #[test]
+    fn connection_existence_retains_released_timewait_and_rejects_reused_generation() {
+        let config = EndpointConfig {
+            max_connections: 2,
+            max_listeners: 1,
+            ..EndpointConfig::default()
+        };
+        let local = "192.0.2.1:40000".parse().unwrap();
+        let remote = "192.0.2.2:8080".parse().unwrap();
+        let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+        let listener = b.listen(remote, 2).unwrap();
+        let client = a.connect(0, local, remote).unwrap();
+        let (tx, bytes) = packet(&mut a, 0);
+        b.input(0, tx.ip, &bytes).unwrap();
+        let (tx, bytes) = packet(&mut b, 0);
+        a.input(100, tx.ip, &bytes).unwrap();
+        let (tx, bytes) = packet(&mut a, 100);
+        b.input(100, tx.ip, &bytes).unwrap();
+        let child = b.accept(listener).unwrap();
+        a.shutdown(client).unwrap();
+        let (tx, bytes) = packet(&mut a, 200);
+        b.input(200, tx.ip, &bytes).unwrap();
+        let (tx, bytes) = packet(&mut b, 200);
+        a.input(200, tx.ip, &bytes).unwrap();
+        b.shutdown(child).unwrap();
+        let (tx, bytes) = packet(&mut b, 300);
+        a.input(300, tx.ip, &bytes).unwrap();
+        let (tx, bytes) = packet(&mut a, 300);
+        b.input(300, tx.ip, &bytes).unwrap();
+        assert_eq!(a.state(client), Ok(State::TimeWait));
+        assert!(a.connection_exists(client));
+        a.release(client).unwrap();
+        assert!(a.connection_exists(client));
+        assert_eq!(a.state(client), Err(EndpointError::InvalidHandle));
+        let expiry = a.next_deadline().unwrap();
+        a.on_timeout(expiry, 8).unwrap();
+        a.poll_transmit(expiry, &mut [0; 2000], 8).unwrap();
+        assert!(!a.connection_exists(client));
+        let replacement = a.connect(expiry, local, remote).unwrap();
+        assert_ne!(replacement, client);
+        assert!(a.connection_exists(replacement));
+        assert!(!a.connection_exists(client));
+        assert_eq!(a.transport_info(client), Err(EndpointError::InvalidHandle));
     }
 }

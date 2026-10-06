@@ -31,6 +31,10 @@ impl Scoreboard {
         }
     }
 
+    pub(crate) fn ranges(&self) -> &[(Seq, Seq)] {
+        &self.ranges[..self.len]
+    }
+
     pub(crate) fn clear(&mut self) {
         self.len = 0;
     }

@@ -5,7 +5,8 @@ use core::{cmp::Ordering, net::SocketAddr};
 
 use crate::{
     buffer::{ReceiveBuffer, SendBuffer},
-    recovery::{Congestion, InitialWindow, RecoveryAlgorithm, RttEstimator},
+    rack::Rack,
+    recovery::{Congestion, InitialWindow, Prr, RecoveryAlgorithm, RttEstimator},
     sack::Scoreboard,
     seq::Seq,
     wire::{self, ACK, CWR, ECE, FIN, Header, IpMetadata, PSH, RST, SYN, Segment, URG},
@@ -36,6 +37,10 @@ pub struct ConnectionConfig {
     pub initial_window: InitialWindow,
     pub timestamps: bool,
     pub sack: bool,
+    // Opt-in RFC 8985 time-based loss detection (requires negotiated SACK).
+    pub rack: bool,
+    // Opt-in RFC 6937 PRR-CRB recovery pacing (requires negotiated SACK).
+    pub prr: bool,
     pub retransmit_beyond_window: bool,
     pub delayed_ack_us: u64,
     pub user_timeout_us: u64,
@@ -82,6 +87,8 @@ impl Default for ConnectionConfig {
             initial_window: InitialWindow::default(),
             timestamps: false,
             sack: false,
+            rack: false,
+            prr: false,
             retransmit_beyond_window: false,
             delayed_ack_us: 200_000,
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
@@ -116,6 +123,37 @@ pub enum State {
     Closing,
     LastAck,
     TimeWait,
+}
+
+// Core diagnostics, not a platform TCP_INFO ABI. Windows and queues use bytes;
+// times use microseconds. Counts identify original successful data segments:
+// split intervals retain their identity. SACK counts require complete delivery;
+// loss/retransmission counts include outstanding fragments. SACKed data remains
+// unacked until cumulative ACK.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransportInfo {
+    pub state: State,
+    pub recovery: bool,
+    pub loss: bool,
+    // False after bounded ledger overflow; segment counts are unavailable.
+    pub ledger_valid: bool,
+    pub unacked: u32,
+    pub sacked: u32,
+    // Original loss attribution persists through retransmission until delivery.
+    pub lost: u32,
+    // Outstanding, non-lost retransmissions, excluding SACKed retransmissions.
+    pub retransmitted: u32,
+    pub reordering: u32,
+    pub cwnd: u32,
+    pub ssthresh: u32,
+    pub mss: u32,
+    pub rtt_us: Option<u64>,
+    pub rttvar_us: u64,
+    pub rto_us: u64,
+    pub send_used: usize,
+    pub send_capacity: usize,
+    pub receive_used: usize,
+    pub receive_capacity: usize,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -230,6 +268,11 @@ pub(crate) struct Connection {
     sack_post_rto: Option<(Seq, Seq)>,
     sack_fallback: Option<Seq>,
     scoreboard: Scoreboard,
+    rack: Rack,
+    prr: Option<Prr>,
+    // Real causative delivery, capped at one MSS and bound to its deferred timer.
+    rack_entry_delivery: Option<(u64, u32)>,
+    receive_used: usize,
     sack_omit: bool,
     ts_recent: u32,
     ts_latest: u32,
@@ -384,6 +427,10 @@ impl Connection {
             sack_post_rto: None,
             sack_fallback: None,
             scoreboard: Scoreboard::new(),
+            rack: Rack::new().map_err(|_| Error::NoMemory)?,
+            prr: None,
+            rack_entry_delivery: None,
+            receive_used: 0,
             sack_omit: false,
             ts_recent: 0,
             ts_latest: 0,
@@ -504,6 +551,106 @@ impl Connection {
             candidate
         } else {
             self.snd_nxt.wrapping_add(1 + candidate % 0x7fff_ffff).0
+        }
+    }
+
+    pub(crate) fn transport_info(&self) -> TransportInfo {
+        let counts = self.rack.counts();
+        TransportInfo {
+            state: self.state,
+            recovery: self.congestion.in_recovery(),
+            loss: self.sack_post_rto.is_some() || self.consecutive_timeouts != 0,
+            ledger_valid: self.rack.valid(),
+            unacked: counts.unacked,
+            sacked: counts.sacked,
+            lost: counts.lost,
+            retransmitted: counts.retransmitted,
+            reordering: self.rack.reordering,
+            cwnd: self.congestion.cwnd(),
+            ssthresh: self.congestion.ssthresh(),
+            mss: self.mss as u32,
+            rtt_us: self.rtt.srtt(),
+            rttvar_us: self.rtt.variance(),
+            rto_us: self.rto(),
+            send_used: self.send.len(),
+            send_capacity: self.config.send_capacity,
+            receive_used: self.receive_used,
+            receive_capacity: self.config.receive_capacity,
+        }
+    }
+
+    fn rack_enabled(&self) -> bool {
+        self.config.rack && self.sack_receive && self.sack_send && self.rack.valid()
+    }
+
+    fn sack_recovery_enabled(&self) -> bool {
+        self.sack_receive && (!(self.config.rack || self.config.prr) || self.sack_send)
+    }
+
+    fn recovery_pipe(&self, high_rxt: Seq) -> u32 {
+        if self.rack_enabled() {
+            self.rack.pipe()
+        } else {
+            self.scoreboard
+                .pipe(self.snd_una, self.data_high(), high_rxt, self.mss as u32)
+        }
+    }
+
+    fn recovery_credit(&self, recovery: SackRecovery) -> u32 {
+        self.prr.map_or_else(
+            || self.congestion.cwnd().saturating_sub(recovery.pipe),
+            |prr| prr.credit(),
+        )
+    }
+
+    fn start_sack_recovery(&mut self) -> bool {
+        if self.sack_guard.is_some()
+            || self.sack_recovery.is_some()
+            || !after(self.data_high(), self.snd_una)
+            || !self.congestion.on_sack_recovery(
+                self.snd_una,
+                self.flight().saturating_sub(self.limited_sent),
+                self.data_high(),
+            )
+        {
+            return false;
+        }
+        self.rack_entry_delivery = None;
+        self.sack_recovery = Some(SackRecovery {
+            recovery_point: self.data_high(),
+            high_rxt: self.snd_una,
+            rescue_rxt: None,
+            entry_pending: true,
+            pipe: self.recovery_pipe(self.snd_una),
+        });
+        if self.config.prr && self.sack_send && self.rack.valid() {
+            self.prr = Some(Prr::new(self.flight(), self.mss as u32));
+        }
+        self.retx_pending = false;
+        self.limited_pending = false;
+        self.ecn_cwr_pending |= self.ecn_feedback();
+        true
+    }
+
+    fn detect_rack(&mut self) {
+        if !self.rack_enabled() || self.snd_wnd == 0 {
+            self.rack.deadline = None;
+            return;
+        }
+        let retransmission_lost = self.rack.detect(
+            self.now,
+            self.sack_recovery.is_some() || self.sack_post_rto.is_some(),
+            self.rtt.srtt(),
+        );
+        if retransmission_lost {
+            self.congestion.retransmission_lost(self.flight());
+        }
+        if self.rack.lowest_lost(self.mss as u32).is_some() {
+            self.start_sack_recovery();
+        }
+        if let Some(mut recovery) = self.sack_recovery {
+            recovery.pipe = self.rack.pipe();
+            self.sack_recovery = Some(recovery);
         }
     }
 
@@ -646,12 +793,7 @@ impl Connection {
         self.config.mss = self.config.mss.min(mss);
         self.congestion.set_mss(effective as u32);
         if let Some(mut recovery) = self.sack_recovery {
-            recovery.pipe = self.scoreboard.pipe(
-                self.snd_una,
-                self.data_high(),
-                recovery.high_rxt,
-                self.mss as u32,
-            );
+            recovery.pipe = self.recovery_pipe(recovery.high_rxt);
             self.sack_recovery = Some(recovery);
         }
         if self.flight() != 0 {
@@ -765,6 +907,7 @@ impl Connection {
             syn.header.flags & PSH != 0 && count == syn.payload.len(),
         );
         self.received_total = count as u64;
+        self.receive_used += outcome.new_bytes;
         if outcome.fin {
             self.syn_window = 0;
         } else {
@@ -826,6 +969,9 @@ impl Connection {
     //# whether it closed normally or was aborted (MUST-12).
     fn terminal(&mut self, reason: CloseReason) {
         self.state = State::Closed;
+        self.rack.deadline = None;
+        self.prr = None;
+        self.rack_entry_delivery = None;
         self.sack_recovery = None;
         self.sack_guard = None;
         self.sack_post_rto = None;
@@ -1169,6 +1315,7 @@ impl Connection {
             return Err(Error::WouldBlock);
         }
         let count = self.receive.read(out);
+        self.receive_used -= count;
         if count == 0 && !self.receive.eof() {
             return Err(Error::WouldBlock);
         }
@@ -1580,6 +1727,9 @@ impl Connection {
         let old_window = self.snd_wnd;
         let was_blocked = old_window == 0 || self.flight() > old_window;
         let advancing = after(ack, self.snd_una);
+        if advancing {
+            self.rack_entry_delivery = None;
+        }
         let ecn_one = ece && self.flight() != 0 && self.congestion.cwnd() <= self.mss as u32;
         let ecn_reduced =
             ece && self.flight() != 0 && self.congestion.on_ecn(ack, self.flight(), self.snd_nxt);
@@ -1587,14 +1737,23 @@ impl Connection {
             self.ecn_cwr_pending = true;
             self.reset_limited_transmit();
         }
+        let mut delivered = 0;
         let sack_evidence = if self.sack_receive
             && at_or_after(ack, self.snd_una)
             && self.sack_fallback.is_none_or(|end| at_or_after(ack, end))
         {
+            let cumulative_delivery = if advancing {
+                self.scoreboard.unsacked_bytes(self.snd_una, ack)
+            } else {
+                0
+            };
             let update =
                 self.scoreboard
                     .update(ack, self.data_high(), &segment.options.sack_blocks);
             if update.overflow {
+                self.rack.abandon(self.data_high());
+                self.prr = None;
+                self.rack_entry_delivery = None;
                 let boundary = self.data_high();
                 self.sack_fallback = Some(boundary);
                 self.sack_guard = Some(boundary);
@@ -1602,6 +1761,32 @@ impl Connection {
                 self.sack_post_rto = None;
                 self.congestion.cancel_sack_recovery();
                 self.reset_limited_transmit();
+            }
+            let valid_ledger = self.rack.valid();
+            let ledger_delivery = self.rack.acknowledge(
+                ack,
+                self.data_high(),
+                &self.scoreboard,
+                now,
+                segment.options.timestamps.map(|ts| ts.1),
+                self.timestamps,
+                self.mss as u32,
+                update.dsack,
+            );
+            delivered = if valid_ledger {
+                ledger_delivery
+            } else {
+                cumulative_delivery.saturating_add(update.newly_sacked)
+            };
+            if !self.rack_enabled() {
+                self.rack
+                    .mark_scoreboard_losses(&self.scoreboard, self.mss as u32);
+            }
+            if self.rack_enabled()
+                && !advancing
+                && let Some(sample) = self.rack.ack_sample
+            {
+                self.rtt.sample(sample);
             }
             update.newly_sacked != 0 && !update.overflow
         } else {
@@ -1615,13 +1800,11 @@ impl Connection {
         {
             if at_or_after(ack, recovery.recovery_point) {
                 self.sack_recovery = None;
+                self.prr = None;
+                self.rack_entry_delivery = None;
+                self.rack.recovery_exit();
             } else {
-                recovery.pipe = self.scoreboard.pipe(
-                    self.snd_una,
-                    self.data_high(),
-                    recovery.high_rxt,
-                    self.mss as u32,
-                );
+                recovery.pipe = self.recovery_pipe(recovery.high_rxt);
                 self.sack_recovery = Some(recovery);
             }
         }
@@ -1654,35 +1837,17 @@ impl Connection {
                 self.persist_unanswered_since = None;
             }
         }
-        if self.sack_receive {
+        if self.sack_recovery_enabled() {
             if sack_evidence && self.sack_recovery.is_none() {
                 self.duplicate_acks = self.duplicate_acks.saturating_add(1);
                 self.limited_pending = self.duplicate_acks <= 2 && self.sack_guard.is_none();
-                if self.sack_guard.is_none()
-                    && after(self.data_high(), self.snd_una)
+                if !self.rack_enabled()
                     && (self.duplicate_acks >= 3
                         || self.scoreboard.is_lost(self.snd_una, self.mss as u32))
-                    && self.congestion.on_sack_recovery(
-                        self.snd_una,
-                        self.flight().saturating_sub(self.limited_sent),
-                        self.data_high(),
-                    )
                 {
-                    self.sack_recovery = Some(SackRecovery {
-                        recovery_point: self.data_high(),
-                        high_rxt: self.snd_una,
-                        rescue_rxt: None,
-                        entry_pending: true,
-                        pipe: self.scoreboard.pipe(
-                            self.snd_una,
-                            self.data_high(),
-                            self.snd_una,
-                            self.mss as u32,
-                        ),
-                    });
-                    self.retx_pending = false;
-                    self.limited_pending = false;
-                    self.ecn_cwr_pending |= self.ecn_feedback();
+                    self.rack
+                        .mark_scoreboard_losses(&self.scoreboard, self.mss as u32);
+                    self.start_sack_recovery();
                 }
             }
         } else if !advancing
@@ -1709,6 +1874,29 @@ impl Connection {
             self.reset_limited_transmit();
             self.congestion.reset_duplicate_acks();
         }
+        self.detect_rack();
+        if self.sack_recovery.is_none()
+            && !advancing
+            && delivered != 0
+            && self.rack.ack_sample.is_some()
+        {
+            self.rack_entry_delivery = self
+                .rack
+                .deadline
+                .map(|deadline| (deadline, delivered.min(self.mss as u32)));
+        }
+        if self.rack.deadline.is_none() || !self.rack.valid() {
+            self.rack_entry_delivery = None;
+        }
+        if let Some(mut prr) = self.prr {
+            let pipe = self.sack_recovery.map_or(0, |r| r.pipe);
+            prr.acknowledge(delivered, pipe, self.congestion.ssthresh());
+            if self.sack_recovery.is_some_and(|r| r.entry_pending) {
+                // The first retransmission is guaranteed, including timer entry.
+                prr.guarantee_initial(self.mss as u32);
+            }
+            self.prr = Some(prr);
+        }
         self.receive_text(seq, segment.payload, h.flags, h.urgent_pointer);
         self.arm_work();
         Ok(())
@@ -1726,9 +1914,21 @@ impl Connection {
     }
 
     fn accept_ack(&mut self, ack: Seq, ece: bool, echo: Option<u32>) {
+        if !self.sack_receive {
+            self.rack.acknowledge(
+                ack,
+                self.data_high(),
+                &self.scoreboard,
+                self.now,
+                echo,
+                self.timestamps,
+                self.mss as u32,
+                false,
+            );
+        }
         let limited = self
             .limited_end
-            .filter(|&end| self.sack_receive && after(end, ack))
+            .filter(|&end| self.sack_recovery_enabled() && after(end, ack))
             .map(|end| (end, self.limited_sent.min(end.distance_from(ack))));
         self.reset_limited_transmit();
         if let Some((end, bytes)) = limited {
@@ -1784,7 +1984,9 @@ impl Connection {
             // One bounded sample per flight. Never infer a transmission time
             // from an unvalidated echo, and retain Karn's exclusion on retransmit.
             if !self.timestamps || echo == Some((sent / 1_000) as u32) {
-                self.rtt.sample(self.now.saturating_sub(sent));
+                let sample = self.now.saturating_sub(sent);
+                self.rtt.sample(sample);
+                self.rack.sample(sample);
                 if !syn_ack {
                     self.syn_timed_out = false;
                 }
@@ -1896,6 +2098,7 @@ impl Connection {
             fin && skip + count == payload.len(),
             flags & PSH != 0 && skip + count == payload.len(),
         );
+        self.receive_used += outcome.new_bytes;
         if outcome.sack_overflow && self.sack_send {
             self.sack_omit = true;
             self.receive.clear_dsack();
@@ -2009,6 +2212,9 @@ impl Connection {
     }
 
     fn post_rto_pipe(&self) -> u32 {
+        if self.rack_enabled() {
+            return self.rack.pipe();
+        }
         let Some((high_rxt, boundary)) = self.sack_post_rto else {
             return 0;
         };
@@ -2141,6 +2347,7 @@ impl Connection {
             .mss
             .saturating_sub(sack_option_len)
             .min((self.config.send_ip_payload_limit as usize).saturating_sub(20 + option_len));
+        let mut burst_push = false;
         let mut sack_segment = None;
         if reset.is_none()
             && !syn
@@ -2150,7 +2357,19 @@ impl Connection {
             && !keepalive
             && let Some(recovery) = self.sack_recovery
         {
-            if recovery.entry_pending {
+            if self.rack_enabled() {
+                let credit = if recovery.entry_pending {
+                    self.mss as u32
+                } else {
+                    self.recovery_credit(recovery)
+                };
+                if credit != 0 {
+                    sack_segment = self
+                        .rack
+                        .lowest_lost((packet_mss as u32).min(credit))
+                        .map(|(left, right)| (left, right, false, recovery.entry_pending));
+                }
+            } else if recovery.entry_pending {
                 let range = self
                     .scoreboard
                     .lowest_hole(self.snd_una, self.data_high(), packet_mss as u32, false)
@@ -2165,7 +2384,9 @@ impl Connection {
                         ))
                     });
                 sack_segment = range.map(|(left, right)| (left, right, false, true));
-            } else if self.congestion.cwnd().saturating_sub(recovery.pipe) >= self.mss as u32 {
+            } else if self.prr.is_some_and(|prr| prr.credit() != 0)
+                || self.prr.is_none() && self.recovery_credit(recovery) >= self.mss as u32
+            {
                 //= https://www.rfc-editor.org/rfc/rfc6675#section-4
                 //= reason=Connection output selection applies the four NextSeg priorities to scoreboard ranges; markers commit only after encoding.
                 //# NextSeg () MUST return the sequence number range of the next segment that is to be transmitted, per the following rules:
@@ -2219,8 +2440,12 @@ impl Connection {
             && let Some((high_rxt, _)) = self.sack_post_rto
             && self.congestion.cwnd().saturating_sub(self.post_rto_pipe()) >= self.mss as u32
         {
-            self.scoreboard
-                .lowest_hole(high_rxt, self.data_high(), packet_mss as u32, false)
+            if self.rack_enabled() {
+                self.rack.lowest_lost(packet_mss as u32)
+            } else {
+                self.scoreboard
+                    .lowest_hole(high_rxt, self.data_high(), packet_mss as u32, false)
+            }
         } else {
             None
         };
@@ -2252,6 +2477,7 @@ impl Connection {
             } else {
                 self.snd_wnd.saturating_sub(seq.distance_from(self.snd_una))
             };
+            let credit = self.prr.map_or(credit, |prr| credit.min(prr.credit()));
             count = self.send.copy(
                 seq.distance_from(self.send_base) as usize,
                 &mut self.scratch[..(right.distance_from(left) as usize).min(credit as usize)],
@@ -2336,15 +2562,12 @@ impl Connection {
             //# be robust against window shrinking, which may cause the "usable
             //# window" (see Section 3.8.6.2.1) to become negative (MUST-34).
             let usable = if let Some(recovery) = self.sack_recovery {
-                if recovery.entry_pending
-                    || self.congestion.cwnd().saturating_sub(recovery.pipe) < self.mss as u32
-                {
+                if recovery.entry_pending || self.recovery_credit(recovery) < self.mss as u32 {
                     0
                 } else {
                     self.snd_wnd
                         .saturating_sub(self.flight())
-                        .min(self.congestion.cwnd().saturating_sub(recovery.pipe))
-                        as usize
+                        .min(self.recovery_credit(recovery)) as usize
                 }
             } else if self.sack_post_rto.is_some() && self.sack_fallback.is_none() {
                 let pipe = self.post_rto_pipe();
@@ -2355,13 +2578,8 @@ impl Connection {
                 } else {
                     0
                 }
-            } else if self.sack_receive && self.limited_pending {
-                let pipe = self.scoreboard.pipe(
-                    self.snd_una,
-                    self.data_high(),
-                    self.snd_una,
-                    self.mss as u32,
-                );
+            } else if self.sack_recovery_enabled() && self.limited_pending {
+                let pipe = self.recovery_pipe(self.snd_una);
                 if cwnd.saturating_sub(pipe) >= self.mss as u32 {
                     self.snd_wnd
                         .saturating_sub(self.flight())
@@ -2401,6 +2619,9 @@ impl Connection {
             if self.ecn_pause.is_some_and(|deadline| now < deadline) {
                 count = 0;
             }
+            burst_push = count != 0
+                && self.flight().saturating_add(count as u32) == self.snd_wnd.min(cwnd)
+                && self.send.pushed(offset, unsent);
             self.send.copy(offset, &mut self.scratch[..count]);
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
             //# Queue this until all preceding SENDs have been segmentized, then form a
@@ -2417,9 +2638,10 @@ impl Connection {
         }
         if count != 0
             && !keepalive
-            && self
-                .send
-                .pushed(seq.distance_from(self.send_base) as usize, count)
+            && (burst_push
+                || self
+                    .send
+                    .pushed(seq.distance_from(self.send_base) as usize, count))
         {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
             //# MUST set the PSH bit in the last buffered segment (i.e., when there is
@@ -2548,6 +2770,16 @@ impl Connection {
         if flags & ACK != 0 {
             self.sack_omit = false;
         }
+        if count != 0 && !syn && !keepalive && !probe {
+            self.rack
+                .transmit(seq, seq.wrapping_add(count as u32), now, retransmitted);
+            if !self.rack.valid() {
+                self.prr = None;
+                self.rack_entry_delivery = None;
+            } else if let Some(prr) = &mut self.prr {
+                prr.sent(count as u32);
+            }
+        }
         if count != 0
             && let Some(mut recovery) = self.sack_recovery
         {
@@ -2563,7 +2795,11 @@ impl Connection {
                     recovery.rescue_rxt = Some(recovery.recovery_point);
                 }
             }
-            recovery.pipe = recovery.pipe.saturating_add(count as u32);
+            recovery.pipe = if self.rack_enabled() {
+                self.rack.pipe()
+            } else {
+                recovery.pipe.saturating_add(count as u32)
+            };
             self.sack_recovery = Some(recovery);
         }
         if retransmitted
@@ -2690,6 +2926,7 @@ impl Connection {
 
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         [
+            self.rack.deadline,
             self.rto_deadline,
             self.ecn_pause,
             self.ack_deadline,
@@ -2734,11 +2971,26 @@ impl Connection {
         if due(self.ecn_pause, now) {
             self.ecn_pause = None;
         }
+        if due(self.rack.deadline, now) && !due(self.rto_deadline, now) {
+            let delivery = self
+                .rack_entry_delivery
+                .take()
+                .filter(|&(deadline, _)| self.rack.deadline == Some(deadline))
+                .map_or(0, |(_, bytes)| bytes);
+            self.detect_rack();
+            if let Some(prr) = &mut self.prr {
+                prr.acknowledge(delivery, self.rack.pipe(), self.congestion.ssthresh());
+                prr.guarantee_initial(self.mss as u32);
+            }
+        }
         if due(self.rto_deadline, now) {
+            self.prr = None;
+            self.rack_entry_delivery = None;
+            self.rack.rto(now, self.snd_una, self.rtt.srtt());
             //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
             //= reason=Timeout discards advisory ranges and guards a fresh recovery phase until its exclusive data boundary is covered.
             //# RecoveryPoint MUST be set to HighData.
-            if self.sack_receive {
+            if self.sack_recovery_enabled() {
                 self.scoreboard.clear();
                 self.sack_recovery = None;
                 self.sack_guard = Some(self.data_high());
@@ -3096,6 +3348,319 @@ mod tests {
         .unwrap();
         to.input(now, &wire::parse(metadata, &bytes[..size]).unwrap())
             .unwrap();
+    }
+
+    fn rack_flight(iss: u32) -> Connection {
+        let cfg = ConnectionConfig {
+            sack: true,
+            rack: true,
+            prr: true,
+            initial_window: InitialWindow::Iw10,
+            ..config(65_536, 1000)
+        };
+        let mut a = Connection::active(tuple(), cfg.clone(), iss, 0).unwrap();
+        let bytes = packet(&mut a, 0);
+        let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+        let mut b = Connection::passive(reverse(tuple()), cfg, 900, 0, &syn).unwrap();
+        deliver(&mut b, &mut a, 100_000);
+        deliver(&mut a, &mut b, 100_000);
+        a.write(&[0x55; 10_000]).unwrap();
+        for _ in 0..10 {
+            packet(&mut a, 100_000);
+        }
+        assert_eq!(a.transport_info().unacked, 10);
+        a
+    }
+
+    fn rack_sack(a: &mut Connection, now: u64, ack_offset: u32, blocks: &[(u32, u32)]) {
+        let base = a.iss.wrapping_add(1);
+        let blocks: Vec<_> = blocks
+            .iter()
+            .map(|&(l, r)| (base.wrapping_add(l).0, base.wrapping_add(r).0))
+            .collect();
+        inject_sack(
+            a,
+            now,
+            a.receive.next(),
+            base.wrapping_add(ack_offset),
+            ACK,
+            65_535,
+            &[],
+            &blocks,
+        );
+    }
+
+    #[test]
+    fn rack_shift_timer_loss_and_reordered_sack_counts() {
+        for iss in [0, u32::MAX - 4999] {
+            for low in [3000, 5000] {
+                let mut a = rack_flight(iss);
+                rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
+                assert_eq!(a.rack.deadline, Some(225_000));
+                assert_eq!(a.next_deadline(), Some(225_000));
+                assert!(!a.transport_info().recovery);
+                a.timeout(227_000).unwrap();
+                let before = a.transport_info();
+                assert_eq!(
+                    (before.recovery, before.lost, before.reordering),
+                    (true, 7, 3)
+                );
+                assert_eq!(
+                    a.transmit(227_000, &mut [0; 20]),
+                    Err(Error::OutputTooSmall)
+                );
+                assert_eq!(a.transport_info(), before);
+                let bytes = packet(&mut a, 227_000);
+                let h = wire::parse(ip(tuple()), &bytes).unwrap().header;
+                assert_eq!(h.sequence, iss.wrapping_add(1));
+                assert_eq!(
+                    (a.transport_info().lost, a.transport_info().retransmitted),
+                    (7, 1)
+                );
+                rack_sack(&mut a, 229_000, 0, &[(low, low + 1000), (7000, 8000)]);
+                assert_eq!(
+                    (a.transport_info().lost, a.transport_info().reordering),
+                    (6, if low == 3000 { 5 } else { 3 })
+                );
+                let bytes = packet(&mut a, 229_000);
+                assert_eq!(
+                    wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+                    iss.wrapping_add(1001)
+                );
+                assert_eq!(a.transport_info().retransmitted, 2);
+                rack_sack(&mut a, 229_000, 0, &[(low, low + 1000), (7000, 8000)]);
+                assert_eq!(a.prr.unwrap().credit(), 0);
+                rack_sack(&mut a, 231_000, 0, &[(low, low + 2000), (7000, 8000)]);
+                assert_eq!(a.transport_info().lost, 5);
+                rack_sack(&mut a, 233_000, 0, &[(low, low + 2000), (7000, 9000)]);
+                rack_sack(&mut a, 235_000, 0, &[(low, low + 2000), (7000, 10_000)]);
+                rack_sack(&mut a, 335_000, 10_000, &[]);
+                let info = a.transport_info();
+                assert!(!info.recovery);
+                assert_eq!(
+                    (info.unacked, info.sacked, info.lost, info.retransmitted),
+                    (0, 0, 0, 0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rack_timer_entry_credit_is_unique_and_cleared_on_ack_and_reset() {
+        let mut a = rack_flight(0);
+        rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
+        let pending = a.rack_entry_delivery;
+        assert_eq!(pending, Some((225_000, 1000)));
+        rack_sack(&mut a, 201_000, 0, &[(7000, 8000)]);
+        assert_eq!(a.rack_entry_delivery, pending);
+        rack_sack(&mut a, 202_000, 1000, &[(7000, 8000)]);
+        assert_eq!(a.rack_entry_delivery, None);
+        // A stale cumulative ACK cannot revive the consumed evidence.
+        rack_sack(&mut a, 203_000, 0, &[(7000, 8000)]);
+        assert_eq!(a.rack_entry_delivery, None);
+        let mut a = rack_flight(0);
+        rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
+        a.terminal(CloseReason::Reset);
+        assert_eq!(a.rack_entry_delivery, None);
+        let mut a = rack_flight(0);
+        rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
+        // Disjoint byte advice overflows the scoreboard without minting credit.
+        for i in 0..65 {
+            rack_sack(&mut a, 200_001 + i as u64, 0, &[(i * 2, i * 2 + 1)]);
+        }
+        assert!(!a.rack.valid());
+        assert_eq!(a.rack_entry_delivery, None);
+        assert!(a.prr.is_none());
+    }
+
+    #[test]
+    fn fresh_burst_push_uses_normal_window_not_limited_credit() {
+        for push in [false, true] {
+            let mut a = rack_flight(0);
+            // Start another flight with a deliberately fixed window.
+            rack_sack(&mut a, 200_000, 10_000, &[]);
+            a.congestion = Congestion::new(1000, RecoveryAlgorithm::NewReno, InitialWindow::Iw10);
+            a.write_with_push(&[0x55; 15_000], push).unwrap();
+            for i in 0..10 {
+                if i == 9 {
+                    assert_eq!(
+                        a.transmit(200_000, &mut [0; 20]),
+                        Err(Error::OutputTooSmall)
+                    );
+                }
+                let bytes = packet(&mut a, 200_000);
+                let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(segment.header.flags & PSH != 0, push && i == 9);
+            }
+            rack_sack(&mut a, 201_000, 10_000, &[(11_000, 12_000)]);
+            let bytes = packet(&mut a, 201_000);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().header.flags & PSH,
+                0
+            );
+            rack_sack(&mut a, 202_000, 10_000, &[(11_000, 13_000)]);
+            let bytes = packet(&mut a, 202_000);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().header.flags & PSH,
+                0
+            );
+            rack_sack(&mut a, 203_000, 13_000, &[]);
+            for i in 0..2 {
+                let bytes = packet(&mut a, 203_000);
+                assert_eq!(
+                    wire::parse(ip(tuple()), &bytes).unwrap().header.flags & PSH != 0,
+                    push && i == 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rack_shift_three_sacks_nofack_and_cumulative_delivery() {
+        for iss in [0, u32::MAX - 4999] {
+            let mut a = rack_flight(iss);
+            rack_sack(&mut a, 200_000, 0, &[(2000, 3000)]);
+            rack_sack(&mut a, 201_000, 0, &[(2000, 3000), (6000, 7000)]);
+            rack_sack(
+                &mut a,
+                202_000,
+                0,
+                &[(2000, 3000), (6000, 7000), (8000, 9000)],
+            );
+            assert_eq!(a.transport_info().lost, 6);
+            packet(&mut a, 202_000);
+            rack_sack(
+                &mut a,
+                209_000,
+                0,
+                &[(2000, 4000), (6000, 7000), (8000, 9000)],
+            );
+            assert_eq!(
+                (a.transport_info().lost, a.transport_info().reordering),
+                (5, 6)
+            );
+            packet(&mut a, 209_000);
+            assert_eq!(a.prr.unwrap().credit(), 0);
+            rack_sack(
+                &mut a,
+                209_000,
+                0,
+                &[(2000, 4000), (6000, 7000), (8000, 9000)],
+            );
+            assert_eq!(a.prr.unwrap().credit(), 0);
+            rack_sack(
+                &mut a,
+                219_000,
+                0,
+                &[(2000, 4000), (6000, 7000), (8000, 10_000)],
+            );
+            assert_eq!(a.transport_info().lost, 5);
+            rack_sack(
+                &mut a,
+                302_000,
+                1000,
+                &[(2000, 4000), (6000, 7000), (8000, 10_000)],
+            );
+            assert_eq!(a.transport_info().lost, 4);
+            rack_sack(&mut a, 319_000, 4000, &[(6000, 7000), (8000, 10_000)]);
+            assert_eq!(a.transport_info().lost, 3);
+            rack_sack(&mut a, 329_000, 7000, &[(8000, 10_000)]);
+            rack_sack(&mut a, 429_000, 10_000, &[]);
+            let info = a.transport_info();
+            assert_eq!(
+                (info.unacked, info.sacked, info.lost, info.retransmitted),
+                (0, 0, 0, 0)
+            );
+            assert!(!info.recovery);
+        }
+    }
+
+    #[test]
+    fn rack_partial_sack_credit_rto_ecn_and_peer_fallback() {
+        let mut a = rack_flight(0);
+        rack_sack(&mut a, 200_000, 0, &[(7501, 7999)]);
+        assert_eq!(a.transport_info().sacked, 0);
+        assert_eq!(a.rack.deadline, None);
+        assert!(a.rack_entry_delivery.is_none());
+        a.timeout(225_000).unwrap();
+        assert!(!a.transport_info().recovery);
+        // Completing the original packet supplies RACK evidence; byte advice
+        // still credits only the 502 bytes not already SACKed.
+        rack_sack(&mut a, 300_000, 0, &[(7000, 8000)]);
+        assert_eq!(a.rack_entry_delivery.unwrap().1, 502);
+        a.timeout(a.rack.deadline.unwrap()).unwrap();
+        packet(&mut a, 350_000);
+        assert_eq!(a.transport_info().sacked, 1);
+        rack_sack(&mut a, 400_000, 7999, &[]);
+        assert_eq!(a.prr.unwrap().credit(), 3000);
+        let mut a = rack_flight(0);
+        assert!(a.congestion.on_ecn(a.snd_una, a.flight(), a.data_high()));
+        let threshold = a.congestion.ssthresh();
+        rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
+        a.timeout(225_000).unwrap();
+        assert_eq!(a.congestion.ssthresh(), threshold);
+        packet(&mut a, 225_000);
+        let rto = a.rto_deadline.unwrap();
+        a.timeout(rto).unwrap();
+        assert!(a.prr.is_none());
+        assert_eq!(a.transport_info().sacked, 0);
+        assert_eq!(a.congestion.cwnd(), 1000);
+        packet(&mut a, rto);
+        assert!(a.transport_info().lost > 0);
+        let cfg = ConnectionConfig {
+            sack: false,
+            rack: true,
+            prr: true,
+            ..config(4096, 1000)
+        };
+        let (mut a, mut b) = pair(cfg, 0);
+        assert!(!a.rack_enabled());
+        a.write(&[1; 1000]).unwrap();
+        deliver(&mut a, &mut b, 100);
+        b.immediate_ack();
+        deliver(&mut b, &mut a, 200);
+        assert_eq!(a.transport_info().unacked, 0);
+        assert!(a.prr.is_none());
+    }
+
+    #[test]
+    fn rack_prr_peer_without_sack_uses_ordinary_fast_retransmit() {
+        let cfg = ConnectionConfig {
+            sack: true,
+            rack: true,
+            prr: true,
+            ..config(65_536, 1000)
+        };
+        let mut a = Connection::active(tuple(), cfg.clone(), 0, 0).unwrap();
+        let bytes = packet(&mut a, 0);
+        let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+        let mut b = Connection::passive(
+            reverse(tuple()),
+            ConnectionConfig { sack: false, ..cfg },
+            900,
+            0,
+            &syn,
+        )
+        .unwrap();
+        deliver(&mut b, &mut a, 100_000);
+        deliver(&mut a, &mut b, 100_000);
+        assert!(a.sack_receive);
+        assert!(!a.sack_send);
+        a.write(&[1; 4000]).unwrap();
+        for _ in 0..4 {
+            packet(&mut a, 100_000);
+        }
+        let ack = a.snd_una;
+        inject_sack(&mut a, 199_999, b.snd_nxt, ack, ACK, 32_768, &[], &[]);
+        for now in 200_000..200_003 {
+            let ack = a.snd_una;
+            let window = (a.snd_wnd >> a.peer_scale) as u16;
+            inject_sack(&mut a, now, b.snd_nxt, ack, ACK, window, &[], &[]);
+        }
+        assert!(a.retx_pending);
+        assert!(a.prr.is_none());
+        let bytes = packet(&mut a, 200_003);
+        assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().header.sequence, 1);
     }
 
     #[test]

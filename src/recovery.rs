@@ -28,6 +28,14 @@ impl RttEstimator {
         }
     }
 
+    pub(crate) fn srtt(&self) -> Option<u64> {
+        self.srtt
+    }
+
+    pub(crate) fn variance(&self) -> u64 {
+        self.variance
+    }
+
     pub(crate) fn rto(&self) -> u64 {
         self.rto
     }
@@ -161,7 +169,6 @@ impl Congestion {
         self.cwnd
     }
 
-    #[cfg(test)]
     pub(crate) fn ssthresh(&self) -> u32 {
         self.ssthresh
     }
@@ -321,6 +328,16 @@ impl Congestion {
         true
     }
 
+    pub(crate) fn in_recovery(&self) -> bool {
+        self.sack_recovery || self.fast_recovery
+    }
+
+    pub(crate) fn retransmission_lost(&mut self, flight: u32) {
+        self.reduce_threshold(flight);
+        self.cwnd = self.cwnd.min(self.ssthresh);
+        self.ecn_end = None;
+    }
+
     pub(crate) fn cancel_sack_recovery(&mut self) {
         self.sack_recovery = false;
         self.acknowledged = 0;
@@ -418,9 +435,89 @@ impl Congestion {
     }
 }
 
+// RFC 6937 section 3, Conservative Reduction Bound (byte units).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Prr {
+    recover_fs: u32,
+    delivered: u64,
+    out: u64,
+    credit: u32,
+}
+
+impl Prr {
+    pub(crate) fn new(flight: u32, mss: u32) -> Self {
+        Self {
+            recover_fs: flight.max(1),
+            delivered: 0,
+            out: 0,
+            credit: mss,
+        }
+    }
+
+    pub(crate) fn acknowledge(&mut self, delivered: u32, pipe: u32, threshold: u32) {
+        if delivered == 0 {
+            self.credit = 0;
+            return;
+        }
+        self.delivered = self.delivered.saturating_add(u64::from(delivered));
+        let allowed = if pipe > threshold {
+            (u128::from(self.delivered) * u128::from(threshold))
+                .div_ceil(u128::from(self.recover_fs))
+                .min(u128::from(u64::MAX)) as u64
+        } else {
+            self.delivered
+                .min(self.out.saturating_add(u64::from(threshold - pipe)))
+        };
+        self.credit = allowed.saturating_sub(self.out).min(u64::from(u32::MAX)) as u32;
+    }
+
+    pub(crate) fn guarantee_initial(&mut self, mss: u32) {
+        self.credit = self.credit.max(mss);
+    }
+
+    pub(crate) fn credit(&self) -> u32 {
+        self.credit
+    }
+
+    pub(crate) fn sent(&mut self, bytes: u32) {
+        self.out = self.out.saturating_add(u64::from(bytes));
+        self.credit = self.credit.saturating_sub(bytes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prr_crb_proportional_conservative_bound_and_no_duplicate_credit() {
+        let mut prr = Prr::new(10_000, 1000);
+        prr.acknowledge(3000, 7000, 5000);
+        assert_eq!(prr.credit(), 1500);
+        prr.sent(1000);
+        assert_eq!(prr.credit(), 500);
+        prr.acknowledge(1000, 3000, 5000);
+        assert_eq!(prr.credit(), 2000);
+        prr.sent(2000);
+        prr.acknowledge(0, 1000, 5000);
+        assert_eq!(prr.credit(), 0);
+        prr.acknowledge(1000, 1000, 5000);
+        assert_eq!(prr.credit(), 2000);
+        let mut timer_entry = Prr::new(10_000, 1000);
+        timer_entry.sent(1000);
+        timer_entry.acknowledge(1000, 3000, 5000);
+        // Initial retransmission consumes actual output even without an entry ACK.
+        assert_eq!(timer_entry.credit(), 0);
+        let mut timer_entry = Prr::new(10_000, 1000);
+        timer_entry.acknowledge(1000, 3000, 5000); // Real deferred causative SACK.
+        timer_entry.guarantee_initial(1000);
+        timer_entry.sent(1000);
+        timer_entry.acknowledge(1000, 3000, 5000);
+        assert_eq!(timer_entry.credit(), 1000);
+        timer_entry.sent(1000);
+        timer_entry.acknowledge(0, 3000, 5000);
+        assert_eq!(timer_entry.credit(), 0);
+    }
 
     #[test]
     // Partial test: estimator vectors and capped backoff; does not test Karn sample
