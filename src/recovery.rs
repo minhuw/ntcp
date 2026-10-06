@@ -11,6 +11,7 @@ pub(crate) struct RttEstimator {
     srtt: Option<u64>,
     variance: u64,
     rto: u64,
+    minimum: u64,
 }
 
 // Partial evidence: estimator arithmetic and bounded backoff only. The connection selects
@@ -20,8 +21,10 @@ pub(crate) struct RttEstimator {
 //# The RTO MUST be computed according to the algorithm in [10], including Karn's algorithm
 //# for taking RTT samples (MUST-18).
 impl RttEstimator {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(minimum: u64) -> Self {
+        assert!((1..=MAX_RTO).contains(&minimum));
         Self {
+            minimum,
             srtt: None,
             variance: 0,
             rto: MIN_RTO,
@@ -57,7 +60,7 @@ impl RttEstimator {
         self.srtt = Some(srtt);
         self.rto = srtt
             .saturating_add(self.variance.saturating_mul(4).max(1_000))
-            .clamp(MIN_RTO, MAX_RTO);
+            .clamp(self.minimum, MAX_RTO);
     }
 
     // Partial evidence: exponential RTO backoff only; congestion-window algorithms are in
@@ -333,7 +336,10 @@ impl Congestion {
     }
 
     pub(crate) fn retransmission_lost(&mut self, flight: u32) {
-        self.reduce_threshold(flight);
+        // A new loss of a retransmission is additional congestion, not another
+        // reduction of the unchanged original cumulative flight. Exclude Reno
+        // inflation and respect any previous loss/ECN window reduction.
+        self.reduce_threshold(flight.min(self.cwnd).min(self.ssthresh));
         self.cwnd = self.cwnd.min(self.ssthresh);
         self.ecn_end = None;
     }
@@ -455,10 +461,8 @@ impl Prr {
     }
 
     pub(crate) fn acknowledge(&mut self, delivered: u32, pipe: u32, threshold: u32) {
-        if delivered == 0 {
-            self.credit = 0;
-            return;
-        }
+        // Duplicate ACKs cannot add delivery, but must not revoke unspent
+        // credit (including after failed output). Recompute the cumulative bound.
         self.delivered = self.delivered.saturating_add(u64::from(delivered));
         let allowed = if pipe > threshold {
             (u128::from(self.delivered) * u128::from(threshold))
@@ -499,7 +503,9 @@ mod tests {
         prr.acknowledge(1000, 3000, 5000);
         assert_eq!(prr.credit(), 2000);
         prr.sent(2000);
-        prr.acknowledge(0, 1000, 5000);
+        // The two emitted MSS raise pipe from 3000 to 5000. An unchanged
+        // duplicate ACK supplies no further credit at the threshold.
+        prr.acknowledge(0, 5000, 5000);
         assert_eq!(prr.credit(), 0);
         prr.acknowledge(1000, 1000, 5000);
         assert_eq!(prr.credit(), 2000);
@@ -520,6 +526,52 @@ mod tests {
     }
 
     #[test]
+    fn prr_duplicate_ack_preserves_banked_credit_without_minting_delivery() {
+        for (pipe, expected) in [(7000, 1500), (3000, 2000)] {
+            let mut prr = Prr::new(10_000, 1000);
+            prr.acknowledge(3000, pipe, 5000);
+            assert_eq!(prr.credit(), expected);
+            for _ in 0..4 {
+                // also the state after repeated failed output
+                prr.acknowledge(0, pipe, 5000);
+                assert_eq!(prr.credit(), expected);
+                assert_eq!(prr.delivered, 3000);
+                assert_eq!(prr.out, 0);
+            }
+            prr.sent(1000);
+            // Reflect the successful retransmission in pipe. The proportional
+            // bound stays constant above threshold; CRB recomputes headroom.
+            prr.acknowledge(0, pipe + 1000, 5000);
+            assert_eq!(prr.credit(), if pipe > 5000 { 500 } else { 1000 });
+            assert_eq!(prr.delivered, 3000);
+            assert_eq!(prr.out, 1000);
+        }
+    }
+
+    #[test]
+    fn rack_retransmission_loss_reduces_again_at_fixed_cumulative_flight() {
+        for ecn in [false, true] {
+            let mut c = Congestion::new(1000, RecoveryAlgorithm::NewReno, InitialWindow::Iw10);
+            if ecn {
+                assert!(c.on_ecn(Seq(1), 16_000, Seq(16_001)));
+            }
+            assert!(c.on_sack_recovery(Seq(1), 16_000, Seq(16_001)));
+            assert_eq!(c.ssthresh(), 8000);
+            c.retransmission_lost(16_000);
+            assert_eq!((c.cwnd(), c.ssthresh()), (4000, 4000));
+            c.retransmission_lost(16_000);
+            assert_eq!((c.cwnd(), c.ssthresh()), (2000, 2000));
+            assert_eq!(c.recover, Some(Seq(16_001)));
+            assert_eq!(c.ecn_end, None);
+        }
+        let mut c = Congestion::new(1000, RecoveryAlgorithm::NewReno, InitialWindow::Iw10);
+        assert!(c.on_ecn(Seq(1), 16_000, Seq(16_001)));
+        assert_eq!((c.cwnd(), c.ssthresh()), (5000, 8000));
+        c.retransmission_lost(16_000);
+        assert_eq!((c.cwnd(), c.ssthresh()), (2500, 2500));
+    }
+
+    #[test]
     // Partial test: estimator vectors and capped backoff; does not test Karn sample
     // exclusion or timer lifecycle.
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.1
@@ -527,7 +579,7 @@ mod tests {
     //# The RTO MUST be computed according to the algorithm in [10], including Karn's
     //# algorithm for taking RTT samples (MUST-18).
     fn rtt_vectors_and_backoff() {
-        let mut rtt = RttEstimator::new();
+        let mut rtt = RttEstimator::new(MIN_RTO);
         assert_eq!(rtt.rto(), 1_000_000);
         rtt.sample(1_000_000);
         assert_eq!(
@@ -563,17 +615,17 @@ mod tests {
 
     #[test]
     fn rtt_floor_granularity_and_extremes() {
-        let mut rtt = RttEstimator::new();
+        let mut rtt = RttEstimator::new(MIN_RTO);
         rtt.sample(0);
         assert_eq!(rtt.rto(), MIN_RTO);
         rtt.sample(1);
         assert_eq!(rtt.rto(), MIN_RTO);
-        let mut rtt = RttEstimator::new();
+        let mut rtt = RttEstimator::new(MIN_RTO);
         for _ in 0..100 {
             rtt.sample(2_000_000);
         }
         assert_eq!(rtt.rto(), 2_001_000);
-        let mut rtt = RttEstimator::new();
+        let mut rtt = RttEstimator::new(MIN_RTO);
         rtt.sample(u64::MAX);
         rtt.sample(u64::MAX);
         assert_eq!(rtt.srtt, Some(u64::MAX));
@@ -581,6 +633,36 @@ mod tests {
         rtt.sample(0);
         assert_eq!(rtt.srtt, Some((7 * u64::MAX as u128 / 8) as u64));
         assert_eq!(rtt.rto(), MAX_RTO);
+    }
+
+    #[test]
+    fn configurable_rto_floor_keeps_initial_and_backoff_bounds() {
+        for minimum in [1, 200_000, 1_000_000, MAX_RTO] {
+            let mut rtt = RttEstimator::new(minimum);
+            assert_eq!(rtt.rto(), 1_000_000);
+            rtt.sample(100_000);
+            assert_eq!(rtt.rto(), 300_000u64.max(minimum));
+            for _ in 0..100 {
+                rtt.backoff();
+            }
+            assert_eq!(rtt.rto(), MAX_RTO);
+            for _ in 0..100 {
+                rtt.sample(1);
+            }
+            assert_eq!(rtt.rto(), minimum.max(1001));
+        }
+    }
+
+    #[test]
+    fn tlp_loss_response_shares_ecn_and_recovery_epoch_guards() {
+        let mut c = Congestion::new(1000, RecoveryAlgorithm::NewReno, InitialWindow::Iw10);
+        assert!(c.on_ecn(Seq(1), 8000, Seq(8001)));
+        assert_eq!(c.ssthresh(), 4000);
+        assert!(c.on_sack_recovery(Seq(7001), 2000, Seq(8001)));
+        assert_eq!(c.ssthresh(), 4000); // do not halve again inside ECN epoch
+        assert!(!c.on_sack_recovery(Seq(7001), 2000, Seq(8001)));
+        c.cancel_sack_recovery();
+        assert!(!c.on_sack_recovery(Seq(7001), 2000, Seq(8001)));
     }
 
     #[test]

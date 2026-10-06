@@ -316,6 +316,23 @@ impl Rack {
         }
     }
 
+    // SACK splits are byte accounting, not packet boundaries. Include even the
+    // SACKed pieces of the highest original segment (RFC 8985 section 7.3).
+    pub(crate) fn tail_segment(&self, mss: u32) -> Option<(Seq, Seq)> {
+        if !self.valid() {
+            return None;
+        }
+        let tail = self.intervals.last()?;
+        let first = self
+            .intervals
+            .iter()
+            .rev()
+            .take_while(|r| r.original_end == tail.original_end)
+            .last()?;
+        let size = tail.end.distance_from(first.start).min(mss);
+        Some((tail.end.wrapping_add(0u32.wrapping_sub(size)), tail.end))
+    }
+
     pub(crate) fn lowest_lost(&self, mss: u32) -> Option<(Seq, Seq)> {
         let i = self
             .intervals
@@ -389,6 +406,44 @@ mod tests {
             1000,
             update.dsack,
         )
+    }
+
+    #[test]
+    fn tail_segment_retains_original_sack_boundaries_partial_ack_and_wrap() {
+        for base in [Seq(1), Seq(u32::MAX - 499)] {
+            let mut rack = Rack::new().unwrap();
+            let mut scoreboard = Scoreboard::new();
+            let end = base.wrapping_add(2000);
+            rack.transmit(base, base.wrapping_add(1000), 0, false);
+            rack.transmit(base.wrapping_add(1000), end, 0, false);
+            sack(
+                &mut rack,
+                &mut scoreboard,
+                base.0,
+                end.0,
+                10,
+                &[(base.wrapping_add(1999).0, end.0)],
+            );
+            assert_eq!(
+                rack.tail_segment(1000),
+                Some((base.wrapping_add(1000), end))
+            );
+            sack(
+                &mut rack,
+                &mut scoreboard,
+                base.wrapping_add(1500).0,
+                end.0,
+                20,
+                &[],
+            );
+            assert_eq!(
+                rack.tail_segment(1000),
+                Some((base.wrapping_add(1500), end))
+            );
+            assert_eq!(rack.tail_segment(300), Some((base.wrapping_add(1700), end)));
+            rack.abandon(end);
+            assert_eq!(rack.tail_segment(1000), None);
+        }
     }
 
     #[test]

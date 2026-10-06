@@ -41,6 +41,13 @@ pub struct ConnectionConfig {
     pub rack: bool,
     // Opt-in RFC 6937 PRR-CRB recovery pacing (requires negotiated SACK).
     pub prr: bool,
+    // Opt-in RFC 8985 tail loss probes; requires rack and sack configuration
+    // and negotiated SACK. At most one probe per outstanding flight.
+    pub tlp: bool,
+    // RTT-derived RTO floor, 1..=60_000_000 us. Values below one second are an
+    // explicit deviation from RFC 6298 section 2.4's SHOULD floor. Initial
+    // RTO remains one second; the post-SYN-timeout three-second guard remains.
+    pub rto_min_us: u64,
     pub retransmit_beyond_window: bool,
     pub delayed_ack_us: u64,
     pub user_timeout_us: u64,
@@ -89,6 +96,8 @@ impl Default for ConnectionConfig {
             sack: false,
             rack: false,
             prr: false,
+            tlp: false,
+            rto_min_us: 1_000_000,
             retransmit_beyond_window: false,
             delayed_ack_us: 200_000,
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
@@ -269,6 +278,13 @@ pub(crate) struct Connection {
     sack_fallback: Option<Seq>,
     scoreboard: Scoreboard,
     rack: Rack,
+    tlp_deadline: Option<Instant>,
+    tlp_pending: bool,
+    // Retain a retransmitted probe at equality until DSACK/duplicate ACK or
+    // an ACK beyond its end resolves the RFC 8985 section 7.4.2 ambiguity.
+    tlp_end: Option<(Seq, Seq, bool)>,
+    tlp_flight: Option<Seq>,
+    tlp_fresh_rtt: bool,
     prr: Option<Prr>,
     // Real causative delivery, capped at one MSS and bound to its deferred timer.
     rack_entry_delivery: Option<(u64, u32)>,
@@ -345,7 +361,9 @@ impl Connection {
         iss: u32,
         now: Instant,
     ) -> Result<Self, Error> {
-        if config.send_capacity == 0
+        if (config.tlp && (!config.rack || !config.sack))
+            || !(1..=60_000_000).contains(&config.rto_min_us)
+            || config.send_capacity == 0
             || config.send_capacity >= 1 << 30
             || config.receive_capacity == 0
             || config.receive_capacity > (65535usize << 14)
@@ -396,6 +414,7 @@ impl Connection {
         let mss = config.mss.min(config.send_ip_payload_limit - 20) as usize;
         let congestion =
             Congestion::new(mss as u32, config.recovery_algorithm, config.initial_window);
+        let rtt = RttEstimator::new(config.rto_min_us);
         Ok(Self {
             tuple,
             config,
@@ -428,6 +447,11 @@ impl Connection {
             sack_fallback: None,
             scoreboard: Scoreboard::new(),
             rack: Rack::new().map_err(|_| Error::NoMemory)?,
+            tlp_deadline: None,
+            tlp_pending: false,
+            tlp_end: None,
+            tlp_flight: None,
+            tlp_fresh_rtt: false,
             prr: None,
             rack_entry_delivery: None,
             receive_used: 0,
@@ -460,7 +484,7 @@ impl Connection {
             limited_end: None,
             probe_pending: false,
             keepalive_pending: false,
-            rtt: RttEstimator::new(),
+            rtt,
             congestion,
             ecn_sent_setup: false,
             ecn_sent_plain: false,
@@ -583,6 +607,76 @@ impl Connection {
         self.config.rack && self.sack_receive && self.sack_send && self.rack.valid()
     }
 
+    fn tlp_eligible(&self) -> bool {
+        self.config.tlp
+            && self.rack_enabled()
+            && matches!(self.state, State::Established | State::CloseWait)
+            && self.fin_sequence.is_none()
+            && self.flight() != 0
+            && self.snd_wnd >= self.flight()
+            && !self.congestion.in_recovery()
+            && self.sack_post_rto.is_none()
+            && self.consecutive_timeouts == 0
+            && !self.retx_pending
+            && self.rack.counts().sacked == 0
+            && self.rack.deadline.is_none()
+    }
+
+    fn schedule_tlp(&mut self) {
+        if self.tlp_eligible()
+            && self.tlp_fresh_rtt
+            && self.tlp_end.is_none()
+            && self.tlp_flight.is_none()
+            && !self.tlp_pending
+        {
+            self.tlp_deadline = self.rto_deadline.map(|rto| {
+                self.now
+                    .saturating_add(self.rtt.srtt().unwrap_or(500_000).saturating_mul(2).max(1))
+                    .min(rto)
+            });
+        }
+    }
+
+    fn reset_tlp(&mut self) {
+        self.tlp_deadline = None;
+        self.tlp_pending = false;
+        self.tlp_end = None;
+        self.tlp_flight = None;
+        // Do not manufacture the fresh RTT sample required since the last probe.
+    }
+
+    // Called only for validated ACKs, before advancing SND.UNA.
+    fn tlp_ack(
+        &mut self,
+        ack: Seq,
+        advancing: bool,
+        dsack: bool,
+        blocks: &[Option<(u32, u32)>; 4],
+        duplicate: bool,
+    ) -> bool {
+        if self.tlp_flight.is_some_and(|end| at_or_after(ack, end)) {
+            self.tlp_flight = None;
+        }
+        let Some((start, end, retransmit)) = self.tlp_end else {
+            return false;
+        };
+        if !at_or_after(ack, end) {
+            return false;
+        }
+        let matching_dsack = dsack
+            && blocks[0]
+                .is_some_and(|(left, right)| at_or_after(start, Seq(left)) && Seq(right) == end);
+        let repaired = retransmit && !matching_dsack && after(ack, end);
+        if !retransmit
+            || matching_dsack
+            || repaired
+            || (!advancing && duplicate && blocks.iter().all(Option::is_none))
+        {
+            self.tlp_end = None;
+        }
+        repaired
+    }
+
     fn sack_recovery_enabled(&self) -> bool {
         self.sack_receive && (!(self.config.rack || self.config.prr) || self.sack_send)
     }
@@ -615,6 +709,7 @@ impl Connection {
         {
             return false;
         }
+        self.reset_tlp();
         self.rack_entry_delivery = None;
         self.sack_recovery = Some(SackRecovery {
             recovery_point: self.data_high(),
@@ -919,11 +1014,9 @@ impl Connection {
     }
 
     fn rto(&self) -> u64 {
-        self.rtt.rto().max(if self.syn_timed_out {
-            3_000_000
-        } else {
-            1_000_000
-        })
+        self.rtt
+            .rto()
+            .max(if self.syn_timed_out { 3_000_000 } else { 0 })
     }
 
     fn flight(&self) -> u32 {
@@ -969,6 +1062,7 @@ impl Connection {
     //# whether it closed normally or was aborted (MUST-12).
     fn terminal(&mut self, reason: CloseReason) {
         self.state = State::Closed;
+        self.reset_tlp();
         self.rack.deadline = None;
         self.prr = None;
         self.rack_entry_delivery = None;
@@ -1087,6 +1181,10 @@ impl Connection {
     fn arm_work(&mut self) {
         if !self.synchronized() {
             return;
+        }
+        if !self.tlp_eligible() {
+            self.tlp_deadline = None;
+            self.tlp_pending = false;
         }
         let pending = self.send.len() != 0
             || self.flight() != 0
@@ -1729,6 +1827,7 @@ impl Connection {
         let advancing = after(ack, self.snd_una);
         if advancing {
             self.rack_entry_delivery = None;
+            self.tlp_pending = false;
         }
         let ecn_one = ece && self.flight() != 0 && self.congestion.cwnd() <= self.mss as u32;
         let ecn_reduced =
@@ -1738,6 +1837,8 @@ impl Connection {
             self.reset_limited_transmit();
         }
         let mut delivered = 0;
+        let mut dsack = false;
+        let tlp_flight = self.flight();
         let sack_evidence = if self.sack_receive
             && at_or_after(ack, self.snd_una)
             && self.sack_fallback.is_none_or(|end| at_or_after(ack, end))
@@ -1750,6 +1851,7 @@ impl Connection {
             let update =
                 self.scoreboard
                     .update(ack, self.data_high(), &segment.options.sack_blocks);
+            dsack = update.dsack;
             if update.overflow {
                 self.rack.abandon(self.data_high());
                 self.prr = None;
@@ -1762,7 +1864,6 @@ impl Connection {
                 self.congestion.cancel_sack_recovery();
                 self.reset_limited_transmit();
             }
-            let valid_ledger = self.rack.valid();
             let ledger_delivery = self.rack.acknowledge(
                 ack,
                 self.data_high(),
@@ -1773,9 +1874,13 @@ impl Connection {
                 self.mss as u32,
                 update.dsack,
             );
-            delivered = if valid_ledger {
+            // Splitting at ACK/SACK edges can exhaust the ledger during this
+            // call. Do not use its delivery or retain PRR after that transition.
+            delivered = if self.rack.valid() {
                 ledger_delivery
             } else {
+                self.prr = None;
+                self.rack_entry_delivery = None;
                 cumulative_delivery.saturating_add(update.newly_sacked)
             };
             if !self.rack_enabled() {
@@ -1787,13 +1892,38 @@ impl Connection {
                 && let Some(sample) = self.rack.ack_sample
             {
                 self.rtt.sample(sample);
+                self.tlp_fresh_rtt = true;
             }
             update.newly_sacked != 0 && !update.overflow
         } else {
             false
         };
+        let tlp_repaired = self.tlp_ack(
+            ack,
+            advancing,
+            dsack,
+            &segment.options.sack_blocks,
+            segment.payload.is_empty()
+                && h.flags & FIN == 0
+                && ack == self.snd_una
+                && old_window
+                    == (u32::from(h.window) << if self.scaling { self.peer_scale } else { 0 }),
+        );
+        // RFC 8985 section 7.4.2: an ACK beyond a retransmitted probe without
+        // duplicate-delivery evidence needs the same loss/ECN epoch guards as
+        // fast recovery, but no retransmission (the probe repaired the loss).
+        let tlp_reduced = tlp_repaired
+            && self
+                .congestion
+                .on_sack_recovery(ack, tlp_flight, self.snd_nxt);
+        if tlp_reduced {
+            self.ecn_cwr_pending |= self.ecn_feedback();
+        }
         if advancing {
             self.accept_ack(ack, ece, segment.options.timestamps.map(|ts| ts.1));
+        }
+        if tlp_reduced {
+            self.congestion.cancel_sack_recovery();
         }
         if at_or_after(ack, self.snd_una)
             && let Some(mut recovery) = self.sack_recovery
@@ -1899,6 +2029,9 @@ impl Connection {
         }
         self.receive_text(seq, segment.payload, h.flags, h.urgent_pointer);
         self.arm_work();
+        if advancing {
+            self.schedule_tlp();
+        }
         Ok(())
     }
 
@@ -1986,6 +2119,7 @@ impl Connection {
             if !self.timestamps || echo == Some((sent / 1_000) as u32) {
                 let sample = self.now.saturating_sub(sent);
                 self.rtt.sample(sample);
+                self.tlp_fresh_rtt = true;
                 self.rack.sample(sample);
                 if !syn_ack {
                     self.syn_timed_out = false;
@@ -2253,6 +2387,14 @@ impl Connection {
         let live = self.synchronized();
         let retransmit = reset.is_none() && !syn && live && self.retx_pending && self.flight() != 0;
         let probe = reset.is_none() && !syn && live && self.probe_pending;
+        let tlp = reset.is_none()
+            && !syn
+            && live
+            && self.tlp_pending
+            && self.tlp_eligible()
+            && self.tlp_end.is_none()
+            && self.tlp_flight.is_none()
+            && self.tlp_fresh_rtt;
         let keepalive = reset.is_none() && !syn && live && self.keepalive_pending;
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
         //= reason=Transmit supplies MSS on SYN; learn_syn consumes the decoded peer MSS.
@@ -2483,6 +2625,22 @@ impl Connection {
                 &mut self.scratch[..(right.distance_from(left) as usize).min(credit as usize)],
             );
             retransmitted = count != 0;
+        } else if tlp {
+            let offset = self.snd_nxt.distance_from(self.send_base) as usize;
+            let unsent = self.send.len().saturating_sub(offset);
+            let credit = self.snd_wnd.saturating_sub(self.flight()) as usize;
+            if unsent != 0 && credit >= unsent.min(packet_mss) {
+                count = self
+                    .send
+                    .copy(offset, &mut self.scratch[..unsent.min(packet_mss)]);
+            } else if let Some((left, right)) = self.rack.tail_segment(packet_mss as u32) {
+                seq = left;
+                count = self.send.copy(
+                    seq.distance_from(self.send_base) as usize,
+                    &mut self.scratch[..right.distance_from(left) as usize],
+                );
+                retransmitted = count != 0;
+            }
         } else if retransmit || probe {
             seq = self.snd_una;
             let offset = seq.distance_from(self.send_base) as usize;
@@ -2868,6 +3026,17 @@ impl Connection {
                 self.rto_deadline = Some(now.saturating_add(self.rto()));
             }
         }
+        if tlp && count != 0 {
+            // A probe is not Limited Transmit: it must neither earn its
+            // duplicate-ACK credit nor be excluded from congestion FlightSize.
+            self.limited_pending = false;
+            self.tlp_pending = false;
+            self.tlp_end = Some((seq, seq.wrapping_add(count as u32), retransmitted));
+            self.tlp_flight = Some(self.snd_nxt);
+            self.tlp_fresh_rtt = false;
+            self.tlp_deadline = None;
+            self.rto_deadline = Some(now.saturating_add(self.rto()));
+        }
         if timestamp.is_some() {
             self.last_timestamp_sent_at = Some(now);
         }
@@ -2917,6 +3086,9 @@ impl Connection {
             self.sws_override = false;
         }
         self.arm_work();
+        if fresh_data && !tlp {
+            self.schedule_tlp();
+        }
         Ok(Some(size))
     }
 
@@ -2927,6 +3099,7 @@ impl Connection {
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         [
             self.rack.deadline,
+            self.tlp_deadline,
             self.rto_deadline,
             self.ecn_pause,
             self.ack_deadline,
@@ -2980,10 +3153,25 @@ impl Connection {
             self.detect_rack();
             if let Some(prr) = &mut self.prr {
                 prr.acknowledge(delivery, self.rack.pipe(), self.congestion.ssthresh());
-                prr.guarantee_initial(self.mss as u32);
+                if self.sack_recovery.is_some_and(|r| r.entry_pending) {
+                    prr.guarantee_initial(self.mss as u32);
+                }
+            }
+        }
+        // PTO takes precedence at an RTO-capped tie. Attempts do not back off
+        // RTO or reduce cwnd; only successfully encoded probes consume state.
+        if due(self.tlp_deadline, now) {
+            self.tlp_deadline = None;
+            self.tlp_pending = self.tlp_eligible()
+                && self.tlp_fresh_rtt
+                && self.tlp_end.is_none()
+                && self.tlp_flight.is_none();
+            if self.flight() != 0 && self.snd_wnd != 0 {
+                self.rto_deadline = Some(now.saturating_add(self.rto()));
             }
         }
         if due(self.rto_deadline, now) {
+            self.reset_tlp();
             self.prr = None;
             self.rack_entry_delivery = None;
             self.rack.rto(now, self.snd_una, self.rtt.srtt());
@@ -3390,6 +3578,373 @@ mod tests {
         );
     }
 
+    fn tlp_pair(iss: u32) -> (Connection, Connection) {
+        let cfg = ConnectionConfig {
+            sack: true,
+            rack: true,
+            prr: true,
+            tlp: true,
+            rto_min_us: 200_000,
+            ..config(65_536, 1000)
+        };
+        let mut a = Connection::active(tuple(), cfg.clone(), iss, 0).unwrap();
+        let bytes = packet(&mut a, 0);
+        let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+        let mut b = Connection::passive(reverse(tuple()), cfg, 900, 0, &syn).unwrap();
+        deliver(&mut b, &mut a, 100_000);
+        deliver(&mut a, &mut b, 100_000);
+        assert_eq!(a.rto(), 300_000);
+        assert!(a.tlp_fresh_rtt);
+        (a, b)
+    }
+
+    #[test]
+    fn tlp_four_packets_partial_byte_sack_output_retry_and_rto_sequence() {
+        for iss in [0, u32::MAX - 1999] {
+            let (mut a, _) = tlp_pair(iss);
+            let base = a.send_base;
+            a.write(&[0x55; 4000]).unwrap();
+            for i in 0..4 {
+                let bytes = packet(&mut a, 100_000);
+                let p = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(p.header.sequence, base.wrapping_add(i * 1000).0);
+                assert_eq!(p.payload, &[0x55; 1000]);
+            }
+            assert_eq!(a.tlp_deadline, Some(300_000));
+            rack_sack(&mut a, 200_000, 0, &[(3999, 4000)]);
+            assert_eq!(a.rack.counts().sacked, 0);
+            assert_eq!(a.rack.deadline, None);
+            assert!(a.sack_recovery.is_none());
+            assert_eq!(a.tlp_deadline, Some(300_000));
+            a.timeout(300_000).unwrap();
+            let before = (
+                a.snd_nxt,
+                a.sample,
+                a.tlp_end,
+                a.tlp_flight,
+                a.tlp_fresh_rtt,
+                a.rto_deadline,
+                a.congestion.cwnd(),
+                a.rack.counts().retransmitted,
+            );
+            assert_eq!(
+                a.transmit(300_000, &mut [0; 19]),
+                Err(Error::OutputTooSmall)
+            );
+            assert!(a.tlp_pending);
+            assert_eq!(
+                before,
+                (
+                    a.snd_nxt,
+                    a.sample,
+                    a.tlp_end,
+                    a.tlp_flight,
+                    a.tlp_fresh_rtt,
+                    a.rto_deadline,
+                    a.congestion.cwnd(),
+                    a.rack.counts().retransmitted
+                )
+            );
+            let bytes = packet(&mut a, 300_000);
+            let p = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(p.header.sequence, base.wrapping_add(3000).0);
+            assert_eq!(p.payload, &[0x55; 1000]); // includes the SACKed last byte
+            assert_eq!(a.rto_deadline, Some(600_000));
+            assert_eq!(a.congestion.cwnd(), 4000);
+            assert_eq!(a.tlp_deadline, None);
+            assert!(!a.tlp_fresh_rtt);
+            assert_eq!(a.rack.counts().retransmitted, 1);
+            assert_eq!(a.limited_sent, 0);
+            assert!(!a.limited_pending);
+            assert_eq!(a.transmit(300_001, &mut [0; 1500]), Ok(None));
+            rack_sack(&mut a, 400_000, 0, &[(3999, 4000)]);
+            assert_eq!(a.tlp_deadline, None);
+            a.timeout(599_999).unwrap();
+            assert_eq!(a.transmit(599_999, &mut [0; 1500]), Ok(None));
+            a.timeout(600_000).unwrap();
+            assert_eq!(a.tlp_end, None);
+            assert_eq!(a.congestion.cwnd(), 1000);
+            assert_eq!(a.rto(), 600_000);
+            let bytes = packet(&mut a, 600_000);
+            let p = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(p.header.sequence, base.0);
+            assert_eq!(p.payload.len(), 1000);
+            rack_sack(&mut a, 1_100_000, 1000, &[(3999, 4000)]);
+            for offset in [1000, 2000] {
+                let bytes = packet(&mut a, 1_100_000);
+                let p = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(p.header.sequence, base.wrapping_add(offset).0);
+                assert_eq!(p.payload.len(), 1000);
+            }
+            rack_sack(&mut a, 1_200_000, 3000, &[(3999, 4000)]);
+            let bytes = packet(&mut a, 1_200_000);
+            let p = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(p.header.sequence, base.wrapping_add(3000).0);
+            // Post-RTO recovery is byte-selective: the advisory SACKed byte
+            // is excluded, unlike the whole-original-segment TLP above.
+            assert_eq!(p.payload, &[0x55; 999]);
+            rack_sack(&mut a, 1_300_000, 4000, &[]);
+            assert_eq!(a.flight(), 0);
+            assert_eq!(a.rto_deadline, None);
+            assert_eq!(a.tlp_deadline, None);
+        }
+    }
+
+    #[test]
+    fn tlp_prefers_new_data_beyond_cwnd_and_ack_is_not_loss() {
+        for iss in [0, u32::MAX - 1999] {
+            let (mut a, _) = tlp_pair(iss);
+            let base = a.send_base;
+            a.write(&[0x55; 6000]).unwrap();
+            for _ in 0..4 {
+                packet(&mut a, 100_000);
+            }
+            assert_eq!(a.transmit(100_000, &mut [0; 1500]), Ok(None));
+            a.timeout(300_000).unwrap();
+            let bytes = packet(&mut a, 300_000);
+            let p = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(p.header.sequence, base.wrapping_add(4000).0);
+            assert_eq!(p.payload.len(), 1000);
+            assert_eq!(a.flight(), 5000);
+            assert_eq!(
+                a.tlp_end,
+                Some((base.wrapping_add(4000), base.wrapping_add(5000), false))
+            );
+            assert_eq!(a.rto_deadline, Some(600_000));
+            assert_eq!(a.transmit(300_001, &mut [0; 1500]), Ok(None));
+            let threshold = a.congestion.ssthresh();
+            rack_sack(&mut a, 400_000, 5000, &[]);
+            assert_eq!(a.tlp_end, None);
+            assert_eq!(a.congestion.ssthresh(), threshold);
+            assert!(!a.congestion.in_recovery());
+        }
+    }
+
+    #[test]
+    fn tlp_retransmit_ack_equality_dsack_dupack_and_single_loss_response() {
+        for iss in [0, u32::MAX - 1999] {
+            // 0: ACK beyond probe = loss; 1: matching DSACK; 2: bare DupACK;
+            // 3: unrelated DSACK must not suppress the later loss response.
+            for case in 0..4 {
+                let (mut a, _) = tlp_pair(iss);
+                a.write(&[0x55; 4000]).unwrap();
+                for _ in 0..4 {
+                    packet(&mut a, 100_000);
+                }
+                a.timeout(300_000).unwrap();
+                packet(&mut a, 300_000);
+                let threshold = a.congestion.ssthresh();
+                rack_sack(
+                    &mut a,
+                    400_000,
+                    4000,
+                    match case {
+                        1 => &[(3000, 4000)][..],
+                        3 => &[(2000, 3000)][..],
+                        _ => &[],
+                    },
+                );
+                assert_eq!(a.congestion.ssthresh(), threshold);
+                assert_eq!(a.tlp_end.is_none(), case == 1);
+                assert!(!a.tlp_fresh_rtt); // Karn: no new measurement from the probe
+                if case == 2 {
+                    rack_sack(&mut a, 400_001, 4000, &[]);
+                    assert_eq!(a.tlp_end, None);
+                }
+                a.write(&[0x66; 1000]).unwrap();
+                packet(&mut a, 400_002);
+                assert_eq!(a.tlp_deadline, None); // no fresh RTT, no second probe
+                rack_sack(&mut a, 500_002, 5000, &[]);
+                assert_eq!(a.tlp_end, None);
+                assert_eq!(
+                    a.congestion.ssthresh(),
+                    if case == 0 || case == 3 {
+                        2000
+                    } else {
+                        threshold
+                    }
+                );
+                assert!(!a.congestion.in_recovery());
+                assert!(a.tlp_fresh_rtt);
+                assert_eq!(a.tlp_deadline, None);
+                a.write(&[0x77; 1000]).unwrap();
+                packet(&mut a, 500_003);
+                assert!(a.tlp_deadline.is_some()); // a genuinely new sampled flight
+            }
+        }
+    }
+
+    #[test]
+    fn tlp_packet_feedback_detects_earlier_losses_and_enters_rack_recovery() {
+        for iss in [0, u32::MAX - 1999] {
+            let (mut a, mut b) = tlp_pair(iss);
+            let base = a.send_base;
+            a.write(&[0x55; 4000]).unwrap();
+            for _ in 0..4 {
+                packet(&mut a, 100_000);
+            } // drop all original packets
+            a.timeout(300_000).unwrap();
+            let probe = deliver(&mut a, &mut b, 300_000);
+            let p = wire::parse(ip(tuple()), &probe).unwrap();
+            assert_eq!(p.header.sequence, base.wrapping_add(3000).0);
+            let ack = deliver(&mut b, &mut a, 400_000);
+            let feedback = wire::parse(ip(reverse(tuple())), &ack).unwrap();
+            assert_eq!(feedback.header.acknowledgment, base.0);
+            assert_eq!(
+                feedback.options.sack_blocks[0],
+                Some((base.wrapping_add(3000).0, base.wrapping_add(4000).0))
+            );
+            assert!(a.sack_recovery.is_some());
+            assert_eq!(a.tlp_end, None);
+            assert_eq!(a.tlp_deadline, None);
+            assert_eq!(a.congestion.ssthresh(), 2000);
+            assert_eq!(a.rack.counts().lost, 3);
+            let bytes = packet(&mut a, 400_000);
+            let p = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(p.header.sequence, base.0);
+            assert_eq!(p.payload, &[0x55; 1000]);
+        }
+    }
+
+    #[test]
+    fn tlp_zero_window_complete_sack_and_recovery_cancel_probe() {
+        for mode in 0..4 {
+            let (mut a, _) = tlp_pair(0);
+            a.write(&[0x55; 4000]).unwrap();
+            for _ in 0..4 {
+                packet(&mut a, 100_000);
+            }
+            a.timeout(300_000).unwrap();
+            assert!(a.tlp_pending);
+            if mode == 0 {
+                inject_sack(&mut a, 300_001, Seq(901), Seq(1), ACK, 0, &[], &[]);
+                assert!(a.persist_deadline.is_some());
+                assert_eq!(a.rto_deadline, None);
+            } else if mode == 1 {
+                rack_sack(&mut a, 300_001, 0, &[(3000, 4000)]);
+                assert_eq!(a.rack.counts().sacked, 1);
+                assert_eq!(a.rack.deadline, Some(325_001));
+            } else if mode == 2 {
+                rack_sack(&mut a, 300_001, 1000, &[]);
+                assert_eq!(a.tlp_deadline, Some(525_001));
+            } else {
+                a.rack.abandon(a.data_high());
+                a.arm_work();
+            }
+            assert!(!a.tlp_pending);
+            assert_eq!(a.tlp_end, None);
+            if mode != 2 {
+                assert_eq!(a.tlp_deadline, None);
+            }
+        }
+    }
+
+    #[test]
+    fn tlp_small_rto_floor_preserves_initial_and_syn_timeout_guard() {
+        let cfg = ConnectionConfig {
+            sack: true,
+            rack: true,
+            tlp: true,
+            rto_min_us: 200_000,
+            ..config(65_536, 1000)
+        };
+        let mut a = Connection::active(tuple(), cfg.clone(), 0, 0).unwrap();
+        assert_eq!(a.rto(), 1_000_000);
+        packet(&mut a, 0); // lose SYN
+        a.timeout(1_000_000).unwrap();
+        let bytes = packet(&mut a, 1_000_000);
+        let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+        let mut b = Connection::passive(reverse(tuple()), cfg, 900, 1_000_000, &syn).unwrap();
+        deliver(&mut b, &mut a, 1_100_000);
+        deliver(&mut a, &mut b, 1_100_000);
+        assert_eq!(a.state(), State::Established);
+        assert_eq!(a.rto(), 3_000_000);
+        assert!(!a.tlp_fresh_rtt);
+        a.write(&[0x55; 1000]).unwrap();
+        deliver(&mut a, &mut b, 1_100_000);
+        assert_eq!(a.rto_deadline, Some(4_100_000));
+        assert_eq!(a.tlp_deadline, None);
+        b.timeout(1_300_000).unwrap();
+        deliver(&mut b, &mut a, 1_300_000);
+        assert!(!a.syn_timed_out);
+        assert!(a.tlp_fresh_rtt);
+        assert_eq!(a.rto(), 600_000);
+    }
+
+    #[test]
+    fn tlp_failed_output_falls_back_to_rto_without_consuming_a_probe() {
+        let (mut a, _) = tlp_pair(0);
+        a.write(&[0x55; 5000]).unwrap();
+        for _ in 0..4 {
+            packet(&mut a, 100_000);
+        }
+        a.timeout(300_000).unwrap();
+        assert_eq!(
+            a.transmit(300_000, &mut [0; 19]),
+            Err(Error::OutputTooSmall)
+        );
+        assert_eq!(a.snd_nxt, Seq(4001));
+        assert_eq!(a.flight(), 4000);
+        assert_eq!(a.tlp_end, None);
+        assert_eq!(a.tlp_flight, None);
+        assert!(a.tlp_pending);
+        assert!(a.tlp_fresh_rtt);
+        a.timeout(600_000).unwrap();
+        assert!(!a.tlp_pending);
+        assert_eq!(a.tlp_end, None);
+        assert_eq!(a.rack.counts().retransmitted, 0);
+        assert_eq!(a.rto(), 600_000);
+        let bytes = packet(&mut a, 600_000);
+        let p = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(p.header.sequence, 1);
+        assert_eq!(p.payload, &[0x55; 1000]);
+        assert_eq!(a.tlp_deadline, None);
+    }
+
+    #[test]
+    fn tlp_opt_in_rto_floor_validation_fresh_rtt_and_capped_pto() {
+        assert!(!ConnectionConfig::default().tlp);
+        assert_eq!(ConnectionConfig::default().rto_min_us, 1_000_000);
+        for (sack, rack) in [(false, false), (true, false), (false, true)] {
+            let cfg = ConnectionConfig {
+                tlp: true,
+                sack,
+                rack,
+                ..config(4096, 1000)
+            };
+            assert!(matches!(
+                Connection::active(tuple(), cfg, 0, 0),
+                Err(Error::InvalidArgument)
+            ));
+        }
+        for floor in [0, 60_000_001, u64::MAX] {
+            let cfg = ConnectionConfig {
+                rto_min_us: floor,
+                ..config(4096, 1000)
+            };
+            assert!(matches!(
+                Connection::active(tuple(), cfg, 0, 0),
+                Err(Error::InvalidArgument)
+            ));
+        }
+        let (mut a, _) = tlp_pair(0);
+        a.tlp_fresh_rtt = false;
+        a.write(&[0x55; 1000]).unwrap();
+        packet(&mut a, 100_000);
+        assert_eq!(a.tlp_deadline, None);
+        a.tlp_fresh_rtt = true;
+        a.rto_deadline = Some(150_000);
+        a.schedule_tlp();
+        assert_eq!(a.tlp_deadline, Some(150_000));
+        a.timeout(150_000).unwrap();
+        assert!(a.tlp_pending);
+        assert!(!a.retx_pending);
+        assert_eq!(a.rto(), 300_000); // capped PTO does not back off
+        packet(&mut a, 150_000);
+        assert_eq!(a.rto_deadline, Some(450_000));
+        assert_eq!(a.congestion.cwnd(), 4000);
+    }
+
     #[test]
     fn rack_shift_timer_loss_and_reordered_sack_counts() {
         for iss in [0, u32::MAX - 4999] {
@@ -3572,6 +4127,67 @@ mod tests {
                 (0, 0, 0, 0)
             );
             assert!(!info.recovery);
+        }
+    }
+
+    #[test]
+    fn rack_mixed_immediate_deferred_loss_timer_cannot_mint_prr_entry_credit() {
+        for iss in [0, u32::MAX - 1999] {
+            let (mut a, _) = tlp_pair(iss);
+            a.config.tlp = false;
+            a.write(&[0x55; 4000]).unwrap();
+            for now in [100_000, 200_000, 300_000, 300_000] {
+                packet(&mut a, now);
+            }
+            rack_sack(&mut a, 400_000, 0, &[(3000, 4000)]);
+            assert_eq!(a.rack.counts().lost, 2);
+            assert_eq!(a.rack.deadline, Some(425_000));
+            assert!(a.sack_recovery.unwrap().entry_pending);
+            assert_eq!(a.prr.unwrap().credit(), 1000);
+            packet(&mut a, 400_000);
+            assert!(!a.sack_recovery.unwrap().entry_pending);
+            assert_eq!(a.prr.unwrap().credit(), 0);
+            a.timeout(425_000).unwrap();
+            assert_eq!(a.rack.counts().lost, 3);
+            assert_eq!(a.prr.unwrap().credit(), 0);
+            assert_eq!(a.transmit(425_000, &mut [0; 1500]), Ok(None));
+        }
+    }
+
+    #[test]
+    fn rack_ack_split_overflow_disables_active_prr_and_uses_byte_pipe_fallback() {
+        for iss in [0, u32::MAX - 99] {
+            let (mut a, _) = tlp_pair(iss);
+            a.set_nagle(false);
+            let base = a.send_base;
+            a.write(&[0x55; 2]).unwrap();
+            packet(&mut a, 100_000);
+            for _ in 0..255 {
+                a.write(&[0x55; 1]).unwrap();
+                packet(&mut a, 100_000);
+            }
+            assert_eq!(a.rack.counts().unacked, 256);
+            assert!(a.rack.valid());
+            assert!(a.start_sack_recovery());
+            assert!(a.prr.is_some());
+            assert!(a.rack_entry_delivery.is_none());
+            // Cumulative ACK cuts the first actual two-byte segment; the SACK
+            // simultaneously supplies one byte of fallback delivery at the tail.
+            rack_sack(&mut a, 200_000, 1, &[(256, 257)]);
+            assert!(!a.rack.valid());
+            assert!(a.prr.is_none());
+            assert!(a.rack_entry_delivery.is_none());
+            assert_eq!(a.snd_una, base.wrapping_add(1));
+            assert_eq!(a.flight(), 256);
+            assert_eq!(a.scoreboard.unsacked_bytes(a.snd_una, a.data_high()), 255);
+            let recovery = a.sack_recovery.unwrap();
+            assert_eq!(
+                recovery.pipe,
+                a.scoreboard
+                    .pipe(a.snd_una, a.data_high(), recovery.high_rxt, a.mss as u32)
+            );
+            assert_eq!(a.tlp_deadline, None);
+            assert_eq!(a.tlp_end, None);
         }
     }
 
@@ -8914,7 +9530,7 @@ mod tests {
         cfg.nagle = false;
         for valid in [false, true] {
             let (mut a, _) = pair(cfg.clone(), 10);
-            a.rtt = RttEstimator::new();
+            a.rtt = RttEstimator::new(1_000_000);
             a.write(b"sample").unwrap();
             packet(&mut a, 2_000_000);
             assert!(a.sample.is_some());
