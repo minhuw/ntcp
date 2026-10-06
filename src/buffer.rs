@@ -470,6 +470,9 @@ impl ReceiveBuffer {
     }
 
     fn find_pending(&self, mut offset: usize) -> Option<Seq> {
+        if self.occupied == 0 || self.report_debt == 0 {
+            return None;
+        }
         while offset < self.data.len() {
             let index = self.index(offset);
             if index.is_multiple_of(8)
@@ -532,6 +535,16 @@ impl ReceiveBuffer {
     // crossing the physical ring edge or reading beyond the metadata allocation.
     fn find_presence(&self, mut offset: usize, present: bool) -> usize {
         let capacity = self.data.len();
+        // The contiguous prefix accounts for every retained byte on the common
+        // in-order path; searching the unused receive window would add O(capacity)
+        // work to every outgoing SACK-capable packet.
+        if present && self.occupied == self.contiguous_len {
+            return if offset < self.contiguous_len {
+                offset
+            } else {
+                capacity
+            };
+        }
         while offset < capacity {
             let index = self.index(offset);
             if index.is_multiple_of(32) && index + 32 <= capacity && offset + 32 <= capacity {
@@ -695,11 +708,9 @@ impl ReceiveBuffer {
             //# segment in which it occurs.
             let end = sequence.wrapping_add(payload.len() as u32);
             let distance = end.distance_from(self.read_base) as usize;
-            // ponytail: O(capacity) on a new FIN; track the highest occupied
-            // position if this scan becomes material. Never erase accepted data.
-            if distance < capacity
-                && !(distance..capacity).any(|offset| self.is_present(self.index(offset)))
-            {
+            // Reject a FIN before retained text. Packed presence lookup skips
+            // empty capacity and uses the contiguous-prefix fast path.
+            if distance < capacity && self.find_presence(distance, true) == capacity {
                 self.fin_sequence = Some(end);
             }
         }
@@ -733,6 +744,30 @@ impl ReceiveBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_and_contiguous_presence_search_preserves_fin_and_wrap() {
+        let capacity = 8 * 1024 * 1024;
+        let start = Seq(u32::MAX - 1);
+        let mut recv = ReceiveBuffer::new(start, capacity).unwrap();
+        assert_eq!(recv.find_presence(0, true), capacity);
+        assert_eq!(recv.sack_blocks(4), [None; 4]);
+        recv.insert(start, b"abc", false);
+        assert_eq!(recv.find_presence(2, true), 2);
+        assert_eq!(recv.find_presence(3, true), capacity);
+        assert_eq!(recv.sack_blocks(4), [None; 4]);
+        assert!(recv.insert(start.wrapping_add(3), &[], true).fin);
+        let mut out = [0; 3];
+        assert_eq!(recv.read(&mut out), 3);
+        assert_eq!(out, *b"abc");
+        assert_eq!(recv.find_pending(0), None);
+
+        let mut recv = ReceiveBuffer::new(start, 64).unwrap();
+        recv.insert(start.wrapping_add(40), b"x", false);
+        assert!(!recv.insert(start.wrapping_add(3), &[], true).fin);
+        assert_eq!(recv.fin_sequence, None);
+        assert_eq!(recv.find_presence(3, true), 40);
+    }
 
     fn receive_packet(recv: &mut ReceiveBuffer, sequence: Seq, payload: &[u8]) -> ReceiveOutcome {
         if let Some(first) = recv.sack_blocks(4)[0] {
