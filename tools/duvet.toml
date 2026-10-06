@@ -23,6 +23,30 @@ pattern = "workbench/duvet/requirements/**/rfc8985/*.toml"
 pattern = "workbench/duvet/requirements/**/rfc6937/*.toml"
 
 [[requirement]]
+pattern = "workbench/duvet/requirements/**/rfc6298/*.toml"
+
+[[requirement]]
+pattern = "workbench/duvet/requirements/**/rfc5681/*.toml"
+
+[[requirement]]
+pattern = "workbench/duvet/requirements/**/rfc6582/*.toml"
+
+[[requirement]]
+pattern = "workbench/duvet/requirements/**/rfc6928/*.toml"
+
+[[requirement]]
+pattern = "workbench/duvet/requirements/**/rfc7323/*.toml"
+
+[[requirement]]
+pattern = "workbench/duvet/requirements/**/rfc2883/*.toml"
+
+[[requirement]]
+pattern = "workbench/duvet/requirements/**/rfc3168/*.toml"
+
+[[requirement]]
+pattern = "workbench/duvet/requirements/**/rfc5961/*.toml"
+
+[[requirement]]
 pattern = "tools/rfc*-additions.toml"
 
 [[requirement]]
@@ -46,6 +70,38 @@ format = "ietf"
 
 [[specification]]
 source = "https://www.rfc-editor.org/rfc/rfc6937"
+format = "ietf"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc6298"
+format = "ietf"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc5681"
+format = "ietf"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc6582"
+format = "ietf"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc6928"
+format = "ietf"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc7323"
+format = "ietf"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc2883"
+format = "ietf"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc3168"
+format = "ietf"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc5961"
 format = "ietf"
 
 [report.html]

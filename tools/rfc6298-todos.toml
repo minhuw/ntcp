@@ -1,0 +1,88 @@
+# Unresolved behavior/profile/test gaps are not exceptions or waivers.
+
+# 6298:section-1:2
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-1"
+reason = "Global conformance is not established by estimator math: configured rto_min_us<1000000 intentionally departs from section2.4, and timer/sample-rate/profile gaps below remain. Close each applicable algorithm TODO and test conservative RTO behavior under retransmit, ACK, zero-window and optional RACK/TLP transitions; do not use this as an implemented-defect waiver."
+quote = '''
+However, a TCP MUST NOT be more aggressive than the following algorithms allow.
+'''
+
+# 6298:section-2:8
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-2"
+reason = "Default minimum1000000 satisfies the floor (rtt_floor_granularity_and_extremes). Opt-in rto_min_us=1..999999 intentionally permits subsecond sampled RTO; configurable_rto_floor_keeps_initial_and_backoff_bounds asserts this deviation. Do not mark that implemented deviation outside scope. Closure: retain >=1s for an RFC6298-conformant profile, or explicitly resolve the SHOULD departure with a justified alternate-spec/profile decision and targeted tests."
+quote = '''
+(2.4) Whenever RTO is computed, if it is less than 1 second, then the RTO SHOULD
+be rounded up to 1 second.
+'''
+
+# 6298:section-3:3
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-3"
+reason = "One pending end/send-time sample starts on fresh output and clears on covered ACK; timestamp mismatch clears it without sampling, and same-millisecond timestamp reuse can suppress rearming. No assertion establishes >=one eligible measurement per RTT in continuous ACK-clocked flights, delayed/stretched ACKs, invalid echoes, ledger fallback, or RACK-only SACK delivery. Add an integrated sample-count trace per RTT and correct starvation if found; Karn-impossible flights must be identified separately."
+quote = '''
+A TCP implementation MUST take at least one RTT measurement per RTT (unless that
+is not possible per Karn's algorithm).
+'''
+
+# 6298:section-5:1
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
+reason = "Ordinary output re-arms on successful retransmission and advancing ACK restarts; there is no packet-identity assertion proving the no-early-RTO invariant after original/retransmit/ACK/RTO changes. Fast retransmit and negotiated RACK/TLP are distinct early-loss algorithms, not proof of timer conformance. Add last-emission-time assertions for head packets at just-before and exact expiry across partial ACKs, wrap, failed output, configured floors, SACK retransmit and persist transitions; resolve any actual early timer-driven retransmission."
+quote = '''
+An implementation MUST manage the retransmission timer(s) in such a way that a
+segment is never retransmitted too early, i.e., less than one RTO after the
+previous transmission of that segment.
+'''
+
+# 6298:section-5:2
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
+reason = "Recommended timer steps5.1-5.6 are added individually. Zero-window arm_work disables RTO in favor of persist; successful recovery retransmits re-arm RTO (RFC6675 section6 optional variant), and RACK/TLP changes loss-timer scheduling. Close individual lifecycle/profile test gaps rather than claiming universal standard timer behavior."
+quote = '''
+The following is the RECOMMENDED algorithm for managing the retransmission
+timer:
+'''
+
+# 6298:section-5:4
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
+reason = "Active lost-SYN path is directly asserted, including subsecond configured floor and first-data deadline. Passive lost-SYN-ACK and simultaneous-open timeout completion are reachable but existing assertions do not check their post-handshake >=3s RTO/data deadline. Add those role-specific assertions, and an exact fresh-sample guard-release assertion per role. Implemented active behavior is evidence only, not a waiver for untested roles."
+quote = '''
+(5.7) If the timer expires awaiting the ACK of a SYN segment and the TCP
+implementation is using an RTO less than 3 seconds, the RTO MUST be
+re-initialized to 3 seconds when data transmission begins (i.e., after the
+three-way handshake completes).
+'''
+
+# 6298:section-3:many-timestamp-samples
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-3"
+reason = "Timestamp per-ACK samples/many measurements per large window are suggested to avoid aliasing, but ordinary Connection sampling retains one pending flight sample; RACK only supplements nonadvancing SACK delivery with valid original ack_sample. No large-window count/aliasing assertions. Characterize rate under negotiated timestamps and add a large-window integrated test or explicitly justify a conservative one-per-RTT policy; minimum-rate MUST stays open."
+quote = '''
+However, when using the timestamp option, each ACK can be used as an RTT sample.
+RFC 1323 [JBB92] suggests that TCP connections utilizing large congestion
+windows should take many RTT samples per window of data to avoid aliasing
+effects in the estimated RTT.
+'''
+
+# 6298:section-5:5.1
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
+reason = "Ordinary send and retransmission commits arm at now+RTO; exact first-data arming and RTO retransmit rearm are asserted. Zero-window output uses persist and suppresses RTO, and recommended no-restart-on-running-timer needs an explicit later-new-packet assertion. Add standard data-first-send/running-send/failure timer assertions plus zero-window role reconciliation; RFC6675 retransmit rearm is a scoped optional variant, not a defect waiver."
+quote = '''
+(5.1) Every time a packet containing data is sent (including a retransmission),
+if the timer is not running, start it running so that it will expire after RTO
+seconds (for the current value of RTO).
+'''
+
+# 6298:section-5:5.3
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
+reason = "accept_ack sets deadline=now+RTO for residual flight, but existing partial-ACK RTO test only reads the deadline and does not assert its exact relation to ACK time/current RTO or distinguish old duplicate ACKs. Add exact advancing/duplicate/nonadvancing-SACK timer assertions, and persist selection/return coverage. Do not substitute successful-retransmit timer assertions."
+quote = '''
+(5.3) When an ACK is received that acknowledges new data, restart the
+retransmission timer so that it will expire after RTO seconds (for the current
+value of RTO).
+'''

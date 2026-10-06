@@ -1,0 +1,321 @@
+# Open semantic/test gaps and explicitly scoped optional/actor exceptions.
+
+# 5681-001
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-2"
+reason = "Ordinary transmit uses min(rwnd,cwnd), and Limited Transmit is the section 3.2 controlled exception. Negotiated SACK uses pipe; RACK/TLP/PRR require their modified-recovery scope (RFC8985/6937), not literal Reno inflation. No universal output assertion covers all paths; audit persist and recovery budgets plus IW bound and post-recovery growth gaps before claiming this global limit. TLP intentionally sends one probe beyond cwnd under RFC8985, which is not evidence for literal RFC5681."
+quote = '''
+At any given time, a TCP MUST NOT send data with a sequence number higher than the sum of the highest acknowledged sequence number and the minimum of cwnd and rwnd.
+'''
+
+# 5681-002
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.1"
+reason = "Ordinary transmit uses min(rwnd,cwnd), and Limited Transmit is the section 3.2 controlled exception. Negotiated SACK uses pipe; RACK/TLP/PRR require their modified-recovery scope (RFC8985/6937), not literal Reno inflation. No universal output assertion covers all paths; audit persist and recovery budgets plus IW bound and post-recovery growth gaps before claiming this global limit. TLP intentionally sends one probe beyond cwnd under RFC8985, which is not evidence for literal RFC5681. Shared helper arithmetic is covered by initial_slow_start_and_byte_counting."
+quote = '''
+The slow start and congestion avoidance algorithms MUST be used by a TCP sender to control the amount of outstanding data being injected into the network.
+'''
+
+# 5681-003
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.1"
+reason = "Default InitialWindow::Rfc5681 uses min(4*MSS,max(2*MSS,4380)), the RFC3390 formula rather than RFC5681 piecewise bounds. At effective MSS=1448 (timestamps), cwnd=4380 exceeds 3*MSS=4344; at MSS=1096 it is 4380 rather than <=3288. Existing initial_window_uses_negotiated_effective_mss asserts the former flawed value. Correct the default bound and add boundary/negotiated-MSS wire assertions. Iw10 is a separately opted-in RFC6928 experiment, not a waiver for the default."
+quote = '''
+IW, the initial value of cwnd, MUST be set using the following guidelines as an upper bound.
+'''
+
+# 5681-004
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.1"
+reason = "Default InitialWindow::Rfc5681 uses min(4*MSS,max(2*MSS,4380)), the RFC3390 formula rather than RFC5681 piecewise bounds. At effective MSS=1448 (timestamps), cwnd=4380 exceeds 3*MSS=4344; at MSS=1096 it is 4380 rather than <=3288. Existing initial_window_uses_negotiated_effective_mss asserts the former flawed value. Correct the default bound and add boundary/negotiated-MSS wire assertions. Iw10 is a separately opted-in RFC6928 experiment, not a waiver for the default."
+quote = '''
+If SMSS > 2190 bytes: IW = 2 * SMSS bytes and MUST NOT be more than 2 segments If (SMSS > 1095 bytes) and (SMSS <= 2190 bytes): IW = 3 * SMSS bytes and MUST NOT be more than 3 segments if SMSS <= 1095 bytes: IW = 4 * SMSS bytes and MUST NOT be more than 4 segments
+'''
+
+# 5681-009
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.1"
+reason = "Congestion::new initializes ssthresh=MAX_WINDOW and reduce_threshold reacts to congestion, but no existing assertion explicitly verifies the initial high ssthresh. Add that assertion and a first-loss threshold trace; timeout and SACK tests separately verify reductions, not initialization."
+quote = '''
+The initial value of ssthresh SHOULD be set arbitrarily high (e.g., to the size of the largest possible advertised window), but ssthresh MUST be reduced in response to congestion.
+'''
+
+# 5681-011
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.1"
+reason = "Byte counting bounds each increment by SMSS per acknowledged cwnd, but no actual RTT-scoped ACK/output trace asserts the MUST/SHOULD per-RTT limit with delayed/divided ACKs. Add such a trace; helper initial_slow_start_and_byte_counting is not timing evidence."
+quote = '''
+* SHOULD increment cwnd per equation (2) once per RTT
+'''
+
+# 5681-012
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.1"
+reason = "Byte counting bounds each increment by SMSS per acknowledged cwnd, but no actual RTT-scoped ACK/output trace asserts the MUST/SHOULD per-RTT limit with delayed/divided ACKs. Add such a trace; helper initial_slow_start_and_byte_counting is not timing evidence."
+quote = '''
+* MUST NOT increment cwnd by more than SMSS bytes
+'''
+
+# 5681-014
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.1"
+reason = "Byte counting bounds each increment by SMSS per acknowledged cwnd, but no actual RTT-scoped ACK/output trace asserts the MUST/SHOULD per-RTT limit with delayed/divided ACKs. Add such a trace; helper initial_slow_start_and_byte_counting is not timing evidence."
+quote = '''
+Note that during congestion avoidance, cwnd MUST NOT be
+'''
+
+# 5681-015
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.1"
+reason = "Optional equation (3) is not selected. Congestion::on_ack_with_ecn uses the recommended byte-counting method with acknowledged>=cwnd; initial_slow_start_and_byte_counting asserts that choice. Rounding recommendation is conditional on equation (3), so no quotient is computed or rounded. This does not waive per-RTT or post-recovery obligations."
+quote = '''
+Another common formula that a TCP MAY use to update cwnd during congestion avoidance is given in equation (3):
+'''
+
+# 5681-016
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.1"
+reason = "Optional equation (3) is not selected. Congestion::on_ack_with_ecn uses the recommended byte-counting method with acknowledged>=cwnd; initial_slow_start_and_byte_counting asserts that choice. Rounding recommendation is conditional on equation (3), so no quotient is computed or rounded. This does not waive per-RTT or post-recovery obligations."
+quote = '''
+If the above formula yields 0, the result SHOULD be rounded up to 1 byte.
+'''
+
+# 5681-023
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.2"
+reason = "Limited transmit keeps Congestion.cwnd unchanged in code, but limited_transmit_is_one_packet_per_duplicate_and_excluded_from_threshold asserts flight/threshold/output, not cwnd before/after each first-two ACK/output. Add explicit cwnd invariance assertions for non-SACK and negotiated SACK paths."
+quote = '''
+Further, the TCP sender MUST NOT change cwnd to reflect these two segments [RFC3042].
+'''
+
+# 5681-029
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.2"
+reason = "Optional outstanding-segment cap on artificial inflation is not selected: on_duplicate_ack adds SMSS with MAX_WINDOW saturation. Mandatory inflation is tested in newreno_partial_and_full_ack. The permission does not require this defense, and it does not waive ACK eligibility or global sending limits."
+quote = '''
+A TCP MAY therefore limit the number of times cwnd is artificially inflated during loss recovery to the number of outstanding segments (or, an approximation thereof).
+'''
+
+# 5681-030
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.2"
+reason = "transmit has cwnd/rwnd gates and emits queued new data after retransmissions, but no existing non-SACK fast-recovery trace asserts a fresh SMSS output after the fourth eligible DupACK and denial at either window limit. Add this direct output test; helper cwnd increments alone are insufficient."
+quote = '''
+When previously unsent data is available and the new value of cwnd and the receiver's advertised window allow, a TCP SHOULD send 1*SMSS bytes of previously unsent data.
+'''
+
+# 5681-032
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3"
+reason = "Ordinary transmit uses min(rwnd,cwnd), and Limited Transmit is the section 3.2 controlled exception. Negotiated SACK uses pipe; RACK/TLP/PRR require their modified-recovery scope (RFC8985/6937), not literal Reno inflation. No universal output assertion covers all paths; audit persist and recovery budgets plus IW bound and post-recovery growth gaps before claiming this global limit. TLP intentionally sends one probe beyond cwnd under RFC8985, which is not evidence for literal RFC5681."
+quote = '''
+In some situations, it may be beneficial for a TCP sender to be more conservative than the algorithms allow; however, a TCP MUST NOT be more aggressive than the following algorithms allow (that is, MUST NOT send data when the value of cwnd computed by the following algorithms would not allow the data to be sent).
+'''
+
+# 5681-033
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-4.1"
+reason = "restart_after_idle computes min(IW,cwnd), and iw10_transmit_idle_restart_and_data_rto tests burst capping and failed-output atomicity. However Connection::transmit writes last_sent=now on every successful packet, including pure ACKs; idle eligibility therefore measures last packet, not last data. A request followed by a pure ACK can postpone reduction. Track last data transmission and add the receive-request/pure-ACK-after-idle regression; default IW arithmetic gap also affects RW."
+quote = '''
+Therefore, a TCP SHOULD set cwnd to no more than RW before beginning transmission if the TCP has not sent data in an interval exceeding the retransmission timeout.
+'''
+
+# 5681-037
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-4.2"
+reason = "Meta-level clarification of RFC1122 requirement strength, not a separate packet algorithm or instruction to implement historical MUST and SHOULD simultaneously. Operative second-full-segment/500ms behavior is audited and annotated independently; deviations cannot be justified by this exception."
+quote = '''
+The requirement that an ACK "SHOULD" be generated for at least every second full-sized segment is listed in [RFC1122] in one place as a SHOULD and another as a MUST.
+'''
+
+# 5681-038
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-4.2"
+reason = "Meta-level clarification of RFC1122 requirement strength, not a separate packet algorithm or instruction to implement historical MUST and SHOULD simultaneously. Operative second-full-segment/500ms behavior is audited and annotated independently; deviations cannot be justified by this exception."
+quote = '''
+Here we unambiguously state it is a SHOULD.
+'''
+
+# 5681-039
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-4.2"
+reason = "Meta-level clarification of RFC1122 requirement strength, not a separate packet algorithm or instruction to implement historical MUST and SHOULD simultaneously. Operative second-full-segment/500ms behavior is audited and annotated independently; deviations cannot be justified by this exception."
+quote = '''
+We also emphasize that this is a SHOULD, meaning that an implementor should indeed only deviate from this requirement after careful consideration of the implications.
+'''
+
+# 5681-044
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-4.2"
+reason = "ack_pending/deadline coalesce ACK work and transmit clears it, but no existing test counts ACK outputs per single incoming segment across delayed ACK, immediate gap feedback, duplex/piggyback and timeout races while excluding receive-credit updates. Add bounded ACK-output count assertions; no outside-role waiver."
+quote = '''
+A TCP receiver MUST NOT generate more than one ACK for every incoming segment, other than to update the offered window as the receiving application consumes new data (see [RFC813] and page 42 of [RFC793]).
+'''
+
+# 5681-046
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-4.3"
+reason = "Enhanced NewReno/SACK/RACK/PRR: no existing actual per-RTT segment-output bound assertion. Byte pipe/headroom and PRR arithmetic tests do not establish this universal half-flight bound; PRR initial MSS floor and uncounted persist are additional known gaps (rfc6937 TODOs). Specify RFC8985/6937 modified recovery applicability and test actual recovery outputs over RTTs, including small flights and lost retransmissions."
+quote = '''
+Second, until all lost segments in the window of data in question are repaired, the number of segments transmitted in each RTT MUST be no more than half the number of outstanding segments when the loss was detected.
+'''
+
+# 5681-047
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-4.3"
+reason = "Enhanced recovery exits deflate cwnd below ssthresh (e.g. sack_entry_partial_and_full_ack gives cwnd=2000, ssthresh=4000); next on_ack_with_ecn selects slow start because cwnd<ssthresh. RFC5681 explicitly requires congestion avoidance after repaired loss (rejected erratum6233 does not change that). Track/enforce avoidance after enhanced recovery and add next-ACK growth assertions for NewReno/SACK/RACK/PRR."
+quote = '''
+has been successfully retransmitted, cwnd MUST be set to no more than ssthresh and congestion avoidance MUST be used to further increase cwnd.
+'''
+
+# 5681-048
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-4.3"
+reason = "RACK lost retransmissions reduce again (rack_retransmission_loss_reduces_again_at_fixed_cumulative_flight); ordinary Reno/NewReno has recover epoch guards and RTO repeat handling. No complete non-SACK two-successive-window plus retransmission-loss trace asserts both cwnd and ssthresh reductions. Add that matrix; do not waive the second loss merely because recover is retained."
+quote = '''
+Loss in two successive windows of data, or the loss of a retransmission, should be taken as two indications of congestion and, therefore, cwnd (and ssthresh) MUST be lowered twice in this case.
+'''
+
+# 5681-049
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-7"
+reason = "Historical changelog reports prior MAY versus new SHOULD; not a second initialization algorithm. Operative section3.1 initial-high-ssthresh obligation remains TODO for missing direct initialization assertion; this exception does not waive it."
+quote = '''
+The recommended initial value for ssthresh has been changed to say that it SHOULD be arbitrarily high, where it was previously MAY.
+'''
+
+# 5681-050
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-7"
+reason = "Historical restatement of optional section3.2 artificial-inflation cap, not a mandatory defense. Cap is not selected; on_duplicate_ack implements uncapped SMSS additions with numeric saturation. Mandatory ACK eligibility/global bounds retain their own TODOs."
+quote = '''
+TCPs now MAY limit the number of duplicate ACKs that artificially inflate cwnd during loss recovery to the number of segments outstanding to avoid the duplicate ACK spoofing attack described in [SCWA99].
+'''
+
+# 5681-051
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-2"
+reason = "Verified erratum5458 changes TCP.UNA to SND.UNA only; preserve published quote. Non-SACK input checks outstanding flight, empty payload, no FIN, ack==snd_una and unchanged window (SYN rejected earlier), with extra conservative zero-window guard. No direct test matrix asserts all five predicates, reset on advancing ACK, and interleaved ineligible ACKs; add one. SACK alternative is separate."
+quote = '''
+DUPLICATE ACKNOWLEDGMENT: An acknowledgment is considered a "duplicate" in the following algorithms when (a) the receiver of the ACK has outstanding data, (b) the incoming acknowledgment carries no data, (c) the SYN and FIN bits are both off, (d) the acknowledgment number is equal to the greatest acknowledgment received on the given connection (TCP.UNA from [RFC793]) and (e) the advertised window in the incoming acknowledgment equals the advertised window in the last incoming acknowledgment.
+'''
+
+# 5681-053
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-2"
+reason = "flight uses exclusive snd_nxt-snd_una, including SYN/FIN sequence space where applicable; data-flight and recovery snapshots must distinguish control bytes and limited-transmit exclusions. Existing flight/PRR snapshots are partial, not a direct cumulative-only flight assertion through SACK-only acknowledgments and SYN/FIN boundaries. Add a byte ledger trace."
+quote = '''
+FLIGHT SIZE: The amount of data that has been sent but not yet cumulatively acknowledged.
+'''
+
+# 5681-057
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.1"
+reason = "accept_ack computes bytes freed and ignores SYN acknowledgments for growth; helper vectors inject acked counts rather than assert full connection derivation across partial ACKs, FIN and retransmitted bytes. Add direct N/cwnd assertions for divided and cumulative ACKs. Held erratum4068 clarifies new data means previously unacknowledged here."
+quote = '''
+where N is the number of previously unacknowledged bytes acknowledged in the incoming ACK.
+'''
+
+# 5681-059
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.1"
+reason = "Completes pagination-truncated extraction: byte-counting helper implements acknowledged>=cwnd then one-MSS growth, but an actual per-RTT output/ACK bound is untested. Add timing-scoped delayed/divided ACK trace; no exception for extraction truncation."
+quote = '''
+The RECOMMENDED way to increase cwnd during congestion avoidance is to count the number of bytes that have been acknowledged by ACKs for new data. (A drawback of this implementation is that it requires maintaining an additional state variable.) When the number of bytes acknowledged reaches cwnd, then cwnd can be incremented by up to SMSS bytes. Note that during congestion avoidance, cwnd MUST NOT be increased by more than SMSS bytes per RTT. This method both allows TCPs to increase cwnd by one segment per RTT in the face of delayed ACKs and provides robustness against ACK Division attacks.
+'''
+
+# 5681-060
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.1"
+reason = "Unselected optional equation(3): shared congestion controller selects recommended byte counting, tested by initial_slow_start_and_byte_counting; no quotient or additive constant branch exists. Mandatory byte-count and per-RTT obligations retain their own evidence/TODOs."
+quote = '''
+cwnd += SMSS*SMSS/cwnd (3)
+'''
+
+# 5681-063
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.2"
+reason = "Three-DupACK SND.UNA wire repair is directly asserted, but no non-SACK connection test interleaves advancing and ineligible ACKs then checks the count/reset and no premature retransmission. Add reset matrix; negotiated SACK/RACK follow modified loss detection."
+quote = '''
+The fast retransmit algorithm uses the arrival of 3 duplicate ACKs (as defined in section 2, without any intervening ACKs which move SND.UNA) as an indication that a segment has been lost. After receiving 3 duplicate ACKs, TCP performs a retransmission of what appears to be the missing segment, without waiting for the retransmission timer to expire.
+'''
+
+# 5681-065
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-4.2"
+reason = "2*RMSS and default200ms deadline are tested, but partial-size segments are deliberately accumulated to 2*RMSS (16 bytes from eight 2-byte segments). The suggestion to avoid stretch ACKs by acknowledging every second segment regardless of size is not selected. Assess the existing byte-threshold choice against this performance guidance and add a small-segment/low-MTU stretch ACK decision test; 500ms operative timer remains separately evidenced."
+quote = '''
+In some cases, the sender and receiver may not agree on what constitutes a full-sized segment. An implementation is deemed to comply with this requirement if it sends at least one acknowledgment every time it receives 2*RMSS bytes of new data from the sender, where RMSS is the Maximum Segment Size specified by the receiver to the sender (or the default value of 536 bytes, per [RFC1122], if the receiver does not specify an MSS option during connection establishment). The sender may be forced to use a segment size less than RMSS due to the maximum transmission unit (MTU), the path MTU discovery algorithm or other factors. For instance, consider the case when the receiver announces an RMSS of X bytes but the sender ends up using a segment size of Y bytes (Y < X) due to path MTU discovery (or the sender's MTU size). The receiver will generate stretch ACKs if it waits for 2*X bytes to arrive before an ACK is sent. Clearly this will take more than 2 segments of size Y bytes. Therefore, while a specific algorithm is not defined, it is desirable for receivers to attempt to prevent this situation, for example, by acknowledging at least every second segment, regardless of size. Finally, we repeat that an ACK MUST NOT be delayed for more than 500 ms waiting on a second full-sized segment to arrive.
+'''
+
+# 5681-067
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-4.3"
+reason = "Restores leading text omitted at pagination in generated extraction. Enhanced exit min(ssthresh,flight+MSS) can leave cwnd<ssthresh; next ACK selects slow start. Implement explicit post-recovery avoidance and assert next-ACK growth across NewReno/SACK/RACK/PRR. Rejected erratum6233 cannot reverse the <=ssthresh condition."
+quote = '''
+Finally, after all loss in the given window of segments has been successfully retransmitted, cwnd MUST be set to no more than ssthresh and congestion avoidance MUST be used to further increase cwnd.
+'''
+
+# 5681-069
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-7"
+reason = "Historical summary, not an independent algorithm. Slow-start/byte-counting, repeated RTO, Limited Transmit and advanced recovery operative clauses are audited in sections3.1/3.2/4.3/5; their TODOs remain. Rejected erratum2269 does not remove Limited Transmit recommendation."
+quote = '''
+During slow start, the usage of Appropriate Byte Counting [RFC3465] with L=1*SMSS is explicitly recommended. The method of increasing cwnd given in [RFC2581] is still explicitly allowed. Byte counting during congestion avoidance is also recommended, while the method from [RFC2581] and other safe methods are still allowed.
+'''
+
+# 5681-070
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-7"
+reason = "Historical summary, not an independent algorithm. Slow-start/byte-counting, repeated RTO, Limited Transmit and advanced recovery operative clauses are audited in sections3.1/3.2/4.3/5; their TODOs remain. Rejected erratum2269 does not remove Limited Transmit recommendation."
+quote = '''
+The treatment of ssthresh on retransmission timeout was clarified. In particular, ssthresh must be set to half the FlightSize on the first retransmission of a given segment and then is held constant on subsequent retransmissions of the same segment.
+'''
+
+# 5681-071
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-7"
+reason = "Historical summary, not an independent algorithm. Slow-start/byte-counting, repeated RTO, Limited Transmit and advanced recovery operative clauses are audited in sections3.1/3.2/4.3/5; their TODOs remain. Rejected erratum2269 does not remove Limited Transmit recommendation."
+quote = '''
+The description of fast retransmit and fast recovery has been clarified, and the use of Limited Transmit [RFC3042] is now recommended.
+'''
+
+# 5681-072
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-7"
+reason = "Historical summary, not an independent algorithm. Slow-start/byte-counting, repeated RTO, Limited Transmit and advanced recovery operative clauses are audited in sections3.1/3.2/4.3/5; their TODOs remain. Rejected erratum2269 does not remove Limited Transmit recommendation."
+quote = '''
+It is now recommended that TCP implementors implement an advanced loss recovery algorithm conforming to the principles outlined in this document.
+'''
+
+# 5681-073
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-7"
+reason = "Historical summary, not an independent algorithm. Slow-start/byte-counting, repeated RTO, Limited Transmit and advanced recovery operative clauses are audited in sections3.1/3.2/4.3/5; their TODOs remain. Rejected erratum2269 does not remove Limited Transmit recommendation."
+quote = '''
+The security considerations have been updated to discuss ACK division and recommend byte counting as a counter to this attack.
+'''
+
+# 5681-074
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-1"
+reason = "BCP14 keyword interpretation is a specification-reader obligation, not packet-processing behavior. Audit classifications use these strengths; this exception covers only the vocabulary declaration, never operational MUST/SHOULD clauses."
+quote = '''
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC2119].
+'''
+
+# 5681-020
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.2"
+reason = "Immediate full-gap ACK is asserted by sack_receiver_reorder_gap_fill_and_dsack_transaction; receive_text schedules immediate ACK on out_of_order and advanced>count. No test explicitly checks an immediate ACK after filling only part of an existing gap. Add that assertion, including ordinary non-SACK receive profile; full gap evidence alone is insufficient."
+quote = '''
+In addition, a TCP receiver SHOULD send an immediate ACK when the incoming segment fills in all or part of a gap in the sequence space.
+'''
+
+# 5681-043
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5681#section-4.2"
+reason = "Immediate full-gap ACK is asserted by sack_receiver_reorder_gap_fill_and_dsack_transaction; receive_text schedules immediate ACK on out_of_order and advanced>count. No test explicitly checks an immediate ACK after filling only part of an existing gap. Add that assertion, including ordinary non-SACK receive profile; full gap evidence alone is insufficient."
+quote = '''
+To provide feedback to senders recovering from losses, the receiver SHOULD send an immediate ACK when it receives a data segment that fills in all or part of a gap in the sequence space.
+'''

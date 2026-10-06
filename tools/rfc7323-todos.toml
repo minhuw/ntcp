@@ -1,0 +1,205 @@
+# Agent-only annotation audit: official RFC quotes, whitespace reflow only.
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.2"
+reason = "Optional zero exponent is emitted for capacity<=65535; no direct assertion of WS=Some(0) on SYN/SYN-ACK. Closure: assert zero offer and unscaled negotiated windows, rather than treating zero as no negotiation."
+quote = '''
+MAY be zero (offering to scale, while applying a scale factor of 1 to
+the receive window).
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.2"
+reason = "Implementation learns WS only in learn_syn and does not renegotiate from established options. No focused existing test injects WS on accepted non-SYN segment. Closure: inject changed exponent on data/ACK and assert both shift state and effective subsequent windows unchanged."
+quote = '''
+A Window Scale option in a segment
+without a SYN bit MUST be ignored.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.3"
+reason = "Mandatory clamp to 14 is implemented/tested; SHOULD log invalid exponent is absent (no event/diagnostic hook). Closure: provide bounded error notification/log integration and assert 15/255 trigger it while effective exponent remains 14. Do not waive logging merely because core is no_std."
+quote = '''
+If a
+Window Scale option is received with a shift.cnt value larger than
+14, the TCP SHOULD log the error but MUST use 14 instead of the
+specified value.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.4"
+reason = "Partial shrink robustness: bytes retained and initial new data constrained; general nonzero shrink regression passes. RFC 7323 first retransmission/sub-scale out-of-window rule is not implemented by default (see added item 4). Closure: implement/test scaled quantization-aware first and later retransmission policy as well as late data within previous receive promise."
+quote = '''
+Implementations MUST ensure that they handle a shrinking
+window, as specified in Section 4.2.2.16 of [RFC1122].
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.4"
+reason = "Receiver preserves largest committed advertised_edge for acceptability, but current scaled rounding test only checks edge/storage inequalities, not arrival in wire-retracted interval. Closure: send delayed data within prior ACK edge but beyond latest encoded edge (wrap and batching included), assert acceptance/delivery and bounded backing; fixed 64-range rejection also requires retention/report policy qualification."
+quote = '''
+1)  The receiver MUST honor, as in window, any segment that would
+have been in window for any <ACK> sent by the receiver.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-3.2"
+reason = "No-ACK paths never call accept_ack; simultaneous SYN path clears sample. Existing SYN tests use TSecr=0 only. Closure: inject nonzero/forged TSecr on SYN and non-ACK synchronized traffic and assert RTT/ACK state unchanged, with normal TSval negotiation unaffected."
+quote = '''
+When the ACK bit is not set, the receiver MUST ignore
+the value of the TSecr field.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-3.2"
+reason = "PAWS/TS.Recent gates use negotiated bool; ordinary RTT ignores echo when unnegotiated. Existing fallback tests omit TS on fallback data. Closure: inject TS on non-negotiated established ACK/data, verify payload/window processed normally, no late negotiation or TS.Recent/RTT echo dependence, and no outgoing TS."
+quote = '''
+If a TSopt is received on a connection where TSopt was not negotiated
+in the initial three-way handshake, the TSopt MUST be ignored and the
+packet processed normally.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-4.1"
+reason = "Embedding gap: TSval=(caller Instant/1000) mod 2^32 and backwards Instant is rejected; no contract/runtime test guarantees caller microseconds proportional to real time or bounds forward jumps. Closure: define and validate embedding clock requirements, test rate/jump limits and real monotonic clock integration; synthetic wrap vectors prove arithmetic only."
+quote = '''
+Values of this
+clock MUST be at least approximately proportional to real time, in
+order to measure actual RTT.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-4.1"
+reason = "Ordinary bounded TSecr-qualified RTT sample is called only on advancing ACK; existing test covers valid/forged advancing echoes, not a matching echo on non-advancing ACK with pending sample. Closure: test matching TSecr on duplicate and SACK-only ACK without consuming/updating the ordinary sample. Scope distinction: RACK ack_sample derives now-minus-local-send-time for original transmissions, not received TSecr, so its non-advancing SACK RTT updates are a different measurement mechanism, not evidence of violating this TSecr-only rule; test that separation under negotiated TS."
+quote = '''
+RTTM Rule: A TSecr value received in a segment MAY be used to update
+the averaged RTT measurement only if the segment advances
+the left edge of the send window, i.e., SND.UNA is
+increased.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-4.2"
+reason = "Ordinary RTTM retains only one outstanding original-transmission sample and rejects same-millisecond reuse; this conservatively declines per-packet and retransmission TS sampling rather than requiring unbounded metadata. Existing valid/forged echo test does not establish sustained-flight estimator history. Closure: test ordinary RTTM sampling cadence and effective RFC6298 history with many ACKs per RTT, plus mixed RACK local-send-time samples; adjust cadence/weights only if measured history truncates. RACK local-clock ACK samples are not TSecr RTTM. Appendix G is a suggestion, not a mandatory exact formula."
+quote = '''
+to update the RTT estimator, an implementation SHOULD try to adhere
+to the spirit of the history specified in [RFC6298].
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.2"
+reason = "Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial."
+quote = '''
+While still under discussion, to enable research into this area it is
+now RECOMMENDED that when generating an <RST>, if the segment causing
+the <RST> to be generated contains a Timestamps option, the <RST>
+should also contain a Timestamps option.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.2"
+reason = "Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial."
+quote = '''
+In the <RST> segment,
+SEG.TSecr SHOULD be set to SEG.TSval from the incoming segment and
+SEG.TSval SHOULD be set to zero.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.3"
+reason = "Implementation tests TS only on raw arrival and ReceiveBuffer retains bytes/ranges, not timestamps. Existing hole-fill test has queued TSval=4 newer than filler=3 and does not distinguish rechecking old queued timestamps. Closure: queue accepted older TS before newer hole-fill, then assert queued bytes delivered/read without a second PAWS test; also assert raw retransmitted arrivals still checked."
+quote = '''
+It is important to note that the timestamp MUST be checked only when
+a segment first arrives at the receiver, regardless of whether it is
+in sequence or it must be queued for later delivery.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.4"
+reason = "Embedding/rate gap: fixed 1ms clock plus monotonic caller time does not prove tick per 2^31 bytes or per receive window; API permits repeated sends at identical Instant without byte-per-tick gate. Closure: specify/enforce supported link/clock rate and test bytes-per-tick boundary (including small windows); do not claim an 8Tbps example as an enforced deployment bound."
+quote = '''
+It MUST tick at least once for each 2^31 bytes sent.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.4"
+reason = "Embedding/rate gap: fixed 1ms clock plus monotonic caller time does not prove tick per 2^31 bytes or per receive window; API permits repeated sends at identical Instant without byte-per-tick gate. Closure: specify/enforce supported link/clock rate and test bytes-per-tick boundary (including small windows); do not claim an 8Tbps example as an enforced deployment bound."
+quote = '''
+In fact,
+in order to be useful to the sender for round-trip timing, the
+clock SHOULD tick at least once per window's worth of data, and
+even with the window extension defined in Section 2.2, 2^31
+bytes must be at least two windows.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.4"
+reason = "Arithmetic period is 2^32 milliseconds (>255 seconds), but caller time can jump/scale arbitrarily and no supported MSL/clock-rate contract proves physical recycle period. Closure: bind monotonic microsecond input to real-time rate and maximum MSL, validate/document embedding contract in code and add period/rate assertion; wrap test establishes arithmetic only."
+quote = '''
+The recycling time of the timestamp clock MUST be greater than
+MSL seconds.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.7"
+reason = "Embedding/behavior gap: core exposes lower_mss/send_ip_payload_limit but no autonomous PMTU discovery; tun example sets DF yet explicitly omits ICMP and cannot discover MTU. Closure: provide bounded ICMP PTB or PLPMTUD integration (IPv4/IPv6), propagate reductions to effective send MSS with options, and assert black-hole/PMTU-change behavior. Merely setting DF/static payload cap is not Path MTU Discovery; TCP/IP layering is not a blanket exception."
+quote = '''
+Setting the DF bit implies the use of Path MTU Discovery as described
+in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
+that implements PAWS MUST also implement Path MTU Discovery.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-7.1"
+reason = "Privacy recommendation unimplemented: TSval is raw caller time/1000 with no per-connection random offset. Closure: generate secret-derived/random per-connection offset with consistent serial/RTTM echo validation, avoid breaking TIME-WAIT freshness, and test unrelated connections differ while wrap/reuse and RTT remain correct. Optional feature disabled by default does not waive this recommendation when enabled."
+quote = '''
+It is therefore RECOMMENDED to generate a random, per-
+connection offset to be used with the clock source when generating
+the Timestamps option value (see Section 5.4).
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-7"
+reason = "Privacy recommendation unimplemented: TSval is raw caller time/1000 with no per-connection random offset. Closure: generate secret-derived/random per-connection offset with consistent serial/RTTM echo validation, avoid breaking TIME-WAIT freshness, and test unrelated connections differ while wrap/reuse and RTT remain correct. Optional feature disabled by default does not waive this recommendation when enabled."
+quote = '''
+It is therefore
+RECOMMENDED to generate a random, per-connection offset to be used
+with the clock source when generating the Timestamps option value
+(see Section 5.4).
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.1"
+reason = "SYN-only output is implemented/tested; ignored non-SYN WS and fixed exponent under malicious changed option lack direct regression. Closure: inject changed WS on established ACK/data and assert effective windows and stored shifts unchanged."
+quote = '''
+This option is sent only in a <SYN> segment (a
+segment with the SYN bit on), hence the window scale is fixed in each
+direction when a connection is opened.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.4"
+reason = "Default retransmit clips to latest snd_wnd, even first retry after scaled rounding retraction; opt-in retransmit_beyond_window ignores window for all retries, not the exact first/sub-scale rule. No per-original first-retry or quantization distinction. Closure: preserve bounded first-transmission/first-retry knowledge and scale-unit tolerance, test original-valid first retry beyond edge and subsequent retries near/far edge across wrap and SACK/RACK paths."
+quote = '''
+4)  On first retransmission, or if the sequence number is out of
+window by less than 2^Rcv.Wind.Shift, then do normal
+retransmission(s) without regard to the receiver window as long
+as the original segment was in window when it was sent.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.3"
+reason = "Valid timestamp OOO data queued and echoed correctly, but receive range metadata capped at64 rejects otherwise in-window 65th disjoint arrival. Core safe fallback does not establish unconditional queueing of arbitrary allowed fragmentation. Closure: represent accepted receive-window fragmentation with capacity-accounted bounded metadata, preserve retained-byte correctness, and test65-range/bridging/PAWS combinations; ordinary SACK report suppression is separately RFC2018 TODO."
+quote = '''
+R5)  Otherwise, treat the segment as a normal in-window,
+out-of-sequence TCP segment (e.g., queue it for later delivery
+to the user).
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.4"
+reason = "TSval increments at1ms in caller microsecond units, but physical rate depends on embedding. Same real-clock gap as section4.1/5.4 MUSTs: closure requires validated monotonic real-time microsecond contract and rate/integration assertions, not synthetic Instant arithmetic alone."
+quote = '''
+Based upon these considerations, we choose a timestamp clock
+frequency in the range 1 ms to 1 sec per tick.
+'''

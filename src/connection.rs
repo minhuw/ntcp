@@ -422,6 +422,11 @@ impl Connection {
             .try_reserve_exact(config.mss as usize)
             .map_err(|_| Error::NoMemory)?;
         scratch.resize(config.mss as usize, 0);
+        // Scope: Capacity-derived exponent is fixed at construction; maximum negotiated true window bounded by receive allocation.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.1
+        //= reason=Capacity-derived exponent is fixed at construction; maximum negotiated true window bounded by receive allocation.
+        //# The maximum receive window, and therefore the scale factor, is
+        //# determined by the maximum receive buffer space.
         let local_scale = (0..=14)
             .find(|&shift| config.receive_capacity <= (65535usize << shift))
             .unwrap_or(14);
@@ -809,6 +814,12 @@ impl Connection {
         repaired
     }
 
+    // Partial evidence only; TODO remains. Opt-in RACK/PRR require peer-negotiated SACK; ordinary fallback otherwise. Directional permission with rack=false/prr=false is audited separately in RFC2018/6675.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-1
+    //= reason=Partial evidence only; TODO remains. Opt-in RACK/PRR require peer-negotiated SACK; ordinary fallback otherwise. Directional permission with rack=false/prr=false is audited separately in RFC2018/6675.
+    //# This document applies to TCP connections that are unable to use the TCP Selective
+    //# Acknowledgment (SACK) option, either because the option is not locally supported or
+    //# because the TCP peer did not indicate a willingness to use SACK.
     fn sack_recovery_enabled(&self) -> bool {
         self.sack_receive && (!(self.config.rack || self.config.prr) || self.sack_send)
     }
@@ -1124,6 +1135,17 @@ impl Connection {
         Ok(())
     }
 
+    // Scope: Embedding gap: TSval=(caller Instant/1000) mod 2^32 and backwards Instant is rejected; no contract/runtime test guarantees caller microseconds proportional to real time or bounds forward jumps. Closure: define and validate embedding clock requirements, test rate/jump limits and real monotonic clock integration; synthetic wrap vectors prove arithmetic only. Partial evidence; closure remains TODO.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
+    //= reason=Embedding gap: TSval=(caller Instant/1000) mod 2^32 and backwards Instant is rejected; no contract/runtime test guarantees caller microseconds proportional to real time or bounds forward jumps. Closure: define and validate embedding clock requirements, test rate/jump limits and real monotonic clock integration; synthetic wrap vectors prove arithmetic only. Partial evidence; closure remains TODO.
+    //# Values of this
+    //# clock MUST be at least approximately proportional to real time, in
+    //# order to measure actual RTT.
+    // Scope: Every input/transmit checks nondecreasing Instant, TSval derived by fixed millisecond scaling modulo2^32; repeated Instant intentionally repeats TSval. Physical rate and forward-jump safety separately TODO.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
+    //= reason=Every input/transmit checks nondecreasing Instant, TSval derived by fixed millisecond scaling modulo2^32; repeated Instant intentionally repeats TSval. Physical rate and forward-jump safety separately TODO.
+    //# The PAWS mechanism also puts a strong monotonicity requirement on the
+    //# sender's timestamp clock.
     fn check_time(&self, now: Instant) -> Result<(), Error> {
         if now < self.now {
             Err(Error::TimeWentBackwards)
@@ -1137,6 +1159,68 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.2
     //# A TCP endpoint SHOULD implement ECN as described in RFC 3168 (SHLD-
     //# 8).
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1.1
+    //= reason=Optional timeout fallback selected; asserts plain setup after timeout and ECT suppression, retaining earlier receive commitment. No RST-triggered retry claim.
+    //# A host that receives no reply to an ECN-setup SYN within the normal
+    //# SYN retransmission timeout interval MAY resend the SYN and any
+    //# subsequent SYN retransmissions with CWR and ECE cleared.
+    // Actor/condition: TCP setup initiator/responder; no setup reply before SYN retransmission timeout.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= reason=Responder ECN setup only after peer setup: endpoint asserts setup SYN yields ECE-only SYN-ACK; opt-out/plain SYN yields plain SYN-ACK. No ECT on handshake output.
+    //# * If a host has received an ECN-setup SYN packet, then it MAY send
+    //# an ECN-setup SYN-ACK packet.
+    // Actor/condition: TCP setup responder; received ECN-setup SYN.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= reason=Responder ECN setup only after peer setup: endpoint asserts setup SYN yields ECE-only SYN-ACK; opt-out/plain SYN yields plain SYN-ACK. No ECT on handshake output.
+    //# Otherwise, it MUST NOT send an
+    //# ECN-setup SYN-ACK packet.
+    // Actor/condition: TCP setup responder; no received ECN-setup SYN.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+    //# * A host MUST NOT set ECT on data packets unless it has sent at
+    //# least one ECN-setup SYN or ECN-setup SYN-ACK packet, and has
+    //# received at least one ECN-setup SYN or ECN-setup SYN-ACK packet,
+    //# and has sent no non-ECN-setup SYN or non-ECN-setup SYN-ACK
+    //# packet.
+    // Actor/condition: TCP sender; ECT eligibility after bilateral setup with no local plain setup.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+    //# If a host has received at least one non-ECN-setup SYN
+    //# or non-ECN-setup SYN-ACK packet, then it SHOULD NOT set ECT on
+    //# data packets.
+    // Actor/condition: TCP sender; received any plain setup packet.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= reason=Existing data/feedback and fallback promise assertions are partial evidence. CE-marked zero-window probe is currently excluded by window != 0; clause depends on all applicable ECN receive processing, so retain mandatory negotiated-connection processing open alongside section 6.1.6 TODO.
+    //# * If a host has sent at least one ECN-setup SYN or ECN-setup SYN-
+    //# ACK packet, and has received no non-ECN-setup SYN or non-ECN-
+    //# setup SYN-ACK packet, then if that host receives TCP data
+    //# packets with ECT and CE codepoints set in the IP header, then
+    //# that host MUST process these packets as specified for an ECN-
+    //# capable connection.
+    // Actor/condition: TCP receiver; sent setup and received no plain setup; ECN data received.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+    //# * A host that is not willing to use ECN on a TCP connection SHOULD
+    //# clear both the ECE and CWR flags in all non-ECN-setup SYN and/or
+    //# SYN-ACK packets that it sends to indicate this unwillingness.
+    // Actor/condition: TCP setup sender; unwilling to use ECN.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+    //# Receivers MUST correctly handle all forms of the non-ECN-setup
+    //# SYN and SYN-ACK packets.
+    // Actor/condition: TCP setup receiver; any non-ECN-setup SYN/SYN-ACK flag combination.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= reason=Explicit receive commitment assertion after delayed setup SYN-ACK and local plain-SYN fallback; sender no longer sets ECT, receiver still latches CE.
+    //# However, the commitment to respond appropriately to incoming packets with the CE codepoint set remains even if the TCP sender in a later transmission, within this TCP connection, sends a SYN packet without ECE and CWR set.
+    // Actor/condition: TCP endpoint; ECN setup followed by local plain-SYN fallback.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1.1
+    //= reason=learn_ecn observes setup flags, not incoming IP ECT. No existing assertion explicitly injects ECT on a non-negotiated connection and proves no implicit ECN enablement. Add a negative assertion.
+    //# a host is forbidden from using the reception of ECT data packets as an implicit signal that the other host is ECN- capable.
+    // Actor/condition: TCP endpoint; ECT packet without bilateral setup.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1.2
+    //= reason=Exact flag-combination assertion enables ECN only for ECE-only SYN-ACK, rejecting reflected ECE|CWR.
+    //# the sending TCP correctly interprets a receiver's reflection of its own flags in the Reserved field as an indication that the receiver is not ECN-capable.
+    // Actor/condition: TCP endpoint; SYN-ACK reflects both ECE/CWR.
     fn learn_ecn(&mut self, flags: u8) {
         let setup = flags & (ECE | CWR) == if flags & ACK != 0 { ECE } else { ECE | CWR };
         self.ecn_peer_setup |= setup;
@@ -1160,6 +1244,29 @@ impl Connection {
     //# Set RCV.NXT to SEG.SEQ+1, IRS is set to SEG.SEQ, and any other control or text should be
     //# queued for processing later. ISS should be selected and a SYN segment sent of the form:
     //# <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>
+    // Scope: Active always offers WS; passive enables only after peer offer. Missing peer WS disables effective shifts in both directions, not necessarily the stored capacity-derived exponent.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+    //= reason=Active always offers WS; passive enables only after peer offer. Missing peer WS disables effective shifts in both directions, not necessarily the stored capacity-derived exponent.
+    //# This option is an offer, not a promise; both sides MUST send Window
+    //# Scale options in their <SYN> segments to enable window scaling in
+    //# either direction.
+    // Scope: Effective incoming/outgoing shifts use negotiated scaling; absent peer WS means zero effective shifts even though local_scale retains its configured value.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+    //= reason=Effective incoming/outgoing shifts use negotiated scaling; absent peer WS means zero effective shifts even though local_scale retains its configured value.
+    //# o  Upon receiving a <SYN> segment with a Window Scale option
+    //# containing shift.cnt = S, a TCP MUST set Snd.Wind.Shift to S and
+    //# MUST set Rcv.Wind.Shift to R; otherwise, it MUST set both
+    //# Snd.Wind.Shift and Rcv.Wind.Shift to zero.
+    // Scope: Timestamp negotiation is config/peer-SYN gated; SYN TSecr=0, ACK replies echo ts_recent, bool timestamps retains negotiated state.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+    //= reason=Timestamp negotiation is config/peer-SYN gated; SYN TSecr=0, ACK replies echo ts_recent, bool timestamps retains negotiated state.
+    //# The TCP SHOULD remember
+    //# this state by setting a flag, referred to as Snd.TS.OK, to one.
+    // Scope: learn_syn copies offered TSval into TS.Recent and ts_latest on both active/passive negotiation.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+    //= reason=learn_syn copies offered TSval into TS.Recent and ts_latest on both active/passive negotiation.
+    //# TSval timestamps sent on <SYN> and <SYN,ACK> segments are used to
+    //# initialize PAWS.
     fn learn_syn(&mut self, syn: &Segment<'_>) {
         self.learn_ecn(syn.header.flags);
         self.sack_send |= self.config.sack && syn.options.sack_permitted;
@@ -1234,6 +1341,13 @@ impl Connection {
         }
     }
 
+    // Partial evidence only; TODO remains. syn_timed_out imposes at least 3000000us until an unambiguous data RTT sample; timeout sets the flag during handshake, including passive SYN-ACK.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Partial evidence only; TODO remains. syn_timed_out imposes at least 3000000us until an unambiguous data RTT sample; timeout sets the flag during handshake, including passive SYN-ACK.
+    //# (5.7) If the timer expires awaiting the ACK of a SYN segment and the TCP
+    //# implementation is using an RTO less than 3 seconds, the RTO MUST be re-initialized to
+    //# 3 seconds when data transmission begins (i.e., after the three-way handshake
+    //# completes).
     fn rto(&self) -> u64 {
         self.rtt
             .rto()
@@ -1256,6 +1370,14 @@ impl Connection {
     //= reason=Coalesces ACK requests; input never transmits inline.
     //# o In general, the processing of received segments MUST be implemented to
     //# aggregate ACK segments whenever possible (MUST-58).
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+    //= reason=Partial evidence only; TODO remains. Ordinary unblocked RST challenge fields are asserted. immediate_ack only sets ack_pending; pending retransmission may emit SND.UNA and clear it. Pending retransmission/probe/other-output challenge templates remain unverified.
+    //# <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+    // Actor/condition: TCP endpoint; nonexact in-window RST challenge.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+    //= reason=Partial evidence only; TODO remains. Ordinary unblocked non-timestamp SYN challenge fields are asserted. immediate_ack only sets ack_pending; pending retransmission may emit SND.UNA and clear it. Pending retransmission/probe/other-output challenge templates remain unverified.
+    //# <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+    // Actor/condition: TCP endpoint; synchronized SYN challenge.
     fn immediate_ack(&mut self) {
         self.ack_pending = true;
         self.ack_deadline = None;
@@ -1780,6 +1902,23 @@ impl Connection {
     }
 
     #[cfg(test)]
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= reason=Negotiated SACK (non-RACK/non-PRR test profile): empty/repeated SACK grants no Limited Transmit output; new SACK including duplex data grants one packet. No assertion that bare non-SACK DupACKs are SACK delivery.
+    //# Note that a sender using SACK [RFC2018] MUST NOT send new data unless the incoming
+    //# duplicate acknowledgment contains new SACK information.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= reason=Non-SACK third DupACK threshold uses flight minus limited_sent; wire assertion flight=24, limited=8, ssthresh=8 at MSS4. Negotiated SACK partial advancing ACK trace additionally retains unacknowledged Limited Transmit exclusion. ECN reduction epoch sharing is separately scoped.
+    //# When the third duplicate ACK is received, a TCP MUST set ssthresh to no more than the
+    //# value given in equation (4).
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= reason=Non-SACK third DupACK threshold uses flight minus limited_sent; wire assertion flight=24, limited=8, ssthresh=8 at MSS4. Negotiated SACK partial advancing ACK trace additionally retains unacknowledged Limited Transmit exclusion. ECN reduction epoch sharing is separately scoped.
+    //# When [RFC3042] is in use, additional data sent in limited transmit MUST NOT be included
+    //# in this calculation.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-2
+    //= reason=Negotiated SACK fresh byte evidence defines duplicate ACK, including duplex input; repeated/no SACK cannot grant new credit. Non-SACK five-predicate definition remains TODO.
+    //# Alternatively, a TCP that utilizes selective acknowledgments (SACKs) [RFC2018, RFC2883]
+    //# can leverage the SACK information to determine when an incoming ACK is a "duplicate"
+    //# (e.g., if the ACK contains previously unknown SACK information).
     pub(crate) fn input(&mut self, now: Instant, segment: &Segment<'_>) -> Result<(), Error> {
         self.input_with_traffic_class(now, 0, segment)
     }
@@ -1948,6 +2087,16 @@ impl Connection {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
             //# If SEG.ACK =< ISS or SEG.ACK > SND.NXT, send a reset (unless the RST bit
             //# is set, if so drop the segment and return)
+            // Scope: No-ACK paths never call accept_ack; simultaneous SYN path clears sample. Existing SYN tests use TSecr=0 only. Closure: inject nonzero/forged TSecr on SYN and non-ACK synchronized traffic and assert RTT/ACK state unchanged, with normal TSval negotiation unaffected. Partial evidence; closure remains TODO.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+            //= reason=No-ACK paths never call accept_ack; simultaneous SYN path clears sample. Existing SYN tests use TSecr=0 only. Closure: inject nonzero/forged TSecr on SYN and non-ACK synchronized traffic and assert RTT/ACK state unchanged, with normal TSval negotiation unaffected. Partial evidence; closure remains TODO.
+            //# When the ACK bit is not set, the receiver MUST ignore
+            //# the value of the TSecr field.
+            //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+            //= reason=SYN-SENT reset validation assertion matrix includes arbitrary peer sequences, invalid/missing ACK silence and valid reset closure.
+            //# In all
+            //# other cases the receiver MUST silently discard the segment.
+            // Actor/condition: TCP endpoint; SYN-SENT reset validation.
             let valid_ack =
                 h.flags & ACK != 0 && after(ack, self.iss) && at_or_after(self.snd_nxt, ack);
             if h.flags & ACK != 0 && !valid_ack {
@@ -1993,6 +2142,92 @@ impl Connection {
 
         // RFC 7323 sections 3.2 and 5.2: RST bypasses PAWS, and its
         // timestamps never update connection state. Missing TS is silent loss.
+        // Scope: With negotiated TS, missing option silently returns, does not abort and later valid timestamp data succeeds; missing RST option is exempt.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+        //= reason=With negotiated TS, missing option silently returns, does not abort and later valid timestamp data succeeds; missing RST option is exempt.
+        //# non-<RST> segment is received without a TSopt, a TCP SHOULD silently
+        //# drop the segment.
+        // Scope: With negotiated TS, missing option silently returns, does not abort and later valid timestamp data succeeds; missing RST option is exempt.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+        //= reason=With negotiated TS, missing option silently returns, does not abort and later valid timestamp data succeeds; missing RST option is exempt.
+        //# A TCP MUST NOT abort a TCP connection because any
+        //# segment lacks an expected TSopt.
+        // Scope: PAWS/TS.Recent gates use negotiated bool; ordinary RTT ignores echo when unnegotiated. Existing fallback tests omit TS on fallback data. Closure: inject TS on non-negotiated established ACK/data, verify payload/window processed normally, no late negotiation or TS.Recent/RTT echo dependence, and no outgoing TS. Partial evidence; closure remains TODO.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+        //= reason=PAWS/TS.Recent gates use negotiated bool; ordinary RTT ignores echo when unnegotiated. Existing fallback tests omit TS on fallback data. Closure: inject TS on non-negotiated established ACK/data, verify payload/window processed normally, no late negotiation or TS.Recent/RTT echo dependence, and no outgoing TS. Partial evidence; closure remains TODO.
+        //# If a TSopt is received on a connection where TSopt was not negotiated
+        //# in the initial three-way handshake, the TSopt MUST be ignored and the
+        //# packet processed normally.
+        // Scope: RST bypasses PAWS and terminates/challenges before TS.Recent/ts_latest updates; no timestamp or stale timestamp cannot veto sequence-valid RST.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+        //= reason=RST bypasses PAWS and terminates/challenges before TS.Recent/ts_latest updates; no timestamp or stale timestamp cannot veto sequence-valid RST.
+        //# When an <RST> segment is
+        //# received, it MUST NOT be subjected to the PAWS check by verifying an
+        //# acceptable value in SEG.TSval, and information from the Timestamps
+        //# option MUST NOT be used to update connection state information.
+        // Scope: Negotiated PAWS/missing TS gate precedes receive-window, RST-exempt, ACK and metadata processing. R1 drop schedules ACK; regular R2/R4/R5 follows for accepted TS.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+        //= reason=Negotiated PAWS/missing TS gate precedes receive-window, RST-exempt, ACK and metadata processing. R1 drop schedules ACK; regular R2/R4/R5 follows for accepted TS.
+        //# If the PAWS algorithm is used, the following processing MUST be
+        //# performed on all incoming segments for a synchronized connection.
+        // Scope: Negotiated PAWS/missing TS gate precedes receive-window, RST-exempt, ACK and metadata processing. R1 drop schedules ACK; regular R2/R4/R5 follows for accepted TS.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+        //= reason=Negotiated PAWS/missing TS gate precedes receive-window, RST-exempt, ACK and metadata processing. R1 drop schedules ACK; regular R2/R4/R5 follows for accepted TS.
+        //# Also, PAWS processing MUST take precedence over the regular TCP
+        //# acceptability check (Section 3.3 in [RFC0793]), which is performed
+        //# after verification of the received Timestamps option:
+        // Scope: Implementation tests TS only on raw arrival and ReceiveBuffer retains bytes/ranges, not timestamps. Existing hole-fill test has queued TSval=4 newer than filler=3 and does not distinguish rechecking old queued timestamps. Closure: queue accepted older TS before newer hole-fill, then assert queued bytes delivered/read without a second PAWS test; also assert raw retransmitted arrivals still checked. Partial evidence; closure remains TODO.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+        //= reason=Implementation tests TS only on raw arrival and ReceiveBuffer retains bytes/ranges, not timestamps. Existing hole-fill test has queued TSval=4 newer than filler=3 and does not distinguish rechecking old queued timestamps. Closure: queue accepted older TS before newer hole-fill, then assert queued bytes delivered/read without a second PAWS test; also assert raw retransmitted arrivals still checked. Partial evidence; closure remains TODO.
+        //# It is important to note that the timestamp MUST be checked only when
+        //# a segment first arrives at the receiver, regardless of whether it is
+        //# in sequence or it must be queued for later delivery.
+        // Scope: Stores ts_recent_at whenever TS.Recent changes, treating baseline invalid after 24 days; synthetic boundary+1 test accepts otherwise stale value.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.5
+        //= reason=Stores ts_recent_at whenever TS.Recent changes, treating baseline invalid after 24 days; synthetic boundary+1 test accepts otherwise stale value.
+        //# To detect how long the connection has been idle, the TCP MAY update a
+        //# clock or timestamp value associated with the connection whenever
+        //# TS.Recent is updated, for example.
+        // Scope: R1 stale negotiated non-RST schedules immediate ACK and returns without accepting data; missing TS is silent per section 3.2.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+        //= reason=R1 stale negotiated non-RST schedules immediate ACK and returns without accepting data; missing TS is silent per section 3.2.
+        //# Send an acknowledgment in reply as specified in Section 3.9
+        //# of [RFC0793], page 69, and drop the segment.
+        // Scope: Tracks last TS.Recent update time and bypasses stale comparison after 24 days, then replaces echo baseline on eligible arrival.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.5
+        //= reason=Tracks last TS.Recent update time and bypasses stale comparison after 24 days, then replaces echo baseline on eligible arrival.
+        //# We therefore require that an implementation of PAWS include a
+        //# mechanism to "invalidate" the TS.Recent value when a connection is
+        //# idle for more than 24 days.
+        // Scope: TS values use same modular serial comparisons as sequence values. Wrap accepted, older values rejected; ambiguous half-space accepted only after baseline expiry.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+        //= reason=TS values use same modular serial comparisons as sequence values. Wrap accepted, older values rejected; ambiguous half-space accepted only after baseline expiry.
+        //# s < t  if 0 < (t - s) < 2^31,
+        // Scope: Shared negotiated PAWS gate precedes window and ACK metadata acceptance, with explicit RST and expired-baseline exemptions.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+        //= reason=Shared negotiated PAWS gate precedes window and ACK metadata acceptance, with explicit RST and expired-baseline exemptions.
+        //# R1)  If there is a Timestamps option in the arriving segment,
+        //# SEG.TSval < TS.Recent, TS.Recent is valid (see later
+        //# discussion), and if the RST bit is not set, then treat the
+        //# arriving segment as not acceptable:
+        // Scope: PAWS-valid in-sequence text advances receive frontier; later gap fill advances through queued data. Negotiated TS assertion covers this path.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+        //= reason=PAWS-valid in-sequence text advances receive frontier; later gap fill advances through queued data. Negotiated TS assertion covers this path.
+        //# R4)  If an arriving segment is in sequence (i.e., at the left window
+        //# edge), then accept it normally.
+        // Scope: Valid timestamp OOO data queued and echoed correctly, but receive range metadata capped at64 rejects otherwise in-window 65th disjoint arrival. Core safe fallback does not establish unconditional queueing of arbitrary allowed fragmentation. Closure: represent accepted receive-window fragmentation with capacity-accounted bounded metadata, preserve retained-byte correctness, and test65-range/bridging/PAWS combinations; ordinary SACK report suppression is separately RFC2018 TODO. Partial evidence; closure remains TODO.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+        //= reason=Valid timestamp OOO data queued and echoed correctly, but receive range metadata capped at64 rejects otherwise in-window 65th disjoint arrival. Core safe fallback does not establish unconditional queueing of arbitrary allowed fragmentation. Closure: represent accepted receive-window fragmentation with capacity-accounted bounded metadata, preserve retained-byte correctness, and test65-range/bridging/PAWS combinations; ordinary SACK report suppression is separately RFC2018 TODO. Partial evidence; closure remains TODO.
+        //# R5)  Otherwise, treat the segment as a normal in-window,
+        //# out-of-sequence TCP segment (e.g., queue it for later delivery
+        //# to the user).
+        // Scope: 24-day expired baseline does not reject older/half-space value; eligible in-sequence arrival replaces TS.Recent and receive frontier advances.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.5
+        //= reason=24-day expired baseline does not reject older/half-space value; eligible in-sequence arrival replaces TS.Recent and receive frontier advances.
+        //# If
+        //# TS.Recent is found to be invalid, then the segment is accepted,
+        //# regardless of the failure of the timestamp check, and rule R3 updates
+        //# TS.Recent with the TSval from the new segment.
         let recent_valid = now.saturating_sub(self.ts_recent_at) <= 24 * 86_400_000_000;
         if self.timestamps && h.flags & RST == 0 {
             let Some((value, _)) = segment.options.timestamps else {
@@ -2068,6 +2303,72 @@ impl Connection {
         //# A TCP receiver MUST process the RST and URG fields of all incoming segments,
         //# even when the receive window is zero (MUST-66).
         let acceptable = if h.flags & RST != 0 {
+            //= https://www.rfc-editor.org/rfc/rfc5961#section-1.1
+            //= reason=All three defenses are selected for ordinary endpoint operation; RST/SYN/ACK assertion matrices establish the operative behavior, not cryptographic/on-path protection or administrator threat assessment.
+            //# The mitigations suggested in this document
+            //# SHOULD be implemented in devices that regularly need to maintain TCP
+            //# connections of the kind most vulnerable to the attacks described in
+            //# this document.
+            // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+            //= https://www.rfc-editor.org/rfc/rfc5961#section-1.1
+            //= reason=All three defenses are selected for ordinary endpoint operation; RST/SYN/ACK assertion matrices establish the operative behavior, not cryptographic/on-path protection or administrator threat assessment.
+            //# These mitigations
+            //# MAY be implemented in other cases.
+            // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+            //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+            //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects.
+            //# Instead, implementations SHOULD implement the following steps in
+            //# place of those specified in [RFC0793] (as listed above).
+            // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+            //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+            //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects.
+            //# 2) If the RST bit is set and the sequence number exactly matches the
+            //# next expected sequence number (RCV.NXT), then TCP MUST reset the
+            //# connection.
+            // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+            //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+            //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects.
+            //# 3) If the RST bit is set and the sequence number does not exactly
+            //# match the next expected sequence value, yet is within the current
+            //# receive window (RCV.NXT < SEG.SEQ < RCV.NXT+RCV.WND), TCP MUST
+            //# send an acknowledgment (challenge ACK):
+            // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+            //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+            //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects.
+            //# After sending the challenge ACK, TCP MUST drop the unacceptable
+            //# segment and stop processing the incoming packet further.
+            // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+            //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+            //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects.
+            //# In all other cases, where
+            //# the SEQ-field does not match and is outside the window, the receiver
+            //# MUST silently discard the segment.
+            // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+            //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+            //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects. Missing scope evidence: PAWS/missing-timestamp checks precede SYN challenge; timestamp-enabled SYN inputs can return before emitting the mandated challenge irrespective of sequence. Existing matrix does not exercise timestamp-enabled SYN. Audit precedence and add assertions; no waiver of the selected SYN mitigation.
+            //# Instead, the handling of the SYN in the synchronized state SHOULD be
+            //# performed as follows:
+            // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+            //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+            //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects. Missing scope evidence: PAWS/missing-timestamp checks precede SYN challenge; timestamp-enabled SYN inputs can return before emitting the mandated challenge irrespective of sequence. Existing matrix does not exercise timestamp-enabled SYN. Audit precedence and add assertions; no waiver of the selected SYN mitigation.
+            //# 1) If the SYN bit is set, irrespective of the sequence number, TCP
+            //# MUST send an ACK (also referred to as challenge ACK) to the remote
+            //# peer:
+            // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+            //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+            //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects. Missing scope evidence: PAWS/missing-timestamp checks precede SYN challenge; timestamp-enabled SYN inputs can return before emitting the mandated challenge irrespective of sequence. Existing matrix does not exercise timestamp-enabled SYN. Audit precedence and add assertions; no waiver of the selected SYN mitigation.
+            //# After sending the acknowledgment, TCP MUST drop the unacceptable
+            //# segment and stop processing further.
+            // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+            //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+            //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects.
+            //# Upon receipt of a valid RST, the local TCP
+            //# endpoint MUST terminate its connection.
+            // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+            //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+            //= reason=This is the operative replacement list, not the preceding historical RFC793 rule. State matrix asserts outside-window RST does not schedule ACK or mutate state; verified erratum 4845 corrects only the historical list inequality.
+            //# 1) If the RST bit is set and the sequence number is outside the current receive window, silently drop the segment.
+            // Actor/condition: TCP endpoint; replacement RST mitigation, outside window.
             // RST validation uses SEG.SEQ, never the end of accompanying text.
             seq == next || seq.in_window(next, window) == Some(true)
         } else if window == 0 {
@@ -2082,6 +2383,11 @@ impl Connection {
                 && (seq.in_window(next, window) == Some(true)
                     || seq.wrapping_add(len as u32 - 1).in_window(next, window) == Some(true))
         };
+        // Scope: Ordinary shared acceptability check follows PAWS; outside-window old-data D-SACK path reports evidence without admitting text or metadata.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+        //= reason=Ordinary shared acceptability check follows PAWS; outside-window old-data D-SACK path reports evidence without admitting text or metadata.
+        //# R2)  If the segment is outside the window, reject it (normal TCP
+        //# processing).
         if !acceptable {
             // Old text is not admitted, but a validated duplicate may be
             // reported without accepting its ACK/window/metadata (RFC 2883).
@@ -2149,6 +2455,45 @@ impl Connection {
             self.ts_latest = value;
         }
         if self.timestamps
+            // Scope: Cross-reference to section 4.3: earliest delayed echo, OOO retained echo and hole-fill replacement use TS.Recent/Last.ACK.sent algorithm.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+            //= reason=Cross-reference to section 4.3: earliest delayed echo, OOO retained echo and hole-fill replacement use TS.Recent/Last.ACK.sent algorithm.
+            //# The exact rules on which TSval MUST be echoed are given in
+            //# Section 4.3.
+            // Scope: TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+            //= reason=TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+            //# Thus,
+            //# when delayed ACKs are in use, the receiver SHOULD reply with the
+            //# TSval field from the earliest unacknowledged segment.
+            // Scope: TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+            //= reason=TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+            //# An <ACK> for an out-of-order segment
+            //# SHOULD, therefore, contain the timestamp from the most recent
+            //# segment that advanced RCV.NXT.
+            // Scope: TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+            //= reason=TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+            //# Thus, the timestamp from the
+            //# latest segment (which filled the hole) MUST be echoed.
+            // Scope: Valid TS.Recent uses modular serial nondecrease; expiry explicitly invalidates old baseline after 24 days; same SYN initializes it.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+            //= reason=Valid TS.Recent uses modular serial nondecrease; expiry explicitly invalidates old baseline after 24 days; same SYN initializes it.
+            //# The choice of incoming timestamps to be saved for this comparison
+            //# MUST guarantee a value that is monotonically non-decreasing.
+            // Scope: Synchronized valid baseline uses serial timestamp comparison and last ACK sequence gate; expired baseline handled by section5.5 exception to stale test.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+            //= reason=Synchronized valid baseline uses serial timestamp comparison and last ACK sequence gate; expired baseline handled by section5.5 exception to stale test.
+            //# SEG.TSval >= TS.Recent and SEG.SEQ <= Last.ACK.sent
+            //#
+            //# then SEG.TSval is copied to TS.Recent; otherwise, it is ignored.
+            // Scope: Accepted synchronized non-RST traffic uses serial nondecrease and last successful ACK gate; expired baseline is separate section5.5 path.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+            //= reason=Accepted synchronized non-RST traffic uses serial nondecrease and last successful ACK gate; expired baseline is separate section5.5 path.
+            //# R3)  If an arriving segment satisfies SEG.TSval >= TS.Recent and
+            //# SEG.SEQ <= Last.ACK.sent (see Section 4.3), then record its
+            //# timestamp in TS.Recent.
             && at_or_after(self.last_ack_sent, seq)
             && let Some((value, _)) = segment.options.timestamps
             && (!recent_valid || at_or_after(Seq(value), Seq(self.ts_recent)))
@@ -2187,6 +2532,37 @@ impl Connection {
         //# TCP stacks that implement RFC 5961 MUST add an input check that the ACK
         //# value is acceptable only if it is in the range of ((SND.UNA - MAX.SND.WND)
         //# =< SEG.ACK =< SND.NXT).
+        //= https://www.rfc-editor.org/rfc/rfc5961#section-1.1
+        //= reason=All three defenses are selected for ordinary endpoint operation; RST/SYN/ACK assertion matrices establish the operative behavior, not cryptographic/on-path protection or administrator threat assessment.
+        //# The mitigations suggested in this document
+        //# SHOULD be implemented in devices that regularly need to maintain TCP
+        //# connections of the kind most vulnerable to the attacks described in
+        //# this document.
+        // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+        //= https://www.rfc-editor.org/rfc/rfc5961#section-1.1
+        //= reason=All three defenses are selected for ordinary endpoint operation; RST/SYN/ACK assertion matrices establish the operative behavior, not cryptographic/on-path protection or administrator threat assessment.
+        //# These mitigations
+        //# MAY be implemented in other cases.
+        // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+        //= https://www.rfc-editor.org/rfc/rfc5961#section-5.2
+        //= reason=Selected DATA/FIN mitigation: inclusive serial ACK bounds, adjacent rejection, challenge fields and no receive/URG/FIN/window/send/timer effects are asserted. RST/SYN state validation remains prior to ordinary ACK/data handling.
+        //# All TCP stacks MAY implement the following mitigation.
+        // Actor/condition: TCP endpoint; ACK-bearing segments after state/control validation.
+        //= https://www.rfc-editor.org/rfc/rfc5961#section-5.2
+        //= reason=Selected DATA/FIN mitigation: inclusive serial ACK bounds, adjacent rejection, challenge fields and no receive/URG/FIN/window/send/timer effects are asserted. RST/SYN state validation remains prior to ordinary ACK/data handling.
+        //# TCP stacks
+        //# that implement this mitigation MUST add an additional input check to
+        //# any incoming segment.
+        // Actor/condition: TCP endpoint; ACK-bearing segments after state/control validation.
+        //= https://www.rfc-editor.org/rfc/rfc5961#section-5.2
+        //= reason=Selected DATA/FIN mitigation: inclusive serial ACK bounds, adjacent rejection, challenge fields and no receive/URG/FIN/window/send/timer effects are asserted. RST/SYN state validation remains prior to ordinary ACK/data handling.
+        //# All incoming segments whose ACK value doesn't satisfy the
+        //# above condition MUST be discarded and an ACK sent back.
+        // Actor/condition: TCP endpoint; ACK-bearing segments after state/control validation.
+        //= https://www.rfc-editor.org/rfc/rfc5961#section-5.2
+        //= reason=Inclusive lower/upper bounds, adjacent invalid values and modular wrap are explicitly asserted.
+        //# The ACK value is considered acceptable only if it is in the range of ((SND.UNA - MAX.SND.WND) <= SEG.ACK <= SND.NXT).
+        // Actor/condition: TCP endpoint; selected ACK bound mitigation.
         let oldest_ack = self
             .snd_una
             .wrapping_add(0u32.wrapping_sub(self.max_snd_wnd));
@@ -2219,6 +2595,46 @@ impl Connection {
         self.keepalive_probes = 0;
         self.keepalive_pending = false;
         self.keepalive_deadline = None;
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+        //= reason=Existing data/feedback and fallback promise assertions are partial evidence. CE-marked zero-window probe is currently excluded by window != 0; clause depends on all applicable ECN receive processing, so retain mandatory negotiated-connection processing open alongside section 6.1.6 TODO.
+        //# * If a host has sent at least one ECN-setup SYN or ECN-setup SYN-
+        //# ACK packet, and has received no non-ECN-setup SYN or non-ECN-
+        //# setup SYN-ACK packet, then if that host receives TCP data
+        //# packets with ECT and CE codepoints set in the IP header, then
+        //# that host MUST process these packets as specified for an ECN-
+        //# capable connection.
+        // Actor/condition: TCP receiver; sent setup and received no plain setup; ECN data received.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.5
+        //= reason=Sender retransmission Not-ECT asserted at endpoint; receiver invalid/out-of-window CE rejection asserted at sequence/ACK boundaries. TCP roles only, no network marking behavior.
+        //# This document specifies ECN-capable TCP implementations MUST NOT set
+        //# either ECT codepoint (ECT(0) or ECT(1)) in the IP header for
+        //# retransmitted data packets, and that the TCP data receiver SHOULD
+        //# ignore the ECN field on arriving data packets that are outside of the
+        //# receiver's current window.
+        // Actor/condition: TCP sender and receiver; retransmitted data output and out-of-window received data.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.5
+        //= reason=Sender retransmission Not-ECT asserted at endpoint; receiver invalid/out-of-window CE rejection asserted at sequence/ACK boundaries. TCP roles only, no network marking behavior.
+        //# To prevent such a denial-of-service attack, we
+        //# specify that a legitimate TCP data sender MUST NOT set an ECT
+        //# codepoint on retransmitted data packets, and that the TCP data
+        //# receiver SHOULD ignore the CE codepoint on out-of-window packets.
+        // Actor/condition: TCP sender and receiver; retransmitted data output and out-of-window received data.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+        //= reason=Explicit receive commitment assertion after delayed setup SYN-ACK and local plain-SYN fallback; sender no longer sets ECT, receiver still latches CE.
+        //# However, the commitment to respond appropriately to incoming packets with the CE codepoint set remains even if the TCP sender in a later transmission, within this TCP connection, sends a SYN packet without ECE and CWR set.
+        // Actor/condition: TCP endpoint; ECN setup followed by local plain-SYN fallback.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.3
+        //= reason=Immediate CE feedback and repeated ECE assertions exist, but no inspected assertion covers CE on either of a two-packet delayed-ACK aggregate. Add explicit aggregate assertion; keep this unextracted receiver instruction visible.
+        //# When TCP receives a CE data packet at the destination end-system, the TCP data receiver sets the ECN-Echo flag in the TCP header of the subsequent ACK packet. If there is any ACK withholding implemented, as in current "delayed-ACK" TCP implementations where the TCP receiver can send an ACK for two arriving data packets, then the ECN-Echo flag in the ACK packet will be set to '1' if the CE codepoint is set in any of the data packets being acknowledged. That is, if any of the received data packets are CE packets, then the returning ACK has the ECN-Echo flag set.
+        // Actor/condition: TCP endpoint; CE data including delayed-ACK aggregation.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.3
+        //= reason=Dropped feedback/repeated echo, unmarked CWR clearing, subsequent CE and CE-marked CWR assertions establish latch behavior. Erratum 3639 clarifies CWR-before-CE; reordered older CWR is guarded by CE epoch sequence.
+        //# After a TCP receiver sends an ACK packet with the ECN-Echo bit set, that TCP receiver continues to set the ECN-Echo flag in all the ACK packets it sends (whether they acknowledge CE data packets or non-CE data packets) until it receives a CWR packet (a packet with the CWR flag set). After the receipt of the CWR packet, acknowledgments for subsequent non-CE data packets do not have the ECN-Echo flag set.
+        // Actor/condition: TCP endpoint; echo persistence until CWR and later CE.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+        //= reason=Sender Not-ECT policy is asserted, but receiver cannot infer an overwritten original Not-ECT from CE alone. Clarify applicable receiver connection/probe handling and add a non-negotiated CE assertion; rejected errata 3636/3680 do not remove the original prose obligation.
+        //# If the TCP connection does not wish to use ECN notification for a particular packet, the sending TCP sets the ECN codepoint to not-ECT, and the TCP receiver ignores the CE codepoint in the received packet.
+        // Actor/condition: TCP endpoint; packet not sent as ECN-capable.
         // ECN never bypasses sequence, RST/SYN, or ACK-range validation.
         // Old ACKs cannot signal sender congestion, but their accepted duplex
         // data still carries receive-side CE/CWR (RFC 3168 section 6.1.3).
@@ -2360,6 +2776,16 @@ impl Connection {
         if recovery_exited || was_rto_recovery && self.sack_post_rto.is_none() {
             self.rack.recovery_exit(reo_grew);
         }
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+        //= reason=One-MSS ECE rate reduction: existing assertion proves no fresh output before RTO-length pause and output at expiry, not merely an MSS cwnd floor.
+        //# Therefore, the sending TCP MUST reset the
+        //# retransmit timer on receiving the ECN-Echo packet when the congestion
+        //# window is one.
+        // Actor/condition: TCP sender; accepted ECE at one-MSS cwnd.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+        //= reason=Existing assertion blocks fresh output until RTO-length pause deadline and permits fresh ECT/CWR output at expiry.
+        //# The sending TCP will then be able to send a new packet only when the retransmit timer expires.
+        // Actor/condition: TCP endpoint; ECE at one-MSS cwnd.
         if ecn_one {
             let deadline = now.saturating_add(self.rto());
             self.ecn_pause = Some(deadline);
@@ -2376,7 +2802,28 @@ impl Connection {
         if at_or_after(ack, self.snd_una)
             && (after(seq, self.wl1) || seq == self.wl1 && at_or_after(ack, self.wl2))
         {
+            // Scope: Implementation learns WS only in learn_syn and does not renegotiate from established options. No focused existing test injects WS on accepted non-SYN segment. Closure: inject changed exponent on data/ACK and assert both shift state and effective subsequent windows unchanged. Partial evidence; closure remains TODO.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+            //= reason=Implementation learns WS only in learn_syn and does not renegotiate from established options. No focused existing test injects WS on accepted non-SYN segment. Closure: inject changed exponent on data/ACK and assert both shift state and effective subsequent windows unchanged. Partial evidence; closure remains TODO.
+            //# A Window Scale option in a segment
+            //# without a SYN bit MUST be ignored.
+            // Scope: Incoming non-SYN SEG.WND is expanded with fixed negotiated peer_scale; raw SYN values stay unscaled.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+            //= reason=Incoming non-SYN SEG.WND is expanded with fixed negotiated peer_scale; raw SYN values stay unscaled.
+            //# o  The window field (SEG.WND) in the header of every incoming
+            //# segment, with the exception of <SYN> segments, MUST be left-
+            //# shifted by Snd.Wind.Shift bits before updating SND.WND:
+            // Scope: snd_wnd and receive acceptance credit are 32-bit; internal/congestion bytes are not scaled header values.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+            //= reason=snd_wnd and receive acceptance credit are 32-bit; internal/congestion bytes are not scaled header values.
+            //# The scale factor applies only to the window field as transmitted in
+            //# the TCP header; each TCP using extended windows will maintain the
+            //# window values locally as 32-bit numbers.
             self.snd_wnd = (h.window as u32) << if self.scaling { self.peer_scale } else { 0 };
+            //= https://www.rfc-editor.org/rfc/rfc5961#section-5.2
+            //= reason=Implementation initializes max_snd_wnd from SYN then monotonically maxes accepted scaled updates. Existing ACK bounds test uses unscaled fixed window; no inspected assertion tracks historical maximum across growth/shrink and scaled windows. Add explicit MAX.SND.WND history/scale assertions.
+            //# A new state variable MAX.SND.WND is defined as the largest window that the local sender has ever received from its peer. This window may be scaled to a value larger than 65,535 bytes ([RFC1323]).
+            // Actor/condition: TCP endpoint; largest historically received scaled sender window.
             self.max_snd_wnd = self.max_snd_wnd.max(self.snd_wnd);
             self.wl1 = seq;
             self.wl2 = ack;
@@ -2498,6 +2945,85 @@ impl Connection {
     //= reason=Validated advancing ACK sample from ordinary estimator also updates Rack::sample.
     //# Use the RTT measurements obtained via [RFC6298] or [RFC7323] to
     //# update the estimated minimum RTT in RACK.min_RTT.
+    // Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-1
+    //= reason=Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //# However, a TCP MUST NOT be more aggressive than the following algorithms allow.
+    // Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= reason=Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //# TCP MUST use Karn's algorithm [KP87] for taking RTT samples.
+    // Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= reason=Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //# That is, RTT samples MUST NOT be made using segments that were retransmitted (and thus
+    //# for which it is ambiguous whether the reply was for the first instance of the packet
+    //# or a later instance).
+    // Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= reason=Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //# A TCP implementation MUST take at least one RTT measurement per RTT (unless that is
+    //# not possible per Karn's algorithm).
+    // Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //# An implementation MUST manage the retransmission timer(s) in such a way that a segment
+    //# is never retransmitted too early, i.e., less than one RTO after the previous
+    //# transmission of that segment.
+    // Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //# The following is the RECOMMENDED algorithm for managing the retransmission timer:
+    // Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //# (5.7) If the timer expires awaiting the ACK of a SYN segment and the TCP
+    //# implementation is using an RTO less than 3 seconds, the RTO MUST be re-initialized to
+    //# 3 seconds when data transmission begins (i.e., after the three-way handshake
+    //# completes).
+    // Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= reason=Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //# However, when using the timestamp option, each ACK can be used as an RTT sample. RFC
+    //# 1323 [JBB92] suggests that TCP connections utilizing large congestion windows should
+    //# take many RTT samples per window of data to avoid aliasing effects in the estimated
+    //# RTT.
+    // Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //# (5.2) When all outstanding data has been acknowledged, turn off the retransmission
+    //# timer.
+    // Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //# (5.3) When an ACK is received that acknowledges new data, restart the retransmission
+    //# timer so that it will expire after RTO seconds (for the current value of RTO).
+    // Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //# Note that after retransmitting, once a new RTT measurement is obtained (which can only
+    //# happen when new data has been sent and acknowledged), the computations outlined in
+    //# Section 2 are performed, including the computation of RTO, which may result in
+    //# "collapsing" RTO back down after it has been subject to exponential back off (rule
+    //# 5.5).
+    // Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //# In this case, retransmit the first unacknowledged segment.
+    // Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //# For the first partial ACK that arrives during fast recovery, also reset the retransmit
+    //# timer.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=Both initial-window policies, active and passive handshakes: accept_ack suppresses congestion growth for SYN ACK; test compares unchanged active/passive cwnd after handshake. No claim about IW formula correctness.
+    //# As specified in [RFC3390], the SYN/ACK and the acknowledgment of the SYN/ACK MUST NOT
+    //# increase the size of the congestion window.
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= reason=IW10 first data-flight bound and handshake no-growth: negotiation test checks cwnd after active/passive handshake; idle/data-RTO trace emits exactly ten MSS before blocking. No claim of SYN-loss relaxation or monitoring/fallback support.
+    //# This change applies to the initial window of the connection in the first round-trip time
+    //# (RTT) of data transmission during or following the TCP three-way handshake. Neither the
+    //# SYN/ACK nor its ACK in the three-way handshake should increase the initial window size.
     fn accept_ack(&mut self, ack: Seq, ece: bool, echo: Option<u32>) {
         if !self.sack_receive {
             self.rack.acknowledge(
@@ -2567,6 +3093,18 @@ impl Connection {
         {
             // One bounded sample per flight. Never infer a transmission time
             // from an unvalidated echo, and retain Karn's exclusion on retransmit.
+            // Scope: Ordinary bounded TSecr-qualified RTT sample is called only on advancing ACK; existing test covers valid/forged advancing echoes, not a matching echo on non-advancing ACK with pending sample. Closure: test matching TSecr on duplicate and SACK-only ACK without consuming/updating the ordinary sample. Scope distinction: RACK ack_sample derives now-minus-local-send-time for original transmissions, not received TSecr, so its non-advancing SACK RTT updates are a different measurement mechanism, not evidence of violating this TSecr-only rule; test that separation under negotiated TS. Partial evidence; closure remains TODO.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
+            //= reason=Ordinary bounded TSecr-qualified RTT sample is called only on advancing ACK; existing test covers valid/forged advancing echoes, not a matching echo on non-advancing ACK with pending sample. Closure: test matching TSecr on duplicate and SACK-only ACK without consuming/updating the ordinary sample. Scope distinction: RACK ack_sample derives now-minus-local-send-time for original transmissions, not received TSecr, so its non-advancing SACK RTT updates are a different measurement mechanism, not evidence of violating this TSecr-only rule; test that separation under negotiated TS. Partial evidence; closure remains TODO.
+            //# RTTM Rule: A TSecr value received in a segment MAY be used to update
+            //# the averaged RTT measurement only if the segment advances
+            //# the left edge of the send window, i.e., SND.UNA is
+            //# increased.
+            // Scope: Ordinary RTTM retains only one outstanding original-transmission sample and rejects same-millisecond reuse; this conservatively declines per-packet and retransmission TS sampling rather than requiring unbounded metadata. Existing valid/forged echo test does not establish sustained-flight estimator history. Closure: test ordinary RTTM sampling cadence and effective RFC6298 history with many ACKs per RTT, plus mixed RACK local-send-time samples; adjust cadence/weights only if measured history truncates. RACK local-clock ACK samples are not TSecr RTTM. Appendix G is a suggestion, not a mandatory exact formula. Partial evidence; closure remains TODO.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-4.2
+            //= reason=Ordinary RTTM retains only one outstanding original-transmission sample and rejects same-millisecond reuse; this conservatively declines per-packet and retransmission TS sampling rather than requiring unbounded metadata. Existing valid/forged echo test does not establish sustained-flight estimator history. Closure: test ordinary RTTM sampling cadence and effective RFC6298 history with many ACKs per RTT, plus mixed RACK local-send-time samples; adjust cadence/weights only if measured history truncates. RACK local-clock ACK samples are not TSecr RTTM. Appendix G is a suggestion, not a mandatory exact formula. Partial evidence; closure remains TODO.
+            //# to update the RTT estimator, an implementation SHOULD try to adhere
+            //# to the spirit of the history specified in [RFC6298].
             if !self.timestamps || echo == Some((sent / 1_000) as u32) {
                 let sample = self.now.saturating_sub(sent);
                 self.rtt.sample(sample);
@@ -2653,6 +3191,43 @@ impl Connection {
     //# The receiver SHOULD send an ACK for every valid segment that arrives
     //# containing new data, and each of these "duplicate" ACKs SHOULD bear a SACK
     //# option.
+    // Partial evidence only; TODO remains. Receiver ACK scheduling independent of sender algorithm/SACK; non-left-edge, out_of_order and advanced>count (hole fill releases queued bytes) force immediate_ack, clearing delayed timer.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-5
+    //= reason=Partial evidence only; TODO remains. Receiver ACK scheduling independent of sender algorithm/SACK; non-left-edge, out_of_order and advanced>count (hole fill releases queued bytes) force immediate_ack, clearing delayed timer.
+    //# [RFC5681] specifies that "Out-of-order data segments SHOULD be acknowledged
+    //# immediately, in order to accelerate loss recovery".
+    // Partial evidence only; TODO remains. Receiver ACK scheduling independent of sender algorithm/SACK; non-left-edge, out_of_order and advanced>count (hole fill releases queued bytes) force immediate_ack, clearing delayed timer.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-5
+    //= reason=Partial evidence only; TODO remains. Receiver ACK scheduling independent of sender algorithm/SACK; non-left-edge, out_of_order and advanced>count (hole fill releases queued bytes) force immediate_ack, clearing delayed timer.
+    //# Echoing [RFC5681], our recommendation is that the data receiver send an immediate
+    //# acknowledgment for an out-of-order segment, even when that out-of-order segment fills
+    //# a hole in the buffer.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= reason=Receiver ACK scheduling applies regardless of sender recovery choice; SACK receive trace polls immediate ACK after reordered data and full gap fill and checks cumulative sequence. Partial-gap case needs its own TODO, not inferred from full gap fill.
+    //# A TCP receiver SHOULD send an immediate duplicate ACK when an out- of-order segment
+    //# arrives.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.2
+    //= reason=Receiver role, all recovery profiles. Default 200ms timer; configuration rejects >=500ms. Existing tests assert no early output, timeout at first packet+200ms, and immediate second full-RMSS ACK; caller must service scheduled timeout/poll. Not a guarantee when host ignores deadlines.
+    //# The delayed ACK algorithm specified in [RFC1122] SHOULD be used by a TCP receiver.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.2
+    //= reason=Receiver role, all recovery profiles. Default 200ms timer; configuration rejects >=500ms. Existing tests assert no early output, timeout at first packet+200ms, and immediate second full-RMSS ACK; caller must service scheduled timeout/poll. Not a guarantee when host ignores deadlines.
+    //# When using delayed ACKs, a TCP receiver MUST NOT excessively delay acknowledgments.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.2
+    //= reason=Receiver role, all recovery profiles. Default 200ms timer; configuration rejects >=500ms. Existing tests assert no early output, timeout at first packet+200ms, and immediate second full-RMSS ACK; caller must service scheduled timeout/poll. Not a guarantee when host ignores deadlines.
+    //# Specifically, an ACK SHOULD be generated for at least every second full-sized segment,
+    //# and MUST be generated within 500 ms of the arrival of the first unacknowledged packet.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.2
+    //= reason=Receiver role, all recovery profiles. Default 200ms timer; configuration rejects >=500ms. Existing tests assert no early output, timeout at first packet+200ms, and immediate second full-RMSS ACK; caller must service scheduled timeout/poll. Not a guarantee when host ignores deadlines.
+    //# Finally, we repeat that an ACK MUST NOT be delayed for more than 500 ms waiting on a
+    //# second full-sized segment to arrive.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.2
+    //= reason=Receiver scheduling after reorder/full gap fill is directly observed in SACK wire trace, with expected cumulative ACK sequence. Applies regardless of local sender recovery profile; partial-only gap fill test remains TODO.
+    //# Out-of-order data segments SHOULD be acknowledged immediately, in order to accelerate
+    //# loss recovery.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.2
+    //= reason=Receiver scheduling after reorder/full gap fill is directly observed in SACK wire trace, with expected cumulative ACK sequence. Applies regardless of local sender recovery profile; partial-only gap fill test remains TODO.
+    //# To trigger the fast retransmit algorithm, the receiver SHOULD send an immediate
+    //# duplicate ACK when it receives a data segment above a gap in the sequence space.
     fn receive_text(&mut self, seq: Seq, payload: &[u8], flags: u8, urgent: u16) {
         if !matches!(
             self.state,
@@ -2806,6 +3381,27 @@ impl Connection {
     //= reason=Receive credit stays occupied until application reads, without a receiver-side reopening timer.
     //# A TCP implementation MAY keep its offered receive window closed indefinitely
     //# (MAY-8).
+    // Scope: SYN windows are learned raw and advertised_window returns raw syn_window; ordinary ACK scaling is separate.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+    //= reason=SYN windows are learned raw and advertised_window returns raw syn_window; ordinary ACK scaling is separate.
+    //# The window field in a segment where the SYN bit is set (i.e., a <SYN>
+    //# or <SYN,ACK>) MUST NOT be scaled.
+    // Scope: Ordinary outgoing receive window divides by scale unit (floor), SYN is raw; backing and encoded edge tested through sub-scale advances.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+    //= reason=Ordinary outgoing receive window divides by scale unit (floor), SYN is raw; backing and encoded edge tested through sub-scale advances.
+    //# o  The window field (SEG.WND) of every outgoing segment, with the
+    //# exception of <SYN> segments, MUST be right-shifted by
+    //# Rcv.Wind.Shift bits:
+    // Scope: Partial shrink robustness: bytes retained and initial new data constrained; general nonzero shrink regression passes. RFC 7323 first retransmission/sub-scale out-of-window rule is not implemented by default (see added item 4). Closure: implement/test scaled quantization-aware first and later retransmission policy as well as late data within previous receive promise. Partial evidence; closure remains TODO.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
+    //= reason=Partial shrink robustness: bytes retained and initial new data constrained; general nonzero shrink regression passes. RFC 7323 first retransmission/sub-scale out-of-window rule is not implemented by default (see added item 4). Closure: implement/test scaled quantization-aware first and later retransmission policy as well as late data within previous receive promise. Partial evidence; closure remains TODO.
+    //# Implementations MUST ensure that they handle a shrinking
+    //# window, as specified in Section 4.2.2.16 of [RFC1122].
+    // Scope: Receive window bounded by explicit configured receive allocation, never rounds beyond backing; no speculative unlimited window growth.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-7
+    //= reason=Receive window bounded by explicit configured receive allocation, never rounds beyond backing; no speculative unlimited window growth.
+    //# Hence, implementers should take care to not open the TCP window
+    //# drastically beyond the requirements of the connection.
     fn advertised_window(&self, syn: bool) -> u16 {
         if syn {
             return self.syn_window;
@@ -3088,6 +3684,84 @@ impl Connection {
     //# On any data transmission or retransmission:
     //#
     //#    prr_out += (data sent) // strictly less than or equal to sndcnt
+    // Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-1
+    //= reason=Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //# However, a TCP MUST NOT be more aggressive than the following algorithms allow.
+    // Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= reason=Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //# TCP MUST use Karn's algorithm [KP87] for taking RTT samples.
+    // Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= reason=Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //# That is, RTT samples MUST NOT be made using segments that were retransmitted (and thus
+    //# for which it is ambiguous whether the reply was for the first instance of the packet
+    //# or a later instance).
+    // Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= reason=Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //# A TCP implementation MUST take at least one RTT measurement per RTT (unless that is
+    //# not possible per Karn's algorithm).
+    // Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //# An implementation MUST manage the retransmission timer(s) in such a way that a segment
+    //# is never retransmitted too early, i.e., less than one RTO after the previous
+    //# transmission of that segment.
+    // Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //# The following is the RECOMMENDED algorithm for managing the retransmission timer:
+    // Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= reason=Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //# However, when using the timestamp option, each ACK can be used as an RTT sample. RFC
+    //# 1323 [JBB92] suggests that TCP connections utilizing large congestion windows should
+    //# take many RTT samples per window of data to avoid aliasing effects in the estimated
+    //# RTT.
+    // Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //# (5.1) Every time a packet containing data is sent (including a retransmission), if the
+    //# timer is not running, start it running so that it will expire after RTO seconds (for
+    //# the current value of RTO).
+    // Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //# (5.4) Retransmit the earliest segment that has not been acknowledged by the TCP
+    //# receiver.
+    // Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //# (5.6) Start the retransmission timer, such that it expires after RTO seconds (for the
+    //# value of RTO after the doubling operation outlined in 5.5).
+    // Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //# The procedures specified in Section 3.2 of [RFC5681] are followed, with the
+    //# modifications listed below.
+    // Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //# In this case, retransmit the first unacknowledged segment.
+    // Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //# Send a new segment if permitted by the new value of cwnd.
+    // Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= reason=Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //# In Section 3.2, step 3 above, it is noted that implementations should take measures to
+    //# avoid a possible burst of data when leaving fast recovery, in case the amount of new
+    //# data that the sender is eligible to send due to the new value of the congestion window
+    //# is large.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= reason=Non-SACK Limited Transmit: each of first two duplicate ACKs yields one unsent SMSS; output then stops, total extra flight is two MSS, and third ACK threshold excludes those bytes. SACK fresh-evidence gating is tested separately; not a PRR output claim.
+    //# On the first and second duplicate ACKs received at a sender, a TCP SHOULD send a segment
+    //# of previously unsent data per [RFC3042] provided that the receiver's advertised window
+    //# allows, the total FlightSize would remain less than or equal to cwnd plus 2*SMSS, and
+    //# that new data is available for transmission.
     pub(crate) fn transmit(
         &mut self,
         now: Instant,
@@ -3129,6 +3803,85 @@ impl Connection {
         //# It MUST NOT be sent on non-SYN segments.
         let sack_offer =
             syn && self.config.sack && (self.state == State::SynSent || self.sack_send);
+        // Scope: Timestamp negotiation is config/peer-SYN gated; SYN TSecr=0, ACK replies echo ts_recent, bool timestamps retains negotiated state.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+        //= reason=Timestamp negotiation is config/peer-SYN gated; SYN TSecr=0, ACK replies echo ts_recent, bool timestamps retains negotiated state.
+        //# If
+        //# the ACK bit is not set in the outgoing TCP header, the sender of that
+        //# segment SHOULD set the TSecr field to zero.
+        // Scope: Timestamp negotiation is config/peer-SYN gated; SYN TSecr=0, ACK replies echo ts_recent, bool timestamps retains negotiated state.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+        //= reason=Timestamp negotiation is config/peer-SYN gated; SYN TSecr=0, ACK replies echo ts_recent, bool timestamps retains negotiated state.
+        //# When the ACK bit is set
+        //# in an outgoing segment, the sender MUST echo a recently received
+        //# TSval sent by the remote TCP in the TSval field of a Timestamps
+        //# option.
+        // Scope: Timestamp negotiation is config/peer-SYN gated; SYN TSecr=0, ACK replies echo ts_recent, bool timestamps retains negotiated state.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+        //= reason=Timestamp negotiation is config/peer-SYN gated; SYN TSecr=0, ACK replies echo ts_recent, bool timestamps retains negotiated state.
+        //# A TCP MAY send the TSopt in an initial <SYN> segment (i.e., segment
+        //# containing a SYN bit and no ACK bit), and MAY send a TSopt in
+        //# <SYN,ACK> only if it received a TSopt in the initial <SYN> segment
+        //# for the connection.
+        // Scope: Negotiated non-RST output always allocates TS; timestamp-enabled path budget minimum 40 preserves SYN options, ordinary data/ACK/FIN/probe/keepalive and user-abort RST retain TS. Reactive reset limits audited separately in section 5.2.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+        //= reason=Negotiated non-RST output always allocates TS; timestamp-enabled path budget minimum 40 preserves SYN options, ordinary data/ACK/FIN/probe/keepalive and user-abort RST retain TS. Reactive reset limits audited separately in section 5.2.
+        //# Once TSopt has been successfully negotiated, that is both <SYN> and
+        //# <SYN,ACK> contain TSopt, the TSopt MUST be sent in every non-<RST>
+        //# segment for the duration of the connection, and SHOULD be sent in an
+        //# <RST> segment (see Section 5.2 for details).
+        // Scope: Local user abort on negotiated connection emits TS; not a reactive RST requiring TSval=0.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+        //= reason=Local user abort on negotiated connection emits TS; not a reactive RST requiring TSval=0.
+        //# If an <RST> is being generated
+        //# because of a user abort, and Snd.TS.OK is set, then a Timestamps
+        //# option SHOULD be included in the <RST>.
+        // Scope: Embedding/rate gap: fixed 1ms clock plus monotonic caller time does not prove tick per 2^31 bytes or per receive window; API permits repeated sends at identical Instant without byte-per-tick gate. Closure: specify/enforce supported link/clock rate and test bytes-per-tick boundary (including small windows); do not claim an 8Tbps example as an enforced deployment bound. Partial evidence; closure remains TODO.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
+        //= reason=Embedding/rate gap: fixed 1ms clock plus monotonic caller time does not prove tick per 2^31 bytes or per receive window; API permits repeated sends at identical Instant without byte-per-tick gate. Closure: specify/enforce supported link/clock rate and test bytes-per-tick boundary (including small windows); do not claim an 8Tbps example as an enforced deployment bound. Partial evidence; closure remains TODO.
+        //# It MUST tick at least once for each 2^31 bytes sent.
+        // Scope: Embedding/rate gap: fixed 1ms clock plus monotonic caller time does not prove tick per 2^31 bytes or per receive window; API permits repeated sends at identical Instant without byte-per-tick gate. Closure: specify/enforce supported link/clock rate and test bytes-per-tick boundary (including small windows); do not claim an 8Tbps example as an enforced deployment bound. Partial evidence; closure remains TODO.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
+        //= reason=Embedding/rate gap: fixed 1ms clock plus monotonic caller time does not prove tick per 2^31 bytes or per receive window; API permits repeated sends at identical Instant without byte-per-tick gate. Closure: specify/enforce supported link/clock rate and test bytes-per-tick boundary (including small windows); do not claim an 8Tbps example as an enforced deployment bound. Partial evidence; closure remains TODO.
+        //# In fact,
+        //# in order to be useful to the sender for round-trip timing, the
+        //# clock SHOULD tick at least once per window's worth of data, and
+        //# even with the window extension defined in Section 2.2, 2^31
+        //# bytes must be at least two windows.
+        // Scope: Arithmetic period is 2^32 milliseconds (>255 seconds), but caller time can jump/scale arbitrarily and no supported MSL/clock-rate contract proves physical recycle period. Closure: bind monotonic microsecond input to real-time rate and maximum MSL, validate/document embedding contract in code and add period/rate assertion; wrap test establishes arithmetic only. Partial evidence; closure remains TODO.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
+        //= reason=Arithmetic period is 2^32 milliseconds (>255 seconds), but caller time can jump/scale arbitrarily and no supported MSL/clock-rate contract proves physical recycle period. Closure: bind monotonic microsecond input to real-time rate and maximum MSL, validate/document embedding contract in code and add period/rate assertion; wrap test establishes arithmetic only. Partial evidence; closure remains TODO.
+        //# The recycling time of the timestamp clock MUST be greater than
+        //# MSL seconds.
+        // Scope: Privacy recommendation unimplemented: TSval is raw caller time/1000 with no per-connection random offset. Closure: generate secret-derived/random per-connection offset with consistent serial/RTTM echo validation, avoid breaking TIME-WAIT freshness, and test unrelated connections differ while wrap/reuse and RTT remain correct. Optional feature disabled by default does not waive this recommendation when enabled. Partial evidence; closure remains TODO.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-7.1
+        //= reason=Privacy recommendation unimplemented: TSval is raw caller time/1000 with no per-connection random offset. Closure: generate secret-derived/random per-connection offset with consistent serial/RTTM echo validation, avoid breaking TIME-WAIT freshness, and test unrelated connections differ while wrap/reuse and RTT remain correct. Optional feature disabled by default does not waive this recommendation when enabled. Partial evidence; closure remains TODO.
+        //# It is therefore RECOMMENDED to generate a random, per-
+        //# connection offset to be used with the clock source when generating
+        //# the Timestamps option value (see Section 5.4).
+        // Scope: Privacy recommendation unimplemented: TSval is raw caller time/1000 with no per-connection random offset. Closure: generate secret-derived/random per-connection offset with consistent serial/RTTM echo validation, avoid breaking TIME-WAIT freshness, and test unrelated connections differ while wrap/reuse and RTT remain correct. Optional feature disabled by default does not waive this recommendation when enabled. Partial evidence; closure remains TODO.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-7
+        //= reason=Privacy recommendation unimplemented: TSval is raw caller time/1000 with no per-connection random offset. Closure: generate secret-derived/random per-connection offset with consistent serial/RTTM echo validation, avoid breaking TIME-WAIT freshness, and test unrelated connections differ while wrap/reuse and RTT remain correct. Optional feature disabled by default does not waive this recommendation when enabled. Partial evidence; closure remains TODO.
+        //# It is therefore
+        //# RECOMMENDED to generate a random, per-connection offset to be used
+        //# with the clock source when generating the Timestamps option value
+        //# (see Section 5.4).
+        // Scope: Wire TS fields u32 network-order; TSval uses caller millisecond clock modulo 32 bits. Physical rate guarantees separately TODO.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+        //= reason=Wire TS fields u32 network-order; TSval uses caller millisecond clock modulo 32 bits. Physical rate guarantees separately TODO.
+        //# The Timestamps option carries two four-byte timestamp fields.  The
+        //# TSval field contains the current value of the timestamp clock of the
+        //# TCP sending the option.
+        // Scope: Negotiated ordinary ACK output echoes single retained TS.Recent; reactive RST overrides follow section 5.2.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+        //= reason=Negotiated ordinary ACK output echoes single retained TS.Recent; reactive RST overrides follow section 5.2.
+        //# (3)  When a TSopt is sent, its TSecr field is set to the current
+        //# TS.Recent value.
+        // Scope: TSval increments at1ms in caller microsecond units, but physical rate depends on embedding. Same real-clock gap as section4.1/5.4 MUSTs: closure requires validated monotonic real-time microsecond contract and rate/integration assertions, not synthetic Instant arithmetic alone. Partial evidence; closure remains TODO.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
+        //= reason=TSval increments at1ms in caller microsecond units, but physical rate depends on embedding. Same real-clock gap as section4.1/5.4 MUSTs: closure requires validated monotonic real-time microsecond contract and rate/integration assertions, not synthetic Instant arithmetic alone. Partial evidence; closure remains TODO.
+        //# Based upon these considerations, we choose a timestamp clock
+        //# frequency in the range 1 ms to 1 sec per tick.
         let timestamp = if reset.is_some() && self.reset_echo.is_some() {
             self.reset_echo.map(|echo| (0, echo))
         } else if self.timestamps || syn && self.state == State::SynSent && self.config.timestamps {
@@ -3160,6 +3913,58 @@ impl Connection {
             options[option_len..option_len + 4].copy_from_slice(&[1, 1, 4, 2]);
             option_len += 4;
         }
+        // Scope: Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+        //= reason=Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
+        //# The three-byte Window Scale option MAY be sent in a <SYN> segment by
+        //# a TCP.
+        // Scope: Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+        //= reason=Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
+        //# Thus, a TCP that is prepared to scale windows SHOULD send the option,
+        //# even if its own scale factor is 1 and the exponent 0.
+        // Scope: Optional zero exponent is emitted for capacity<=65535; no direct assertion of WS=Some(0) on SYN/SYN-ACK. Closure: assert zero offer and unscaled negotiated windows, rather than treating zero as no negotiation. Partial evidence; closure remains TODO.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+        //= reason=Optional zero exponent is emitted for capacity<=65535; no direct assertion of WS=Some(0) on SYN/SYN-ACK. Closure: assert zero offer and unscaled negotiated windows, rather than treating zero as no negotiation. Partial evidence; closure remains TODO.
+        //# MAY be zero (offering to scale, while applying a scale factor of 1 to
+        //# the receive window).
+        // Scope: Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+        //= reason=Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
+        //# This option MAY be sent in an initial <SYN> segment (i.e., a segment
+        //# with the SYN bit on and the ACK bit off).
+        // Scope: Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+        //= reason=Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
+        //# If a Window Scale option
+        //# was received in the initial <SYN> segment, then this option MAY be
+        //# sent in the <SYN,ACK> segment.
+        // Scope: SYN-only WS output sends capacity-derived local_scale, including passive echo after peer offer; selected R=2 is asserted on wire.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+        //= reason=SYN-only WS output sends capacity-derived local_scale, including passive echo after peer offer; selected R=2 is asserted on wire.
+        //# o  If a TCP receives a <SYN> segment containing a Window Scale
+        //# option, it SHOULD send its own Window Scale option in the
+        //# <SYN,ACK> segment.
+        // Scope: SYN-only WS output sends capacity-derived local_scale, including passive echo after peer offer; selected R=2 is asserted on wire.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+        //= reason=SYN-only WS output sends capacity-derived local_scale, including passive echo after peer offer; selected R=2 is asserted on wire.
+        //# o  The Window Scale option MUST be sent with shift.cnt = R, where R
+        //# is the value that the TCP would like to use for its receive
+        //# window.
+        // Scope: SYN-only output is implemented/tested; ignored non-SYN WS and fixed exponent under malicious changed option lack direct regression. Closure: inject changed WS on established ACK/data and assert effective windows and stored shifts unchanged. Partial evidence; closure remains TODO.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.1
+        //= reason=SYN-only output is implemented/tested; ignored non-SYN WS and fixed exponent under malicious changed option lack direct regression. Closure: inject changed WS on established ACK/data and assert effective windows and stored shifts unchanged. Partial evidence; closure remains TODO.
+        //# This option is sent only in a <SYN> segment (a
+        //# segment with the SYN bit on), hence the window scale is fixed in each
+        //# direction when a connection is opened.
+        // Scope: WS wire kind fixed at 3 in SYN layout; independent option parser/clamp assertions use literal kind 3.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+        //= reason=WS wire kind fixed at 3 in SYN layout; independent option parser/clamp assertions use literal kind 3.
+        //# Kind: 3
+        // Scope: WS emits [NOP,3,3,local_scale], parser only accepts option length 3.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+        //= reason=WS emits [NOP,3,3,local_scale], parser only accepts option length 3.
+        //# Length: 3 bytes
         if syn && (self.state == State::SynSent || self.scaling) {
             options[option_len..option_len + 4].copy_from_slice(&[1, 3, 3, self.local_scale]);
             option_len += 4;
@@ -3331,6 +4136,11 @@ impl Connection {
         } else if tlp {
             let offset = self.snd_nxt.distance_from(self.send_base) as usize;
             let unsent = self.send.len().saturating_sub(offset);
+            // Scope: Fresh-data branch saturates latest-window credit after flight subtraction; no new data after shrinking below flight; retransmit policy never sends unsent tail.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
+            //= reason=Fresh-data branch saturates latest-window credit after flight subtraction; no new data after shrinking below flight; retransmit policy never sends unsent tail.
+            //# 3)  The initial transmission MUST be within the window announced by
+            //# the most recent <ACK>.
             let credit = self.snd_wnd.saturating_sub(self.flight()) as usize;
             if unsent != 0 && credit >= unsent.min(packet_mss) {
                 count = self
@@ -3361,6 +4171,18 @@ impl Connection {
                 //# retransmit old data beyond SND.UNA+SND.WND (MAY-7), but SHOULD NOT
                 //# time out the connection if data beyond the right window edge is not
                 //# acknowledged (SHLD-17).
+                // Scope: This MAY permits in-window-only subsequent retries; default selects it. Explicit retransmit_beyond_window opt-in is a separate policy, not claimed as selecting this MAY.
+                //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
+                //= reason=This MAY permits in-window-only subsequent retries; default selects it. Explicit retransmit_beyond_window opt-in is a separate policy, not claimed as selecting this MAY.
+                //# 5)  Subsequent retransmissions MAY only be sent if they are within
+                //# the window announced by the most recent <ACK>.
+                // Scope: Default retransmit clips to latest snd_wnd, even first retry after scaled rounding retraction; opt-in retransmit_beyond_window ignores window for all retries, not the exact first/sub-scale rule. No per-original first-retry or quantization distinction. Closure: preserve bounded first-transmission/first-retry knowledge and scale-unit tolerance, test original-valid first retry beyond edge and subsequent retries near/far edge across wrap and SACK/RACK paths. Partial evidence; closure remains TODO.
+                //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
+                //= reason=Default retransmit clips to latest snd_wnd, even first retry after scaled rounding retraction; opt-in retransmit_beyond_window ignores window for all retries, not the exact first/sub-scale rule. No per-original first-retry or quantization distinction. Closure: preserve bounded first-transmission/first-retry knowledge and scale-unit tolerance, test original-valid first retry beyond edge and subsequent retries near/far edge across wrap and SACK/RACK paths. Partial evidence; closure remains TODO.
+                //# 4)  On first retransmission, or if the sequence number is out of
+                //# window by less than 2^Rcv.Wind.Shift, then do normal
+                //# retransmission(s) without regard to the receiver window as long
+                //# as the original segment was in window when it was sent.
                 let window = if self.config.retransmit_beyond_window && self.snd_wnd != 0 {
                     self.flight()
                 } else {
@@ -3570,6 +4392,11 @@ impl Connection {
                 //= reason=Long urgent runs use an advancing capped wire pointer; absolute receive offsets track consumption.
                 //# A TCP implementation MUST support a sequence of urgent data of any
                 //# length (MUST-31) [19].
+                // Scope: Appendix A suggestion implemented as saturating wire offset; retained full urgent endpoint lets later packets advance receiver urgent pointer without leaving urgent mode.
+                //= https://www.rfc-editor.org/rfc/rfc7323#appendix-A
+                //= reason=Appendix A suggestion implemented as saturating wire offset; retained full urgent endpoint lets later packets advance receiver urgent pointer without leaving urgent mode.
+                //# If it does overflow, than a value of 65535
+                //# should be inserted into the Urgent Pointer.
                 urgent_pointer = distance.min(65535) as u16;
             }
         }
@@ -3589,6 +4416,134 @@ impl Connection {
             && self.flight() == 0
             && now.saturating_sub(self.last_sent) >= self.rto()
             && self.congestion.cwnd() > self.initial_window();
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-5.2
+        //= reason=Fresh-data predicate and Not-ECT ACK/retransmit/persist assertions are partial evidence. No complete assertion inventory covers every special ECT output path (including TLP original versus retransmission), nor end-to-end loss interpretation for every ECT-marked output. Retain universal reliability-of-congestion-indication requirement open; router marking is not claimed.
+        //# To ensure the reliable delivery of the congestion indication
+        //# of the CE codepoint, an ECT codepoint MUST NOT be set in a packet
+        //# unless the loss of that packet in the network would be detected by
+        //# the end nodes and interpreted as an indication of congestion.
+        // Actor/condition: TCP sender and IP adapter; all ECT outputs.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-5.2
+        //= reason=TCP output policy evidence: fresh ECT(0), setup and pure ACK Not-ECT are asserted at endpoint metadata boundary; external adapters must preserve that metadata. No router/AQM behavior is claimed.
+        //# We believe that this aspect is still
+        //# the subject of research, so this document specifies that at this
+        //# time, "pure" ACK packets MUST NOT indicate ECN-Capability.
+        // Actor/condition: TCP sender; pure ACK output.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-5
+        //= reason=TCP output policy evidence: fresh ECT(0), setup and pure ACK Not-ECT are asserted at endpoint metadata boundary; external adapters must preserve that metadata. No router/AQM behavior is claimed.
+        //# Protocols and senders that only require a single ECT codepoint SHOULD
+        //# use ECT(0).
+        // Actor/condition: TCP sender; single ECT codepoint policy.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1.1
+        //= reason=Optional timeout fallback selected; asserts plain setup after timeout and ECT suppression, retaining earlier receive commitment. No RST-triggered retry claim.
+        //# A host that receives no reply to an ECN-setup SYN within the normal
+        //# SYN retransmission timeout interval MAY resend the SYN and any
+        //# subsequent SYN retransmissions with CWR and ECE cleared.
+        // Actor/condition: TCP setup initiator/responder; no setup reply before SYN retransmission timeout.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+        //= reason=Responder ECN setup only after peer setup: endpoint asserts setup SYN yields ECE-only SYN-ACK; opt-out/plain SYN yields plain SYN-ACK. No ECT on handshake output.
+        //# * If a host has received an ECN-setup SYN packet, then it MAY send
+        //# an ECN-setup SYN-ACK packet.
+        // Actor/condition: TCP setup responder; received ECN-setup SYN.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+        //= reason=Responder ECN setup only after peer setup: endpoint asserts setup SYN yields ECE-only SYN-ACK; opt-out/plain SYN yields plain SYN-ACK. No ECT on handshake output.
+        //# Otherwise, it MUST NOT send an
+        //# ECN-setup SYN-ACK packet.
+        // Actor/condition: TCP setup responder; no received ECN-setup SYN.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+        //= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+        //# * A host MUST NOT set ECT on data packets unless it has sent at
+        //# least one ECN-setup SYN or ECN-setup SYN-ACK packet, and has
+        //# received at least one ECN-setup SYN or ECN-setup SYN-ACK packet,
+        //# and has sent no non-ECN-setup SYN or non-ECN-setup SYN-ACK
+        //# packet.
+        // Actor/condition: TCP sender; ECT eligibility after bilateral setup with no local plain setup.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+        //= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+        //# If a host has received at least one non-ECN-setup SYN
+        //# or non-ECN-setup SYN-ACK packet, then it SHOULD NOT set ECT on
+        //# data packets.
+        // Actor/condition: TCP sender; received any plain setup packet.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+        //= reason=First fresh CWR and retransmit/probe no-CWR assertions provide partial evidence, but universal all-subsequent-packets/loss-reduction paths lack complete existing assertions (e.g. every TLP/recovery mode). Keep mandatory CWR consistency open rather than waive untested branches.
+        //# * If a host ever sets the ECT codepoint on a data packet, then
+        //# that host MUST correctly set/clear the CWR TCP bit on all
+        //# subsequent packets in the connection.
+        // Actor/condition: TCP sender; ever transmitted ECT within this connection.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+        //= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+        //# * A host that is not willing to use ECN on a TCP connection SHOULD
+        //# clear both the ECE and CWR flags in all non-ECN-setup SYN and/or
+        //# SYN-ACK packets that it sends to indicate this unwillingness.
+        // Actor/condition: TCP setup sender; unwilling to use ECN.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+        //= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+        //# Receivers MUST correctly handle all forms of the non-ECN-setup
+        //# SYN and SYN-ACK packets.
+        // Actor/condition: TCP setup receiver; any non-ECN-setup SYN/SYN-ACK flag combination.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+        //= reason=TCP output policy evidence: fresh ECT(0), setup and pure ACK Not-ECT are asserted at endpoint metadata boundary; external adapters must preserve that metadata. No router/AQM behavior is claimed.
+        //# * A host MUST NOT set ECT on SYN or SYN-ACK packets.
+        // Actor/condition: TCP sender; SYN/SYN-ACK output.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+        //= reason=TCP output policy evidence: fresh ECT(0), setup and pure ACK Not-ECT are asserted at endpoint metadata boundary; external adapters must preserve that metadata. No router/AQM behavior is claimed.
+        //# When only one ECT codepoint
+        //# is needed by a sender for all packets sent on a TCP connection,
+        //# ECT(0) SHOULD be used.
+        // Actor/condition: TCP sender; one ECT codepoint for fresh data.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+        //= reason=First committed fresh-data CWR; lost CWR data retransmits without CWR; next fresh data after subsequent reduction carries CWR. Failed encoding cannot consume pending signaling.
+        //# Thus, the
+        //# CWR bit in the TCP header SHOULD NOT be set on retransmitted packets.
+        // Actor/condition: TCP sender; retransmitted data output.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+        //= reason=First committed fresh-data CWR; lost CWR data retransmits without CWR; next fresh data after subsequent reduction carries CWR. Failed encoding cannot consume pending signaling.
+        //# When the TCP data sender is ready to set the CWR bit after reducing
+        //# the congestion window, it SHOULD set the CWR bit only on the first
+        //# new data packet that it transmits.
+        // Actor/condition: TCP sender; first fresh data after reduction.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.4
+        //= reason=TCP output policy evidence: fresh ECT(0), setup and pure ACK Not-ECT are asserted at endpoint metadata boundary; external adapters must preserve that metadata. No router/AQM behavior is claimed.
+        //# For the current generation of TCP congestion control algorithms, pure
+        //# acknowledgement packets (e.g., packets that do not contain any
+        //# accompanying data) MUST be sent with the not-ECT codepoint.
+        // Actor/condition: TCP sender; pure ACK output.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.5
+        //= reason=Sender retransmission Not-ECT asserted at endpoint; receiver invalid/out-of-window CE rejection asserted at sequence/ACK boundaries. TCP roles only, no network marking behavior.
+        //# This document specifies ECN-capable TCP implementations MUST NOT set
+        //# either ECT codepoint (ECT(0) or ECT(1)) in the IP header for
+        //# retransmitted data packets, and that the TCP data receiver SHOULD
+        //# ignore the ECN field on arriving data packets that are outside of the
+        //# receiver's current window.
+        // Actor/condition: TCP sender and receiver; retransmitted data output and out-of-window received data.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.5
+        //= reason=Sender retransmission Not-ECT asserted at endpoint; receiver invalid/out-of-window CE rejection asserted at sequence/ACK boundaries. TCP roles only, no network marking behavior.
+        //# To prevent such a denial-of-service attack, we
+        //# specify that a legitimate TCP data sender MUST NOT set an ECT
+        //# codepoint on retransmitted data packets, and that the TCP data
+        //# receiver SHOULD ignore the CE codepoint on out-of-window packets.
+        // Actor/condition: TCP sender and receiver; retransmitted data output and out-of-window received data.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.6
+        //= reason=Persist probe output explicitly excludes fresh data; assertions prove Not-ECT, no CWR, pending CWR preserved for later eligible data.
+        //# Therefore, the TCP data sender MUST NOT set either an ECT codepoint
+        //# or the CWR bit on window probe packets.
+        // Actor/condition: TCP sender; zero-window probe output.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+        //= reason=Endpoint loss/CWR and idle-reduction tests are partial evidence. Every recovery mode/TLP output cause has not been asserted for first-fresh CWR. Keep universal reduction-cause obligation open.
+        //# When an ECN-Capable TCP sender reduces its congestion window for any reason (because of a retransmit timeout, a Fast Retransmit, or in response to an ECN Notification), the TCP sender sets the CWR flag in the TCP header of the first new data packet sent after the window reduction.
+        // Actor/condition: TCP endpoint; any reduction cause including timeout, fast retransmit and ECN.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-21
+        //= reason=Output defaults to Not-ECT unless eligible fresh data with bilateral ECN; setup, control ACK, retransmission and opted-out data metadata are asserted.
+        //# the not-ECT codepoint should be the default.
+        // Actor/condition: TCP endpoint; default IP/TCP output ECN policy.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+        //= reason=Sender Not-ECT policy is asserted, but receiver cannot infer an overwritten original Not-ECT from CE alone. Clarify applicable receiver connection/probe handling and add a non-negotiated CE assertion; rejected errata 3636/3680 do not remove the original prose obligation.
+        //# If the TCP connection does not wish to use ECN notification for a particular packet, the sending TCP sets the ECN codepoint to not-ECT, and the TCP receiver ignores the CE codepoint in the received packet.
+        // Actor/condition: TCP endpoint; packet not sent as ECN-capable.
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+        //= reason=Bilateral setup gates fresh data ECT(0), with endpoint metadata assertions in both directions; no router marking claim.
+        //# For a TCP connection using ECN, new data packets are transmitted with an ECT codepoint set in the IP header.
+        // Actor/condition: TCP endpoint; negotiated fresh data.
         let ecn = if fresh_data && self.ecn_send() { 2 } else { 0 };
         if setup {
             flags |= ECE | if flags & ACK == 0 { CWR } else { 0 };
@@ -3662,6 +4617,13 @@ impl Connection {
             self.reset_echo = None;
             return Ok(Some(size));
         }
+        // Scope: Planning/retry does not consume pending report; successful SACK-bearing ACK consumes it once. Second identical report requires fresh duplicate recording.
+        //= https://www.rfc-editor.org/rfc/rfc2883#section-4
+        //= reason=Planning/retry does not consume pending report; successful SACK-bearing ACK consumes it once. Second identical report requires fresh duplicate recording.
+        //# (2) Each duplicate contiguous sequence of data received is reported
+        //# in at most one D-SACK block.  (I.e., the receiver sends two identical
+        //# D-SACK blocks in subsequent packets only if the receiver receives two
+        //# duplicate segments.)
         if sack_option_len != 0 && flags & ACK != 0 {
             self.receive.clear_dsack();
         }
@@ -3723,6 +4685,13 @@ impl Connection {
         self.last_sent = now;
         self.syn_pending = false;
         if flags & ACK != 0 {
+            // Scope: Retains one pending echo value and last successfully committed ACK; separate ts_latest is TIME-WAIT freshness bookkeeping, not extra unprocessed echo queue.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+            //= reason=Retains one pending echo value and last successfully committed ACK; separate ts_latest is TIME-WAIT freshness bookkeeping, not extra unprocessed echo queue.
+            //# TS.Recent holds a timestamp to be echoed in TSecr whenever a
+            //# segment is sent, and Last.ACK.sent holds the ACK field from the
+            //# last segment sent.  Last.ACK.sent will equal RCV.NXT except when
+            //# <ACK>s have been delayed.
             self.last_ack_sent = self.receive.next();
             self.ack_pending = false;
             self.ack_deadline = None;
@@ -3734,6 +4703,19 @@ impl Connection {
                 0
             };
             let edge = self.receive.next().wrapping_add((window as u32) << shift);
+            // Scope: Receiver preserves largest committed advertised_edge for acceptability, but current scaled rounding test only checks edge/storage inequalities, not arrival in wire-retracted interval. Closure: send delayed data within prior ACK edge but beyond latest encoded edge (wrap and batching included), assert acceptance/delivery and bounded backing; fixed 64-range rejection also requires retention/report policy qualification. Partial evidence; closure remains TODO.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
+            //= reason=Receiver preserves largest committed advertised_edge for acceptability, but current scaled rounding test only checks edge/storage inequalities, not arrival in wire-retracted interval. Closure: send delayed data within prior ACK edge but beyond latest encoded edge (wrap and batching included), assert acceptance/delivery and bounded backing; fixed 64-range rejection also requires retention/report policy qualification. Partial evidence; closure remains TODO.
+            //# 1)  The receiver MUST honor, as in window, any segment that would
+            //# have been in window for any <ACK> sent by the receiver.
+            // Scope: Tracks maximum successful advertised edge independently of current quantized field; not advanced on failed output.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
+            //= reason=Tracks maximum successful advertised edge independently of current quantized field; not advanced on failed output.
+            //# 2)  When window scaling is in effect, the receiver SHOULD track the
+            //# actual maximum window sequence number (which is likely to be
+            //# greater than the window announced by the most recent <ACK>, if
+            //# more than one segment has arrived since the application consumed
+            //# any data in the receive buffer).
             if after(edge, self.advertised_edge) || self.receive.eof() {
                 self.advertised_edge = edge;
             }
@@ -3935,6 +4917,58 @@ impl Connection {
     //#
     //#    DeliveredData = change_in(snd.una) + change_in(SACKd)
     //#    prr_delivered += DeliveredData
+    // Partial evidence only; TODO remains. Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-1
+    //= reason=Partial evidence only; TODO remains. Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //# However, a TCP MUST NOT be more aggressive than the following algorithms allow.
+    // Partial evidence only; TODO remains. Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Partial evidence only; TODO remains. Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //# An implementation MUST manage the retransmission timer(s) in such a way that a segment
+    //# is never retransmitted too early, i.e., less than one RTO after the previous
+    //# transmission of that segment.
+    // Partial evidence only; TODO remains. Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Partial evidence only; TODO remains. Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //# The following is the RECOMMENDED algorithm for managing the retransmission timer:
+    // Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //# (5.5) The host MUST set RTO <- RTO * 2 ("back off the timer").
+    // Partial evidence only; TODO remains. Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Partial evidence only; TODO remains. Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //# (5.7) If the timer expires awaiting the ACK of a SYN segment and the TCP
+    //# implementation is using an RTO less than 3 seconds, the RTO MUST be re-initialized to
+    //# 3 seconds when data transmission begins (i.e., after the three-way handshake
+    //# completes).
+    // Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //# (5.4) Retransmit the earliest segment that has not been acknowledged by the TCP
+    //# receiver.
+    // Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //# (5.6) Start the retransmission timer, such that it expires after RTO seconds (for the
+    //# value of RTO after the doubling operation outlined in 5.5).
+    // Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
+    //= reason=Partial evidence only; TODO remains. Due RTO calls on_timeout with exclusive snd_nxt and schedules retransmission. Existing tests do not assert timeout-driven exit from active no-SACK NewReno recovery.
+    //# The NewReno modification applies to the fast recovery procedure that begins when three
+    //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
+    //# ACK arrives that acknowledges all of the data up to and including the data that was
+    //# outstanding when the fast recovery procedure began.
+    // Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Partial evidence only; TODO remains. Due RTO calls on_timeout with exclusive snd_nxt and schedules retransmission. Existing tests do not assert that active no-SACK NewReno RTO both clears recovery and replaces recover.
+    //# After a retransmit timeout, record the highest sequence number transmitted in the
+    //# variable recover, and exit the fast recovery procedure if applicable.
+    // Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-4
+    //= reason=Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //# After each retransmit timeout, the highest sequence number transmitted so far is
+    //# recorded in the variable recover.
     pub(crate) fn timeout(&mut self, now: Instant) -> Result<(), Error> {
         self.check_time(now)?;
         self.now = now;
@@ -4740,6 +5774,12 @@ mod tests {
     //# If the ACK control bit is set, this field contains the value of the next sequence number
     //# the sender of the segment is expecting to receive. Once a connection is established,
     //# this is always sent.
+    // Scope: Ordinary shared acceptability check follows PAWS; outside-window old-data D-SACK path reports evidence without admitting text or metadata.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+    //= type=test
+    //= reason=Ordinary shared acceptability check follows PAWS; outside-window old-data D-SACK path reports evidence without admitting text or metadata.
+    //# R2)  If the segment is outside the window, reject it (normal TCP
+    //# processing).
     fn receive_acceptability_edges_trim_duplicates_and_wrap() {
         for next in [Seq(901), Seq(u32::MAX - 1)] {
             for (offset, payload, flags, used, readable, reply) in [
@@ -4801,6 +5841,42 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=Both initial-window policies, active and passive handshakes: accept_ack suppresses congestion growth for SYN ACK; test compares unchanged active/passive cwnd after handshake. No claim about IW formula correctness.
+    //# As specified in [RFC3390], the SYN/ACK and the acknowledgment of the SYN/ACK MUST NOT
+    //# increase the size of the congestion window.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=set_mss scales cwnd by new/old MSS on a decrease; negotiated/path/timestamp vectors assert exact byte ratio. No claim that discovery itself is supplied by TCP.
+    //# When initial congestion windows of more than one segment are implemented along with Path
+    //# MTU Discovery [RFC1191], and the MSS being used is found to be too large, the congestion
+    //# window cwnd SHOULD be reduced to prevent large bursts of smaller segments.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=set_mss scales cwnd by new/old MSS on a decrease; negotiated/path/timestamp vectors assert exact byte ratio. No claim that discovery itself is supplied by TCP.
+    //# Specifically, cwnd SHOULD be reduced by the ratio of the old segment size to the new
+    //# segment size.
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-12
+    //= type=test
+    //= reason=No monitoring-backed default deployment is claimed: InitialWindow default and ConnectionConfig default select Rfc5681, and test explicitly asserts this. Iw10 is only explicit opt-in; sender monitoring/cache/fallback TODOs still apply when enabled.
+    //# An increased initial window MUST NOT be turned on by default on systems without such
+    //# monitoring capabilities.
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= type=test
+    //= reason=IW10 is optional and InitialWindow::default is Rfc5681; config default assertion confirms opt-in. This permission does not discharge IW10 fallback/monitoring obligations or default RFC5681 arithmetic TODO.
+    //# This increase is optional: a TCP MAY start with an initial window that is smaller than
+    //# 10 segments.
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= type=test
+    //= reason=Explicit InitialWindow::Iw10 computes min(10*MSS,max(2*MSS,14600)) with conservative integer cap. Tests assert representative small/normal/jumbo/overflow vectors, negotiated MSS/path/options and initial handshake value. Default RFC5681 arithmetic is a separate TODO.
+    //# min (10*MSS, max (2*MSS, 14600)) (1)
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= type=test
+    //= reason=IW10 first data-flight bound and handshake no-growth: negotiation test checks cwnd after active/passive handshake; idle/data-RTO trace emits exactly ten MSS before blocking. No claim of SYN-loss relaxation or monitoring/fallback support.
+    //# This change applies to the initial window of the connection in the first round-trip time
+    //# (RTT) of data transmission during or following the TCP three-way handshake. Neither the
+    //# SYN/ACK nor its ACK in the three-way handshake should increase the initial window size.
     fn initial_window_uses_negotiated_effective_mss() {
         assert_eq!(
             ConnectionConfig::default().initial_window,
@@ -4857,6 +5933,11 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=Default RFC5681 SYN/SYNACK loss rule (also conservatively retained for opt-in IW10, whose distinct RFC6928 recommendation remains TODO). Test forces each endpoint timeout and asserts one negotiated effective MSS after successful handshake; failed output cannot grow cwnd.
+    //# Further, if the SYN or SYN/ACK is lost, the initial window used by a sender after a
+    //# correctly transmitted SYN MUST be one segment consisting of at most SMSS bytes.
     fn initial_window_syn_loss_and_output_retries_remain_conservative() {
         for policy in [InitialWindow::Rfc5681, InitialWindow::Iw10] {
             for lose_synack in [false, true] {
@@ -4911,6 +5992,28 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=Both Reno/NewReno and default/IW10 retain a one-effective-MSS loss window. Helper verifies cwnd reset and ACK-driven transition; IW10 wire test asserts exactly one retransmission and no second output.
+    //# Furthermore, upon a timeout (as specified in [RFC2988]) cwnd MUST be set to no more than
+    //# the loss window, LW, which equals 1 full-sized segment (regardless of the value of IW).
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= type=test
+    //= reason=Selected IW10 restart choice uses min(current cwnd, IW10); helper covers grown and reduced cwnd and changing MSS, and wire idle trace asserts burst limited to ten MSS. Idle-trigger last-data issue remains RFC5681 TODO; this evidence is the optional window value only.
+    //# Optionally, a TCP MAY set the restart window to the minimum of the value used for the
+    //# initial window and the current value of cwnd (in other words, using a larger value for
+    //# the restart window should never increase the size of cwnd).
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= type=test
+    //= reason=IW10 first data-flight bound and handshake no-growth: negotiation test checks cwnd after active/passive handshake; idle/data-RTO trace emits exactly ten MSS before blocking. No claim of SYN-loss relaxation or monitoring/fallback support.
+    //# This change applies to the initial window of the connection in the first round-trip time
+    //# (RTT) of data transmission during or following the TCP three-way handshake. Neither the
+    //# SYN/ACK nor its ACK in the three-way handshake should increase the initial window size.
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= type=test
+    //= reason=IW10 loss window remains one effective MSS; helper and wire trace assert timeout reduction, one retransmit and denied next output.
+    //# These changes do NOT change the loss window, which must remain 1 segment of MSS bytes
+    //# (to permit the lowest possible window size in the case of severe congestion).
     fn iw10_transmit_idle_restart_and_data_rto() {
         for mss in [1_000, 1_460] {
             let mut cfg = config(65_536, mss);
@@ -5634,6 +6737,37 @@ mod tests {
     }
 
     #[test]
+    // Active lost SYN with negotiated SACK/RACK/TLP and configured 200ms floor.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Active lost SYN with negotiated SACK/RACK/TLP and configured 200ms floor.
+    //# (2.1) Until a round-trip time (RTT) measurement has been made for a segment sent
+    //# between the sender and receiver, the sender SHOULD set RTO <- 1 second, though the
+    //# "backing off" on repeated retransmission discussed in (5.5) still applies.
+    // Partial evidence only; TODO remains. Active lost SYN with negotiated SACK/RACK/TLP and configured 200ms floor.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Active lost SYN with negotiated SACK/RACK/TLP and configured 200ms floor.
+    //# (5.7) If the timer expires awaiting the ACK of a SYN segment and the TCP
+    //# implementation is using an RTO less than 3 seconds, the RTO MUST be re-initialized to
+    //# 3 seconds when data transmission begins (i.e., after the three-way handshake
+    //# completes).
+    // Partial evidence only; TODO remains. Active lost SYN with negotiated SACK/RACK/TLP and configured 200ms floor.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Active lost SYN with negotiated SACK/RACK/TLP and configured 200ms floor.
+    //# (5.1) Every time a packet containing data is sent (including a retransmission), if the
+    //# timer is not running, start it running so that it will expire after RTO seconds (for
+    //# the current value of RTO).
+    // Active lost SYN with negotiated SACK/RACK/TLP and configured 200ms floor.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= type=test
+    //= reason=Active lost SYN with negotiated SACK/RACK/TLP and configured 200ms floor.
+    //# Note that after retransmitting, once a new RTT measurement is obtained (which can only
+    //# happen when new data has been sent and acknowledged), the computations outlined in
+    //# Section 2 are performed, including the computation of RTO, which may result in
+    //# "collapsing" RTO back down after it has been subject to exponential back off (rule
+    //# 5.5).
     fn tlp_small_rto_floor_preserves_initial_and_syn_timeout_guard() {
         let cfg = ConnectionConfig {
             sack: true,
@@ -6697,6 +7831,13 @@ mod tests {
     //# acknowledgements, and on a subsequent partial or full ACK,
     //# DeliveredData is estimated to be the change in snd.una, minus 1
     //# SMSS for each preceding duplicate ACK.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-1
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery.
+    //# This document applies to TCP connections that are unable to use the TCP Selective
+    //# Acknowledgment (SACK) option, either because the option is not locally supported or
+    //# because the TCP peer did not indicate a willingness to use SACK.
     fn rack_prr_peer_without_sack_uses_ordinary_fast_retransmit() {
         let cfg = ConnectionConfig {
             sack: true,
@@ -7229,6 +8370,50 @@ mod tests {
     //# normally by advancing the left window edge in the Acknowledgement Number
     //# Field of the TCP header. The SACK option does not change the meaning of the
     //# Acknowledgement Number field.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= type=test
+    //= reason=Receiver ACK scheduling applies regardless of sender recovery choice; SACK receive trace polls immediate ACK after reordered data and full gap fill and checks cumulative sequence. Partial-gap case needs its own TODO, not inferred from full gap fill.
+    //# A TCP receiver SHOULD send an immediate duplicate ACK when an out- of-order segment
+    //# arrives.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.2
+    //= type=test
+    //= reason=Receiver scheduling after reorder/full gap fill is directly observed in SACK wire trace, with expected cumulative ACK sequence. Applies regardless of local sender recovery profile; partial-only gap fill test remains TODO.
+    //# Out-of-order data segments SHOULD be acknowledged immediately, in order to accelerate
+    //# loss recovery.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.2
+    //= type=test
+    //= reason=Receiver scheduling after reorder/full gap fill is directly observed in SACK wire trace, with expected cumulative ACK sequence. Applies regardless of local sender recovery profile; partial-only gap fill test remains TODO.
+    //# To trigger the fast retransmit algorithm, the receiver SHOULD send an immediate
+    //# duplicate ACK when it receives a data segment above a gap in the sequence space.
+    // Scope: D-SACK alters option contents only; cumulative ACK still follows receive frontier and ACK scheduling remains normal TCP.
+    //= https://www.rfc-editor.org/rfc/rfc2883#section-2
+    //= type=test
+    //= reason=D-SACK alters option contents only; cumulative ACK still follows receive frontier and ACK scheduling remains normal TCP.
+    //# This document does not make any changes to TCP's use of the
+    //# cumulative acknowledgement field, or to the TCP receiver's decision
+    //# of *when* to send an acknowledgement packet.
+    // Scope: Existing SACK negotiation gates duplicate reports, no separate D-SACK capability flag or handshake option.
+    //= https://www.rfc-editor.org/rfc/rfc2883#section-2
+    //= type=test
+    //= reason=Existing SACK negotiation gates duplicate reports, no separate D-SACK capability flag or handshake option.
+    //# The use of D-SACK does not require separate negotiation between a TCP
+    //# sender and receiver that have already negotiated SACK capability.
+    // Scope: Planning/retry does not consume pending report; successful SACK-bearing ACK consumes it once. Second identical report requires fresh duplicate recording.
+    //= https://www.rfc-editor.org/rfc/rfc2883#section-4
+    //= type=test
+    //= reason=Planning/retry does not consume pending report; successful SACK-bearing ACK consumes it once. Second identical report requires fresh duplicate recording.
+    //# (2) Each duplicate contiguous sequence of data received is reported
+    //# in at most one D-SACK block.  (I.e., the receiver sends two identical
+    //# D-SACK blocks in subsequent packets only if the receiver receives two
+    //# duplicate segments.)
+    // Scope: Pending raw duplicate occupies first block, ahead of containing/other ordinary SACK ranges; option budget may decline duplicate report, not mislabel an ordinary block as DSACK.
+    //= https://www.rfc-editor.org/rfc/rfc2883#section-4
+    //= type=test
+    //= reason=Pending raw duplicate occupies first block, ahead of containing/other ordinary SACK ranges; option budget may decline duplicate report, not mislabel an ordinary block as DSACK.
+    //# When D-SACK is used, the
+    //# first block of the SACK option should be a D-SACK block specifying
+    //# the sequence numbers for the duplicate segment that triggers the
+    //# acknowledgement.
     fn sack_receiver_reorder_gap_fill_and_dsack_transaction() {
         for iss in [100, u32::MAX - 20] {
             let (mut a, mut b) = pair(sack_config(128), iss);
@@ -7380,6 +8565,13 @@ mod tests {
     //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Validated negotiated ACKs update in-flight ranges; stale/future/DSACK-only blocks cannot count as fresh delivery.
     //# Upon the receipt of any ACK containing SACK information, the scoreboard MUST
     //# be updated via the Update () routine.
+    // Scope: Prior-cycle ambiguity is not ruled out by DSACK; sender bounds interval validity and never counts DSACK as delivery, but RACK growth/TLP cancellation consume it without prior-cycle-specific assertion. Closure: inject stale prior-cycle duplicate report across sequence wrap and assert bounded advisory-only response, no release of send bytes, inappropriate congestion undo, or fresh RTT credit. Partial evidence; closure remains TODO.
+    //= https://www.rfc-editor.org/rfc/rfc2883#section-4.3
+    //= type=test
+    //= reason=Prior-cycle ambiguity is not ruled out by DSACK; sender bounds interval validity and never counts DSACK as delivery, but RACK growth/TLP cancellation consume it without prior-cycle-specific assertion. Closure: inject stale prior-cycle duplicate report across sequence wrap and assert bounded advisory-only response, no release of send bytes, inappropriate congestion undo, or fresh RTT credit. Partial evidence; closure remains TODO.
+    //# TCP senders receiving D-SACK blocks should be aware that a segment
+    //# reported as a duplicate segment could possibly have been from a prior
+    //# cycle through the sequence number space.
     fn sack_invalid_future_stale_ack_and_dsack_are_not_delivery() {
         let mut a = sack_flight(128, 100, 6);
         let una = a.snd_una;
@@ -7535,6 +8727,14 @@ mod tests {
     //# [RFC6298]-style RTO management or, optionally, a more careful variant that
     //# re-arms the RTO timer on each retransmission that is sent during recovery
     //# MAY be used.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.3
+    //= type=test
+    //= reason=Recommendation to employ multi-loss recovery: default NewReno handles partial ACKs; opt-in negotiated SACK repairs multiple holes. These tests evidence algorithm selection and multi-loss repair only, not every section4.3 general bound (TODOs remain).
+    //# We RECOMMEND that TCP implementors employ some form of advanced loss recovery that can
+    //# cope with multiple losses in a window of data. The algorithms detailed in [RFC3782] and
+    //# [RFC3517] conform to the general principles outlined above. We note that while these are
+    //# not the only two algorithms that conform to the above general principles these two
+    //# algorithms have been vetted by the community and are currently on the Standards Track.
     fn sack_multiloss_selective_recovery_and_transactional_entry() {
         for iss in [100, u32::MAX - 1000] {
             let mut a = sack_flight(128, iss, 8);
@@ -7812,6 +9012,17 @@ mod tests {
     //= type=test
     //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Event input returns; output is poll-driven and repeated evidence gives no extra credit.
     //# (3.4) Terminate processing of this ACK.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= type=test
+    //= reason=Negotiated SACK (non-RACK/non-PRR test profile): empty/repeated SACK grants no Limited Transmit output; new SACK including duplex data grants one packet. No assertion that bare non-SACK DupACKs are SACK delivery.
+    //# Note that a sender using SACK [RFC2018] MUST NOT send new data unless the incoming
+    //# duplicate acknowledgment contains new SACK information.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-2
+    //= type=test
+    //= reason=Negotiated SACK fresh byte evidence defines duplicate ACK, including duplex input; repeated/no SACK cannot grant new credit. Non-SACK five-predicate definition remains TODO.
+    //# Alternatively, a TCP that utilizes selective acknowledgments (SACKs) [RFC2018, RFC2883]
+    //# can leverage the SACK information to determine when an incoming ACK is a "duplicate"
+    //# (e.g., if the ACK contains previously unknown SACK information).
     fn sack_limited_transmit_requires_new_evidence_including_duplex_ack() {
         let (mut a, _) = pair(sack_config(128), 100);
         a.write(&[1; 1024]).unwrap();
@@ -7874,6 +9085,16 @@ mod tests {
     //# [RFC5681]. Additionally, note that [RFC5681] requires that any segments sent
     //# as part of the Limited Transmit mechanism not be counted in FlightSize for
     //# the purpose of the above equation.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= type=test
+    //= reason=Non-SACK third DupACK threshold uses flight minus limited_sent; wire assertion flight=24, limited=8, ssthresh=8 at MSS4. Negotiated SACK partial advancing ACK trace additionally retains unacknowledged Limited Transmit exclusion. ECN reduction epoch sharing is separately scoped.
+    //# When the third duplicate ACK is received, a TCP MUST set ssthresh to no more than the
+    //# value given in equation (4).
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= type=test
+    //= reason=Non-SACK third DupACK threshold uses flight minus limited_sent; wire assertion flight=24, limited=8, ssthresh=8 at MSS4. Negotiated SACK partial advancing ACK trace additionally retains unacknowledged Limited Transmit exclusion. ECN reduction epoch sharing is separately scoped.
+    //# When [RFC3042] is in use, additional data sent in limited transmit MUST NOT be included
+    //# in this calculation.
     fn sack_advancing_ack_keeps_unacked_limited_bytes_out_of_reduction() {
         let (mut a, _) = pair(sack_config(128), 100);
         a.write(&[1; 1024]).unwrap();
@@ -7961,6 +9182,12 @@ mod tests {
     //# [RFC6298]-style RTO management or, optionally, a more careful variant that
     //# re-arms the RTO timer on each retransmission that is sent during recovery
     //# MAY be used.
+    // Negotiated non-RACK/non-PRR SACK RTO clears prior SACK advice.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= type=test
+    //= reason=Negotiated non-RACK/non-PRR SACK RTO clears prior SACK advice.
+    //# (5.4) Retransmit the earliest segment that has not been acknowledged by the TCP
+    //# receiver.
     fn sack_rto_discards_advice_retransmits_head_and_guards_epoch() {
         let mut a = sack_flight(128, 100, 8);
         let una = a.snd_una;
@@ -9227,6 +10454,24 @@ mod tests {
     //# A TCP endpoint SHOULD implement a delayed ACK (SHLD-18), but an ACK should not
     //# be excessively delayed; in particular, the delay MUST be less than 0.5 seconds
     //# (MUST-40).
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.2
+    //= type=test
+    //= reason=Receiver role, all recovery profiles. Default 200ms timer; configuration rejects >=500ms. Existing tests assert no early output, timeout at first packet+200ms, and immediate second full-RMSS ACK; caller must service scheduled timeout/poll. Not a guarantee when host ignores deadlines.
+    //# The delayed ACK algorithm specified in [RFC1122] SHOULD be used by a TCP receiver.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.2
+    //= type=test
+    //= reason=Receiver role, all recovery profiles. Default 200ms timer; configuration rejects >=500ms. Existing tests assert no early output, timeout at first packet+200ms, and immediate second full-RMSS ACK; caller must service scheduled timeout/poll. Not a guarantee when host ignores deadlines.
+    //# When using delayed ACKs, a TCP receiver MUST NOT excessively delay acknowledgments.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.2
+    //= type=test
+    //= reason=Receiver role, all recovery profiles. Default 200ms timer; configuration rejects >=500ms. Existing tests assert no early output, timeout at first packet+200ms, and immediate second full-RMSS ACK; caller must service scheduled timeout/poll. Not a guarantee when host ignores deadlines.
+    //# Specifically, an ACK SHOULD be generated for at least every second full-sized segment,
+    //# and MUST be generated within 500 ms of the arrival of the first unacknowledged packet.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.2
+    //= type=test
+    //= reason=Receiver role, all recovery profiles. Default 200ms timer; configuration rejects >=500ms. Existing tests assert no early output, timeout at first packet+200ms, and immediate second full-RMSS ACK; caller must service scheduled timeout/poll. Not a guarantee when host ignores deadlines.
+    //# Finally, we repeat that an ACK MUST NOT be delayed for more than 500 ms waiting on a
+    //# second full-sized segment to arrive.
     fn delayed_ack_nagle_and_override_deadlines() {
         let (mut a, mut b) = pair(config(64, 4), 100);
         a.write(b"abcde").unwrap();
@@ -9380,6 +10625,62 @@ mod tests {
     }
 
     #[test]
+    // Scope: Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+    //= type=test
+    //= reason=Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
+    //# The three-byte Window Scale option MAY be sent in a <SYN> segment by
+    //# a TCP.
+    // Scope: Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+    //= type=test
+    //= reason=Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
+    //# Thus, a TCP that is prepared to scale windows SHOULD send the option,
+    //# even if its own scale factor is 1 and the exponent 0.
+    // Scope: Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+    //= type=test
+    //= reason=Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
+    //# This option MAY be sent in an initial <SYN> segment (i.e., a segment
+    //# with the SYN bit on and the ACK bit off).
+    // Scope: Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+    //= type=test
+    //= reason=Scaling-capable endpoint offers WS in active SYN and echoes only peer-offered WS in passive SYN-ACK; scale fixed for connection.
+    //# If a Window Scale option
+    //# was received in the initial <SYN> segment, then this option MAY be
+    //# sent in the <SYN,ACK> segment.
+    // Scope: SYN-only WS output sends capacity-derived local_scale, including passive echo after peer offer; selected R=2 is asserted on wire.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+    //= type=test
+    //= reason=SYN-only WS output sends capacity-derived local_scale, including passive echo after peer offer; selected R=2 is asserted on wire.
+    //# o  If a TCP receives a <SYN> segment containing a Window Scale
+    //# option, it SHOULD send its own Window Scale option in the
+    //# <SYN,ACK> segment.
+    // Scope: SYN-only WS output sends capacity-derived local_scale, including passive echo after peer offer; selected R=2 is asserted on wire.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+    //= type=test
+    //= reason=SYN-only WS output sends capacity-derived local_scale, including passive echo after peer offer; selected R=2 is asserted on wire.
+    //# o  The Window Scale option MUST be sent with shift.cnt = R, where R
+    //# is the value that the TCP would like to use for its receive
+    //# window.
+    // Scope: SYN-only output is implemented/tested; ignored non-SYN WS and fixed exponent under malicious changed option lack direct regression. Closure: inject changed WS on established ACK/data and assert effective windows and stored shifts unchanged. Partial evidence; closure remains TODO.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.1
+    //= type=test
+    //= reason=SYN-only output is implemented/tested; ignored non-SYN WS and fixed exponent under malicious changed option lack direct regression. Closure: inject changed WS on established ACK/data and assert effective windows and stored shifts unchanged. Partial evidence; closure remains TODO.
+    //# This option is sent only in a <SYN> segment (a
+    //# segment with the SYN bit on), hence the window scale is fixed in each
+    //# direction when a connection is opened.
+    // Scope: WS wire kind fixed at 3 in SYN layout; independent option parser/clamp assertions use literal kind 3.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+    //= type=test
+    //= reason=WS wire kind fixed at 3 in SYN layout; independent option parser/clamp assertions use literal kind 3.
+    //# Kind: 3
+    // Scope: WS emits [NOP,3,3,local_scale], parser only accepts option length 3.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+    //= type=test
+    //= reason=WS emits [NOP,3,3,local_scale], parser only accepts option length 3.
+    //# Length: 3 bytes
     fn syn_option_layout_and_short_output_are_transactional() {
         for (synack, scaling) in [(false, true), (true, false), (true, true)] {
             for local_ts in [false, true] {
@@ -9539,6 +10840,12 @@ mod tests {
         let before = (a.snd_nxt, a.next_deadline(), a.now);
         assert_eq!(a.transmit(200, &mut [0; 128]), Ok(None));
         assert_eq!((a.snd_nxt, a.next_deadline(), a.now), before);
+        // Scope: Every input/transmit checks nondecreasing Instant, TSval derived by fixed millisecond scaling modulo2^32; repeated Instant intentionally repeats TSval. Physical rate and forward-jump safety separately TODO.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
+        //= type=test
+        //= reason=Every input/transmit checks nondecreasing Instant, TSval derived by fixed millisecond scaling modulo2^32; repeated Instant intentionally repeats TSval. Physical rate and forward-jump safety separately TODO.
+        //# The PAWS mechanism also puts a strong monotonicity requirement on the
+        //# sender's timestamp clock.
         assert_eq!(a.transmit(99, &mut [0; 128]), Err(Error::TimeWentBackwards));
         let (mut a, _) = pair(config(64, 8), 42);
         a.write(b"data").unwrap();
@@ -9565,6 +10872,49 @@ mod tests {
     //# (i.e., SEND buffer should be returned with "ok" response). If the ACK is a duplicate
     //# (SEG.ACK =< SND.UNA), it can be ignored. If the ACK acks something not yet sent (SEG.ACK
     //# > SND.NXT), then send an ACK, drop the segment, and return.
+    // Partial evidence only; TODO remains. Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    //# An implementation MUST manage the retransmission timer(s) in such a way that a segment
+    //# is never retransmitted too early, i.e., less than one RTO after the previous
+    //# transmission of that segment.
+    // Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= type=test
+    //= reason=Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    //# (5.5) The host MUST set RTO <- RTO * 2 ("back off the timer").
+    // Partial evidence only; TODO remains. Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    //# (5.1) Every time a packet containing data is sent (including a retransmission), if the
+    //# timer is not running, start it running so that it will expire after RTO seconds (for
+    //# the current value of RTO).
+    // Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= type=test
+    //= reason=Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    //# (5.2) When all outstanding data has been acknowledged, turn off the retransmission
+    //# timer.
+    // Partial evidence only; TODO remains. Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    //# (5.3) When an ACK is received that acknowledges new data, restart the retransmission
+    //# timer so that it will expire after RTO seconds (for the current value of RTO).
+    // Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= type=test
+    //= reason=Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    //# (5.4) Retransmit the earliest segment that has not been acknowledged by the TCP
+    //# receiver.
+    // Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= type=test
+    //= reason=Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    //# (5.6) Start the retransmission timer, such that it expires after RTO seconds (for the
+    //# value of RTO after the doubling operation outlined in 5.5).
     fn retransmission_uses_partial_ack_base_and_never_sends_unsent_tail() {
         let (mut a, mut b) = pair(config(64, 8), u32::MAX - 4);
         a.set_nagle(false);
@@ -9819,6 +11169,26 @@ mod tests {
     //# If the ACK was acceptable, then signal to the user "error: connection reset", drop the
     //# segment, enter CLOSED state, delete TCB, and return. Otherwise (no ACK), drop the
     //# segment and return.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-1.1
+    //= type=test
+    //= reason=All three defenses are selected for ordinary endpoint operation; RST/SYN/ACK assertion matrices establish the operative behavior, not cryptographic/on-path protection or administrator threat assessment.
+    //# The mitigations suggested in this document
+    //# SHOULD be implemented in devices that regularly need to maintain TCP
+    //# connections of the kind most vulnerable to the attacks described in
+    //# this document.
+    // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-1.1
+    //= type=test
+    //= reason=All three defenses are selected for ordinary endpoint operation; RST/SYN/ACK assertion matrices establish the operative behavior, not cryptographic/on-path protection or administrator threat assessment.
+    //# These mitigations
+    //# MAY be implemented in other cases.
+    // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+    //= type=test
+    //= reason=SYN-SENT reset validation assertion matrix includes arbitrary peer sequences, invalid/missing ACK silence and valid reset closure.
+    //# In all
+    //# other cases the receiver MUST silently discard the segment.
+    // Actor/condition: TCP endpoint; SYN-SENT reset validation.
     fn syn_sent_resets_require_ack_and_abort_outputs_once() {
         // Verified erratum 8167 removes the SYN-SENT RCV.NXT check:
         // https://www.rfc-editor.org/errata/eid8167
@@ -9994,6 +11364,19 @@ mod tests {
     //# o A TCP implementation MAY send an ACK segment acknowledging RCV.NXT when a
     //# valid segment arrives that is in the window but not at the left window edge
     //# (MAY-13).
+    // Partial evidence only; TODO remains. Out-of-order data with queued FIN and sequence wrap; not a pure-data partial-hole-fill test.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-5
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Out-of-order data with queued FIN and sequence wrap; not a pure-data partial-hole-fill test.
+    //# [RFC5681] specifies that "Out-of-order data segments SHOULD be acknowledged
+    //# immediately, in order to accelerate loss recovery".
+    // Partial evidence only; TODO remains. Out-of-order data with queued FIN and sequence wrap; not a pure-data partial-hole-fill test.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-5
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Out-of-order data with queued FIN and sequence wrap; not a pure-data partial-hole-fill test.
+    //# Echoing [RFC5681], our recommendation is that the data receiver send an immediate
+    //# acknowledgment for an out-of-order segment, even when that out-of-order segment fills
+    //# a hole in the buffer.
     fn out_of_order_data_fin_and_inline_urgent() {
         let (mut a, mut b) = pair(config(64, 4), u32::MAX - 2);
         a.write_urgent(b"abcdef").unwrap();
@@ -10102,6 +11485,32 @@ mod tests {
     //# It is RECOMMENDED that implementations will reserve 32-bit fields for the send
     //# and receive window sizes in the connection record and do all window computations
     //# with 32 bits (REC- 1).
+    // Scope: SYN windows are learned raw and advertised_window returns raw syn_window; ordinary ACK scaling is separate.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+    //= type=test
+    //= reason=SYN windows are learned raw and advertised_window returns raw syn_window; ordinary ACK scaling is separate.
+    //# The window field in a segment where the SYN bit is set (i.e., a <SYN>
+    //# or <SYN,ACK>) MUST NOT be scaled.
+    // Scope: Incoming non-SYN SEG.WND is expanded with fixed negotiated peer_scale; raw SYN values stay unscaled.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+    //= type=test
+    //= reason=Incoming non-SYN SEG.WND is expanded with fixed negotiated peer_scale; raw SYN values stay unscaled.
+    //# o  The window field (SEG.WND) in the header of every incoming
+    //# segment, with the exception of <SYN> segments, MUST be left-
+    //# shifted by Snd.Wind.Shift bits before updating SND.WND:
+    // Scope: snd_wnd and receive acceptance credit are 32-bit; internal/congestion bytes are not scaled header values.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+    //= type=test
+    //= reason=snd_wnd and receive acceptance credit are 32-bit; internal/congestion bytes are not scaled header values.
+    //# The scale factor applies only to the window field as transmitted in
+    //# the TCP header; each TCP using extended windows will maintain the
+    //# window values locally as 32-bit numbers.
+    // Scope: Capacity-derived exponent is fixed at construction; maximum negotiated true window bounded by receive allocation.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.1
+    //= type=test
+    //= reason=Capacity-derived exponent is fixed at construction; maximum negotiated true window bounded by receive allocation.
+    //# The maximum receive window, and therefore the scale factor, is
+    //# determined by the maximum receive buffer space.
     fn window_scaling_is_negotiated_but_syn_windows_are_unscaled() {
         let (mut a, mut b) = pair(config(131072, 1460), 100);
         assert!(a.scaling && b.scaling);
@@ -10214,6 +11623,12 @@ mod tests {
     //# A TCP implementation MUST (MUST-32) inform the application layer asynchronously
     //# whenever it receives an urgent pointer and there was previously no pending
     //# urgent data, or whenever the urgent pointer advances in the data stream.
+    // Scope: Appendix A suggestion implemented as saturating wire offset; retained full urgent endpoint lets later packets advance receiver urgent pointer without leaving urgent mode.
+    //= https://www.rfc-editor.org/rfc/rfc7323#appendix-A
+    //= type=test
+    //= reason=Appendix A suggestion implemented as saturating wire offset; retained full urgent endpoint lets later packets advance receiver urgent pointer without leaving urgent mode.
+    //# If it does overflow, than a value of 65535
+    //# should be inserted into the Urgent Pointer.
     fn urgent_run_larger_than_pointer_keeps_urg_set_from_first_packet() {
         let (mut a, mut b) = pair(config(131072, 1460), u32::MAX - 100);
         assert_eq!(a.write_urgent(&vec![42; 70000]), Ok(70000));
@@ -10279,6 +11694,56 @@ mod tests {
     //= reason=Repeated shutdown is idempotent and never creates a second FIN.
     //# An "ok" response would be acceptable, too, as long as a second FIN is not emitted (the
     //# first FIN may be retransmitted, though).
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Ordinary first-flight end-to-end single-loss fast retransmit.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-5
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Ordinary first-flight end-to-end single-loss fast retransmit.
+    //# [RFC5681] specifies that "Out-of-order data segments SHOULD be acknowledged
+    //# immediately, in order to accelerate loss recovery".
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Ordinary first-flight end-to-end single-loss fast retransmit.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno single-loss wire trace proves third-duplicate entry and full-ACK completion, not active-recovery timeout exit.
+    //# The NewReno modification applies to the fast recovery procedure that begins when three
+    //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
+    //# ACK arrives that acknowledges all of the data up to and including the data that was
+    //# outstanding when the fast recovery procedure began.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Ordinary first-flight end-to-end single-loss fast retransmit.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Ordinary first-flight end-to-end single-loss fast retransmit.
+    //# The procedures specified in Section 3.2 of [RFC5681] are followed, with the
+    //# modifications listed below.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Ordinary first-flight end-to-end single-loss fast retransmit.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Ordinary first-flight end-to-end single-loss fast retransmit.
+    //# When the TCP protocol control block is initialized, recover is set to the initial send
+    //# sequence number.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Ordinary first-flight end-to-end single-loss fast retransmit.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Ordinary first-flight end-to-end single-loss fast retransmit.
+    //# This document also does not address issues of adjusting the duplicate acknowledgment
+    //# threshold, but assumes the threshold specified in the IETF standards; the current
+    //# standard is [RFC5681], which specifies a threshold of three duplicate acknowledgments.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Ordinary first-flight end-to-end single-loss fast retransmit.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-5
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Ordinary first-flight end-to-end single-loss fast retransmit.
+    //# Echoing [RFC5681], our recommendation is that the data receiver send an immediate
+    //# acknowledgment for an out-of-order segment, even when that out-of-order segment fills
+    //# a hole in the buffer.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= type=test
+    //= reason=Non-SACK Reno/NewReno fallback uses three eligible duplicate ACKs without RTO backoff; wire trace asserts retransmission of SND.UNA payload. Negotiated SACK/RACK loss inference is separately RFC6675/8985, not this fallback test.
+    //# The TCP sender SHOULD use the "fast retransmit" algorithm to detect and repair loss,
+    //# based on incoming duplicate ACKs.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= type=test
+    //= reason=Non-SACK Reno/NewReno fast entry: helper asserts cwnd=ssthresh+3SMSS (7000=4000+3000); wire test asserts SND.UNA retransmission. Negotiated SACK/RACK/PRR instead follow section4.3 modified recovery and do not use Reno inflation.
+    //# The lost segment starting at SND.UNA MUST be retransmitted and cwnd set to ssthresh plus
+    //# 3*SMSS.
     fn fast_retransmit_uses_three_duplicate_acks_and_fin_shutdown_is_idempotent() {
         let (mut a, mut b) = pair(config(64, 4), 100);
         a.write(b"abcdefghijklmnop").unwrap();
@@ -10445,6 +11910,21 @@ mod tests {
     //# If an MSS Option is not received at connection setup, TCP implementations MUST
     //# assume a default send MSS of 536 (576 - 40) for IPv4 or 1220 (1280 - 60) for
     //# IPv6 (MUST-15).
+    // Scope: Active always offers WS; passive enables only after peer offer. Missing peer WS disables effective shifts in both directions, not necessarily the stored capacity-derived exponent.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+    //= type=test
+    //= reason=Active always offers WS; passive enables only after peer offer. Missing peer WS disables effective shifts in both directions, not necessarily the stored capacity-derived exponent.
+    //# This option is an offer, not a promise; both sides MUST send Window
+    //# Scale options in their <SYN> segments to enable window scaling in
+    //# either direction.
+    // Scope: Effective incoming/outgoing shifts use negotiated scaling; absent peer WS means zero effective shifts even though local_scale retains its configured value.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+    //= type=test
+    //= reason=Effective incoming/outgoing shifts use negotiated scaling; absent peer WS means zero effective shifts even though local_scale retains its configured value.
+    //# o  Upon receiving a <SYN> segment with a Window Scale option
+    //# containing shift.cnt = S, a TCP MUST set Snd.Wind.Shift to S and
+    //# MUST set Rcv.Wind.Shift to R; otherwise, it MUST set both
+    //# Snd.Wind.Shift and Rcv.Wind.Shift to zero.
     fn invalid_configuration_and_unscaled_peer_defaults() {
         assert!(Connection::active(tuple(), config(64, 65495), 100, 0).is_ok());
         assert!(matches!(
@@ -10498,6 +11978,34 @@ mod tests {
     //= type=test
     //# A TCP receiver SHOULD NOT shrink the window, i.e., move the right
     //# window edge to the left (SHLD-14).
+    // Scope: Ordinary outgoing receive window divides by scale unit (floor), SYN is raw; backing and encoded edge tested through sub-scale advances.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+    //= type=test
+    //= reason=Ordinary outgoing receive window divides by scale unit (floor), SYN is raw; backing and encoded edge tested through sub-scale advances.
+    //# o  The window field (SEG.WND) of every outgoing segment, with the
+    //# exception of <SYN> segments, MUST be right-shifted by
+    //# Rcv.Wind.Shift bits:
+    // Scope: Receiver preserves largest committed advertised_edge for acceptability, but current scaled rounding test only checks edge/storage inequalities, not arrival in wire-retracted interval. Closure: send delayed data within prior ACK edge but beyond latest encoded edge (wrap and batching included), assert acceptance/delivery and bounded backing; fixed 64-range rejection also requires retention/report policy qualification. Partial evidence; closure remains TODO.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
+    //= type=test
+    //= reason=Receiver preserves largest committed advertised_edge for acceptability, but current scaled rounding test only checks edge/storage inequalities, not arrival in wire-retracted interval. Closure: send delayed data within prior ACK edge but beyond latest encoded edge (wrap and batching included), assert acceptance/delivery and bounded backing; fixed 64-range rejection also requires retention/report policy qualification. Partial evidence; closure remains TODO.
+    //# 1)  The receiver MUST honor, as in window, any segment that would
+    //# have been in window for any <ACK> sent by the receiver.
+    // Scope: Tracks maximum successful advertised edge independently of current quantized field; not advanced on failed output.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
+    //= type=test
+    //= reason=Tracks maximum successful advertised edge independently of current quantized field; not advanced on failed output.
+    //# 2)  When window scaling is in effect, the receiver SHOULD track the
+    //# actual maximum window sequence number (which is likely to be
+    //# greater than the window announced by the most recent <ACK>, if
+    //# more than one segment has arrived since the application consumed
+    //# any data in the receive buffer).
+    // Scope: Receive window bounded by explicit configured receive allocation, never rounds beyond backing; no speculative unlimited window growth.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-7
+    //= type=test
+    //= reason=Receive window bounded by explicit configured receive allocation, never rounds beyond backing; no speculative unlimited window growth.
+    //# Hence, implementers should take care to not open the TCP window
+    //# drastically beyond the requirements of the connection.
     fn scaled_window_rounding_never_overruns_storage_or_revokes_old_credit() {
         let (mut a, mut b) = pair(config(65536, 1460), 100);
         let backing = b.receive.right_edge();
@@ -10531,6 +12039,23 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= type=test
+    //= reason=Non-SACK Limited Transmit: each of first two duplicate ACKs yields one unsent SMSS; output then stops, total extra flight is two MSS, and third ACK threshold excludes those bytes. SACK fresh-evidence gating is tested separately; not a PRR output claim.
+    //# On the first and second duplicate ACKs received at a sender, a TCP SHOULD send a segment
+    //# of previously unsent data per [RFC3042] provided that the receiver's advertised window
+    //# allows, the total FlightSize would remain less than or equal to cwnd plus 2*SMSS, and
+    //# that new data is available for transmission.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= type=test
+    //= reason=Non-SACK third DupACK threshold uses flight minus limited_sent; wire assertion flight=24, limited=8, ssthresh=8 at MSS4. Negotiated SACK partial advancing ACK trace additionally retains unacknowledged Limited Transmit exclusion. ECN reduction epoch sharing is separately scoped.
+    //# When the third duplicate ACK is received, a TCP MUST set ssthresh to no more than the
+    //# value given in equation (4).
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= type=test
+    //= reason=Non-SACK third DupACK threshold uses flight minus limited_sent; wire assertion flight=24, limited=8, ssthresh=8 at MSS4. Negotiated SACK partial advancing ACK trace additionally retains unacknowledged Limited Transmit exclusion. ECN reduction epoch sharing is separately scoped.
+    //# When [RFC3042] is in use, additional data sent in limited transmit MUST NOT be included
+    //# in this calculation.
     fn limited_transmit_is_one_packet_per_duplicate_and_excluded_from_threshold() {
         let (mut a, mut b) = pair(config(64, 4), 100);
         a.write(b"abcdefghijklmnopqrstuvwxyzABCDEF").unwrap();
@@ -10562,6 +12087,27 @@ mod tests {
     }
 
     #[test]
+    // Ordinary retransmitted flight followed by newly sent data.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= type=test
+    //= reason=Ordinary retransmitted flight followed by newly sent data.
+    //# TCP MUST use Karn's algorithm [KP87] for taking RTT samples.
+    // Ordinary retransmitted flight followed by newly sent data.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= type=test
+    //= reason=Ordinary retransmitted flight followed by newly sent data.
+    //# That is, RTT samples MUST NOT be made using segments that were retransmitted (and thus
+    //# for which it is ambiguous whether the reply was for the first instance of the packet
+    //# or a later instance).
+    // Ordinary retransmitted flight followed by newly sent data.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= type=test
+    //= reason=Ordinary retransmitted flight followed by newly sent data.
+    //# Note that after retransmitting, once a new RTT measurement is obtained (which can only
+    //# happen when new data has been sent and acknowledged), the computations outlined in
+    //# Section 2 are performed, including the computation of RTO, which may result in
+    //# "collapsing" RTO back down after it has been subject to exponential back off (rule
+    //# 5.5).
     fn karn_discards_retransmission_samples_but_can_time_fresh_sequence_space() {
         let (mut a, _) = pair(config(64, 4), 100);
         a.write(b"abcdefghijkl").unwrap();
@@ -10784,6 +12330,24 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.2
+    //= type=test
+    //= reason=Receiver role, all recovery profiles. Default 200ms timer; configuration rejects >=500ms. Existing tests assert no early output, timeout at first packet+200ms, and immediate second full-RMSS ACK; caller must service scheduled timeout/poll. Not a guarantee when host ignores deadlines.
+    //# The delayed ACK algorithm specified in [RFC1122] SHOULD be used by a TCP receiver.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.2
+    //= type=test
+    //= reason=Receiver role, all recovery profiles. Default 200ms timer; configuration rejects >=500ms. Existing tests assert no early output, timeout at first packet+200ms, and immediate second full-RMSS ACK; caller must service scheduled timeout/poll. Not a guarantee when host ignores deadlines.
+    //# When using delayed ACKs, a TCP receiver MUST NOT excessively delay acknowledgments.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.2
+    //= type=test
+    //= reason=Receiver role, all recovery profiles. Default 200ms timer; configuration rejects >=500ms. Existing tests assert no early output, timeout at first packet+200ms, and immediate second full-RMSS ACK; caller must service scheduled timeout/poll. Not a guarantee when host ignores deadlines.
+    //# Specifically, an ACK SHOULD be generated for at least every second full-sized segment,
+    //# and MUST be generated within 500 ms of the arrival of the first unacknowledged packet.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.2
+    //= type=test
+    //= reason=Receiver role, all recovery profiles. Default 200ms timer; configuration rejects >=500ms. Existing tests assert no early output, timeout at first packet+200ms, and immediate second full-RMSS ACK; caller must service scheduled timeout/poll. Not a guarantee when host ignores deadlines.
+    //# Finally, we repeat that an ACK MUST NOT be delayed for more than 500 ms waiting on a
+    //# second full-sized segment to arrive.
     fn delayed_ack_uses_advertised_receive_mss_not_peer_send_mss() {
         for receive_limit in [28, 100] {
             let mut cfg = config(128, 16);
@@ -11049,6 +12613,26 @@ mod tests {
     //# but SHOULD NOT
     //# time out the connection if data beyond the right window edge is not
     //# acknowledged (SHLD-17).
+    // Scope: Partial shrink robustness: bytes retained and initial new data constrained; general nonzero shrink regression passes. RFC 7323 first retransmission/sub-scale out-of-window rule is not implemented by default (see added item 4). Closure: implement/test scaled quantization-aware first and later retransmission policy as well as late data within previous receive promise. Partial evidence; closure remains TODO.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
+    //= type=test
+    //= reason=Partial shrink robustness: bytes retained and initial new data constrained; general nonzero shrink regression passes. RFC 7323 first retransmission/sub-scale out-of-window rule is not implemented by default (see added item 4). Closure: implement/test scaled quantization-aware first and later retransmission policy as well as late data within previous receive promise. Partial evidence; closure remains TODO.
+    //# Implementations MUST ensure that they handle a shrinking
+    //# window, as specified in Section 4.2.2.16 of [RFC1122].
+    // Scope: Fresh-data branch saturates latest-window credit after flight subtraction; no new data after shrinking below flight; retransmit policy never sends unsent tail.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
+    //= type=test
+    //= reason=Fresh-data branch saturates latest-window credit after flight subtraction; no new data after shrinking below flight; retransmit policy never sends unsent tail.
+    //# 3)  The initial transmission MUST be within the window announced by
+    //# the most recent <ACK>.
+    // Scope: Default retransmit clips to latest snd_wnd, even first retry after scaled rounding retraction; opt-in retransmit_beyond_window ignores window for all retries, not the exact first/sub-scale rule. No per-original first-retry or quantization distinction. Closure: preserve bounded first-transmission/first-retry knowledge and scale-unit tolerance, test original-valid first retry beyond edge and subsequent retries near/far edge across wrap and SACK/RACK paths. Partial evidence; closure remains TODO.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
+    //= type=test
+    //= reason=Default retransmit clips to latest snd_wnd, even first retry after scaled rounding retraction; opt-in retransmit_beyond_window ignores window for all retries, not the exact first/sub-scale rule. No per-original first-retry or quantization distinction. Closure: preserve bounded first-transmission/first-retry knowledge and scale-unit tolerance, test original-valid first retry beyond edge and subsequent retries near/far edge across wrap and SACK/RACK paths. Partial evidence; closure remains TODO.
+    //# 4)  On first retransmission, or if the sequence number is out of
+    //# window by less than 2^Rcv.Wind.Shift, then do normal
+    //# retransmission(s) without regard to the receiver window as long
+    //# as the original segment was in window when it was sent.
     fn nonzero_shrink_below_flight_retains_bytes_retransmits_inside_and_reopens() {
         for iss in [100, u32::MAX - 4] {
             let mut cfg = config(64, 8);
@@ -11278,6 +12862,43 @@ mod tests {
     //# All incoming segments
     //# whose ACK value doesn't satisfy the above condition MUST be
     //# discarded and an ACK sent back.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-1.1
+    //= type=test
+    //= reason=All three defenses are selected for ordinary endpoint operation; RST/SYN/ACK assertion matrices establish the operative behavior, not cryptographic/on-path protection or administrator threat assessment.
+    //# The mitigations suggested in this document
+    //# SHOULD be implemented in devices that regularly need to maintain TCP
+    //# connections of the kind most vulnerable to the attacks described in
+    //# this document.
+    // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-1.1
+    //= type=test
+    //= reason=All three defenses are selected for ordinary endpoint operation; RST/SYN/ACK assertion matrices establish the operative behavior, not cryptographic/on-path protection or administrator threat assessment.
+    //# These mitigations
+    //# MAY be implemented in other cases.
+    // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-5.2
+    //= type=test
+    //= reason=Selected DATA/FIN mitigation: inclusive serial ACK bounds, adjacent rejection, challenge fields and no receive/URG/FIN/window/send/timer effects are asserted. RST/SYN state validation remains prior to ordinary ACK/data handling.
+    //# All TCP stacks MAY implement the following mitigation.
+    // Actor/condition: TCP endpoint; ACK-bearing segments after state/control validation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-5.2
+    //= type=test
+    //= reason=Selected DATA/FIN mitigation: inclusive serial ACK bounds, adjacent rejection, challenge fields and no receive/URG/FIN/window/send/timer effects are asserted. RST/SYN state validation remains prior to ordinary ACK/data handling.
+    //# TCP stacks
+    //# that implement this mitigation MUST add an additional input check to
+    //# any incoming segment.
+    // Actor/condition: TCP endpoint; ACK-bearing segments after state/control validation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-5.2
+    //= type=test
+    //= reason=Selected DATA/FIN mitigation: inclusive serial ACK bounds, adjacent rejection, challenge fields and no receive/URG/FIN/window/send/timer effects are asserted. RST/SYN state validation remains prior to ordinary ACK/data handling.
+    //# All incoming segments whose ACK value doesn't satisfy the
+    //# above condition MUST be discarded and an ACK sent back.
+    // Actor/condition: TCP endpoint; ACK-bearing segments after state/control validation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-5.2
+    //= type=test
+    //= reason=Inclusive lower/upper bounds, adjacent invalid values and modular wrap are explicitly asserted.
+    //# The ACK value is considered acceptable only if it is in the range of ((SND.UNA - MAX.SND.WND) <= SEG.ACK <= SND.NXT).
+    // Actor/condition: TCP endpoint; selected ACK bound mitigation.
     fn rfc5961_ack_bounds_are_inclusive_and_reject_all_incoming_side_effects() {
         for iss in [100, u32::MAX - 4] {
             for bound in 0..4 {
@@ -11368,6 +12989,94 @@ mod tests {
     //# responses. All segment queues should be flushed. Users should also receive an
     //# unsolicited general "connection reset" signal. Enter the CLOSED state, delete the TCB,
     //# and return.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-1.1
+    //= type=test
+    //= reason=All three defenses are selected for ordinary endpoint operation; RST/SYN/ACK assertion matrices establish the operative behavior, not cryptographic/on-path protection or administrator threat assessment.
+    //# The mitigations suggested in this document
+    //# SHOULD be implemented in devices that regularly need to maintain TCP
+    //# connections of the kind most vulnerable to the attacks described in
+    //# this document.
+    // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-1.1
+    //= type=test
+    //= reason=All three defenses are selected for ordinary endpoint operation; RST/SYN/ACK assertion matrices establish the operative behavior, not cryptographic/on-path protection or administrator threat assessment.
+    //# These mitigations
+    //# MAY be implemented in other cases.
+    // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+    //= type=test
+    //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects.
+    //# Instead, implementations SHOULD implement the following steps in
+    //# place of those specified in [RFC0793] (as listed above).
+    // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+    //= type=test
+    //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects.
+    //# 2) If the RST bit is set and the sequence number exactly matches the
+    //# next expected sequence number (RCV.NXT), then TCP MUST reset the
+    //# connection.
+    // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+    //= type=test
+    //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects.
+    //# 3) If the RST bit is set and the sequence number does not exactly
+    //# match the next expected sequence value, yet is within the current
+    //# receive window (RCV.NXT < SEG.SEQ < RCV.NXT+RCV.WND), TCP MUST
+    //# send an acknowledgment (challenge ACK):
+    // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+    //= type=test
+    //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects.
+    //# After sending the challenge ACK, TCP MUST drop the unacceptable
+    //# segment and stop processing the incoming packet further.
+    // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+    //= type=test
+    //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects.
+    //# In all other cases, where
+    //# the SEQ-field does not match and is outside the window, the receiver
+    //# MUST silently discard the segment.
+    // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+    //= type=test
+    //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects. Missing scope evidence: PAWS/missing-timestamp checks precede SYN challenge; timestamp-enabled SYN inputs can return before emitting the mandated challenge irrespective of sequence. Existing matrix does not exercise timestamp-enabled SYN. Audit precedence and add assertions; no waiver of the selected SYN mitigation.
+    //# Instead, the handling of the SYN in the synchronized state SHOULD be
+    //# performed as follows:
+    // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+    //= type=test
+    //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects. Missing scope evidence: PAWS/missing-timestamp checks precede SYN challenge; timestamp-enabled SYN inputs can return before emitting the mandated challenge irrespective of sequence. Existing matrix does not exercise timestamp-enabled SYN. Audit precedence and add assertions; no waiver of the selected SYN mitigation.
+    //# 1) If the SYN bit is set, irrespective of the sequence number, TCP
+    //# MUST send an ACK (also referred to as challenge ACK) to the remote
+    //# peer:
+    // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+    //= type=test
+    //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects. Missing scope evidence: PAWS/missing-timestamp checks precede SYN challenge; timestamp-enabled SYN inputs can return before emitting the mandated challenge irrespective of sequence. Existing matrix does not exercise timestamp-enabled SYN. Audit precedence and add assertions; no waiver of the selected SYN mitigation.
+    //# After sending the acknowledgment, TCP MUST drop the unacceptable
+    //# segment and stop processing further.
+    // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+    //= type=test
+    //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects.
+    //# Upon receipt of a valid RST, the local TCP
+    //# endpoint MUST terminate its connection.
+    // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+    //= type=test
+    //= reason=This is the operative replacement list, not the preceding historical RFC793 rule. State matrix asserts outside-window RST does not schedule ACK or mutate state; verified erratum 4845 corrects only the historical list inequality.
+    //# 1) If the RST bit is set and the sequence number is outside the current receive window, silently drop the segment.
+    // Actor/condition: TCP endpoint; replacement RST mitigation, outside window.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Matrix asserts ordinary unblocked RST challenge SEQ=SND.NXT, ACK=RCV.NXT and flags ACK, not challenge arbitration with retransmission, probe or other output pending.
+    //# <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+    // Actor/condition: TCP endpoint; nonexact in-window RST challenge.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Matrix asserts ordinary unblocked non-timestamp SYN challenge SEQ=SND.NXT, ACK=RCV.NXT and flags ACK, not challenge arbitration with retransmission, probe or other output pending.
+    //# <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+    // Actor/condition: TCP endpoint; synchronized SYN challenge.
     fn rfc5961_reset_and_syn_state_matrix_drops_text_urgent_fin_and_ack() {
         for state in [
             State::SynReceived,
@@ -11638,6 +13347,12 @@ mod tests {
     //# time out the connection if data beyond the right window edge is not
     //# acknowledged (SHLD-17).
     #[test]
+    // Scope: This MAY permits in-window-only subsequent retries; default selects it. Explicit retransmit_beyond_window opt-in is a separate policy, not claimed as selecting this MAY.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
+    //= type=test
+    //= reason=This MAY permits in-window-only subsequent retries; default selects it. Explicit retransmit_beyond_window opt-in is a separate policy, not claimed as selecting this MAY.
+    //# 5)  Subsequent retransmissions MAY only be sent if they are within
+    //# the window announced by the most recent <ACK>.
     fn optional_beyond_window_retransmission_never_sends_new_bytes() {
         for iss in [100, u32::MAX - 3] {
             for enabled in [false, true] {
@@ -11748,6 +13463,16 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= type=test
+    //= reason=Reno/NewReno helper epoch/threshold assertions plus connection emitted-retransmission-versus-pending-loss RTO assertions. No router congestion-detection claim.
+    //# TCP should not react to congestion indications more than once every window of data (or more loosely, more than once every round-trip time). That is, the TCP sender's congestion window should be reduced only once in response to a series of dropped and/or CE packets from a single window of data. In addition, the TCP source should not decrease the slow-start threshold, ssthresh, if it has been decreased within the last round trip time. However, if any retransmitted packets are dropped, then this is interpreted by the source TCP as a new instance of congestion.
+    // Actor/condition: TCP endpoint; mixed ECN/loss epoch and lost retransmission.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-5
+    //= type=test
+    //= reason=Original-flight reduction epoch assertions combine ECN and actual loss; retransmission loss remains a new event, as refined in section 6.1.2.
+    //# An additional goal is that the end-systems should react to congestion at most once per window of data (i.e., at most once per round-trip time), to avoid reacting multiple times to multiple indications of congestion within a round-trip time.
+    // Actor/condition: TCP endpoint; multiple indications within original-flight epoch.
     fn ecn_rto_distinguishes_emitted_retransmission_from_pending_original_loss() {
         for iss in [100, u32::MAX - 20_000] {
             for emit_partial_retransmission in [false, true] {
@@ -11799,6 +13524,51 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-5
+    //= type=test
+    //= reason=TCP sender reduction only: helper asserts cwnd/threshold reduction, mixed loss/ECN epoch and no duplicate response; connection asserts repeated ECE and no ECN-driven retransmission. Generic non-TCP transports are not provided.
+    //# Upon the receipt by an ECN-Capable transport of a single CE packet,
+    //# the congestion control algorithms followed at the end-systems MUST be
+    //# essentially the same as the congestion control response to a *single*
+    //# dropped packet.
+    // Actor/condition: TCP sender/congestion controller; single CE indication in eligible original-flight epoch.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= type=test
+    //= reason=Existing data/feedback and fallback promise assertions are partial evidence. CE-marked zero-window probe is currently excluded by window != 0; clause depends on all applicable ECN receive processing, so retain mandatory negotiated-connection processing open alongside section 6.1.6 TODO.
+    //# * If a host has sent at least one ECN-setup SYN or ECN-setup SYN-
+    //# ACK packet, and has received no non-ECN-setup SYN or non-ECN-
+    //# setup SYN-ACK packet, then if that host receives TCP data
+    //# packets with ECT and CE codepoints set in the IP header, then
+    //# that host MUST process these packets as specified for an ECN-
+    //# capable connection.
+    // Actor/condition: TCP receiver; sent setup and received no plain setup; ECN data received.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.5
+    //= type=test
+    //= reason=Sender retransmission Not-ECT asserted at endpoint; receiver invalid/out-of-window CE rejection asserted at sequence/ACK boundaries. TCP roles only, no network marking behavior.
+    //# This document specifies ECN-capable TCP implementations MUST NOT set
+    //# either ECT codepoint (ECT(0) or ECT(1)) in the IP header for
+    //# retransmitted data packets, and that the TCP data receiver SHOULD
+    //# ignore the ECN field on arriving data packets that are outside of the
+    //# receiver's current window.
+    // Actor/condition: TCP sender and receiver; retransmitted data output and out-of-window received data.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.5
+    //= type=test
+    //= reason=Sender retransmission Not-ECT asserted at endpoint; receiver invalid/out-of-window CE rejection asserted at sequence/ACK boundaries. TCP roles only, no network marking behavior.
+    //# To prevent such a denial-of-service attack, we
+    //# specify that a legitimate TCP data sender MUST NOT set an ECT
+    //# codepoint on retransmitted data packets, and that the TCP data
+    //# receiver SHOULD ignore the CE codepoint on out-of-window packets.
+    // Actor/condition: TCP sender and receiver; retransmitted data output and out-of-window received data.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.3
+    //= type=test
+    //= reason=Immediate CE feedback and repeated ECE assertions exist, but no inspected assertion covers CE on either of a two-packet delayed-ACK aggregate. Add explicit aggregate assertion; keep this unextracted receiver instruction visible.
+    //# When TCP receives a CE data packet at the destination end-system, the TCP data receiver sets the ECN-Echo flag in the TCP header of the subsequent ACK packet. If there is any ACK withholding implemented, as in current "delayed-ACK" TCP implementations where the TCP receiver can send an ACK for two arriving data packets, then the ECN-Echo flag in the ACK packet will be set to '1' if the CE codepoint is set in any of the data packets being acknowledged. That is, if any of the received data packets are CE packets, then the returning ACK has the ECN-Echo flag set.
+    // Actor/condition: TCP endpoint; CE data including delayed-ACK aggregation.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.3
+    //= type=test
+    //= reason=Dropped feedback/repeated echo, unmarked CWR clearing, subsequent CE and CE-marked CWR assertions establish latch behavior. Erratum 3639 clarifies CWR-before-CE; reordered older CWR is guarded by CE epoch sequence.
+    //# After a TCP receiver sends an ACK packet with the ECN-Echo bit set, that TCP receiver continues to set the ECN-Echo flag in all the ACK packets it sends (whether they acknowledge CE data packets or non-CE data packets) until it receives a CWR packet (a packet with the CWR flag set). After the receipt of the CWR packet, acknowledgments for subsequent non-CE data packets do not have the ECN-Echo flag set.
+    // Actor/condition: TCP endpoint; echo persistence until CWR and later CE.
     fn ecn_validation_wrap_repeated_marks_and_transactional_output() {
         let (mut a, mut b) = pair(config(1024, 64), u32::MAX - 63);
         a.write(&[1; 128]).unwrap();
@@ -11896,6 +13666,39 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-5.2
+    //= type=test
+    //= reason=Fresh-data predicate and Not-ECT ACK/retransmit/persist assertions are partial evidence. No complete assertion inventory covers every special ECT output path (including TLP original versus retransmission), nor end-to-end loss interpretation for every ECT-marked output. Retain universal reliability-of-congestion-indication requirement open; router marking is not claimed.
+    //# To ensure the reliable delivery of the congestion indication
+    //# of the CE codepoint, an ECT codepoint MUST NOT be set in a packet
+    //# unless the loss of that packet in the network would be detected by
+    //# the end nodes and interpreted as an indication of congestion.
+    // Actor/condition: TCP sender and IP adapter; all ECT outputs.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= type=test
+    //= reason=First fresh CWR and retransmit/probe no-CWR assertions provide partial evidence, but universal all-subsequent-packets/loss-reduction paths lack complete existing assertions (e.g. every TLP/recovery mode). Keep mandatory CWR consistency open rather than waive untested branches.
+    //# * If a host ever sets the ECT codepoint on a data packet, then
+    //# that host MUST correctly set/clear the CWR TCP bit on all
+    //# subsequent packets in the connection.
+    // Actor/condition: TCP sender; ever transmitted ECT within this connection.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= type=test
+    //= reason=One-MSS ECE rate reduction: existing assertion proves no fresh output before RTO-length pause and output at expiry, not merely an MSS cwnd floor.
+    //# Therefore, the sending TCP MUST reset the
+    //# retransmit timer on receiving the ECN-Echo packet when the congestion
+    //# window is one.
+    // Actor/condition: TCP sender; accepted ECE at one-MSS cwnd.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.6
+    //= type=test
+    //= reason=Persist probe output explicitly excludes fresh data; assertions prove Not-ECT, no CWR, pending CWR preserved for later eligible data.
+    //# Therefore, the TCP data sender MUST NOT set either an ECT codepoint
+    //# or the CWR bit on window probe packets.
+    // Actor/condition: TCP sender; zero-window probe output.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= type=test
+    //= reason=Existing assertion blocks fresh output until RTO-length pause deadline and permits fresh ECT/CWR output at expiry.
+    //# The sending TCP will then be able to send a new packet only when the retransmit timer expires.
+    // Actor/condition: TCP endpoint; ECE at one-MSS cwnd.
     fn ecn_one_mss_waits_rto_and_zero_window_probe_is_not_ect() {
         let (mut a, mut b) = pair(config(1024, 64), 10);
         // Model a previous timeout followed by enough ACK progress to leave recovery.
@@ -11932,6 +13735,50 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= type=test
+    //= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+    //# * A host MUST NOT set ECT on data packets unless it has sent at
+    //# least one ECN-setup SYN or ECN-setup SYN-ACK packet, and has
+    //# received at least one ECN-setup SYN or ECN-setup SYN-ACK packet,
+    //# and has sent no non-ECN-setup SYN or non-ECN-setup SYN-ACK
+    //# packet.
+    // Actor/condition: TCP sender; ECT eligibility after bilateral setup with no local plain setup.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= type=test
+    //= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+    //# If a host has received at least one non-ECN-setup SYN
+    //# or non-ECN-setup SYN-ACK packet, then it SHOULD NOT set ECT on
+    //# data packets.
+    // Actor/condition: TCP sender; received any plain setup packet.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= type=test
+    //= reason=Existing data/feedback and fallback promise assertions are partial evidence. CE-marked zero-window probe is currently excluded by window != 0; clause depends on all applicable ECN receive processing, so retain mandatory negotiated-connection processing open alongside section 6.1.6 TODO.
+    //# * If a host has sent at least one ECN-setup SYN or ECN-setup SYN-
+    //# ACK packet, and has received no non-ECN-setup SYN or non-ECN-
+    //# setup SYN-ACK packet, then if that host receives TCP data
+    //# packets with ECT and CE codepoints set in the IP header, then
+    //# that host MUST process these packets as specified for an ECN-
+    //# capable connection.
+    // Actor/condition: TCP receiver; sent setup and received no plain setup; ECN data received.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= type=test
+    //= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+    //# * A host that is not willing to use ECN on a TCP connection SHOULD
+    //# clear both the ECE and CWR flags in all non-ECN-setup SYN and/or
+    //# SYN-ACK packets that it sends to indicate this unwillingness.
+    // Actor/condition: TCP setup sender; unwilling to use ECN.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= type=test
+    //= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+    //# Receivers MUST correctly handle all forms of the non-ECN-setup
+    //# SYN and SYN-ACK packets.
+    // Actor/condition: TCP setup receiver; any non-ECN-setup SYN/SYN-ACK flag combination.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= type=test
+    //= reason=Explicit receive commitment assertion after delayed setup SYN-ACK and local plain-SYN fallback; sender no longer sets ECT, receiver still latches CE.
+    //# However, the commitment to respond appropriately to incoming packets with the CE codepoint set remains even if the TCP sender in a later transmission, within this TCP connection, sends a SYN packet without ECE and CWR set.
+    // Actor/condition: TCP endpoint; ECN setup followed by local plain-SYN fallback.
     fn ecn_fallback_retains_receive_commitment() {
         let cfg = config(1024, 64);
         let mut a = Connection::active(tuple(), cfg.clone(), 10, 0).unwrap();
@@ -11967,6 +13814,40 @@ mod tests {
         assert!(a.ecn_echo);
     }
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= type=test
+    //= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+    //# * A host MUST NOT set ECT on data packets unless it has sent at
+    //# least one ECN-setup SYN or ECN-setup SYN-ACK packet, and has
+    //# received at least one ECN-setup SYN or ECN-setup SYN-ACK packet,
+    //# and has sent no non-ECN-setup SYN or non-ECN-setup SYN-ACK
+    //# packet.
+    // Actor/condition: TCP sender; ECT eligibility after bilateral setup with no local plain setup.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= type=test
+    //= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+    //# If a host has received at least one non-ECN-setup SYN
+    //# or non-ECN-setup SYN-ACK packet, then it SHOULD NOT set ECT on
+    //# data packets.
+    // Actor/condition: TCP sender; received any plain setup packet.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= type=test
+    //= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+    //# * A host that is not willing to use ECN on a TCP connection SHOULD
+    //# clear both the ECE and CWR flags in all non-ECN-setup SYN and/or
+    //# SYN-ACK packets that it sends to indicate this unwillingness.
+    // Actor/condition: TCP setup sender; unwilling to use ECN.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+    //= type=test
+    //= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+    //# Receivers MUST correctly handle all forms of the non-ECN-setup
+    //# SYN and SYN-ACK packets.
+    // Actor/condition: TCP setup receiver; any non-ECN-setup SYN/SYN-ACK flag combination.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1.2
+    //= type=test
+    //= reason=Exact flag-combination assertion enables ECN only for ECE-only SYN-ACK, rejecting reflected ECE|CWR.
+    //# the sending TCP correctly interprets a receiver's reflection of its own flags in the Reserved field as an indication that the receiver is not ECN-capable.
+    // Actor/condition: TCP endpoint; SYN-ACK reflects both ECE/CWR.
     fn ecn_setup_output_is_atomic_and_synack_flags_are_not_echoed_reserved_bits() {
         for flags in [0, ECE, CWR, ECE | CWR] {
             let cfg = config(1024, 64);
@@ -12049,6 +13930,13 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1.1
+    //= type=test
+    //= reason=Optional timeout fallback selected; asserts plain setup after timeout and ECT suppression, retaining earlier receive commitment. No RST-triggered retry claim.
+    //# A host that receives no reply to an ECN-setup SYN within the normal
+    //# SYN retransmission timeout interval MAY resend the SYN and any
+    //# subsequent SYN retransmissions with CWR and ECE cleared.
+    // Actor/condition: TCP setup initiator/responder; no setup reply before SYN retransmission timeout.
     fn ecn_synack_timeout_fallback_and_invalid_handshake_ack() {
         let cfg = config(1024, 64);
         let mut a = Connection::active(tuple(), cfg.clone(), 10, 0).unwrap();
@@ -12087,6 +13975,11 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.3
+    //= type=test
+    //= reason=Dropped feedback/repeated echo, unmarked CWR clearing, subsequent CE and CE-marked CWR assertions establish latch behavior. Erratum 3639 clarifies CWR-before-CE; reordered older CWR is guarded by CE epoch sequence.
+    //# After a TCP receiver sends an ACK packet with the ECN-Echo bit set, that TCP receiver continues to set the ECN-Echo flag in all the ACK packets it sends (whether they acknowledge CE data packets or non-CE data packets) until it receives a CWR packet (a packet with the CWR flag set). After the receipt of the CWR packet, acknowledgments for subsequent non-CE data packets do not have the ECN-Echo flag set.
+    // Actor/condition: TCP endpoint; echo persistence until CWR and later CE.
     fn ecn_reordered_cwr_cannot_clear_newer_ce() {
         let (mut a, mut b) = pair(config(1024, 64), u32::MAX - 127);
         a.write(&[1; 192]).unwrap();
@@ -12110,6 +14003,11 @@ mod tests {
         );
     }
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= type=test
+    //= reason=Endpoint loss/CWR and idle-reduction tests are partial evidence. Every recovery mode/TLP output cause has not been asserted for first-fresh CWR. Keep universal reduction-cause obligation open.
+    //# When an ECN-Capable TCP sender reduces its congestion window for any reason (because of a retransmit timeout, a Fast Retransmit, or in response to an ECN Notification), the TCP sender sets the CWR flag in the TCP header of the first new data packet sent after the window reduction.
+    // Actor/condition: TCP endpoint; any reduction cause including timeout, fast retransmit and ECN.
     fn ecn_idle_window_reduction_signals_cwr_on_committed_fresh_data() {
         let (mut a, mut b) = pair(config(1024, 64), 10);
         a.write(&[0; 64]).unwrap();
@@ -12796,6 +14694,49 @@ mod tests {
     }
 
     #[test]
+    // Scope: Timestamp negotiation is config/peer-SYN gated; SYN TSecr=0, ACK replies echo ts_recent, bool timestamps retains negotiated state.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+    //= type=test
+    //= reason=Timestamp negotiation is config/peer-SYN gated; SYN TSecr=0, ACK replies echo ts_recent, bool timestamps retains negotiated state.
+    //# If
+    //# the ACK bit is not set in the outgoing TCP header, the sender of that
+    //# segment SHOULD set the TSecr field to zero.
+    // Scope: Timestamp negotiation is config/peer-SYN gated; SYN TSecr=0, ACK replies echo ts_recent, bool timestamps retains negotiated state.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+    //= type=test
+    //= reason=Timestamp negotiation is config/peer-SYN gated; SYN TSecr=0, ACK replies echo ts_recent, bool timestamps retains negotiated state.
+    //# When the ACK bit is set
+    //# in an outgoing segment, the sender MUST echo a recently received
+    //# TSval sent by the remote TCP in the TSval field of a Timestamps
+    //# option.
+    // Scope: Timestamp negotiation is config/peer-SYN gated; SYN TSecr=0, ACK replies echo ts_recent, bool timestamps retains negotiated state.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+    //= type=test
+    //= reason=Timestamp negotiation is config/peer-SYN gated; SYN TSecr=0, ACK replies echo ts_recent, bool timestamps retains negotiated state.
+    //# A TCP MAY send the TSopt in an initial <SYN> segment (i.e., segment
+    //# containing a SYN bit and no ACK bit), and MAY send a TSopt in
+    //# <SYN,ACK> only if it received a TSopt in the initial <SYN> segment
+    //# for the connection.
+    // Scope: Negotiated non-RST output always allocates TS; timestamp-enabled path budget minimum 40 preserves SYN options, ordinary data/ACK/FIN/probe/keepalive and user-abort RST retain TS. Reactive reset limits audited separately in section 5.2.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+    //= type=test
+    //= reason=Negotiated non-RST output always allocates TS; timestamp-enabled path budget minimum 40 preserves SYN options, ordinary data/ACK/FIN/probe/keepalive and user-abort RST retain TS. Reactive reset limits audited separately in section 5.2.
+    //# Once TSopt has been successfully negotiated, that is both <SYN> and
+    //# <SYN,ACK> contain TSopt, the TSopt MUST be sent in every non-<RST>
+    //# segment for the duration of the connection, and SHOULD be sent in an
+    //# <RST> segment (see Section 5.2 for details).
+    // Scope: Timestamp negotiation is config/peer-SYN gated; SYN TSecr=0, ACK replies echo ts_recent, bool timestamps retains negotiated state.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+    //= type=test
+    //= reason=Timestamp negotiation is config/peer-SYN gated; SYN TSecr=0, ACK replies echo ts_recent, bool timestamps retains negotiated state.
+    //# The TCP SHOULD remember
+    //# this state by setting a flag, referred to as Snd.TS.OK, to one.
+    // Scope: learn_syn copies offered TSval into TS.Recent and ts_latest on both active/passive negotiation.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+    //= type=test
+    //= reason=learn_syn copies offered TSval into TS.Recent and ts_latest on both active/passive negotiation.
+    //# TSval timestamps sent on <SYN> and <SYN,ACK> segments are used to
+    //# initialize PAWS.
     fn timestamps_negotiate_fallback_and_atomic_output() {
         for active_ts in [false, true] {
             for passive_ts in [false, true] {
@@ -12866,6 +14807,160 @@ mod tests {
     }
 
     #[test]
+    // Scope: Cross-reference to section 4.3: earliest delayed echo, OOO retained echo and hole-fill replacement use TS.Recent/Last.ACK.sent algorithm.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+    //= type=test
+    //= reason=Cross-reference to section 4.3: earliest delayed echo, OOO retained echo and hole-fill replacement use TS.Recent/Last.ACK.sent algorithm.
+    //# The exact rules on which TSval MUST be echoed are given in
+    //# Section 4.3.
+    // Scope: With negotiated TS, missing option silently returns, does not abort and later valid timestamp data succeeds; missing RST option is exempt.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+    //= type=test
+    //= reason=With negotiated TS, missing option silently returns, does not abort and later valid timestamp data succeeds; missing RST option is exempt.
+    //# non-<RST> segment is received without a TSopt, a TCP SHOULD silently
+    //# drop the segment.
+    // Scope: With negotiated TS, missing option silently returns, does not abort and later valid timestamp data succeeds; missing RST option is exempt.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+    //= type=test
+    //= reason=With negotiated TS, missing option silently returns, does not abort and later valid timestamp data succeeds; missing RST option is exempt.
+    //# A TCP MUST NOT abort a TCP connection because any
+    //# segment lacks an expected TSopt.
+    // Scope: TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+    //= type=test
+    //= reason=TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+    //# Thus,
+    //# when delayed ACKs are in use, the receiver SHOULD reply with the
+    //# TSval field from the earliest unacknowledged segment.
+    // Scope: TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+    //= type=test
+    //= reason=TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+    //# An <ACK> for an out-of-order segment
+    //# SHOULD, therefore, contain the timestamp from the most recent
+    //# segment that advanced RCV.NXT.
+    // Scope: TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+    //= type=test
+    //= reason=TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
+    //# Thus, the timestamp from the
+    //# latest segment (which filled the hole) MUST be echoed.
+    // Scope: Valid TS.Recent uses modular serial nondecrease; expiry explicitly invalidates old baseline after 24 days; same SYN initializes it.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+    //= type=test
+    //= reason=Valid TS.Recent uses modular serial nondecrease; expiry explicitly invalidates old baseline after 24 days; same SYN initializes it.
+    //# The choice of incoming timestamps to be saved for this comparison
+    //# MUST guarantee a value that is monotonically non-decreasing.
+    // Scope: RST bypasses PAWS and terminates/challenges before TS.Recent/ts_latest updates; no timestamp or stale timestamp cannot veto sequence-valid RST.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+    //= type=test
+    //= reason=RST bypasses PAWS and terminates/challenges before TS.Recent/ts_latest updates; no timestamp or stale timestamp cannot veto sequence-valid RST.
+    //# When an <RST> segment is
+    //# received, it MUST NOT be subjected to the PAWS check by verifying an
+    //# acceptable value in SEG.TSval, and information from the Timestamps
+    //# option MUST NOT be used to update connection state information.
+    // Scope: Negotiated PAWS/missing TS gate precedes receive-window, RST-exempt, ACK and metadata processing. R1 drop schedules ACK; regular R2/R4/R5 follows for accepted TS.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+    //= type=test
+    //= reason=Negotiated PAWS/missing TS gate precedes receive-window, RST-exempt, ACK and metadata processing. R1 drop schedules ACK; regular R2/R4/R5 follows for accepted TS.
+    //# If the PAWS algorithm is used, the following processing MUST be
+    //# performed on all incoming segments for a synchronized connection.
+    // Scope: Negotiated PAWS/missing TS gate precedes receive-window, RST-exempt, ACK and metadata processing. R1 drop schedules ACK; regular R2/R4/R5 follows for accepted TS.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+    //= type=test
+    //= reason=Negotiated PAWS/missing TS gate precedes receive-window, RST-exempt, ACK and metadata processing. R1 drop schedules ACK; regular R2/R4/R5 follows for accepted TS.
+    //# Also, PAWS processing MUST take precedence over the regular TCP
+    //# acceptability check (Section 3.3 in [RFC0793]), which is performed
+    //# after verification of the received Timestamps option:
+    // Scope: Implementation tests TS only on raw arrival and ReceiveBuffer retains bytes/ranges, not timestamps. Existing hole-fill test has queued TSval=4 newer than filler=3 and does not distinguish rechecking old queued timestamps. Closure: queue accepted older TS before newer hole-fill, then assert queued bytes delivered/read without a second PAWS test; also assert raw retransmitted arrivals still checked. Partial evidence; closure remains TODO.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+    //= type=test
+    //= reason=Implementation tests TS only on raw arrival and ReceiveBuffer retains bytes/ranges, not timestamps. Existing hole-fill test has queued TSval=4 newer than filler=3 and does not distinguish rechecking old queued timestamps. Closure: queue accepted older TS before newer hole-fill, then assert queued bytes delivered/read without a second PAWS test; also assert raw retransmitted arrivals still checked. Partial evidence; closure remains TODO.
+    //# It is important to note that the timestamp MUST be checked only when
+    //# a segment first arrives at the receiver, regardless of whether it is
+    //# in sequence or it must be queued for later delivery.
+    // Scope: Stores ts_recent_at whenever TS.Recent changes, treating baseline invalid after 24 days; synthetic boundary+1 test accepts otherwise stale value.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.5
+    //= type=test
+    //= reason=Stores ts_recent_at whenever TS.Recent changes, treating baseline invalid after 24 days; synthetic boundary+1 test accepts otherwise stale value.
+    //# To detect how long the connection has been idle, the TCP MAY update a
+    //# clock or timestamp value associated with the connection whenever
+    //# TS.Recent is updated, for example.
+    // Scope: Negotiated ordinary ACK output echoes single retained TS.Recent; reactive RST overrides follow section 5.2.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+    //= type=test
+    //= reason=Negotiated ordinary ACK output echoes single retained TS.Recent; reactive RST overrides follow section 5.2.
+    //# (3)  When a TSopt is sent, its TSecr field is set to the current
+    //# TS.Recent value.
+    // Scope: R1 stale negotiated non-RST schedules immediate ACK and returns without accepting data; missing TS is silent per section 3.2.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+    //= type=test
+    //= reason=R1 stale negotiated non-RST schedules immediate ACK and returns without accepting data; missing TS is silent per section 3.2.
+    //# Send an acknowledgment in reply as specified in Section 3.9
+    //# of [RFC0793], page 69, and drop the segment.
+    // Scope: Tracks last TS.Recent update time and bypasses stale comparison after 24 days, then replaces echo baseline on eligible arrival.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.5
+    //= type=test
+    //= reason=Tracks last TS.Recent update time and bypasses stale comparison after 24 days, then replaces echo baseline on eligible arrival.
+    //# We therefore require that an implementation of PAWS include a
+    //# mechanism to "invalidate" the TS.Recent value when a connection is
+    //# idle for more than 24 days.
+    // Scope: Retains one pending echo value and last successfully committed ACK; separate ts_latest is TIME-WAIT freshness bookkeeping, not extra unprocessed echo queue.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+    //= type=test
+    //= reason=Retains one pending echo value and last successfully committed ACK; separate ts_latest is TIME-WAIT freshness bookkeeping, not extra unprocessed echo queue.
+    //# TS.Recent holds a timestamp to be echoed in TSecr whenever a
+    //# segment is sent, and Last.ACK.sent holds the ACK field from the
+    //# last segment sent.  Last.ACK.sent will equal RCV.NXT except when
+    //# <ACK>s have been delayed.
+    // Scope: Synchronized valid baseline uses serial timestamp comparison and last ACK sequence gate; expired baseline handled by section5.5 exception to stale test.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+    //= type=test
+    //= reason=Synchronized valid baseline uses serial timestamp comparison and last ACK sequence gate; expired baseline handled by section5.5 exception to stale test.
+    //# SEG.TSval >= TS.Recent and SEG.SEQ <= Last.ACK.sent
+    //#
+    //# then SEG.TSval is copied to TS.Recent; otherwise, it is ignored.
+    // Scope: TS values use same modular serial comparisons as sequence values. Wrap accepted, older values rejected; ambiguous half-space accepted only after baseline expiry.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+    //= type=test
+    //= reason=TS values use same modular serial comparisons as sequence values. Wrap accepted, older values rejected; ambiguous half-space accepted only after baseline expiry.
+    //# s < t  if 0 < (t - s) < 2^31,
+    // Scope: Shared negotiated PAWS gate precedes window and ACK metadata acceptance, with explicit RST and expired-baseline exemptions.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+    //= type=test
+    //= reason=Shared negotiated PAWS gate precedes window and ACK metadata acceptance, with explicit RST and expired-baseline exemptions.
+    //# R1)  If there is a Timestamps option in the arriving segment,
+    //# SEG.TSval < TS.Recent, TS.Recent is valid (see later
+    //# discussion), and if the RST bit is not set, then treat the
+    //# arriving segment as not acceptable:
+    // Scope: Accepted synchronized non-RST traffic uses serial nondecrease and last successful ACK gate; expired baseline is separate section5.5 path.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+    //= type=test
+    //= reason=Accepted synchronized non-RST traffic uses serial nondecrease and last successful ACK gate; expired baseline is separate section5.5 path.
+    //# R3)  If an arriving segment satisfies SEG.TSval >= TS.Recent and
+    //# SEG.SEQ <= Last.ACK.sent (see Section 4.3), then record its
+    //# timestamp in TS.Recent.
+    // Scope: PAWS-valid in-sequence text advances receive frontier; later gap fill advances through queued data. Negotiated TS assertion covers this path.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+    //= type=test
+    //= reason=PAWS-valid in-sequence text advances receive frontier; later gap fill advances through queued data. Negotiated TS assertion covers this path.
+    //# R4)  If an arriving segment is in sequence (i.e., at the left window
+    //# edge), then accept it normally.
+    // Scope: Valid timestamp OOO data queued and echoed correctly, but receive range metadata capped at64 rejects otherwise in-window 65th disjoint arrival. Core safe fallback does not establish unconditional queueing of arbitrary allowed fragmentation. Closure: represent accepted receive-window fragmentation with capacity-accounted bounded metadata, preserve retained-byte correctness, and test65-range/bridging/PAWS combinations; ordinary SACK report suppression is separately RFC2018 TODO. Partial evidence; closure remains TODO.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+    //= type=test
+    //= reason=Valid timestamp OOO data queued and echoed correctly, but receive range metadata capped at64 rejects otherwise in-window 65th disjoint arrival. Core safe fallback does not establish unconditional queueing of arbitrary allowed fragmentation. Closure: represent accepted receive-window fragmentation with capacity-accounted bounded metadata, preserve retained-byte correctness, and test65-range/bridging/PAWS combinations; ordinary SACK report suppression is separately RFC2018 TODO. Partial evidence; closure remains TODO.
+    //# R5)  Otherwise, treat the segment as a normal in-window,
+    //# out-of-sequence TCP segment (e.g., queue it for later delivery
+    //# to the user).
+    // Scope: 24-day expired baseline does not reject older/half-space value; eligible in-sequence arrival replaces TS.Recent and receive frontier advances.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.5
+    //= type=test
+    //= reason=24-day expired baseline does not reject older/half-space value; eligible in-sequence arrival replaces TS.Recent and receive frontier advances.
+    //# If
+    //# TS.Recent is found to be invalid, then the segment is accepted,
+    //# regardless of the failure of the timestamp check, and rule R3 updates
+    //# TS.Recent with the TSval from the new segment.
     fn timestamps_paws_echo_order_wrap_idle_and_rst_exemption() {
         let mut cfg = config(1024, 128);
         cfg.timestamps = true;
@@ -12962,6 +15057,32 @@ mod tests {
     }
 
     #[test]
+    // Negotiated timestamp option remains conservatively Karn-excluding retransmissions.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= type=test
+    //= reason=Negotiated timestamp option remains conservatively Karn-excluding retransmissions.
+    //# TCP MUST use Karn's algorithm [KP87] for taking RTT samples.
+    // Negotiated timestamp option remains conservatively Karn-excluding retransmissions.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= type=test
+    //= reason=Negotiated timestamp option remains conservatively Karn-excluding retransmissions.
+    //# That is, RTT samples MUST NOT be made using segments that were retransmitted (and thus
+    //# for which it is ambiguous whether the reply was for the first instance of the packet
+    //# or a later instance).
+    // Scope: Ordinary bounded TSecr-qualified RTT sample is called only on advancing ACK; existing test covers valid/forged advancing echoes, not a matching echo on non-advancing ACK with pending sample. Closure: test matching TSecr on duplicate and SACK-only ACK without consuming/updating the ordinary sample. Scope distinction: RACK ack_sample derives now-minus-local-send-time for original transmissions, not received TSecr, so its non-advancing SACK RTT updates are a different measurement mechanism, not evidence of violating this TSecr-only rule; test that separation under negotiated TS. Partial evidence; closure remains TODO.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
+    //= type=test
+    //= reason=Ordinary bounded TSecr-qualified RTT sample is called only on advancing ACK; existing test covers valid/forged advancing echoes, not a matching echo on non-advancing ACK with pending sample. Closure: test matching TSecr on duplicate and SACK-only ACK without consuming/updating the ordinary sample. Scope distinction: RACK ack_sample derives now-minus-local-send-time for original transmissions, not received TSecr, so its non-advancing SACK RTT updates are a different measurement mechanism, not evidence of violating this TSecr-only rule; test that separation under negotiated TS. Partial evidence; closure remains TODO.
+    //# RTTM Rule: A TSecr value received in a segment MAY be used to update
+    //# the averaged RTT measurement only if the segment advances
+    //# the left edge of the send window, i.e., SND.UNA is
+    //# increased.
+    // Scope: Ordinary RTTM retains only one outstanding original-transmission sample and rejects same-millisecond reuse; this conservatively declines per-packet and retransmission TS sampling rather than requiring unbounded metadata. Existing valid/forged echo test does not establish sustained-flight estimator history. Closure: test ordinary RTTM sampling cadence and effective RFC6298 history with many ACKs per RTT, plus mixed RACK local-send-time samples; adjust cadence/weights only if measured history truncates. RACK local-clock ACK samples are not TSecr RTTM. Appendix G is a suggestion, not a mandatory exact formula. Partial evidence; closure remains TODO.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-4.2
+    //= type=test
+    //= reason=Ordinary RTTM retains only one outstanding original-transmission sample and rejects same-millisecond reuse; this conservatively declines per-packet and retransmission TS sampling rather than requiring unbounded metadata. Existing valid/forged echo test does not establish sustained-flight estimator history. Closure: test ordinary RTTM sampling cadence and effective RFC6298 history with many ACKs per RTT, plus mixed RACK local-send-time samples; adjust cadence/weights only if measured history truncates. RACK local-clock ACK samples are not TSecr RTTM. Appendix G is a suggestion, not a mandatory exact formula. Partial evidence; closure remains TODO.
+    //# to update the RTT estimator, an implementation SHOULD try to adhere
+    //# to the spirit of the history specified in [RFC6298].
     fn timestamps_rtt_validated_echo_and_karn() {
         let mut cfg = config(1024, 128);
         cfg.timestamps = true;
@@ -13009,6 +15130,40 @@ mod tests {
     }
 
     #[test]
+    // Scope: Negotiated TS survives ordinary data/FIN/keepalive and clock wrap under minimum path budget; assertions include output rollback.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+    //= type=test
+    //= reason=Negotiated TS survives ordinary data/FIN/keepalive and clock wrap under minimum path budget; assertions include output rollback.
+    //# Once TSopt has been successfully negotiated, that is both <SYN> and
+    //# <SYN,ACK> contain TSopt, the TSopt MUST be sent in every non-<RST>
+    //# segment for the duration of the connection, and SHOULD be sent in an
+    //# <RST> segment (see Section 5.2 for details).
+    // Scope: Embedding gap: TSval=(caller Instant/1000) mod 2^32 and backwards Instant is rejected; no contract/runtime test guarantees caller microseconds proportional to real time or bounds forward jumps. Closure: define and validate embedding clock requirements, test rate/jump limits and real monotonic clock integration; synthetic wrap vectors prove arithmetic only. Partial evidence; closure remains TODO.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
+    //= type=test
+    //= reason=Embedding gap: TSval=(caller Instant/1000) mod 2^32 and backwards Instant is rejected; no contract/runtime test guarantees caller microseconds proportional to real time or bounds forward jumps. Closure: define and validate embedding clock requirements, test rate/jump limits and real monotonic clock integration; synthetic wrap vectors prove arithmetic only. Partial evidence; closure remains TODO.
+    //# Values of this
+    //# clock MUST be at least approximately proportional to real time, in
+    //# order to measure actual RTT.
+    // Scope: Arithmetic period is 2^32 milliseconds (>255 seconds), but caller time can jump/scale arbitrarily and no supported MSL/clock-rate contract proves physical recycle period. Closure: bind monotonic microsecond input to real-time rate and maximum MSL, validate/document embedding contract in code and add period/rate assertion; wrap test establishes arithmetic only. Partial evidence; closure remains TODO.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
+    //= type=test
+    //= reason=Arithmetic period is 2^32 milliseconds (>255 seconds), but caller time can jump/scale arbitrarily and no supported MSL/clock-rate contract proves physical recycle period. Closure: bind monotonic microsecond input to real-time rate and maximum MSL, validate/document embedding contract in code and add period/rate assertion; wrap test establishes arithmetic only. Partial evidence; closure remains TODO.
+    //# The recycling time of the timestamp clock MUST be greater than
+    //# MSL seconds.
+    // Scope: Wire TS fields u32 network-order; TSval uses caller millisecond clock modulo 32 bits. Physical rate guarantees separately TODO.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+    //= type=test
+    //= reason=Wire TS fields u32 network-order; TSval uses caller millisecond clock modulo 32 bits. Physical rate guarantees separately TODO.
+    //# The Timestamps option carries two four-byte timestamp fields.  The
+    //# TSval field contains the current value of the timestamp clock of the
+    //# TCP sending the option.
+    // Scope: TSval increments at1ms in caller microsecond units, but physical rate depends on embedding. Same real-clock gap as section4.1/5.4 MUSTs: closure requires validated monotonic real-time microsecond contract and rate/integration assertions, not synthetic Instant arithmetic alone. Partial evidence; closure remains TODO.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
+    //= type=test
+    //= reason=TSval increments at1ms in caller microsecond units, but physical rate depends on embedding. Same real-clock gap as section4.1/5.4 MUSTs: closure requires validated monotonic real-time microsecond contract and rate/integration assertions, not synthetic Instant arithmetic alone. Partial evidence; closure remains TODO.
+    //# Based upon these considerations, we choose a timestamp clock
+    //# frequency in the range 1 ms to 1 sec per tick.
     fn timestamps_ip_budget_data_fin_keepalive_and_clock_wrap() {
         for v6 in [false, true] {
             let mut cfg = config(1024, 128);
@@ -13082,6 +15237,21 @@ mod tests {
         assert_ne!(a.reuse_iss(1), a.reuse_iss(2));
     }
     #[test]
+    // Scope: Negotiated TS probe and user-abort RST asserted; same-feature simultaneous opens retain negotiation.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+    //= type=test
+    //= reason=Negotiated TS probe and user-abort RST asserted; same-feature simultaneous opens retain negotiation.
+    //# Once TSopt has been successfully negotiated, that is both <SYN> and
+    //# <SYN,ACK> contain TSopt, the TSopt MUST be sent in every non-<RST>
+    //# segment for the duration of the connection, and SHOULD be sent in an
+    //# <RST> segment (see Section 5.2 for details).
+    // Scope: Local user abort on negotiated connection emits TS; not a reactive RST requiring TSval=0.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+    //= type=test
+    //= reason=Local user abort on negotiated connection emits TS; not a reactive RST requiring TSval=0.
+    //# If an <RST> is being generated
+    //# because of a user abort, and Snd.TS.OK is set, then a Timestamps
+    //# option SHOULD be included in the <RST>.
     fn timestamps_lower_mss_probe_garbage_keepalive_abort_and_simultaneous_open() {
         let mut cfg = config(1024, 128);
         cfg.timestamps = true;

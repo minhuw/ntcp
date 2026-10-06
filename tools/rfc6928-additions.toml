@@ -1,0 +1,148 @@
+# Operative requirements omitted by keyword extraction; exact published text, whitespace reflow only.
+
+# 6928-011
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-2"
+quote = '''
+min (10*MSS, max (2*MSS, 14600)) (1)
+'''
+
+# 6928-012
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-2"
+quote = '''
+This change applies to the initial window of the connection in the first round-trip time (RTT) of data transmission during or following the TCP three-way handshake. Neither the SYN/ACK nor its ACK in the three-way handshake should increase the initial window size.
+'''
+
+# 6928-013
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-2"
+quote = '''
+These changes do NOT change the loss window, which must remain 1 segment of MSS bytes (to permit the lowest possible window size in the case of severe congestion).
+'''
+
+# 6928-014
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-2"
+quote = '''
+Implementations must also follow RFC 6298 [RFC6298] in order to avoid spurious RTO as described in Section 9.
+'''
+
+# 6928-015
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-1"
+quote = '''
+We recommend that all TCP implementations have a settable TCP IW parameter, as long as there is a reasonable effort to monitor for possible interactions with other Internet applications and services as described in Section 12. Furthermore, Section 10 details why 10 segments may be an appropriate value, and while that value may continue to rise in the future, this document does not include any supporting evidence for values of IW larger than 10.
+'''
+
+# 6928-016
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-2"
+quote = '''
+Note that all the test results described in this document were based on the regular Ethernet MTU of 1500 bytes. Future study of the effect of a different MTU may be needed to fully validate (1) above.
+'''
+
+# 6928-017
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-3"
+quote = '''
+When web browsers open simultaneous TCP connections to the same destination, they are working against TCP's congestion control mechanisms [FF99]. Combining this behavior with larger initial windows further increases the burstiness and unfairness to other traffic in the network. If a larger initial window causes harm to any other flows, then local application tuning will reveal that having fewer concurrent connections yields better performance for some users. Any content provider deploying IW10 in conjunction with content distributed across multiple domains is explicitly encouraged to perform measurement experiments to detect such problems, and to consider reducing the number of concurrent connections used to retrieve their content.
+'''
+
+# 6928-018
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-3"
+quote = '''
+Some implementations advertise a small initial receive window (Table 2 in [Duk10]), effectively limiting how much window a remote host may use. In order to realize the full benefit of the large initial window, implementations are encouraged to advertise an initial receive window of at least 10 segments, except for the circumstances where a larger initial window is deemed harmful. (See Section 8 below.)
+'''
+
+# 6928-019
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-4"
+quote = '''
+we argue that the browsers and other application need to respect HTTP 1.1 regulation and stop increasing the number of simultaneous TCP connections.
+'''
+
+# 6928-020
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-4"
+quote = '''
+Pacing is not required in this proposal due to a strong preference for a simple solution.
+'''
+
+# 6928-021
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-8"
+quote = '''
+The negative impact can be mitigated by hosts directly connected to a low-speed link advertising an initial receive window smaller than 10 segments. This can be achieved either through manual configuration by the users or through the host stack auto-detecting the low- bandwidth links.
+'''
+
+# 6928-022
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
+quote = '''
+Further experiments are required before a larger initial window shall be enabled by default in the Internet. The existing measurement results indicate that this does not cause significant harm to other traffic. However, widespread use in the Internet could reveal issues not known yet, e.g., regarding fairness or impact on latency- sensitive traffic such as VoIP.
+'''
+
+# 6928-023
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
+quote = '''
+Key metrics to monitor are the rate of packet losses, ECN marking, and segment retransmissions during the initial burst.
+'''
+
+# 6928-024
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
+quote = '''
+Other relevant metrics that may indicate a need to reduce the IW include an increased overall percentage of packet loss or segment retransmissions as well as application-level metrics such as reduced data transfer completion times or impaired media quality.
+'''
+
+# 6928-025
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
+quote = '''
+It is important also to take into account hosts that do not implement a larger initial window. Furthermore, any deployment of IW10 should be aware that there are potential side effects to real-time traffic (such as VoIP).
+'''
+
+# 6928-026
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
+quote = '''
+The IETF TCPM working group is very much interested in further reports from experiments with this specification and encourages the publication of such measurement data. By now, there are no adequate studies available that either prove or do not prove the impact of IW10 to real-time traffic. Further experimentation in this direction is encouraged.
+'''
+
+# 6928-027
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
+quote = '''
+As use of IW10 becomes more prevalent, monitoring and analysis of flows throughout the network will be needed to assess the impact across the spectrum of scenarios found on the real Internet.
+'''
+
+# 6928-028
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-13"
+quote = '''
+Although a modest, static increase of IW to 10 may address the near- term need for better web performance, much work is needed from the TCP research community to find a long-term solution to the TCP flow startup problem.
+'''
+
+# 6928-029
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-1.1"
+quote = '''
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in RFC 2119 [RFC2119].
+'''
+
+# 6928-030
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-7"
+quote = '''
+Although no severe unfairness has been detected on all the known tests so far, further study on this topic may be warranted.
+'''
+
+# 6928-031
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
+quote = '''
+Further experiments are needed on the design of such a cache and corresponding heuristics.
+'''

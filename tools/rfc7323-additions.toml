@@ -1,0 +1,252 @@
+# Agent-only annotation audit: official RFC quotes, whitespace reflow only.
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-3.2"
+reason = "Optional asymmetric crossing-SYN late timestamp offer not selected. learn_syn requires local config and received SYN TS; SYN-ACK timestamp output is gated by that negotiated bool. Both-enabled simultaneous open is supported/tested, but no requirement to offer after asymmetric crossing SYN. Missing mandatory negotiated TS processing remains applicable."
+quote = '''
+In the case of crossing <SYN> segments where one <SYN> contains a
+TSopt and the other doesn't, both sides MAY send a TSopt in the
+<SYN,ACK> segment.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.2"
+reason = "Optional stricter TSecr-based reset acceptance is not selected. Reset acceptance uses RFC5961 sequence check; RST TS cannot modify timestamp connection state and is deliberately ignored. No mandate to add cryptographic or echo validation."
+quote = '''
+SEG.TSecr MAY be used to provide stricter <RST> acceptance checks.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-1.4"
+reason = "Keyword definition only; not endpoint behavior. Generated extraction currently omits section 1.4, but full inventory records it."
+quote = '''
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+"SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this
+document are to be interpreted as described in [RFC2119].
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.1"
+quote = '''
+This option is sent only in a <SYN> segment (a
+segment with the SYN bit on), hence the window scale is fixed in each
+direction when a connection is opened.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.2"
+quote = '''
+Kind: 3
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.2"
+quote = '''
+Length: 3 bytes
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.3"
+quote = '''
+The scale factor applies only to the window field as transmitted in
+the TCP header; each TCP using extended windows will maintain the
+window values locally as 32-bit numbers.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.4"
+quote = '''
+4)  On first retransmission, or if the sequence number is out of
+window by less than 2^Rcv.Wind.Shift, then do normal
+retransmission(s) without regard to the receiver window as long
+as the original segment was in window when it was sent.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-3.2"
+quote = '''
+Kind: 8
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-3.2"
+quote = '''
+Length: 10 bytes
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-3.2"
+quote = '''
+The Timestamps option carries two four-byte timestamp fields.  The
+TSval field contains the current value of the timestamp clock of the
+TCP sending the option.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-4.3"
+quote = '''
+(3)  When a TSopt is sent, its TSecr field is set to the current
+TS.Recent value.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.2"
+quote = '''
+TSval timestamps sent on <SYN> and <SYN,ACK> segments are used to
+initialize PAWS.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.3"
+quote = '''
+Send an acknowledgment in reply as specified in Section 3.9
+of [RFC0793], page 69, and drop the segment.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.5"
+quote = '''
+We therefore require that an implementation of PAWS include a
+mechanism to "invalidate" the TS.Recent value when a connection is
+idle for more than 24 days.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-7"
+reason = "Outside role: this crate is a TCP endpoint, not a forwarding middlebox or TCP option rewriter. Negotiation/ignoring endpoint obligations remain applicable."
+quote = '''
+Middleboxes must not remove or modify the Window
+Scale option from <SYN,ACK> segments.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-7"
+reason = "Outside role: not a stateful firewall performing transit window filtering. Endpoint negotiated-window semantics are audited separately."
+quote = '''
+These middle boxes must also support the Window Scale option
+and apply the scale factor when processing segments.  If the
+window scale factor cannot be determined, it must not do
+window-based processing.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-7"
+reason = "Outside role: not a middlebox modifying transit segments; negotiated endpoint missing-option drops remain mandatory/applicable."
+quote = '''
+Middleboxes should not
+remove the Timestamps option.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#appendix-A"
+quote = '''
+If it does overflow, than a value of 65535
+should be inserted into the Urgent Pointer.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.1"
+quote = '''
+The maximum receive window, and therefore the scale factor, is
+determined by the maximum receive buffer space.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-4.3"
+quote = '''
+TS.Recent holds a timestamp to be echoed in TSecr whenever a
+segment is sent, and Last.ACK.sent holds the ACK field from the
+last segment sent.  Last.ACK.sent will equal RCV.NXT except when
+<ACK>s have been delayed.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-4.3"
+quote = '''
+SEG.TSval >= TS.Recent and SEG.SEQ <= Last.ACK.sent
+
+then SEG.TSval is copied to TS.Recent; otherwise, it is ignored.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.2"
+quote = '''
+s < t  if 0 < (t - s) < 2^31,
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.3"
+quote = '''
+R1)  If there is a Timestamps option in the arriving segment,
+SEG.TSval < TS.Recent, TS.Recent is valid (see later
+discussion), and if the RST bit is not set, then treat the
+arriving segment as not acceptable:
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.3"
+quote = '''
+R2)  If the segment is outside the window, reject it (normal TCP
+processing).
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.3"
+quote = '''
+R3)  If an arriving segment satisfies SEG.TSval >= TS.Recent and
+SEG.SEQ <= Last.ACK.sent (see Section 4.3), then record its
+timestamp in TS.Recent.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.3"
+quote = '''
+R4)  If an arriving segment is in sequence (i.e., at the left window
+edge), then accept it normally.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.3"
+quote = '''
+R5)  Otherwise, treat the segment as a normal in-window,
+out-of-sequence TCP segment (e.g., queue it for later delivery
+to the user).
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.4"
+quote = '''
+Based upon these considerations, we choose a timestamp clock
+frequency in the range 1 ms to 1 sec per tick.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.4"
+quote = '''
+The PAWS mechanism also puts a strong monotonicity requirement on the
+sender's timestamp clock.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.5"
+quote = '''
+If
+TS.Recent is found to be invalid, then the segment is accepted,
+regardless of the failure of the timestamp check, and rule R3 updates
+TS.Recent with the TSval from the new segment.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-7"
+quote = '''
+Hence, implementers should take care to not open the TCP window
+drastically beyond the requirements of the connection.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7323#section-7"
+reason = "Conditional security guidance: no separate TCP-AO/IPsec/header-authentication mechanism is implemented by this endpoint; selected TCP checksum already covers options with the entire segment. Not a claim that checksum resists malicious rewriting and not a waiver for an embedding adding header authentication without option protection."
+quote = '''
+Mechanisms to protect the TCP header from modification should also
+protect the TCP options.
+'''

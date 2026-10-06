@@ -1,0 +1,190 @@
+# Agent audit: exact RFC text, whitespace reflow only; no behavior changes.
+
+# 6298:name-abstract:1
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#name-abstract"
+reason = "Historical statement upgrading RFC1122, not a distinct algorithm step. Algorithm obligations are inventoried in sections2-5; this exception does not waive their implementation or test gaps."
+quote = '''
+It expands on the discussion in Section 4.2.3.1 of RFC 1122 and upgrades the
+requirement of supporting the algorithm from a SHOULD to a MUST.
+'''
+
+# 6298:section-1:1
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-1"
+reason = "Historical statement upgrading RFC1122, not a distinct algorithm step. Algorithm obligations are inventoried in sections2-5; this exception does not waive their implementation or test gaps."
+quote = '''
+In addition, this document expands on the discussion in Section 4.2.3.1 of RFC
+1122 and upgrades the requirement of supporting the algorithm from a SHOULD to a
+MUST.
+'''
+
+# 6298:section-2:2
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-2"
+reason = "Optional initial value above one second is not selected. RttEstimator::new always initializes one second; rto_min_us controls the sampled floor, not the initial RTO. Configurable post-SYN timeout guard is separately implemented and audited."
+quote = '''
+A TCP implementation MAY still use this value (or any other value > 1 second).
+'''
+
+# 6298:section-5:5
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
+reason = "Optional clearing after repeated backoff is not selected. RttEstimator::backoff changes only RTO; SRTT/variance remain available and the next sample uses subsequent-sample equations. New-connection construction is not repeated-backoff clearing."
+quote = '''
+Note that a TCP implementation MAY clear SRTT and RTTVAR after backing off the
+timer multiple times as it is likely that the current SRTT and RTTVAR are bogus
+in this situation.
+'''
+
+# 6298:section-1:keywords
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-1"
+quote = '''
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
+"SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be
+interpreted as described in [Bra97].
+'''
+
+# 6298:section-1:keywords
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-1"
+reason = "RFC2119 terminology definition, not runtime behavior; all protocol uses above remain classified separately."
+quote = '''
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
+"SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be
+interpreted as described in [Bra97].
+'''
+
+# 6298:section-2:state
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-2"
+quote = '''
+To compute the current RTO, a TCP sender maintains two state variables, SRTT
+(smoothed round-trip time) and RTTVAR (round-trip time variation). In addition,
+we assume a clock granularity of G seconds.
+'''
+
+# 6298:section-2:first-equations
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-2"
+quote = '''
+SRTT <- R RTTVAR <- R/2 RTO <- SRTT + max (G, K*RTTVAR) where K = 4.
+'''
+
+# 6298:section-2:subsequent-equations
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-2"
+quote = '''
+RTTVAR <- (1 - beta) * RTTVAR + beta * |SRTT - R'| SRTT <- (1 - alpha) * SRTT +
+alpha * R'
+'''
+
+# 6298:section-2:old-srtt
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-2"
+quote = '''
+The value of SRTT used in the update to RTTVAR is its value before updating SRTT
+itself using the second assignment.
+'''
+
+# 6298:section-3:timestamp-permission
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-3"
+quote = '''
+The only case when TCP can safely take RTT samples from retransmitted segments
+is when the TCP timestamp option [JBB92] is employed, since the timestamp option
+removes the ambiguity regarding which instance of the data segment triggered the
+acknowledgment.
+'''
+
+# 6298:section-3:timestamp-permission
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-3"
+reason = "Timestamp-based RTT sampling on retransmitted segments is permitted, not required. This implementation conservatively excludes all retransmissions from the ordinary RTO estimator, including RACK ack_sample; timestamps_rtt_validated_echo_and_karn and retransmitted_ack_requires_min_rtt_and_matching_timestamp assert exclusion. Does not excuse minimum sampling-rate TODO."
+quote = '''
+The only case when TCP can safely take RTT samples from retransmitted segments
+is when the TCP timestamp option [JBB92] is employed, since the timestamp option
+removes the ambiguity regarding which instance of the data segment triggered the
+acknowledgment.
+'''
+
+# 6298:section-3:many-timestamp-samples
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-3"
+quote = '''
+However, when using the timestamp option, each ACK can be used as an RTT sample.
+RFC 1323 [JBB92] suggests that TCP connections utilizing large congestion
+windows should take many RTT samples per window of data to avoid aliasing
+effects in the estimated RTT.
+'''
+
+# 6298:section-5:5.1
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
+quote = '''
+(5.1) Every time a packet containing data is sent (including a retransmission),
+if the timer is not running, start it running so that it will expire after RTO
+seconds (for the current value of RTO).
+'''
+
+# 6298:section-5:5.2
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
+quote = '''
+(5.2) When all outstanding data has been acknowledged, turn off the
+retransmission timer.
+'''
+
+# 6298:section-5:5.3
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
+quote = '''
+(5.3) When an ACK is received that acknowledges new data, restart the
+retransmission timer so that it will expire after RTO seconds (for the current
+value of RTO).
+'''
+
+# 6298:section-5:5.4
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
+quote = '''
+(5.4) Retransmit the earliest segment that has not been acknowledged by the TCP
+receiver.
+'''
+
+# 6298:section-5:5.6
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
+quote = '''
+(5.6) Start the retransmission timer, such that it expires after RTO seconds
+(for the value of RTO after the doubling operation outlined in 5.5).
+'''
+
+# 6298:section-5:collapse
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
+quote = '''
+Note that after retransmitting, once a new RTT measurement is obtained (which
+can only happen when new data has been sent and acknowledged), the computations
+outlined in Section 2 are performed, including the computation of RTO, which may
+result in "collapsing" RTO back down after it has been subject to exponential
+back off (rule 5.5).
+'''
+
+# 6298:section-5:cleared-reinitialize
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
+quote = '''
+Once SRTT and RTTVAR are cleared, they should be initialized with the next RTT
+sample taken per (2.2) rather than using (2.3).
+'''
+
+# 6298:section-5:cleared-reinitialize
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
+reason = "Conditional on optional repeated-backoff clearing, which is not selected; backoff retains SRTT/RTTVAR. First sample of a new estimator is separately covered, not claimed as evidence of optional clearing."
+quote = '''
+Once SRTT and RTTVAR are cleared, they should be initialized with the next RTT
+sample taken per (2.2) rather than using (2.3).
+'''

@@ -1,0 +1,18 @@
+# Agent-only annotation audit: official RFC quotes, whitespace reflow only.
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc2883#section-4"
+reason = "record_duplicate resets on accepted raw data/FIN and records latest prefix/overlap; fixed one report and failed-output transaction tested. Rejected or PAWS-stale arrivals can retain an earlier pending report, and ACK-only arrivals do not clear it. Closure: define most-recent-packet supersession precisely and test batch duplicate then rejected/missing-TS/stale-TS/ACK-only arrival before successful ACK; if older report is emitted contrary to rule, clear at validated appropriate arrival boundary without manufacturing duplicate evidence."
+quote = '''
+(1) A D-SACK block is only used to report a duplicate contiguous
+sequence of data received by the receiver in the most recent packet.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc2883#section-4.3"
+reason = "Prior-cycle ambiguity is not ruled out by DSACK; sender bounds interval validity and never counts DSACK as delivery, but RACK growth/TLP cancellation consume it without prior-cycle-specific assertion. Closure: inject stale prior-cycle duplicate report across sequence wrap and assert bounded advisory-only response, no release of send bytes, inappropriate congestion undo, or fresh RTT credit."
+quote = '''
+TCP senders receiving D-SACK blocks should be aware that a segment
+reported as a duplicate segment could possibly have been from a prior
+cycle through the sequence number space.
+'''

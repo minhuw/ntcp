@@ -1,0 +1,201 @@
+# Open semantic/test gaps and explicitly scoped optional/actor exceptions.
+
+# 6928-001
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
+reason = "External operational validation TODO for supported IW10 opt-in usage: the actor enabling IW10 (vendor or operator) must supply deployment before/after performance measurements or a justified SHOULD decision. Default-disabled configuration evidence is scoped implementation evidence only, not deployment satisfaction. Instrumentation may be external; no new built-in transport telemetry API is required. Sender cache/fallback and default-enablement obligations remain separate."
+quote = '''
+Anyone (stack vendors, network administrators, etc.) turning on a larger initial window SHOULD ensure that the performance is monitored before and after that change.
+'''
+
+# 6928-002
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
+reason = "Sender/endpoint role: no cross-connection setup cache or performance-driven fallback selection is implemented. Add path/peer setup telemetry cache with loss/ECN/retransmission heuristics and tested fallback to RFC3390. Configurable initial_window is not automatic fallback and opt-in does not waive this SHOULD."
+quote = '''
+The sender SHOULD cache such information about connection setups using an initial window larger than allowed by RFC 3390, and new connections SHOULD fall back to the initial window allowed by RFC 3390 if there is evidence of performance issues.
+'''
+
+# 6928-003
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
+reason = "Conditional instruction to deployment users observing service deterioration: they must disable IW10/use RFC3390 at deployment. This library neither observes application media quality nor operates a deployment; users can select Rfc5681 per ConnectionConfig. No deployment result is claimed; sender cache/fallback and vendor monitoring requirements remain TODO."
+quote = '''
+If users observe any significant deterioration of performance, they SHOULD fall back to an initial window as allowed by RFC 3390 for safety reasons.
+'''
+
+# 6928-006
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-2"
+reason = "This is an indented quotation of the previous RFC3390 rule being revised, not a new RFC6928 mandate. Default RFC5681 loss requirement is separately evidenced; opt-in IW10 recommended first-SYN-timeout behavior remains TODO (current implementation conservatively resets)."
+quote = '''
+If the SYN or SYN/ACK is lost, the initial window used by a sender after a correctly transmitted SYN MUST be one segment consisting of MSS bytes.
+'''
+
+# 6928-007
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-2"
+reason = "set_initial_mss and timeout unconditionally reduce after first SYN/SYNACK timeout, including IW10. initial_window_syn_loss_and_output_retries_remain_conservative asserts this policy but does not prove true loss. Implement the recommended distinction between first possibly-spurious retransmission and >1/true-loss, or justify a deliberate SHOULD departure with measured rationale and tests."
+quote = '''
+For this reason, it is RECOMMENDED that implementations refrain from resetting the initial window to 1 segment, unless there have been more than one SYN or SYN/ACK retransmissions or true loss detection has been made.
+'''
+
+# 6928-009
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-2"
+reason = "IW10 restart always uses initial_window.bytes; no loss-in-initial/restart-window and >4KB state reduces future RW to RFC3390. Add loss/byte-threshold tracking and actual restart trace after fast-retransmit and RTO losses, with <=4KB boundary cases. Experiment opt-in triggers this SHOULD; optional IW10 selection is not an exception."
+quote = '''
+Furthermore, to limit any negative effect that a larger initial window may have on links with limited bandwidth or buffer space, implementations SHOULD fall back to RFC 3390 for the restart window (RW) if any packet loss is detected during either the initial window or a restart window, and more than 4 KB of data is sent.
+'''
+
+# 6928-010
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-9"
+reason = "accept_ack re-arms deadline at now+current RTO while flight remains, cancels at zero. Existing retransmission tests assert restart on retransmission, not each new-data ACK with outstanding bytes and changing estimator RTO under IW10. Add exact ACK-time deadline assertions including divided/delayed ACK and last-ACK cancellation; full RFC6298 audit is separate."
+quote = '''
+To minimize spurious retransmissions, implementations MUST follow RFC 6298 [RFC6298] to restart the retransmission timer with the current value of RTO for each ACK received that acknowledges new data.
+'''
+
+# 6928-014
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-2"
+reason = "Stack obligation after IW10 opt-in: estimator/backoff/Karn have partial existing evidence, but full RFC6298 audit and exact per-new-ACK deadline restart evidence are missing here. Add remaining RFC6298 evidence; section9 exact restart TODO is not discharged by estimator arithmetic."
+quote = '''
+Implementations must also follow RFC 6298 [RFC6298] in order to avoid spurious RTO as described in Section 9.
+'''
+
+# 6928-015
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-1"
+reason = "ConnectionConfig provides Rfc5681/Iw10 selection; existing tests establish default-disabled IW10 and explicit opt-in only. External operational validation remains TODO for supported opt-in usage: the actor enabling IW10 must supply deployment before/after metrics and evidence of reasonable monitoring effort for application/service interactions. External instrumentation is sufficient; no built-in transport API is prescribed. Settable configuration alone does not establish deployment satisfaction."
+quote = '''
+We recommend that all TCP implementations have a settable TCP IW parameter, as long as there is a reasonable effort to monitor for possible interactions with other Internet applications and services as described in Section 12. Furthermore, Section 10 details why 10 segments may be an appropriate value, and while that value may continue to rise in the future, this document does not include any supporting evidence for values of IW larger than 10.
+'''
+
+# 6928-016
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-2"
+reason = "Research validation of non-Ethernet MTU impacts is an experiment-design task, not a transport algorithm requirement. Unit MSS/jumbo/path-budget vectors verify arithmetic only, not fairness or real-network validation; no deployment safety result is claimed."
+quote = '''
+Note that all the test results described in this document were based on the regular Ethernet MTU of 1500 bytes. Future study of the effect of a different MTU may be needed to fully validate (1) above.
+'''
+
+# 6928-017
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-3"
+reason = "Content-provider actor must measure domain-sharded application concurrency and consider reducing parallel retrievals. This TCP library is neither a content provider nor an HTTP scheduling implementation; sender monitoring/fallback and stack-vendor obligations remain TODO, not waived by this outside-role exception."
+quote = '''
+When web browsers open simultaneous TCP connections to the same destination, they are working against TCP's congestion control mechanisms [FF99]. Combining this behavior with larger initial windows further increases the burstiness and unfairness to other traffic in the network. If a larger initial window causes harm to any other flows, then local application tuning will reveal that having fewer concurrent connections yields better performance for some users. Any content provider deploying IW10 in conjunction with content distributed across multiple domains is explicitly encouraged to perform measurement experiments to detect such problems, and to consider reducing the number of concurrent connections used to retrieve their content.
+'''
+
+# 6928-018
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-3"
+reason = "Receiver-stack performance recommendation: configured receive_capacity and MSS can allow >=10 segments, but storage capacity may intentionally be small and there is no IW10-specific receive-window default assertion or harmful-environment policy evidence. Assess chosen receive defaults and add actual initial advertised-window assertions relative to local RMSS, including justified small-storage/slow-link cases."
+quote = '''
+Some implementations advertise a small initial receive window (Table 2 in [Duk10]), effectively limiting how much window a remote host may use. In order to realize the full benefit of the large initial window, implementations are encouraged to advertise an initial receive window of at least 10 segments, except for the circumstances where a larger initial window is deemed harmful. (See Section 8 below.)
+'''
+
+# 6928-019
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-4"
+reason = "HTTP browser/application concurrency actor, not a TCP transport library. ntcp does not create HTTP requests or allocate domains; no application-concurrency conformance is claimed. IW10 sender/vendor monitoring TODOs remain."
+quote = '''
+we argue that the browsers and other application need to respect HTTP 1.1 regulation and stop increasing the number of simultaneous TCP connections.
+'''
+
+# 6928-020
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-4"
+reason = "Explicitly optional/non-required pacing; no pacing implementation is claimed. Absence of pacing cannot waive IW10 byte bound, loss window, fallback or monitoring requirements."
+quote = '''
+Pacing is not required in this proposal due to a strong preference for a simple solution.
+'''
+
+# 6928-021
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-8"
+reason = "Optional mitigation choice, not compulsory auto-detection: manual receive_capacity can constrain window. No existing test explicitly ties a configured slow-link capacity to <10 local-RMSS initial advertisement. Add that configuration/wire assertion; no assertion of bandwidth auto-detection is warranted."
+quote = '''
+The negative impact can be mitigated by hosts directly connected to a low-speed link advertising an initial receive window smaller than 10 segments. This can be achieved either through manual configuration by the users or through the host stack auto-detecting the low- bandwidth links.
+'''
+
+# 6928-022
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
+reason = "Internet-wide default experiment/research prerequisite is outside a library annotation audit: no default IW10 rollout is proposed, and default prohibition is separately evidenced. Researchers/deployers still owe experiments before broader default enablement; this is not a safety waiver for opt-in sender obligations."
+quote = '''
+Further experiments are required before a larger initial window shall be enabled by default in the Internet. The existing measurement results indicate that this does not cause significant harm to other traffic. However, widespread use in the Internet could reveal issues not known yet, e.g., regarding fairness or impact on latency- sensitive traffic such as VoIP.
+'''
+
+# 6928-023
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
+reason = "External operational validation TODO for supported IW10 opt-in usage: the actor enabling IW10 must supply before/after deployment rates of packet loss, ECN marking and segment retransmission scoped to the initial burst. Measurements may use external instrumentation; missing deployment evidence is not a missing mandatory library telemetry feature. Default-disabled implementation evidence does not satisfy opt-in deployment monitoring; sender cache/fallback remains a separate obligation."
+quote = '''
+Key metrics to monitor are the rate of packet losses, ECN marking, and segment retransmissions during the initial burst.
+'''
+
+# 6928-024
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
+reason = "Operational/application metric assessment includes transfer completion and media quality, not observable inside this transport library alone. Deployment operators must compare workload behavior; no such deployment has been audited. Required sender cache/fallback and vendor initial-burst monitoring remain TODO."
+quote = '''
+Other relevant metrics that may indicate a need to reduce the IW include an increased overall percentage of packet loss or segment retransmissions as well as application-level metrics such as reduced data transfer completion times or impaired media quality.
+'''
+
+# 6928-025
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
+reason = "Deployment experiment designers must assess mixed-IW and real-time cross-traffic; this library does not operate the network experiment or VoIP workload. No deployment safety evidence is claimed. Default prohibition and sender fallback/monitoring retain their own records."
+quote = '''
+It is important also to take into account hosts that do not implement a larger initial window. Furthermore, any deployment of IW10 should be aware that there are potential side effects to real-time traffic (such as VoIP).
+'''
+
+# 6928-026
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
+reason = "Publishing measurements and studying real-time traffic are tasks for experiment researchers/TCPM participants, not TCP runtime behavior. No experiment results are invented or claimed; vendor monitoring and sender fallback remain TODO."
+quote = '''
+The IETF TCPM working group is very much interested in further reports from experiments with this specification and encourages the publication of such measurement data. By now, there are no adequate studies available that either prove or do not prove the impact of IW10 to real-time traffic. Further experimentation in this direction is encouraged.
+'''
+
+# 6928-027
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
+reason = "Network-wide flow observation actor is network researchers/operators, beyond this endpoint library. This does not excuse the library sender cache/fallback SHOULD or the enabling actor's deployment-monitoring evidence TODOs; external instrumentation is sufficient."
+quote = '''
+As use of IW10 becomes more prevalent, monitoring and analysis of flows throughout the network will be needed to assess the impact across the spectrum of scenarios found on the real Internet.
+'''
+
+# 6928-028
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-13"
+reason = "Long-timescale startup research is directed to TCP research community, not a required algorithm to implement in this bounded IW10 profile. No adaptive long-term IW mechanism is claimed."
+quote = '''
+Although a modest, static increase of IW to 10 may address the near- term need for better web performance, much work is needed from the TCP research community to find a long-term solution to the TCP flow startup problem.
+'''
+
+# 6928-029
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-1.1"
+reason = "BCP14 vocabulary declaration is interpreted by specification readers/auditors. This does not waive the experimentally opted-in stack obligations; MAY choice and conditional SHOULD/MUST are recorded separately."
+quote = '''
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in RFC 2119 [RFC2119].
+'''
+
+# 6928-030
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-7"
+reason = "Fairness evaluation between IW10 and baseline flows is a network research/experiment task. No empirical fairness evidence is claimed for this library; opt-in stack monitoring/cache/fallback TODOs remain."
+quote = '''
+Although no severe unfairness has been detected on all the known tests so far, further study on this topic may be warranted.
+'''
+
+# 6928-031
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
+reason = "Research invitation to evaluate sender cache designs, not permission to omit the preceding sender-cache/fallback SHOULD. That implementation obligation remains TODO; this record only excludes publication/experimental study from TCP runtime role."
+quote = '''
+Further experiments are needed on the design of such a cache and corresponding heuristics.
+'''

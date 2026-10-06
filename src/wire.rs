@@ -6,7 +6,15 @@ pub const RST: u8 = 0x04;
 pub const PSH: u8 = 0x08;
 pub const ACK: u8 = 0x10;
 pub const URG: u8 = 0x20;
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1
+//= reason=TCP flag layout: existing endpoint parses emitted SYN/SYN-ACK ECE/CWR; wire constants and encoder use the assigned low-byte positions. Erratum 2307 corrects only the RFC793 figure reference.
+//# Bit 9 in the Reserved field of the TCP header is designated as the ECN-Echo flag.
+// Actor/condition: TCP endpoint; selected mitigation.
 pub const ECE: u8 = 0x40;
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1
+//= reason=TCP flag layout: existing endpoint asserts emitted CWR in setup SYN and fresh data, absent from SYN-ACK/retransmissions.
+//# The CWR flag is assigned to Bit 8 in the Reserved field of the TCP header.
+// Actor/condition: TCP endpoint; selected mitigation.
 pub const CWR: u8 = 0x80;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -179,6 +187,18 @@ fn read_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> 
                         if outgoing && bytes[2] > 14 {
                             return Err(WireError::InvalidOption);
                         }
+                        // Scope: Parser clamps peer exponent to 14; local exponent search bounded 0..=14. Erratum 5585 is editorial; rejected 5586 does not replace the <2^30 requirement.
+                        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+                        //= reason=Parser clamps peer exponent to 14; local exponent search bounded 0..=14. Erratum 5585 is editorial; rejected 5586 does not replace the <2^30 requirement.
+                        //# Thus, the shift count
+                        //# MUST be limited to 14 (which allows windows of 2^30 = 1 GiB).
+                        // Scope: Mandatory clamp to 14 is implemented/tested; SHOULD log invalid exponent is absent (no event/diagnostic hook). Closure: provide bounded error notification/log integration and assert 15/255 trigger it while effective exponent remains 14. Do not waive logging merely because core is no_std. Partial evidence; closure remains TODO.
+                        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+                        //= reason=Mandatory clamp to 14 is implemented/tested; SHOULD log invalid exponent is absent (no event/diagnostic hook). Closure: provide bounded error notification/log integration and assert 15/255 trigger it while effective exponent remains 14. Do not waive logging merely because core is no_std. Partial evidence; closure remains TODO.
+                        //# If a
+                        //# Window Scale option is received with a shift.cnt value larger than
+                        //# 14, the TCP SHOULD log the error but MUST use 14 instead of the
+                        //# specified value.
                         options.window_scale = Some(bytes[2].min(14));
                     }
                     4 if len == 2 => options.sack_permitted = true,
@@ -198,6 +218,14 @@ fn read_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> 
                             ));
                         }
                     }
+                    // Scope: TS parser/output literal kind 8.
+                    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+                    //= reason=TS parser/output literal kind 8.
+                    //# Kind: 8
+                    // Scope: TS has two four-byte fields plus kind/length, padding external to length.
+                    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+                    //= reason=TS has two four-byte fields plus kind/length, padding external to length.
+                    //# Length: 10 bytes
                     8 if len == 10 && options.timestamps.is_none() => {
                         options.timestamps = Some((
                             u32::from_be_bytes(bytes[2..6].try_into().unwrap()),
@@ -586,6 +614,20 @@ mod tests {
             seal(ip, &mut bytes);
             let parsed = parse(ip, &bytes).unwrap();
             assert_eq!(parsed.options.mss, Some(0));
+            // Scope: Parser clamps peer exponent to 14; local exponent search bounded 0..=14. Erratum 5585 is editorial; rejected 5586 does not replace the <2^30 requirement.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+            //= type=test
+            //= reason=Parser clamps peer exponent to 14; local exponent search bounded 0..=14. Erratum 5585 is editorial; rejected 5586 does not replace the <2^30 requirement.
+            //# Thus, the shift count
+            //# MUST be limited to 14 (which allows windows of 2^30 = 1 GiB).
+            // Scope: Mandatory clamp to 14 is implemented/tested; SHOULD log invalid exponent is absent (no event/diagnostic hook). Closure: provide bounded error notification/log integration and assert 15/255 trigger it while effective exponent remains 14. Do not waive logging merely because core is no_std. Partial evidence; closure remains TODO.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+            //= type=test
+            //= reason=Mandatory clamp to 14 is implemented/tested; SHOULD log invalid exponent is absent (no event/diagnostic hook). Closure: provide bounded error notification/log integration and assert 15/255 trigger it while effective exponent remains 14. Do not waive logging merely because core is no_std. Partial evidence; closure remains TODO.
+            //# If a
+            //# Window Scale option is received with a shift.cnt value larger than
+            //# 14, the TCP SHOULD log the error but MUST use 14 instead of the
+            //# specified value.
             assert_eq!(parsed.options.window_scale, Some(scale.min(14)));
             assert_eq!(parsed.header.flags, ACK | FIN | RST | PSH | URG);
         }
@@ -1002,6 +1044,16 @@ mod tests {
     }
 
     #[test]
+    // Scope: TS parser/output literal kind 8.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+    //= type=test
+    //= reason=TS parser/output literal kind 8.
+    //# Kind: 8
+    // Scope: TS has two four-byte fields plus kind/length, padding external to length.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+    //= type=test
+    //= reason=TS has two four-byte fields plus kind/length, padding external to length.
+    //# Length: 10 bytes
     fn timestamp_option_parses_and_rejects_malformed_or_duplicate_values() {
         let option = [8, 10, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 7];
         assert_eq!(

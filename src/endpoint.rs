@@ -1142,6 +1142,19 @@ impl Endpoint {
                 source_route: route,
                 ..OutgoingIpv4Options::default()
             },
+            // Scope: Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial. Partial evidence; closure remains TODO.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+            //= reason=Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial. Partial evidence; closure remains TODO.
+            //# While still under discussion, to enable research into this area it is
+            //# now RECOMMENDED that when generating an <RST>, if the segment causing
+            //# the <RST> to be generated contains a Timestamps option, the <RST>
+            //# should also contain a Timestamps option.
+            // Scope: Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial. Partial evidence; closure remains TODO.
+            //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+            //= reason=Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial. Partial evidence; closure remains TODO.
+            //# In the <RST> segment,
+            //# SEG.TSecr SHOULD be set to SEG.TSval from the incoming segment and
+            //# SEG.TSval SHOULD be set to zero.
             segment.options.timestamps.map(|ts| ts.0).filter(|_| {
                 self.config.connection.timestamps
                     && self.config.connection.send_ip_payload_limit >= 32

@@ -21,6 +21,12 @@ pub(crate) struct RttEstimator {
 //# The RTO MUST be computed according to the algorithm in [10], including Karn's algorithm
 //# for taking RTT samples (MUST-18).
 impl RttEstimator {
+    // Initial estimator RTO is MIN_RTO regardless of configured sampled minimum.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= reason=Initial estimator RTO is MIN_RTO regardless of configured sampled minimum.
+    //# (2.1) Until a round-trip time (RTT) measurement has been made for a segment sent
+    //# between the sender and receiver, the sender SHOULD set RTO <- 1 second, though the
+    //# "backing off" on repeated retransmission discussed in (5.5) still applies.
     pub(crate) fn new(minimum: u64) -> Self {
         assert!((1..=MAX_RTO).contains(&minimum));
         Self {
@@ -44,6 +50,72 @@ impl RttEstimator {
     }
 
     // The caller excludes ambiguous retransmission samples (Karn's algorithm).
+    // Partial evidence only; TODO remains. RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-1
+    //= reason=Partial evidence only; TODO remains. RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //# However, a TCP MUST NOT be more aggressive than the following algorithms allow.
+    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //# (2.2) When the first RTT measurement R is made, the host MUST set
+    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //# (2.3) When a subsequent RTT measurement R' is made, a host MUST set
+    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //# That is, updating RTTVAR and SRTT MUST be computed in the above order.
+    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //# The above SHOULD be computed using alpha=1/8 and beta=1/4 (as suggested in [JK88]).
+    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //# After the computation, a host MUST update RTO <- SRTT + max (G, K*RTTVAR)
+    // Partial evidence only; TODO remains. RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= reason=Partial evidence only; TODO remains. RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //# (2.4) Whenever RTO is computed, if it is less than 1 second, then the RTO SHOULD be
+    //# rounded up to 1 second.
+    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //# (2.5) A maximum value MAY be placed on RTO provided it is at least 60 seconds.
+    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-4
+    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //# However, if the K*RTTVAR term in the RTO calculation equals zero, the variance term
+    //# MUST be rounded to G seconds (i.e., use the equation given in step 2.3).
+    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //# To compute the current RTO, a TCP sender maintains two state variables, SRTT (smoothed
+    //# round-trip time) and RTTVAR (round-trip time variation). In addition, we assume a
+    //# clock granularity of G seconds.
+    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //# SRTT <- R RTTVAR <- R/2 RTO <- SRTT + max (G, K*RTTVAR) where K = 4.
+    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //# RTTVAR <- (1 - beta) * RTTVAR + beta * |SRTT - R'| SRTT <- (1 - alpha) * SRTT + alpha
+    //# * R'
+    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //# The value of SRTT used in the update to RTTVAR is its value before updating SRTT
+    //# itself using the second assignment.
+    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //# Note that after retransmitting, once a new RTT measurement is obtained (which can only
+    //# happen when new data has been sent and acknowledged), the computations outlined in
+    //# Section 2 are performed, including the computation of RTO, which may result in
+    //# "collapsing" RTO back down after it has been subject to exponential back off (rule
+    //# 5.5).
     pub(crate) fn sample(&mut self, rtt_us: u64) {
         let srtt = match self.srtt {
             None => {
@@ -69,6 +141,20 @@ impl RttEstimator {
     //# A TCP endpoint MUST implement the basic congestion control algorithms slow start,
     //# congestion avoidance, and exponential backoff of RTO to avoid creating congestion
     //# collapse conditions (MUST-19).
+    // Estimator exponential doubling capped at 60 seconds; timeout caller invokes this before successful output commits the timer.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= reason=Estimator exponential doubling capped at 60 seconds; timeout caller invokes this before successful output commits the timer.
+    //# (2.1) Until a round-trip time (RTT) measurement has been made for a segment sent
+    //# between the sender and receiver, the sender SHOULD set RTO <- 1 second, though the
+    //# "backing off" on repeated retransmission discussed in (5.5) still applies.
+    // Estimator exponential doubling capped at 60 seconds; timeout caller invokes this before successful output commits the timer.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= reason=Estimator exponential doubling capped at 60 seconds; timeout caller invokes this before successful output commits the timer.
+    //# (2.5) A maximum value MAY be placed on RTO provided it is at least 60 seconds.
+    // Estimator exponential doubling capped at 60 seconds; timeout caller invokes this before successful output commits the timer.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= reason=Estimator exponential doubling capped at 60 seconds; timeout caller invokes this before successful output commits the timer.
+    //# (5.5) The host MUST set RTO <- RTO * 2 ("back off the timer").
     pub(crate) fn backoff(&mut self) {
         self.rto = self.rto.saturating_mul(2).min(MAX_RTO);
     }
@@ -99,6 +185,17 @@ pub enum InitialWindow {
 }
 
 impl InitialWindow {
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-12
+    //= reason=No monitoring-backed default deployment is claimed: InitialWindow default and ConnectionConfig default select Rfc5681, and test explicitly asserts this. Iw10 is only explicit opt-in; sender monitoring/cache/fallback TODOs still apply when enabled.
+    //# An increased initial window MUST NOT be turned on by default on systems without such
+    //# monitoring capabilities.
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= reason=IW10 is optional and InitialWindow::default is Rfc5681; config default assertion confirms opt-in. This permission does not discharge IW10 fallback/monitoring obligations or default RFC5681 arithmetic TODO.
+    //# This increase is optional: a TCP MAY start with an initial window that is smaller than
+    //# 10 segments.
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= reason=Explicit InitialWindow::Iw10 computes min(10*MSS,max(2*MSS,14600)) with conservative integer cap. Tests assert representative small/normal/jumbo/overflow vectors, negotiated MSS/path/options and initial handshake value. Default RFC5681 arithmetic is a separate TODO.
+    //# min (10*MSS, max (2*MSS, 14600)) (1)
     fn bytes(self, mss: u32) -> u32 {
         let (segments, cap) = match self {
             Self::Rfc5681 => (4, 4_380),
@@ -132,6 +229,11 @@ pub(crate) struct Congestion {
     retransmitted_end: Option<Seq>,
 }
 
+// Partial evidence only; TODO remains. Constructor stores recover=None rather than initial send sequence; first-flight admission differs from literal initial comparison.
+//= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+//= reason=Partial evidence only; TODO remains. Constructor stores recover=None rather than initial send sequence; first-flight admission differs from literal initial comparison.
+//# When the TCP protocol control block is initialized, recover is set to the initial send
+//# sequence number.
 impl Congestion {
     pub(crate) fn new(
         mss: u32,
@@ -163,6 +265,10 @@ impl Congestion {
     }
 
     // SYN negotiation selects the byte bound anew; path changes preserve segment counts.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=Default RFC5681 SYN/SYNACK loss rule (also conservatively retained for opt-in IW10, whose distinct RFC6928 recommendation remains TODO). Test forces each endpoint timeout and asserts one negotiated effective MSS after successful handshake; failed output cannot grow cwnd.
+    //# Further, if the SYN or SYN/ACK is lost, the initial window used by a sender after a
+    //# correctly transmitted SYN MUST be one segment consisting of at most SMSS bytes.
     pub(crate) fn set_initial_mss(&mut self, mss: u32, syn_timed_out: bool) {
         self.set_mss(mss);
         self.cwnd = if syn_timed_out {
@@ -180,6 +286,15 @@ impl Congestion {
         self.ssthresh
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=set_mss scales cwnd by new/old MSS on a decrease; negotiated/path/timestamp vectors assert exact byte ratio. No claim that discovery itself is supplied by TCP.
+    //# When initial congestion windows of more than one segment are implemented along with Path
+    //# MTU Discovery [RFC1191], and the MSS being used is found to be too large, the congestion
+    //# window cwnd SHOULD be reduced to prevent large bursts of smaller segments.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=set_mss scales cwnd by new/old MSS on a decrease; negotiated/path/timestamp vectors assert exact byte ratio. No claim that discovery itself is supplied by TCP.
+    //# Specifically, cwnd SHOULD be reduced by the ratio of the old segment size to the new
+    //# segment size.
     pub(crate) fn set_mss(&mut self, mss: u32) {
         assert!(mss > 0);
         let mss = mss.min(MAX_WINDOW);
@@ -207,6 +322,164 @@ impl Congestion {
     //# A TCP endpoint MUST implement the basic congestion control algorithms slow start,
     //# congestion avoidance, and exponential backoff of RTO to avoid creating congestion
     //# collapse conditions (MUST-19).
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-1
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# This document applies to TCP connections that are unable to use the TCP Selective
+    //# Acknowledgment (SACK) option, either because the option is not locally supported or
+    //# because the TCP peer did not indicate a willingness to use SACK.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-2
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# When in fast recovery, this variable records the send sequence number that must be
+    //# acknowledged before the fast recovery procedure is declared to be over.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno full-ACK exit uses exclusive recover; equality covers the prior flight and greater ACK clears the guard. This ACK path does not establish active-recovery timeout exit.
+    //# The NewReno modification applies to the fast recovery procedure that begins when three
+    //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
+    //# ACK arrives that acknowledges all of the data up to and including the data that was
+    //# outstanding when the fast recovery procedure began.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# The procedures specified in Section 3.2 of [RFC5681] are followed, with the
+    //# modifications listed below.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# When the third duplicate ACK is received, the TCP sender first checks the value of
+    //# recover to see if the Cumulative Acknowledgment field covers more than recover. If so,
+    //# the value of recover is incremented to the value of the highest sequence number
+    //# transmitted by the TCP so far. The TCP then enters fast retransmit (step 2 of Section
+    //# 3.2 of [RFC5681]). If not, the TCP does not enter fast retransmit and does not reset
+    //# ssthresh.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# If this ACK acknowledges all of the data up to and including recover, then the ACK
+    //# acknowledges all the intermediate segments sent between the original transmission of
+    //# the lost segment and the receipt of the third duplicate ACK. Set cwnd to either (1)
+    //# min (ssthresh, max(FlightSize, SMSS) + SMSS) or (2) ssthresh, where ssthresh is the
+    //# value set when fast retransmit was entered, and where FlightSize in (1) is the amount
+    //# of data presently outstanding.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# Exit the fast recovery procedure.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# If this ACK does *not* acknowledge all of the data up to and including recover, then
+    //# this is a partial ACK.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# In this case, retransmit the first unacknowledged segment.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# Deflate the congestion window by the amount of new data acknowledged by the Cumulative
+    //# Acknowledgment field. If the partial ACK acknowledges at least one SMSS of new data,
+    //# then add back SMSS bytes to the congestion window.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# Send a new segment if permitted by the new value of cwnd.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# Do not exit the fast recovery procedure (i.e., if any duplicate ACKs subsequently
+    //# arrive, execute step 4 of Section 3.2 of [RFC5681]).
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# Because the acknowledgment field contains the sequence number that the sender next
+    //# expects to receive, the acknowledgment "ack_number" covers more than recover when
+    //# ack_number - 1 > recover; i.e., at least one byte more of data is acknowledged beyond
+    //# the highest byte that was outstanding when fast retransmit was last entered.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# In Section 3.2, step 3 above, it is noted that implementations should take measures to
+    //# avoid a possible burst of data when leaving fast recovery, in case the amount of new
+    //# data that the sender is eligible to send due to the new value of the congestion window
+    //# is large.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# An implementation may want to use a separate flag to record whether or not it is
+    //# presently in the fast recovery procedure.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# The use of the value of the duplicate acknowledgment counter for this purpose is not
+    //# reliable, because it can be reset upon window updates and out-of- order
+    //# acknowledgments.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# Entry into fast recovery is only possible when the Cumulative Acknowledgment field
+    //# covers more than the state variable recover.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# When updating the Cumulative Acknowledgment field outside of fast recovery, the state
+    //# variable recover may also need to be updated in order to continue to permit possible
+    //# entry into fast recovery (Section 3.2, step 2). This issue arises when an update of
+    //# the Cumulative Acknowledgment field results in a sequence wraparound that affects the
+    //# ordering between the Cumulative Acknowledgment field and the state variable recover.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //# Note that after cwnd is set based on the procedure for exiting fast recovery (Section
+    //# 3.2, step 3), cwnd should not be updated until a further event occurs (e.g., arrival
+    //# of an ack, or timeout) after this adjustment.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //# * MAY increment cwnd by SMSS bytes
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //# The RECOMMENDED way to increase cwnd during congestion avoidance is to count the number
+    //# of bytes that have been acknowledged by ACKs for new data.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= reason=RecoveryAlgorithm::Reno only, without negotiated SACK: on first advancing ACK sets cwnd=ssthresh; reno_and_newreno_recovery_exit explicitly asserts 4000 for partial and full Reno ACKs. NewReno/SACK/RACK/PRR use enhanced section4.3 recovery, not immediate Reno deflation.
+    //# When the next ACK arrives that acknowledges previously unacknowledged data, a TCP MUST
+    //# set cwnd to ssthresh (the value set in step 2).
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //# The slow start algorithm is used when cwnd < ssthresh, while the congestion avoidance
+    //# algorithm is used when cwnd > ssthresh. When cwnd and ssthresh are equal, the sender may
+    //# use either slow start or congestion avoidance.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //# During slow start, a TCP increments cwnd by at most SMSS bytes for each ACK received
+    //# that cumulatively acknowledges new data. Slow start ends when cwnd exceeds ssthresh (or,
+    //# optionally, when it reaches it, as noted above) or when congestion is observed. While
+    //# traditionally TCP implementations have increased cwnd by precisely SMSS bytes upon
+    //# receipt of an ACK covering new data, we RECOMMEND that TCP implementations increase
+    //# cwnd, per:
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //# cwnd += min (N, SMSS) (2)
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //# We note that [RFC3465] allows for cwnd increases of more than SMSS bytes for incoming
+    //# acknowledgments during slow start on an experimental basis; however, such behavior is
+    //# not allowed as part of the standard.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.3
+    //= reason=Recommendation to employ multi-loss recovery: default NewReno handles partial ACKs; opt-in negotiated SACK repairs multiple holes. These tests evidence algorithm selection and multi-loss repair only, not every section4.3 general bound (TODOs remain).
+    //# We RECOMMEND that TCP implementors employ some form of advanced loss recovery that can
+    //# cope with multiple losses in a window of data. The algorithms detailed in [RFC3782] and
+    //# [RFC3517] conform to the general principles outlined above. We note that while these are
+    //# not the only two algorithms that conform to the above general principles these two
+    //# algorithms have been vetted by the community and are currently on the Standards Track.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-5
+    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //# In response to the ACK division attack outlined in [SCWA99], this document RECOMMENDS
+    //# increasing the congestion window based on the number of bytes newly acknowledged in each
+    //# arriving ACK rather than by a particular constant on each arriving ACK (as outlined in
+    //# section 3.1).
     pub(crate) fn on_ack_with_ecn(
         &mut self,
         ack: Seq,
@@ -357,6 +630,10 @@ impl Congestion {
     //# If multiple original transmissions or retransmissions were lost in a
     //# window, the congestion control specified in [RFC5681] only reacts
     //# once per window.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.3
+    //= reason=Enhanced SACK recovery target halves eligible flight with two-MSS floor; sack_entry_partial_and_full_ack asserts 8000 -> 4000 and minimum case. Negotiated SACK/non-RACK and RACK lost-retransmission responses separately tested; ECN shared epoch is distinct policy.
+    //# That is, when the first loss in a window of data is detected, ssthresh MUST be set to no
+    //# more than the value given by equation (4).
     pub(crate) fn on_sack_recovery(&mut self, ack: Seq, flight: u32, highest_sent: Seq) -> bool {
         if self.sack_recovery
             || self.fast_recovery
@@ -416,6 +693,99 @@ impl Congestion {
     }
 
     // The caller checks RFC 5681's duplicate-ACK eligibility conditions.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-2
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //# When in fast recovery, this variable records the send sequence number that must be
+    //# acknowledged before the fast recovery procedure is declared to be over.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno eligible third-duplicate entry stores exclusive highest_sent. Entry evidence does not establish active-recovery timeout exit.
+    //# The NewReno modification applies to the fast recovery procedure that begins when three
+    //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
+    //# ACK arrives that acknowledges all of the data up to and including the data that was
+    //# outstanding when the fast recovery procedure began.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //# The procedures specified in Section 3.2 of [RFC5681] are followed, with the
+    //# modifications listed below.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //# When the third duplicate ACK is received, the TCP sender first checks the value of
+    //# recover to see if the Cumulative Acknowledgment field covers more than recover. If so,
+    //# the value of recover is incremented to the value of the highest sequence number
+    //# transmitted by the TCP so far. The TCP then enters fast retransmit (step 2 of Section
+    //# 3.2 of [RFC5681]). If not, the TCP does not enter fast retransmit and does not reset
+    //# ssthresh.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //# Do not exit the fast recovery procedure (i.e., if any duplicate ACKs subsequently
+    //# arrive, execute step 4 of Section 3.2 of [RFC5681]).
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //# Because the acknowledgment field contains the sequence number that the sender next
+    //# expects to receive, the acknowledgment "ack_number" covers more than recover when
+    //# ack_number - 1 > recover; i.e., at least one byte more of data is acknowledged beyond
+    //# the highest byte that was outstanding when fast retransmit was last entered.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //# This document also does not address issues of adjusting the duplicate acknowledgment
+    //# threshold, but assumes the threshold specified in the IETF standards; the current
+    //# standard is [RFC5681], which specifies a threshold of three duplicate acknowledgments.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-4
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //# For a TCP sender that implements the algorithm specified in Section 3.2 of this
+    //# document, the sender does not infer a packet drop from duplicate acknowledgments in
+    //# this scenario. As always, the retransmit timer is the backup mechanism for inferring
+    //# packet loss in this case.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //# An implementation may want to use a separate flag to record whether or not it is
+    //# presently in the fast recovery procedure.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //# The use of the value of the duplicate acknowledgment counter for this purpose is not
+    //# reliable, because it can be reset upon window updates and out-of- order
+    //# acknowledgments.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //# Entry into fast recovery is only possible when the Cumulative Acknowledgment field
+    //# covers more than the state variable recover.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //# When updating the Cumulative Acknowledgment field outside of fast recovery, the state
+    //# variable recover may also need to be updated in order to continue to permit possible
+    //# entry into fast recovery (Section 3.2, step 2). This issue arises when an update of
+    //# the Cumulative Acknowledgment field results in a sequence wraparound that affects the
+    //# ordering between the Cumulative Acknowledgment field and the state variable recover.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //# When three or more duplicate acknowledgments are received, the Cumulative
+    //# Acknowledgment field doesn't cover more than recover, and a new fast recovery is not
+    //# invoked, the sender should follow the guidance in Section 4.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= reason=Non-SACK Reno/NewReno fallback uses three eligible duplicate ACKs without RTO backoff; wire trace asserts retransmission of SND.UNA payload. Negotiated SACK/RACK loss inference is separately RFC6675/8985, not this fallback test.
+    //# The TCP sender SHOULD use the "fast retransmit" algorithm to detect and repair loss,
+    //# based on incoming duplicate ACKs.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= reason=Non-SACK Reno/NewReno fast entry: helper asserts cwnd=ssthresh+3SMSS (7000=4000+3000); wire test asserts SND.UNA retransmission. Negotiated SACK/RACK/PRR instead follow section4.3 modified recovery and do not use Reno inflation.
+    //# The lost segment starting at SND.UNA MUST be retransmitted and cwnd set to ssthresh plus
+    //# 3*SMSS.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= reason=Non-SACK fast recovery only: helper fourth DupACK raises 7000 to 8000 at MSS1000. Negotiated SACK/RACK/PRR do not artificially inflate cwnd; see section4.3 obligations.
+    //# For each additional duplicate ACK received (after the third), cwnd MUST be incremented
+    //# by SMSS.
     pub(crate) fn on_duplicate_ack(&mut self, flight: u32, highest_sent: Seq) -> bool {
         if self.sack_recovery {
             return false;
@@ -443,6 +813,31 @@ impl Congestion {
 
     // A separate ECN epoch must not suppress fast retransmission of real losses.
     // Loss recovery and ECN share the threshold reduction, not retransmit state.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-5
+    //= reason=TCP sender reduction only: helper asserts cwnd/threshold reduction, mixed loss/ECN epoch and no duplicate response; connection asserts repeated ECE and no ECN-driven retransmission. Generic non-TCP transports are not provided.
+    //# Upon the receipt by an ECN-Capable transport of a single CE packet,
+    //# the congestion control algorithms followed at the end-systems MUST be
+    //# essentially the same as the congestion control response to a *single*
+    //# dropped packet.
+    // Actor/condition: TCP sender/congestion controller; single CE indication in eligible original-flight epoch.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= reason=Partial evidence only; TODO remains. on_ack_with_ecn suppresses growth on advancing ECE ACKs, including recovery exit. Accepted duplicate ECE ACKs reach on_duplicate_ack and can add MSS in recovery; integrated duplicate-ECE suppression or a justified SHOULD decision remains open.
+    //# The sending
+    //# TCP SHOULD NOT increase the congestion window in response to the
+    //# receipt of an ECN-Echo ACK packet.
+    // Actor/condition: TCP sender/congestion controller; accepted ECE ACK.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= reason=Reno/NewReno helper epoch/threshold assertions plus connection emitted-retransmission-versus-pending-loss RTO assertions. No router congestion-detection claim.
+    //# TCP should not react to congestion indications more than once every window of data (or more loosely, more than once every round-trip time). That is, the TCP sender's congestion window should be reduced only once in response to a series of dropped and/or CE packets from a single window of data. In addition, the TCP source should not decrease the slow-start threshold, ssthresh, if it has been decreased within the last round trip time. However, if any retransmitted packets are dropped, then this is interpreted by the source TCP as a new instance of congestion.
+    // Actor/condition: TCP endpoint; mixed ECN/loss epoch and lost retransmission.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-5
+    //= reason=Original-flight reduction epoch assertions combine ECN and actual loss; retransmission loss remains a new event, as refined in section 6.1.2.
+    //# An additional goal is that the end-systems should react to congestion at most once per window of data (i.e., at most once per round-trip time), to avoid reacting multiple times to multiple indications of congestion within a round-trip time.
+    // Actor/condition: TCP endpoint; multiple indications within original-flight epoch.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= reason=Congestion helper asserts cwnd/threshold values after eligible ECN and mixed-loss epochs; one-MSS timer rate reduction is separately audited.
+    //# That is, the TCP source halves the congestion window "cwnd" and reduces the slow start threshold "ssthresh".
+    // Actor/condition: TCP endpoint; eligible ECE ACK.
     pub(crate) fn on_ecn(&mut self, ack: Seq, flight: u32, highest_sent: Seq) -> bool {
         if self
             .tlp_reduction_end
@@ -463,6 +858,9 @@ impl Congestion {
         true
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=Threshold helper uses actual eligible flight /2 with two-MSS minimum; timeout vectors assert 10000->5000 and SACK boundary vectors assert floor. Limited Transmit exclusion is caller-owned and separately evidenced.
+    //# ssthresh = max (FlightSize / 2, 2*SMSS) (4)
     fn reduce_threshold(&mut self, flight: u32) {
         self.ssthresh = (flight / 2).max(self.mss.saturating_mul(2)).min(MAX_WINDOW);
     }
@@ -480,6 +878,54 @@ impl Congestion {
         }
     }
 
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Stores exclusive highest_sent, exits both recovery flags, sets cwnd=MSS, resets duplicate count.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
+    //= reason=Partial evidence only; TODO remains. on_timeout clears recovery flags and records exclusive highest_sent, but existing marker tests time out outside recovery or after full-ACK exit; active no-SACK NewReno timeout exit is not asserted.
+    //# The NewReno modification applies to the fast recovery procedure that begins when three
+    //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
+    //# ACK arrives that acknowledges all of the data up to and including the data that was
+    //# outstanding when the fast recovery procedure began.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Stores exclusive highest_sent, exits both recovery flags, sets cwnd=MSS, resets duplicate count.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Partial evidence only; TODO remains. on_timeout clears recovery flags and records exclusive highest_sent. Marker boundaries are tested separately, not the combined active no-SACK NewReno RTO exit and recover replacement.
+    //# After a retransmit timeout, record the highest sequence number transmitted in the
+    //# variable recover, and exit the fast recovery procedure if applicable.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Stores exclusive highest_sent, exits both recovery flags, sets cwnd=MSS, resets duplicate count.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-4
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Stores exclusive highest_sent, exits both recovery flags, sets cwnd=MSS, resets duplicate count.
+    //# After each retransmit timeout, the highest sequence number transmitted so far is
+    //# recorded in the variable recover.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Stores exclusive highest_sent, exits both recovery flags, sets cwnd=MSS, resets duplicate count.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-4
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Stores exclusive highest_sent, exits both recovery flags, sets cwnd=MSS, resets duplicate count.
+    //# For a TCP sender that implements the algorithm specified in Section 3.2 of this
+    //# document, the sender does not infer a packet drop from duplicate acknowledgments in
+    //# this scenario. As always, the retransmit timer is the backup mechanism for inferring
+    //# packet loss in this case.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Stores exclusive highest_sent, exits both recovery flags, sets cwnd=MSS, resets duplicate count.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Stores exclusive highest_sent, exits both recovery flags, sets cwnd=MSS, resets duplicate count.
+    //# When three or more duplicate acknowledgments are received, the Cumulative
+    //# Acknowledgment field doesn't cover more than recover, and a new fast recovery is not
+    //# invoked, the sender should follow the guidance in Section 4.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=on_timeout halves supplied FlightSize with two-MSS floor on first timeout; repeated same-segment timeout keeps threshold. Helper asserts 10000 flight -> 5000 threshold, repeat at flight=2000 -> unchanged 5000; minimum floor separately asserted by sack_timeout_boundary_and_cancel_preserve_epoch. ECN sharing is a separate RFC3168 policy.
+    //# When a TCP sender detects segment loss using the retransmission timer and the given
+    //# segment has not yet been resent by way of the retransmission timer, the value of
+    //# ssthresh MUST be set to no more than the value given in equation (4):
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=Both Reno/NewReno and default/IW10 retain a one-effective-MSS loss window. Helper verifies cwnd reset and ACK-driven transition; IW10 wire test asserts exactly one retransmission and no second output.
+    //# Furthermore, upon a timeout (as specified in [RFC2988]) cwnd MUST be set to no more than
+    //# the loss window, LW, which equals 1 full-sized segment (regardless of the value of IW).
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=Repeated RTO for the same outstanding head retains ssthresh; timeout_marker_boundaries_and_wrap asserts threshold remains5000 after smaller-flight second timeout and resets for a new acknowledged flight. Caller timer/encode atomicity is separate.
+    //# On the other hand, when a TCP sender detects segment loss using the retransmission timer
+    //# and the given segment has already been retransmitted by way of the retransmission timer
+    //# at least once, the value of ssthresh is held constant.
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= reason=IW10 loss window remains one effective MSS; helper and wire trace assert timeout reduction, one retransmit and denied next output.
+    //# These changes do NOT change the loss window, which must remain 1 segment of MSS bytes
+    //# (to permit the lowest possible window size in the case of severe congestion).
     pub(crate) fn on_timeout(&mut self, flight: u32, highest_sent: Seq) {
         // Repeated RTOs for the same unacknowledged segment retain ssthresh.
         // RFC 3168 section 6.1.2: loss of a retransmission is new congestion,
@@ -505,6 +951,14 @@ impl Congestion {
         self.duplicate_acks = 0;
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= reason=Selected IW10 restart choice uses min(current cwnd, IW10); helper covers grown and reduced cwnd and changing MSS, and wire idle trace asserts burst limited to ten MSS. Idle-trigger last-data issue remains RFC5681 TODO; this evidence is the optional window value only.
+    //# Optionally, a TCP MAY set the restart window to the minimum of the value used for the
+    //# initial window and the current value of cwnd (in other words, using a larger value for
+    //# the restart window should never increase the size of cwnd).
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.1
+    //= reason=restart_after_idle sets min(cwnd,selected IW), never increases a reduced cwnd; both algorithm choices assert reduced and grown values. Trigger and default IW calculation have separate TODOs.
+    //# For the purposes of this standard, we define RW = min(IW,cwnd).
     pub(crate) fn restart_after_idle(&mut self) {
         self.cwnd = self.cwnd.min(self.initial_window());
         self.acknowledged = 0;
@@ -843,6 +1297,81 @@ mod tests {
     //= type=test
     //# The RTO MUST be computed according to the algorithm in [10], including Karn's
     //# algorithm for taking RTT samples (MUST-18).
+    // Estimator vectors, not connection sampling or timers.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Estimator vectors, not connection sampling or timers.
+    //# (2.1) Until a round-trip time (RTT) measurement has been made for a segment sent
+    //# between the sender and receiver, the sender SHOULD set RTO <- 1 second, though the
+    //# "backing off" on repeated retransmission discussed in (5.5) still applies.
+    // Estimator vectors, not connection sampling or timers.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Estimator vectors, not connection sampling or timers.
+    //# (2.2) When the first RTT measurement R is made, the host MUST set
+    // Estimator vectors, not connection sampling or timers.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Estimator vectors, not connection sampling or timers.
+    //# (2.3) When a subsequent RTT measurement R' is made, a host MUST set
+    // Estimator vectors, not connection sampling or timers.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Estimator vectors, not connection sampling or timers.
+    //# That is, updating RTTVAR and SRTT MUST be computed in the above order.
+    // Estimator vectors, not connection sampling or timers.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Estimator vectors, not connection sampling or timers.
+    //# The above SHOULD be computed using alpha=1/8 and beta=1/4 (as suggested in [JK88]).
+    // Estimator vectors, not connection sampling or timers.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Estimator vectors, not connection sampling or timers.
+    //# After the computation, a host MUST update RTO <- SRTT + max (G, K*RTTVAR)
+    // Estimator vectors, not connection sampling or timers.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Estimator vectors, not connection sampling or timers.
+    //# (2.5) A maximum value MAY be placed on RTO provided it is at least 60 seconds.
+    // Estimator vectors, not connection sampling or timers.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= type=test
+    //= reason=Estimator vectors, not connection sampling or timers.
+    //# (5.5) The host MUST set RTO <- RTO * 2 ("back off the timer").
+    // Estimator vectors, not connection sampling or timers.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Estimator vectors, not connection sampling or timers.
+    //# To compute the current RTO, a TCP sender maintains two state variables, SRTT (smoothed
+    //# round-trip time) and RTTVAR (round-trip time variation). In addition, we assume a
+    //# clock granularity of G seconds.
+    // Estimator vectors, not connection sampling or timers.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Estimator vectors, not connection sampling or timers.
+    //# SRTT <- R RTTVAR <- R/2 RTO <- SRTT + max (G, K*RTTVAR) where K = 4.
+    // Estimator vectors, not connection sampling or timers.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Estimator vectors, not connection sampling or timers.
+    //# RTTVAR <- (1 - beta) * RTTVAR + beta * |SRTT - R'| SRTT <- (1 - alpha) * SRTT + alpha
+    //# * R'
+    // Estimator vectors, not connection sampling or timers.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Estimator vectors, not connection sampling or timers.
+    //# The value of SRTT used in the update to RTTVAR is its value before updating SRTT
+    //# itself using the second assignment.
+    // Estimator vectors, not connection sampling or timers.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= type=test
+    //= reason=Estimator vectors, not connection sampling or timers.
+    //# Note that after retransmitting, once a new RTT measurement is obtained (which can only
+    //# happen when new data has been sent and acknowledged), the computations outlined in
+    //# Section 2 are performed, including the computation of RTO, which may result in
+    //# "collapsing" RTO back down after it has been subject to exponential back off (rule
+    //# 5.5).
     fn rtt_vectors_and_backoff() {
         let mut rtt = RttEstimator::new(MIN_RTO);
         assert_eq!(rtt.rto(), 1_000_000);
@@ -879,6 +1408,30 @@ mod tests {
     }
 
     #[test]
+    // Default one-second minimum and estimator granularity.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Default one-second minimum and estimator granularity.
+    //# After the computation, a host MUST update RTO <- SRTT + max (G, K*RTTVAR)
+    // Partial evidence only; TODO remains. Default one-second minimum and estimator granularity.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Default one-second minimum and estimator granularity.
+    //# (2.4) Whenever RTO is computed, if it is less than 1 second, then the RTO SHOULD be
+    //# rounded up to 1 second.
+    // Default one-second minimum and estimator granularity.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-4
+    //= type=test
+    //= reason=Default one-second minimum and estimator granularity.
+    //# However, if the K*RTTVAR term in the RTO calculation equals zero, the variance term
+    //# MUST be rounded to G seconds (i.e., use the equation given in step 2.3).
+    // Default one-second minimum and estimator granularity.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Default one-second minimum and estimator granularity.
+    //# To compute the current RTO, a TCP sender maintains two state variables, SRTT (smoothed
+    //# round-trip time) and RTTVAR (round-trip time variation). In addition, we assume a
+    //# clock granularity of G seconds.
     fn rtt_floor_granularity_and_extremes() {
         let mut rtt = RttEstimator::new(MIN_RTO);
         rtt.sample(0);
@@ -901,6 +1454,30 @@ mod tests {
     }
 
     #[test]
+    // Explicit configurable floor includes subsecond deviation, not universal RFC floor compliance.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Explicit configurable floor includes subsecond deviation, not universal RFC floor compliance.
+    //# (2.1) Until a round-trip time (RTT) measurement has been made for a segment sent
+    //# between the sender and receiver, the sender SHOULD set RTO <- 1 second, though the
+    //# "backing off" on repeated retransmission discussed in (5.5) still applies.
+    // Partial evidence only; TODO remains. Explicit configurable floor includes subsecond deviation, not universal RFC floor compliance.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Explicit configurable floor includes subsecond deviation, not universal RFC floor compliance.
+    //# (2.4) Whenever RTO is computed, if it is less than 1 second, then the RTO SHOULD be
+    //# rounded up to 1 second.
+    // Explicit configurable floor includes subsecond deviation, not universal RFC floor compliance.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-2
+    //= type=test
+    //= reason=Explicit configurable floor includes subsecond deviation, not universal RFC floor compliance.
+    //# (2.5) A maximum value MAY be placed on RTO provided it is at least 60 seconds.
+    // Explicit configurable floor includes subsecond deviation, not universal RFC floor compliance.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-4
+    //= type=test
+    //= reason=Explicit configurable floor includes subsecond deviation, not universal RFC floor compliance.
+    //# However, if the K*RTTVAR term in the RTO calculation equals zero, the variance term
+    //# MUST be rounded to G seconds (i.e., use the equation given in step 2.3).
     fn configurable_rto_floor_keeps_initial_and_backoff_bounds() {
         for minimum in [1, 200_000, 1_000_000, MAX_RTO] {
             let mut rtt = RttEstimator::new(minimum);
@@ -963,6 +1540,25 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= type=test
+    //= reason=Selected IW10 restart choice uses min(current cwnd, IW10); helper covers grown and reduced cwnd and changing MSS, and wire idle trace asserts burst limited to ten MSS. Idle-trigger last-data issue remains RFC5681 TODO; this evidence is the optional window value only.
+    //# Optionally, a TCP MAY set the restart window to the minimum of the value used for the
+    //# initial window and the current value of cwnd (in other words, using a larger value for
+    //# the restart window should never increase the size of cwnd).
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.1
+    //= type=test
+    //= reason=restart_after_idle sets min(cwnd,selected IW), never increases a reduced cwnd; both algorithm choices assert reduced and grown values. Trigger and default IW calculation have separate TODOs.
+    //# For the purposes of this standard, we define RW = min(IW,cwnd).
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= type=test
+    //= reason=Explicit InitialWindow::Iw10 computes min(10*MSS,max(2*MSS,14600)) with conservative integer cap. Tests assert representative small/normal/jumbo/overflow vectors, negotiated MSS/path/options and initial handshake value. Default RFC5681 arithmetic is a separate TODO.
+    //# min (10*MSS, max (2*MSS, 14600)) (1)
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= type=test
+    //= reason=IW10 loss window remains one effective MSS; helper and wire trace assert timeout reduction, one retransmit and denied next output.
+    //# These changes do NOT change the loss window, which must remain 1 segment of MSS bytes
+    //# (to permit the lowest possible window size in the case of severe congestion).
     fn iw10_bounds_mss_changes_timeout_and_idle_restart() {
         for (mss, window) in [
             (1_000, 10_000),
@@ -1005,6 +1601,52 @@ mod tests {
     //# A TCP endpoint MUST implement the basic congestion control algorithms slow start,
     //# congestion avoidance, and exponential backoff of RTO to avoid creating congestion
     //# collapse conditions (MUST-19).
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //# * MAY increment cwnd by SMSS bytes
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //# The RECOMMENDED way to increase cwnd during congestion avoidance is to count the number
+    //# of bytes that have been acknowledged by ACKs for new data.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=Both Reno/NewReno and default/IW10 retain a one-effective-MSS loss window. Helper verifies cwnd reset and ACK-driven transition; IW10 wire test asserts exactly one retransmission and no second output.
+    //# Furthermore, upon a timeout (as specified in [RFC2988]) cwnd MUST be set to no more than
+    //# the loss window, LW, which equals 1 full-sized segment (regardless of the value of IW).
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //# The slow start algorithm is used when cwnd < ssthresh, while the congestion avoidance
+    //# algorithm is used when cwnd > ssthresh. When cwnd and ssthresh are equal, the sender may
+    //# use either slow start or congestion avoidance.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //# During slow start, a TCP increments cwnd by at most SMSS bytes for each ACK received
+    //# that cumulatively acknowledges new data. Slow start ends when cwnd exceeds ssthresh (or,
+    //# optionally, when it reaches it, as noted above) or when congestion is observed. While
+    //# traditionally TCP implementations have increased cwnd by precisely SMSS bytes upon
+    //# receipt of an ACK covering new data, we RECOMMEND that TCP implementations increase
+    //# cwnd, per:
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //# cwnd += min (N, SMSS) (2)
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //# We note that [RFC3465] allows for cwnd increases of more than SMSS bytes for incoming
+    //# acknowledgments during slow start on an experimental basis; however, such behavior is
+    //# not allowed as part of the standard.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-5
+    //= type=test
+    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //# In response to the ACK division attack outlined in [SCWA99], this document RECOMMENDS
+    //# increasing the congestion window based on the number of bytes newly acknowledged in each
+    //# arriving ACK rather than by a particular constant on each arriving ACK (as outlined in
+    //# section 3.1).
     fn initial_slow_start_and_byte_counting() {
         for (mss, window) in [(500, 2_000), (1_000, 4_000), (1_460, 4_380), (3_000, 6_000)] {
             assert_eq!(
@@ -1048,6 +1690,11 @@ mod tests {
     //= type=test
     //= reason=Congestion target selection only: asserts SACK entry threshold and shared ECN epoch; not PRR sending or entry conservation.
     //# ssthresh = CongCtrlAlg()  // Target cwnd after recovery
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.3
+    //= type=test
+    //= reason=Enhanced SACK recovery target halves eligible flight with two-MSS floor; sack_entry_partial_and_full_ack asserts 8000 -> 4000 and minimum case. Negotiated SACK/non-RACK and RACK lost-retransmission responses separately tested; ECN shared epoch is distinct policy.
+    //# That is, when the first loss in a window of data is detected, ssthresh MUST be set to no
+    //# more than the value given by equation (4).
     fn sack_entry_partial_and_full_ack() {
         for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
             for base in [Seq(0), Seq(u32::MAX - 3_999)] {
@@ -1096,6 +1743,16 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=on_timeout halves supplied FlightSize with two-MSS floor on first timeout; repeated same-segment timeout keeps threshold. Helper asserts 10000 flight -> 5000 threshold, repeat at flight=2000 -> unchanged 5000; minimum floor separately asserted by sack_timeout_boundary_and_cancel_preserve_epoch. ECN sharing is a separate RFC3168 policy.
+    //# When a TCP sender detects segment loss using the retransmission timer and the given
+    //# segment has not yet been resent by way of the retransmission timer, the value of
+    //# ssthresh MUST be set to no more than the value given in equation (4):
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=Threshold helper uses actual eligible flight /2 with two-MSS minimum; timeout vectors assert 10000->5000 and SACK boundary vectors assert floor. Limited Transmit exclusion is caller-owned and separately evidenced.
+    //# ssthresh = max (FlightSize / 2, 2*SMSS) (4)
     fn sack_timeout_boundary_and_cancel_preserve_epoch() {
         for end in [Seq(10_000), Seq(0), Seq(u32::MAX)] {
             let mut c = Congestion::new(
@@ -1200,6 +1857,142 @@ mod tests {
     }
 
     #[test]
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-2
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //# When in fast recovery, this variable records the send sequence number that must be
+    //# acknowledged before the fast recovery procedure is declared to be over.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno controller assertions establish third-duplicate entry and full-ACK exit, not active-recovery timeout exit, wire retransmission or timer management.
+    //# The NewReno modification applies to the fast recovery procedure that begins when three
+    //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
+    //# ACK arrives that acknowledges all of the data up to and including the data that was
+    //# outstanding when the fast recovery procedure began.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //# The procedures specified in Section 3.2 of [RFC5681] are followed, with the
+    //# modifications listed below.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //# When the third duplicate ACK is received, the TCP sender first checks the value of
+    //# recover to see if the Cumulative Acknowledgment field covers more than recover. If so,
+    //# the value of recover is incremented to the value of the highest sequence number
+    //# transmitted by the TCP so far. The TCP then enters fast retransmit (step 2 of Section
+    //# 3.2 of [RFC5681]). If not, the TCP does not enter fast retransmit and does not reset
+    //# ssthresh.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //# If this ACK acknowledges all of the data up to and including recover, then the ACK
+    //# acknowledges all the intermediate segments sent between the original transmission of
+    //# the lost segment and the receipt of the third duplicate ACK. Set cwnd to either (1)
+    //# min (ssthresh, max(FlightSize, SMSS) + SMSS) or (2) ssthresh, where ssthresh is the
+    //# value set when fast retransmit was entered, and where FlightSize in (1) is the amount
+    //# of data presently outstanding.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //# Exit the fast recovery procedure.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //# If this ACK does *not* acknowledge all of the data up to and including recover, then
+    //# this is a partial ACK.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //# In this case, retransmit the first unacknowledged segment.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //# Deflate the congestion window by the amount of new data acknowledged by the Cumulative
+    //# Acknowledgment field. If the partial ACK acknowledges at least one SMSS of new data,
+    //# then add back SMSS bytes to the congestion window.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //# Do not exit the fast recovery procedure (i.e., if any duplicate ACKs subsequently
+    //# arrive, execute step 4 of Section 3.2 of [RFC5681]).
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //# Because the acknowledgment field contains the sequence number that the sender next
+    //# expects to receive, the acknowledgment "ack_number" covers more than recover when
+    //# ack_number - 1 > recover; i.e., at least one byte more of data is acknowledged beyond
+    //# the highest byte that was outstanding when fast retransmit was last entered.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //# This document also does not address issues of adjusting the duplicate acknowledgment
+    //# threshold, but assumes the threshold specified in the IETF standards; the current
+    //# standard is [RFC5681], which specifies a threshold of three duplicate acknowledgments.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //# In Section 3.2, step 3 above, it is noted that implementations should take measures to
+    //# avoid a possible burst of data when leaving fast recovery, in case the amount of new
+    //# data that the sender is eligible to send due to the new value of the congestion window
+    //# is large.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //# An implementation may want to use a separate flag to record whether or not it is
+    //# presently in the fast recovery procedure.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //# The use of the value of the duplicate acknowledgment counter for this purpose is not
+    //# reliable, because it can be reset upon window updates and out-of- order
+    //# acknowledgments.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //# Entry into fast recovery is only possible when the Cumulative Acknowledgment field
+    //# covers more than the state variable recover.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //# Note that after cwnd is set based on the procedure for exiting fast recovery (Section
+    //# 3.2, step 3), cwnd should not be updated until a further event occurs (e.g., arrival
+    //# of an ack, or timeout) after this adjustment.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= type=test
+    //= reason=Non-SACK Reno/NewReno fast entry: helper asserts cwnd=ssthresh+3SMSS (7000=4000+3000); wire test asserts SND.UNA retransmission. Negotiated SACK/RACK/PRR instead follow section4.3 modified recovery and do not use Reno inflation.
+    //# The lost segment starting at SND.UNA MUST be retransmitted and cwnd set to ssthresh plus
+    //# 3*SMSS.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= type=test
+    //= reason=Non-SACK fast recovery only: helper fourth DupACK raises 7000 to 8000 at MSS1000. Negotiated SACK/RACK/PRR do not artificially inflate cwnd; see section4.3 obligations.
+    //# For each additional duplicate ACK received (after the third), cwnd MUST be incremented
+    //# by SMSS.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.3
+    //= type=test
+    //= reason=Recommendation to employ multi-loss recovery: default NewReno handles partial ACKs; opt-in negotiated SACK repairs multiple holes. These tests evidence algorithm selection and multi-loss repair only, not every section4.3 general bound (TODOs remain).
+    //# We RECOMMEND that TCP implementors employ some form of advanced loss recovery that can
+    //# cope with multiple losses in a window of data. The algorithms detailed in [RFC3782] and
+    //# [RFC3517] conform to the general principles outlined above. We note that while these are
+    //# not the only two algorithms that conform to the above general principles these two
+    //# algorithms have been vetted by the community and are currently on the Standards Track.
     fn newreno_partial_and_full_ack() {
         let mut c = Congestion::new(
             1_000,
@@ -1237,6 +2030,87 @@ mod tests {
     //# algorithms provided that the algorithms are conformant with the TCP
     //# specifications from the IETF Standards Track as described in RFC
     //# 2914, RFC 5033 [7], and RFC 8961 [15] (MAY-18).
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-1
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //# This document applies to TCP connections that are unable to use the TCP Selective
+    //# Acknowledgment (SACK) option, either because the option is not locally supported or
+    //# because the TCP peer did not indicate a willingness to use SACK.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-2
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //# When in fast recovery, this variable records the send sequence number that must be
+    //# acknowledged before the fast recovery procedure is declared to be over.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //# If this ACK acknowledges all of the data up to and including recover, then the ACK
+    //# acknowledges all the intermediate segments sent between the original transmission of
+    //# the lost segment and the receipt of the third duplicate ACK. Set cwnd to either (1)
+    //# min (ssthresh, max(FlightSize, SMSS) + SMSS) or (2) ssthresh, where ssthresh is the
+    //# value set when fast retransmit was entered, and where FlightSize in (1) is the amount
+    //# of data presently outstanding.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //# Exit the fast recovery procedure.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //# If this ACK does *not* acknowledge all of the data up to and including recover, then
+    //# this is a partial ACK.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //# In this case, retransmit the first unacknowledged segment.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //# Deflate the congestion window by the amount of new data acknowledged by the Cumulative
+    //# Acknowledgment field. If the partial ACK acknowledges at least one SMSS of new data,
+    //# then add back SMSS bytes to the congestion window.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //# Do not exit the fast recovery procedure (i.e., if any duplicate ACKs subsequently
+    //# arrive, execute step 4 of Section 3.2 of [RFC5681]).
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //# In Section 3.2, step 3 above, it is noted that implementations should take measures to
+    //# avoid a possible burst of data when leaving fast recovery, in case the amount of new
+    //# data that the sender is eligible to send due to the new value of the congestion window
+    //# is large.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //# When updating the Cumulative Acknowledgment field outside of fast recovery, the state
+    //# variable recover may also need to be updated in order to continue to permit possible
+    //# entry into fast recovery (Section 3.2, step 2). This issue arises when an update of
+    //# the Cumulative Acknowledgment field results in a sequence wraparound that affects the
+    //# ordering between the Cumulative Acknowledgment field and the state variable recover.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //# Note that after cwnd is set based on the procedure for exiting fast recovery (Section
+    //# 3.2, step 3), cwnd should not be updated until a further event occurs (e.g., arrival
+    //# of an ack, or timeout) after this adjustment.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
+    //= type=test
+    //= reason=RecoveryAlgorithm::Reno only, without negotiated SACK: on first advancing ACK sets cwnd=ssthresh; reno_and_newreno_recovery_exit explicitly asserts 4000 for partial and full Reno ACKs. NewReno/SACK/RACK/PRR use enhanced section4.3 recovery, not immediate Reno deflation.
+    //# When the next ACK arrives that acknowledges previously unacknowledged data, a TCP MUST
+    //# set cwnd to ssthresh (the value set in step 2).
     fn reno_and_newreno_recovery_exit() {
         assert_eq!(RecoveryAlgorithm::default(), RecoveryAlgorithm::NewReno);
         for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
@@ -1280,6 +2154,90 @@ mod tests {
     }
 
     #[test]
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno marker boundaries/wrap are tested, but timeouts occur outside recovery or after full-ACK exit; active-recovery timeout exit is not asserted.
+    //# The NewReno modification applies to the fast recovery procedure that begins when three
+    //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
+    //# ACK arrives that acknowledges all of the data up to and including the data that was
+    //# outstanding when the fast recovery procedure began.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //# When the third duplicate ACK is received, the TCP sender first checks the value of
+    //# recover to see if the Cumulative Acknowledgment field covers more than recover. If so,
+    //# the value of recover is incremented to the value of the highest sequence number
+    //# transmitted by the TCP so far. The TCP then enters fast retransmit (step 2 of Section
+    //# 3.2 of [RFC5681]). If not, the TCP does not enter fast retransmit and does not reset
+    //# ssthresh.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno marker boundaries/wrap and replacement are tested outside active recovery; no assertion combines recovery exit with recover replacement during active-recovery RTO.
+    //# After a retransmit timeout, record the highest sequence number transmitted in the
+    //# variable recover, and exit the fast recovery procedure if applicable.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //# Because the acknowledgment field contains the sequence number that the sender next
+    //# expects to receive, the acknowledgment "ack_number" covers more than recover when
+    //# ack_number - 1 > recover; i.e., at least one byte more of data is acknowledged beyond
+    //# the highest byte that was outstanding when fast retransmit was last entered.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-4
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //# After each retransmit timeout, the highest sequence number transmitted so far is
+    //# recorded in the variable recover.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-4
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //# For a TCP sender that implements the algorithm specified in Section 3.2 of this
+    //# document, the sender does not infer a packet drop from duplicate acknowledgments in
+    //# this scenario. As always, the retransmit timer is the backup mechanism for inferring
+    //# packet loss in this case.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //# Entry into fast recovery is only possible when the Cumulative Acknowledgment field
+    //# covers more than the state variable recover.
+    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //# When updating the Cumulative Acknowledgment field outside of fast recovery, the state
+    //# variable recover may also need to be updated in order to continue to permit possible
+    //# entry into fast recovery (Section 3.2, step 2). This issue arises when an update of
+    //# the Cumulative Acknowledgment field results in a sequence wraparound that affects the
+    //# ordering between the Cumulative Acknowledgment field and the state variable recover.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= type=test
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //# When three or more duplicate acknowledgments are received, the Cumulative
+    //# Acknowledgment field doesn't cover more than recover, and a new fast recovery is not
+    //# invoked, the sender should follow the guidance in Section 4.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=on_timeout halves supplied FlightSize with two-MSS floor on first timeout; repeated same-segment timeout keeps threshold. Helper asserts 10000 flight -> 5000 threshold, repeat at flight=2000 -> unchanged 5000; minimum floor separately asserted by sack_timeout_boundary_and_cancel_preserve_epoch. ECN sharing is a separate RFC3168 policy.
+    //# When a TCP sender detects segment loss using the retransmission timer and the given
+    //# segment has not yet been resent by way of the retransmission timer, the value of
+    //# ssthresh MUST be set to no more than the value given in equation (4):
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=Threshold helper uses actual eligible flight /2 with two-MSS minimum; timeout vectors assert 10000->5000 and SACK boundary vectors assert floor. Limited Transmit exclusion is caller-owned and separately evidenced.
+    //# ssthresh = max (FlightSize / 2, 2*SMSS) (4)
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=Repeated RTO for the same outstanding head retains ssthresh; timeout_marker_boundaries_and_wrap asserts threshold remains5000 after smaller-flight second timeout and resets for a new acknowledged flight. Caller timer/encode atomicity is separate.
+    //# On the other hand, when a TCP sender detects segment loss using the retransmission timer
+    //# and the given segment has already been retransmitted by way of the retransmission timer
+    //# at least once, the value of ssthresh is held constant.
     fn timeout_marker_boundaries_and_wrap() {
         for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
             for end in [Seq(10_000), Seq(0), Seq(u32::MAX)] {
@@ -1307,6 +2265,10 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.1
+    //= type=test
+    //= reason=restart_after_idle sets min(cwnd,selected IW), never increases a reduced cwnd; both algorithm choices assert reduced and grown values. Trigger and default IW calculation have separate TODOs.
+    //# For the purposes of this standard, we define RW = min(IW,cwnd).
     fn mss_idle_reset_and_saturation() {
         for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
             let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
@@ -1397,6 +2359,36 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-5
+    //= type=test
+    //= reason=TCP sender reduction only: helper asserts cwnd/threshold reduction, mixed loss/ECN epoch and no duplicate response; connection asserts repeated ECE and no ECN-driven retransmission. Generic non-TCP transports are not provided.
+    //# Upon the receipt by an ECN-Capable transport of a single CE packet,
+    //# the congestion control algorithms followed at the end-systems MUST be
+    //# essentially the same as the congestion control response to a *single*
+    //# dropped packet.
+    // Actor/condition: TCP sender/congestion controller; single CE indication in eligible original-flight epoch.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= type=test
+    //= reason=Partial evidence only; TODO remains. Helper asserts on_ack_with_ecn growth suppression for advancing ECE ACKs, including recovery exit. It does not exercise accepted duplicate ECE routing to on_duplicate_ack or its MSS inflation during recovery.
+    //# The sending
+    //# TCP SHOULD NOT increase the congestion window in response to the
+    //# receipt of an ECN-Echo ACK packet.
+    // Actor/condition: TCP sender/congestion controller; accepted ECE ACK.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= type=test
+    //= reason=Reno/NewReno helper epoch/threshold assertions plus connection emitted-retransmission-versus-pending-loss RTO assertions. No router congestion-detection claim.
+    //# TCP should not react to congestion indications more than once every window of data (or more loosely, more than once every round-trip time). That is, the TCP sender's congestion window should be reduced only once in response to a series of dropped and/or CE packets from a single window of data. In addition, the TCP source should not decrease the slow-start threshold, ssthresh, if it has been decreased within the last round trip time. However, if any retransmitted packets are dropped, then this is interpreted by the source TCP as a new instance of congestion.
+    // Actor/condition: TCP endpoint; mixed ECN/loss epoch and lost retransmission.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-5
+    //= type=test
+    //= reason=Original-flight reduction epoch assertions combine ECN and actual loss; retransmission loss remains a new event, as refined in section 6.1.2.
+    //# An additional goal is that the end-systems should react to congestion at most once per window of data (i.e., at most once per round-trip time), to avoid reacting multiple times to multiple indications of congestion within a round-trip time.
+    // Actor/condition: TCP endpoint; multiple indications within original-flight epoch.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= type=test
+    //= reason=Congestion helper asserts cwnd/threshold values after eligible ECN and mixed-loss epochs; one-MSS timer rate reduction is separately audited.
+    //# That is, the TCP source halves the congestion window "cwnd" and reduces the slow start threshold "ssthresh".
+    // Actor/condition: TCP endpoint; eligible ECE ACK.
     fn ecn_loss_recovery_shares_reduction_but_not_retransmission() {
         for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
             for base in [Seq(0), Seq(u32::MAX - 3_999)] {

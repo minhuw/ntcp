@@ -1,0 +1,198 @@
+# Operative clauses omitted by extraction; exact RFC text, whitespace normalized only.
+# External actor exceptions do not claim TCP-core implementation.
+
+# 5961-A001 | specification reader | BCP 14 interpretation
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-2"
+quote = '''
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC2119].
+'''
+
+# 5961-A002 | TCP endpoint | replacement RST mitigation, outside window
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-3.2"
+quote = '''
+1) If the RST bit is set and the sequence number is outside the current receive window, silently drop the segment.
+'''
+
+# 5961-A003 | TCP endpoint | nonexact in-window RST challenge
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-3.2"
+quote = '''
+<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+'''
+
+# 5961-A004 | TCP endpoint | synchronized SYN challenge
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-4.2"
+quote = '''
+<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+'''
+
+# 5961-A005 | TCP endpoint | selected ACK bound mitigation
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-5.2"
+quote = '''
+The ACK value is considered acceptable only if it is in the range of ((SND.UNA - MAX.SND.WND) <= SEG.ACK <= SND.NXT).
+'''
+
+# 5961-A006 | TCP endpoint | largest historically received scaled sender window
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-5.2"
+quote = '''
+A new state variable MAX.SND.WND is defined as the largest window that the local sender has ever received from its peer. This window may be scaled to a value larger than 65,535 bytes ([RFC1323]).
+'''
+
+# 5961-A007 | TCP endpoint | optional fixed maximum instead of observed maximum
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-5.2"
+quote = '''
+Implementations can also chose to hard code the MAX.SND.WND value to the maximum permissible window size, i.e., 65535 in the absence of window scaling. In the presence of the window scaling option, the value becomes (MAX.SND.WND << Snd.Wind.Scale).
+'''
+
+# 5961-A008 | TCP endpoint | administrator-configurable throttle
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-7"
+quote = '''
+1) The system administrator can configure the number of challenge ACKs that can be sent out in a given interval. For example, in any 5 second window, no more than 10 challenge ACKs should be sent.
+'''
+
+# 5961-A009 | TCP endpoint | restart with no synchronized TCB
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-4.2"
+quote = '''
+A legitimate peer, after restart, would not have a TCB in the synchronized state. Thus, when the ACK arrives, the peer should send a RST segment back with the sequence number derived from the ACK field that caused the RST.
+'''
+
+# 5961-A010 | TCP endpoint | restart after confirmed valid reset
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-4.2"
+quote = '''
+The local TCP endpoint should then rely on SYN retransmission from the remote end to re-establish the connection.
+'''
+
+# 5961-A011 | deployment administrator/security integrator | complete off-path threat strategy
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-10"
+quote = '''
+Administrators and implementers should consider the other attack vectors and determine appropriate mitigations in securing their systems.
+'''
+
+# 5961-A012 | historical RFC793 description | superseded comparison before Instead
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-3.2"
+quote = '''
+1) If the RST bit is set and the sequence number is outside the current receive window (SEG.SEQ <= RCV.NXT || SEG.SEQ > RCV.NXT+ RCV.WND), silently drop the segment.
+'''
+
+# 5961-A013 | historical RFC793 description | superseded reset-in-window rule
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-3.2"
+quote = '''
+2) If the RST bit is set and the sequence number is acceptable, i.e., (RCV.NXT <= SEG.SEQ < RCV.NXT+RCV.WND), then reset the connection.
+'''
+
+# 5961-A014 | historical RFC793 description | superseded synchronized SYN rule
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-4.2"
+quote = '''
+2) If the SYN bit is set and the sequence number is acceptable, i.e., (RCV.NXT <= SEG.SEQ < RCV.NXT+RCV.WND), then send a RST segment to the sender.
+'''
+
+# 5961-A015 | specification reader | terminology interpretation
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-2"
+quote = '''
+TCP terminology should be interpreted as described in [RFC0793].
+'''
+
+# 5961-A016 | implementer/security integrator | overall security threat assessment
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-10"
+quote = '''
+Implementers also should be aware that the attacks detailed in this specification are not the only attacks available to an off-path attacker and that the counter measures described herein are not a comprehensive defense against such attacks.
+'''
+
+# 5961-G016 | specification reader/implementer | recommendation-level rationale
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-6"
+reason = "Section 6 explains the SHOULD/SHOULD/MAY levels already audited in operative sections 3.2/4.2/5.2, rather than adding a wire or runtime rule. Mitigations are selected; their conditional MUSTs are not waived."
+quote = '''
+As described in the above sections, recommendation levels for RST,
+SYN, and DATA are tagged as SHOULD, SHOULD, and MAY, respectively.
+'''
+
+# 5961-G017 | specification reader/implementer | recommendation-level rationale
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-6"
+reason = "Section 6 explains the SHOULD/SHOULD/MAY levels already audited in operative sections 3.2/4.2/5.2, rather than adding a wire or runtime rule. Mitigations are selected; their conditional MUSTs are not waived."
+quote = '''
+The reason that DATA mitigation is tagged as MAY, even though it
+increased the TCP robustness in general is because, the DATA
+injection is perceived to be more difficult (twice as unlikely) when
+compared to RST and SYN counterparts.
+'''
+
+# 5961-A001 | specification reader | BCP 14 interpretation
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-2"
+reason = "Keyword definition is omitted by automatic extraction; it governs requirement interpretation, not runtime behavior. No implementation/test claim."
+quote = '''
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC2119].
+'''
+
+# 5961-A007 | TCP endpoint | optional fixed maximum instead of observed maximum
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-5.2"
+reason = "Optional hardcoded-window alternative not selected: implementation uses maximum observed peer window. The selected history/scaling evidence gap remains TODO; this alternative is not a waiver of ACK validation."
+quote = '''
+Implementations can also chose to hard code the MAX.SND.WND value to the maximum permissible window size, i.e., 65535 in the absence of window scaling. In the presence of the window scaling option, the value becomes (MAX.SND.WND << Snd.Wind.Scale).
+'''
+
+# 5961-A011 | deployment administrator/security integrator | complete off-path threat strategy
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-10"
+reason = "External system security review obligation, not a TCP wire algorithm. This audit does not claim complete on/off-path or ICMP attack prevention; ACK-validation gaps remain separately open."
+quote = '''
+Administrators and implementers should consider the other attack vectors and determine appropriate mitigations in securing their systems.
+'''
+
+# 5961-A012 | historical RFC793 description | superseded comparison before Instead
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-3.2"
+reason = "Historical description, replaced immediately by RFC5961 mitigation steps. Verified erratum 4845 corrects inequalities to SEG.SEQ < RCV.NXT || SEG.SEQ >= RCV.NXT+RCV.WND; retain original exact quote for traceability, not implementation claim."
+quote = '''
+1) If the RST bit is set and the sequence number is outside the current receive window (SEG.SEQ <= RCV.NXT || SEG.SEQ > RCV.NXT+ RCV.WND), silently drop the segment.
+'''
+
+# 5961-A013 | historical RFC793 description | superseded reset-in-window rule
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-3.2"
+reason = "Quoted prior behavior is replaced by exact-next reset/challenge rules; implementing this historical rule would contradict the selected mitigation."
+quote = '''
+2) If the RST bit is set and the sequence number is acceptable, i.e., (RCV.NXT <= SEG.SEQ < RCV.NXT+RCV.WND), then reset the connection.
+'''
+
+# 5961-A014 | historical RFC793 description | superseded synchronized SYN rule
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-4.2"
+reason = "Prior synchronized SYN reset rule is replaced by challenge ACK/drop; not a current implementation obligation."
+quote = '''
+2) If the SYN bit is set and the sequence number is acceptable, i.e., (RCV.NXT <= SEG.SEQ < RCV.NXT+RCV.WND), then send a RST segment to the sender.
+'''
+
+# 5961-A015 | specification reader | terminology interpretation
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-2"
+reason = "Terminology convention, not runtime behavior; operative TCP state/sequence conditions are separately audited."
+quote = '''
+TCP terminology should be interpreted as described in [RFC0793].
+'''
+
+# 5961-A016 | implementer/security integrator | overall security threat assessment
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5961#section-10"
+reason = "Security caveat for integration and threat assessment; does not require a new wire algorithm and does not waive any selected mitigation MUST."
+quote = '''
+Implementers also should be aware that the attacks detailed in this specification are not the only attacks available to an off-path attacker and that the counter measures described herein are not a comprehensive defense against such attacks.
+'''

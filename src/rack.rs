@@ -289,6 +289,28 @@ impl Rack {
     //# RACK.dsack_round = SND.NXT
     //# RACK.reo_wnd_mult += 1
     //# RACK.reo_wnd_persist = 16
+    // RACK may advance its loss-detection RTT on retransmission; ack_sample supplied to ordinary RTO estimator is restricted to non-retransmitted, complete, unambiguous original intervals.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= reason=RACK may advance its loss-detection RTT on retransmission; ack_sample supplied to ordinary RTO estimator is restricted to non-retransmitted, complete, unambiguous original intervals.
+    //# TCP MUST use Karn's algorithm [KP87] for taking RTT samples.
+    // RACK may advance its loss-detection RTT on retransmission; ack_sample supplied to ordinary RTO estimator is restricted to non-retransmitted, complete, unambiguous original intervals.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= reason=RACK may advance its loss-detection RTT on retransmission; ack_sample supplied to ordinary RTO estimator is restricted to non-retransmitted, complete, unambiguous original intervals.
+    //# That is, RTT samples MUST NOT be made using segments that were retransmitted (and thus
+    //# for which it is ambiguous whether the reply was for the first instance of the packet
+    //# or a later instance).
+    // Partial evidence only; TODO remains. RACK may advance its loss-detection RTT on retransmission; ack_sample supplied to ordinary RTO estimator is restricted to non-retransmitted, complete, unambiguous original intervals.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= reason=Partial evidence only; TODO remains. RACK may advance its loss-detection RTT on retransmission; ack_sample supplied to ordinary RTO estimator is restricted to non-retransmitted, complete, unambiguous original intervals.
+    //# A TCP implementation MUST take at least one RTT measurement per RTT (unless that is
+    //# not possible per Karn's algorithm).
+    // Partial evidence only; TODO remains. RACK may advance its loss-detection RTT on retransmission; ack_sample supplied to ordinary RTO estimator is restricted to non-retransmitted, complete, unambiguous original intervals.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= reason=Partial evidence only; TODO remains. RACK may advance its loss-detection RTT on retransmission; ack_sample supplied to ordinary RTO estimator is restricted to non-retransmitted, complete, unambiguous original intervals.
+    //# However, when using the timestamp option, each ACK can be used as an RTT sample. RFC
+    //# 1323 [JBB92] suggests that TCP connections utilizing large congestion windows should
+    //# take many RTT samples per window of data to avoid aliasing effects in the estimated
+    //# RTT.
     pub(crate) fn acknowledge(
         &mut self,
         ack: Seq,
@@ -1326,6 +1348,18 @@ mod tests {
     //# acknowledging the last retransmission of the segment.
     //#
     //# 2.  The segment was last retransmitted less than RACK.min_rtt ago.
+    // RACK retransmission feedback versus ordinary RTO sample.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= type=test
+    //= reason=RACK retransmission feedback versus ordinary RTO sample.
+    //# TCP MUST use Karn's algorithm [KP87] for taking RTT samples.
+    // RACK retransmission feedback versus ordinary RTO sample.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= type=test
+    //= reason=RACK retransmission feedback versus ordinary RTO sample.
+    //# That is, RTT samples MUST NOT be made using segments that were retransmitted (and thus
+    //# for which it is ambiguous whether the reply was for the first instance of the packet
+    //# or a later instance).
     fn retransmitted_ack_requires_min_rtt_and_matching_timestamp() {
         for (now, echo, valid) in [
             (399_999, 300, false), // Matching echo, but below minimum RTT.

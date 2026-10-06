@@ -1,0 +1,897 @@
+# Operative clauses omitted by extraction; exact RFC text, whitespace normalized only.
+# External actor exceptions do not claim TCP-core implementation.
+
+# 3168-A001 | router/AQM | network forwarding/congestion marking
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5"
+quote = '''
+Routers treat the ECT(0) and ECT(1) codepoints as equivalent.
+'''
+
+# 3168-A002 | router/AQM | network forwarding/congestion marking
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5"
+quote = '''
+Routers that have a packet arriving at a full queue drop the packet, just as they do in the absence of ECN.
+'''
+
+# 3168-A003 | router/AQM | network forwarding/congestion marking
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5"
+quote = '''
+When a CE packet (i.e., a packet that has the CE codepoint set) is received by a router, the CE codepoint is left unchanged, and the packet is transmitted as usual.
+'''
+
+# 3168-A004 | router/AQM | network forwarding/congestion marking
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.1"
+quote = '''
+Therefore, the CE codepoint should not be set by a router based on the instantaneous queue size.
+'''
+
+# 3168-A005 | router/AQM | network forwarding/congestion marking
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-7"
+quote = '''
+During periods where the average queue size exceeds an upper threshold, and therefore the potential packet marking rate would be high, our recommendation is that routers drop packets rather then set the CE codepoint in packet headers.
+'''
+
+# 3168-A006 | router/AQM | network forwarding/congestion marking
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-10"
+quote = '''
+We recommend that any "penalty box" that detects a flow or an aggregate of flows that is not responding to end-to-end congestion control first change from marking to dropping packets from that flow, before taking any additional action to restrict the bandwidth available to that flow.
+'''
+
+# 3168-A007 | router/AQM | network forwarding/congestion marking
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-19.1"
+quote = '''
+ECN-capable routers should drop rather than mark packets during heavy congestion even if the router's queue is not yet full. For example, for routers using active queue management based on RED, the router should drop rather than mark packets that arrive while the average queue sizes exceed the RED queue's maximum threshold.
+'''
+
+# 3168-A008 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.1"
+quote = '''
+The limited-functionality option for ECN encapsulation in IP tunnels is for the not-ECT codepoint to be set in the outside (encapsulating) header regardless of the value of the ECN field in the inside (encapsulated) header. With this option, the ECN field in the inner header is not altered upon de-capsulation.
+'''
+
+# 3168-A009 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.1"
+quote = '''
+At tunnel ingress, the full-functionality option sets the ECN codepoint in the outer header. If the ECN codepoint in the inner header is not-ECT or ECT, then it is copied to the ECN codepoint in the outer header. If the ECN codepoint in the inner header is CE, then the ECN codepoint in the outer header is set to ECT(0). Upon decapsulation at the tunnel egress, the full-functionality option sets the CE codepoint in the inner header if the CE codepoint is set in the outer header. Otherwise, no change is made to this field of the inner header.
+'''
+
+# 3168-A010 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.2"
+quote = '''
+If the IP tunnel uses the full-functionality option, then the not-ECT codepoint should be set in the outer header if and only if it is also set in the inner header.
+'''
+
+# 3168-A011 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.2"
+quote = '''
+If the tunnel uses the limited-functionality option, then the not-ECT codepoint should be set in the outer header.
+'''
+
+# 3168-A012 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2"
+quote = '''
+if it is necessary to eliminate such a channel or reduce its bandwidth, then the IPsec tunnel should be run in limited-functionality mode.
+'''
+
+# 3168-A013 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.2"
+quote = '''
+If unspecified, the default shall be assumed to be Forbidden.
+'''
+
+# 3168-A014 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.3"
+quote = '''
+(7) If the value of the ECN Tunnel field in the SAD entry for this SA is "allowed" and the ECN field in the inner header is set to any value other than CE, copy this ECN field to the outer header. If the ECN field in the inner header is set to CE, then set the ECN field in the outer header to ECT(0).
+'''
+
+# 3168-A015 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.3"
+quote = '''
+(8) If the value of the ECN tunnel field in the SAD entry for this SA is "allowed" and the ECN field in the inner header is set to ECT(0) or ECT(1) and the ECN field in the outer header is set to CE, then copy the ECN field from the outer header to the inner header. Otherwise, make no change to the ECN field in the inner header.
+'''
+
+# 3168-A016 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.3"
+quote = '''
+(7) Set the ECN field to not-ECT in the outer header.
+'''
+
+# 3168-A017 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.3"
+quote = '''
+(8) Make no change to the ECN field in the inner header.
+'''
+
+# 3168-A018 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.2"
+quote = '''
+If the ECN Field is changed inappropriately within an IPsec tunnel, and this change is detected at the tunnel egress, then the receipt of a packet not satisfying the appropriate condition for its SA is an auditable event.
+'''
+
+# 3168-A019 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-12"
+quote = '''
+When ECN (Explicit Congestion Notification) is used, it is required that congestion indications generated within an IP tunnel not be lost at the tunnel egress.
+'''
+
+# 3168-A020 | IP reassembler | CE-bearing fragment reassembly alternative
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.3"
+quote = '''
+* The packet is dropped, instead of being reassembled, for any other reason.
+'''
+
+# 3168-A021 | IP adapter | IPv4 and IPv6 traffic class encoding
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5"
+quote = '''
+Bits 6 and 7 in the IPv4 TOS octet are designated as the ECN field. The IPv4 TOS octet corresponds to the Traffic Class octet in IPv6, and the ECN field is defined identically in both cases.
+'''
+
+# 3168-A022 | TCP endpoint | selected mitigation
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1"
+quote = '''
+Bit 9 in the Reserved field of the TCP header is designated as the ECN-Echo flag.
+'''
+
+# 3168-A023 | TCP endpoint | selected mitigation
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1"
+quote = '''
+The CWR flag is assigned to Bit 8 in the Reserved field of the TCP header.
+'''
+
+# 3168-A024 | TCP endpoint | ECN setup followed by local plain-SYN fallback
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1"
+quote = '''
+However, the commitment to respond appropriately to incoming packets with the CE codepoint set remains even if the TCP sender in a later transmission, within this TCP connection, sends a SYN packet without ECE and CWR set.
+'''
+
+# 3168-A025 | TCP endpoint | terminal state/reused tuple
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1"
+quote = '''
+When a TCP host enters TIME-WAIT or CLOSED state, it should ignore any previous state about the negotiation of ECN for that connection.
+'''
+
+# 3168-A026 | TCP endpoint | ECT packet without bilateral setup
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1.1"
+quote = '''
+a host is forbidden from using the reception of ECT data packets as an implicit signal that the other host is ECN- capable.
+'''
+
+# 3168-A027 | TCP endpoint | SYN-ACK reflects both ECE/CWR
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1.2"
+quote = '''
+the sending TCP correctly interprets a receiver's reflection of its own flags in the Reserved field as an indication that the receiver is not ECN-capable.
+'''
+
+# 3168-A028 | TCP endpoint | mixed ECN/loss epoch and lost retransmission
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2"
+quote = '''
+TCP should not react to congestion indications more than once every window of data (or more loosely, more than once every round-trip time). That is, the TCP sender's congestion window should be reduced only once in response to a series of dropped and/or CE packets from a single window of data. In addition, the TCP source should not decrease the slow-start threshold, ssthresh, if it has been decreased within the last round trip time. However, if any retransmitted packets are dropped, then this is interpreted by the source TCP as a new instance of congestion.
+'''
+
+# 3168-A029 | TCP endpoint | any reduction cause including timeout, fast retransmit and ECN
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2"
+quote = '''
+When an ECN-Capable TCP sender reduces its congestion window for any reason (because of a retransmit timeout, a Fast Retransmit, or in response to an ECN Notification), the TCP sender sets the CWR flag in the TCP header of the first new data packet sent after the window reduction.
+'''
+
+# 3168-A030 | TCP endpoint | CE data including delayed-ACK aggregation
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.3"
+quote = '''
+When TCP receives a CE data packet at the destination end-system, the TCP data receiver sets the ECN-Echo flag in the TCP header of the subsequent ACK packet. If there is any ACK withholding implemented, as in current "delayed-ACK" TCP implementations where the TCP receiver can send an ACK for two arriving data packets, then the ECN-Echo flag in the ACK packet will be set to '1' if the CE codepoint is set in any of the data packets being acknowledged. That is, if any of the received data packets are CE packets, then the returning ACK has the ECN-Echo flag set.
+'''
+
+# 3168-A031 | TCP endpoint | echo persistence until CWR and later CE
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.3"
+quote = '''
+After a TCP receiver sends an ACK packet with the ECN-Echo bit set, that TCP receiver continues to set the ECN-Echo flag in all the ACK packets it sends (whether they acknowledge CE data packets or non-CE data packets) until it receives a CWR packet (a packet with the CWR flag set). After the receipt of the CWR packet, acknowledgments for subsequent non-CE data packets do not have the ECN-Echo flag set.
+'''
+
+# 3168-A032 | TCP endpoint | ACKs without ECE
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2"
+quote = '''
+TCP also follows the normal procedures for increasing the congestion window when it receives ACK packets without the ECN-Echo bit set [RFC2581].
+'''
+
+# 3168-A033 | TCP endpoint | default IP/TCP output ECN policy
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-21"
+quote = '''
+the not-ECT codepoint should be the default.
+'''
+
+# 3168-A034 | IANA | publication registry allocation
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-23.1"
+quote = '''
+When this document is published as an RFC, IANA should create a new registry, "IPv4 TOS Byte and IPv6 Traffic Class Octet", with the namespace as follows:
+'''
+
+# 3168-A035 | IANA | publication registry allocation
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-23.2"
+quote = '''
+When this document is published as an RFC, IANA should create a new registry, "TCP Header Flags", with the namespace as follows:
+'''
+
+# 3168-A036 | TCP sender | optional ECT codepoint choice
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5"
+quote = '''
+Senders are free to use either the ECT(0) or the ECT(1) codepoint to indicate ECT, on a packet-by-packet basis.
+'''
+
+# 3168-A037 | TCP endpoint | multiple indications within original-flight epoch
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5"
+quote = '''
+An additional goal is that the end-systems should react to congestion at most once per window of data (i.e., at most once per round-trip time), to avoid reacting multiple times to multiple indications of congestion within a round-trip time.
+'''
+
+# 3168-A038 | TCP endpoint | loss of corrupted CE data
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.2"
+quote = '''
+Similarly, if a CE packet is dropped later in the network due to corruption (bit errors), the end nodes should still invoke congestion control, just as TCP would today in response to a dropped data packet.
+'''
+
+# 3168-A039 | TCP endpoint | packet not sent as ECN-capable
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1"
+quote = '''
+If the TCP connection does not wish to use ECN notification for a particular packet, the sending TCP sets the ECN codepoint to not-ECT, and the TCP receiver ignores the CE codepoint in the received packet.
+'''
+
+# 3168-A040 | TCP endpoint | negotiated fresh data
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2"
+quote = '''
+For a TCP connection using ECN, new data packets are transmitted with an ECT codepoint set in the IP header.
+'''
+
+# 3168-A041 | TCP endpoint | eligible ECE ACK
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2"
+quote = '''
+That is, the TCP source halves the congestion window "cwnd" and reduces the slow start threshold "ssthresh".
+'''
+
+# 3168-A042 | TCP endpoint | ECE at one-MSS cwnd
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2"
+quote = '''
+The sending TCP will then be able to send a new packet only when the retransmit timer expires.
+'''
+
+# 3168-A043 | TCP endpoint | normal ACK/duplicate ACK/timeout output
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2"
+quote = '''
+TCP follows existing algorithms for sending data packets in response to incoming ACKs, multiple duplicate acknowledgments, or retransmit timeouts [RFC2581].
+'''
+
+# 3168-A044 | IPv4 marking router | incremental checksum update after ECT(0)-to-CE
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-17"
+quote = '''
+Then for header checksums calculated with one's complement subtraction, HC' would be recalculated as follows:
+'''
+
+# 3168-A045 | IPv4 marking router | incremental checksum update after ECT(0)-to-CE
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-17"
+quote = '''
+For header checksums calculated on two's complement machines, HC' would be recalculated as follows after the CE bit was set:
+'''
+
+# 3168-G001 | router/AQM | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-12"
+reason = "Actor: router/AQM. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+The CE codepoint in a packet header MUST NOT be reset by a
+router.
+'''
+
+# 3168-G002 | specification reader | BCP 14 interpretation
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-2"
+reason = "Keyword interpretation is a specification-reading convention, not executable TCP behavior. RFC 2119 levels are retained in the generated requirements; no runtime implementation claim."
+quote = '''
+The keywords MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD,
+SHOULD NOT, RECOMMENDED, MAY, and OPTIONAL, when they appear in this
+document, are to be interpreted as described in [RFC2119].
+'''
+
+# 3168-G003 | multicast protocol/deployer | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-20.2"
+reason = "Actor: multicast protocol/deployer. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+This is not consistent with some of the proposed uses of
+ECT(1) by the multicast duplication procedures in the previous
+paragraph, and such procedures SHOULD NOT be deployed unless this
+inconsistency between multicast duplication procedures and IP tunnels
+with full ECN functionality is resolved.
+'''
+
+# 3168-G007 | IP reassembler | fragment reassembly
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.3"
+reason = "Actor: IP reassembler. No IP reassembler is provided: examples/tun_echo.rs:parse_ipv4 rejects MF/nonzero offsets and output sets DF, while the core accepts caller-supplied TCP segments, not IP fragments. Reassembly is the external IP layer responsibility; this is not a waiver for an implemented reassembly path or a claim of ECN reassembly compliance."
+quote = '''
+Reassembly of a fragmented packet MUST NOT lose indications of
+congestion.
+'''
+
+# 3168-G008 | IP reassembler | fragment reassembly
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.3"
+reason = "Actor: IP reassembler. No IP reassembler is provided: examples/tun_echo.rs:parse_ipv4 rejects MF/nonzero offsets and output sets DF, while the core accepts caller-supplied TCP segments, not IP fragments. Reassembly is the external IP layer responsibility; this is not a waiver for an implemented reassembly path or a claim of ECN reassembly compliance."
+quote = '''
+In other words, if any fragment of an IP packet to be
+reassembled has the CE codepoint set, then one of two actions MUST be
+taken:
+'''
+
+# 3168-G009 | IP reassembler | fragment reassembly
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.3"
+reason = "Actor: IP reassembler. No IP reassembler is provided: examples/tun_echo.rs:parse_ipv4 rejects MF/nonzero offsets and output sets DF, while the core accepts caller-supplied TCP segments, not IP fragments. Reassembly is the external IP layer responsibility; this is not a waiver for an implemented reassembly path or a claim of ECN reassembly compliance."
+quote = '''
+However, this
+MUST NOT occur if any of the other fragments contributing to
+this reassembly carries the Not-ECT codepoint.
+'''
+
+# 3168-G010 | IP reassembler | fragment reassembly
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.3"
+reason = "Actor: IP reassembler. No IP reassembler is provided: examples/tun_echo.rs:parse_ipv4 rejects MF/nonzero offsets and output sets DF, while the core accepts caller-supplied TCP segments, not IP fragments. Reassembly is the external IP layer responsibility; this is not a waiver for an implemented reassembly path or a claim of ECN reassembly compliance."
+quote = '''
+If both actions are applicable, either MAY be chosen.
+'''
+
+# 3168-G011 | IP reassembler | fragment reassembly
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.3"
+reason = "Actor: IP reassembler. No IP reassembler is provided: examples/tun_echo.rs:parse_ipv4 rejects MF/nonzero offsets and output sets DF, while the core accepts caller-supplied TCP segments, not IP fragments. Reassembly is the external IP layer responsibility; this is not a waiver for an implemented reassembly path or a claim of ECN reassembly compliance."
+quote = '''
+Reassembly of
+a fragmented packet MUST NOT change the ECN codepoint when all of the
+fragments carry the same codepoint.
+'''
+
+# 3168-G012 | protocol specification author | protocol requires more precise mixed-fragment semantics
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.3"
+reason = "Actor: protocol specification author. No IP reassembler is provided: examples/tun_echo.rs:parse_ipv4 rejects MF/nonzero offsets and output sets DF, while the core accepts caller-supplied TCP segments, not IP fragments. Reassembly is the external IP layer responsibility; this is not a waiver for an implemented reassembly path or a claim of ECN reassembly compliance."
+quote = '''
+In situations
+where more precise reassembly behavior would be required, protocol
+specifications SHOULD instead specify that DF MUST be set in all
+ECN-capable packets sent by the protocol.
+'''
+
+# 3168-G015 | router/AQM | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5"
+reason = "Actor: router/AQM. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+For a router, the CE codepoint of an ECN-Capable packet SHOULD only
+be set if the router would otherwise have dropped the packet as an
+indication of congestion to the end nodes.
+'''
+
+# 3168-G016 | router/AQM | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5"
+reason = "Actor: router/AQM. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+If so,
+then instead of dropping the packet, the router MAY instead set the
+CE codepoint in the IP header.
+'''
+
+# 3168-G017 | PHB specification author | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5"
+reason = "Actor: PHB specification author. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+Specifications for PHBs MAY provide
+more specifics on how a compliant implementation is to choose between
+setting CE and dropping a packet, but this is NOT REQUIRED.
+'''
+
+# 3168-G018 | router/AQM | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5"
+reason = "Actor: router/AQM. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+A router
+MUST NOT set CE instead of dropping a packet when the drop that would
+occur is caused by reasons other than congestion or the desire to
+indicate incipient congestion to end nodes (e.g., a diffserv edge
+node may be configured to unconditionally drop certain classes of
+traffic to prevent them from entering its diffserv domain).
+'''
+
+# 3168-G019 | TCP endpoint | optional retry after ECN SYN reset
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1.1"
+reason = "Optional RST-triggered SYN retry is not selected. SYN-SENT accepts a valid reset and terminates (syn_sent_resets_require_ack_and_abort_outputs_once); timeout-triggered plain SYN fallback is separately selected. This MAY is an alternative, not permission to omit mandatory setup/feedback behavior."
+quote = '''
+To provide robust connectivity even in the presence of such faulty
+equipment, a host that receives a RST in response to the transmission
+of an ECN-setup SYN packet MAY resend a SYN with CWR and ECE cleared.
+'''
+
+# 3168-G040 | IP tunnel ingress/egress | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.1"
+reason = "Actor: IP tunnel ingress/egress. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+(1) An IP tunnel MUST modify the handling of the DS field octet at
+IP tunnel endpoints by implementing either the limited-
+functionality or the full-functionality option.
+'''
+
+# 3168-G041 | IP tunnel ingress/egress | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.1"
+reason = "Actor: IP tunnel ingress/egress. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+(2) Optionally, an IP tunnel MAY enable the endpoints of an IP
+tunnel to negotiate the choice between the limited-functionality
+and the full-functionality option for ECN in the tunnel.
+'''
+
+# 3168-G042 | IP tunnel ingress/egress | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.1"
+reason = "Actor: IP tunnel ingress/egress. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+All IP tunnels MUST implement the limited-functionality option, and
+SHOULD support the full-functionality option.
+'''
+
+# 3168-G043 | IP tunnel ingress/egress | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.1"
+reason = "Actor: IP tunnel ingress/egress. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+In addition, it is RECOMMENDED that packets with the CE codepoint in
+the outer header be dropped if they arrive at the tunnel egress point
+for a tunnel that uses the limited-functionality option, or for a
+tunnel that uses the full-functionality option but for which the
+not-ECT codepoint is set in the inner header.
+'''
+
+# 3168-G044 | IP tunnel ingress/egress | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.2"
+reason = "Actor: IP tunnel ingress/egress. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+It is RECOMMENDED that
+on a tunnel that has not been configured to support the full-
+functionality option, packets should be dropped at the egress point
+if the CE codepoint is set in the outer header but not in the inner
+header, and should be forwarded otherwise.
+'''
+
+# 3168-G045 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.1"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+[OPTIONAL.
+'''
+
+# 3168-G046 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.1"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+The value of this field SHOULD be assumed to be
+"forbidden" in implementations that do not support it.]
+'''
+
+# 3168-G047 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.1"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+If this attribute is implemented, then the SA specification in a
+Security Policy Database (SPD) entry MUST support a corresponding
+attribute, and this SPD attribute MUST be covered by the SPD
+administrative interface (currently described in Section 4.4.1 of
+[RFC2401]).
+'''
+
+# 3168-G048 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.2"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+This attribute
+is OPTIONAL, although implementations that support it SHOULD also
+support the SAD field defined in Section 9.2.1.1.
+'''
+
+# 3168-G049 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.2"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+For backwards
+compatibility with such implementations initiators SHOULD always also
+include a proposal without the ECN Tunnel attribute to enable such a
+responder to select a transform or proposal that does not contain the
+ECN Tunnel attribute.
+'''
+
+# 3168-G050 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.3"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+(5)(6) If the packet will immediately enter a domain for which the
+DSCP value in the outer header is not appropriate, that value MUST
+be mapped to an appropriate value for the domain [RFC 2474].
+'''
+
+# 3168-G051 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.3"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+The above description applies to implementations that support the ECN
+Tunnel field in the SAD; such implementations MUST implement this
+processing instead of the processing of the IPv4 TOS octet and IPv6
+Traffic Class octet defined in [RFC2401].
+'''
+
+# 3168-G052 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.3"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+An implementation that does not support the ECN Tunnel field in the
+SAD MUST implement this processing by assuming that the value of the
+ECN Tunnel field of the SAD is "forbidden" for every SA.
+'''
+
+# 3168-G053 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.3"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+For backwards compatibility, packets with the CE codepoint set in the
+outer header SHOULD be dropped if they arrive on an SA that is using
+the limited-functionality option, or that is using the full-
+functionality option with the not-ECN codepoint set in the inner
+header.
+'''
+
+# 3168-G054 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+If negotiation of ECN usage is implemented, then the SAD field SHOULD
+also be implemented.
+'''
+
+# 3168-G055 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+On the other hand, negotiation of ECN usage is
+OPTIONAL in all cases, even for implementations that support the SAD
+field.
+'''
+
+# 3168-G056 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+The encapsulation and decapsulation processing changes are
+REQUIRED, but MAY be implemented without the other two changes by
+assuming that ECN usage is always forbidden.
+'''
+
+# 3168-G057 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+The full-functionality
+alternative for ECN usage over IPsec tunnels consists of the SAD
+field and the full version of encapsulation and decapsulation
+processing changes, with or without the OPTIONAL negotiation support.
+'''
+
+# 3168-G058 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.2"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+An implementation MAY create audit records with
+per-SA counts of incorrect packets over some time period rather than
+creating an audit record for each erroneous packet.
+'''
+
+# 3168-G059 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.2"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+Any such audit
+record SHOULD contain the headers from at least one erroneous packet,
+but need not contain the headers from every packet represented by the
+entry.
+'''
+
+# 3168-G060 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.3"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+The
+addition to SA negotiation in this document is OPTIONAL and will
+remain so; implementers are free to ignore it.
+'''
+
+# 3168-G061 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.3"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+It seems better
+simply to specify an OPTIONAL extension to the existing SA
+negotiation mechanism.
+'''
+
+# 3168-G062 | IPsec tunnel endpoint/administrator | when this actor implements the quoted tunnel/marking/PHB/multicast function
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2"
+reason = "Actor: IPsec tunnel endpoint/administrator. This repository offers a TCP endpoint and non-routing TUN host adapter, not router/AQM, IP-in-IP/IPsec tunnel, SA/SPD/SAD negotiation, PHB or multicast deployment functions. The clause remains an obligation for that external actor; TCP ECN metadata plumbing is not evidence of this behavior. No mandatory TCP or adapter obligation is waived."
+quote = '''
+In particular, in tunnel mode the IPsec tunnel MUST support the
+limited-functionality option outlined in Section 9.1.1, and SHOULD
+support the full-functionality option outlined in Section 9.1.1.
+'''
+
+# 3168-A001 | router/AQM | network forwarding/congestion marking
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5"
+reason = "Actor: router/AQM. No forwarding, queues, congestion marking or policing actor is provided; TCP receiver test injection of CE is not implementation evidence of this network behavior."
+quote = '''
+Routers treat the ECT(0) and ECT(1) codepoints as equivalent.
+'''
+
+# 3168-A002 | router/AQM | network forwarding/congestion marking
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5"
+reason = "Actor: router/AQM. No forwarding, queues, congestion marking or policing actor is provided; TCP receiver test injection of CE is not implementation evidence of this network behavior."
+quote = '''
+Routers that have a packet arriving at a full queue drop the packet, just as they do in the absence of ECN.
+'''
+
+# 3168-A003 | router/AQM | network forwarding/congestion marking
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5"
+reason = "Actor: router/AQM. No forwarding, queues, congestion marking or policing actor is provided; TCP receiver test injection of CE is not implementation evidence of this network behavior."
+quote = '''
+When a CE packet (i.e., a packet that has the CE codepoint set) is received by a router, the CE codepoint is left unchanged, and the packet is transmitted as usual.
+'''
+
+# 3168-A004 | router/AQM | network forwarding/congestion marking
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.1"
+reason = "Actor: router/AQM. No forwarding, queues, congestion marking or policing actor is provided; TCP receiver test injection of CE is not implementation evidence of this network behavior."
+quote = '''
+Therefore, the CE codepoint should not be set by a router based on the instantaneous queue size.
+'''
+
+# 3168-A005 | router/AQM | network forwarding/congestion marking
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-7"
+reason = "Actor: router/AQM. No forwarding, queues, congestion marking or policing actor is provided; TCP receiver test injection of CE is not implementation evidence of this network behavior."
+quote = '''
+During periods where the average queue size exceeds an upper threshold, and therefore the potential packet marking rate would be high, our recommendation is that routers drop packets rather then set the CE codepoint in packet headers.
+'''
+
+# 3168-A006 | router/AQM | network forwarding/congestion marking
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-10"
+reason = "Actor: router/AQM. No forwarding, queues, congestion marking or policing actor is provided; TCP receiver test injection of CE is not implementation evidence of this network behavior."
+quote = '''
+We recommend that any "penalty box" that detects a flow or an aggregate of flows that is not responding to end-to-end congestion control first change from marking to dropping packets from that flow, before taking any additional action to restrict the bandwidth available to that flow.
+'''
+
+# 3168-A007 | router/AQM | network forwarding/congestion marking
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-19.1"
+reason = "Actor: router/AQM. No forwarding, queues, congestion marking or policing actor is provided; TCP receiver test injection of CE is not implementation evidence of this network behavior."
+quote = '''
+ECN-capable routers should drop rather than mark packets during heavy congestion even if the router's queue is not yet full. For example, for routers using active queue management based on RED, the router should drop rather than mark packets that arrive while the average queue sizes exceed the RED queue's maximum threshold.
+'''
+
+# 3168-A008 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.1"
+reason = "Actor: IP/IPsec tunnel ingress/egress. The TCP core and plain-IP TUN adapter do not offer encapsulation/decapsulation, tunnel policy or SA negotiation. External tunnel responsibility; not claimed as TCP or adapter coverage."
+quote = '''
+The limited-functionality option for ECN encapsulation in IP tunnels is for the not-ECT codepoint to be set in the outside (encapsulating) header regardless of the value of the ECN field in the inside (encapsulated) header. With this option, the ECN field in the inner header is not altered upon de-capsulation.
+'''
+
+# 3168-A009 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.1"
+reason = "Actor: IP/IPsec tunnel ingress/egress. The TCP core and plain-IP TUN adapter do not offer encapsulation/decapsulation, tunnel policy or SA negotiation. External tunnel responsibility; not claimed as TCP or adapter coverage."
+quote = '''
+At tunnel ingress, the full-functionality option sets the ECN codepoint in the outer header. If the ECN codepoint in the inner header is not-ECT or ECT, then it is copied to the ECN codepoint in the outer header. If the ECN codepoint in the inner header is CE, then the ECN codepoint in the outer header is set to ECT(0). Upon decapsulation at the tunnel egress, the full-functionality option sets the CE codepoint in the inner header if the CE codepoint is set in the outer header. Otherwise, no change is made to this field of the inner header.
+'''
+
+# 3168-A010 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.2"
+reason = "Actor: IP/IPsec tunnel ingress/egress. The TCP core and plain-IP TUN adapter do not offer encapsulation/decapsulation, tunnel policy or SA negotiation. External tunnel responsibility; not claimed as TCP or adapter coverage."
+quote = '''
+If the IP tunnel uses the full-functionality option, then the not-ECT codepoint should be set in the outer header if and only if it is also set in the inner header.
+'''
+
+# 3168-A011 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.1.2"
+reason = "Actor: IP/IPsec tunnel ingress/egress. The TCP core and plain-IP TUN adapter do not offer encapsulation/decapsulation, tunnel policy or SA negotiation. External tunnel responsibility; not claimed as TCP or adapter coverage."
+quote = '''
+If the tunnel uses the limited-functionality option, then the not-ECT codepoint should be set in the outer header.
+'''
+
+# 3168-A012 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2"
+reason = "Actor: IP/IPsec tunnel ingress/egress. The TCP core and plain-IP TUN adapter do not offer encapsulation/decapsulation, tunnel policy or SA negotiation. External tunnel responsibility; not claimed as TCP or adapter coverage."
+quote = '''
+if it is necessary to eliminate such a channel or reduce its bandwidth, then the IPsec tunnel should be run in limited-functionality mode.
+'''
+
+# 3168-A013 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.2"
+reason = "Actor: IP/IPsec tunnel ingress/egress. The TCP core and plain-IP TUN adapter do not offer encapsulation/decapsulation, tunnel policy or SA negotiation. External tunnel responsibility; not claimed as TCP or adapter coverage."
+quote = '''
+If unspecified, the default shall be assumed to be Forbidden.
+'''
+
+# 3168-A014 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.3"
+reason = "Actor: IP/IPsec tunnel ingress/egress. The TCP core and plain-IP TUN adapter do not offer encapsulation/decapsulation, tunnel policy or SA negotiation. External tunnel responsibility; not claimed as TCP or adapter coverage."
+quote = '''
+(7) If the value of the ECN Tunnel field in the SAD entry for this SA is "allowed" and the ECN field in the inner header is set to any value other than CE, copy this ECN field to the outer header. If the ECN field in the inner header is set to CE, then set the ECN field in the outer header to ECT(0).
+'''
+
+# 3168-A015 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.3"
+reason = "Actor: IP/IPsec tunnel ingress/egress. The TCP core and plain-IP TUN adapter do not offer encapsulation/decapsulation, tunnel policy or SA negotiation. External tunnel responsibility; not claimed as TCP or adapter coverage."
+quote = '''
+(8) If the value of the ECN tunnel field in the SAD entry for this SA is "allowed" and the ECN field in the inner header is set to ECT(0) or ECT(1) and the ECN field in the outer header is set to CE, then copy the ECN field from the outer header to the inner header. Otherwise, make no change to the ECN field in the inner header.
+'''
+
+# 3168-A016 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.3"
+reason = "Actor: IP/IPsec tunnel ingress/egress. The TCP core and plain-IP TUN adapter do not offer encapsulation/decapsulation, tunnel policy or SA negotiation. External tunnel responsibility; not claimed as TCP or adapter coverage."
+quote = '''
+(7) Set the ECN field to not-ECT in the outer header.
+'''
+
+# 3168-A017 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.1.3"
+reason = "Actor: IP/IPsec tunnel ingress/egress. The TCP core and plain-IP TUN adapter do not offer encapsulation/decapsulation, tunnel policy or SA negotiation. External tunnel responsibility; not claimed as TCP or adapter coverage."
+quote = '''
+(8) Make no change to the ECN field in the inner header.
+'''
+
+# 3168-A018 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-9.2.2"
+reason = "Actor: IP/IPsec tunnel ingress/egress. The TCP core and plain-IP TUN adapter do not offer encapsulation/decapsulation, tunnel policy or SA negotiation. External tunnel responsibility; not claimed as TCP or adapter coverage."
+quote = '''
+If the ECN Field is changed inappropriately within an IPsec tunnel, and this change is detected at the tunnel egress, then the receipt of a packet not satisfying the appropriate condition for its SA is an auditable event.
+'''
+
+# 3168-A019 | IP/IPsec tunnel ingress/egress | selected tunnel mode/policy
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-12"
+reason = "Actor: IP/IPsec tunnel ingress/egress. The TCP core and plain-IP TUN adapter do not offer encapsulation/decapsulation, tunnel policy or SA negotiation. External tunnel responsibility; not claimed as TCP or adapter coverage."
+quote = '''
+When ECN (Explicit Congestion Notification) is used, it is required that congestion indications generated within an IP tunnel not be lost at the tunnel egress.
+'''
+
+# 3168-A020 | IP reassembler | CE-bearing fragment reassembly alternative
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5.3"
+reason = "No reassembler is provided; adapter rejects IP fragments rather than offering reassembly. This alternative is not an implemented TCP reassembly guarantee."
+quote = '''
+* The packet is dropped, instead of being reassembled, for any other reason.
+'''
+
+# 3168-A034 | IANA | publication registry allocation
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-23.1"
+reason = "IANA registry creation is an external publication action, not TCP implementation behavior; ECN codepoint use is separately audited."
+quote = '''
+When this document is published as an RFC, IANA should create a new registry, "IPv4 TOS Byte and IPv6 Traffic Class Octet", with the namespace as follows:
+'''
+
+# 3168-A035 | IANA | publication registry allocation
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-23.2"
+reason = "IANA registry creation is an external publication action, not TCP implementation behavior; TCP ECE/CWR layout is separately audited."
+quote = '''
+When this document is published as an RFC, IANA should create a new registry, "TCP Header Flags", with the namespace as follows:
+'''
+
+# 3168-A036 | TCP sender | optional ECT codepoint choice
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-5"
+reason = "Choice of either ECT codepoint is permitted, not a requirement to implement both transmit alternatives. This sender selects ECT(0); fresh ECT(0) output is independently asserted."
+quote = '''
+Senders are free to use either the ECT(0) or the ECT(1) codepoint to indicate ECT, on a packet-by-packet basis.
+'''
+
+# 3168-A044 | IPv4 marking router | incremental checksum update after ECT(0)-to-CE
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-17"
+reason = "Optional router incremental-checksum recipe is not selected by TCP or host adapter. Adapter computes full IPv4 header checksum; all DSCP/ECN values have a checksum assertion. No forwarding CE-marking actor is offered."
+quote = '''
+Then for header checksums calculated with one's complement subtraction, HC' would be recalculated as follows:
+'''
+
+# 3168-A045 | IPv4 marking router | incremental checksum update after ECT(0)-to-CE
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc3168#section-17"
+reason = "Router incremental-checksum alternative, outside this non-forwarding TCP/host adapter actor. Full adapter checksum calculation is separately asserted; no router recipe implementation claim."
+quote = '''
+For header checksums calculated on two's complement machines, HC' would be recalculated as follows after the CE bit was set:
+'''

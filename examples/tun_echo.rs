@@ -1128,6 +1128,11 @@ mod linux {
         }
 
         #[test]
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-5
+        //= type=test
+        //= reason=IPv4 adapter ECN/DSCP/checksum roundtrip is asserted. The example adapter has no IPv6 packet path; core metadata permits IPv6 but no current assertion proves IPv6 traffic class ECN plumbing. Mandatory adapter evidence remains open.
+        //# Bits 6 and 7 in the IPv4 TOS octet are designated as the ECN field. The IPv4 TOS octet corresponds to the Traffic Class octet in IPv6, and the ECN field is defined identically in both cases.
+        // Actor/condition: IP adapter; IPv4 and IPv6 traffic class encoding.
         fn ipv4_dscp_and_ecn_are_independent() {
             let (mut bytes, _, local) = packet();
             let ip = IpMetadata {

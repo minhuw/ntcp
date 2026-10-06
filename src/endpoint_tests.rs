@@ -1767,6 +1767,135 @@ fn ecn_deliver(endpoint: &mut Endpoint, now: u64, packet: &(Transmit, Vec<u8>), 
 //= type=test
 //# A TCP endpoint SHOULD implement ECN as described in RFC 3168 (SHLD-
 //# 8).
+//= https://www.rfc-editor.org/rfc/rfc3168#section-5.2
+//= type=test
+//= reason=Fresh-data predicate and Not-ECT ACK/retransmit/persist assertions are partial evidence. No complete assertion inventory covers every special ECT output path (including TLP original versus retransmission), nor end-to-end loss interpretation for every ECT-marked output. Retain universal reliability-of-congestion-indication requirement open; router marking is not claimed.
+//# To ensure the reliable delivery of the congestion indication
+//# of the CE codepoint, an ECT codepoint MUST NOT be set in a packet
+//# unless the loss of that packet in the network would be detected by
+//# the end nodes and interpreted as an indication of congestion.
+// Actor/condition: TCP sender and IP adapter; all ECT outputs.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-5.2
+//= type=test
+//= reason=TCP output policy evidence: fresh ECT(0), setup and pure ACK Not-ECT are asserted at endpoint metadata boundary; external adapters must preserve that metadata. No router/AQM behavior is claimed.
+//# We believe that this aspect is still
+//# the subject of research, so this document specifies that at this
+//# time, "pure" ACK packets MUST NOT indicate ECN-Capability.
+// Actor/condition: TCP sender; pure ACK output.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-5
+//= type=test
+//= reason=TCP output policy evidence: fresh ECT(0), setup and pure ACK Not-ECT are asserted at endpoint metadata boundary; external adapters must preserve that metadata. No router/AQM behavior is claimed.
+//# Protocols and senders that only require a single ECT codepoint SHOULD
+//# use ECT(0).
+// Actor/condition: TCP sender; single ECT codepoint policy.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+//= type=test
+//= reason=Responder ECN setup only after peer setup: endpoint asserts setup SYN yields ECE-only SYN-ACK; opt-out/plain SYN yields plain SYN-ACK. No ECT on handshake output.
+//# * If a host has received an ECN-setup SYN packet, then it MAY send
+//# an ECN-setup SYN-ACK packet.
+// Actor/condition: TCP setup responder; received ECN-setup SYN.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+//= type=test
+//= reason=Responder ECN setup only after peer setup: endpoint asserts setup SYN yields ECE-only SYN-ACK; opt-out/plain SYN yields plain SYN-ACK. No ECT on handshake output.
+//# Otherwise, it MUST NOT send an
+//# ECN-setup SYN-ACK packet.
+// Actor/condition: TCP setup responder; no received ECN-setup SYN.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+//= type=test
+//= reason=First fresh CWR and retransmit/probe no-CWR assertions provide partial evidence, but universal all-subsequent-packets/loss-reduction paths lack complete existing assertions (e.g. every TLP/recovery mode). Keep mandatory CWR consistency open rather than waive untested branches.
+//# * If a host ever sets the ECT codepoint on a data packet, then
+//# that host MUST correctly set/clear the CWR TCP bit on all
+//# subsequent packets in the connection.
+// Actor/condition: TCP sender; ever transmitted ECT within this connection.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+//= type=test
+//= reason=TCP output policy evidence: fresh ECT(0), setup and pure ACK Not-ECT are asserted at endpoint metadata boundary; external adapters must preserve that metadata. No router/AQM behavior is claimed.
+//# * A host MUST NOT set ECT on SYN or SYN-ACK packets.
+// Actor/condition: TCP sender; SYN/SYN-ACK output.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+//= type=test
+//= reason=TCP output policy evidence: fresh ECT(0), setup and pure ACK Not-ECT are asserted at endpoint metadata boundary; external adapters must preserve that metadata. No router/AQM behavior is claimed.
+//# When only one ECT codepoint
+//# is needed by a sender for all packets sent on a TCP connection,
+//# ECT(0) SHOULD be used.
+// Actor/condition: TCP sender; one ECT codepoint for fresh data.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+//= type=test
+//= reason=First committed fresh-data CWR; lost CWR data retransmits without CWR; next fresh data after subsequent reduction carries CWR. Failed encoding cannot consume pending signaling.
+//# Thus, the
+//# CWR bit in the TCP header SHOULD NOT be set on retransmitted packets.
+// Actor/condition: TCP sender; retransmitted data output.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+//= type=test
+//= reason=First committed fresh-data CWR; lost CWR data retransmits without CWR; next fresh data after subsequent reduction carries CWR. Failed encoding cannot consume pending signaling.
+//# When the TCP data sender is ready to set the CWR bit after reducing
+//# the congestion window, it SHOULD set the CWR bit only on the first
+//# new data packet that it transmits.
+// Actor/condition: TCP sender; first fresh data after reduction.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.4
+//= type=test
+//= reason=TCP output policy evidence: fresh ECT(0), setup and pure ACK Not-ECT are asserted at endpoint metadata boundary; external adapters must preserve that metadata. No router/AQM behavior is claimed.
+//# For the current generation of TCP congestion control algorithms, pure
+//# acknowledgement packets (e.g., packets that do not contain any
+//# accompanying data) MUST be sent with the not-ECT codepoint.
+// Actor/condition: TCP sender; pure ACK output.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.5
+//= type=test
+//= reason=Sender retransmission Not-ECT asserted at endpoint; receiver invalid/out-of-window CE rejection asserted at sequence/ACK boundaries. TCP roles only, no network marking behavior.
+//# This document specifies ECN-capable TCP implementations MUST NOT set
+//# either ECT codepoint (ECT(0) or ECT(1)) in the IP header for
+//# retransmitted data packets, and that the TCP data receiver SHOULD
+//# ignore the ECN field on arriving data packets that are outside of the
+//# receiver's current window.
+// Actor/condition: TCP sender and receiver; retransmitted data output and out-of-window received data.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.5
+//= type=test
+//= reason=Sender retransmission Not-ECT asserted at endpoint; receiver invalid/out-of-window CE rejection asserted at sequence/ACK boundaries. TCP roles only, no network marking behavior.
+//# To prevent such a denial-of-service attack, we
+//# specify that a legitimate TCP data sender MUST NOT set an ECT
+//# codepoint on retransmitted data packets, and that the TCP data
+//# receiver SHOULD ignore the CE codepoint on out-of-window packets.
+// Actor/condition: TCP sender and receiver; retransmitted data output and out-of-window received data.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1
+//= type=test
+//= reason=TCP flag layout: existing endpoint parses emitted SYN/SYN-ACK ECE/CWR; wire constants and encoder use the assigned low-byte positions. Erratum 2307 corrects only the RFC793 figure reference.
+//# Bit 9 in the Reserved field of the TCP header is designated as the ECN-Echo flag.
+// Actor/condition: TCP endpoint; selected mitigation.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1
+//= type=test
+//= reason=TCP flag layout: existing endpoint asserts emitted CWR in setup SYN and fresh data, absent from SYN-ACK/retransmissions.
+//# The CWR flag is assigned to Bit 8 in the Reserved field of the TCP header.
+// Actor/condition: TCP endpoint; selected mitigation.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+//= type=test
+//= reason=Endpoint loss/CWR and idle-reduction tests are partial evidence. Every recovery mode/TLP output cause has not been asserted for first-fresh CWR. Keep universal reduction-cause obligation open.
+//# When an ECN-Capable TCP sender reduces its congestion window for any reason (because of a retransmit timeout, a Fast Retransmit, or in response to an ECN Notification), the TCP sender sets the CWR flag in the TCP header of the first new data packet sent after the window reduction.
+// Actor/condition: TCP endpoint; any reduction cause including timeout, fast retransmit and ECN.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.3
+//= type=test
+//= reason=Immediate CE feedback and repeated ECE assertions exist, but no inspected assertion covers CE on either of a two-packet delayed-ACK aggregate. Add explicit aggregate assertion; keep this unextracted receiver instruction visible.
+//# When TCP receives a CE data packet at the destination end-system, the TCP data receiver sets the ECN-Echo flag in the TCP header of the subsequent ACK packet. If there is any ACK withholding implemented, as in current "delayed-ACK" TCP implementations where the TCP receiver can send an ACK for two arriving data packets, then the ECN-Echo flag in the ACK packet will be set to '1' if the CE codepoint is set in any of the data packets being acknowledged. That is, if any of the received data packets are CE packets, then the returning ACK has the ECN-Echo flag set.
+// Actor/condition: TCP endpoint; CE data including delayed-ACK aggregation.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.3
+//= type=test
+//= reason=Dropped feedback/repeated echo, unmarked CWR clearing, subsequent CE and CE-marked CWR assertions establish latch behavior. Erratum 3639 clarifies CWR-before-CE; reordered older CWR is guarded by CE epoch sequence.
+//# After a TCP receiver sends an ACK packet with the ECN-Echo bit set, that TCP receiver continues to set the ECN-Echo flag in all the ACK packets it sends (whether they acknowledge CE data packets or non-CE data packets) until it receives a CWR packet (a packet with the CWR flag set). After the receipt of the CWR packet, acknowledgments for subsequent non-CE data packets do not have the ECN-Echo flag set.
+// Actor/condition: TCP endpoint; echo persistence until CWR and later CE.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-21
+//= type=test
+//= reason=Output defaults to Not-ECT unless eligible fresh data with bilateral ECN; setup, control ACK, retransmission and opted-out data metadata are asserted.
+//# the not-ECT codepoint should be the default.
+// Actor/condition: TCP endpoint; default IP/TCP output ECN policy.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-5.2
+//= type=test
+//= reason=Endpoint test drops corrupted CE data and checks no feedback, but does not trace resulting sender RTO/reduction for that specific corrupted packet. Add actual loss-to-congestion assertion; no corruption-versus-congestion reinterpretation is waived.
+//# Similarly, if a CE packet is dropped later in the network due to corruption (bit errors), the end nodes should still invoke congestion control, just as TCP would today in response to a dropped data packet.
+// Actor/condition: TCP endpoint; loss of corrupted CE data.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+//= type=test
+//= reason=Bilateral setup gates fresh data ECT(0), with endpoint metadata assertions in both directions; no router marking claim.
+//# For a TCP connection using ECN, new data packets are transmitted with an ECT codepoint set in the IP header.
+// Actor/condition: TCP endpoint; negotiated fresh data.
 fn classic_ecn_duplex_feedback_loss_cwr_and_capacity() {
     let (mut a, mut b, listener, client) = endpoints();
     let syn = ecn_packet(&mut a, 0);
@@ -1911,6 +2040,64 @@ fn classic_ecn_duplex_feedback_loss_cwr_and_capacity() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1.1
+//= type=test
+//= reason=Optional timeout fallback selected; asserts plain setup after timeout and ECT suppression, retaining earlier receive commitment. No RST-triggered retry claim.
+//# A host that receives no reply to an ECN-setup SYN within the normal
+//# SYN retransmission timeout interval MAY resend the SYN and any
+//# subsequent SYN retransmissions with CWR and ECE cleared.
+// Actor/condition: TCP setup initiator/responder; no setup reply before SYN retransmission timeout.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+//= type=test
+//= reason=Responder ECN setup only after peer setup: endpoint asserts setup SYN yields ECE-only SYN-ACK; opt-out/plain SYN yields plain SYN-ACK. No ECT on handshake output.
+//# * If a host has received an ECN-setup SYN packet, then it MAY send
+//# an ECN-setup SYN-ACK packet.
+// Actor/condition: TCP setup responder; received ECN-setup SYN.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+//= type=test
+//= reason=Responder ECN setup only after peer setup: endpoint asserts setup SYN yields ECE-only SYN-ACK; opt-out/plain SYN yields plain SYN-ACK. No ECT on handshake output.
+//# Otherwise, it MUST NOT send an
+//# ECN-setup SYN-ACK packet.
+// Actor/condition: TCP setup responder; no received ECN-setup SYN.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+//= type=test
+//= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+//# * A host MUST NOT set ECT on data packets unless it has sent at
+//# least one ECN-setup SYN or ECN-setup SYN-ACK packet, and has
+//# received at least one ECN-setup SYN or ECN-setup SYN-ACK packet,
+//# and has sent no non-ECN-setup SYN or non-ECN-setup SYN-ACK
+//# packet.
+// Actor/condition: TCP sender; ECT eligibility after bilateral setup with no local plain setup.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+//= type=test
+//= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+//# If a host has received at least one non-ECN-setup SYN
+//# or non-ECN-setup SYN-ACK packet, then it SHOULD NOT set ECT on
+//# data packets.
+// Actor/condition: TCP sender; received any plain setup packet.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+//= type=test
+//= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+//# * A host that is not willing to use ECN on a TCP connection SHOULD
+//# clear both the ECE and CWR flags in all non-ECN-setup SYN and/or
+//# SYN-ACK packets that it sends to indicate this unwillingness.
+// Actor/condition: TCP setup sender; unwilling to use ECN.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+//= type=test
+//= reason=Setup/opt-out evidence: exact SYN/SYN-ACK flag interpretation, plain setup forbids ECT, all SYN-ACK ECE/CWR forms are asserted. Earlier receive commitment is separately retained.
+//# Receivers MUST correctly handle all forms of the non-ECN-setup
+//# SYN and SYN-ACK packets.
+// Actor/condition: TCP setup receiver; any non-ECN-setup SYN/SYN-ACK flag combination.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-21
+//= type=test
+//= reason=Output defaults to Not-ECT unless eligible fresh data with bilateral ECN; setup, control ACK, retransmission and opted-out data metadata are asserted.
+//# the not-ECT codepoint should be the default.
+// Actor/condition: TCP endpoint; default IP/TCP output ECN policy.
+//= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
+//= type=test
+//= reason=Sender Not-ECT policy is asserted, but receiver cannot infer an overwritten original Not-ECT from CE alone. Clarify applicable receiver connection/probe handling and add a non-negotiated CE assertion; rejected errata 3636/3680 do not remove the original prose obligation.
+//# If the TCP connection does not wish to use ECN notification for a particular packet, the sending TCP sets the ECN codepoint to not-ECT, and the TCP receiver ignores the CE codepoint in the received packet.
+// Actor/condition: TCP endpoint; packet not sent as ECN-capable.
 fn classic_ecn_opt_out_and_syn_timeout_fallback() {
     for (enabled, lost_syn) in [(false, false), (true, true)] {
         let (local, remote) = addresses();
@@ -2776,6 +2963,21 @@ fn time_wait_pending_candidate_timeout_restores_original_tuple() {
 }
 
 #[test]
+// Scope: Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial. Partial evidence; closure remains TODO.
+//= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+//= type=test
+//= reason=Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial. Partial evidence; closure remains TODO.
+//# While still under discussion, to enable research into this area it is
+//# now RECOMMENDED that when generating an <RST>, if the segment causing
+//# the <RST> to be generated contains a Timestamps option, the <RST>
+//# should also contain a Timestamps option.
+// Scope: Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial. Partial evidence; closure remains TODO.
+//= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+//= type=test
+//= reason=Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial. Partial evidence; closure remains TODO.
+//# In the <RST> segment,
+//# SEG.TSecr SHOULD be set to SEG.TSval from the incoming segment and
+//# SEG.TSval SHOULD be set to zero.
 fn timestamps_endpoint_config_and_control_reset_budgets() {
     let mut cfg = config();
     cfg.connection.timestamps = true;

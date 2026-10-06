@@ -108,6 +108,33 @@ impl Scoreboard {
             (start < end && end <= span).then_some((left, right))
         };
 
+        // Scope: Detection compares first block to current packet ACK argument, never saved scoreboard ACK or connection snd_una. Wrap regression changes saved scoreboard ACK from u32::MAX-99 to packet ACK=10 and asserts below-packet-ACK duplicate recognition; comparing against old saved ACK would fail. Connection passes wire ack directly and declines stale ACK detection rather than comparing it against newer snd_una. RFC2883 does not mandate sender response to each stale duplicate report.
+        //= https://www.rfc-editor.org/rfc/rfc2883#section-5
+        //= reason=Detection compares first block to current packet ACK argument, never saved scoreboard ACK or connection snd_una. Wrap regression changes saved scoreboard ACK from u32::MAX-99 to packet ACK=10 and asserts below-packet-ACK duplicate recognition; comparing against old saved ACK would fail. Connection passes wire ack directly and declines stale ACK detection rather than comparing it against newer snd_una. RFC2883 does not mandate sender response to each stale duplicate report.
+        //# An implementation MUST NOT compare the
+        //# sequence space in the SACK block to the TCP state variable snd.una
+        //# (which carries the total cumulative ACK), as this may result in the
+        //# wrong conclusion if ACK packets are reordered.
+        // Scope: Compares wire first/second containment before sorting and excludes DSACK block from newly delivered bytes. Future/malformed bounds excluded.
+        //= https://www.rfc-editor.org/rfc/rfc2883#section-5
+        //= reason=Compares wire first/second containment before sorting and excludes DSACK block from newly delivered bytes. Future/malformed bounds excluded.
+        //# If the sequence space in the first SACK block is greater than the
+        //# cumulative ACK, then the sender next compares the sequence space in
+        //# the first SACK block with the sequence space in the second SACK
+        //# block, if there is one.
+        // Scope: Prior-cycle ambiguity is not ruled out by DSACK; sender bounds interval validity and never counts DSACK as delivery, but RACK growth/TLP cancellation consume it without prior-cycle-specific assertion. Closure: inject stale prior-cycle duplicate report across sequence wrap and assert bounded advisory-only response, no release of send bytes, inappropriate congestion undo, or fresh RTT credit. Partial evidence; closure remains TODO.
+        //= https://www.rfc-editor.org/rfc/rfc2883#section-4.3
+        //= reason=Prior-cycle ambiguity is not ruled out by DSACK; sender bounds interval validity and never counts DSACK as delivery, but RACK growth/TLP cancellation consume it without prior-cycle-specific assertion. Closure: inject stale prior-cycle duplicate report across sequence wrap and assert bounded advisory-only response, no release of send bytes, inappropriate congestion undo, or fresh RTT credit. Partial evidence; closure remains TODO.
+        //# TCP senders receiving D-SACK blocks should be aware that a segment
+        //# reported as a duplicate segment could possibly have been from a prior
+        //# cycle through the sequence number space.
+        // Scope: Current packet ACK supplied by connection, prior saved scoreboard ACK never substituted; valid stale ACKs may be ignored instead of producing sender adaptation.
+        //= https://www.rfc-editor.org/rfc/rfc2883#section-5
+        //= reason=Current packet ACK supplied by connection, prior saved scoreboard ACK never substituted; valid stale ACKs may be ignored instead of producing sender adaptation.
+        //# In order for the sender to check that the first (D)SACK block of an
+        //# acknowledgement in fact acknowledges duplicate data, the sender
+        //# should compare the sequence space in the first SACK block to the
+        //# cumulative ACK which is carried IN THE SAME PACKET.
         // RFC 2883: inspect the wire's FIRST block, not the sorted union.
         if let Some((left, right)) = blocks[0] {
             let left = Seq(left);
@@ -477,6 +504,14 @@ mod tests {
     }
 
     #[test]
+    // Scope: Compares wire first/second containment before sorting and excludes DSACK block from newly delivered bytes. Future/malformed bounds excluded.
+    //= https://www.rfc-editor.org/rfc/rfc2883#section-5
+    //= type=test
+    //= reason=Compares wire first/second containment before sorting and excludes DSACK block from newly delivered bytes. Future/malformed bounds excluded.
+    //# If the sequence space in the first SACK block is greater than the
+    //# cumulative ACK, then the sender next compares the sequence space in
+    //# the first SACK block with the sequence space in the second SACK
+    //# block, if there is one.
     fn first_dsack_below_ack_and_contained_above_ack_before_sorting() {
         let mut s = Scoreboard::new();
         let out = update(&mut s, 100, 500, &[(50, 100), (200, 250)]);
@@ -499,6 +534,22 @@ mod tests {
     }
 
     #[test]
+    // Scope: Detection compares first block to current packet ACK argument, never saved scoreboard ACK or connection snd_una. Wrap regression changes saved scoreboard ACK from u32::MAX-99 to packet ACK=10 and asserts below-packet-ACK duplicate recognition; comparing against old saved ACK would fail. Connection passes wire ack directly and declines stale ACK detection rather than comparing it against newer snd_una. RFC2883 does not mandate sender response to each stale duplicate report.
+    //= https://www.rfc-editor.org/rfc/rfc2883#section-5
+    //= type=test
+    //= reason=Detection compares first block to current packet ACK argument, never saved scoreboard ACK or connection snd_una. Wrap regression changes saved scoreboard ACK from u32::MAX-99 to packet ACK=10 and asserts below-packet-ACK duplicate recognition; comparing against old saved ACK would fail. Connection passes wire ack directly and declines stale ACK detection rather than comparing it against newer snd_una. RFC2883 does not mandate sender response to each stale duplicate report.
+    //# An implementation MUST NOT compare the
+    //# sequence space in the SACK block to the TCP state variable snd.una
+    //# (which carries the total cumulative ACK), as this may result in the
+    //# wrong conclusion if ACK packets are reordered.
+    // Scope: Current packet ACK supplied by connection, prior saved scoreboard ACK never substituted; valid stale ACKs may be ignored instead of producing sender adaptation.
+    //= https://www.rfc-editor.org/rfc/rfc2883#section-5
+    //= type=test
+    //= reason=Current packet ACK supplied by connection, prior saved scoreboard ACK never substituted; valid stale ACKs may be ignored instead of producing sender adaptation.
+    //# In order for the sender to check that the first (D)SACK block of an
+    //# acknowledgement in fact acknowledges duplicate data, the sender
+    //# should compare the sequence space in the first SACK block to the
+    //# cumulative ACK which is carried IN THE SAME PACKET.
     fn wrap_update_trim_dsack_and_holes() {
         let base = u32::MAX - 99;
         let mut s = Scoreboard::new();

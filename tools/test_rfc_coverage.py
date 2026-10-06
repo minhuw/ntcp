@@ -33,8 +33,10 @@ def complete_report():
 
 
 class CoverageGate(unittest.TestCase):
-    def test_config_extracts_all_five_rfcs_and_all_extension_sections(self):
+    def test_config_extracts_all_requested_rfcs_and_all_extension_sections(self):
         config = tomllib.loads((Path(__file__).parent / "duvet.toml").read_text())
+        self.assertEqual(set(RFCS), {9293, 2018, 6675, 8985, 6937, 6298,
+                                     5681, 6582, 6928, 7323, 2883, 3168, 5961})
         self.assertEqual({s["source"] for s in config["specification"]},
                          {f"{PREFIX}{rfc}" for rfc in RFCS})
         patterns = {r["pattern"] for r in config["requirement"]}
@@ -44,7 +46,7 @@ class CoverageGate(unittest.TestCase):
         self.assertIn("tools/rfc*-additions.toml", patterns)
         self.assertIn("tools/rfc*-todos.toml", patterns)
 
-    def test_all_five_rfcs_require_complete_spans_and_inventory(self):
+    def test_all_requested_rfcs_require_complete_spans_and_inventory(self):
         report = complete_report()
         summaries, errors = check(report)
         self.assertEqual(errors, [])
