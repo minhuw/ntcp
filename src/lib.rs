@@ -32,5 +32,5 @@ pub use endpoint::{
 pub use ipv4_options::{
     Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options, SourceRoute, TimestampRequest,
 };
-pub use recovery::RecoveryAlgorithm;
+pub use recovery::{InitialWindow, RecoveryAlgorithm};
 pub use wire::{IpMetadata, WireError};

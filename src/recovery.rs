@@ -79,9 +79,30 @@ pub enum RecoveryAlgorithm {
     NewReno,
 }
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum InitialWindow {
+    #[default]
+    Rfc5681,
+    // Experimental RFC 6928 initial/restart window; loss windows stay one MSS.
+    Iw10,
+}
+
+impl InitialWindow {
+    fn bytes(self, mss: u32) -> u32 {
+        let (segments, cap) = match self {
+            Self::Rfc5681 => (4, 4_380),
+            Self::Iw10 => (10, 14_600),
+        };
+        mss.saturating_mul(segments)
+            .min(mss.saturating_mul(2).max(cap))
+            .min(MAX_WINDOW)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Congestion {
     algorithm: RecoveryAlgorithm,
+    initial_window: InitialWindow,
     mss: u32,
     cwnd: u32,
     ssthresh: u32,
@@ -98,13 +119,18 @@ pub(crate) struct Congestion {
 }
 
 impl Congestion {
-    pub(crate) fn new(mss: u32, algorithm: RecoveryAlgorithm) -> Self {
+    pub(crate) fn new(
+        mss: u32,
+        algorithm: RecoveryAlgorithm,
+        initial_window: InitialWindow,
+    ) -> Self {
         assert!(mss > 0);
         let mss = mss.min(MAX_WINDOW);
         Self {
             algorithm,
+            initial_window,
             mss,
-            cwnd: Self::initial_window(mss),
+            cwnd: initial_window.bytes(mss),
             ssthresh: MAX_WINDOW,
             acknowledged: 0,
             duplicate_acks: 0,
@@ -117,10 +143,18 @@ impl Congestion {
         }
     }
 
-    fn initial_window(mss: u32) -> u32 {
-        mss.saturating_mul(4)
-            .min(mss.saturating_mul(2).max(4_380))
-            .min(MAX_WINDOW)
+    pub(crate) fn initial_window(&self) -> u32 {
+        self.initial_window.bytes(self.mss)
+    }
+
+    // SYN negotiation selects the byte bound anew; path changes preserve segment counts.
+    pub(crate) fn set_initial_mss(&mut self, mss: u32, syn_timed_out: bool) {
+        self.set_mss(mss);
+        self.cwnd = if syn_timed_out {
+            self.mss
+        } else {
+            self.initial_window()
+        };
     }
 
     pub(crate) fn cwnd(&self) -> u32 {
@@ -378,7 +412,7 @@ impl Congestion {
     }
 
     pub(crate) fn restart_after_idle(&mut self) {
-        self.cwnd = self.cwnd.min(Self::initial_window(self.mss));
+        self.cwnd = self.cwnd.min(self.initial_window());
         self.acknowledged = 0;
         self.reset_duplicate_acks();
     }
@@ -453,6 +487,41 @@ mod tests {
     }
 
     #[test]
+    fn iw10_bounds_mss_changes_timeout_and_idle_restart() {
+        for (mss, window) in [
+            (1_000, 10_000),
+            (1_460, 14_600),
+            (3_000, 14_600),
+            (8_000, 16_000),
+            (u32::MAX, MAX_WINDOW),
+        ] {
+            for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
+                let mut c = Congestion::new(mss, algorithm, InitialWindow::Iw10);
+                assert_eq!(c.cwnd(), window);
+                c.on_ack(Seq(1), 1, 0);
+                c.restart_after_idle();
+                assert_eq!(c.cwnd(), window);
+                c.on_timeout(window, Seq(2));
+                assert_eq!(c.cwnd(), mss.min(MAX_WINDOW));
+                c.restart_after_idle();
+                assert_eq!(c.cwnd(), mss.min(MAX_WINDOW));
+            }
+        }
+        let mut c = Congestion::new(3_000, RecoveryAlgorithm::default(), InitialWindow::Iw10);
+        c.set_initial_mss(1_000, false);
+        assert_eq!(c.cwnd(), 10_000);
+        c.set_mss(500);
+        assert_eq!(c.cwnd(), 5_000);
+        c.set_mss(1_000);
+        assert_eq!(c.cwnd(), 5_000);
+        c.restart_after_idle();
+        assert_eq!(c.cwnd(), 5_000);
+        c.on_timeout(5_000, Seq(100));
+        c.set_initial_mss(500, true);
+        assert_eq!(c.cwnd(), 500);
+    }
+
+    #[test]
     // Partial test: initial window, ACK-driven growth, timeout reduction, and congestion-
     // avoidance byte counting; not end-to-end congestion-control conformance.
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.2
@@ -463,11 +532,15 @@ mod tests {
     fn initial_slow_start_and_byte_counting() {
         for (mss, window) in [(500, 2_000), (1_000, 4_000), (1_460, 4_380), (3_000, 6_000)] {
             assert_eq!(
-                Congestion::new(mss, RecoveryAlgorithm::default()).cwnd(),
+                Congestion::new(mss, RecoveryAlgorithm::default(), InitialWindow::default()).cwnd(),
                 window
             );
         }
-        let mut c = Congestion::new(1_000, RecoveryAlgorithm::default());
+        let mut c = Congestion::new(
+            1_000,
+            RecoveryAlgorithm::default(),
+            InitialWindow::default(),
+        );
         c.on_ack(Seq(100), 100, 0);
         assert_eq!(c.cwnd(), 4_100);
         c.on_ack(Seq(2_100), 2_000, 0);
@@ -500,7 +573,7 @@ mod tests {
             for base in [Seq(0), Seq(u32::MAX - 3_999)] {
                 for extra in [0, 1] {
                     let end = base.wrapping_add(8_000);
-                    let mut c = Congestion::new(1_000, algorithm);
+                    let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
                     c.acknowledged = 3_000;
                     assert!(c.on_sack_recovery(base, 8_000, end));
                     assert_eq!((c.cwnd(), c.ssthresh()), (4_000, 4_000));
@@ -530,7 +603,11 @@ mod tests {
                 }
             }
         }
-        let mut c = Congestion::new(1_000, RecoveryAlgorithm::default());
+        let mut c = Congestion::new(
+            1_000,
+            RecoveryAlgorithm::default(),
+            InitialWindow::default(),
+        );
         assert!(three_duplicates(&mut c, 8_000, Seq(8_000)));
         assert!(!c.on_sack_recovery(Seq(8_000), 2_000, Seq(12_000)));
         assert!(c.fast_recovery);
@@ -541,7 +618,11 @@ mod tests {
     #[test]
     fn sack_timeout_boundary_and_cancel_preserve_epoch() {
         for end in [Seq(10_000), Seq(0), Seq(u32::MAX)] {
-            let mut c = Congestion::new(1_000, RecoveryAlgorithm::default());
+            let mut c = Congestion::new(
+                1_000,
+                RecoveryAlgorithm::default(),
+                InitialWindow::default(),
+            );
             assert!(c.on_sack_recovery(end.wrapping_add(u32::MAX - 7_999), 8_000, end));
             c.on_timeout(8_000, end);
             assert!(!c.sack_recovery);
@@ -577,7 +658,11 @@ mod tests {
         for base in [Seq(0), Seq(u32::MAX - 3_999)] {
             let end = base.wrapping_add(16_000);
             for extra in [0, 1] {
-                let mut c = Congestion::new(1_000, RecoveryAlgorithm::default());
+                let mut c = Congestion::new(
+                    1_000,
+                    RecoveryAlgorithm::default(),
+                    InitialWindow::default(),
+                );
                 assert!(c.on_ecn(base, 16_000, end));
                 assert!(c.on_sack_recovery(
                     end.wrapping_add(extra),
@@ -587,7 +672,11 @@ mod tests {
                 let threshold = if extra == 0 { 8_000 } else { 2_000 };
                 assert_eq!((c.cwnd(), c.ssthresh()), (threshold, threshold));
             }
-            let mut c = Congestion::new(1_000, RecoveryAlgorithm::default());
+            let mut c = Congestion::new(
+                1_000,
+                RecoveryAlgorithm::default(),
+                InitialWindow::default(),
+            );
             assert!(c.on_ecn(base, 16_000, end));
             assert!(c.on_sack_recovery(base, 4_000, end));
             assert_eq!((c.cwnd(), c.ssthresh()), (8_000, 8_000));
@@ -603,7 +692,11 @@ mod tests {
         for base in [Seq(0), Seq(u32::MAX - 3_999)] {
             for acked in [2_000, 3_000] {
                 let end = base.wrapping_add(16_000);
-                let mut c = Congestion::new(1_000, RecoveryAlgorithm::default());
+                let mut c = Congestion::new(
+                    1_000,
+                    RecoveryAlgorithm::default(),
+                    InitialWindow::default(),
+                );
                 assert!(c.on_ecn(base, 16_000, end));
                 assert!(c.on_sack_recovery(base, 16_000, end));
                 c.on_retransmit(base.wrapping_add(3_000));
@@ -624,7 +717,11 @@ mod tests {
 
     #[test]
     fn newreno_partial_and_full_ack() {
-        let mut c = Congestion::new(1_000, RecoveryAlgorithm::default());
+        let mut c = Congestion::new(
+            1_000,
+            RecoveryAlgorithm::default(),
+            InitialWindow::default(),
+        );
         assert!(three_duplicates(&mut c, 8_000, Seq(8_000)));
         assert_eq!((c.ssthresh(), c.cwnd()), (4_000, 7_000));
         assert!(!c.on_duplicate_ack(8_000, Seq(8_000)));
@@ -662,7 +759,7 @@ mod tests {
             for base in [Seq(0), Seq(u32::MAX - 3_999)] {
                 for acked in [500, 2_000, 8_000, 9_000] {
                     let end = base.wrapping_add(8_000);
-                    let mut c = Congestion::new(1_000, algorithm);
+                    let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
                     assert!(three_duplicates(&mut c, 8_000, end));
                     // Control-only and ambiguous ACKs cannot exit recovery.
                     assert!(!c.on_ack(base, 0, 8_000));
@@ -702,7 +799,7 @@ mod tests {
     fn timeout_marker_boundaries_and_wrap() {
         for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
             for end in [Seq(10_000), Seq(0), Seq(u32::MAX)] {
-                let mut c = Congestion::new(1_000, algorithm);
+                let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
                 c.on_timeout(10_000, end);
                 assert_eq!((c.cwnd(), c.ssthresh()), (1_000, 5_000));
                 c.on_timeout(2_000, end);
@@ -728,7 +825,7 @@ mod tests {
     #[test]
     fn mss_idle_reset_and_saturation() {
         for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
-            let mut c = Congestion::new(1_000, algorithm);
+            let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
             c.on_ack(Seq(1_000), 1_000, 0);
             c.set_mss(500);
             assert_eq!(c.cwnd(), 2_500);
@@ -739,7 +836,7 @@ mod tests {
             assert_eq!(c.cwnd(), 500);
             c.set_mss(1_000);
             assert_eq!(c.cwnd(), 1_000);
-            let mut c = Congestion::new(u32::MAX, algorithm);
+            let mut c = Congestion::new(u32::MAX, algorithm, InitialWindow::default());
             assert_eq!(c.cwnd(), MAX_WINDOW);
             c.on_ack(Seq(1), u32::MAX, u32::MAX);
             assert_eq!(c.cwnd(), MAX_WINDOW);
@@ -749,7 +846,7 @@ mod tests {
             c.set_mss(u32::MAX);
             c.on_timeout(u32::MAX, Seq(10));
             assert_eq!((c.cwnd(), c.ssthresh()), (MAX_WINDOW, MAX_WINDOW));
-            let mut c = Congestion::new(1_000, algorithm);
+            let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
             c.on_duplicate_ack(4_000, Seq(4_000));
             c.on_duplicate_ack(4_000, Seq(4_000));
             c.reset_duplicate_acks();
@@ -760,13 +857,18 @@ mod tests {
     #[test]
     #[should_panic]
     fn zero_mss_rejected() {
-        Congestion::new(0, RecoveryAlgorithm::default());
+        Congestion::new(0, RecoveryAlgorithm::default(), InitialWindow::default());
     }
 
     #[test]
     #[should_panic]
     fn zero_mss_update_rejected() {
-        Congestion::new(1_000, RecoveryAlgorithm::default()).set_mss(0);
+        Congestion::new(
+            1_000,
+            RecoveryAlgorithm::default(),
+            InitialWindow::default(),
+        )
+        .set_mss(0);
     }
     #[test]
     fn ecn_retransmission_loss_and_ack_boundaries_wrap() {
@@ -774,7 +876,7 @@ mod tests {
             for base in [Seq(100), Seq(u32::MAX - 12_499)] {
                 for acked_retransmission in [0, 500, 1000] {
                     let end = base.wrapping_add(16_000);
-                    let mut c = Congestion::new(1000, algorithm);
+                    let mut c = Congestion::new(1000, algorithm, InitialWindow::default());
                     assert!(c.on_ecn(base, 16_000, end));
                     assert_eq!(c.ssthresh(), 8000);
                     assert!(three_duplicates(&mut c, 16_000, end));
@@ -815,7 +917,7 @@ mod tests {
         for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
             for base in [Seq(0), Seq(u32::MAX - 3_999)] {
                 let end = base.wrapping_add(4_000);
-                let mut c = Congestion::new(1_000, algorithm);
+                let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
                 assert!(c.on_ecn(base, 4_000, end));
                 assert_eq!((c.cwnd(), c.ssthresh()), (2_000, 2_000));
                 assert!(!c.on_ecn(end, 4_000, end));
@@ -833,7 +935,7 @@ mod tests {
                 assert!(!c.on_ecn(end, 2_000, end));
                 assert!(c.on_ecn(end.wrapping_add(1), 2_000, end.wrapping_add(2_000)));
 
-                let mut c = Congestion::new(1_000, algorithm);
+                let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
                 assert!(three_duplicates(&mut c, 8_000, end));
                 let threshold = c.ssthresh();
                 assert!(!c.on_ecn(end, 8_000, end));
@@ -842,7 +944,7 @@ mod tests {
                 assert_eq!(c.cwnd(), 1_000);
                 assert!(!c.on_ecn(end, 2_000, end));
 
-                let mut c = Congestion::new(1_000, algorithm);
+                let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
                 assert!(c.on_ecn(base, 8_000, end));
                 let threshold = c.ssthresh();
                 c.on_timeout(2_000, end);

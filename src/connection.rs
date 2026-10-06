@@ -5,7 +5,7 @@ use core::{cmp::Ordering, net::SocketAddr};
 
 use crate::{
     buffer::{ReceiveBuffer, SendBuffer},
-    recovery::{Congestion, RecoveryAlgorithm, RttEstimator},
+    recovery::{Congestion, InitialWindow, RecoveryAlgorithm, RttEstimator},
     sack::Scoreboard,
     seq::Seq,
     wire::{self, ACK, CWR, ECE, FIN, Header, IpMetadata, PSH, RST, SYN, Segment, URG},
@@ -33,6 +33,7 @@ pub struct ConnectionConfig {
     pub nagle: bool,
     pub ecn: bool,
     pub recovery_algorithm: RecoveryAlgorithm,
+    pub initial_window: InitialWindow,
     pub timestamps: bool,
     pub sack: bool,
     pub retransmit_beyond_window: bool,
@@ -78,6 +79,7 @@ impl Default for ConnectionConfig {
             nagle: true,
             ecn: true,
             recovery_algorithm: RecoveryAlgorithm::default(),
+            initial_window: InitialWindow::default(),
             timestamps: false,
             sack: false,
             retransmit_beyond_window: false,
@@ -349,7 +351,8 @@ impl Connection {
             .unwrap_or(14);
         let syn_window = config.receive_capacity.min(65535) as u16;
         let mss = config.mss.min(config.send_ip_payload_limit - 20) as usize;
-        let congestion = Congestion::new(mss as u32, config.recovery_algorithm);
+        let congestion =
+            Congestion::new(mss as u32, config.recovery_algorithm, config.initial_window);
         Ok(Self {
             tuple,
             config,
@@ -744,7 +747,8 @@ impl Connection {
             .max(1)
             .min(self.config.send_ip_payload_limit - 20 - if self.timestamps { 12 } else { 0 })
             as usize;
-        self.congestion.set_mss(self.mss as u32);
+        self.congestion
+            .set_initial_mss(self.mss as u32, self.syn_timed_out);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
         //# The window size MUST be treated as an unsigned number, or else large window
         //# sizes will appear like negative windows and TCP will not work (MUST-1).
@@ -2681,8 +2685,7 @@ impl Connection {
     }
 
     fn initial_window(&self) -> u32 {
-        let mss = self.mss as u32;
-        (4 * mss).min((2 * mss).max(4380))
+        self.congestion.initial_window()
     }
 
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
@@ -2871,6 +2874,157 @@ mod tests {
         assert!(a.take_events().connected);
         assert!(b.take_events().connected);
         (a, b)
+    }
+
+    #[test]
+    fn initial_window_uses_negotiated_effective_mss() {
+        assert_eq!(
+            ConnectionConfig::default().initial_window,
+            InitialWindow::Rfc5681
+        );
+        for policy in [InitialWindow::Rfc5681, InitialWindow::Iw10] {
+            for (configured, peer, timestamps, path_limit, effective, default_iw, iw10) in [
+                (1_000, 1_000, false, 65_515, 1_000, 4_000, 10_000),
+                (1_460, 1_460, false, 65_515, 1_460, 4_380, 14_600),
+                (3_000, 3_000, false, 65_515, 3_000, 6_000, 14_600),
+                (8_000, 8_000, false, 65_515, 8_000, 16_000, 16_000),
+                (3_000, 1_000, false, 65_515, 1_000, 4_000, 10_000),
+                (3_000, 1_460, false, 65_515, 1_460, 4_380, 14_600),
+                (1_000, 3_000, false, 65_515, 1_000, 4_000, 10_000),
+                (3_000, 1_460, true, 65_515, 1_448, 4_380, 14_480),
+                (3_000, 3_000, true, 1_032, 1_000, 4_000, 10_000),
+            ] {
+                let mut cfg = config(65_536, configured);
+                cfg.initial_window = policy;
+                cfg.timestamps = timestamps;
+                cfg.send_ip_payload_limit = path_limit;
+                let mut peer_cfg = config(65_536, peer);
+                peer_cfg.initial_window = policy;
+                peer_cfg.timestamps = timestamps;
+                let mut a = Connection::active(tuple(), cfg, 100, 0).unwrap();
+                let bytes = packet(&mut a, 0);
+                let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+                let mut b = Connection::passive(reverse(tuple()), peer_cfg, 900, 10, &syn).unwrap();
+                let passive_iw = b.congestion.cwnd();
+                deliver(&mut b, &mut a, 20);
+                deliver(&mut a, &mut b, 30);
+                assert_eq!(a.mss, effective);
+                assert_eq!(
+                    a.congestion.cwnd(),
+                    if policy == InitialWindow::Iw10 {
+                        iw10
+                    } else {
+                        default_iw
+                    }
+                );
+                assert_eq!(a.congestion.cwnd(), a.initial_window());
+                assert_eq!(b.congestion.cwnd(), passive_iw);
+                let before = a.congestion.cwnd();
+                let lowered = effective / 2;
+                a.lower_mss(lowered as u16 + if timestamps { 12 } else { 0 })
+                    .unwrap();
+                assert_eq!(a.mss, lowered);
+                assert_eq!(
+                    a.congestion.cwnd(),
+                    (before as u64 * lowered as u64 / effective as u64) as u32
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn initial_window_syn_loss_and_output_retries_remain_conservative() {
+        for policy in [InitialWindow::Rfc5681, InitialWindow::Iw10] {
+            for lose_synack in [false, true] {
+                let mut cfg = config(65_536, 3_000);
+                cfg.initial_window = policy;
+                let mut peer_cfg = cfg.clone();
+                peer_cfg.mss = 1_000;
+                let mut a = Connection::active(tuple(), cfg, 100, 0).unwrap();
+                let initial = a.congestion.cwnd();
+                assert_eq!(a.transmit(0, &mut [0; 19]), Err(Error::OutputTooSmall));
+                assert_eq!(a.congestion.cwnd(), initial);
+                assert_eq!(a.rto_deadline, None);
+                let bytes = packet(&mut a, 0);
+                let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+                if !lose_synack {
+                    a.timeout(1_000_000).unwrap();
+                    assert_eq!(a.congestion.cwnd(), 3_000);
+                    assert_eq!(
+                        a.transmit(1_000_000, &mut [0; 19]),
+                        Err(Error::OutputTooSmall)
+                    );
+                    packet(&mut a, 1_000_000);
+                }
+                let mut b =
+                    Connection::passive(reverse(tuple()), peer_cfg, 900, 1_000_000, &syn).unwrap();
+                if lose_synack {
+                    packet(&mut b, 1_000_000);
+                    b.timeout(2_000_000).unwrap();
+                    assert_eq!(b.congestion.cwnd(), 1_000);
+                    assert_eq!(
+                        b.transmit(2_000_000, &mut [0; 19]),
+                        Err(Error::OutputTooSmall)
+                    );
+                }
+                deliver(&mut b, &mut a, 2_000_010);
+                deliver(&mut a, &mut b, 2_000_020);
+                let selected = if policy == InitialWindow::Iw10 {
+                    10_000
+                } else {
+                    4_000
+                };
+                assert_eq!(
+                    a.congestion.cwnd(),
+                    if lose_synack { selected } else { 1_000 }
+                );
+                assert_eq!(
+                    b.congestion.cwnd(),
+                    if lose_synack { 1_000 } else { selected }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn iw10_transmit_idle_restart_and_data_rto() {
+        for mss in [1_000, 1_460] {
+            let mut cfg = config(65_536, mss);
+            cfg.initial_window = InitialWindow::Iw10;
+            cfg.nagle = false;
+            let (mut a, mut b) = pair(cfg, 100);
+            let iw = 10 * mss as u32;
+            a.write(&vec![1; mss as usize]).unwrap();
+            deliver(&mut a, &mut b, 40);
+            b.immediate_ack();
+            deliver(&mut b, &mut a, 50);
+            assert!(a.congestion.cwnd() > iw);
+            a.write(&vec![2; 2 * iw as usize]).unwrap();
+            let now = 50 + a.rto();
+            let grown = a.congestion.cwnd();
+            assert_eq!(a.transmit(now, &mut [0; 19]), Err(Error::OutputTooSmall));
+            assert_eq!(a.congestion.cwnd(), grown);
+            let mut sent = 0;
+            let mut out = vec![0; 65_535];
+            while let Some(size) = a.transmit(now, &mut out).unwrap() {
+                sent += wire::parse(ip(tuple()), &out[..size])
+                    .unwrap()
+                    .payload
+                    .len();
+            }
+            assert_eq!(sent, iw as usize);
+            assert_eq!(a.congestion.cwnd(), iw);
+            a.timeout(a.rto_deadline.unwrap()).unwrap();
+            assert_eq!(a.congestion.cwnd(), mss as u32);
+            let now = a.now;
+            let retry = packet(&mut a, now);
+            assert_eq!(
+                wire::parse(ip(tuple()), &retry).unwrap().payload.len(),
+                mss as usize
+            );
+            assert_eq!(a.congestion.cwnd(), mss as u32);
+            assert_eq!(a.transmit(now, &mut out).unwrap(), None);
+        }
     }
 
     fn inject(
