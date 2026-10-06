@@ -4,7 +4,7 @@ import json
 import sys
 from pathlib import Path
 
-RFCS = (9293, 2018, 6675, 8985, 6937, 6298, 5681, 6582, 6928, 7323, 2883, 3168, 5961)
+RFCS = (9293, 2018, 6675, 8985, 6937, 6298, 5681, 6582, 6928, 7323, 2883, 3168, 5961, 3042)
 PREFIX = "https://www.rfc-editor.org/rfc/rfc"
 
 

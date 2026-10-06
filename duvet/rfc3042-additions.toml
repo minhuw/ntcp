@@ -1,0 +1,14 @@
+# Operative conditions omitted by keyword extraction; exact published text, whitespace reflow only.
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3042#section-2"
+quote = '''
+The receiver's advertised window allows the transmission of the segment.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc3042#section-2"
+quote = '''
+The amount of outstanding data would remain less than or equal to the congestion window plus 2 segments. In other words, the sender can only send two segments beyond the congestion window (cwnd).
+'''
+

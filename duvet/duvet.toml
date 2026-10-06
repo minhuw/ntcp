@@ -47,6 +47,9 @@ pattern = "workbench/duvet/requirements/**/rfc3168/*.toml"
 pattern = "workbench/duvet/requirements/**/rfc5961/*.toml"
 
 [[requirement]]
+pattern = "workbench/duvet/requirements/**/rfc3042/*.toml"
+
+[[requirement]]
 pattern = "duvet/rfc*-additions.toml"
 
 [[requirement]]
@@ -102,6 +105,10 @@ format = "ietf"
 
 [[specification]]
 source = "https://www.rfc-editor.org/rfc/rfc5961"
+format = "ietf"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc3042"
 format = "ietf"
 
 [report.html]

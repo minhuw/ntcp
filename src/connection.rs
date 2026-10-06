@@ -3140,6 +3140,12 @@ impl Connection {
         let mut reo_grew = false;
         let tlp_flight = self.data_flight();
         let had_sack_advice = !self.scoreboard.ranges().is_empty();
+        //= https://www.rfc-editor.org/rfc/rfc3042#section-2
+        //= reason=Scoreboard update must add previously unknown sent bytes without overflow. Empty/repeated SACK grants no new credit; fresh SACK including duplex ACK is asserted by sack_limited_transmit_requires_new_evidence_including_duplex_ack.
+        //# Note: If the connection is using selective acknowledgments [RFC2018], the data sender MUST
+        //# NOT send new segments in response to duplicate ACKs that contain no new SACK information,
+        //# as a misbehaving receiver can generate such ACKs to trigger inappropriate transmission of
+        //# data segments.
         let sack_evidence = if self.sack_receive
             && at_or_after(ack, self.snd_una)
             && self.sack_fallback.is_none_or(|end| at_or_after(ack, end))
@@ -3370,6 +3376,12 @@ impl Connection {
             && self.snd_wnd != 0
         {
             self.duplicate_acks = self.duplicate_acks.saturating_add(1);
+            //= https://www.rfc-editor.org/rfc/rfc3042#section-2
+            //= reason=Non-SACK first two consecutive duplicates grant fresh output; advancing/ineligible ACKs reset the epoch. Wire tests assert fresh sequence, one packet per grant, cwnd invariance, and denial with exhausted window or queue. Negotiated SACK uses RFC6675 SetPipe, not a claim of one output packet per SACK ACK.
+            //# When a TCP sender has previously unsent data queued for transmission it SHOULD use the
+            //# Limited Transmit algorithm, which calls for a TCP sender to transmit new data upon the
+            //# arrival of the first two consecutive duplicate ACKs when the following conditions are
+            //# satisfied:
             // RFC 5681 limited transmit: one new segment on each of the first
             // two duplicate ACKs, bounded by cwnd + 2 MSS and the peer window.
             self.limited_pending =
@@ -3464,6 +3476,12 @@ impl Connection {
     //# without any intervening ACKs which move SND.UNA) as an indication that a segment has been lost.
     //# After receiving 3 duplicate ACKs, TCP performs a retransmission of what appears to be the
     //# missing segment, without waiting for the retransmission timer to expire.
+    //= https://www.rfc-editor.org/rfc/rfc3042#section-2
+    //= reason=Reset consecutive duplicate/grant state on advancing or ineligible ACKs, ECN/RTO and SACK overflow. duplicate_ack_eligibility_and_intervening_advancement_reset asserts no premature third-ACK repair; outstanding limited_sent retention after partial cumulative ACK is separately RFC5681 evidence.
+    //# When a TCP sender has previously unsent data queued for transmission it SHOULD use the
+    //# Limited Transmit algorithm, which calls for a TCP sender to transmit new data upon the
+    //# arrival of the first two consecutive duplicate ACKs when the following conditions are
+    //# satisfied:
     fn reset_limited_transmit(&mut self) {
         self.duplicate_acks = 0;
         self.limited_pending = false;
@@ -4987,6 +5005,14 @@ impl Connection {
             } else {
                 self.congestion.cwnd()
             };
+            //= https://www.rfc-editor.org/rfc/rfc3042#section-2
+            //= reason=Local cwnd_limit extends admission, never stored cwnd; before/after ACK and successful output invariance asserted for ordinary and negotiated-SACK Limited Transmit.
+            //# The congestion window (cwnd) MUST NOT be changed when these new segments are transmitted.
+            //= https://www.rfc-editor.org/rfc/rfc3042#section-2
+            //= reason=Ordinary admission uses cwnd+2*SMSS minus flight. RFC6675 SACK pre-recovery admission recomputes pipe; sack_limited_transmit_repeats_setpipe_on_same_ack checks its two-SMSS original-flight headroom, option clipping and window exhaustion.
+            //# The amount of outstanding data would remain less than or equal to the congestion window
+            //# plus 2 segments. In other words, the sender can only send two segments beyond the
+            //# congestion window (cwnd).
             let cwnd_limit = if self.limited_pending {
                 cwnd.saturating_add(2 * self.mss as u32)
             } else {
@@ -5015,6 +5041,9 @@ impl Connection {
             //# recovery.  Note that as long as some voluntary window reductions are
             //# not undone, the final value for pipe will be the same as ssthresh,
             //# the target cwnd value chosen by the congestion control algorithm.
+            //= https://www.rfc-editor.org/rfc/rfc3042#section-2
+            //= reason=All fresh-data branches subtract sequence-space flight from peer window. limited_transmit_window_queue_and_failed_output and sack_limited_transmit_repeats_setpipe_on_same_ack assert exhausted and one-segment headroom.
+            //# The receiver's advertised window allows the transmission of the segment.
             let usable = if let Some(recovery) = self.sack_recovery {
                 if recovery.entry_pending || self.recovery_credit(recovery) < self.mss as u32 {
                     0
@@ -12194,6 +12223,16 @@ mod tests {
     //# the receiver's advertised window allows, transmit up to 1 SMSS of data
     //# starting with the octet HighData+1 and update HighData to reflect this
     //# transmission, then return to (3.2).
+    //= https://www.rfc-editor.org/rfc/rfc3042#section-2
+    //= type=test
+    //= reason=Non-RACK/non-PRR RFC6675 profile: two-MSS SACK delivery permits two outputs on one ACK, not Reno one-packet credit. Assert total sequence-space flight <= cwnd+2*SMSS, peer-window bound and exhaustion with/without outgoing SACK option clipping.
+    //# The amount of outstanding data would remain less than or equal to the congestion window
+    //# plus 2 segments. In other words, the sender can only send two segments beyond the
+    //# congestion window (cwnd).
+    //= https://www.rfc-editor.org/rfc/rfc3042#section-2
+    //= type=test
+    //= reason=Peer window with one-MSS headroom limits repeated SetPipe admission to one packet; every matrix case checks total flight <= peer window.
+    //# The receiver's advertised window allows the transmission of the segment.
     fn sack_limited_transmit_repeats_setpipe_on_same_ack() {
         for (piggyback, window, queued, packets) in [
             (false, 8192, 1024, 2),
@@ -12252,6 +12291,7 @@ mod tests {
             assert_eq!(a.duplicate_acks, 1);
             assert!(a.recovery_pipe(una) <= a.congestion.cwnd());
             assert!(a.flight() <= a.snd_wnd);
+            assert!(a.flight() <= a.congestion.cwnd() + 2 * a.mss as u32);
         }
     }
 
@@ -12969,6 +13009,17 @@ mod tests {
     //# Alternatively, a TCP that utilizes selective acknowledgments (SACKs) [RFC2018, RFC2883]
     //# can leverage the SACK information to determine when an incoming ACK is a "duplicate"
     //# (e.g., if the ACK contains previously unknown SACK information).
+    //= https://www.rfc-editor.org/rfc/rfc3042#section-2
+    //= type=test
+    //= reason=Empty and repeated SACK produce no fresh packet. Newly SACKed sent ranges grant new sequence data, including a duplex ACK; tests hold cwnd constant.
+    //# Note: If the connection is using selective acknowledgments [RFC2018], the data sender MUST
+    //# NOT send new segments in response to duplicate ACKs that contain no new SACK information,
+    //# as a misbehaving receiver can generate such ACKs to trigger inappropriate transmission of
+    //# data segments.
+    //= https://www.rfc-editor.org/rfc/rfc3042#section-2
+    //= type=test
+    //= reason=Both fresh SACK ACKs and their Limited Transmit output preserve the original cwnd.
+    //# The congestion window (cwnd) MUST NOT be changed when these new segments are transmitted.
     fn sack_limited_transmit_requires_new_evidence_including_duplex_ack() {
         let (mut a, _) = pair(sack_config(128), 100);
         a.write(&[1; 1024]).unwrap();
@@ -16252,6 +16303,23 @@ mod tests {
     //= type=test
     //= reason=Explicit before-ACK/after-ACK/after-output cwnd invariance for first two ordinary duplicates; sack_limited_transmit_requires_new_evidence_including_duplex_ack asserts SACK invariance and evidence gating separately.
     //# Further, the TCP sender MUST NOT change cwnd to reflect these two segments [RFC3042].
+    //= https://www.rfc-editor.org/rfc/rfc3042#section-2
+    //= type=test
+    //= reason=Non-SACK first two consecutive duplicates grant fresh output; advancing/ineligible ACKs reset the epoch. Wire tests assert fresh sequence, one packet per grant, cwnd invariance, and denial with exhausted window or queue. Negotiated SACK uses RFC6675 SetPipe, not a claim of one output packet per SACK ACK.
+    //# When a TCP sender has previously unsent data queued for transmission it SHOULD use the
+    //# Limited Transmit algorithm, which calls for a TCP sender to transmit new data upon the
+    //# arrival of the first two consecutive duplicate ACKs when the following conditions are
+    //# satisfied:
+    //= https://www.rfc-editor.org/rfc/rfc3042#section-2
+    //= type=test
+    //= reason=Before duplicate ACK, after input and after output cwnd are equal for both grants; third duplicate enters fast retransmit independently.
+    //# The congestion window (cwnd) MUST NOT be changed when these new segments are transmitted.
+    //= https://www.rfc-editor.org/rfc/rfc3042#section-2
+    //= type=test
+    //= reason=Four original MSS fill cwnd; two duplicate ACKs each admit one fresh MSS and then stop. Final flight=cwnd+2*SMSS; third ACK repairs original UNA.
+    //# The amount of outstanding data would remain less than or equal to the congestion window
+    //# plus 2 segments. In other words, the sender can only send two segments beyond the
+    //# congestion window (cwnd).
     fn limited_transmit_is_one_packet_per_duplicate_and_excluded_from_threshold() {
         let (mut a, mut b) = primed_pair(config(64, 4), 100);
         a.write(b"abcdefghijklmnopqrstuvwxyzABCDEF").unwrap();
@@ -16268,7 +16336,12 @@ mod tests {
             deliver(&mut b, &mut a, now);
             assert!(a.limited_pending);
             assert_eq!(a.congestion.cwnd(), cwnd);
+            let next = a.snd_nxt;
             let extra = packet(&mut a, now);
+            assert_eq!(
+                wire::parse(ip(tuple()), &extra).unwrap().header.sequence,
+                next.0
+            );
             assert_eq!(a.congestion.cwnd(), cwnd);
             assert_eq!(wire::parse(ip(tuple()), &extra).unwrap().payload.len(), 4);
             assert!(!a.limited_pending);
@@ -16283,6 +16356,50 @@ mod tests {
         assert_eq!(a.congestion.ssthresh(), 8);
         let bytes = packet(&mut a, 80);
         assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, b"abcd");
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3042#section-2
+    //= type=test
+    //= reason=Ordinary first two duplicate ACKs: no peer-window headroom emits nothing; one-MSS headroom emits one fresh packet only. Queue exhaustion independently emits nothing. Failed encoding preserves grant/accounting and successful output preserves cwnd.
+    //# The receiver's advertised window allows the transmission of the segment.
+    fn limited_transmit_window_queue_and_failed_output() {
+        for (window, queued, packets) in [(16, 32, 0), (20, 32, 1), (64, 16, 0)] {
+            let (mut a, _) = primed_pair(config(64, 4), u32::MAX - 7);
+            a.write(&vec![1; queued]).unwrap();
+            for _ in 0..4 {
+                packet(&mut a, 40);
+            }
+            // Establish the peer window before counting consecutive duplicates.
+            let seq = a.receive.next();
+            let una = a.snd_una;
+            if a.snd_wnd != u32::from(window) {
+                inject(&mut a, 45, seq, una, ACK, window, b"");
+            }
+            let cwnd = a.congestion.cwnd();
+            let end = a.snd_nxt;
+            for duplicate in 1..=2 {
+                let now = 50 + u64::from(duplicate) * 10;
+                inject(&mut a, now, seq, una, ACK, window, b"");
+                assert_eq!(a.duplicate_acks, duplicate);
+                assert!(a.limited_pending);
+                if duplicate <= packets {
+                    assert_eq!(a.transmit(now, &mut [0; 8]), Err(Error::OutputTooSmall));
+                    assert_eq!(a.snd_nxt, end);
+                    assert_eq!(a.limited_sent, 0);
+                    assert!(a.limited_pending);
+                    let bytes = packet(&mut a, now);
+                    let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+                    assert_eq!(segment.header.sequence, end.0);
+                    assert_eq!(segment.payload.len(), 4);
+                }
+                assert_eq!(a.transmit(now, &mut [0; 64]), Ok(None));
+                assert_eq!(a.congestion.cwnd(), cwnd);
+                assert!(a.flight() <= u32::from(window));
+                assert!(a.flight() <= cwnd + 2 * a.mss as u32);
+                assert_eq!(a.limited_sent, u32::from(packets) * 4);
+            }
+        }
     }
 
     #[test]
