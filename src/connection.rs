@@ -6,6 +6,7 @@ use core::{cmp::Ordering, net::SocketAddr};
 use crate::{
     buffer::{ReceiveBuffer, SendBuffer},
     recovery::{Congestion, RecoveryAlgorithm, RttEstimator},
+    sack::Scoreboard,
     seq::Seq,
     wire::{self, ACK, CWR, ECE, FIN, Header, IpMetadata, PSH, RST, SYN, Segment, URG},
 };
@@ -32,6 +33,7 @@ pub struct ConnectionConfig {
     pub ecn: bool,
     pub recovery_algorithm: RecoveryAlgorithm,
     pub timestamps: bool,
+    pub sack: bool,
     pub retransmit_beyond_window: bool,
     pub delayed_ack_us: u64,
     pub user_timeout_us: u64,
@@ -76,6 +78,7 @@ impl Default for ConnectionConfig {
             ecn: true,
             recovery_algorithm: RecoveryAlgorithm::default(),
             timestamps: false,
+            sack: false,
             retransmit_beyond_window: false,
             delayed_ack_us: 200_000,
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
@@ -177,6 +180,16 @@ fn due(deadline: Option<Instant>, now: Instant) -> bool {
     deadline.is_some_and(|deadline| now >= deadline)
 }
 
+#[derive(Copy, Clone, Debug)]
+struct SackRecovery {
+    // All sequence markers are exclusive, unlike the RFC's inclusive octets.
+    recovery_point: Seq,
+    high_rxt: Seq,
+    rescue_rxt: Option<Seq>,
+    entry_pending: bool,
+    pipe: u32,
+}
+
 pub(crate) struct Connection {
     tuple: Tuple,
     config: ConnectionConfig,
@@ -206,6 +219,14 @@ pub(crate) struct Connection {
     peer_scale: u8,
     scaling: bool,
     timestamps: bool,
+    sack_send: bool,
+    sack_receive: bool,
+    sack_recovery: Option<SackRecovery>,
+    sack_guard: Option<Seq>,
+    sack_post_rto: Option<Seq>,
+    sack_fallback: Option<Seq>,
+    scoreboard: Scoreboard,
+    sack_omit: bool,
     ts_recent: u32,
     ts_latest: u32,
     ts_recent_at: Instant,
@@ -231,6 +252,7 @@ pub(crate) struct Connection {
     duplicate_acks: u8,
     limited_pending: bool,
     limited_sent: u32,
+    limited_end: Option<Seq>,
     probe_pending: bool,
     keepalive_pending: bool,
     rtt: RttEstimator,
@@ -281,7 +303,8 @@ impl Connection {
             || config.receive_capacity == 0
             || config.receive_capacity > (65535usize << 14)
             || config.receive_ip_payload_limit < 21
-            || config.send_ip_payload_limit < if config.timestamps { 40 } else { 28 }
+            || config.send_ip_payload_limit
+                < 28 + if config.timestamps { 12 } else { 0 } + if config.sack { 4 } else { 0 }
             || config.mss == 0
             || config.mss > if tuple.local.is_ipv4() { 65495 } else { 65515 }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.3
@@ -343,6 +366,14 @@ impl Connection {
             peer_scale: 0,
             scaling: false,
             timestamps: false,
+            sack_send: false,
+            sack_receive: false,
+            sack_recovery: None,
+            sack_guard: None,
+            sack_post_rto: None,
+            sack_fallback: None,
+            scoreboard: Scoreboard::new(),
+            sack_omit: false,
             ts_recent: 0,
             ts_latest: 0,
             ts_recent_at: now,
@@ -368,6 +399,7 @@ impl Connection {
             duplicate_acks: 0,
             limited_pending: false,
             limited_sent: 0,
+            limited_end: None,
             probe_pending: false,
             keepalive_pending: false,
             rtt: RttEstimator::new(),
@@ -602,10 +634,19 @@ impl Connection {
         // before the peer's SYN; the scratch allocation never changes.
         self.config.mss = self.config.mss.min(mss);
         self.congestion.set_mss(effective as u32);
+        if let Some(mut recovery) = self.sack_recovery {
+            recovery.pipe = self.scoreboard.pipe(
+                self.snd_una,
+                self.data_high(),
+                recovery.high_rxt,
+                self.mss as u32,
+            );
+            self.sack_recovery = Some(recovery);
+        }
         if self.flight() != 0 {
             if matches!(self.state, State::SynSent | State::SynReceived) {
                 self.syn_pending = true;
-            } else if self.synchronized() && self.snd_wnd != 0 {
+            } else if self.synchronized() && self.snd_wnd != 0 && self.sack_recovery.is_none() {
                 self.retx_pending = true;
             }
         }
@@ -652,6 +693,7 @@ impl Connection {
 
     fn learn_syn(&mut self, syn: &Segment<'_>) {
         self.learn_ecn(syn.header.flags);
+        self.sack_send |= self.config.sack && syn.options.sack_permitted;
         self.timestamps = self.config.timestamps && syn.options.timestamps.is_some();
         if self.timestamps {
             self.ts_recent = syn.options.timestamps.unwrap().0;
@@ -772,6 +814,11 @@ impl Connection {
     //# whether it closed normally or was aborted (MUST-12).
     fn terminal(&mut self, reason: CloseReason) {
         self.state = State::Closed;
+        self.sack_recovery = None;
+        self.sack_guard = None;
+        self.sack_post_rto = None;
+        self.sack_fallback = None;
+        self.scoreboard.clear();
         self.ecn_echo = false;
         self.ecn_cwr_pending = false;
         self.ecn_pause = None;
@@ -1298,6 +1345,7 @@ impl Connection {
         {
             self.accepted_metadata = true;
             self.learn_ecn(h.flags);
+            self.sack_send |= self.config.sack && segment.options.sack_permitted;
             if self.timestamps
                 && let Some((value, _)) = segment.options.timestamps
             {
@@ -1363,10 +1411,30 @@ impl Connection {
                     || seq.wrapping_add(len as u32 - 1).in_window(next, window) == Some(true))
         };
         if !acceptable {
+            // Old text is not admitted, but a validated duplicate may be
+            // reported without accepting its ACK/window/metadata (RFC 2883).
+            if self.sack_send
+                && self.synchronized()
+                && h.flags & (ACK | RST | SYN) == ACK
+                && !segment.payload.is_empty()
+                && segment.payload.len() < 1usize << 31
+                && after(next, seq)
+                && at_or_after(next, seq.wrapping_add(segment.payload.len() as u32))
+                && at_or_after(self.snd_nxt, ack)
+                && at_or_after(
+                    ack,
+                    self.snd_una
+                        .wrapping_add(0u32.wrapping_sub(self.max_snd_wnd)),
+                )
+            {
+                self.receive.record_duplicate(seq, segment.payload.len());
+                self.sack_omit = false;
+            }
             if h.flags & RST == 0 {
                 if self.state == State::SynReceived && h.flags & SYN != 0 && self.irs == Some(seq) {
                     if h.flags & (ACK | FIN) == 0 {
                         self.learn_ecn(h.flags);
+                        self.sack_send |= self.config.sack && segment.options.sack_permitted;
                     }
                     self.syn_pending = true;
                 } else {
@@ -1507,8 +1575,43 @@ impl Connection {
             self.ecn_cwr_pending = true;
             self.reset_limited_transmit();
         }
+        let sack_evidence = if self.sack_receive
+            && at_or_after(ack, self.snd_una)
+            && self.sack_fallback.is_none_or(|end| at_or_after(ack, end))
+        {
+            let update =
+                self.scoreboard
+                    .update(ack, self.data_high(), &segment.options.sack_blocks);
+            if update.overflow {
+                let boundary = self.data_high();
+                self.sack_fallback = Some(boundary);
+                self.sack_guard = Some(boundary);
+                self.sack_recovery = None;
+                self.sack_post_rto = None;
+                self.congestion.cancel_sack_recovery();
+                self.reset_limited_transmit();
+            }
+            update.newly_sacked != 0 && !update.overflow
+        } else {
+            false
+        };
         if advancing {
             self.accept_ack(ack, ece, segment.options.timestamps.map(|ts| ts.1));
+        }
+        if at_or_after(ack, self.snd_una)
+            && let Some(mut recovery) = self.sack_recovery
+        {
+            if at_or_after(ack, recovery.recovery_point) {
+                self.sack_recovery = None;
+            } else {
+                recovery.pipe = self.scoreboard.pipe(
+                    self.snd_una,
+                    self.data_high(),
+                    recovery.high_rxt,
+                    self.mss as u32,
+                );
+                self.sack_recovery = Some(recovery);
+            }
         }
         if ecn_one {
             let deadline = now.saturating_add(self.rto());
@@ -1539,7 +1642,38 @@ impl Connection {
                 self.persist_unanswered_since = None;
             }
         }
-        if !advancing
+        if self.sack_receive {
+            if sack_evidence && self.sack_recovery.is_none() {
+                self.duplicate_acks = self.duplicate_acks.saturating_add(1);
+                self.limited_pending = self.duplicate_acks <= 2 && self.sack_guard.is_none();
+                if self.sack_guard.is_none()
+                    && after(self.data_high(), self.snd_una)
+                    && (self.duplicate_acks >= 3
+                        || self.scoreboard.is_lost(self.snd_una, self.mss as u32))
+                    && self.congestion.on_sack_recovery(
+                        self.snd_una,
+                        self.flight().saturating_sub(self.limited_sent),
+                        self.data_high(),
+                    )
+                {
+                    self.sack_recovery = Some(SackRecovery {
+                        recovery_point: self.data_high(),
+                        high_rxt: self.snd_una,
+                        rescue_rxt: None,
+                        entry_pending: true,
+                        pipe: self.scoreboard.pipe(
+                            self.snd_una,
+                            self.data_high(),
+                            self.snd_una,
+                            self.mss as u32,
+                        ),
+                    });
+                    self.retx_pending = false;
+                    self.limited_pending = false;
+                    self.ecn_cwr_pending |= self.ecn_feedback();
+                }
+            }
+        } else if !advancing
             && ack == self.snd_una
             && self.flight() != 0
             && segment.payload.is_empty()
@@ -1568,14 +1702,27 @@ impl Connection {
         Ok(())
     }
 
+    fn data_high(&self) -> Seq {
+        self.fin_sequence.unwrap_or(self.snd_nxt)
+    }
+
     fn reset_limited_transmit(&mut self) {
         self.duplicate_acks = 0;
         self.limited_pending = false;
         self.limited_sent = 0;
+        self.limited_end = None;
     }
 
     fn accept_ack(&mut self, ack: Seq, ece: bool, echo: Option<u32>) {
+        let limited = self
+            .limited_end
+            .filter(|&end| self.sack_receive && after(end, ack))
+            .map(|end| (end, self.limited_sent.min(end.distance_from(ack))));
         self.reset_limited_transmit();
+        if let Some((end, bytes)) = limited {
+            self.limited_end = Some(end);
+            self.limited_sent = bytes;
+        }
         let syn_ack =
             self.snd_una == self.iss && matches!(self.state, State::SynSent | State::SynReceived);
         let bytes = ack
@@ -1598,6 +1745,14 @@ impl Connection {
             }
         }
         self.snd_una = ack;
+        if self.sack_guard.is_some_and(|end| at_or_after(ack, end)) {
+            self.sack_guard = None;
+            self.sack_post_rto = None;
+        }
+        if self.sack_fallback.is_some_and(|end| at_or_after(ack, end)) {
+            self.sack_fallback = None;
+        }
+
         if self.snd_up.is_some_and(|end| at_or_after(ack, end)) {
             self.snd_up = None;
         }
@@ -1673,6 +1828,10 @@ impl Connection {
         }
         let next = self.receive.next();
         let window = self.receive_window();
+        if self.sack_send && !payload.is_empty() {
+            self.receive.record_duplicate(seq, payload.len());
+            self.sack_omit = false;
+        }
         if flags & URG != 0 && !self.read_closed {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5
             //# The urgent pointer MUST point to the sequence number of the octet
@@ -1723,6 +1882,10 @@ impl Connection {
             fin && skip + count == payload.len(),
             flags & PSH != 0 && skip + count == payload.len(),
         );
+        if outcome.sack_overflow && self.sack_send {
+            self.sack_omit = true;
+            self.receive.clear_dsack();
+        }
         if self.read_closed && outcome.new_bytes != 0 {
             self.events.readable = false;
             self.events.pushed = false;
@@ -1845,6 +2008,171 @@ impl Connection {
         let retransmit = reset.is_none() && !syn && live && self.retx_pending && self.flight() != 0;
         let probe = reset.is_none() && !syn && live && self.probe_pending;
         let keepalive = reset.is_none() && !syn && live && self.keepalive_pending;
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
+        //= reason=Transmit supplies MSS on SYN; learn_syn consumes the decoded peer MSS.
+        //# TCP endpoints MUST implement both sending and receiving the MSS Option
+        //# (MUST-14).
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
+        //# where MMS_R is the maximum size for a transport-layer message that
+        //# can be received (and reassembled at the IP layer) (MUST-67).
+        let mss = self
+            .config
+            .mss
+            .min(self.config.receive_ip_payload_limit - 20)
+            .to_be_bytes();
+        let mut options = [0; 40];
+        options[..8].copy_from_slice(&[2, 4, mss[0], mss[1], 1, 3, 3, self.local_scale]);
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
+        //# TCP implementations SHOULD send an MSS Option in every SYN segment when its
+        //# receive MSS differs from the default 536 for IPv4 or 1220 for IPv6 (SHLD-5),
+        //# and MAY send it always (MAY-3).
+        let mut option_len = if syn {
+            if self.state == State::SynSent || self.scaling {
+                8
+            } else {
+                4
+            }
+        } else {
+            0
+        };
+        //= https://www.rfc-editor.org/rfc/rfc2018#section-2
+        //# It MUST NOT be sent on non-SYN segments.
+        let sack_offer =
+            syn && self.config.sack && (self.state == State::SynSent || self.sack_send);
+        if sack_offer {
+            options[option_len..option_len + 4].copy_from_slice(&[1, 1, 4, 2]);
+            option_len += 4;
+        }
+        let timestamp = if reset.is_some() && self.reset_echo.is_some() {
+            self.reset_echo.map(|echo| (0, echo))
+        } else if self.timestamps || syn && self.state == State::SynSent && self.config.timestamps {
+            Some((
+                (now / 1_000) as u32,
+                if reset.map_or(self.state != State::SynSent, |(_, with_ack)| with_ack) {
+                    self.ts_recent
+                } else {
+                    0
+                },
+            ))
+        } else {
+            None
+        };
+        if let Some((value, echo)) =
+            timestamp.filter(|_| reset.is_none() || self.config.send_ip_payload_limit >= 32)
+        {
+            options[option_len..option_len + 4].copy_from_slice(&[1, 1, 8, 10]);
+            options[option_len + 4..option_len + 8].copy_from_slice(&value.to_be_bytes());
+            options[option_len + 8..option_len + 12].copy_from_slice(&echo.to_be_bytes());
+            option_len += 12;
+        }
+        let mut sack_option_len = 0;
+        if reset.is_none() && !syn && live && self.sack_send && !self.sack_omit {
+            let available = (40 - option_len)
+                .min((self.config.send_ip_payload_limit as usize).saturating_sub(20 + option_len))
+                .min(self.mss.saturating_sub(1));
+            let max_blocks = available.saturating_sub(4) / 8;
+            let blocks = self.receive.sack_blocks(max_blocks);
+            let n = blocks.iter().flatten().count();
+            if n != 0 {
+                options[option_len..option_len + 4].copy_from_slice(&[1, 1, 5, (2 + n * 8) as u8]);
+                for (index, &(left, right)) in blocks.iter().flatten().enumerate() {
+                    let offset = option_len + 4 + index * 8;
+                    options[offset..offset + 4].copy_from_slice(&left.to_be_bytes());
+                    options[offset + 4..offset + 8].copy_from_slice(&right.to_be_bytes());
+                }
+                sack_option_len = 4 + n * 8;
+                option_len += sack_option_len;
+            }
+        }
+        let packet_mss = self
+            .mss
+            .saturating_sub(sack_option_len)
+            .min((self.config.send_ip_payload_limit as usize).saturating_sub(20 + option_len));
+        let mut sack_segment = None;
+        if reset.is_none()
+            && !syn
+            && live
+            && !retransmit
+            && !probe
+            && !keepalive
+            && let Some(recovery) = self.sack_recovery
+        {
+            if recovery.entry_pending {
+                let range = self
+                    .scoreboard
+                    .lowest_hole(self.snd_una, self.data_high(), packet_mss as u32, false)
+                    .or_else(|| {
+                        after(self.data_high(), self.snd_una).then_some((
+                            self.snd_una,
+                            self.snd_una.wrapping_add(
+                                self.data_high()
+                                    .distance_from(self.snd_una)
+                                    .min(packet_mss as u32),
+                            ),
+                        ))
+                    });
+                sack_segment = range.map(|(left, right)| (left, right, false, true));
+            } else if self.congestion.cwnd().saturating_sub(recovery.pipe) >= self.mss as u32 {
+                //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+                //= reason=Connection output selection applies the four NextSeg priorities to scoreboard ranges; markers commit only after encoding.
+                //# NextSeg () MUST return the sequence number range of the next segment that is to be transmitted, per the following rules:
+                // RFC 6675 NextSeg: lost hole, new data, speculative hole,
+                // then one tail rescue. New data is selected by the live branch.
+                let lost = self.scoreboard.lowest_hole(
+                    recovery.high_rxt,
+                    self.data_high(),
+                    packet_mss as u32,
+                    true,
+                );
+                let unsent = self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize;
+                let new_allowed = unsent
+                    && self.snd_wnd > self.flight()
+                    && self.ecn_pause.is_none_or(|deadline| now >= deadline);
+                if let Some((left, right)) = lost {
+                    sack_segment = Some((left, right, false, false));
+                } else if !new_allowed {
+                    if let Some((left, right)) = self.scoreboard.lowest_hole(
+                        recovery.high_rxt,
+                        self.data_high(),
+                        packet_mss as u32,
+                        false,
+                    ) {
+                        sack_segment = Some((left, right, false, false));
+                    } else if recovery
+                        .rescue_rxt
+                        .is_none_or(|end| after(self.snd_una, end))
+                    {
+                        sack_segment = self
+                            .scoreboard
+                            .tail_hole(self.snd_una, self.data_high(), packet_mss as u32)
+                            .map(|(left, right)| (left, right, true, false));
+                    }
+                }
+            }
+        }
+        // RFC 6675 §5.1 recommends filling the newly reported holes after an
+        // RTO, but forbids starting another recovery phase before its boundary
+        // is covered. The initial RTO retransmission still ignores all SACKs.
+        let post_rto_segment = if reset.is_none()
+            && !syn
+            && live
+            && !retransmit
+            && !probe
+            && !keepalive
+            && self.sack_fallback.is_none()
+            && let Some(high_rxt) = self.sack_post_rto
+            && self.congestion.cwnd().saturating_sub(self.scoreboard.pipe(
+                self.snd_una,
+                self.data_high(),
+                high_rxt,
+                self.mss as u32,
+            )) >= self.mss as u32
+        {
+            self.scoreboard
+                .lowest_hole(high_rxt, self.data_high(), packet_mss as u32, false)
+        } else {
+            None
+        };
         let mut seq = self.snd_nxt;
         let mut flags = ACK;
         let mut count = 0usize;
@@ -1864,6 +2192,20 @@ impl Connection {
             retransmitted = self.snd_nxt != self.iss;
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
         //# Probing of zero (offered) windows MUST be supported (MUST-36).
+        } else if let Some((left, right)) =
+            post_rto_segment.or(sack_segment.map(|(left, right, _, _)| (left, right)))
+        {
+            seq = left;
+            let credit = if self.config.retransmit_beyond_window && self.snd_wnd != 0 {
+                self.data_high().distance_from(seq)
+            } else {
+                self.snd_wnd.saturating_sub(seq.distance_from(self.snd_una))
+            };
+            count = self.send.copy(
+                seq.distance_from(self.send_base) as usize,
+                &mut self.scratch[..(right.distance_from(left) as usize).min(credit as usize)],
+            );
+            retransmitted = count != 0;
         } else if retransmit || probe {
             seq = self.snd_una;
             let offset = seq.distance_from(self.send_base) as usize;
@@ -1886,7 +2228,7 @@ impl Connection {
                 } else {
                     self.snd_wnd
                 };
-                self.mss.min(window as usize).min(self.flight() as usize)
+                packet_mss.min(window as usize).min(self.flight() as usize)
             };
             count = self.send.copy(offset, &mut self.scratch[..limit]);
             retransmitted = seq != self.snd_nxt;
@@ -1942,14 +2284,54 @@ impl Connection {
             //# However, a sending TCP peer MUST
             //# be robust against window shrinking, which may cause the "usable
             //# window" (see Section 3.8.6.2.1) to become negative (MUST-34).
-            let usable = self.snd_wnd.min(cwnd_limit).saturating_sub(self.flight()) as usize;
+            let usable = if let Some(recovery) = self.sack_recovery {
+                if recovery.entry_pending
+                    || self.congestion.cwnd().saturating_sub(recovery.pipe) < self.mss as u32
+                {
+                    0
+                } else {
+                    self.snd_wnd
+                        .saturating_sub(self.flight())
+                        .min(self.congestion.cwnd().saturating_sub(recovery.pipe))
+                        as usize
+                }
+            } else if let Some(high_rxt) =
+                self.sack_post_rto.filter(|_| self.sack_fallback.is_none())
+            {
+                let pipe =
+                    self.scoreboard
+                        .pipe(self.snd_una, self.data_high(), high_rxt, self.mss as u32);
+                if cwnd.saturating_sub(pipe) >= self.mss as u32 {
+                    self.snd_wnd
+                        .saturating_sub(self.flight())
+                        .min(cwnd.saturating_sub(pipe)) as usize
+                } else {
+                    0
+                }
+            } else if self.sack_receive && self.limited_pending {
+                let pipe = self.scoreboard.pipe(
+                    self.snd_una,
+                    self.data_high(),
+                    self.snd_una,
+                    self.mss as u32,
+                );
+                if cwnd.saturating_sub(pipe) >= self.mss as u32 {
+                    self.snd_wnd
+                        .saturating_sub(self.flight())
+                        .min(cwnd.saturating_sub(pipe)) as usize
+                } else {
+                    0
+                }
+            } else {
+                self.snd_wnd.min(cwnd_limit).saturating_sub(self.flight()) as usize
+            };
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
             //# However, a TCP implementation SHOULD send a maximum-sized segment
             //# whenever possible (SHLD-28) to improve performance (see Section
             //# 3.8.6.2.1).
-            count = unsent.min(self.mss).min(usable);
+            count = unsent.min(packet_mss).min(usable);
             let urgent = self.snd_up.is_some_and(|end| after(end, seq));
-            if count < self.mss && !urgent {
+            if count < packet_mss && !urgent && self.sack_recovery.is_none() {
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.4
                 //# A TCP implementation SHOULD implement the Nagle algorithm to
                 //# coalesce short segments (SHLD-7).
@@ -2062,51 +2444,6 @@ impl Connection {
             window,
             urgent_pointer,
         };
-        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
-        //= reason=Transmit supplies MSS on SYN; learn_syn consumes the decoded peer MSS.
-        //# TCP endpoints MUST implement both sending and receiving the MSS Option
-        //# (MUST-14).
-        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
-        //# where MMS_R is the maximum size for a transport-layer message that
-        //# can be received (and reassembled at the IP layer) (MUST-67).
-        let mss = self
-            .config
-            .mss
-            .min(self.config.receive_ip_payload_limit - 20)
-            .to_be_bytes();
-        let mut options = [0; 20];
-        options[..8].copy_from_slice(&[2, 4, mss[0], mss[1], 1, 3, 3, self.local_scale]);
-        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
-        //# TCP implementations SHOULD send an MSS Option in every SYN segment when its
-        //# receive MSS differs from the default 536 for IPv4 or 1220 for IPv6 (SHLD-5),
-        //# and MAY send it always (MAY-3).
-        let mut option_len = if syn {
-            if self.state == State::SynSent || self.scaling {
-                8
-            } else {
-                4
-            }
-        } else {
-            0
-        };
-        let timestamp = if reset.is_some() && self.reset_echo.is_some() {
-            self.reset_echo.map(|echo| (0, echo))
-        } else if self.timestamps || syn && self.state == State::SynSent && self.config.timestamps {
-            Some((
-                (now / 1_000) as u32,
-                if flags & ACK != 0 { self.ts_recent } else { 0 },
-            ))
-        } else {
-            None
-        };
-        if let Some((value, echo)) =
-            timestamp.filter(|_| reset.is_none() || self.config.send_ip_payload_limit >= 32)
-        {
-            options[option_len..option_len + 4].copy_from_slice(&[1, 1, 8, 10]);
-            options[option_len + 4..option_len + 8].copy_from_slice(&value.to_be_bytes());
-            options[option_len + 8..option_len + 12].copy_from_slice(&echo.to_be_bytes());
-            option_len += 12;
-        }
         let ip = IpMetadata {
             source: self.tuple.local.ip(),
             destination: self.tuple.remote.ip(),
@@ -2146,6 +2483,7 @@ impl Connection {
         self.now = now;
         self.last_output_ecn = ecn;
         if syn {
+            self.sack_receive |= sack_offer;
             self.ecn_sent_setup |= setup;
             self.ecn_sent_plain |= !setup;
         }
@@ -2156,6 +2494,41 @@ impl Connection {
             self.pending_rst = None;
             self.reset_echo = None;
             return Ok(Some(size));
+        }
+        if sack_option_len != 0 && flags & ACK != 0 {
+            self.receive.clear_dsack();
+        }
+        if flags & ACK != 0 {
+            self.sack_omit = false;
+        }
+        if count != 0
+            && let Some(mut recovery) = self.sack_recovery
+        {
+            if let Some((_, _, rescue, entry)) = sack_segment {
+                let end = seq.wrapping_add(count as u32);
+                if !rescue {
+                    recovery.high_rxt = end;
+                }
+                if entry {
+                    recovery.entry_pending = false;
+                    recovery.rescue_rxt = Some(end);
+                } else if rescue {
+                    recovery.rescue_rxt = Some(recovery.recovery_point);
+                }
+            }
+            recovery.pipe = recovery.pipe.saturating_add(count as u32);
+            self.sack_recovery = Some(recovery);
+        }
+        if retransmitted
+            && !syn
+            && !probe
+            && count != 0
+            && let Some(old) = self.sack_post_rto
+        {
+            let end = seq.wrapping_add(count as u32);
+            if after(end, old) {
+                self.sack_post_rto = Some(end);
+            }
         }
         if !keepalive
             && self.flight() == 0
@@ -2254,6 +2627,7 @@ impl Connection {
         if count != 0 && !keepalive {
             if self.limited_pending && !retransmit && !probe {
                 self.limited_sent = self.limited_sent.saturating_add(count as u32);
+                self.limited_end = Some(seq.wrapping_add(count as u32));
                 self.limited_pending = false;
             }
             self.sws_deadline = None;
@@ -2315,6 +2689,16 @@ impl Connection {
             self.ecn_pause = None;
         }
         if due(self.rto_deadline, now) {
+            //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+            //= reason=Timeout discards advisory ranges and guards a fresh recovery phase until its exclusive data boundary is covered.
+            //# RecoveryPoint MUST be set to HighData.
+            if self.sack_receive {
+                self.scoreboard.clear();
+                self.sack_recovery = None;
+                self.sack_guard = Some(self.data_high());
+                self.sack_post_rto = Some(self.snd_una);
+                self.congestion.cancel_sack_recovery();
+            }
             self.reset_limited_transmit();
             self.rto_deadline = None;
             self.sample = None;
@@ -2469,6 +2853,1057 @@ mod tests {
         let size = wire::encode(metadata, header, &[], payload, &mut bytes).unwrap();
         let segment = wire::parse(metadata, &bytes[..size]).unwrap();
         to.input(now, &segment).unwrap();
+    }
+
+    fn inject_sack(
+        to: &mut Connection,
+        now: Instant,
+        seq: Seq,
+        ack: Seq,
+        flags: u8,
+        window: u16,
+        payload: &[u8],
+        blocks: &[(u32, u32)],
+    ) {
+        let mut options = vec![];
+        if to.timestamps {
+            options.extend_from_slice(&[1, 1, 8, 10]);
+            options.extend_from_slice(&((now / 1_000) as u32).to_be_bytes());
+            options.extend_from_slice(&to.ts_recent.to_be_bytes());
+        }
+        if !blocks.is_empty() {
+            options.extend_from_slice(&[1, 1, 5, (2 + 8 * blocks.len()) as u8]);
+            for &(left, right) in blocks {
+                options.extend_from_slice(&left.to_be_bytes());
+                options.extend_from_slice(&right.to_be_bytes());
+            }
+        }
+        let metadata = ip(reverse(to.tuple()));
+        let mut bytes = vec![0; 60 + payload.len()];
+        let size = wire::encode(
+            metadata,
+            Header {
+                source_port: to.tuple.remote.port(),
+                destination_port: to.tuple.local.port(),
+                sequence: seq.0,
+                acknowledgment: ack.0,
+                flags,
+                window,
+                urgent_pointer: 0,
+            },
+            &options,
+            payload,
+            &mut bytes,
+        )
+        .unwrap();
+        to.input(now, &wire::parse(metadata, &bytes[..size]).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn sack_negotiation_directional_and_disabled_layout() {
+        assert!(!ConnectionConfig::default().sack);
+        for active in [false, true] {
+            for passive in [false, true] {
+                for timestamps in [false, true] {
+                    let cfg = ConnectionConfig {
+                        sack: active,
+                        timestamps,
+                        ..config(1024, 128)
+                    };
+                    let mut a = Connection::active(tuple(), cfg.clone(), 100, 0).unwrap();
+                    assert_eq!(a.transmit(0, &mut [0; 8]), Err(Error::OutputTooSmall));
+                    assert!(!a.sack_receive);
+                    let bytes = packet(&mut a, 0);
+                    assert_eq!(&bytes[20..28], &[2, 4, 0, 128, 1, 3, 3, 0]);
+                    if active {
+                        assert_eq!(&bytes[28..32], &[1, 1, 4, 2]);
+                    }
+                    let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+                    assert_eq!(syn.options.sack_permitted, active);
+                    assert_eq!(
+                        bytes.len(),
+                        28 + 4 * usize::from(active) + 12 * usize::from(timestamps)
+                    );
+                    let mut b = Connection::passive(
+                        reverse(tuple()),
+                        ConnectionConfig {
+                            sack: passive,
+                            ..cfg
+                        },
+                        900,
+                        10,
+                        &syn,
+                    )
+                    .unwrap();
+                    let bytes = deliver(&mut b, &mut a, 20);
+                    let reply = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+                    assert_eq!(reply.options.sack_permitted, active && passive);
+                    deliver(&mut a, &mut b, 30);
+                    assert_eq!((a.sack_receive, a.sack_send), (active, active && passive));
+                    assert_eq!(
+                        (b.sack_receive, b.sack_send),
+                        (active && passive, active && passive)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sack_passive_without_scale_and_repeated_syn() {
+        let cfg = ConnectionConfig {
+            sack: true,
+            ..config(1024, 128)
+        };
+        let metadata = ip(tuple());
+        let mut bytes = [0; 64];
+        let len = wire::encode(
+            metadata,
+            Header {
+                source_port: 1000,
+                destination_port: 2000,
+                sequence: 100,
+                acknowledgment: 0,
+                flags: SYN,
+                window: 1024,
+                urgent_pointer: 0,
+            },
+            &[2, 4, 0, 128, 1, 1, 4, 2],
+            &[],
+            &mut bytes,
+        )
+        .unwrap();
+        let syn = wire::parse(metadata, &bytes[..len]).unwrap();
+        let mut b = Connection::passive(reverse(tuple()), cfg, 900, 10, &syn).unwrap();
+        let reply = packet(&mut b, 20);
+        assert_eq!(&reply[20..], &[2, 4, 0, 128, 1, 1, 4, 2]);
+        b.input(30, &syn).unwrap();
+        assert_eq!(packet(&mut b, 40), reply);
+        assert!(b.sack_receive && b.sack_send);
+    }
+
+    #[test]
+    fn sack_syn_path_budget_validated() {
+        for timestamps in [false, true] {
+            let bound = 32 + 12 * u16::from(timestamps);
+            let mut cfg = ConnectionConfig {
+                sack: true,
+                timestamps,
+                send_ip_payload_limit: bound - 1,
+                ..config(1024, 128)
+            };
+            assert!(matches!(
+                Connection::active(tuple(), cfg.clone(), 100, 0),
+                Err(Error::InvalidArgument)
+            ));
+            cfg.send_ip_payload_limit = bound;
+            let mut a = Connection::active(tuple(), cfg, 100, 0).unwrap();
+            assert_eq!(packet(&mut a, 0).len(), bound as usize);
+        }
+    }
+
+    #[test]
+    fn sack_disabled_ignores_peer_kind5() {
+        let (mut a, _) = pair(config(1024, 128), 100);
+        a.write(&[1; 512]).unwrap();
+        for now in 40..44 {
+            packet(&mut a, now);
+        }
+        let una = a.snd_una;
+        let next = a.receive.next();
+        let timer = a.rto_deadline;
+        for now in 50..53 {
+            inject_sack(&mut a, now, next, una, ACK, 1024, &[], &[(229, 613)]);
+        }
+        assert!(a.retx_pending); // Classic Reno/NewReno duplicate ACK handling.
+        assert_eq!(a.rto_deadline, timer);
+        assert_eq!(a.send.len(), 512);
+        let bytes = packet(&mut a, 60);
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(segment.header.sequence, una.0);
+        assert!(segment.options.sack_blocks.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn sack_simultaneous_open_and_syn_retransmit() {
+        let cfg = ConnectionConfig {
+            sack: true,
+            ..config(1024, 128)
+        };
+        let mut a = Connection::active(tuple(), cfg.clone(), 100, 0).unwrap();
+        let mut b = Connection::active(reverse(tuple()), cfg, 900, 0).unwrap();
+        let a_syn = packet(&mut a, 0);
+        let b_syn = packet(&mut b, 0);
+        a.input(10, &wire::parse(ip(reverse(tuple())), &b_syn).unwrap())
+            .unwrap();
+        b.input(10, &wire::parse(ip(tuple()), &a_syn).unwrap())
+            .unwrap();
+        let a_reply = packet(&mut a, 20);
+        let b_reply = packet(&mut b, 20);
+        assert!(
+            wire::parse(ip(tuple()), &a_reply)
+                .unwrap()
+                .options
+                .sack_permitted
+        );
+        a.input(30, &wire::parse(ip(reverse(tuple())), &b_reply).unwrap())
+            .unwrap();
+        b.input(30, &wire::parse(ip(tuple()), &a_reply).unwrap())
+            .unwrap();
+        assert_eq!((a.state, b.state), (State::Established, State::Established));
+        assert!(a.sack_send && a.sack_receive && b.sack_send && b.sack_receive);
+        let bytes = deliver(&mut a, &mut b, 40);
+        assert!(
+            !wire::parse(ip(tuple()), &bytes)
+                .unwrap()
+                .options
+                .sack_permitted
+        );
+    }
+
+    fn sack_config(mss: u16) -> ConnectionConfig {
+        ConnectionConfig {
+            sack: true,
+            nagle: false,
+            delayed_ack_us: 0,
+            ..config(8192, mss)
+        }
+    }
+
+    fn sack_ack(a: &mut Connection, now: Instant, ack: Seq, blocks: &[(u32, u32)]) {
+        inject_sack(a, now, a.receive.next(), ack, ACK, 8192, &[], blocks);
+    }
+
+    fn sack_flight(mss: u16, iss: u32, segments: usize) -> Connection {
+        let (mut a, mut b) = pair(sack_config(mss), iss);
+        // Grow cwnd through real cumulative acknowledgments, not test-only setters.
+        for round in 0..segments {
+            a.write(&vec![0x55; mss as usize]).unwrap();
+            deliver(&mut a, &mut b, 40 + round as u64 * 2);
+            deliver(&mut b, &mut a, 41 + round as u64 * 2);
+            b.read(&mut vec![0; mss as usize]).unwrap();
+        }
+        a.write(&vec![0x77; mss as usize * segments]).unwrap();
+        for i in 0..segments {
+            packet(&mut a, 100 + i as u64);
+        }
+        a
+    }
+
+    #[test]
+    fn sack_receiver_reorder_gap_fill_and_dsack_transaction() {
+        for iss in [100, u32::MAX - 20] {
+            let (mut a, mut b) = pair(sack_config(128), iss);
+            a.write(&[1; 384]).unwrap();
+            let first = packet(&mut a, 40);
+            let second = packet(&mut a, 41);
+            let third = packet(&mut a, 42);
+            let start = wire::parse(ip(tuple()), &first).unwrap().header.sequence;
+            b.input(50, &wire::parse(ip(tuple()), &second).unwrap())
+                .unwrap();
+            let ack = packet(&mut b, 51);
+            let ack = wire::parse(ip(reverse(tuple())), &ack).unwrap();
+            assert_eq!(ack.header.acknowledgment, start);
+            assert_eq!(
+                ack.options.sack_blocks[0],
+                Some((start.wrapping_add(128), start.wrapping_add(256)))
+            );
+            b.input(52, &wire::parse(ip(tuple()), &third).unwrap())
+                .unwrap();
+            packet(&mut b, 53);
+            b.input(54, &wire::parse(ip(tuple()), &third).unwrap())
+                .unwrap();
+            assert_eq!(b.transmit(55, &mut [0; 20]), Err(Error::OutputTooSmall));
+            let bytes = packet(&mut b, 55);
+            let ack = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+            assert_eq!(
+                ack.options.sack_blocks[..2],
+                [
+                    Some((start.wrapping_add(256), start.wrapping_add(384))),
+                    Some((start.wrapping_add(128), start.wrapping_add(384)))
+                ]
+            );
+            b.immediate_ack();
+            let bytes = packet(&mut b, 56);
+            assert_eq!(
+                wire::parse(ip(reverse(tuple())), &bytes)
+                    .unwrap()
+                    .options
+                    .sack_blocks[0],
+                Some((start.wrapping_add(128), start.wrapping_add(384)))
+            );
+            b.input(57, &wire::parse(ip(tuple()), &first).unwrap())
+                .unwrap();
+            let bytes = packet(&mut b, 58);
+            let ack = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+            assert_eq!(ack.header.acknowledgment, start.wrapping_add(384));
+            assert!(ack.options.sack_blocks.iter().all(Option::is_none));
+            b.read(&mut [0; 384]).unwrap();
+            b.input(59, &wire::parse(ip(tuple()), &first).unwrap())
+                .unwrap();
+            assert!(!b.accepted_metadata); // Narrow old-data path accepts no metadata.
+            let bytes = packet(&mut b, 60);
+            assert_eq!(
+                wire::parse(ip(reverse(tuple())), &bytes)
+                    .unwrap()
+                    .options
+                    .sack_blocks[0],
+                Some((start, start.wrapping_add(128)))
+            );
+        }
+    }
+
+    #[test]
+    fn sack_options_budget_ts_payload_fin_and_failed_output() {
+        for timestamps in [false, true] {
+            let cfg = ConnectionConfig {
+                timestamps,
+                send_ip_payload_limit: 160,
+                ..sack_config(128)
+            };
+            let (mut a, _) = pair(cfg, 100);
+            let next = a.receive.next();
+            for (i, offset) in [10, 30, 50, 70].into_iter().enumerate() {
+                let una = a.snd_una;
+                inject_sack(
+                    &mut a,
+                    1000 + i as u64,
+                    next.wrapping_add(offset),
+                    una,
+                    ACK,
+                    8192,
+                    &[1; 5],
+                    &[],
+                );
+                packet(&mut a, 1000 + i as u64);
+            }
+            // Restore a pending option report and send final queued bytes with FIN.
+            let una = a.snd_una;
+            inject_sack(
+                &mut a,
+                2000,
+                next.wrapping_add(70),
+                una,
+                ACK,
+                8192,
+                &[1; 5],
+                &[],
+            );
+            a.write(&[2; 128]).unwrap();
+            a.shutdown().unwrap();
+            let before = (
+                a.snd_nxt,
+                a.fin_sequence,
+                a.now,
+                a.rto_deadline,
+                a.last_ack_sent,
+            );
+            assert_eq!(a.transmit(3000, &mut [0; 20]), Err(Error::OutputTooSmall));
+            assert_eq!(
+                before,
+                (
+                    a.snd_nxt,
+                    a.fin_sequence,
+                    a.now,
+                    a.rto_deadline,
+                    a.last_ack_sent
+                )
+            );
+            let bytes = packet(&mut a, 3000);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(
+                segment.options.sack_blocks.iter().flatten().count(),
+                if timestamps { 3 } else { 4 }
+            );
+            assert_eq!(
+                segment.payload.len(),
+                a.mss - if timestamps { 28 } else { 36 }
+            );
+            assert!(bytes.len() <= 160);
+            assert_eq!(segment.header.flags & (FIN | PSH), 0);
+            let bytes = packet(&mut a, 4000);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.header.flags & (FIN | PSH), FIN | PSH);
+            assert_eq!(
+                a.fin_sequence,
+                Some(Seq(segment.header.sequence).wrapping_add(segment.payload.len() as u32))
+            );
+        }
+    }
+
+    #[test]
+    fn sack_invalid_future_stale_ack_and_dsack_are_not_delivery() {
+        let mut a = sack_flight(128, 100, 6);
+        let una = a.snd_una;
+        let end = a.data_high();
+        let next = a.receive.next();
+        let timer = a.rto_deadline;
+        for (i, (ack, block)) in [
+            (end.wrapping_add(1), (una.wrapping_add(128).0, end.0)),
+            (una.wrapping_add(u32::MAX), (una.wrapping_add(128).0, end.0)),
+            (una, (una.wrapping_add(128).0, end.wrapping_add(1).0)),
+            (una, (end.0, una.0)),
+            (una, (una.0, una.0)),
+            (una, (una.wrapping_add(1 << 31).0, end.0)),
+            (una, (una.wrapping_add(u32::MAX - 9).0, una.0)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            inject_sack(&mut a, 200 + i as u64, next, ack, ACK, 8192, &[], &[block]);
+            assert_eq!(a.duplicate_acks, 0);
+            assert!(a.sack_recovery.is_none());
+            assert_eq!(
+                a.scoreboard.pipe(una, end, una, 128),
+                end.distance_from(una)
+            );
+        }
+        assert_eq!(a.rto_deadline, timer);
+        assert_eq!(a.send.len(), 768);
+        let ack = a.snd_una;
+        // The second enclosing block is evidence once; the first DSACK is not.
+        sack_ack(
+            &mut a,
+            220,
+            ack,
+            &[
+                (una.wrapping_add(140).0, una.wrapping_add(150).0),
+                (una.wrapping_add(128).0, una.wrapping_add(256).0),
+            ],
+        );
+        assert_eq!(a.duplicate_acks, 1);
+        sack_ack(
+            &mut a,
+            221,
+            ack,
+            &[
+                (una.wrapping_add(140).0, una.wrapping_add(150).0),
+                (una.wrapping_add(128).0, una.wrapping_add(256).0),
+            ],
+        );
+        assert_eq!(a.duplicate_acks, 1);
+        assert_eq!(a.send.len(), 768);
+    }
+
+    #[test]
+    fn sack_multiloss_selective_recovery_and_transactional_entry() {
+        for iss in [100, u32::MAX - 1000] {
+            let mut a = sack_flight(128, iss, 8);
+            let una = a.snd_una;
+            let point = a.data_high();
+            // Losses at 0 and 256; enough new bytes above both to mark both lost.
+            sack_ack(
+                &mut a,
+                200,
+                una,
+                &[
+                    (una.wrapping_add(128).0, una.wrapping_add(256).0),
+                    (una.wrapping_add(384).0, point.0),
+                ],
+            );
+            let recovery = a.sack_recovery.unwrap();
+            assert!(recovery.entry_pending);
+            assert_eq!(recovery.high_rxt, una);
+            assert_eq!(a.transmit(201, &mut [0; 8]), Err(Error::OutputTooSmall));
+            assert!(a.sack_recovery.unwrap().entry_pending);
+            assert_eq!(a.sack_recovery.unwrap().rescue_rxt, None);
+            let bytes = packet(&mut a, 201);
+            let first = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(first.header.sequence, una.0);
+            assert_eq!(first.payload.len(), 128);
+            assert_eq!(a.sack_recovery.unwrap().high_rxt, una.wrapping_add(128));
+            let bytes = packet(&mut a, 202);
+            let second = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(second.header.sequence, una.wrapping_add(256).0);
+            assert_eq!(second.payload.len(), 128);
+            assert_eq!(a.transmit(203, &mut [0; 1024]), Ok(None));
+            assert_eq!(a.send.len(), 1024); // SACK never frees send bytes.
+            assert_eq!(a.acknowledged, 1024); // Only the warmup was ACKed.
+            sack_ack(&mut a, 210, point, &[]);
+            assert!(a.sack_recovery.is_none());
+            assert_eq!(a.send.len(), 0);
+            assert_eq!(a.congestion.cwnd(), 256);
+        }
+    }
+
+    #[test]
+    fn sack_discontiguous_evidence_and_unaligned_retransmit() {
+        let mut a = sack_flight(128, 100, 8);
+        let una = a.snd_una;
+        sack_ack(
+            &mut a,
+            200,
+            una,
+            &[
+                (una.wrapping_add(17).0, una.wrapping_add(18).0),
+                (una.wrapping_add(91).0, una.wrapping_add(92).0),
+                (una.wrapping_add(201).0, una.wrapping_add(202).0),
+            ],
+        );
+        assert!(a.sack_recovery.is_some()); // Three ranges, not three SMSS.
+        let bytes = packet(&mut a, 201);
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(segment.header.sequence, una.0);
+        assert_eq!(segment.payload.len(), 17);
+        // ACK trims arbitrary bytes; a retransmission starts from that offset.
+        sack_ack(&mut a, 202, una.wrapping_add(7), &[]);
+        assert_eq!(a.snd_una, una.wrapping_add(7));
+        assert_eq!(a.send.len(), 1017);
+        assert_eq!(
+            a.sack_recovery.unwrap().recovery_point,
+            una.wrapping_add(1024)
+        );
+    }
+
+    #[test]
+    fn sack_limited_transmit_requires_new_evidence_including_duplex_ack() {
+        let (mut a, _) = pair(sack_config(128), 100);
+        a.write(&[1; 1024]).unwrap();
+        for now in 40..44 {
+            packet(&mut a, now);
+        }
+        let una = a.snd_una;
+        let end = a.snd_nxt;
+        sack_ack(&mut a, 50, una, &[]);
+        assert_eq!(a.transmit(51, &mut [0; 1024]), Ok(None));
+        let next = a.receive.next();
+        inject_sack(
+            &mut a,
+            52,
+            next,
+            una,
+            ACK,
+            8000,
+            b"duplex",
+            &[(una.wrapping_add(128).0, una.wrapping_add(256).0)],
+        );
+        assert_eq!(a.duplicate_acks, 1);
+        let bytes = packet(&mut a, 53);
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+            end.0
+        );
+        assert_eq!(a.limited_sent, 128);
+        sack_ack(
+            &mut a,
+            54,
+            una,
+            &[(una.wrapping_add(128).0, una.wrapping_add(256).0)],
+        );
+        assert_eq!(a.transmit(55, &mut [0; 1024]), Ok(None));
+        sack_ack(
+            &mut a,
+            56,
+            una,
+            &[(una.wrapping_add(256).0, una.wrapping_add(384).0)],
+        );
+        packet(&mut a, 57);
+        assert_eq!(a.limited_sent, 256);
+        sack_ack(&mut a, 58, una, &[(una.wrapping_add(384).0, end.0)]);
+        assert!(a.sack_recovery.is_some());
+        assert_eq!(a.congestion.ssthresh(), 256); // Excludes 256 limited bytes.
+    }
+
+    #[test]
+    fn sack_advancing_ack_keeps_unacked_limited_bytes_out_of_reduction() {
+        let (mut a, _) = pair(sack_config(128), 100);
+        a.write(&[1; 1024]).unwrap();
+        for now in 40..44 {
+            packet(&mut a, now);
+        }
+        let una = a.snd_una;
+        sack_ack(
+            &mut a,
+            50,
+            una,
+            &[(una.wrapping_add(128).0, una.wrapping_add(256).0)],
+        );
+        packet(&mut a, 51);
+        sack_ack(
+            &mut a,
+            52,
+            una,
+            &[(una.wrapping_add(256).0, una.wrapping_add(384).0)],
+        );
+        packet(&mut a, 53);
+        assert_eq!(a.limited_sent, 256);
+        let end = a.snd_nxt;
+        sack_ack(
+            &mut a,
+            54,
+            una.wrapping_add(64),
+            &[(una.wrapping_add(128).0, end.0)],
+        );
+        assert!(a.sack_recovery.is_some());
+        assert_eq!(a.limited_sent, 256);
+        assert_eq!(a.congestion.ssthresh(), 256);
+    }
+
+    #[test]
+    fn sack_rto_discards_advice_retransmits_head_and_guards_epoch() {
+        let mut a = sack_flight(128, 100, 8);
+        let una = a.snd_una;
+        let point = a.data_high();
+        sack_ack(&mut a, 200, una, &[(una.wrapping_add(128).0, point.0)]);
+        packet(&mut a, 201);
+        let deadline = a.rto_deadline.unwrap();
+        a.timeout(deadline).unwrap();
+        assert!(a.sack_recovery.is_none());
+        assert_eq!(a.sack_guard, Some(point));
+        assert_eq!(a.scoreboard.pipe(una, point, una, 128), 1024);
+        assert!(a.sample.is_none());
+        let bytes = packet(&mut a, deadline);
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+            una.0
+        );
+        sack_ack(
+            &mut a,
+            deadline + 1,
+            una,
+            &[(una.wrapping_add(128).0, point.0)],
+        );
+        assert!(a.sack_recovery.is_none());
+        assert_eq!(a.send.len(), 1024);
+        sack_ack(&mut a, deadline + 2, point, &[]);
+        assert!(a.sack_guard.is_none());
+        assert_eq!(a.send.len(), 0);
+    }
+
+    #[test]
+    fn sack_after_rto_uses_fresh_holes_without_reentering_recovery() {
+        let mut a = sack_flight(128, 100, 8);
+        let una = a.snd_una;
+        let point = a.data_high();
+        let deadline = a.rto_deadline.unwrap();
+        a.timeout(deadline).unwrap();
+        let bytes = packet(&mut a, deadline);
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+            una.0
+        );
+        sack_ack(
+            &mut a,
+            deadline + 1,
+            una.wrapping_add(256),
+            &[(una.wrapping_add(384).0, point.0)],
+        );
+        assert!(a.sack_recovery.is_none());
+        assert_eq!(a.sack_guard, Some(point));
+        let bytes = packet(&mut a, deadline + 2);
+        let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(seg.header.sequence, una.wrapping_add(256).0);
+        assert_eq!(seg.payload.len(), 128);
+        assert_eq!(a.transmit(deadline + 3, &mut [0; 1024]), Ok(None));
+        sack_ack(&mut a, deadline + 4, point, &[]);
+        assert!(a.sack_post_rto.is_none());
+    }
+
+    #[test]
+    fn sack_sender_overflow_cumulative_only_until_flight_covered() {
+        let mut a = sack_flight(128, 100, 8);
+        let una = a.snd_una;
+        let end = a.data_high();
+        for i in 0..65 {
+            sack_ack(
+                &mut a,
+                200 + i as u64,
+                una,
+                &[(una.wrapping_add(2 * i + 1).0, una.wrapping_add(2 * i + 2).0)],
+            );
+        }
+        assert_eq!(a.sack_fallback, Some(end));
+        assert!(a.sack_recovery.is_none());
+        assert_eq!(a.scoreboard.pipe(una, end, una, 128), 1024);
+        for now in 300..305 {
+            sack_ack(&mut a, now, una, &[(una.wrapping_add(128).0, end.0)]);
+        }
+        assert_eq!(a.scoreboard.pipe(una, end, una, 128), 1024);
+        assert!(a.sack_recovery.is_none());
+        sack_ack(&mut a, 310, end, &[]);
+        assert!(a.sack_fallback.is_none());
+        assert!(a.sack_guard.is_none());
+    }
+
+    #[test]
+    fn sack_receiver_cap_rejection_sends_only_cumulative_ack() {
+        let (mut a, _) = pair(sack_config(128), 100);
+        let next = a.receive.next();
+        let una = a.snd_una;
+        for i in 0..64 {
+            inject_sack(
+                &mut a,
+                40 + i as u64,
+                next.wrapping_add(2 * i + 1),
+                una,
+                ACK,
+                8192,
+                &[1],
+                &[],
+            );
+            packet(&mut a, 40 + i as u64);
+        }
+        inject_sack(
+            &mut a,
+            110,
+            next.wrapping_add(201),
+            una,
+            ACK,
+            8192,
+            &[2],
+            &[],
+        );
+        assert!(a.sack_omit);
+        assert_eq!(a.transmit(111, &mut [0; 8]), Err(Error::OutputTooSmall));
+        assert!(a.sack_omit);
+        let bytes = packet(&mut a, 111);
+        let ack = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(ack.header.acknowledgment, next.0);
+        assert!(ack.options.sack_blocks.iter().all(Option::is_none));
+        inject_sack(&mut a, 112, next, una, ACK, 8192, &[3; 128], &[]);
+        let bytes = packet(&mut a, 113);
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes)
+                .unwrap()
+                .header
+                .acknowledgment,
+            next.wrapping_add(128).0
+        );
+        assert_eq!(a.read(&mut [0; 128]), Ok(128));
+        assert_eq!(a.read(&mut [0; 1]), Err(Error::WouldBlock));
+    }
+
+    #[test]
+    fn sack_nextseg_new_data_precedes_speculative_holes_and_bounds_pipe() {
+        let mut a = sack_flight(128, 100, 12);
+        let una = a.snd_una;
+        let point = a.data_high();
+        let ranges = [
+            (una.wrapping_add(128).0, una.wrapping_add(256).0),
+            (una.wrapping_add(512).0, una.wrapping_add(1152).0),
+        ];
+        a.write(&[9; 128]).unwrap();
+        sack_ack(&mut a, 200, una, &ranges);
+        for (now, offset) in [(201, 0), (202, 256), (203, 384)] {
+            let bytes = packet(&mut a, now);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+                una.wrapping_add(offset).0
+            );
+        }
+        assert_eq!(a.sack_recovery.unwrap().pipe, a.congestion.cwnd());
+        assert_eq!(a.transmit(204, &mut [0; 1024]), Ok(None));
+        sack_ack(&mut a, 210, una.wrapping_add(256), &ranges[1..]);
+        let bytes = packet(&mut a, 211);
+        let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(seg.header.sequence, point.0); // Rule 2 before rule 3.
+        assert_eq!(seg.payload, &[9; 128]);
+        assert_eq!(a.sack_recovery.unwrap().recovery_point, point);
+        assert_eq!(a.snd_nxt, point.wrapping_add(128));
+        assert_eq!(a.transmit(212, &mut [0; 1024]), Ok(None));
+    }
+
+    #[test]
+    fn sack_nextseg_speculative_then_single_transactional_tail_rescue() {
+        for speculative in [false, true] {
+            let mut a = sack_flight(128, 100, 8);
+            let una = a.snd_una;
+            let point = a.data_high();
+            let ranges = [
+                (una.wrapping_add(128).0, una.wrapping_add(256).0),
+                (una.wrapping_add(384).0, una.wrapping_add(768).0),
+            ];
+            sack_ack(&mut a, 200, una, &ranges);
+            packet(&mut a, 201);
+            packet(&mut a, 202);
+            assert_eq!(a.transmit(203, &mut [0; 1024]), Ok(None));
+            let blocks = if speculative {
+                &[(una.wrapping_add(896).0, point.0)][..]
+            } else {
+                &[][..]
+            };
+            sack_ack(&mut a, 210, una.wrapping_add(384), blocks);
+            if speculative {
+                let bytes = packet(&mut a, 211);
+                let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(seg.header.sequence, una.wrapping_add(768).0); // Rule 3.
+                assert_eq!(seg.payload.len(), 128);
+                assert_eq!(a.sack_recovery.unwrap().high_rxt, una.wrapping_add(896));
+            }
+            let old = a.sack_recovery.unwrap();
+            assert_eq!(a.transmit(212, &mut [0; 8]), Err(Error::OutputTooSmall));
+            assert_eq!(a.sack_recovery.unwrap().rescue_rxt, old.rescue_rxt);
+            assert_eq!(a.sack_recovery.unwrap().pipe, old.pipe);
+            let bytes = packet(&mut a, 212);
+            let rescue = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(
+                rescue.header.sequence,
+                una.wrapping_add(if speculative { 768 } else { 896 }).0
+            );
+            assert_eq!(rescue.payload.len(), 128);
+            assert_eq!(a.sack_recovery.unwrap().high_rxt, old.high_rxt);
+            assert_eq!(a.sack_recovery.unwrap().rescue_rxt, Some(point));
+            assert_eq!(a.transmit(213, &mut [0; 1024]), Ok(None));
+            // More credit and identical SACK cannot grant another rescue.
+            sack_ack(&mut a, 214, una.wrapping_add(512), &[]);
+            assert_eq!(a.transmit(215, &mut [0; 1024]), Ok(None));
+        }
+    }
+
+    #[test]
+    fn sack_fin_is_not_scoreboard_data_and_remains_rto_retransmittable() {
+        let mut a = sack_flight(128, 100, 8);
+        a.shutdown().unwrap();
+        let bytes = packet(&mut a, 150);
+        let fin = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(fin.header.flags & FIN, FIN);
+        assert!(fin.payload.is_empty());
+        let una = a.snd_una;
+        let data_end = a.fin_sequence.unwrap();
+        sack_ack(
+            &mut a,
+            200,
+            una,
+            &[(una.wrapping_add(128).0, data_end.wrapping_add(1).0)],
+        );
+        assert!(a.sack_recovery.is_none()); // A block including FIN is invalid.
+        sack_ack(&mut a, 201, una, &[(una.wrapping_add(128).0, data_end.0)]);
+        assert_eq!(a.sack_recovery.unwrap().recovery_point, data_end);
+        let bytes = packet(&mut a, 202);
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes).unwrap().header.flags & FIN,
+            0
+        );
+        sack_ack(&mut a, 203, data_end, &[]);
+        assert!(a.sack_recovery.is_none());
+        assert_eq!(a.send.len(), 0);
+        assert_eq!(a.flight(), 1);
+        // FIN-only SACK reports cannot start data recovery.
+        for now in 204..208 {
+            sack_ack(
+                &mut a,
+                now,
+                data_end,
+                &[(data_end.0, data_end.wrapping_add(1).0)],
+            );
+        }
+        assert!(a.sack_recovery.is_none());
+        let deadline = a.rto_deadline.unwrap();
+        a.timeout(deadline).unwrap();
+        let bytes = packet(&mut a, deadline);
+        let fin = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(fin.header.sequence, data_end.0);
+        assert_eq!(fin.header.flags & FIN, FIN);
+        sack_ack(&mut a, deadline + 1, data_end.wrapping_add(1), &[]);
+        assert_eq!(a.state, State::FinWait2);
+    }
+
+    #[test]
+    fn sack_ecn_shares_reduction_but_preserves_loss_retransmit() {
+        let mut a = sack_flight(128, 100, 8);
+        let una = a.snd_una;
+        let point = a.data_high();
+        let next = a.receive.next();
+        inject_sack(
+            &mut a,
+            200,
+            next,
+            una,
+            ACK | ECE,
+            8192,
+            &[],
+            &[(una.wrapping_add(128).0, point.0)],
+        );
+        assert!(a.sack_recovery.is_some());
+        assert_eq!(a.congestion.ssthresh(), 512);
+        assert_eq!(a.congestion.cwnd(), 512);
+        assert!(a.ecn_cwr_pending);
+        let bytes = packet(&mut a, 201);
+        let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(seg.header.sequence, una.0);
+        assert_eq!(seg.header.flags & CWR, 0);
+        assert_eq!(a.last_output_ecn(), 0);
+        assert!(a.ecn_cwr_pending);
+        inject_sack(
+            &mut a,
+            202,
+            next,
+            una,
+            ACK | ECE,
+            8192,
+            &[],
+            &[(una.wrapping_add(128).0, point.0)],
+        );
+        assert_eq!(a.congestion.cwnd(), 512);
+        assert_eq!(a.transmit(203, &mut [0; 1024]), Ok(None));
+    }
+
+    #[test]
+    fn sack_advancing_ack_resets_count_before_new_evidence_and_partial_cwnd() {
+        let mut a = sack_flight(128, 100, 8);
+        let una = a.snd_una;
+        sack_ack(
+            &mut a,
+            200,
+            una,
+            &[(una.wrapping_add(128).0, una.wrapping_add(256).0)],
+        );
+        assert_eq!(a.duplicate_acks, 1);
+        sack_ack(
+            &mut a,
+            201,
+            una.wrapping_add(17),
+            &[(una.wrapping_add(256).0, una.wrapping_add(384).0)],
+        );
+        assert_eq!(a.duplicate_acks, 1);
+        sack_ack(
+            &mut a,
+            202,
+            una.wrapping_add(17),
+            &[(una.wrapping_add(384).0, una.wrapping_add(512).0)],
+        );
+        assert!(a.sack_recovery.is_some());
+        let cwnd = a.congestion.cwnd();
+        packet(&mut a, 203);
+        sack_ack(&mut a, 204, una.wrapping_add(30), &[]);
+        assert_eq!(a.congestion.cwnd(), cwnd);
+        assert!(a.sack_recovery.is_some());
+    }
+
+    #[test]
+    fn sack_tiny_mss_option_budget_and_shrink_remain_safe() {
+        for mss in [1, 4, 12, 13] {
+            let (mut a, _) = pair(sack_config(mss), 100);
+            let una = a.snd_una;
+            let next = a.receive.next();
+            inject_sack(&mut a, 40, next.wrapping_add(4), una, ACK, 8192, &[2], &[]);
+            a.write(&[1; 20]).unwrap();
+            let bytes = packet(&mut a, 41);
+            let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert!(seg.payload.len() <= mss as usize);
+            assert!(seg.options.sack_blocks.iter().flatten().count() <= 1);
+        }
+        let mut a = sack_flight(128, 100, 8);
+        let una = a.snd_una;
+        let end = a.data_high();
+        sack_ack(&mut a, 200, una, &[(una.wrapping_add(128).0, end.0)]);
+        let next = a.receive.next();
+        inject_sack(&mut a, 201, next, una, ACK, 7, &[], &[]);
+        let bytes = packet(&mut a, 202);
+        assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 7);
+        assert!(!a.sack_recovery.unwrap().entry_pending);
+        a.lower_mss(32).unwrap();
+        assert_eq!(a.mss, 32);
+        assert!(a.rto_deadline.is_some());
+    }
+
+    #[test]
+    fn sack_future_ack_and_paws_cannot_forge_old_duplicate_evidence() {
+        let cfg = ConnectionConfig {
+            timestamps: true,
+            ..sack_config(128)
+        };
+        let (mut a, mut b) = pair(cfg, 100);
+        a.write(&[1; 20]).unwrap();
+        let bytes = deliver(&mut a, &mut b, 2_000);
+        deliver(&mut b, &mut a, 3_000);
+        b.read(&mut [0; 20]).unwrap();
+        let old = wire::parse(ip(tuple()), &bytes).unwrap();
+        let next = Seq(old.header.sequence);
+        let future = b.snd_nxt.wrapping_add(1);
+        inject_sack(&mut b, 4_000, next, future, ACK, 8192, &[1; 20], &[]);
+        let bytes = packet(&mut b, 4_000);
+        assert!(
+            wire::parse(ip(reverse(tuple())), &bytes)
+                .unwrap()
+                .options
+                .sack_blocks
+                .iter()
+                .all(Option::is_none)
+        );
+        // Old timestamp is rejected before recording a duplicate.
+        b.ts_recent = 100;
+        b.ts_recent_at = 4_000;
+        b.input(5_000, &old).unwrap();
+        let bytes = packet(&mut b, 5_000);
+        assert!(
+            wire::parse(ip(reverse(tuple())), &bytes)
+                .unwrap()
+                .options
+                .sack_blocks
+                .iter()
+                .all(Option::is_none)
+        );
+    }
+
+    #[test]
+    fn sack_seeded_lossy_reordered_duplex_delivers_and_closes() {
+        for seed in [1u64, 17, 0xdead_beef] {
+            let (mut a, mut b) = pair(sack_config(128), u32::MAX - 200);
+            let left: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+            let right: Vec<u8> = (0..3072).map(|i| (i % 239) as u8).collect();
+            a.write(&left).unwrap();
+            b.write(&right).unwrap();
+            a.shutdown().unwrap();
+            b.shutdown().unwrap();
+            let mut a_read = vec![];
+            let mut b_read = vec![];
+            let mut pending: Vec<(bool, Vec<u8>)> = vec![];
+            let mut random = seed;
+            let mut scratch = [0; 2048];
+            for tick in 1..20_000 {
+                let now = 100 + tick * 10_000;
+                for (direction, conn) in [(true, &mut a), (false, &mut b)] {
+                    if conn.next_deadline().is_some_and(|deadline| now >= deadline) {
+                        conn.timeout(now).unwrap();
+                    }
+                    for _ in 0..8 {
+                        if let Some(len) = conn.transmit(now, &mut scratch).unwrap() {
+                            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                            if random % 7 != 0 {
+                                pending.push((direction, scratch[..len].to_vec()));
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                // Retain some packets and select the rest out of order.
+                for _ in 0..4 {
+                    if pending.is_empty() {
+                        break;
+                    }
+                    random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let index = random as usize % pending.len();
+                    let (direction, bytes) = pending.swap_remove(index);
+                    let (sender, receiver) = if direction {
+                        (tuple(), &mut b)
+                    } else {
+                        (reverse(tuple()), &mut a)
+                    };
+                    receiver
+                        .input(now, &wire::parse(ip(sender), &bytes).unwrap())
+                        .unwrap();
+                }
+                for (conn, received) in [(&mut a, &mut a_read), (&mut b, &mut b_read)] {
+                    while let Ok(count) = conn.read(&mut scratch) {
+                        if count == 0 {
+                            break;
+                        }
+                        received.extend_from_slice(&scratch[..count]);
+                    }
+                }
+                if a_read == right && b_read == left && a.flight() == 0 && b.flight() == 0 {
+                    break;
+                }
+            }
+            assert_eq!(a_read, right, "seed={seed}");
+            assert_eq!(b_read, left, "seed={seed}");
+            assert_eq!((a.flight(), b.flight()), (0, 0));
+            assert!(matches!(a.state, State::TimeWait | State::Closed));
+            assert!(matches!(b.state, State::TimeWait | State::Closed));
+        }
     }
 
     #[test]
