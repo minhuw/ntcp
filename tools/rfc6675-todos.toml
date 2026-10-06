@@ -27,7 +27,7 @@ used for each arriving ACK:
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6675#section-3"
-reason = "Scoreboard is bounded to 64 disjoint ranges; a 65th clears advice and Connection disables SACK inference until cumulative flight coverage. This conservative fallback avoids fabricated delivery, but does not mark all arbitrary ranges for RFC 6675 recovery. Add/profile capacity-limit applicability explicitly; no implementation waiver."
+reason = "Scoreboard is bounded to 64 disjoint ranges; a 65th clears advice and Connection disables SACK inference until cumulative flight coverage. This conservative fallback avoids fabricated delivery, but does not mark all arbitrary ranges for RFC 6675 recovery. Required replacement must represent arbitrary subsets inside the configured finite send window (such as a capacity-accounted bitmap) and support Update, IsLost and SetPipe within explicit work budgets. A larger fixed interval array only moves the overflow threshold. Keep the tested conservative fallback until allocation accounting and fragmented-window queries are verified; this is an implementation limit, not an external dependency."
 quote = '''
 The algorithms presented here allow this, but require the ability to mark
 arbitrary sequence number ranges as having been selectively acknowledged.

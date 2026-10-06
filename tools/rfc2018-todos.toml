@@ -3,7 +3,7 @@
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc2018#section-4"
-reason = "Receive range-cap rejection sets sack_omit and emits a cumulative-only ACK even with retained noncontiguous data (sack_receiver_cap_rejection_sends_only_cumulative_ack). Tiny path budgets can also omit SACK. This is a bounded-resource SHOULD deviation, not full all-circumstances coverage; add connection tests documenting accepted OOO arrivals followed by constrained/batched ACKs and decide the profile policy."
+reason = "Resource-bound reporting gap: a rejected 65th receive range suppresses SACK for that ACK despite older retained ranges; a path budget too small for required options can also suppress it. Closure requires reporting only actually retained data after rejection, while preserving first-block rules, and defining a minimum negotiated path budget or separate ACK emission when options crowd out data. Add cap/batched-arrival/failed-output wire tests; claiming receipt of the rejected range or enlarging metadata without memory accounting would be incorrect."
 quote = '''
 If the data receiver generates SACK options under any circumstance, it
 SHOULD generate them under all permitted circumstances.
@@ -11,7 +11,7 @@ SHOULD generate them under all permitted circumstances.
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc2018#section-4"
-reason = "Receive range-cap rejection sets sack_omit and emits a cumulative-only ACK even with retained noncontiguous data (sack_receiver_cap_rejection_sends_only_cumulative_ack). Tiny path budgets can also omit SACK. This is a bounded-resource SHOULD deviation, not full all-circumstances coverage; add connection tests documenting accepted OOO arrivals followed by constrained/batched ACKs and decide the profile policy."
+reason = "Same receiver-cap/path-budget root as the all-circumstances clause: sack_omit allows cumulative-only ACKs while older out-of-order bytes remain queued. Required fix is a retained-range-only reporting path after rejection and option-budget handling that can emit a separate ACK without starving data; prove queued highest sequence remains reported across batching and output failure. The current cap regression deliberately exhibits the deviation."
 quote = '''
 If sent at all, SACK options SHOULD be included in all ACKs which do not ACK
 the highest sequence number in the data receiver's queue.
@@ -19,7 +19,7 @@ the highest sequence number in the data receiver's queue.
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc2018#section-4"
-reason = "Receive range-cap rejection sets sack_omit and emits a cumulative-only ACK even with retained noncontiguous data (sack_receiver_cap_rejection_sends_only_cumulative_ack). Tiny path budgets can also omit SACK. This is a bounded-resource SHOULD deviation, not full all-circumstances coverage; add connection tests documenting accepted OOO arrivals followed by constrained/batched ACKs and decide the profile policy."
+reason = "Same receive-cap/output-budget gap: output polling can coalesce valid arrivals, while cap rejection sets sack_omit and suppresses retained SACK information. Closure needs explicit per-arrival ACK/report scheduling within the endpoint work budget and tests showing retained data is reported without fabricating receipt of rejected data. A single cumulative ACK after the batch supplies weaker evidence than this recommendation."
 quote = '''
 The receiver SHOULD send an ACK for every valid segment that arrives
 containing new data, and each of these "duplicate" ACKs SHOULD bear a SACK
@@ -28,7 +28,7 @@ option.
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc2018#section-4"
-reason = "Output deliberately caps piggybacked SACK space by MSS-1 when ack_pending=false (sack_small_mss_ack_report_does_not_starve_data), even where more TCP option space exists. Add an explicit distinct ordinary-block count test (current budget test includes DSACK) and document/resolve this SHOULD tradeoff rather than claiming unconditional maximal blocks."
+reason = "Deliberate data-progress tradeoff remains: piggybacked SACK space is capped by MSS-1 when ack_pending=false, preserving at least one payload byte but sometimes omitting blocks that fit the TCP option area. Removing that cap alone can starve data at small MSS. Closure requires a separate full-report ACK/data scheduling path or validated minimum MSS policy, with ordinary-block-count and no-starvation regressions; the existing DSACK budget test covers only the current tradeoff."
 quote = '''
 * The data receiver SHOULD include as many distinct SACK blocks as possible
 in the SACK option.
@@ -36,7 +36,7 @@ in the SACK option.
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc2018#section-4"
-reason = "Recency is updated on insertion, not on successful first-block reporting; batched arrivals, DSACK, reduced option budgets and failed output can distinguish arrival order from most-recently-reported order. Add connection test batching more than four disjoint arrivals, committing ACKs under changing budgets, and checking report-history order. No report-history state exists today."
+reason = "Recency is updated on insertion, not on successful first-block reporting; batched arrivals, DSACK, reduced option budgets and failed output can distinguish arrival order from most-recently-reported order. Add connection test batching more than four disjoint arrivals, committing ACKs under changing budgets, and checking report-history order. Required implementation: bounded successful-first-block history, updated only after encoding commits and reconciled with range merges/ACK advancement; insertion recency alone cannot establish this obligation."
 quote = '''
 * The SACK option SHOULD be filled out by repeating the most recently
 reported SACK blocks (based on first SACK blocks in previous SACK options)
@@ -46,7 +46,7 @@ being constructed.
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc2018#section-5"
-reason = "Scoreboard retains advice within 64 disjoint ranges, but a 65th range clears all advice and Connection suppresses SACK inference until cumulative flight coverage. Ordinary-capacity union tests establish only partial recording evidence. Track the same bounded-domain gap as RFC 6675 Update/arbitrary-range TODOs; no resource-fallback waiver."
+reason = "Scoreboard retains advice within 64 disjoint ranges, but a 65th range clears all advice and Connection suppresses SACK inference until cumulative flight coverage. Ordinary-capacity union tests establish only partial recording evidence. Same root as RFC 6675 Update: represent every possible SACKed byte inside the configured send window, for example with capacity-accounted bitmap metadata, then maintain union/loss/pipe queries within per-iteration budgets. Raising the fixed range count merely moves the failure threshold; preserve current safe fallback until the replacement and fragmentation/overflow tests are complete."
 quote = '''
 When receiving an ACK containing a SACK option, the data sender SHOULD
 record the selective acknowledgment for future reference.

@@ -4,7 +4,7 @@
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4"
 feature = "BASE-013"
-reason = "shutdown only arms work in SYN-RECEIVED; transmit requires Established/CloseWait to create FIN. The no-SEND branch specified here has no corresponding transition. Review protocol/security policy before fixing; do not cite the deferred-close tests as satisfying this branch."
+reason = "Implementation gap: shutdown defers SYN-RECEIVED close until establishment. Correct closure needs a handshake-aware FIN path: remember whether SEND was issued, preserve SYN-ACK output/retransmission, emit FIN at ISS+1 transactionally, and distinguish a SYN-only ACK from an ACK covering FIN. Endpoint currently infers handshake completion from leaving SYN states, so that admission/event condition must also change. Required regressions cover passive and simultaneous opens, queued SEND, failed output and both ACK boundaries; changing only the FIN state guard would falsely accept an incomplete handshake."
 quote = '''
 If no SENDs have been issued and there is no pending data to send, then form a
 FIN segment and send it, and enter FIN-WAIT-1 state; otherwise, queue for
@@ -14,7 +14,7 @@ processing after entering ESTABLISHED state.
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.5.2"
 feature = "BASE-044"
-reason = "No TIME-WAIT reservation is kept for locally generated ABORT/data-loss resets: terminal detaches the tuple and release can reclaim it after reset output. This conflicts with the recommendation here (while 3.10.5 describes immediate CLOSED). Parent must decide/document policy rather than claiming coverage of both."
+reason = "Unimplemented recommendation: local ABORT reports CLOSED and releases the tuple after reset output, as section 3.10.5 prescribes, but retains no reset-origin tuple quarantine. This forgoes the server-load benefit recommended here. Supporting both obligations requires a separately bounded endpoint tombstone lasting 2MSL while the application still observes CLOSED, with capacity, expiry and tuple-reuse tests. Reusing FIN TIME-WAIT as the application state would contradict ABORT semantics. This remains an explicit deviation rather than a conformance exception."
 quote = '''
 The side of a connection issuing a reset should enter the TIME-WAIT state, as
 this generally helps to reduce the load on busy servers for reasons described
@@ -24,7 +24,7 @@ in [70].
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.2"
 feature = "BASE-056"
-reason = "Endpoint lower_mss applies an embedding-supplied limit; neither a PMTUD ICMP/DF path nor a PLPMTUD discovery/probing engine is implemented here. The TUN example does not consume ICMP. Track the strongly recommended discovery mechanisms honestly; a packet-size-limit test does not demonstrate discovery."
+reason = "Adapter/integration gap: lower_mss applies supplied limits; TUN has no ICMP discovery input. PMTUD requires validated fragmentation-needed/Packet-Too-Big feedback tied to a quoted live tuple and transmitted sequence, a path-MTU cache, correct IP/TCP header subtraction and total payload-limit updates, plus stale/spoofed-feedback tests. PLPMTUD additionally requires identified size probes, ACK-confirmed success, bounded search, black-hole fallback and upward adjustment, which lowering-only MSS cannot express. Static configuration and caller hooks provide no discovery evidence; an implementing adapter or probe API is required."
 quote = '''
 Instead, implementation of Path MTU Discovery (PMTUD) and Packetization Layer
 Path MTU Discovery (PLPMTUD) is strongly recommended in order for TCP to
