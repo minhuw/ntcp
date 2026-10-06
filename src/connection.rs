@@ -2755,7 +2755,8 @@ impl Connection {
             self.unacked_bytes = self
                 .unacked_bytes
                 .saturating_add(advanced.saturating_sub(u32::from(outcome.fin)));
-            if payload.len() >= self.mss {
+            let rmss = self.receive_mss();
+            if payload.len() >= usize::from(rmss) {
                 self.full_segments = self.full_segments.saturating_add(1);
             }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
@@ -2769,12 +2770,7 @@ impl Connection {
                 || flags & FIN != 0
                 || self.receive_window() == 0
                 || self.full_segments >= 2
-                || self.unacked_bytes
-                    >= 2 * u32::from(
-                        self.config
-                            .mss
-                            .min(self.config.receive_ip_payload_limit - 20),
-                    )
+                || self.unacked_bytes >= 2 * u32::from(rmss)
                 || self.config.delayed_ack_us == 0
             {
                 self.immediate_ack();
@@ -2791,6 +2787,12 @@ impl Connection {
                 _ => {}
             }
         }
+    }
+
+    fn receive_mss(&self) -> u16 {
+        self.config
+            .mss
+            .min(self.config.receive_ip_payload_limit - 20)
     }
 
     fn window_threshold(&self) -> u32 {
@@ -3115,11 +3117,7 @@ impl Connection {
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
         //# where MMS_R is the maximum size for a transport-layer message that
         //# can be received (and reassembled at the IP layer) (MUST-67).
-        let mss = self
-            .config
-            .mss
-            .min(self.config.receive_ip_payload_limit - 20)
-            .to_be_bytes();
+        let mss = self.receive_mss().to_be_bytes();
         let mut options = [0; 40];
         options[..4].copy_from_slice(&[2, 4, mss[0], mss[1]]);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
@@ -10738,6 +10736,49 @@ mod tests {
         a.write(b"reply").unwrap();
         packet(&mut a, 70);
         assert_eq!(a.unacked_bytes, 0);
+    }
+
+    #[test]
+    fn delayed_ack_uses_advertised_receive_mss_not_peer_send_mss() {
+        for receive_limit in [28, 100] {
+            let mut cfg = config(128, 16);
+            cfg.receive_ip_payload_limit = receive_limit;
+            let mut a = Connection::active(tuple(), cfg, 100, 0).unwrap();
+            let bytes = packet(&mut a, 0);
+            let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+            let rmss = syn.options.mss.unwrap();
+            assert_eq!(rmss, 16.min(receive_limit - 20));
+            let mut b =
+                Connection::passive(reverse(tuple()), config(128, 4), 900, 10, &syn).unwrap();
+            deliver(&mut b, &mut a, 20);
+            deliver(&mut a, &mut b, 30);
+            assert_eq!(a.mss, 4);
+            let ack = a.snd_nxt;
+            for now in [40, 50] {
+                let next = a.receive.next();
+                inject(&mut a, now, next, ack, ACK, 128, b"abcd");
+                assert_eq!(a.full_segments, 0);
+                assert!(!a.ack_pending);
+                assert_eq!(a.transmit(now, &mut [0; 64]), Ok(None));
+            }
+            // The default delayed ACK still fires 200 ms after the first data.
+            assert_eq!(a.ack_deadline, Some(200_040));
+            a.timeout(200_040).unwrap();
+            packet(&mut a, 200_040);
+            for i in 0..2 {
+                let now = 200_050 + i;
+                let next = a.receive.next();
+                inject(&mut a, now, next, ack, ACK, 128, &vec![0; rmss as usize]);
+                assert_eq!(a.full_segments, (i + 1) as u8);
+                assert_eq!(a.unacked_bytes, (i + 1) as u32 * u32::from(rmss));
+                assert_eq!(a.ack_pending, i == 1);
+                if i == 0 {
+                    assert_eq!(a.transmit(now, &mut [0; 64]), Ok(None));
+                }
+            }
+            packet(&mut a, 200_052);
+            assert_eq!((a.full_segments, a.unacked_bytes), (0, 0));
+        }
     }
 
     #[test]

@@ -44,6 +44,7 @@
           "receive_capacity": 8388608,
           "mss": 1460,
           "window_scale": 8,
+          "delayed_ack_us": 0,
           "endpoint_max_buffer_bytes": 33554432
         },
         "linux_defaults_reproduced": false,
@@ -52,6 +53,7 @@
           "A real 8 MiB receive capacity yields window scale 8; the endpoint aggregate buffer budget remains 32 MiB. Packet and syscall assertions remain byte-for-byte unchanged.",
           "The peer SYN negotiates neither SACK nor timestamps. ECN and timestamps remain off, NewReno and MSS 1460 remain unchanged.",
           "These cases do not measure CUBIC recovery; Linux CUBIC and the remaining defaults.sh sysctls, metrics flush and qdisc setup are not reproduced.",
+          "The upstream-window8 profile explicitly sets delayed_ack_us to 0 for immediate-ACK compatibility, including data received before an application read. This is not complete Linux quickACK emulation; other profiles retain their delayed-ACK policy.",
           "ACK timing and greater-than-MSS output aggregation assertions are retained; failures are not weakened or reclassified as passes."
         ]
       },
@@ -73,6 +75,7 @@
           "receive_capacity": 8388608,
           "mss": 1460,
           "window_scale": 8,
+          "delayed_ack_us": 0,
           "endpoint_max_buffer_bytes": 33554432
         },
         "linux_defaults_reproduced": false,
@@ -81,6 +84,7 @@
           "A real 8 MiB receive capacity yields window scale 8; the endpoint aggregate buffer budget remains 32 MiB. Packet and syscall assertions remain byte-for-byte unchanged.",
           "The peer SYN negotiates neither SACK nor timestamps. ECN and timestamps remain off, NewReno and MSS 1460 remain unchanged.",
           "These cases do not measure CUBIC recovery; Linux CUBIC and the remaining defaults.sh sysctls, metrics flush and qdisc setup are not reproduced.",
+          "The upstream-window8 profile explicitly sets delayed_ack_us to 0 for immediate-ACK compatibility, including data received before an application read. This is not complete Linux quickACK emulation; other profiles retain their delayed-ACK policy.",
           "ACK timing and greater-than-MSS output aggregation assertions are retained; failures are not weakened or reclassified as passes."
         ]
       },

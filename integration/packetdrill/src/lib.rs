@@ -346,6 +346,10 @@ impl Owner {
         // Its mlockall(MCL_FUTURE) makes first-touch allocation synchronous.
         config.preallocate_connections = usize::from(profile == Profile::UpstreamSack);
         config.connection.mss = 1460;
+        if profile == Profile::UpstreamWindow8 {
+            // Immediate-ACK compatibility policy, not Linux quickACK emulation.
+            config.connection.delayed_ack_us = 0;
+        }
         config.connection.initial_window = if profile == Profile::UpstreamSack {
             ntcp::InitialWindow::Iw10
         } else {
@@ -431,6 +435,20 @@ impl Owner {
                     self.detached.push_back(id);
                 }
             }
+            // Retry queued reads before generating ACKs so their window credit
+            // can be coalesced with the ACK for the newly received data.
+            for _ in 0..self.pending.len().min(BUDGET) {
+                let mut request = self.pending.pop_front().unwrap();
+                match self.execute_at_now(&mut request) {
+                    Ok(Some(response)) => {
+                        let _ = request.reply.send(Ok(response));
+                    }
+                    Ok(None) => self.pending.push_back(request),
+                    Err(e) => {
+                        let _ = request.reply.send(Err(e));
+                    }
+                }
+            }
             for _ in 0..BUDGET {
                 if self.output.len() == LIMIT || !self.endpoint.has_pending_output() {
                     break;
@@ -466,18 +484,6 @@ impl Owner {
                 }
             }
             self.gc_ip_options();
-            for _ in 0..self.pending.len().min(BUDGET) {
-                let mut request = self.pending.pop_front().unwrap();
-                match self.execute_at_now(&mut request) {
-                    Ok(Some(response)) => {
-                        let _ = request.reply.send(Ok(response));
-                    }
-                    Ok(None) => self.pending.push_back(request),
-                    Err(e) => {
-                        let _ = request.reply.send(Err(e));
-                    }
-                }
-            }
             let wait = self
                 .endpoint
                 .next_deadline()

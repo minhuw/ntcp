@@ -543,6 +543,184 @@ fn profiles_emit_real_synack_scale_through_owner_thread() {
 }
 
 #[test]
+fn window8_acks_third_2000_byte_packet_before_application_read() {
+    for selected in [
+        Profile::Baseline,
+        Profile::Sack,
+        Profile::UpstreamSack,
+        Profile::UpstreamWindow8,
+    ] {
+        let mut owner = Owner::new((local(), selected)).unwrap();
+        let listener = owner.alloc(Socket::new(0)).unwrap();
+        let (mut bind, _) = request(
+            2,
+            listener,
+            0,
+            encode_addr(SocketAddr::new(local().into(), 8080)),
+            0,
+        );
+        owner.execute_at_now(&mut bind).unwrap();
+        execute_value(&mut owner, 3, listener, 1, 0).unwrap();
+        let incoming_syn = syn_with_options(100, 8080, &[2, 4, 5, 180, 1, 3, 3, 7]);
+        let ip = parse_frame(&incoming_syn).unwrap().0;
+        let (mut incoming, _) = request(14, 0, 0, incoming_syn, 0);
+        owner.execute_at_now(&mut incoming).unwrap();
+        let (_, bytes) = poll_frame(&mut owner).unwrap();
+        let ack = packet_header(&bytes).sequence.wrapping_add(1);
+        let mut header = ntcp::wire::Header {
+            source_port: 50000,
+            destination_port: 8080,
+            sequence: 101,
+            acknowledgment: ack,
+            flags: ntcp::wire::ACK,
+            window: 65535,
+            urgent_pointer: 0,
+        };
+        input_packet(&mut owner, ip, header, &[]);
+        let fd = execute_value(&mut owner, 4, listener, 0, 0).unwrap() as i32;
+        for i in 0..3 {
+            header.sequence = 101 + i * 2000;
+            let mut tcp = vec![0; 2020];
+            let len = ntcp::wire::encode(ip, header, &[], &vec![0; 2000], &mut tcp).unwrap();
+            let bytes = frame(
+                ntcp::Transmit {
+                    connection: None,
+                    ip,
+                    len,
+                    hop_limit: 64,
+                    dscp: 0,
+                    ecn: 0,
+                    ipv4_options: Default::default(),
+                },
+                &tcp[..len],
+            )
+            .unwrap();
+            let (mut data, _) = request(14, 0, 0, bytes, 0);
+            owner.execute_at_now(&mut data).unwrap();
+            // Same owner iteration: process timers and poll real wire output,
+            // without sleeping or advancing to the delayed-ACK deadline.
+            owner.endpoint.on_timeout(owner.now(), BUDGET).unwrap();
+            let output = poll_frame(&mut owner);
+            if selected == Profile::UpstreamWindow8 {
+                let (_, bytes) = output.expect("immediate ACK before read");
+                let sent = packet_header(&bytes);
+                assert_eq!(sent.flags, ntcp::wire::ACK);
+                assert_eq!(sent.acknowledgment, 101 + (i + 1) * 2000);
+            } else {
+                assert!(output.is_none(), "{selected:?} retains delayed ACK");
+            }
+            if i < 2 {
+                let (mut read, _) = request(6, fd, 0, vec![], 2000);
+                assert_eq!(
+                    owner.execute_at_now(&mut read).unwrap().unwrap().value,
+                    2000
+                );
+                while poll_frame(&mut owner).is_some() {}
+            }
+        }
+    }
+}
+
+#[test]
+fn owner_loop_coalesces_queued_reads_with_immediate_ack_window_credit() {
+    let adapter = Adapter::start((local(), Profile::UpstreamWindow8)).unwrap();
+    let listener = call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap().value as i32;
+    call(
+        &adapter,
+        2,
+        listener,
+        0,
+        encode_addr(SocketAddr::new(local().into(), 8080)),
+        0,
+    )
+    .unwrap();
+    call(&adapter, 3, listener, 1, vec![], 0).unwrap();
+    let incoming_syn = syn_with_options(100, 8080, &[2, 4, 3, 232, 1, 3, 3, 7]);
+    let ip = parse_frame(&incoming_syn).unwrap().0;
+    call(&adapter, 14, 0, 0, incoming_syn, 0).unwrap();
+    let synack = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap();
+    let mut header = ntcp::wire::Header {
+        source_port: 50000,
+        destination_port: 8080,
+        sequence: 101,
+        acknowledgment: packet_header(&synack.bytes).sequence.wrapping_add(1),
+        flags: ntcp::wire::ACK,
+        window: 257,
+        urgent_pointer: 0,
+    };
+    let send = |header, payload: &[u8]| {
+        let mut tcp = vec![0; 20 + payload.len()];
+        let len = ntcp::wire::encode(ip, header, &[], payload, &mut tcp).unwrap();
+        let bytes = frame(
+            ntcp::Transmit {
+                connection: None,
+                ip,
+                len,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+                ipv4_options: Default::default(),
+            },
+            &tcp[..len],
+        )
+        .unwrap();
+        call(&adapter, 14, 0, 0, bytes, 0).unwrap();
+    };
+    send(header, &[]);
+    let fd = call(&adapter, 4, listener, 0, vec![], 0).unwrap().value as i32;
+    for i in 0..3 {
+        let read = if i < 2 {
+            let (request, rx) = request(6, fd, 0, vec![], 2000);
+            adapter
+                .tx
+                .try_send(request)
+                .unwrap_or_else(|_| panic!("request channel full"));
+            // FIFO barrier: the read has been attempted and queued before data.
+            call(&adapter, 17, fd, 0, vec![], 0).unwrap();
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            Some(rx)
+        } else {
+            None
+        };
+        header.sequence = 101 + i * 2000;
+        header.flags = ntcp::wire::ACK | ntcp::wire::PSH;
+        send(header, &vec![0; 2000]);
+        if let Some(rx) = read {
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .unwrap()
+                    .value,
+                2000
+            );
+        }
+        let output = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap();
+        let sent = packet_header(&output.bytes);
+        // An extra ACK from an earlier read would fail the cumulative ACK check.
+        assert_eq!(sent.acknowledgment, 101 + (i + 1) * 2000);
+        assert_eq!(sent.flags, ntcp::wire::ACK);
+        assert_eq!(sent.window, if i < 2 { 32768 } else { 32760 });
+        assert!(output.stamp > 0);
+    }
+    // No application read follows the third data: its ACK must already be out,
+    // and no redundant ACK from the two queued reads may remain in the queue.
+    let (request, rx) = request(15, 0, 0, vec![], BYTES);
+    adapter
+        .tx
+        .try_send(request)
+        .unwrap_or_else(|_| panic!("request channel full"));
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_millis(20)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    drop(adapter);
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(3)).unwrap().err(),
+        Some(ECANCELED)
+    );
+}
+
+#[test]
 fn sack_profile_negotiation_reaches_owner_thread() {
     for selected in [Profile::Baseline, Profile::Sack] {
         let adapter = Adapter::start((local(), selected)).unwrap();
