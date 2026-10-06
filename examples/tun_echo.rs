@@ -480,6 +480,11 @@ mod linux {
             Err(std::env::VarError::NotPresent) => false,
             _ => return Err(invalid("NTCP_TIMESTAMPS must be exactly 1 or unset")),
         };
+        let sack = match std::env::var("NTCP_SACK") {
+            Ok(value) if value == "1" => true,
+            Err(std::env::VarError::NotPresent) => false,
+            _ => return Err(invalid("NTCP_SACK must be exactly 1 or unset")),
+        };
         let secret = acquire_secret()?;
         let mut tun = open_tun(&args[1])?;
         let start = Instant::now();
@@ -499,6 +504,7 @@ mod linux {
             reuse_time_wait: false,
             connection: ConnectionConfig {
                 timestamps,
+                sack,
                 send_capacity: 65536,
                 receive_capacity: 65536,
                 mss: 1460,

@@ -19,7 +19,7 @@ class RunnerChecks(unittest.TestCase):
         self.assertTrue(preflight('--init_scripts=/tmp/script'))
         self.assertTrue(preflight('--so_filename=other.so'))
         self.assertTrue(preflight('--wire_server'))
-        self.assertTrue(preflight('0 > S. 0:0(0) ack 1 <mss 1460,sackOK>'))
+        self.assertEqual(preflight('0 > S. 0:0(0) ack 1 <mss 1460,sackOK>'), [])
         self.assertEqual(preflight('0 < S 0:0(0) win 1000 <sackOK>'), [])
         self.assertEqual(preflight('--tolerance_usecs=10000\n0 > . 1:1(0) ack 1'), [])
 
@@ -125,8 +125,10 @@ class SelectionChecks(unittest.TestCase):
             plugin = checkout / 'plugin.so'
             plugin.write_text('plugin')
             report = checkout / 'report.json'
-            for suite in ('smoke', 'upstream'):
-                directory = checkout / ('tests' if suite == 'smoke' else PIN['tcp_tests'])
+            for suite in ('smoke', 'sack', 'upstream'):
+                native = suite in ('smoke', 'sack')
+                directory = checkout / ('sack-tests' if suite == 'sack' else
+                                        'tests' if suite == 'smoke' else PIN['tcp_tests'])
                 directory.mkdir(parents=True, exist_ok=True)
                 for name in ('basic.pkt', 'other.pkt'):
                     (directory / name).write_text('0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3')
@@ -134,7 +136,7 @@ class SelectionChecks(unittest.TestCase):
                                     for name in ('basic.pkt', 'other.pkt'))
                 argv = ['run.py', '--checkout', str(checkout), '--plugin', str(plugin),
                         '--suite', suite, '--report', str(report)]
-                variant = 'native-ipv4' if suite == 'smoke' else 'ipv4'
+                variant = 'native-ipv4' if native else 'ipv4'
                 filters = ['--variant', variant, '--script', 'basic.pkt']
                 with patch('run.HERE', checkout), \
                         patch('run.check_checkout', return_value=PIN['revision']), \
@@ -154,7 +156,11 @@ class SelectionChecks(unittest.TestCase):
                         self.assertEqual(data['counts'], {status: 1})
                         self.assertEqual(data['eligible_script_files'], 2)
                         self.assertEqual(data['script_files'], 1)
-                        self.assertEqual(data['eligible_total'], 2 if suite == 'smoke' else 6)
+                        self.assertEqual(data['eligible_total'], 2 if native else 6)
+                        self.assertEqual(data['results'][0]['effective_flags']['adapter'],
+                                         'sack,local=192.0.2.1' if suite == 'sack' else
+                                         'baseline,local=192.0.2.1' if suite == 'smoke' else
+                                         'baseline,local=192.168.0.1')
                         self.assertEqual(data['selected_total'], 1)
                         self.assertEqual(data['excluded_total'], data['eligible_total'] - 1)
                         self.assertEqual(len(data['excluded_cases']), data['excluded_total'])
@@ -165,7 +171,7 @@ class SelectionChecks(unittest.TestCase):
                                          ['unshare', '--user', '--map-root-user', '--net'])
                     with patch.object(sys, 'argv', argv), \
                             patch('run.invoke', return_value=(0, False, '')):
-                        self.assertEqual(main(), 0 if suite == 'smoke' else 1)
+                        self.assertEqual(main(), 0 if native else 1)
                     data = json.loads(report.read_text())
                     self.assertEqual(data['selected_total'], data['eligible_total'])
                     self.assertEqual(data['excluded_cases'], [])
@@ -181,7 +187,7 @@ class SelectionChecks(unittest.TestCase):
                     self.assertFalse(data['all_passed'])
                     self.assertEqual(data['behavior_executed'], 0)
                     for invalid in (['--variant', 'unknown'], ['--variant', ''],
-                                    ['--variant', 'ipv4' if suite == 'smoke' else 'native-ipv4'],
+                                    ['--variant', 'ipv4' if native else 'native-ipv4'],
                                     ['--script', ''], ['--script', 'missing.pkt']):
                         with patch.object(sys, 'argv', argv + invalid), \
                                 patch('run.invoke') as execute:

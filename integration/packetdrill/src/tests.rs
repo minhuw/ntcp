@@ -332,8 +332,14 @@ fn profiles_require_one_selection_and_one_ipv4_address() {
         profile("local=192.0.2.1,upstream-window8").unwrap(),
         (local(), Profile::UpstreamWindow8)
     );
+    assert_eq!(
+        profile("sack,local=192.0.2.1").unwrap(),
+        (local(), Profile::Sack)
+    );
     for flags in [
         "",
+        "sack",
+        "sack,sack,local=192.0.2.1",
         "baseline",
         "upstream-window8",
         "local=192.0.2.1",
@@ -379,6 +385,32 @@ fn profiles_emit_real_synack_scale_through_owner_thread() {
         assert_eq!(segment.options.mss, Some(1460));
         assert_eq!(segment.options.timestamps, None);
         assert_eq!(segment.raw_options, &[2, 4, 5, 180, 1, 3, 3, scale]);
+    }
+}
+
+#[test]
+fn sack_profile_negotiation_reaches_owner_thread() {
+    for selected in [Profile::Baseline, Profile::Sack] {
+        let adapter = Adapter::start((local(), selected)).unwrap();
+        let fd = call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap().value as i32;
+        call(
+            &adapter,
+            2,
+            fd,
+            0,
+            encode_addr(SocketAddr::new(local().into(), 8080)),
+            0,
+        )
+        .unwrap();
+        call(&adapter, 3, fd, 1, vec![], 0).unwrap();
+        let syn = syn_with_options(100, 8080, &[2, 4, 5, 180, 1, 3, 3, 0, 1, 1, 4, 2]);
+        call(&adapter, 14, 0, 0, syn, 0).unwrap();
+        let response = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap();
+        let (ip, tcp) = parse_frame(&response.bytes).unwrap();
+        let segment = ntcp::wire::parse(ip, tcp).unwrap();
+        assert_eq!(segment.options.sack_permitted, selected == Profile::Sack);
+        assert_eq!(segment.options.timestamps, None);
+        assert_eq!(segment.options.window_scale, Some(0));
     }
 }
 

@@ -14,12 +14,14 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 def assert_timestamp_negotiation(sock):
     info = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 8)
     assert bool(info[5] & 1) == (os.environ.get('NTCP_TIMESTAMPS') == '1'), info
+    assert bool(info[5] & 2) == (os.environ.get('NTCP_SACK') == '1'), info
 
 
 def isolated_test(parent_namespace):
     if str(os.stat('/proc/self/ns/net').st_ino) == parent_namespace:
         raise RuntimeError('refusing to change the parent network namespace')
-    subprocess.run(['sysctl', '-qw', 'net.ipv4.tcp_timestamps=1'], check=True)
+    subprocess.run(['sysctl', '-qw', 'net.ipv4.tcp_timestamps=1',
+                    'net.ipv4.tcp_sack=1', 'net.ipv4.tcp_dsack=1'], check=True)
     subprocess.run(['ip', 'link', 'set', 'lo', 'up'], check=True)
     subprocess.run(['ip', 'tuntap', 'add', 'dev', 'ntcp-test', 'mode', 'tun'], check=True)
     subprocess.run(['ip', 'addr', 'add', '10.73.0.1/24', 'dev', 'ntcp-test'], check=True)
@@ -50,6 +52,11 @@ def isolated_test(parent_namespace):
                 time.sleep(0.01)
             else:
                 raise RuntimeError('TUN adapter did not start')
+            if os.environ.get('NTCP_NETEM') == '1':
+                # Impair Linux-to-ntcp packets; never silently skip a requested gate.
+                subprocess.run(['tc', 'qdisc', 'add', 'dev', 'ntcp-test', 'root', 'netem',
+                                'delay', '5ms', '2ms', 'loss', '1%', 'duplicate', '1%',
+                                'reorder', '25%', '50%'], check=True)
             for size in [1, 31, 1460, 65536, 1048576]:
                 payload = bytes(i % 251 for i in range(size))
                 with socket.create_connection(('10.73.0.2', 8080), timeout=10) as client:

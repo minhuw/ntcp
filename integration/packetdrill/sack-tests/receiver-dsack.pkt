@@ -1,0 +1,25 @@
+--ip_version=ipv4
+--local_ip=192.0.2.1
+--remote_ip=192.0.2.2
+
+0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
++0 bind(3, ..., ...) = 0
++0 listen(3, 1) = 0
++0 < S 0:0(0) win 65535 <mss 1460,nop,wscale 0,nop,nop,sackOK>
++0 > S. 0:0(0) ack 1 win 65535 <mss 1460,nop,wscale 0,nop,nop,sackOK>
++0 < . 1:1(0) ack 1 win 65535
++0 accept(3, ..., ...) = 4
++0 < . 11:21(10) ack 1 win 65535
++0 > . 1:1(0) ack 1 win 65535 <nop,nop,sack 11:21>
++0 < . 15:18(3) ack 1 win 65535
++0 > . 1:1(0) ack 1 win 65535 <nop,nop,sack 15:18 11:21>
++0 < . 1:11(10) ack 1 win 65535
++0 > . 1:1(0) ack 21 win 65515
++0 read(4, ..., 20) = 20
++0 < . 1:11(10) ack 1 win 65535
++0 > . 1:1(0) ack 21 win 65515 <nop,nop,sack 1:11>
++0 close(4) = 0
++0 > F. 1:1(0) ack 21 win 65515
++0 < F. 21:21(0) ack 2 win 65535
++0 > . 2:2(0) ack 22 win 0
++0 close(3) = 0

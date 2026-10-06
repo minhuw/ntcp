@@ -32,8 +32,6 @@ def preflight(text):
     for option in re.findall(r'^\s*--([\w_-]+)', text, re.M):
         if option not in allowed:
             reasons.append(f'script option --{option} is outside the supported profile')
-    if re.search(r'^\s*[^\n]*>[^\n]*\bsackOK\b', text, re.M):
-        reasons.append('expects SACK negotiation, which ntcp does not implement')
     return sorted(set(reasons))
 
 
@@ -134,7 +132,7 @@ def variants(script, upstream):
 
 
 def select_cases(scripts, directory, suite, selected_variants=None, selected_scripts=None):
-    known_variants = {'native-ipv4'} if suite == 'smoke' else set(PIN['variants'])
+    known_variants = set(PIN['variants']) if suite in ('upstream', 'adapted') else {'native-ipv4'}
     for variant in selected_variants or []:
         if variant not in known_variants:
             raise ValueError(f'--variant {variant!r} is invalid for suite {suite}')
@@ -145,7 +143,7 @@ def select_cases(scripts, directory, suite, selected_variants=None, selected_scr
     selected, excluded = [], []
     for script in scripts:
         relative = str(script.relative_to(directory))
-        for variant, flags in variants(script, suite != 'smoke'):
+        for variant, flags in variants(script, suite in ('upstream', 'adapted')):
             reasons = []
             if selected_scripts is not None and relative not in selected_scripts:
                 reasons.append('excluded by --script selection')
@@ -166,7 +164,7 @@ def main():
     parser.add_argument('--checkout', required=True, type=Path)
     parser.add_argument('--plugin', type=Path,
                         default=ROOT / 'target/debug/libntcp_packetdrill.so')
-    parser.add_argument('--suite', choices=['smoke', 'upstream', 'adapted'], default='smoke')
+    parser.add_argument('--suite', choices=['smoke', 'sack', 'upstream', 'adapted'], default='smoke')
     parser.add_argument('--variant', action='append',
                         choices=['native-ipv4', *PIN['variants']],
                         help='select a suite variant (repeatable; default: all eligible variants)')
@@ -178,8 +176,9 @@ def main():
     parser.add_argument('--so-flags')
     args = parser.parse_args()
     if args.so_flags is None and args.suite != 'adapted':
-        args.so_flags = ('baseline,local=192.168.0.1' if args.suite != 'smoke'
-                         else 'baseline,local=192.0.2.1')
+        args.so_flags = ('sack,local=192.0.2.1' if args.suite == 'sack' else
+                         'baseline,local=192.0.2.1' if args.suite == 'smoke' else
+                         'baseline,local=192.168.0.1')
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error('--timeout must be finite and positive')
     checkout = args.checkout.resolve()
@@ -195,9 +194,11 @@ def main():
         parser.error(f'build ntcp-packetdrill first: {plugin}')
     manifest_bytes = (HERE / 'adaptations.json').read_bytes() if args.suite == 'adapted' else None
     manifest = json.loads(manifest_bytes) if manifest_bytes is not None else None
-    directory = checkout / PIN['tcp_tests'] if args.suite != 'smoke' else HERE / 'tests'
+    upstream = args.suite in ('upstream', 'adapted')
+    directory = (checkout / PIN['tcp_tests'] if upstream else
+                 HERE / ('sack-tests' if args.suite == 'sack' else 'tests'))
     upstream_scripts = []
-    if args.suite != 'smoke':
+    if upstream:
         tracked = subprocess.check_output(
             ['git', '-C', str(checkout), 'ls-files', '-z', '--', PIN['tcp_tests']],
             text=True,
@@ -286,7 +287,7 @@ def main():
               'all_passed': bool(results) and len(results) == len(cases) and all(
                   row['status'] == 'passed' and row['behavior_executed']
                   for row in results)}
-    if args.suite != 'smoke':
+    if upstream:
         report['coverage'] = {'selected_script_files': selected_script_files,
                               'upstream_script_files': len(upstream_scripts),
                               'selection': 'adaptation_allowlist' if manifest is not None
