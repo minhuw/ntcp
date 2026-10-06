@@ -3417,9 +3417,9 @@ impl Connection {
     //# That is, RTT samples MUST NOT be made using segments that were retransmitted (and thus
     //# for which it is ambiguous whether the reply was for the first instance of the packet
     //# or a later instance).
-    // Continuous sliding flights use complete unambiguous local ledger candidates even without fresh output; actual update counts cover delayed/stretched ACKs and same-millisecond reuse. Negotiated non-RACK RTTM retains echo validation; invalid echoes and Karn-ambiguous originals are separately counted. Minimum-rate TODO remains for all-invalid non-RACK echoes because the upstream no-update assertion is preserved.
+    // Continuous sliding flights use complete unambiguous local ledger candidates even without fresh output; actual update counts cover delayed/stretched ACKs and same-millisecond reuse. All-invalid echo flights with/without RACK assert identical local-clock estimator histories for differing forgeries. RTTM still validates TSecr; independent local timing never uses it, and Karn-ambiguous originals remain excluded.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-3
-    //= reason=Continuous sliding flights use complete unambiguous local ledger candidates even without fresh output; actual update counts cover delayed/stretched ACKs and same-millisecond reuse. Negotiated non-RACK RTTM retains echo validation; invalid echoes and Karn-ambiguous originals are separately counted. Minimum-rate TODO remains for all-invalid non-RACK echoes because the upstream no-update assertion is preserved.
+    //= reason=Continuous sliding flights use complete unambiguous local ledger candidates even without fresh output; actual update counts cover delayed/stretched ACKs and same-millisecond reuse. All-invalid echo flights with/without RACK assert identical local-clock estimator histories for differing forgeries. RTTM still validates TSecr; independent local timing never uses it, and Karn-ambiguous originals remain excluded.
     //# A TCP implementation MUST take at least one RTT measurement per RTT (unless that is
     //# not possible per Karn's algorithm).
     // Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
@@ -3584,13 +3584,10 @@ impl Connection {
             self.sample = None;
         }
         // A covered/mismatched pending RTTM must not starve the remaining flight.
-        // RACK's candidate is a complete, never-retransmitted original measured
-        // on the local clock. Without RACK, negotiated RTTM still needs a validated
-        // echo; never derive a send time from TSecr or remove its secret offset twice.
+        // The ledger candidate is a complete, never-retransmitted original
+        // measured on the local clock, regardless of the loss-recovery algorithm.
+        // Unlike RTTM above, it uses no peer echo, valid or otherwise.
         if let Some(sample) = self.rack.ack_sample
-            && (self.rack_enabled()
-                || !self.timestamps
-                || echo == Some(self.timestamp_value(self.now.saturating_sub(sample))))
             && self.update_rtt(sample)
             && !syn_ack
         {
@@ -19957,7 +19954,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc6298#section-3
     //= type=test
-    //= reason=Continuous eight/64-packet sliding flights, immediate/delayed/stretched ACKs and repeated millisecond TSvals assert eight actual estimator updates in eight causal RTTs, with and without timestamps/RACK.
+    //= reason=Continuous eight/64-packet sliding flights, immediate/delayed/stretched ACKs and repeated millisecond TSvals assert eight actual estimator updates in eight causal RTTs, with and without timestamps/RACK. All-invalid echo streams assert exact local SRTT/RTTVAR/RTO for three different forgeries, independent of TSecr.
     //# A TCP implementation MUST take at least one RTT measurement per RTT (unless that is
     //# not possible per Karn's algorithm).
     //= https://www.rfc-editor.org/rfc/rfc6298#section-3
@@ -19970,68 +19967,102 @@ mod tests {
     fn rtt_cadence_continuous_delayed_stretched_and_same_tick() {
         for width in [8usize, 64] {
             for timestamps in [false, true] {
-                for rack in [false, true] {
-                    for batch in [1usize, 2, 8] {
-                        for step in [100u64, 1_000] {
-                            let cfg = ConnectionConfig {
-                                timestamps,
-                                rack,
-                                nagle: false,
-                                initial_window: InitialWindow::Iw10,
-                                ..sack_config(128)
-                            };
-                            let (mut a, _) = pair(cfg, u32::MAX - 100);
-                            a.rtt = RttEstimator::new(1_000_000);
-                            a.rtt_sample_after = None;
-                            let mut flight = alloc::collections::VecDeque::new();
-                            let base = 2_000_000;
-                            let send_one = |a: &mut Connection, sent| {
-                                a.write(b"x").unwrap();
-                                let bytes = packet(a, sent);
-                                let seg = wire::parse(ip(tuple()), &bytes).unwrap();
-                                assert_eq!(seg.payload, b"x");
-                                (
-                                    Seq(seg.header.sequence).wrapping_add(1),
-                                    sent,
-                                    seg.options.timestamps.map(|ts| ts.0),
-                                )
-                            };
-                            for i in 0..width {
-                                flight.push_back(send_one(&mut a, base + i as u64 * step));
-                            }
-                            for group in 0..width * 8 / batch {
-                                let mut delivered = Vec::new();
-                                for _ in 0..batch {
-                                    delivered.push(flight.pop_front().unwrap());
+                for forge in if timestamps {
+                    &[0u32, 1, 0x8000_0000, 0x4000_0000][..]
+                } else {
+                    &[0][..]
+                } {
+                    for rack in [false, true] {
+                        for batch in [1usize, 2, 8] {
+                            for step in [100u64, 1_000, 10_000] {
+                                let cfg = ConnectionConfig {
+                                    timestamps,
+                                    rack,
+                                    nagle: false,
+                                    initial_window: InitialWindow::Iw10,
+                                    ..sack_config(128)
+                                };
+                                let (mut a, _) = pair(cfg, u32::MAX - 100);
+                                a.timestamp_offset = u32::MAX - 2000;
+                                a.rtt = RttEstimator::new(1_000_000);
+                                let mut expected_local = RttEstimator::new(1_000_000);
+                                a.rtt_sample_after = None;
+                                let mut flight = alloc::collections::VecDeque::new();
+                                let base = 2_000_000;
+                                let send_one = |a: &mut Connection, sent| {
+                                    a.write(b"x").unwrap();
+                                    let bytes = packet(a, sent);
+                                    let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+                                    assert_eq!(seg.payload, b"x");
+                                    (
+                                        Seq(seg.header.sequence).wrapping_add(1),
+                                        sent,
+                                        seg.options.timestamps.map(|ts| ts.0),
+                                    )
+                                };
+                                for i in 0..width {
+                                    flight.push_back(send_one(&mut a, base + i as u64 * step));
                                 }
-                                let &(ack, sent, echo) = delivered.last().unwrap();
-                                let now = sent + width as u64 * step;
-                                let next = a.receive.next();
-                                if timestamps {
-                                    timestamp_input(
-                                        &mut a,
-                                        now,
-                                        next,
-                                        ack,
-                                        ACK,
-                                        Some((now as u32 / 1000, echo.unwrap())),
-                                        b"",
+                                for group in 0..width * 8 / batch {
+                                    let mut delivered = Vec::new();
+                                    for _ in 0..batch {
+                                        delivered.push(flight.pop_front().unwrap());
+                                    }
+                                    let &(ack, sent, echo) = delivered.last().unwrap();
+                                    let now = sent + width as u64 * step;
+                                    let next = a.receive.next();
+                                    if timestamps {
+                                        if *forge != 0 {
+                                            assert!(a.sample.is_none_or(|(end, sent)| {
+                                                !at_or_after(ack, end)
+                                                    || echo.unwrap().wrapping_add(*forge)
+                                                        != a.timestamp_value(sent)
+                                            }));
+                                        }
+                                        timestamp_input(
+                                            &mut a,
+                                            now,
+                                            next,
+                                            ack,
+                                            ACK,
+                                            Some((
+                                                now as u32 / 1000,
+                                                echo.unwrap().wrapping_add(*forge),
+                                            )),
+                                            b"",
+                                        );
+                                    } else {
+                                        inject(&mut a, now, next, ack, ACK, 8192, b"");
+                                    }
+                                    // One update per window-sized causal round, even though
+                                    // flight never drains and delayed ACKs cover multiple sends.
+                                    assert_eq!(
+                                        a.rtt.updates,
+                                        1 + group * batch / width,
+                                        "TS={timestamps} RACK={rack} batch={batch} step={step}"
                                     );
-                                } else {
-                                    inject(&mut a, now, next, ack, ACK, 8192, b"");
+                                    if *forge != 0 {
+                                        // Every ACK has rejected TSecr. Differing forgeries
+                                        // must yield the same exact local-clock estimator.
+                                        if group * batch % width == 0 {
+                                            expected_local.sample(width as u64 * step);
+                                        }
+                                        assert_eq!(
+                                            (a.rtt.srtt(), a.rtt.variance(), a.rtt.rto()),
+                                            (
+                                                expected_local.srtt(),
+                                                expected_local.variance(),
+                                                expected_local.rto()
+                                            ),
+                                            "forge={forge} RACK={rack} width={width} batch={batch} step={step}"
+                                        );
+                                    }
+                                    for (i, _) in delivered.iter().enumerate() {
+                                        flight.push_back(send_one(&mut a, now + i as u64 * step));
+                                    }
                                 }
-                                // One update per window-sized causal round, even though
-                                // flight never drains and delayed ACKs cover multiple sends.
-                                assert_eq!(
-                                    a.rtt.updates,
-                                    1 + group * batch / width,
-                                    "TS={timestamps} RACK={rack} batch={batch} step={step}"
-                                );
-                                for (i, _) in delivered.iter().enumerate() {
-                                    flight.push_back(send_one(&mut a, now + i as u64 * step));
-                                }
+                                assert_eq!(a.rtt.updates, 8);
                             }
-                            assert_eq!(a.rtt.updates, 8);
                         }
                     }
                 }
@@ -20070,8 +20101,12 @@ mod tests {
                 Some((3000, echo.wrapping_sub(1))),
                 b"",
             );
-            // Invalid RTTM is not eligible; RACK may use independent local evidence.
-            assert_eq!(a.rtt.updates, usize::from(rack));
+            // Invalid RTTM is not eligible; both algorithms use local original timing.
+            assert_eq!(a.rtt.updates, 1);
+            assert_eq!(
+                (a.rtt.srtt(), a.rtt.variance(), a.rtt.rto()),
+                (Some(100_000), 50_000, 1_000_000)
+            );
             assert!(a.sample.is_none());
             timestamp_input(&mut a, 2_100_000, next, end, ACK, Some((3000, echo)), b"");
             assert_eq!(a.rtt.updates, 1); // No new output needed to rearm.
@@ -20527,7 +20562,7 @@ mod tests {
         let mut cfg = config(1024, 128);
         cfg.timestamps = true;
         cfg.nagle = false;
-        for valid in [false, true] {
+        for echo in [2000, 1999, 0, u32::MAX, 200_000] {
             let (mut a, _) = pair(cfg.clone(), 10);
             a.rtt = RttEstimator::new(1_000_000);
             a.write(b"sample").unwrap();
@@ -20535,38 +20570,41 @@ mod tests {
             assert!(a.sample.is_some());
             let next = a.receive.next();
             let ack = a.snd_nxt;
-            timestamp_input(
-                &mut a,
-                2_600_000,
-                next,
-                ack,
-                ACK,
-                Some((5, if valid { 2000 } else { 1999 })),
-                b"",
+            timestamp_input(&mut a, 2_600_000, next, ack, ACK, Some((5, echo)), b"");
+            // Only a matching echo qualifies for RTTM. Every other value falls
+            // back to the same unambiguous local 600ms measurement, never the echo.
+            assert_eq!(a.rtt.updates, 1);
+            assert_eq!(
+                (a.rtt.srtt(), a.rtt.variance(), a.rtt.rto()),
+                (Some(600_000), 300_000, 1_800_000)
             );
-            assert_eq!(a.rtt.rto(), if valid { 1_800_000 } else { 1_000_000 });
             assert!(a.sample.is_none());
         }
-        let (mut a, _) = pair(cfg, 10);
-        a.write(b"lost").unwrap();
-        packet(&mut a, 2_000_000);
-        a.timeout(3_000_000).unwrap();
-        let bytes = packet(&mut a, 3_000_000);
-        assert_eq!(
-            wire::parse(ip(tuple()), &bytes)
-                .unwrap()
-                .options
-                .timestamps
-                .unwrap()
-                .0,
-            3000
-        );
-        assert!(a.sample.is_none());
-        let rto = a.rtt.rto();
-        let next = a.receive.next();
-        let ack = a.snd_nxt;
-        timestamp_input(&mut a, 3_600_000, next, ack, ACK, Some((6, 3000)), b"");
-        assert_eq!(a.rtt.rto(), rto);
+        for echo in [3000, 2000, 0, u32::MAX] {
+            let (mut a, _) = pair(cfg.clone(), 10);
+            a.rtt = RttEstimator::new(1_000_000);
+            a.rtt_sample_after = None;
+            a.write(b"lost").unwrap();
+            packet(&mut a, 2_000_000);
+            a.timeout(3_000_000).unwrap();
+            let bytes = packet(&mut a, 3_000_000);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes)
+                    .unwrap()
+                    .options
+                    .timestamps
+                    .unwrap()
+                    .0,
+                3000
+            );
+            assert!(a.sample.is_none());
+            let rto = a.rtt.rto();
+            let next = a.receive.next();
+            let ack = a.snd_nxt;
+            timestamp_input(&mut a, 3_600_000, next, ack, ACK, Some((6, echo)), b"");
+            assert_eq!(a.rtt.rto(), rto);
+            assert_eq!(a.rtt.updates, 0);
+        }
     }
 
     #[test]
