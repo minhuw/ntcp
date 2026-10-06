@@ -808,6 +808,17 @@ impl Connection {
     //= reason=Uses byte PRR credit rather than inflated cwnd when PRR is active. Does not prove all output-path or entry behavior.
     //# We introduce a local variable "sndcnt", which indicates exactly how
     //# many bytes should be sent in response to each ACK.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-4
+    //= reason=Active PRR uses cumulative unspent credit, rather than consuming allowance on app/rwnd stalls. Paired full-MSS-credit traces verify catchup before recovery exit; new-data output still gates on >=MSS allowance. This is not evidence for entry conservation or final-window convergence.
+    //# The missed opportunities to send
+    //# due to stalls are treated like banked voluntary window reductions;
+    //# specifically, they cause prr_delivered - prr_out to be significantly
+    //# positive.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-4
+    //= reason=Same active epoch retains allowance across app and nonzero-rwnd stalls; successful poll-driven output consumes actual bytes. Paired traces compare cumulative out, snd.nxt and pipe after resume under full-MSS-credit assumptions, not universal sub-MSS catchup.
+    //# If the application catches up while TCP is still in
+    //# recovery, TCP will send a partial window burst to catch up to exactly
+    //# where it would have been had the application never stalled.
     fn recovery_credit(&self, recovery: SackRecovery) -> u32 {
         self.prr.map_or_else(
             || self.congestion.cwnd().saturating_sub(recovery.pipe),
@@ -1860,29 +1871,29 @@ impl Connection {
     //# (B.2) Use SetPipe () to re-calculate the number of octets still in the
     //# network.
     //= https://www.rfc-editor.org/rfc/rfc6937#section-2
-    //= reason=Partial byte-ledger evidence: acknowledge counts new covered bytes once; feeds PRR on ACKs while active and disables PRR on invalid ledger. Signed-delta equivalence and retained pre-entry interval accounting remain TODOs.
+    //= reason=Valid active-ledger ACK delivery is tested against deltaUNA plus signed delta of retained SACK union, including omitted advice and cumulative transition across wrap; invalidation cancels PRR. Retained timer-entry delivery and all-entry interval accounting remain TODOs.
     //# SACKd: The total number of bytes that the scoreboard indicates have
     //# been delivered to the receiver.  This can be computed by scanning
     //# the scoreboard and counting the total number of bytes covered by
     //# all SACK blocks.  If SACK is not in use, SACKd is not defined.
     //= https://www.rfc-editor.org/rfc/rfc6937#section-2
-    //= reason=Partial byte-ledger evidence: acknowledge counts new covered bytes once; feeds PRR on ACKs while active and disables PRR on invalid ledger. Signed-delta equivalence and retained pre-entry interval accounting remain TODOs.
+    //= reason=Valid active-ledger ACK delivery is tested against deltaUNA plus signed delta of retained SACK union, including omitted advice and cumulative transition across wrap; invalidation cancels PRR. Retained timer-entry delivery and all-entry interval accounting remain TODOs.
     //# With SACK,
     //# DeliveredData can be computed precisely as the change in snd.una,
     //# plus the (signed) change in SACKd.
     //= https://www.rfc-editor.org/rfc/rfc6937#section-3
-    //= reason=Partial byte-ledger evidence: acknowledge counts new covered bytes once; feeds PRR on ACKs while active and disables PRR on invalid ledger. Signed-delta equivalence and retained pre-entry interval accounting remain TODOs.
+    //= reason=Valid active-ledger ACK delivery is tested against deltaUNA plus signed delta of retained SACK union, including omitted advice and cumulative transition across wrap; invalidation cancels PRR. Retained timer-entry delivery and all-entry interval accounting remain TODOs.
     //# On every ACK during recovery compute:
     //#
     //#    DeliveredData = change_in(snd.una) + change_in(SACKd)
     //#    prr_delivered += DeliveredData
     //= https://www.rfc-editor.org/rfc/rfc6937#section-2
-    //= reason=Partial byte-ledger evidence: acknowledge counts new covered bytes once; feeds PRR on ACKs while active and disables PRR on invalid ledger. Signed-delta equivalence and retained pre-entry interval accounting remain TODOs.
+    //= reason=Valid active-ledger ACK delivery is tested against deltaUNA plus signed delta of retained SACK union, including omitted advice and cumulative transition across wrap; invalidation cancels PRR. Retained timer-entry delivery and all-entry interval accounting remain TODOs.
     //# Furthermore, for any TCP
     //# (with or without SACK), the sum of DeliveredData must agree with the
     //# forward progress over the same time interval.
     //= https://www.rfc-editor.org/rfc/rfc6937#section-2
-    //= reason=Delayed timer entry reuses retained pre-entry ACK delivery (capped at MSS) instead of a current ACK; audit interval/epoch semantics rather than treating one-shot evidence as compliance. ACK path ledger counts unique covered bytes; this is partial evidence, not a deferred-entry waiver.
+    //= reason=Delayed timer entry replays retained pre-entry ACK delivery capped at MSS, without a current ACK. Literal current-ACK accounting requires timer-entry zero PRR delivery and no capped replay; valid active ACK ledger equality does not settle the entry epoch.
     //# DeliveredData: The total number of bytes that the current ACK
     //# indicates have been delivered to the receiver.
     pub(crate) fn input_with_traffic_class(
@@ -5173,6 +5184,293 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= type=test
+    //= reason=Within a valid active epoch, unique delivery equals deltaUNA plus signed delta of the retained scoreboard union, including overlap, omission (not reneging), cumulative transition and wrap. Invalid ledgers and RTO cancel PRR rather than subtract delivery across epochs.
+    //# With SACK,
+    //# DeliveredData can be computed precisely as the change in snd.una,
+    //# plus the (signed) change in SACKd.
+    fn prr_active_delivery_matches_signed_scoreboard_delta() {
+        for iss in [0, u32::MAX - 4999] {
+            let mut a = rack_flight(iss);
+            rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
+            a.timeout(225_000).unwrap();
+            assert!(a.prr.is_some());
+            for (ack, blocks, expected) in [
+                (0, vec![(7500, 8500), (8000, 9000)], 1000),
+                (0, vec![], 0), // Omitted advice remains in the scoreboard.
+                (0, vec![(7000, 9000)], 0),
+                (1000, vec![(7000, 9000)], 1000),
+                (8000, vec![(8000, 9000)], 6000),
+                (9000, vec![], 0), // deltaSACKd=-1000 offsets deltaUNA=1000.
+                (9000, vec![(9500, 9750)], 250),
+            ] {
+                let una = a.snd_una;
+                let sackd = a.flight() - a.scoreboard.unsacked_bytes(una, a.data_high());
+                let delivered = a.prr.unwrap().counters().1;
+                rack_sack(&mut a, 226_000, ack, &blocks);
+                let new_sackd = a.flight() - a.scoreboard.unsacked_bytes(a.snd_una, a.data_high());
+                let signed = i64::from(a.snd_una.distance_from(una)) + i64::from(new_sackd)
+                    - i64::from(sackd);
+                assert_eq!(signed, expected);
+                assert_eq!(a.prr.unwrap().counters().1 - delivered, expected as u64);
+                assert!(a.rack.valid());
+                assert!(a.sack_recovery.is_some());
+            }
+            a.timeout(a.rto_deadline.unwrap()).unwrap();
+            assert!(a.prr.is_none());
+            assert!(a.rack_entry_delivery.is_none());
+            assert!(a.sack_recovery.is_none());
+
+            let mut a = rack_flight(iss);
+            rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
+            a.timeout(225_000).unwrap();
+            assert!(a.prr.is_some());
+            // Scoreboard exhaustion, distinct from ledger split exhaustion
+            // tested below, also terminates rather than debits the epoch.
+            for i in 0..65 {
+                rack_sack(&mut a, 226_000, 0, &[(i * 2, i * 2 + 1)]);
+            }
+            assert!(!a.rack.valid());
+            assert!(a.prr.is_none());
+            assert!(a.rack_entry_delivery.is_none());
+            assert!(a.sack_recovery.is_none());
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Actual advancing entry ACK updates snd.una before RecoverFS snapshots outstanding bytes, across wrap; empty data flight cannot enter. Initial credit policy remains a separate TODO.
+    //# RecoverFS = snd.nxt-snd.una // FlightSize at the start of recovery
+    fn prr_entry_snapshots_flight_after_advancing_ack() {
+        for iss in [0, u32::MAX - 4999] {
+            let mut a = rack_flight(iss);
+            a.config.rack = false; // Exercise ACK-driven RFC 6675 entry, not timer entry.
+            let nxt = a.snd_nxt;
+            rack_sack(&mut a, 200_000, 1000, &[(4000, 10_000)]);
+            assert!(a.sack_recovery.unwrap().entry_pending);
+            assert_eq!(a.snd_nxt, nxt);
+            assert_eq!(a.snd_una, a.iss.wrapping_add(1001));
+            assert_eq!(a.prr.unwrap().counters().0, nxt.distance_from(a.snd_una));
+            assert_eq!(a.prr.unwrap().counters().0, 9000);
+            rack_sack(&mut a, 300_000, 10_000, &[]);
+            assert!(a.prr.is_none());
+            assert!(!a.start_sack_recovery());
+        }
+    }
+
+    #[test]
+    // Characterization, not an RFC 6937 output-bound annotation: persist
+    // probes are reachable with active, exhausted PRR and bypass its counters.
+    fn prr_special_output_reachability_and_persist_accounting_gap() {
+        for iss in [0, u32::MAX - 4999] {
+            let mut a = rack_flight(iss);
+            a.config.tlp = true;
+            assert!(a.tlp_eligible());
+            a.schedule_tlp();
+            assert!(a.tlp_deadline.is_some());
+            rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
+            a.timeout(225_000).unwrap();
+            prr_packet(&mut a, 225_000);
+            assert_eq!(a.prr.unwrap().credit(), 0);
+            assert!(!a.tlp_eligible());
+            assert!(a.tlp_deadline.is_none());
+            assert!(!a.tlp_pending);
+            let rto = a.rto_deadline.unwrap();
+            a.timeout(rto).unwrap();
+            assert!(a.prr.is_none()); // RTO retransmission is outside this epoch.
+            assert!(a.retx_pending);
+            let bytes = packet(&mut a, rto);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.header.sequence, a.snd_una.0);
+            assert_eq!(segment.payload.len(), 1000);
+
+            let mut a = rack_flight(iss);
+            rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
+            a.timeout(225_000).unwrap();
+            prr_packet(&mut a, 225_000);
+            let seq = a.receive.next();
+            let una = a.snd_una;
+            inject(&mut a, 226_000, seq, una, ACK, 0, &[]);
+            let before = a.prr.unwrap();
+            assert_eq!(before.credit(), 0);
+            assert!(a.rto_deadline.is_none());
+            let persist = a.persist_deadline.unwrap();
+            a.timeout(persist).unwrap();
+            assert!(a.probe_pending);
+            assert!(a.prr.is_some());
+            assert_eq!(
+                a.transmit(persist, &mut [0; 20]),
+                Err(Error::OutputTooSmall)
+            );
+            assert_eq!(a.prr.unwrap().counters(), before.counters());
+            assert!(a.probe_pending);
+            let bytes = packet(&mut a, persist);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.header.sequence, una.0);
+            assert_eq!(segment.payload.len(), 1);
+            assert!(a.sack_recovery.is_some());
+            assert_eq!(a.prr.unwrap().counters(), before.counters());
+            assert_eq!(a.prr.unwrap().credit(), 0);
+        }
+    }
+
+    // Every ordinary output poll checks cumulative actual bytes and pre-poll allowance.
+    fn prr_packet(a: &mut Connection, now: u64) -> (u32, usize) {
+        let before = a.prr.unwrap();
+        assert_eq!(a.transmit(now, &mut [0; 20]), Err(Error::OutputTooSmall));
+        assert_eq!(a.prr.unwrap().counters(), before.counters());
+        assert_eq!(a.prr.unwrap().credit(), before.credit());
+        let bytes = packet(a, now);
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        let count = segment.payload.len();
+        assert!(count > 0);
+        assert!(count as u32 <= before.credit());
+        assert!(Seq(segment.header.sequence).distance_from(a.snd_una) + count as u32 <= a.snd_wnd);
+        assert_eq!(
+            a.prr.unwrap().counters().2,
+            before.counters().2 + count as u64
+        );
+        assert_eq!(a.prr.unwrap().credit(), before.credit() - count as u32);
+        (segment.header.sequence, count)
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= type=test
+    //= reason=Actual retransmit and new-data polls stay within byte credit and rwnd; short queued data is emitted with >=MSS allowance, while sub-MSS allowance banks without new output. Failed encoding preserves cumulative out.
+    //# We introduce a local variable "sndcnt", which indicates exactly how
+    //# many bytes should be sent in response to each ACK.
+    fn prr_short_output_and_sub_mss_new_data_gate() {
+        for iss in [0, u32::MAX - 4999] {
+            let mut a = rack_flight(iss);
+            rack_sack(&mut a, 200_000, 0, &[(1000, 7000)]);
+            a.timeout(225_000).unwrap();
+            // Shrink rwnd to bound the entry retransmit to a short payload.
+            let seq = a.receive.next();
+            let una = a.snd_una;
+            let short_window = (250 >> a.peer_scale) as u16;
+            inject(&mut a, 225_000, seq, una, ACK, short_window, &[]);
+            assert_eq!(a.snd_wnd, 250);
+            assert_eq!(prr_packet(&mut a, 225_000), (una.0, 250));
+            assert_eq!(a.prr.unwrap().counters().2, 250);
+            // Reopen without delivery. Finish the actual lost head, then earn
+            // credit from still-unacknowledged original tail bytes.
+            inject(&mut a, 225_000, seq, una, ACK, 65_535, &[]);
+            assert_eq!(prr_packet(&mut a, 225_000).1, 750);
+            a.write(&[0x66; 1250]).unwrap();
+            rack_sack(&mut a, 226_000, 0, &[(1000, 7500)]);
+            assert_eq!(a.prr.unwrap().credit(), 1500);
+            assert_eq!(prr_packet(&mut a, 226_000).1, 1000);
+            assert_eq!(a.prr.unwrap().credit(), 500);
+            let before = a.prr.unwrap().counters();
+            assert_eq!(a.transmit(226_000, &mut [0; 1500]), Ok(None));
+            assert_eq!(a.prr.unwrap().counters(), before);
+            rack_sack(&mut a, 226_000, 0, &[(1000, 8000)]);
+            assert_eq!(a.prr.unwrap().credit(), 1000);
+            let nxt = a.snd_nxt;
+            let short_window = ((a.flight() + 126) >> a.peer_scale) as u16;
+            inject(&mut a, 226_000, seq, una, ACK, short_window, &[]);
+            assert_eq!(a.snd_wnd - a.flight(), 126);
+            assert_eq!(prr_packet(&mut a, 226_000), (nxt.0, 126));
+            assert_eq!(a.prr.unwrap().credit(), 874);
+            // Further delivery restores >=MSS allowance; queued short data,
+            // not MSS, determines actual output.
+            rack_sack(&mut a, 226_000, 0, &[(1000, 8500)]);
+            assert_eq!(prr_packet(&mut a, 226_000), (nxt.wrapping_add(126).0, 124));
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-4
+    //= type=test
+    //= reason=Application and nonzero-rwnd stalls retain credit and resume with three packets to the same cumulative out, snd.nxt and pipe as an unstalled run, within the same active epoch. ACK-driven entry counts its causative delivery; trace holds retransmitted head unacknowledged, avoids further loss timers and uses full-MSS credit.
+    //# The missed opportunities to send
+    //# due to stalls are treated like banked voluntary window reductions;
+    //# specifically, they cause prr_delivered - prr_out to be significantly
+    //# positive.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-4
+    //= type=test
+    //= reason=Same-epoch paired traces compare app/rwnd resume to unstalled output, not universal sub-MSS or final-window convergence.
+    //# If the application catches up while TCP is still in
+    //# recovery, TCP will send a partial window burst to catch up to exactly
+    //# where it would have been had the application never stalled.
+    fn prr_stall_resume_catches_unstalled_active_epoch() {
+        for iss in [0, u32::MAX - 4999] {
+            for rwnd_stall in [false, true] {
+                let mut results = vec![];
+                for stalled in [false, true] {
+                    let mut a = rack_flight(iss);
+                    rack_sack(&mut a, 200_000, 0, &[(1000, 7000)]);
+                    a.timeout(225_000).unwrap();
+                    prr_packet(&mut a, 225_000);
+                    let stalled_window = (a.flight() >> a.peer_scale) as u16;
+                    let boundary = a.sack_recovery.unwrap().recovery_point;
+                    if !stalled || rwnd_stall {
+                        a.write(&[0x66; 3000]).unwrap();
+                    }
+                    if stalled && rwnd_stall {
+                        let seq = a.receive.next();
+                        let una = a.snd_una;
+                        inject(&mut a, 225_000, seq, una, ACK, stalled_window, &[]);
+                    }
+                    for right in [8000, 9000] {
+                        let base = a.iss.wrapping_add(1);
+                        let seq = a.receive.next();
+                        let una = a.snd_una;
+                        inject_sack(
+                            &mut a,
+                            226_000,
+                            seq,
+                            una,
+                            ACK,
+                            if stalled && rwnd_stall {
+                                stalled_window
+                            } else {
+                                65_535
+                            },
+                            &[],
+                            &[(base.wrapping_add(1000).0, base.wrapping_add(right).0)],
+                        );
+                        if stalled {
+                            assert_eq!(a.transmit(226_000, &mut [0; 1500]), Ok(None));
+                            assert_eq!(a.prr.unwrap().counters().2, 1000);
+                        } else {
+                            for _ in 0..if right == 8000 { 2 } else { 1 } {
+                                assert_eq!(prr_packet(&mut a, 226_000).1, 1000);
+                            }
+                        }
+                    }
+                    if stalled {
+                        assert_eq!(a.prr.unwrap().credit(), 3000);
+                        assert_eq!(
+                            a.prr.unwrap().counters().1 - a.prr.unwrap().counters().2,
+                            7000
+                        );
+                        if rwnd_stall {
+                            let seq = a.receive.next();
+                            let una = a.snd_una;
+                            inject(&mut a, 226_000, seq, una, ACK, 65_535, &[]);
+                        } else {
+                            a.write(&[0x66; 3000]).unwrap();
+                        }
+                        for _ in 0..3 {
+                            assert_eq!(prr_packet(&mut a, 226_000).1, 1000);
+                        }
+                    }
+                    assert_eq!(a.sack_recovery.unwrap().recovery_point, boundary);
+                    assert!(!a.sack_recovery.unwrap().entry_pending);
+                    assert_eq!(a.prr.unwrap().credit(), 0);
+                    assert_eq!(a.transmit(226_000, &mut [0; 1500]), Ok(None));
+                    results.push((a.prr.unwrap().counters(), a.snd_nxt, a.rack.pipe()));
+                }
+                assert_eq!(results[0], results[1]);
+            }
+        }
+    }
+
+    #[test]
     //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
     //= type=test
     //= reason=Checks next_deadline, deferred entry and emitted retransmission after timer expiry.
@@ -5702,6 +6000,12 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= type=test
+    //= reason=Ledger split exhaustion cancels active PRR and retained delivery before fallback ACK accounting; signed delivery equality is claimed only for valid active epochs.
+    //# With SACK,
+    //# DeliveredData can be computed precisely as the change in snd.una,
+    //# plus the (signed) change in SACKd.
     fn rack_ack_split_overflow_disables_active_prr_and_uses_byte_pipe_fallback() {
         for iss in [0, u32::MAX - 99] {
             let (mut a, _) = tlp_pair(iss);

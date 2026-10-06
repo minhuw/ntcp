@@ -599,6 +599,11 @@ impl Prr {
         self.credit = self.credit.max(mss);
     }
 
+    #[cfg(test)]
+    pub(crate) fn counters(&self) -> (u32, u64, u64) {
+        (self.recover_fs, self.delivered, self.out)
+    }
+
     pub(crate) fn credit(&self) -> u32 {
         self.credit
     }

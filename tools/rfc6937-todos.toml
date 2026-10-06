@@ -3,61 +3,34 @@
 # outside-delivery
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#section-2"
-reason = "Outside recovery ledger_delivery includes SACK delivery, retained for deferred entry; not this definition. Decide entry accounting epoch explicitly."
+reason = "Outside recovery, Rack::acknowledge counts fresh cumulative and SACK bytes, and rack_entry_delivery retains SACK evidence for timer entry. Literal RFC 6937 requires outside-recovery DeliveredData to be delta snd.una only: separate recovery delivery from pre-entry detection evidence."
 quote = '''
 When not in
 recovery, DeliveredData is the change in snd.una.
 '''
 
-# sack-delivery
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6937#section-2"
-reason = "Unique-byte ledger covers SACK-to-cumulative transitions; audit equivalence for reneging/signed SACK changes, delayed entry, and invalidation."
-quote = '''
-With SACK,
-DeliveredData can be computed precisely as the change in snd.una,
-plus the (signed) change in SACKd.
-'''
-
 # delivery-sum
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#section-2"
-reason = "These prevent duplicates, not prove full interval equality: retained pre-entry delivery is capped, replaced or cleared; all-entry conservation audit missing."
+reason = "Valid active-epoch signed-delta equality is tested, but timer entry replays at most MSS of a prior ACK, while advancing ACK clears retained evidence. Literal interval conservation requires timer entry with zero PRR delivery and no capped replay, plus an explicit ACK-entry accounting boundary."
 quote = '''
 Furthermore, for any TCP
 (with or without SACK), the sum of DeliveredData must agree with the
 forward progress over the same time interval.
 '''
 
-# sndcnt
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6937#section-2"
-reason = "Output less than or equal to sndcnt, including application/rwnd stalls and banked credit, is permitted by sections 3 and 4. The remaining gap is focused integration evidence for sub-MSS new data: the connection new-data branch requires at least MSS credit. Test its selected behavior with both congestion and receiver-window limits."
-quote = '''
-We introduce a local variable "sndcnt", which indicates exactly how
-many bytes should be sent in response to each ACK.
-'''
-
 # entry
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
-reason = "Initialization creates one MSS of credit not prescribed by the equations; initial retransmission guarantee is not a CRB waiver."
+reason = "Prr::new grants MSS with delivered=out=0; guarantee_initial floors credit at MSS while entry_pending, including zero-delivery ACKs and timers. Literal RFC 6937 requires zero initial credit and removal of the floor. A modern RFC 9937 alternative would gate initial sending on positive current delivery; that is not the implemented unconditional policy or a waiver here."
 quote = '''
 At the beginning of recovery, initialize PRR state.
-'''
-
-# flight-init
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
-reason = "Helper asserts provided flight retention, not connection snapshot after advancing entry ACK. Zero flight clamped to 1; connection refuses empty data flight."
-quote = '''
-RecoverFS = snd.nxt-snd.una // FlightSize at the start of recovery
 '''
 
 # ack-delivery
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
-reason = "Deferred timer feeds capped pre-entry ACK evidence, not a new ACK. Full signed-delta and interval equivalence unproven."
+reason = "Active valid-ledger ACKs satisfy deltaUNA plus signed deltaSACKd. Deferred timer entry instead calls Prr::acknowledge with capped retained pre-entry delivery, without a current ACK. Required correction: initialize timer-entry PRR delivery to zero and remove capped replay; keep ACK updates bound to their actual epoch."
 quote = '''
 On every ACK during recovery compute:
 
@@ -68,7 +41,7 @@ On every ACK during recovery compute:
 # pipe
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
-reason = "Non-RACK uses Scoreboard::pipe; RACK uses Rack::pipe, a time-loss ledger estimator. Need explicit RFC 6675 equivalence/compatibility audit, not a waiver."
+reason = "Non-RACK recovery uses Scoreboard::pipe; RACK uses Rack::pipe, excluding time-marked losses and accounting retransmitted ledger ranges. RFC 8985 section 9.2 requires modified recovery rather than literal RFC 6675 loss inference. Required evidence must state that applicability and test estimator/branch behavior for reordered originals and lost retransmissions; time-loss counts alone do not establish the literal estimator."
 quote = '''
 pipe = (RFC 6675 pipe algorithm)
 '''
@@ -76,7 +49,7 @@ pipe = (RFC 6675 pipe algorithm)
 # proportional
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
-reason = "Helper matches nonnegative budget; guarantee_initial can override the equation at entry."
+reason = "Prr::acknowledge computes the widened proportional ceiling, but Prr::new and guarantee_initial can authorize MSS above its result. Literal RFC 6937 requires zero initial credit and removal of the entry floor; positive-current-delivery-gated initial sending would instead be a distinct modern RFC 9937 policy."
 quote = '''
 if (pipe > ssthresh) {
    // Proportional Rate Reduction
@@ -86,7 +59,7 @@ if (pipe > ssthresh) {
 # crb
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
-reason = "Helper uses CRB without SSRB extra MSS; entry guarantee can exceed it."
+reason = "The CRB helper computes delivered-out, but unconditional initial MSS credit and the entry floor can transmit with delivered=0. Literal RFC 6937 requires zero initial credit and removal of guarantee_initial; modern positive-delivery-gated initial sending does not prove universal strict CRB."
 quote = '''
 if (conservative) {    // PRR-CRB
   limit = prr_delivered - prr_out
@@ -95,7 +68,7 @@ if (conservative) {    // PRR-CRB
 # headroom
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
-reason = "Helper matches; entry override remains open."
+reason = "Prr::acknowledge clips CRB credit to ssthresh-pipe; guarantee_initial subsequently raises it to MSS even when headroom is smaller or zero. Literal equation conformance requires removing that floor and zero initial credit, not treating guaranteed entry output as headroom evidence."
 quote = '''
 // Attempt to catch up, as permitted by limit
 sndcnt = MIN(ssthresh - pipe, limit)
@@ -104,7 +77,7 @@ sndcnt = MIN(ssthresh - pipe, limit)
 # output
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
-reason = "Connection commits actual payload after encoding; helper relies on caller to bound bytes. Need direct cumulative PRR out/credit assertions for both new-data and retransmit output, including short payload, failed output, and special output paths."
+reason = "Ordinary retransmit/new-data polls directly assert actual payload <= prior credit and cumulative out increments only after successful encode, including short data and rwnd bounds. RTO cancels PRR and TLP is ineligible during recovery. Persist is reachable with active exhausted PRR: it emits one data byte at zero credit and leaves prr_out unchanged (prr_special_output_reachability_and_persist_accounting_gap). Universal data-output accounting requires bounding and counting that probe, or a separately justified applicability rule; no exception is asserted here."
 quote = '''
 On any data transmission or retransmission:
 
@@ -114,7 +87,7 @@ On any data transmission or retransmission:
 # crb-explanation
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#section-3.1"
-reason = "Operative explanation of CRB, not a claim to reproduce example diagrams; entry override gap remains."
+reason = "CRB sending-limit equations are tested, but unconditional MSS initialization and guarantee_initial override delivered-out at entry. Required literal correction is zero initial credit and removal of the floor, together with timer-entry zero delivery/no replay; example diagrams cannot waive these deviations."
 quote = '''
 Transmission is controlled
 by the sending limit, which is set to prr_delivered - prr_out.
@@ -123,27 +96,16 @@ by the sending limit, which is set to prr_delivered - prr_out.
 # convergence
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#section-4"
-reason = "Equation vectors include delivered=RecoverFS => allowed=ssthresh; no end-to-end minimal-loss convergence proof (exit cwnd separately deflated by Congestion)."
+reason = "Helper vectors reach ssthresh when delivered=RecoverFS, but connection exit clears PRR and Congestion separately deflates cwnd. No complete minimal-loss trace yet asserts actual final outstanding pipe equals the target. Required evidence is a bulk-data ACK/output trace through the recovery boundary with target, pipe, and entry-credit assumptions explicit; helper arithmetic and exit cwnd alone are insufficient."
 quote = '''
 If there are minimal losses, PRR will converge to exactly the target
 window chosen by the congestion control algorithm.
 '''
 
-# banking
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6937#section-4"
-reason = "Helper retains unspent allowance; application/rwnd stall then resume end-to-end burst test is missing."
-quote = '''
-The missed opportunities to send
-due to stalls are treated like banked voluntary window reductions;
-specifically, they cause prr_delivered - prr_out to be significantly
-positive.
-'''
-
 # conservation
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#section-4"
-reason = "Not established: initial credit/guarantee permits out > delivered; delayed entry credits capped pre-entry delivery. Tests characterize policy, not universal Strong Packet Conservation."
+reason = "Observed Prr::new/guarantee_initial permits out=1000 with delivered=0; timer entry replays capped pre-entry delivery, and active persist emits uncounted data at zero credit. Literal strict CRB requires zero initial credit, no entry floor, timer-entry zero delivery/no replay, and accounting/bounding every applicable data output. Modern positive-delivery-gated initial send is a different policy, not proof of this universal bound."
 quote = '''
 Under all conditions and sequences of events during recovery, PRR-CRB
 strictly bounds the data transmitted to be equal to or less than the
@@ -153,7 +115,7 @@ amount of data delivered to the receiver.
 # appendix-conservation
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#appendix-A"
-reason = "Same unresolved strict-bound entry/delivery issue as section 4; appendix thought experiment is not implementation evidence."
+reason = "The zero-delivery initial MSS counterexample also violates this appendix bound; capped timer replay and uncounted active persist prevent an interval-wide claim. Required literal corrections: zero initial credit, remove entry floor, initialize timer entry with zero PRR delivery/no replay, and bound/account applicable data outputs."
 quote = '''
 Under all conditions and sequences of
  events during recovery, PRR-CRB strictly bounds the data transmitted
@@ -164,7 +126,7 @@ Under all conditions and sequences of
 # current-delivery
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#section-2"
-reason = "Delayed timer entry reuses retained pre-entry ACK delivery (capped at MSS) instead of a current ACK; audit interval/epoch semantics rather than treating one-shot evidence as compliance."
+reason = "Deferred timer entry consumes rack_entry_delivery from an earlier ACK, capped at MSS; no ACK arrived at that timer event. Required correction: timer entry starts with zero PRR delivery and does not replay retained delivery. Retained evidence may identify loss, but cannot stand in for current-ACK DeliveredData."
 quote = '''
 DeliveredData: The total number of bytes that the current ACK
 indicates have been delivered to the receiver.
@@ -173,7 +135,7 @@ indicates have been delivered to the receiver.
 # implicit-reductions
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#section-4"
-reason = "Branch/limit byte vectors exercise adjustment to reduced pipe; no isolated-multiple-loss end-to-end final-window regression."
+reason = "Helper vectors cover pipe/headroom changes, but no complete isolated-multiple-loss connection trace yet asserts skipped voluntary reductions and final pipe equal to the target. Required evidence is actual ACK/output progression with small loss count, bulk queued data and an explicit entry-policy boundary; separate cwnd deflation is not a final-pipe assertion."
 quote = '''
 Implicit window reductions, due to multiple isolated losses during
 recovery, cause later voluntary reductions to be skipped.  For small
@@ -184,7 +146,7 @@ by the congestion control algorithm.
 # burst-reductions
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#section-4"
-reason = "Helper vectors show retained budget/headroom; no complete burst-loss ACK sequence proving final pipe equals ssthresh under stated condition."
+reason = "Banking/resume traces cover stalled output, not burst-loss final-window behavior. No complete burst-loss connection trace yet proves final pipe equals ssthresh while some voluntary reductions remain undone. Required evidence must measure those remaining reductions and final actual pipe under stated entry/estimator assumptions, rather than infer them from helper headroom vectors."
 quote = '''
 For burst losses, earlier voluntary window reductions can be undone
 by sending extra segments in response to ACKs arriving later during
@@ -193,20 +155,10 @@ not undone, the final value for pipe will be the same as ssthresh,
 the target cwnd value chosen by the congestion control algorithm.
 '''
 
-# stall-catchup
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6937#section-4"
-reason = "Helper retains unconsumed budget after simulated failed/stalled output. Need end-to-end application stall and receiver-window stall followed by catchup comparison; >=MSS new-data gating also needs sub-MSS coverage."
-quote = '''
-If the application catches up while TCP is still in
-recovery, TCP will send a partial window burst to catch up to exactly
-where it would have been had the application never stalled.
-'''
-
 # pipe-role
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#section-4"
-reason = "Helper selects branch using pipe and clips Reduction Bound to headroom as section 3 specifies. RACK estimator compatibility and recovery with reordered/premature-loss pipe correction need behavioral audit."
+reason = "Branch selection and headroom clipping are implemented, but RACK pipe is the RFC 8985 modified time-loss estimator, not literal RFC 6675 loss inference. Required evidence must establish modified-recovery applicability and compare branch/output behavior as premature time-loss is corrected by reordered ACKs, including lost retransmissions; final-window equivalence has not been shown."
 quote = '''
 For PRR, pipe merely determines which algorithm, PRR or the
 Reduction Bound, is used to compute sndcnt from DeliveredData.
@@ -215,7 +167,7 @@ Reduction Bound, is used to compute sndcnt from DeliveredData.
 # variants: CRB selection does not establish its strict-bound property.
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6937#section-1"
-reason = "CRB branch selected, but initial MSS guarantee and pre-entry delivery policy prevent a claim of strict packet conservation. SSRB alternative exception does not waive this shared gap."
+reason = "The CRB branch is selected, but initial MSS credit and guarantee_initial allow output without delivery; capped timer replay and active uncounted persist also prevent strict conservation. Literal RFC 6937 CRB requires zero initial credit/removal of floor, zero timer-entry delivery/no replay, and bounded/accounted applicable outputs. Modern RFC 9937 positive-current-delivery-gated initial sending is a distinct policy, not an SSRB waiver."
 quote = '''
 We describe two slightly different Reduction Bound algorithms:
 Conservative Reduction Bound (CRB), which is strictly packet
