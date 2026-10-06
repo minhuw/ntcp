@@ -50,6 +50,10 @@ pub struct ConnectionConfig {
     pub rto_min_us: u64,
     pub retransmit_beyond_window: bool,
     pub delayed_ack_us: u64,
+    // Per-connection fixed-window challenge budget, in caller-clock microseconds.
+    // ponytail: permits boundary bursts; use sliding windows if a rolling cap is needed.
+    pub challenge_ack_limit: u32,
+    pub challenge_ack_interval_us: u64,
     pub user_timeout_us: u64,
     pub time_wait_us: u64,
     pub keepalive: Option<KeepaliveConfig>,
@@ -100,6 +104,8 @@ impl Default for ConnectionConfig {
             rto_min_us: 1_000_000,
             retransmit_beyond_window: false,
             delayed_ack_us: 200_000,
+            challenge_ack_limit: 100,
+            challenge_ack_interval_us: 1_000_000,
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
             //= reason=Default R2; applications may override the per-connection timeout.
             //# The value of R2 SHOULD correspond to at least 100 seconds (SHLD-11).
@@ -312,6 +318,9 @@ pub(crate) struct Connection {
     fin_sequence: Option<Seq>,
     syn_pending: bool,
     ack_pending: bool,
+    challenge_ack_pending: bool,
+    challenge_ack_start: Option<Instant>,
+    challenge_ack_sent: u32,
     pending_rst: Option<(Seq, bool)>,
     retx_pending: bool,
     duplicate_acks: u8,
@@ -402,6 +411,8 @@ impl Connection {
             //# should not be excessively delayed; in particular, the delay MUST be less
             //# than 0.5 seconds (MUST-40).
             || config.delayed_ack_us >= 500_000
+            || config.challenge_ack_limit == 0
+            || config.challenge_ack_interval_us == 0
             || config.user_timeout_us == 0
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.2
             //# For this specification the MSL is taken to be 2 minutes.
@@ -507,6 +518,9 @@ impl Connection {
             fin_sequence: None,
             syn_pending: true,
             ack_pending: false,
+            challenge_ack_pending: false,
+            challenge_ack_start: None,
+            challenge_ack_sent: 0,
             pending_rst: None,
             retx_pending: false,
             duplicate_acks: 0,
@@ -1371,17 +1385,44 @@ impl Connection {
     //= reason=Coalesces ACK requests; input never transmits inline.
     //# o In general, the processing of received segments MUST be implemented to
     //# aggregate ACK segments whenever possible (MUST-58).
-    //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
-    //= reason=Partial evidence only; TODO remains. Ordinary unblocked RST challenge fields are asserted. immediate_ack only sets ack_pending; pending retransmission may emit SND.UNA and clear it. Pending retransmission/probe/other-output challenge templates remain unverified.
-    //# <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-    // Actor/condition: TCP endpoint; nonexact in-window RST challenge.
-    //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
-    //= reason=Partial evidence only; TODO remains. Ordinary unblocked non-timestamp SYN challenge fields are asserted. immediate_ack only sets ack_pending; pending retransmission may emit SND.UNA and clear it. Pending retransmission/probe/other-output challenge templates remain unverified.
-    //# <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-    // Actor/condition: TCP endpoint; synchronized SYN challenge.
     fn immediate_ack(&mut self) {
         self.ack_pending = true;
         self.ack_deadline = None;
+    }
+
+    // RFC 5961 section 7; held erratum 4772 warns against global counters.
+    // Count successful output, not coalesced requests or failed encodes.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-7
+    //= reason=Validated nonzero per-connection count/interval tunables; caller-clock fixed windows, bounded successful-output counters, coalescing and transactional encode. No shared challenge counter; held erratum 4772 is considered, not treated as verified normative text.
+    //# 2) The values for both the time and number of ACKs SHOULD be tunable
+    //# by the system administrator to accommodate different perceived
+    //# levels of threat and/or system resources.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-7
+    //= reason=Validated nonzero per-connection count/interval tunables; caller-clock fixed windows, bounded successful-output counters, coalescing and transactional encode. No shared challenge counter; held erratum 4772 is considered, not treated as verified normative text.
+    //# An implementation SHOULD include an ACK throttling mechanism to be
+    //# conservative.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-7
+    //= reason=Validated nonzero per-connection count/interval tunables; caller-clock fixed windows, bounded successful-output counters, coalescing and transactional encode. No shared challenge counter; held erratum 4772 is considered, not treated as verified normative text.
+    //# The time limit SHOULD be tunable to help timeout brute force attacks
+    //# faster than a potential legitimate flood of RSTs.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-7
+    //= reason=Validated nonzero per-connection count/interval tunables; caller-clock fixed windows, bounded successful-output counters, coalescing and transactional encode. No shared challenge counter; held erratum 4772 is considered, not treated as verified normative text.
+    //# 1) The system administrator can configure the number of challenge ACKs that can be sent out in a given interval. For example, in any 5 second window, no more than 10 challenge ACKs should be sent.
+    fn refresh_challenge_budget(&mut self, now: Instant) {
+        if self
+            .challenge_ack_start
+            .is_none_or(|start| now.saturating_sub(start) >= self.config.challenge_ack_interval_us)
+        {
+            self.challenge_ack_start = Some(now);
+            self.challenge_ack_sent = 0;
+        }
+    }
+
+    fn challenge_ack(&mut self) {
+        self.refresh_challenge_budget(self.now);
+        if self.challenge_ack_sent < self.config.challenge_ack_limit {
+            self.challenge_ack_pending = true;
+        }
     }
 
     fn establish(&mut self) {
@@ -1445,6 +1486,7 @@ impl Connection {
         }
         self.syn_pending = false;
         self.ack_pending = false;
+        self.challenge_ack_pending = false;
         self.retx_pending = false;
         self.probe_pending = false;
         self.keepalive_pending = false;
@@ -2242,9 +2284,40 @@ impl Connection {
                 return Ok(());
             };
             if recent_valid && !at_or_after(Seq(value), Seq(self.ts_recent)) {
-                self.immediate_ack();
+                if h.flags & SYN != 0 && !self.handshake_pending() {
+                    self.challenge_ack();
+                } else {
+                    self.immediate_ack();
+                }
                 return Ok(());
             }
+        }
+
+        // RFC 7323 5.3 R1 is checked above, including SYN: stale SYN is
+        // challenged and dropped without timestamp or stream side effects.
+        // Missing TS still silently drops per 7323 3.2; the competing 5961
+        // 4.2 requirement remains an explicit conformance TODO. Neither RFC
+        // has a precedence erratum resolving that case. Handshake paths below
+        // retain their passive/SYN+ACK simultaneous-open handling.
+        //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+        //= reason=Partial evidence; TODO remains for negotiated-TS SYN lacking TSopt. RFC7323 3.2 recommends silent drop, while RFC5961 4.2 mandates a challenge; no listed erratum resolves this precedence. Valid/stale TS SYN challenges now precede window and metadata processing and are tested, including output arbitration. Missing-TS silence is explicitly tested, not waived.
+        //# Instead, the handling of the SYN in the synchronized state SHOULD be
+        //# performed as follows:
+        // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+        //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+        //= reason=Partial evidence; TODO remains for negotiated-TS SYN lacking TSopt. RFC7323 3.2 recommends silent drop, while RFC5961 4.2 mandates a challenge; no listed erratum resolves this precedence. Valid/stale TS SYN challenges now precede window and metadata processing and are tested, including output arbitration. Missing-TS silence is explicitly tested, not waived.
+        //# 1) If the SYN bit is set, irrespective of the sequence number, TCP
+        //# MUST send an ACK (also referred to as challenge ACK) to the remote
+        //# peer:
+        // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+        //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+        //= reason=Partial evidence; TODO remains for negotiated-TS SYN lacking TSopt. RFC7323 3.2 recommends silent drop, while RFC5961 4.2 mandates a challenge; no listed erratum resolves this precedence. Valid/stale TS SYN challenges now precede window and metadata processing and are tested, including output arbitration. Missing-TS silence is explicitly tested, not waived.
+        //# After sending the acknowledgment, TCP MUST drop the unacceptable
+        //# segment and stop processing further.
+        // Actor/condition: TCP endpoint; selected blind-attack mitigation.
+        if h.flags & (SYN | RST) == SYN && !self.handshake_pending() {
+            self.challenge_ack();
+            return Ok(());
         }
 
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.5
@@ -2353,22 +2426,6 @@ impl Connection {
             //# MUST silently discard the segment.
             // Actor/condition: TCP endpoint; selected blind-attack mitigation.
             //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
-            //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects. Missing scope evidence: PAWS/missing-timestamp checks precede SYN challenge; timestamp-enabled SYN inputs can return before emitting the mandated challenge irrespective of sequence. Existing matrix does not exercise timestamp-enabled SYN. Audit precedence and add assertions; no waiver of the selected SYN mitigation.
-            //# Instead, the handling of the SYN in the synchronized state SHOULD be
-            //# performed as follows:
-            // Actor/condition: TCP endpoint; selected blind-attack mitigation.
-            //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
-            //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects. Missing scope evidence: PAWS/missing-timestamp checks precede SYN challenge; timestamp-enabled SYN inputs can return before emitting the mandated challenge irrespective of sequence. Existing matrix does not exercise timestamp-enabled SYN. Audit precedence and add assertions; no waiver of the selected SYN mitigation.
-            //# 1) If the SYN bit is set, irrespective of the sequence number, TCP
-            //# MUST send an ACK (also referred to as challenge ACK) to the remote
-            //# peer:
-            // Actor/condition: TCP endpoint; selected blind-attack mitigation.
-            //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
-            //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects. Missing scope evidence: PAWS/missing-timestamp checks precede SYN challenge; timestamp-enabled SYN inputs can return before emitting the mandated challenge irrespective of sequence. Existing matrix does not exercise timestamp-enabled SYN. Audit precedence and add assertions; no waiver of the selected SYN mitigation.
-            //# After sending the acknowledgment, TCP MUST drop the unacceptable
-            //# segment and stop processing further.
-            // Actor/condition: TCP endpoint; selected blind-attack mitigation.
-            //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
             //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects.
             //# Upon receipt of a valid RST, the local TCP
             //# endpoint MUST terminate its connection.
@@ -2452,7 +2509,26 @@ impl Connection {
                     self.events = ConnectionEvents::default();
                 }
             } else {
-                self.immediate_ack();
+                self.challenge_ack();
+            }
+            return Ok(());
+        }
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+        //# RFC 5961 recommends that in
+        //# these synchronized states, if the SYN bit is set,
+        //# irrespective of the sequence number, TCP endpoints MUST send
+        //# a "challenge ACK" to the remote peer:
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+        //# o  After sending the acknowledgment, TCP implementations MUST
+        //# drop the unacceptable segment and stop processing further.
+        if h.flags & SYN != 0 {
+            if self.handshake_pending() && self.passive_open {
+                // Endpoint owns LISTEN independently; closing this unaccepted
+                // child releases its slot without notifying the application.
+                self.terminal(CloseReason::Reset);
+                self.events = ConnectionEvents::default();
+            } else {
+                self.challenge_ack();
             }
             return Ok(());
         }
@@ -2508,25 +2584,6 @@ impl Connection {
         {
             self.ts_recent = value;
             self.ts_recent_at = now;
-        }
-        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
-        //# RFC 5961 recommends that in
-        //# these synchronized states, if the SYN bit is set,
-        //# irrespective of the sequence number, TCP endpoints MUST send
-        //# a "challenge ACK" to the remote peer:
-        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
-        //# o  After sending the acknowledgment, TCP implementations MUST
-        //# drop the unacceptable segment and stop processing further.
-        if h.flags & SYN != 0 {
-            if self.handshake_pending() && self.passive_open {
-                // Endpoint owns LISTEN independently; closing this unaccepted
-                // child releases its slot without notifying the application.
-                self.terminal(CloseReason::Reset);
-                self.events = ConnectionEvents::default();
-            } else {
-                self.immediate_ack();
-            }
-            return Ok(());
         }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
         //# if the ACK bit is off, drop the segment and return
@@ -2840,7 +2897,7 @@ impl Connection {
             //# window values locally as 32-bit numbers.
             self.snd_wnd = (h.window as u32) << if self.scaling { self.peer_scale } else { 0 };
             //= https://www.rfc-editor.org/rfc/rfc5961#section-5.2
-            //= reason=Implementation initializes max_snd_wnd from SYN then monotonically maxes accepted scaled updates. Existing ACK bounds test uses unscaled fixed window; no inspected assertion tracks historical maximum across growth/shrink and scaled windows. Add explicit MAX.SND.WND history/scale assertions.
+            //= reason=Initial SYN window is unscaled; accepted updates are scaled and monotonically maxed. Scaled growth/shrink/zero history and ACK lower bounds across wrap are asserted.
             //# A new state variable MAX.SND.WND is defined as the largest window that the local sender has ever received from its peer. This window may be scaled to a value larger than 65,535 bytes ([RFC1323]).
             // Actor/condition: TCP endpoint; largest historically received scaled sender window.
             self.max_snd_wnd = self.max_snd_wnd.max(self.snd_wnd);
@@ -3784,8 +3841,9 @@ impl Connection {
         // Plan entirely before encode. Even timer/clock/accounting changes
         // are committed only once the adapter has sufficient output space.
         let reset = self.pending_rst;
-        let syn = reset.is_none() && self.syn_pending;
-        let live = self.synchronized();
+        let challenge = reset.is_none() && self.challenge_ack_pending;
+        let syn = reset.is_none() && !challenge && self.syn_pending;
+        let live = self.synchronized() && !challenge;
         let retransmit = reset.is_none() && !syn && live && self.retx_pending && self.flight() != 0;
         let probe = reset.is_none() && !syn && live && self.probe_pending;
         let tlp = reset.is_none()
@@ -4129,6 +4187,14 @@ impl Connection {
             retransmitted = self.snd_nxt != self.iss;
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
         //# Probing of zero (offered) windows MUST be supported (MUST-36).
+        } else if challenge {
+            //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+            //= reason=Dedicated challenge output precedes sender work; SEQ=SND.NXT, ACK=RCV.NXT, no payload/FIN/RST/URG. Negotiated TS and ECE feedback remain; successful encode alone consumes the obligation. Missing-TS SYN challenge selection remains a separate TODO.
+            //# <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+            //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+            //= reason=Dedicated challenge output precedes sender work; SEQ=SND.NXT, ACK=RCV.NXT, no payload/FIN/RST/URG. Negotiated TS and ECE feedback remain; successful encode alone consumes the obligation. Missing-TS SYN challenge selection remains a separate TODO.
+            //# <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+            // Pure ACK at SND.NXT, ahead of all stream/recovery/probe work.
         } else if let Some((left, right)) =
             post_rto_segment.or(sack_segment.map(|(left, right, _, _)| (left, right)))
         {
@@ -4387,6 +4453,7 @@ impl Connection {
             && !probe
             && !keepalive
             && !self.ack_pending
+            && !challenge
         {
             return Ok(None);
         }
@@ -4394,7 +4461,8 @@ impl Connection {
             return Ok(None);
         }
         let mut urgent_pointer = 0;
-        if reset.is_none()
+        if !challenge
+            && reset.is_none()
             && !syn
             && let Some(end) = self.snd_up
         {
@@ -4600,7 +4668,9 @@ impl Connection {
                 Error::Wire(error)
             }
         })?;
-        self.retransmit_burst = retransmit_burst;
+        if !challenge {
+            self.retransmit_burst = retransmit_burst;
+        }
         // Commit only the encoded (possibly clamped) urgent coverage, and only
         // after successful output. Retransmissions must not move it backwards.
         if flags & URG != 0 {
@@ -4698,10 +4768,12 @@ impl Connection {
         {
             self.congestion.restart_after_idle();
         }
-        if count != 0 && !keepalive {
-            self.last_sent = now;
+        if !challenge {
+            if count != 0 && !keepalive {
+                self.last_sent = now;
+            }
+            self.syn_pending = false;
         }
-        self.syn_pending = false;
         if flags & ACK != 0 {
             // Scope: Retains one pending echo value and last successfully committed ACK; separate ts_latest is TIME-WAIT freshness bookkeeping, not extra unprocessed echo queue.
             //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
@@ -4737,6 +4809,17 @@ impl Connection {
             if after(edge, self.advertised_edge) || self.receive.eof() {
                 self.advertised_edge = edge;
             }
+        }
+        if challenge {
+            self.refresh_challenge_budget(now);
+            self.challenge_ack_sent += 1;
+            self.challenge_ack_pending = false;
+            if timestamp.is_some() {
+                self.last_timestamp_sent_at = Some(now);
+            }
+            // The ACK satisfies receiver work, but must not re-arm, consume,
+            // or otherwise perturb sender work or any protocol timer.
+            return Ok(Some(size));
         }
         let length = count as u32 + u32::from(flags & SYN != 0) + u32::from(flags & FIN != 0);
         if length != 0 && !keepalive {
@@ -6258,15 +6341,12 @@ mod tests {
                 let mut out = vec![0; 65_535];
                 while let Some(size) = a.transmit(40, &mut out).unwrap() {
                     let segment = wire::parse(ip(tuple()), &out[..size]).unwrap();
-                    assert!(segment.payload.len() <= effective as usize);
+                    assert!(segment.payload.len() <= effective);
                     sent += segment.payload.len();
                 }
                 // Sender SWS avoidance may retain a fractional-MSS IW10 tail.
                 assert!(sent <= a.initial_window() as usize);
-                assert_eq!(
-                    sent / effective as usize,
-                    a.initial_window() as usize / effective
-                );
+                assert_eq!(sent / effective, a.initial_window() as usize / effective);
                 if policy == InitialWindow::Rfc5681 {
                     assert_eq!(sent, a.initial_window() as usize);
                 }
@@ -11545,7 +11625,7 @@ mod tests {
             b"rejected",
         );
         assert_eq!(a.state(), State::Established);
-        assert!(a.ack_pending);
+        assert!(a.challenge_ack_pending);
         assert_eq!(a.receive.readable(), 0);
         assert_eq!(a.receive.next(), next);
         assert_eq!(a.send.len(), 8);
@@ -13450,20 +13530,20 @@ mod tests {
     // Actor/condition: TCP endpoint; selected blind-attack mitigation.
     //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
     //= type=test
-    //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects. Missing scope evidence: PAWS/missing-timestamp checks precede SYN challenge; timestamp-enabled SYN inputs can return before emitting the mandated challenge irrespective of sequence. Existing matrix does not exercise timestamp-enabled SYN. Audit precedence and add assertions; no waiver of the selected SYN mitigation.
+    //= reason=Partial evidence; TODO remains for negotiated-TS SYN lacking TSopt. RFC7323 3.2 recommends silent drop, while RFC5961 4.2 mandates a challenge; no listed erratum resolves this precedence. Valid/stale TS SYN challenges now precede window and metadata processing and are tested, including output arbitration. Missing-TS silence is explicitly tested, not waived.
     //# Instead, the handling of the SYN in the synchronized state SHOULD be
     //# performed as follows:
     // Actor/condition: TCP endpoint; selected blind-attack mitigation.
     //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
     //= type=test
-    //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects. Missing scope evidence: PAWS/missing-timestamp checks precede SYN challenge; timestamp-enabled SYN inputs can return before emitting the mandated challenge irrespective of sequence. Existing matrix does not exercise timestamp-enabled SYN. Audit precedence and add assertions; no waiver of the selected SYN mitigation.
+    //= reason=Partial evidence; TODO remains for negotiated-TS SYN lacking TSopt. RFC7323 3.2 recommends silent drop, while RFC5961 4.2 mandates a challenge; no listed erratum resolves this precedence. Valid/stale TS SYN challenges now precede window and metadata processing and are tested, including output arbitration. Missing-TS silence is explicitly tested, not waived.
     //# 1) If the SYN bit is set, irrespective of the sequence number, TCP
     //# MUST send an ACK (also referred to as challenge ACK) to the remote
     //# peer:
     // Actor/condition: TCP endpoint; selected blind-attack mitigation.
     //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
     //= type=test
-    //= reason=Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects. Missing scope evidence: PAWS/missing-timestamp checks precede SYN challenge; timestamp-enabled SYN inputs can return before emitting the mandated challenge irrespective of sequence. Existing matrix does not exercise timestamp-enabled SYN. Audit precedence and add assertions; no waiver of the selected SYN mitigation.
+    //= reason=Partial evidence; TODO remains for negotiated-TS SYN lacking TSopt. RFC7323 3.2 recommends silent drop, while RFC5961 4.2 mandates a challenge; no listed erratum resolves this precedence. Valid/stale TS SYN challenges now precede window and metadata processing and are tested, including output arbitration. Missing-TS silence is explicitly tested, not waived.
     //# After sending the acknowledgment, TCP MUST drop the unacceptable
     //# segment and stop processing further.
     // Actor/condition: TCP endpoint; selected blind-attack mitigation.
@@ -13478,16 +13558,6 @@ mod tests {
     //= reason=This is the operative replacement list, not the preceding historical RFC793 rule. State matrix asserts outside-window RST does not schedule ACK or mutate state; verified erratum 4845 corrects only the historical list inequality.
     //# 1) If the RST bit is set and the sequence number is outside the current receive window, silently drop the segment.
     // Actor/condition: TCP endpoint; replacement RST mitigation, outside window.
-    //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
-    //= type=test
-    //= reason=Partial evidence only; TODO remains. Matrix asserts ordinary unblocked RST challenge SEQ=SND.NXT, ACK=RCV.NXT and flags ACK, not challenge arbitration with retransmission, probe or other output pending.
-    //# <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-    // Actor/condition: TCP endpoint; nonexact in-window RST challenge.
-    //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
-    //= type=test
-    //= reason=Partial evidence only; TODO remains. Matrix asserts ordinary unblocked non-timestamp SYN challenge SEQ=SND.NXT, ACK=RCV.NXT and flags ACK, not challenge arbitration with retransmission, probe or other output pending.
-    //# <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-    // Actor/condition: TCP endpoint; synchronized SYN challenge.
     fn rfc5961_reset_and_syn_state_matrix_drops_text_urgent_fin_and_ack() {
         for state in [
             State::SynReceived,
@@ -13544,8 +13614,11 @@ mod tests {
                             ),
                             before
                         );
-                        assert_eq!(a.ack_pending, control == SYN || offset == 1);
-                        if a.ack_pending {
+                        assert_eq!(
+                            a.ack_pending || a.challenge_ack_pending,
+                            control == SYN || offset == 1
+                        );
+                        if a.ack_pending || a.challenge_ack_pending {
                             let bytes = packet(&mut a, 50);
                             let ack = wire::parse(ip(tuple()), &bytes).unwrap();
                             assert_eq!(ack.header.flags, ACK);
@@ -13561,6 +13634,362 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+    //= type=test
+    //= reason=Packet assertions cover real pending RTO/TLP/persist, new/urgent data, FIN and failed output; sender work and deadlines are unchanged and the next poll emits preserved work.
+    //# <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+    //= type=test
+    //= reason=Packet assertions cover real pending RTO/TLP/persist, new/urgent data, FIN and failed output; sender work and deadlines are unchanged and the next poll emits preserved work.
+    //# <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+    fn rfc5961_challenge_preempts_sender_work_transactionally() {
+        for control in [RST, SYN] {
+            for work in ["rto", "tlp", "persist", "new"] {
+                let (mut a, _) = if work == "tlp" {
+                    tlp_pair(u32::MAX - 500)
+                } else {
+                    pair(config(4096, 1000), u32::MAX - 500)
+                };
+                a.set_nagle(false);
+                let mut now = 100_001;
+                if work != "new" {
+                    a.write(&[7; 1000]).unwrap();
+                    packet(&mut a, now);
+                    if work == "persist" {
+                        let next = a.receive.next();
+                        let una = a.snd_una;
+                        inject(&mut a, now, next, una, ACK, 0, b"");
+                    }
+                    now = match work {
+                        "tlp" => a.tlp_deadline.unwrap(),
+                        "persist" => a.persist_deadline.unwrap(),
+                        _ => a.rto_deadline.unwrap(),
+                    };
+                    a.timeout(now).unwrap();
+                }
+                assert_eq!(a.retx_pending, work == "rto");
+                assert_eq!(a.tlp_pending, work == "tlp");
+                assert_eq!(a.probe_pending, work == "persist");
+                a.write_urgent(b"tail").unwrap();
+                a.shutdown().unwrap();
+                let high = a.snd_nxt;
+                let next = a.receive.next();
+                let deadlines = |c: &Connection| {
+                    [
+                        c.rto_deadline,
+                        c.tlp_deadline,
+                        c.rack.deadline,
+                        c.persist_deadline,
+                        c.sws_deadline,
+                        c.keepalive_deadline,
+                        c.time_wait_deadline,
+                        c.ecn_pause,
+                    ]
+                };
+                let work_state = |c: &Connection| {
+                    (
+                        c.snd_una,
+                        c.snd_nxt,
+                        c.sample,
+                        c.last_sent,
+                        c.send.len(),
+                        c.retx_pending,
+                        c.tlp_pending,
+                        c.probe_pending,
+                        c.limited_pending,
+                        c.persist_interval,
+                        c.fin_sequence,
+                        c.retransmit_burst,
+                    )
+                };
+                let before = (deadlines(&a), work_state(&a));
+                inject(
+                    &mut a,
+                    now,
+                    next.wrapping_add(1),
+                    high,
+                    control | ACK | FIN | URG,
+                    0,
+                    b"bad",
+                );
+                assert!(a.challenge_ack_pending);
+                assert!(!a.accepted_metadata);
+                assert_eq!(a.receive.next(), next);
+                assert_eq!(
+                    a.transmit(now + 1, &mut [0; 19]),
+                    Err(Error::OutputTooSmall)
+                );
+                assert!(a.challenge_ack_pending);
+                assert_eq!(a.now, now);
+                assert_eq!(a.challenge_ack_sent, 0);
+                assert_eq!((deadlines(&a), work_state(&a)), before);
+                let bytes = packet(&mut a, now + 2);
+                let p = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(p.header.flags, ACK);
+                assert_eq!(p.header.sequence, high.0);
+                assert_eq!(p.header.acknowledgment, next.0);
+                assert_eq!(p.header.urgent_pointer, 0);
+                assert!(p.payload.is_empty());
+                assert_eq!(a.last_output_ecn, 0);
+                assert_eq!((deadlines(&a), work_state(&a)), before);
+                assert!(!a.challenge_ack_pending);
+                assert_eq!(a.challenge_ack_sent, 1);
+                let bytes = packet(&mut a, now + 3);
+                let p = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert!(!p.payload.is_empty());
+                assert_eq!(
+                    p.payload[0],
+                    if work == "new" || work == "tlp" {
+                        b't'
+                    } else {
+                        7
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+    //= type=test
+    //= reason=Real passive and simultaneous-open SYN-RECEIVED RST challenges preempt pending initial/retransmitted SYN-ACK without consuming handshake work or changing timers; failed encode retries are pure ACKs.
+    //# <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+    fn rfc5961_rst_challenge_preserves_pending_handshake_output() {
+        for simultaneous in [false, true] {
+            for synack_sent in [false, true] {
+                let (mut a, _) = opening_for_close(config(64, 8), 100, simultaneous);
+                if synack_sent {
+                    packet(&mut a, 20);
+                    let deadline = a.rto_deadline.unwrap();
+                    a.timeout(deadline).unwrap();
+                }
+                assert!(a.syn_pending);
+                let now = a.now;
+                let next = a.receive.next();
+                let high = a.snd_nxt;
+                let before = (a.syn_pending, a.rto_deadline, a.next_deadline(), a.sample);
+                inject(&mut a, now, next.wrapping_add(1), high, RST, 0, b"bad");
+                assert!(a.challenge_ack_pending);
+                assert_eq!(a.transmit(now, &mut [0; 19]), Err(Error::OutputTooSmall));
+                let bytes = packet(&mut a, now);
+                let p = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(p.header.flags, ACK);
+                assert_eq!(p.header.sequence, high.0);
+                assert_eq!(p.header.acknowledgment, next.0);
+                assert!(p.payload.is_empty());
+                assert_eq!(
+                    (a.syn_pending, a.rto_deadline, a.next_deadline(), a.sample),
+                    before
+                );
+                let bytes = packet(&mut a, now);
+                let p = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(p.header.flags & (SYN | ACK | FIN | RST), SYN | ACK);
+                assert_eq!(p.header.sequence, a.iss.0);
+            }
+        }
+    }
+
+    #[test]
+    fn rfc5961_timestamp_syn_precedence_and_ecn_feedback() {
+        for control in [SYN, RST] {
+            for timestamp in [None, Some((0, u32::MAX)), Some((500, u32::MAX))] {
+                for offset in [1, 1 << 30] {
+                    let cfg = ConnectionConfig {
+                        timestamps: true,
+                        ..config(64, 8)
+                    };
+                    let (mut a, _) = pair(cfg, 100);
+                    a.ts_recent = 100;
+                    a.ts_latest = 100;
+                    a.ecn_echo = true;
+                    a.ecn_cwr_pending = true;
+                    a.write(b"queued").unwrap();
+                    let next = a.receive.next();
+                    let high = a.snd_nxt;
+                    let before = (
+                        a.ts_recent,
+                        a.ts_latest,
+                        a.ts_recent_at,
+                        a.last_received,
+                        a.snd_wnd,
+                        a.rcv_up,
+                    );
+                    let segment = Segment {
+                        header: Header {
+                            source_port: 2000,
+                            destination_port: 1000,
+                            sequence: next.wrapping_add(offset).0,
+                            acknowledgment: high.0,
+                            flags: control | ACK | FIN | URG | CWR,
+                            window: 0,
+                            urgent_pointer: 9,
+                        },
+                        options: wire::Options {
+                            timestamps: timestamp,
+                            ..wire::Options::default()
+                        },
+                        raw_options: &[],
+                        payload: b"rejected",
+                    };
+                    a.input_with_traffic_class(1000, 3, &segment).unwrap();
+                    assert_eq!(
+                        (
+                            a.ts_recent,
+                            a.ts_latest,
+                            a.ts_recent_at,
+                            a.last_received,
+                            a.snd_wnd,
+                            a.rcv_up
+                        ),
+                        before
+                    );
+                    assert!(!a.accepted_metadata);
+                    assert_eq!(a.receive.next(), next);
+                    let expected =
+                        (control == SYN && timestamp.is_some()) || (control == RST && offset == 1);
+                    assert_eq!(a.challenge_ack_pending, expected);
+                    if expected {
+                        let sent_at = a.last_timestamp_sent_at;
+                        assert_eq!(a.transmit(1001, &mut [0; 31]), Err(Error::OutputTooSmall));
+                        assert!(a.challenge_ack_pending);
+                        assert_eq!(a.challenge_ack_sent, 0);
+                        assert_eq!(a.last_timestamp_sent_at, sent_at);
+                        assert_eq!(a.now, 1000);
+                        let bytes = packet(&mut a, 1001);
+                        let p = wire::parse(ip(tuple()), &bytes).unwrap();
+                        assert_eq!(p.header.flags, ACK | ECE);
+                        assert_eq!(p.header.sequence, high.0);
+                        assert_eq!(p.header.acknowledgment, next.0);
+                        assert_eq!(p.options.timestamps, Some((1, 100)));
+                        assert!(p.payload.is_empty());
+                        assert_eq!(a.last_output_ecn, 0);
+                        assert!(a.ecn_cwr_pending);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-7
+    //= type=test
+    //= reason=Asserts nonzero validation, emission cap, coalescing/failed-output accounting, exact interval reset, independent connections and unthrottled normal ACKs.
+    //# 2) The values for both the time and number of ACKs SHOULD be tunable
+    //# by the system administrator to accommodate different perceived
+    //# levels of threat and/or system resources.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-7
+    //= type=test
+    //= reason=Asserts nonzero validation, emission cap, coalescing/failed-output accounting, exact interval reset, independent connections and unthrottled normal ACKs.
+    //# An implementation SHOULD include an ACK throttling mechanism to be
+    //# conservative.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-7
+    //= type=test
+    //= reason=Asserts nonzero validation, emission cap, coalescing/failed-output accounting, exact interval reset, independent connections and unthrottled normal ACKs.
+    //# The time limit SHOULD be tunable to help timeout brute force attacks
+    //# faster than a potential legitimate flood of RSTs.
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-7
+    //= type=test
+    //= reason=Asserts nonzero validation, emission cap, coalescing/failed-output accounting, exact interval reset, independent connections and unthrottled normal ACKs.
+    //# 1) The system administrator can configure the number of challenge ACKs that can be sent out in a given interval. For example, in any 5 second window, no more than 10 challenge ACKs should be sent.
+    fn rfc5961_challenge_budget_reset_isolation_and_validation() {
+        let cfg = ConnectionConfig {
+            challenge_ack_limit: 2,
+            challenge_ack_interval_us: 100,
+            ..config(64, 8)
+        };
+        let (mut a, mut b) = pair(cfg.clone(), 100);
+        for now in [40, 41] {
+            let next = a.receive.next();
+            let high = a.snd_nxt;
+            for _ in 0..10 {
+                inject(&mut a, now, next.wrapping_add(1), high, RST, 0, b"");
+            }
+            assert!(a.challenge_ack_pending);
+            assert_eq!(a.transmit(now, &mut [0; 19]), Err(Error::OutputTooSmall));
+            packet(&mut a, now);
+            assert_eq!(a.challenge_ack_sent, (now - 39) as u32);
+        }
+        for now in [42, 139] {
+            let next = a.receive.next();
+            let high = a.snd_nxt;
+            inject(&mut a, now, next.wrapping_add(1), high, RST, 0, b"");
+            assert!(!a.challenge_ack_pending);
+            assert_eq!(a.transmit(now, &mut [0; 64]), Ok(None));
+        }
+        let next = b.receive.next();
+        let high = b.snd_nxt;
+        inject(&mut b, 139, next.wrapping_add(1), high, RST, 0, b"");
+        packet(&mut b, 139);
+        assert_eq!(b.challenge_ack_sent, 1);
+        let next = a.receive.next();
+        let high = a.snd_nxt;
+        inject(&mut a, 140, next.wrapping_add(1), high, RST, 0, b"");
+        packet(&mut a, 140);
+        assert_eq!(a.challenge_ack_sent, 1);
+        // Ordinary ACK scheduling is neither throttled nor counted.
+        a.immediate_ack();
+        packet(&mut a, 141);
+        assert_eq!(a.challenge_ack_sent, 1);
+        inject(&mut a, 142, next, high, RST, 0, b"");
+        assert_eq!(a.state(), State::Closed);
+        assert!(!a.challenge_ack_pending);
+        for cfg in [
+            ConnectionConfig {
+                challenge_ack_limit: 0,
+                ..cfg.clone()
+            },
+            ConnectionConfig {
+                challenge_ack_interval_us: 0,
+                ..cfg
+            },
+        ] {
+            assert!(matches!(
+                Connection::active(tuple(), cfg, 100, 0),
+                Err(Error::InvalidArgument)
+            ));
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-5.2
+    //= type=test
+    //= reason=Negotiated scale, growth/shrink/zero updates, historical maximum >65535 and modular inclusive ACK lower bound are asserted.
+    //# A new state variable MAX.SND.WND is defined as the largest window that the local sender has ever received from its peer. This window may be scaled to a value larger than 65,535 bytes ([RFC1323]).
+    fn rfc5961_max_sender_window_scaled_history() {
+        let (mut a, _) = pair(config(262144, 1000), u32::MAX - 4);
+        assert!(a.scaling && a.peer_scale > 0);
+        // SYN-ACK initializes the history without applying negotiated scaling.
+        assert_eq!(a.snd_wnd, 65535);
+        assert_eq!(a.max_snd_wnd, 65535);
+        let mut maximum = a.max_snd_wnd;
+        for (i, window) in [10000, 60000, 1000, 0].into_iter().enumerate() {
+            let next = a.receive.next();
+            let una = a.snd_una;
+            inject(&mut a, 40 + i as u64, next, una, ACK, window, b"");
+            assert_eq!(a.snd_wnd, (window as u32) << a.peer_scale);
+            maximum = maximum.max(a.snd_wnd);
+            assert_eq!(a.max_snd_wnd, maximum);
+        }
+        assert!(maximum > 65535);
+        let next = a.receive.next();
+        let oldest = a.snd_una.wrapping_add(0u32.wrapping_sub(maximum));
+        inject(&mut a, 50, next, oldest, ACK, 0, b"accepted");
+        assert_eq!(a.receive.readable(), 8);
+        let next = a.receive.next();
+        inject(
+            &mut a,
+            51,
+            next,
+            oldest.wrapping_add(u32::MAX),
+            ACK,
+            0,
+            b"bad",
+        );
+        assert_eq!(a.receive.readable(), 8);
+        assert_eq!(a.max_snd_wnd, maximum);
     }
 
     #[test]

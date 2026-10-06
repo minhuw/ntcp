@@ -144,7 +144,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 # 5961-A007 | TCP endpoint | optional fixed maximum instead of observed maximum
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc5961#section-5.2"
-reason = "Optional hardcoded-window alternative not selected: implementation uses maximum observed peer window. The selected history/scaling evidence gap remains TODO; this alternative is not a waiver of ACK validation."
+reason = "Optional hardcoded-window alternative not selected: implementation uses maximum observed peer window. Scaled observed history and ACK lower bounds are asserted; this alternative is not a waiver of ACK validation."
 quote = '''
 Implementations can also chose to hard code the MAX.SND.WND value to the maximum permissible window size, i.e., 65535 in the absence of window scaling. In the presence of the window scaling option, the value becomes (MAX.SND.WND << Snd.Wind.Scale).
 '''

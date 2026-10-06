@@ -304,7 +304,9 @@ impl Endpoint {
         now: Instant,
         address_policy: F,
     ) -> Result<Self, EndpointError> {
-        if config.max_connections == 0
+        if config.connection.challenge_ack_limit == 0
+            || config.connection.challenge_ack_interval_us == 0
+            || config.max_connections == 0
             || config.connection.send_ip_payload_limit
                 < if config.connection.timestamps { 40 } else { 28 }
             || config.max_listeners == 0
@@ -1088,6 +1090,9 @@ impl Endpoint {
     //= reason=Checks ACK-derived reset sequence and non-ACK sequence-space length including SYN/FIN across wrap.
     //# If the ACK bit is off, sequence number zero is used,
     //# <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK> If the ACK bit is on, <SEQ=SEG.ACK><CTL=RST>
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+    //= reason=ACK-derived reset_for output provides the restarted, unsynchronized peer response; end-to-end restart test proves the sequence.
+    //# A legitimate peer, after restart, would not have a TCB in the synchronized state. Thus, when the ACK arrives, the peer should send a RST segment back with the sequence number derived from the ACK field that caused the RST.
     fn reset_for(
         &mut self,
         ip: IpMetadata,
@@ -1172,6 +1177,9 @@ impl Endpoint {
         self.input_with_traffic_class(now, ip, 0, bytes)
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+    //= reason=Confirmed valid reset closes the old connection while its listener remains. A later peer SYN retransmission is routed to that listener and establishes a replacement, proven by the restart trace.
+    //# The local TCP endpoint should then rely on SYN retransmission from the remote end to re-establish the connection.
     pub fn input_with_traffic_class(
         &mut self,
         now: Instant,

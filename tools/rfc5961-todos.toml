@@ -1,25 +1,9 @@
 # Open behavior/evidence gaps; partial annotations are not waivers.
 
-# 5961-A003 | TCP endpoint | nonexact in-window RST challenge
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc5961#section-3.2"
-reason = "Partial evidence covers ordinary unblocked challenge output only. immediate_ack sets ack_pending; pending retransmission can emit SND.UNA instead of SND.NXT and clear ack_pending. Add nonexact in-window RST regressions with retransmission, probe and other output pending, asserting challenge SEQ=SND.NXT, ACK=RCV.NXT and flags ACK; resolve output arbitration before claiming the template universally."
-quote = '''
-<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-'''
-
-# 5961-A004 | TCP endpoint | synchronized SYN challenge
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc5961#section-4.2"
-reason = "Partial evidence covers ordinary unblocked non-timestamp SYN challenge output only. immediate_ack sets ack_pending; pending retransmission can emit SND.UNA instead of SND.NXT and clear ack_pending. Add synchronized SYN regressions with retransmission, probe and other output pending, asserting challenge SEQ=SND.NXT, ACK=RCV.NXT and flags ACK; resolve output arbitration and retain the separate timestamp-precedence TODO."
-quote = '''
-<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-'''
-
 # 5961-G009 | TCP endpoint | selected blind-attack mitigation
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc5961#section-4.2"
-reason = "Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects. Missing scope evidence: PAWS/missing-timestamp checks precede SYN challenge; timestamp-enabled SYN inputs can return before emitting the mandated challenge irrespective of sequence. Existing matrix does not exercise timestamp-enabled SYN. Audit precedence and add assertions; no waiver of the selected SYN mitigation."
+reason = "Partial evidence; TODO remains for negotiated-TS SYN lacking TSopt. RFC7323 3.2 recommends silent drop, while RFC5961 4.2 mandates a challenge; no listed erratum resolves this precedence. Valid/stale TS SYN challenges now precede window and metadata processing and are tested, including output arbitration. Missing-TS silence is explicitly tested, not waived."
 quote = '''
 Instead, the handling of the SYN in the synchronized state SHOULD be
 performed as follows:
@@ -28,7 +12,7 @@ performed as follows:
 # 5961-G010 | TCP endpoint | selected blind-attack mitigation
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc5961#section-4.2"
-reason = "Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects. Missing scope evidence: PAWS/missing-timestamp checks precede SYN challenge; timestamp-enabled SYN inputs can return before emitting the mandated challenge irrespective of sequence. Existing matrix does not exercise timestamp-enabled SYN. Audit precedence and add assertions; no waiver of the selected SYN mitigation."
+reason = "Partial evidence; TODO remains for negotiated-TS SYN lacking TSopt. RFC7323 3.2 recommends silent drop, while RFC5961 4.2 mandates a challenge; no listed erratum resolves this precedence. Valid/stale TS SYN challenges now precede window and metadata processing and are tested, including output arbitration. Missing-TS silence is explicitly tested, not waived."
 quote = '''
 1) If the SYN bit is set, irrespective of the sequence number, TCP
 MUST send an ACK (also referred to as challenge ACK) to the remote
@@ -38,68 +22,8 @@ peer:
 # 5961-G011 | TCP endpoint | selected blind-attack mitigation
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc5961#section-4.2"
-reason = "Selected RST/SYN defenses: existing state/sequence matrix asserts exact reset termination, outside reset silence, nonexact in-window challenge and SYN challenge fields/drop. Matrix exercises sequence wrap and rejects appended text/URG/FIN/ACK effects. Missing scope evidence: PAWS/missing-timestamp checks precede SYN challenge; timestamp-enabled SYN inputs can return before emitting the mandated challenge irrespective of sequence. Existing matrix does not exercise timestamp-enabled SYN. Audit precedence and add assertions; no waiver of the selected SYN mitigation."
+reason = "Partial evidence; TODO remains for negotiated-TS SYN lacking TSopt. RFC7323 3.2 recommends silent drop, while RFC5961 4.2 mandates a challenge; no listed erratum resolves this precedence. Valid/stale TS SYN challenges now precede window and metadata processing and are tested, including output arbitration. Missing-TS silence is explicitly tested, not waived."
 quote = '''
 After sending the acknowledgment, TCP MUST drop the unacceptable
 segment and stop processing further.
-'''
-
-# 5961-G018 | TCP endpoint and administrator | challenge ACK rate limiting
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc5961#section-7"
-reason = "No challenge-ACK throttling counter/interval or administrator tunables found in Connection or Endpoint. Immediate ACK coalescing is not the prescribed tunable interval/count policy. Add rate limiting and time/count configuration plus assertions; consider held erratum 4772 warning against shared global side-channel counters."
-quote = '''
-2) The values for both the time and number of ACKs SHOULD be tunable
-by the system administrator to accommodate different perceived
-levels of threat and/or system resources.
-'''
-
-# 5961-G019 | TCP endpoint and administrator | challenge ACK rate limiting
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc5961#section-7"
-reason = "No challenge-ACK throttling counter/interval or administrator tunables found in Connection or Endpoint. Immediate ACK coalescing is not the prescribed tunable interval/count policy. Add rate limiting and time/count configuration plus assertions; consider held erratum 4772 warning against shared global side-channel counters."
-quote = '''
-An implementation SHOULD include an ACK throttling mechanism to be
-conservative.
-'''
-
-# 5961-G020 | TCP endpoint and administrator | challenge ACK rate limiting
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc5961#section-7"
-reason = "No challenge-ACK throttling counter/interval or administrator tunables found in Connection or Endpoint. Immediate ACK coalescing is not the prescribed tunable interval/count policy. Add rate limiting and time/count configuration plus assertions; consider held erratum 4772 warning against shared global side-channel counters."
-quote = '''
-The time limit SHOULD be tunable to help timeout brute force attacks
-faster than a potential legitimate flood of RSTs.
-'''
-
-# 5961-A006 | TCP endpoint | largest historically received scaled sender window
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc5961#section-5.2"
-reason = "Implementation initializes max_snd_wnd from SYN then monotonically maxes accepted scaled updates. Existing ACK bounds test uses unscaled fixed window; no inspected assertion tracks historical maximum across growth/shrink and scaled windows. Add explicit MAX.SND.WND history/scale assertions."
-quote = '''
-A new state variable MAX.SND.WND is defined as the largest window that the local sender has ever received from its peer. This window may be scaled to a value larger than 65,535 bytes ([RFC1323]).
-'''
-
-# 5961-A008 | TCP endpoint | administrator-configurable throttle
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc5961#section-7"
-reason = "No challenge-ACK interval/count configuration exists. Example numbers are illustrative, not hardcoded requirements; implement tunable throttling and assertions, with held erratum 4772 global-counter side-channel warning."
-quote = '''
-1) The system administrator can configure the number of challenge ACKs that can be sent out in a given interval. For example, in any 5 second window, no more than 10 challenge ACKs should be sent.
-'''
-
-# 5961-A009 | TCP endpoint | restart with no synchronized TCB
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc5961#section-4.2"
-reason = "Endpoint unknown-connection reset generation exists; no inspected end-to-end restart challenge/response/re-establishment assertion proves this entire sequence. Add explicit restarted-peer trace rather than infer from local reset field tests."
-quote = '''
-A legitimate peer, after restart, would not have a TCB in the synchronized state. Thus, when the ACK arrives, the peer should send a RST segment back with the sequence number derived from the ACK field that caused the RST.
-'''
-
-# 5961-A010 | TCP endpoint | restart after confirmed valid reset
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc5961#section-4.2"
-reason = "No existing inspected assertion proves SYN retransmission-driven re-establishment after a challenge ACK/valid RST exchange. Require existing trace evidence or new test in a later implementation pass."
-quote = '''
-The local TCP endpoint should then rely on SYN retransmission from the remote end to re-establish the connection.
 '''

@@ -4105,3 +4105,80 @@ fn dsack_checksum_invalid_arrival_preserves_failed_output_report() {
         Some(duplicate)
     );
 }
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+//= type=test
+//= reason=End-to-end restarted SYN-SENT peer receives challenge, emits ACK-derived exact RST, and reestablishes via timed SYN retransmission; retained listener accepts a new connection and data transfers.
+//# A legitimate peer, after restart, would not have a TCB in the synchronized state. Thus, when the ACK arrives, the peer should send a RST segment back with the sequence number derived from the ACK field that caused the RST.
+//= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
+//= type=test
+//= reason=End-to-end restarted SYN-SENT peer receives challenge, emits ACK-derived exact RST, and reestablishes via timed SYN retransmission; retained listener accepts a new connection and data transfers.
+//# The local TCP endpoint should then rely on SYN retransmission from the remote end to re-establish the connection.
+fn rfc5961_restart_challenge_valid_reset_then_syn_retransmission() {
+    let (mut a, mut b, listener, _) = endpoints();
+    pump(&mut a, &mut b, 0);
+    let old = b.accept(listener).unwrap();
+    let (local, remote) = addresses();
+    // Restart discards all of the client's old TCBs, preserving the server.
+    a = Endpoint::new(config(), [99; 32], 10, test_policy).unwrap();
+    let restarted = a.connect(10, local, remote).unwrap();
+    let syn = packets(&mut a, 10);
+    assert_eq!(syn.len(), 1);
+    let initial = wire::parse(syn[0].0, &syn[0].1).unwrap();
+    assert_eq!(initial.header.flags & wire::SYN, wire::SYN);
+    let initial_seq = initial.header.sequence;
+    deliver(&mut b, 10, syn);
+    assert_eq!(b.state(old), Ok(State::Established));
+    let challenge = packets(&mut b, 10);
+    assert_eq!(challenge.len(), 1);
+    let p = wire::parse(challenge[0].0, &challenge[0].1).unwrap();
+    assert_eq!(p.header.flags, wire::ACK);
+    assert!(p.payload.is_empty());
+    let valid_reset_seq = p.header.acknowledgment;
+    deliver(&mut a, 10, challenge);
+    assert_eq!(a.state(restarted), Ok(State::SynSent));
+    let reset = packets(&mut a, 10);
+    assert_eq!(reset.len(), 1);
+    let p = wire::parse(reset[0].0, &reset[0].1).unwrap();
+    assert_eq!(p.header.flags, wire::RST);
+    assert_eq!(p.header.sequence, valid_reset_seq);
+    assert!(p.payload.is_empty());
+    deliver(&mut b, 10, reset);
+    assert_eq!(b.state(old), Ok(State::Closed));
+    b.release(old).unwrap();
+    let deadline = a.next_deadline().unwrap();
+    assert!(!a.on_timeout(deadline, 16).unwrap());
+    let retry = packets(&mut a, deadline);
+    assert_eq!(retry.len(), 1);
+    let p = wire::parse(retry[0].0, &retry[0].1).unwrap();
+    assert_eq!(p.header.flags & wire::SYN, wire::SYN);
+    assert_eq!(p.header.sequence, initial_seq);
+    deliver(&mut b, deadline, retry);
+    pump(&mut a, &mut b, deadline);
+    let replacement = b.accept(listener).unwrap();
+    assert_ne!(replacement, old);
+    assert_eq!(a.state(restarted), Ok(State::Established));
+    assert_eq!(b.state(replacement), Ok(State::Established));
+    a.write(restarted, b"new incarnation").unwrap();
+    pump(&mut a, &mut b, deadline);
+    let mut data = [0; 32];
+    assert_eq!(b.read(replacement, &mut data), Ok(15));
+    assert_eq!(&data[..15], b"new incarnation");
+}
+
+#[test]
+fn endpoint_rejects_zero_challenge_budget_configuration() {
+    for interval in [false, true] {
+        let mut cfg = config();
+        if interval {
+            cfg.connection.challenge_ack_interval_us = 0;
+        } else {
+            cfg.connection.challenge_ack_limit = 0;
+        }
+        assert!(matches!(
+            Endpoint::new(cfg, [1; 32], 0, test_policy),
+            Err(EndpointError::Connection(Error::InvalidArgument))
+        ));
+    }
+}
