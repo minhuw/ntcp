@@ -285,6 +285,13 @@ class AdaptationChecks(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     adapt_source(self.directory, self.name, self.manifest, self.flags)
 
+    def test_upstream_sack_mapping_declares_legacy_not_rfc_crb(self):
+        for entry in self.manifest['scripts'].values():
+            if entry['adapter_flags'].startswith('upstream-sack,'):
+                self.assertEqual(entry['mapping']['ntcp_settings']['prr'], 'LegacyInitialCredit')
+                self.assertTrue(any('not claimed to conform to RFC 6937 or RFC 9937' in reason
+                                    for reason in entry['mapping']['reasons']))
+
     def test_mapping_requires_allowlist_exact_flags_count_and_replacement(self):
         with self.assertRaisesRegex(ValueError, 'allowlisted'):
             adapt_source(self.directory, 'other.pkt', self.manifest, self.flags)

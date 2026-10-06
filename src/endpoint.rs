@@ -2087,6 +2087,7 @@ mod recovery_observation_tests {
                 sack: true,
                 rack: true,
                 prr: true,
+                prr_algorithm: crate::PrrAlgorithm::LegacyInitialCredit,
                 initial_window: InitialWindow::Iw10,
                 nagle: false,
                 ..ConnectionConfig::default()

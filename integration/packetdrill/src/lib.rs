@@ -358,6 +358,9 @@ impl Owner {
         config.connection.timestamps = profile == Profile::UpstreamSack;
         config.connection.rack = profile == Profile::UpstreamSack;
         config.connection.prr = profile == Profile::UpstreamSack;
+        if profile == Profile::UpstreamSack {
+            config.connection.prr_algorithm = ntcp::PrrAlgorithm::LegacyInitialCredit;
+        }
         config.connection.tlp = profile == Profile::UpstreamSack;
         if profile == Profile::UpstreamSack {
             // Explicit Linux timing compatibility; the core keeps RFC 6298's

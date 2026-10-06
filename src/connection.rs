@@ -6,7 +6,7 @@ use core::{cmp::Ordering, net::SocketAddr};
 use crate::{
     buffer::{ReceiveBuffer, SendBuffer},
     rack::Rack,
-    recovery::{Congestion, InitialWindow, Prr, RecoveryAlgorithm, RttEstimator},
+    recovery::{Congestion, InitialWindow, Prr, PrrAlgorithm, RecoveryAlgorithm, RttEstimator},
     sack::Scoreboard,
     seq::Seq,
     wire::{self, ACK, CWR, ECE, FIN, Header, IpMetadata, PSH, RST, SYN, Segment, URG},
@@ -68,8 +68,9 @@ pub struct ConnectionConfig {
     // Opt-in RFC 8985 time-based loss detection (requires negotiated SACK
     // and observed minimum RTT >4us with the current 1us time units).
     pub rack: bool,
-    // Opt-in RFC 6937 PRR-CRB recovery pacing (requires negotiated SACK).
+    // Opt-in PRR recovery pacing (requires negotiated SACK and valid ledger).
     pub prr: bool,
+    pub prr_algorithm: PrrAlgorithm,
     // Opt-in RFC 8985 tail loss probes; requires rack and sack configuration
     // and negotiated SACK. At most one probe per outstanding flight.
     pub tlp: bool,
@@ -148,6 +149,7 @@ impl Default for ConnectionConfig {
             sack: false,
             rack: false,
             prr: false,
+            prr_algorithm: PrrAlgorithm::default(),
             tlp: false,
             peer_max_ack_delay_us: 499_999,
             rto_min_us: 1_000_000,
@@ -373,7 +375,9 @@ pub(crate) struct Connection {
     tlp_flight: Option<Seq>,
     tlp_fresh_rtt: bool,
     prr: Option<Prr>,
-    // Real causative delivery, capped at one MSS and bound to its deferred timer.
+    #[cfg(test)]
+    prr_exit_trace: Option<Prr>,
+    // LegacyInitialCredit only: prior ACK delivery, capped and bound to its timer.
     rack_entry_delivery: Option<(u64, u32)>,
     receive_used: usize,
     sack_omit: bool,
@@ -591,6 +595,8 @@ impl Connection {
             tlp_flight: None,
             tlp_fresh_rtt: false,
             prr: None,
+            #[cfg(test)]
+            prr_exit_trace: None,
             rack_entry_delivery: None,
             receive_used: 0,
             sack_omit: false,
@@ -1087,7 +1093,11 @@ impl Connection {
             pipe: self.recovery_pipe(self.snd_una),
         });
         if self.config.prr && self.sack_send && self.rack.valid() {
-            self.prr = Some(Prr::new(self.flight(), self.mss as u32));
+            self.prr = Some(Prr::new(
+                self.flight(),
+                self.mss as u32,
+                self.config.prr_algorithm,
+            ));
         }
         self.retx_pending = false;
         self.limited_pending = false;
@@ -1124,6 +1134,10 @@ impl Connection {
     //# If multiple original transmissions or retransmissions were lost in a
     //# window, the congestion control specified in [RFC5681] only reacts
     //# once per window.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-4
+    //= reason=Strict RACK modified-recovery scope (RFC 8985 section 9.2): full receiver-derived paired ordered/reordered minimal, isolated and burst traces measure identical final actual pipe/target after premature original loss is corrected. Every active ACK/output is equation-checked; boundary handoff is separate. strict_prr_rack_pipe_reordered_originals_and_lost_retransmissions additionally covers lost committed copies and both equation branches. Not literal RFC 6675 or LegacyInitialCredit equivalence.
+    //# For PRR, pipe merely determines which algorithm, PRR or the
+    //# Reduction Bound, is used to compute sndcnt from DeliveredData.
     fn detect_rack(&mut self) {
         if !self.rack_enabled() || self.snd_wnd == 0 {
             self.rack.deadline = None;
@@ -1801,6 +1815,15 @@ impl Connection {
         //# If the window shrinks to zero, the TCP implementation MUST probe it in the
         //# standard way (described below) (MUST-35).
         if self.snd_wnd == 0 && pending {
+            if self.prr.is_some() && self.config.prr_algorithm == PrrAlgorithm::Rfc6937Crb {
+                // Leave the strict recovery epoch before zero-window probes.
+                self.sack_guard = self.sack_recovery.map(|r| r.recovery_point);
+                self.sack_recovery = None;
+                self.prr = None;
+                self.rack_entry_delivery = None;
+                self.congestion.cancel_sack_recovery();
+                self.reset_limited_transmit();
+            }
             self.rack.deadline = None;
             if self.persist_interval == 0 {
                 self.persist_interval = self.rto();
@@ -2956,7 +2979,33 @@ impl Connection {
             self.ecn_cwr_pending = true;
             self.reset_limited_transmit();
         }
-        let mut delivered = 0;
+        //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+        //= reason=Rfc6937Crb only: pre-ACK UNA/retained-SACK baseline defines current entry ACK; active ACKs use signed deltaUNA+deltaSACKd, outside recovery deltaUNA is separate from RACK evidence. Timers retain no strict delivery; boundary ACK is accounted before exit. Legacy capped replay is explicitly not covered.
+        //# When not in
+        //# recovery, DeliveredData is the change in snd.una.
+        //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+        //= reason=Rfc6937Crb only: pre-ACK UNA/retained-SACK baseline defines current entry ACK; active ACKs use signed deltaUNA+deltaSACKd, outside recovery deltaUNA is separate from RACK evidence. Timers retain no strict delivery; boundary ACK is accounted before exit. Legacy capped replay is explicitly not covered.
+        //# Furthermore, for any TCP
+        //# (with or without SACK), the sum of DeliveredData must agree with the
+        //# forward progress over the same time interval.
+        //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+        //= reason=Rfc6937Crb only: pre-ACK UNA/retained-SACK baseline defines current entry ACK; active ACKs use signed deltaUNA+deltaSACKd, outside recovery deltaUNA is separate from RACK evidence. Timers retain no strict delivery; boundary ACK is accounted before exit. Legacy capped replay is explicitly not covered.
+        //# On every ACK during recovery compute:
+        //#
+        //#    DeliveredData = change_in(snd.una) + change_in(SACKd)
+        //#    prr_delivered += DeliveredData
+        //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+        //= reason=Rfc6937Crb only: pre-ACK UNA/retained-SACK baseline defines current entry ACK; active ACKs use signed deltaUNA+deltaSACKd, outside recovery deltaUNA is separate from RACK evidence. Timers retain no strict delivery; boundary ACK is accounted before exit. Legacy capped replay is explicitly not covered.
+        //# DeliveredData: The total number of bytes that the current ACK
+        //# indicates have been delivered to the receiver.
+        // Snapshot before this ACK: if it enters recovery, its entire current
+        // delta belongs to the new epoch. Timer entry has no current ACK.
+        let delivery_una = self.snd_una;
+        let sackd_before = self.flight()
+            - self
+                .scoreboard
+                .unsacked_bytes(self.snd_una, self.data_high());
+        let mut rack_delivery = 0;
         let mut dsack = false;
         let mut reo_grew = false;
         let tlp_flight = self.data_flight();
@@ -3004,7 +3053,7 @@ impl Connection {
             reo_grew = self.rack.reo_grew;
             // Capacity backing preserves timestamp splits. Advice fallback
             // cannot retain a PRR epoch based on the discarded scoreboard.
-            delivered = if self.rack.valid() {
+            rack_delivery = if self.rack.valid() {
                 ledger_delivery
             } else {
                 self.prr = None;
@@ -3063,6 +3112,27 @@ impl Connection {
             && let Some(mut recovery) = self.sack_recovery
         {
             if at_or_after(ack, recovery.recovery_point) {
+                if self.config.prr_algorithm == PrrAlgorithm::Rfc6937Crb {
+                    // The boundary ACK arrived in this epoch: account its signed
+                    // delivery before ending it. Later output uses reduced cwnd,
+                    // not stale PRR credit. No counter carries into the next epoch.
+                    let sackd_after = self.flight()
+                        - self
+                            .scoreboard
+                            .unsacked_bytes(self.snd_una, self.data_high());
+                    let delta = i64::from(self.snd_una.distance_from(delivery_una))
+                        + i64::from(sackd_after)
+                        - i64::from(sackd_before);
+                    debug_assert!(delta >= 0);
+                    let pipe = self.recovery_pipe(recovery.high_rxt);
+                    if let Some(prr) = &mut self.prr {
+                        prr.acknowledge(delta.max(0) as u32, pipe, self.congestion.ssthresh());
+                    }
+                    #[cfg(test)]
+                    {
+                        self.prr_exit_trace = self.prr;
+                    }
+                }
                 self.sack_recovery = None;
                 self.prr = None;
                 self.rack_entry_delivery = None;
@@ -3191,24 +3261,43 @@ impl Connection {
             self.congestion.reset_duplicate_acks();
         }
         self.detect_rack();
-        if self.sack_recovery.is_none()
+        if self.config.prr_algorithm == PrrAlgorithm::LegacyInitialCredit
+            && self.sack_recovery.is_none()
             && !advancing
-            && delivered != 0
+            && rack_delivery != 0
             && self.rack.ack_sample.is_some()
         {
             self.rack_entry_delivery = self
                 .rack
                 .deadline
-                .map(|deadline| (deadline, delivered.min(self.mss as u32)));
+                .map(|deadline| (deadline, rack_delivery.min(self.mss as u32)));
         }
         if self.rack.deadline.is_none() || !self.rack.valid() {
             self.rack_entry_delivery = None;
         }
+        // Outside recovery DeliveredData is deltaUNA, not RACK's detection
+        // evidence (which can include SACKs). An ACK entering recovery uses
+        // the pre-ACK scoreboard baseline; no earlier ACK is replayed.
+        let cumulative_delivery = self.snd_una.distance_from(delivery_una);
         if let Some(mut prr) = self.prr {
             let pipe = self.sack_recovery.map_or(0, |r| r.pipe);
+            let sackd_after = self.flight()
+                - self
+                    .scoreboard
+                    .unsacked_bytes(self.snd_una, self.data_high());
+            let delivered = if self.config.prr_algorithm == PrrAlgorithm::Rfc6937Crb {
+                // Retained advisory SACK union is monotonic except for cumulative
+                // trimming; omissions are not reneging. Overflow cancels PRR.
+                let delta = i64::from(cumulative_delivery) + i64::from(sackd_after)
+                    - i64::from(sackd_before);
+                debug_assert!(delta >= 0);
+                delta.max(0) as u32
+            } else {
+                rack_delivery
+            };
             prr.acknowledge(delivered, pipe, self.congestion.ssthresh());
             if self.sack_recovery.is_some_and(|r| r.entry_pending) {
-                // The first retransmission is guaranteed, including timer entry.
+                // Only LegacyInitialCredit guarantees an entry MSS.
                 prr.guarantee_initial(self.mss as u32);
             }
             self.prr = Some(prr);
@@ -4416,7 +4505,7 @@ impl Connection {
             && let Some(recovery) = self.sack_recovery
         {
             if self.rack_enabled() {
-                let credit = if recovery.entry_pending {
+                let credit = if recovery.entry_pending && self.prr.is_none() {
                     self.mss as u32
                 } else {
                     self.recovery_credit(recovery)
@@ -4428,7 +4517,12 @@ impl Connection {
                         .map(|(left, right)| (left, right, false, recovery.entry_pending));
                 }
             } else if recovery.entry_pending {
-                // SACK is advisory: RFC 6675 entry always starts at HighACK+1.
+                // SACK is advisory: RFC 6675 entry starts at HighACK+1.
+                // With strict PRR this candidate is credit-clipped below, so
+                // the RFC 6675 forced entry-SMSS guarantee is NOT claimed.
+                // RFC 6937 governs quantity, not selection; RACK instead uses
+                // RFC 8985 section 9.2 modified recovery. Keep the composition
+                // TODO for non-RACK strict PRR, especially zero/tiny delivery.
                 let range = after(self.data_high(), self.snd_una).then_some((
                     self.snd_una,
                     self.snd_una.wrapping_add(
@@ -4684,6 +4778,23 @@ impl Connection {
             //# However, a sending TCP peer MUST
             //# be robust against window shrinking, which may cause the "usable
             //# window" (see Section 3.8.6.2.1) to become negative (MUST-34).
+            //= https://www.rfc-editor.org/rfc/rfc6937#section-4
+            //= reason=Strict negotiated-SACK bulk profile: active output uses PRR credit and modified RACK pipe; boundary ACK accounts final delivery then ends the epoch, and ordinary reduced-cwnd output fills remaining target headroom. Full minimal/isolated/burst traces measure actual final pipe, voluntary reductions and handoff bytes; no claim for stalls or LegacyInitialCredit.
+            //# If there are minimal losses, PRR will converge to exactly the target
+            //# window chosen by the congestion control algorithm.
+            //= https://www.rfc-editor.org/rfc/rfc6937#section-4
+            //= reason=Strict negotiated-SACK bulk profile: active output uses PRR credit and modified RACK pipe; boundary ACK accounts final delivery then ends the epoch, and ordinary reduced-cwnd output fills remaining target headroom. Full minimal/isolated/burst traces measure actual final pipe, voluntary reductions and handoff bytes; no claim for stalls or LegacyInitialCredit.
+            //# Implicit window reductions, due to multiple isolated losses during
+            //# recovery, cause later voluntary reductions to be skipped.  For small
+            //# numbers of losses, the window size ends at exactly the window chosen
+            //# by the congestion control algorithm.
+            //= https://www.rfc-editor.org/rfc/rfc6937#section-4
+            //= reason=Strict negotiated-SACK bulk profile: active output uses PRR credit and modified RACK pipe; boundary ACK accounts final delivery then ends the epoch, and ordinary reduced-cwnd output fills remaining target headroom. Full minimal/isolated/burst traces measure actual final pipe, voluntary reductions and handoff bytes; no claim for stalls or LegacyInitialCredit.
+            //# For burst losses, earlier voluntary window reductions can be undone
+            //# by sending extra segments in response to ACKs arriving later during
+            //# recovery.  Note that as long as some voluntary window reductions are
+            //# not undone, the final value for pipe will be the same as ssthresh,
+            //# the target cwnd value chosen by the congestion control algorithm.
             let usable = if let Some(recovery) = self.sack_recovery {
                 if recovery.entry_pending || self.recovery_credit(recovery) < self.mss as u32 {
                     0
@@ -5134,13 +5245,16 @@ impl Connection {
             self.sack_omit = false;
         }
         if count != 0 && !syn && !keepalive {
+            // Strict recovery exits before persist; legacy probes retain their
+            // separate policy. Record every real emission in the age ledger.
+            if !probe && let Some(prr) = &mut self.prr {
+                prr.sent(count as u32);
+            }
             self.rack
                 .transmit(seq, seq.wrapping_add(count as u32), now, retransmitted);
             if !self.rack.valid() {
                 self.prr = None;
                 self.rack_entry_delivery = None;
-            } else if !probe && let Some(prr) = &mut self.prr {
-                prr.sent(count as u32);
             }
         }
         if count != 0
@@ -8553,6 +8667,7 @@ mod tests {
             sack: true,
             rack: true,
             prr: true,
+            prr_algorithm: PrrAlgorithm::LegacyInitialCredit,
             initial_window: InitialWindow::Iw10,
             ..config(65_536, 1000)
         };
@@ -8570,6 +8685,469 @@ mod tests {
         a
     }
 
+    fn strict_flight(iss: u32) -> Connection {
+        let mut a = rack_flight(iss);
+        a.config.prr_algorithm = PrrAlgorithm::Rfc6937Crb;
+        a
+    }
+
+    // Independent equation/conservation oracle for every ACK and successful
+    // packet in the strict traces. The boundary ACK exits the epoch; it cannot
+    // grant PRR output afterward. RTO/overflow/persist cancellation is separate.
+    fn strict_ack(a: &mut Connection, now: u64, ack: u32, blocks: &[(u32, u32)]) {
+        let una = a.snd_una;
+        let sackd = a.flight() - a.scoreboard.unsacked_bytes(una, a.data_high());
+        let before = a.prr.map(|p| p.counters()).unwrap_or((0, 0, 0));
+        rack_sack(a, now, ack, blocks);
+        if let Some(p) = a.prr {
+            let (fs, delivered, out) = p.counters();
+            let new_sackd = a.flight() - a.scoreboard.unsacked_bytes(a.snd_una, a.data_high());
+            let delta =
+                i64::from(a.snd_una.distance_from(una)) + i64::from(new_sackd) - i64::from(sackd);
+            assert!(delta >= 0);
+            assert_eq!(delivered, before.1 + delta as u64);
+            assert_eq!(out, before.2);
+            assert!(out <= delivered);
+            let pipe = a.sack_recovery.unwrap().pipe;
+            let target = a.congestion.ssthresh();
+            let expected = if pipe > target {
+                (delivered * u64::from(target))
+                    .div_ceil(u64::from(fs))
+                    .saturating_sub(out)
+            } else {
+                (delivered - out).min(u64::from(target - pipe))
+            };
+            assert_eq!(u64::from(p.credit()), expected);
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= type=test
+    //= reason=Strict default, zero timer-entry credit, repeated old SACK with no credit, fresh current ACK, signed cumulative trimming, advancing ACK entry and RTO cancellation; active-delivery test additionally covers omission/overlap/wrap and exhaustion.
+    //# When not in
+    //# recovery, DeliveredData is the change in snd.una.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= type=test
+    //= reason=Strict default, zero timer-entry credit, repeated old SACK with no credit, fresh current ACK, signed cumulative trimming, advancing ACK entry and RTO cancellation; active-delivery test additionally covers omission/overlap/wrap and exhaustion.
+    //# Furthermore, for any TCP
+    //# (with or without SACK), the sum of DeliveredData must agree with the
+    //# forward progress over the same time interval.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Strict default, zero timer-entry credit, repeated old SACK with no credit, fresh current ACK, signed cumulative trimming, advancing ACK entry and RTO cancellation; active-delivery test additionally covers omission/overlap/wrap and exhaustion.
+    //# On every ACK during recovery compute:
+    //#
+    //#    DeliveredData = change_in(snd.una) + change_in(SACKd)
+    //#    prr_delivered += DeliveredData
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= type=test
+    //= reason=Strict default, zero timer-entry credit, repeated old SACK with no credit, fresh current ACK, signed cumulative trimming, advancing ACK entry and RTO cancellation; active-delivery test additionally covers omission/overlap/wrap and exhaustion.
+    //# DeliveredData: The total number of bytes that the current ACK
+    //# indicates have been delivered to the receiver.
+    fn strict_prr_default_timer_entry_and_current_ack_epoch() {
+        assert_eq!(
+            ConnectionConfig::default().prr_algorithm,
+            PrrAlgorithm::Rfc6937Crb
+        );
+        assert!(!ConnectionConfig::default().prr);
+        for iss in [0, u32::MAX - 4999] {
+            let mut a = strict_flight(iss);
+            strict_ack(&mut a, 200_000, 0, &[(7000, 8000)]);
+            assert!(a.prr.is_none()); // Outside recovery: SACK is detection evidence.
+            assert!(a.rack_entry_delivery.is_none());
+            a.timeout(225_000).unwrap();
+            assert_eq!(a.prr.unwrap().counters(), (10_000, 0, 0));
+            assert_eq!(a.prr.unwrap().credit(), 0);
+            assert_eq!(a.transmit(225_000, &mut [0; 1500]), Ok(None));
+            strict_ack(&mut a, 226_000, 0, &[(7000, 8000)]);
+            assert_eq!(a.prr.unwrap().credit(), 0); // No old ACK replay/floor.
+            strict_ack(&mut a, 227_000, 0, &[(7000, 9000)]);
+            assert_eq!(a.prr.unwrap().counters().1, 1000);
+            prr_packet(&mut a, 227_000);
+            assert_eq!(a.prr.unwrap().counters().2, 1000);
+            strict_ack(&mut a, 228_000, 8000, &[(8000, 9000)]);
+            assert_eq!(a.prr.unwrap().counters().1, 8000); // signed SACK trimming
+            let rto = a.rto_deadline.unwrap();
+            a.timeout(rto).unwrap();
+            assert!(a.prr.is_none()); // No delivery carries to another epoch.
+
+            let mut a = strict_flight(iss);
+            a.config.rack = false;
+            strict_ack(&mut a, 200_000, 1000, &[(4000, 10_000)]);
+            assert_eq!(a.prr.unwrap().counters(), (9000, 7000, 0));
+            // Current advancing entry ACK counted once, post-ACK flight retained.
+            prr_packet(&mut a, 200_000);
+            strict_ack(&mut a, 200_001, 1000, &[(4000, 10_000)]);
+        }
+    }
+
+    #[test]
+    fn strict_prr_zero_window_cancels_epoch_before_persist_and_rearms_rto() {
+        for iss in [0, u32::MAX - 4999] {
+            let mut a = strict_flight(iss);
+            strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
+            while a.prr.unwrap().credit() >= 1000 {
+                prr_packet(&mut a, 200_000);
+            }
+            let point = a.sack_recovery.unwrap().recovery_point;
+            let target = a.congestion.ssthresh();
+            let seq = a.receive.next();
+            let una = a.snd_una;
+            inject(&mut a, 201_000, seq, una, ACK, 0, &[]);
+            assert!(a.prr.is_none());
+            assert!(a.sack_recovery.is_none());
+            assert_eq!(a.sack_guard, Some(point));
+            assert_eq!(a.congestion.cwnd(), target);
+            assert_eq!(a.rack.deadline, None);
+            // Outstanding data probes on the selected RTO; only unsent data
+            // uses the separate persist timer.
+            assert_eq!(a.persist_deadline, None);
+            let persist = a.rto_deadline.unwrap();
+            a.timeout(persist).unwrap();
+            assert_eq!(
+                a.transmit(persist, &mut [0; 20]),
+                Err(Error::OutputTooSmall)
+            );
+            assert!(a.probe_pending);
+            let bytes = packet(&mut a, persist);
+            assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 1);
+            assert!(a.rto_deadline.is_some());
+            assert!(a.persist_deadline.is_none());
+            // Responsive persist must stay live even across the user timeout.
+            inject(&mut a, persist + 1, seq, una, ACK, 0, &[]);
+            assert!(a.user_deadline().is_none());
+            inject(&mut a, persist + 2, seq, una, ACK, 65_535, &[]);
+            assert!(a.persist_deadline.is_none());
+            assert!(a.rto_deadline.is_some());
+            assert!(a.prr.is_none());
+            assert!(!a.start_sack_recovery()); // Old flight cannot reenter.
+            let rto = a.rto_deadline.unwrap();
+            a.timeout(rto).unwrap();
+            let bytes = packet(&mut a, rto);
+            // The latest one-byte probe split the head transmission. RTO
+            // retains that copy boundary instead of including its suffix.
+            assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 1);
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-4
+    //= type=test
+    //= reason=Rfc6937Crb with negotiated SACK, valid RACK ledger, bulk queued data and open rwnd. Receiver-derived minimal/isolated/burst ACKs check each equation and actual output; measured final pipe equals target. Boundary ACK credit/counters are traced before epoch exit; separately measured reduced-cwnd handoff stays within that final equation budget. Excess-loss burst without voluntary reductions is not used as proof of the conditional burst property.
+    //# If there are minimal losses, PRR will converge to exactly the target
+    //# window chosen by the congestion control algorithm.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-4
+    //= type=test
+    //= reason=Rfc6937Crb with negotiated SACK, valid RACK ledger, bulk queued data and open rwnd. Receiver-derived minimal/isolated/burst ACKs check each equation and actual output; measured final pipe equals target. Boundary ACK credit/counters are traced before epoch exit; separately measured reduced-cwnd handoff stays within that final equation budget. Excess-loss burst without voluntary reductions is not used as proof of the conditional burst property.
+    //# Implicit window reductions, due to multiple isolated losses during
+    //# recovery, cause later voluntary reductions to be skipped.  For small
+    //# numbers of losses, the window size ends at exactly the window chosen
+    //# by the congestion control algorithm.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-4
+    //= type=test
+    //= reason=Rfc6937Crb with negotiated SACK, valid RACK ledger, bulk queued data and open rwnd. Receiver-derived minimal/isolated/burst ACKs check each equation and actual output; measured final pipe equals target. Boundary ACK credit/counters are traced before epoch exit; separately measured reduced-cwnd handoff stays within that final equation budget. Excess-loss burst without voluntary reductions is not used as proof of the conditional burst property.
+    //# For burst losses, earlier voluntary window reductions can be undone
+    //# by sending extra segments in response to ACKs arriving later during
+    //# recovery.  Note that as long as some voluntary window reductions are
+    //# not undone, the final value for pipe will be the same as ssthresh,
+    //# the target cwnd value chosen by the congestion control algorithm.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-4
+    //= type=test
+    //= reason=Strict RACK modified-recovery scope (RFC 8985 section 9.2): full receiver-derived paired ordered/reordered minimal, isolated and burst traces measure identical final actual pipe/target after premature original loss is corrected. Every active ACK/output is equation-checked; boundary handoff is separate. strict_prr_rack_pipe_reordered_originals_and_lost_retransmissions additionally covers lost committed copies and both equation branches. Not literal RFC 6675 or LegacyInitialCredit equivalence.
+    //# For PRR, pipe merely determines which algorithm, PRR or the
+    //# Reduction Bound, is used to compute sndcnt from DeliveredData.
+    fn strict_prr_full_minimal_isolated_and_burst_loss_traces() {
+        // Bulk queued data, no rwnd/application stall, losses below half the
+        // flight. RACK's RFC 8985 modified pipe, not literal RFC 6675 NextSeg.
+        // Measure the boundary-ACK handoff separately: output after exit is
+        // ordinary reduced-cwnd output, NOT an active-epoch PRR proof. The
+        // trace verifies that it fills only the equation's remaining headroom.
+        for iss in [0, u32::MAX - 4999] {
+            for losses in [
+                &[0][..],
+                &[0, 3][..],
+                &[0, 1][..],
+                &[0, 1, 2][..],
+                &[0, 1, 2, 3, 4][..],
+            ] {
+                let mut final_windows = Vec::new();
+                for reordered in [false, true] {
+                    let mut a = strict_flight(iss);
+                    a.write(&[0x66; 20_000]).unwrap();
+                    let base = a.send_base;
+                    let mut received = [false; 30_000];
+                    let mut pending = Vec::new();
+                    let mut now = 200_000;
+                    let mut active_outputs = 0;
+                    let mut voluntary = 0;
+                    let mut undone = 0;
+                    let mut below_target = false;
+                    let mut target: u32 = 0;
+                    // Deliver originals in order, except dropped segments. Each
+                    // ACK reports the receiver's actual union (at most four ranges).
+                    for i in 0..10 {
+                        if !losses.contains(&i) {
+                            pending.push((i * 1000, (i + 1) * 1000, 0));
+                        }
+                    }
+                    if reordered {
+                        // Three later originals arrive first and cause premature
+                        // loss inference. Then the delayed original corrects it.
+                        let original = pending.remove(0);
+                        pending.insert(3, original);
+                    }
+                    for (i, event) in pending.iter_mut().enumerate() {
+                        event.2 = 200_000 + i as u64 * 1000;
+                    }
+                    let mut index = 0;
+                    while index < pending.len() {
+                        let (left, right, arrival) = pending[index];
+                        index += 1;
+                        now = now.max(arrival);
+                        a.timeout(now).unwrap();
+                        received[left..right].fill(true);
+                        let ack = received.iter().take_while(|&&r| r).count();
+                        let mut blocks = Vec::new();
+                        let mut j = ack;
+                        while j < received.len() {
+                            if !received[j] {
+                                j += 1;
+                                continue;
+                            }
+                            let left = j;
+                            while j < received.len() && received[j] {
+                                j += 1;
+                            }
+                            blocks.push((left as u32, j as u32));
+                        }
+                        assert!(blocks.len() <= 4);
+                        // The boundary ACK terminates recovery before output. Measure
+                        // its actual pipe and remaining equation budget explicitly;
+                        // do not mistake cwnd deflation for actual convergence.
+                        let boundary = a.sack_recovery.map_or(usize::MAX, |r| {
+                            r.recovery_point.distance_from(base) as usize
+                        });
+                        if ack >= boundary {
+                            let before_pipe = a.rack.pipe();
+                            let delivered = a
+                                .scoreboard
+                                .unsacked_bytes(a.snd_una, base.wrapping_add(boundary as u32));
+                            let final_pipe = before_pipe - delivered;
+                            let (_, epoch_delivery, epoch_out) = a.prr.unwrap().counters();
+                            let remaining = (epoch_delivery + u64::from(delivered) - epoch_out)
+                                .min(u64::from(target.saturating_sub(final_pipe)));
+                            strict_ack(&mut a, now, ack as u32, &blocks);
+                            assert!(a.prr.is_none());
+                            let trace = a.prr_exit_trace.unwrap();
+                            assert_eq!(trace.counters().1, epoch_delivery + u64::from(delivered));
+                            assert_eq!(trace.counters().2, epoch_out);
+                            assert_eq!(u64::from(trace.credit()), remaining);
+                            assert_eq!(a.rack.pipe(), final_pipe);
+                            let mut handoff_output = 0;
+                            let mut output = [0; 1500];
+                            while let Some(size) = a.transmit(now, &mut output).unwrap() {
+                                handoff_output += wire::parse(ip(tuple()), &output[..size])
+                                    .unwrap()
+                                    .payload
+                                    .len() as u64;
+                            }
+                            assert!(handoff_output <= remaining);
+                            voluntary += u64::from(delivered).saturating_sub(handoff_output);
+                            undone += handoff_output.saturating_sub(u64::from(delivered));
+                            assert_eq!(
+                                voluntary - undone,
+                                trace.counters().1 - trace.counters().2 - handoff_output
+                            );
+                            final_windows.push((a.rack.pipe(), target));
+                            assert_eq!(a.rack.pipe(), target, "losses={losses:?}");
+                            assert_eq!(a.flight(), target, "actual outstanding bytes: {losses:?}");
+                            assert_eq!(a.congestion.cwnd(), target);
+                            break;
+                        }
+                        let before_delivery = a.prr.map_or(0, |p| p.counters().1);
+                        strict_ack(&mut a, now, ack as u32, &blocks);
+                        if a.prr.is_some() {
+                            let ack_delivery = a.prr.unwrap().counters().1 - before_delivery;
+                            target = a.congestion.ssthresh();
+                            let pipe = a.rack.pipe();
+                            below_target |= pipe < target;
+                            let before_out = a.prr.unwrap().counters().2;
+                            loop {
+                                let before = a.prr.unwrap();
+                                // Poll until the actual selector says no output;
+                                // a partial-byte retransmission may use sub-MSS
+                                // credit even though new data would have to bank it.
+                                let attempt = a.transmit(now, &mut [0; 20]);
+                                assert_eq!(a.prr.unwrap().counters(), before.counters());
+                                assert_eq!(a.prr.unwrap().credit(), before.credit());
+                                if attempt == Ok(None) {
+                                    break;
+                                }
+                                assert_eq!(attempt, Err(Error::OutputTooSmall));
+                                let wire = packet(&mut a, now);
+                                let segment = wire::parse(ip(tuple()), &wire).unwrap();
+                                let bytes = segment.payload.len();
+                                assert!(bytes > 0 && bytes as u32 <= before.credit());
+                                assert_eq!(
+                                    a.prr.unwrap().counters().2,
+                                    before.counters().2 + bytes as u64
+                                );
+                                let sent =
+                                    Seq(segment.header.sequence).distance_from(base) as usize;
+                                pending.push((sent, sent + bytes, now + 100_000));
+                                active_outputs += 1;
+                                let p = a.prr.unwrap();
+                                assert!(p.counters().2 <= p.counters().1);
+                            }
+                            // Use actual ACK delivery and emitted bytes, including
+                            // duplicate copies and banked catch-up, not fixed outputs.
+                            let actual = a.prr.unwrap().counters().2 - before_out;
+                            voluntary += ack_delivery.saturating_sub(actual);
+                            undone += actual.saturating_sub(ack_delivery);
+                        } else {
+                            // The bulk sender also polls BEFORE PRR entry: real
+                            // Limited Transmit packets extend RecoverFS/boundary.
+                            // Their ACKs belong to this same receiver event queue.
+                            let mut output = [0; 1500];
+                            while let Some(size) = a.transmit(now, &mut output).unwrap() {
+                                let segment = wire::parse(ip(tuple()), &output[..size]).unwrap();
+                                let bytes = segment.payload.len();
+                                if bytes != 0 {
+                                    let sent =
+                                        Seq(segment.header.sequence).distance_from(base) as usize;
+                                    pending.push((sent, sent + bytes, now + 100_000));
+                                }
+                            }
+                        }
+                        assert!(now < 1_000_000);
+                    }
+                    assert!(a.prr.is_none(), "recovery did not finish: {losses:?}");
+                    assert!(active_outputs > 0);
+                    assert!(below_target);
+                    if losses.len() < 5 {
+                        assert!(
+                            voluntary > undone,
+                            "losses={losses:?}, reordered={reordered}"
+                        );
+                    } else {
+                        // Five losses plus two pre-entry SACKs exhaust the
+                        // reduction of the twelve-segment LT-extended flight:
+                        // do not claim the conditional burst
+                        // theorem for this case merely because the handoff fills cwnd.
+                        assert_eq!(voluntary, undone);
+                    }
+                }
+                // Same delivery interval/loss pattern, corrected premature time
+                // loss versus ordinary ordering: actual final window agrees.
+                assert_eq!(final_windows.len(), 2);
+                assert_eq!(final_windows[0], final_windows[1]);
+            }
+        }
+    }
+
+    #[test]
+    fn strict_prr_rack_pipe_reordered_originals_and_lost_retransmissions() {
+        for iss in [0, u32::MAX - 4999] {
+            let mut a = strict_flight(iss);
+            strict_ack(&mut a, 200_000, 0, &[(7000, 8000)]);
+            assert_eq!(a.rack.pipe(), 9000); // SACKed bytes excluded, originals live.
+            a.timeout(225_000).unwrap();
+            assert_eq!(a.rack.pipe(), 2000); // Seven premature time losses excluded.
+            assert_eq!(a.prr.unwrap().credit(), 0);
+            // Reordered originals actually arrive. Loss assumptions do not add
+            // delivery; each ACK adds only new scoreboard bytes and the equation
+            // limits the emitted replacement. This is modified RACK recovery.
+            strict_ack(&mut a, 226_000, 0, &[(3000, 4000), (7000, 8000)]);
+            assert!(a.transport_info().reordering > 3);
+            assert_eq!(a.rack.pipe(), 2000);
+            prr_packet(&mut a, 226_000);
+            assert_eq!(a.rack.pipe(), 3000); // The committed copy is in pipe.
+            strict_ack(&mut a, 227_000, 0, &[(3000, 5000), (7000, 8000)]);
+            assert_eq!(a.rack.pipe(), 3000);
+            prr_packet(&mut a, 227_000);
+            assert_eq!(a.rack.pipe(), 4000);
+
+            let mut a = strict_flight(iss);
+            strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
+            assert_eq!(a.rack.pipe(), 0);
+            for _ in 0..3 {
+                prr_packet(&mut a, 200_000);
+            }
+            assert_eq!(a.rack.pipe(), 3000);
+            strict_ack(&mut a, 300_000, 0, &[(1000, 2000), (7000, 10_000)]);
+            assert_eq!(a.congestion.ssthresh(), 2500);
+            assert_eq!(a.rack.pipe(), 1000); // SACKed copy + lost copy excluded.
+            let (seq, _) = prr_packet(&mut a, 300_000);
+            assert_eq!(seq, a.iss.wrapping_add(1).0); // Below HighRxt, not NextSeg.
+            assert_eq!(a.rack.pipe(), 2000);
+            strict_ack(&mut a, 400_000, 2000, &[(7000, 10_000)]);
+            assert_eq!(a.congestion.ssthresh(), 2500); // Same copy-loss window.
+            assert_eq!(a.rack.pipe(), 0);
+            let (seq, _) = prr_packet(&mut a, 400_000);
+            assert_eq!(seq, a.iss.wrapping_add(2001).0);
+            assert_eq!(a.rack.pipe(), 1000);
+
+            // With bulk new data, the same lost-copy event leaves pipe ABOVE
+            // the newly reduced target. Proportional credit, not pipe headroom,
+            // forbids retransmission until delivery catches up (or RTO cancels).
+            let mut a = strict_flight(iss);
+            a.write(&[0x66; 10_000]).unwrap();
+            strict_ack(&mut a, 200_000, 0, &[(3000, 10_000)]);
+            while a.prr.unwrap().credit() >= 1000 {
+                prr_packet(&mut a, 200_000);
+            }
+            assert_eq!(a.rack.pipe(), 5000);
+            strict_ack(&mut a, 300_000, 0, &[(1000, 2000), (3000, 10_000)]);
+            assert_eq!(a.congestion.ssthresh(), 2500);
+            assert_eq!(a.rack.pipe(), 3000);
+            assert_eq!(a.prr.unwrap().credit(), 0);
+            assert_eq!(a.transmit(300_000, &mut [0; 1500]), Ok(None));
+            let rto = a.rto_deadline.unwrap();
+            a.timeout(rto).unwrap();
+            assert!(a.prr.is_none());
+        }
+    }
+
+    #[test]
+    fn strict_prr_nonrack_entry_is_credit_limited_not_forced_smss() {
+        for iss in [0, u32::MAX - 4999] {
+            let mut a = strict_flight(iss);
+            a.config.rack = false;
+            assert!(a.start_sack_recovery());
+            assert_eq!(a.prr.unwrap().credit(), 0);
+            assert_eq!(a.transmit(200_000, &mut [0; 1500]), Ok(None));
+            // One byte of fresh SACK delivery, no IsLost inference, pipe above
+            // target: CEIL(1*5000/10000)=1. RFC 6675's forced SMSS would exceed
+            // this budget. Preserve the composition TODO, not a conformance waiver.
+            strict_ack(&mut a, 200_001, 0, &[(9000, 9001)]);
+            assert_eq!(a.prr.unwrap().credit(), 1);
+            assert_eq!(prr_packet(&mut a, 200_001).1, 1);
+            assert_eq!(a.prr.unwrap().counters(), (10_000, 1, 1));
+        }
+    }
+
+    #[test]
+    fn strict_prr_capacity_backed_ledger_preserves_credit_past_old_limit() {
+        let mut a = strict_flight(0);
+        strict_ack(&mut a, 200_000, 0, &[(3000, 10_000)]);
+        for _ in 0..3 {
+            prr_packet(&mut a, 200_000);
+        }
+        for _ in 0..256 {
+            a.write(&[0x66]).unwrap();
+            let before = a.prr.unwrap();
+            let bytes = packet(&mut a, 200_000);
+            let count = wire::parse(ip(tuple()), &bytes).unwrap().payload.len() as u32;
+            assert_eq!(count, 1);
+            assert!(count <= before.credit());
+            assert!(before.counters().2 + u64::from(count) <= before.counters().1);
+            assert!(a.rack.valid());
+            assert_eq!(a.prr.unwrap().counters().2, before.counters().2 + 1);
+        }
+        assert!(a.prr.is_some());
+    }
+
     #[test]
     fn rack_single_sacked_segment_uses_same_rtt_window_for_four_and_ten_packets() {
         for iss in [100, u32::MAX - 4999] {
@@ -8578,6 +9156,7 @@ mod tests {
                     sack: true,
                     rack: true,
                     prr: true,
+                    prr_algorithm: PrrAlgorithm::LegacyInitialCredit,
                     initial_window: InitialWindow::Iw10,
                     ..config(65_536, 1000)
                 };
@@ -8638,6 +9217,7 @@ mod tests {
             sack: true,
             rack: true,
             prr: true,
+            prr_algorithm: PrrAlgorithm::LegacyInitialCredit,
             tlp: true,
             peer_max_ack_delay_us: 0,
             rto_min_us: 200_000,
@@ -8714,6 +9294,7 @@ mod tests {
                 sack: true,
                 rack: true,
                 prr: true,
+                prr_algorithm: PrrAlgorithm::LegacyInitialCredit,
                 tlp: true,
                 peer_max_ack_delay_us: 0,
                 rto_min_us: 200_000,
@@ -9354,7 +9935,7 @@ mod tests {
     //# plus the (signed) change in SACKd.
     fn prr_active_delivery_matches_signed_scoreboard_delta() {
         for iss in [0, u32::MAX - 4999] {
-            let mut a = rack_flight(iss);
+            let mut a = strict_flight(iss);
             rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
             a.timeout(225_000).unwrap();
             assert!(a.prr.is_some());
@@ -9384,7 +9965,7 @@ mod tests {
             assert!(a.rack_entry_delivery.is_none());
             assert!(a.sack_recovery.is_none());
 
-            let mut a = rack_flight(iss);
+            let mut a = strict_flight(iss);
             rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
             a.timeout(225_000).unwrap();
             assert!(a.prr.is_some());
@@ -9406,7 +9987,7 @@ mod tests {
     //# RecoverFS = snd.nxt-snd.una // FlightSize at the start of recovery
     fn prr_entry_snapshots_flight_after_advancing_ack() {
         for iss in [0, u32::MAX - 4999] {
-            let mut a = rack_flight(iss);
+            let mut a = strict_flight(iss);
             a.config.rack = false; // Exercise ACK-driven RFC 6675 entry, not timer entry.
             let nxt = a.snd_nxt;
             rack_sack(&mut a, 200_000, 1000, &[(4000, 10_000)]);
@@ -9424,7 +10005,7 @@ mod tests {
     #[test]
     // Characterization, not an RFC 6937 output-bound annotation: persist
     // probes are reachable with active, exhausted PRR and bypass its counters.
-    fn prr_special_output_reachability_and_persist_accounting_gap() {
+    fn legacy_prr_special_output_reachability_and_persist_accounting_gap() {
         for iss in [0, u32::MAX - 4999] {
             let mut a = rack_flight(iss);
             a.config.tlp = true;
@@ -10241,6 +10822,7 @@ mod tests {
             sack: false,
             rack: true,
             prr: true,
+            prr_algorithm: PrrAlgorithm::LegacyInitialCredit,
             ..config(4096, 1000)
         };
         let (mut a, mut b) = pair(cfg, 0);
@@ -10281,6 +10863,7 @@ mod tests {
             sack: true,
             rack: true,
             prr: true,
+            prr_algorithm: PrrAlgorithm::LegacyInitialCredit,
             ..config(65_536, 1000)
         };
         let mut a = Connection::active(tuple(), cfg.clone(), 0, 0).unwrap();
