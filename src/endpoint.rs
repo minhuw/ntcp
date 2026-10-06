@@ -54,6 +54,8 @@ pub struct EndpointConfig {
     pub reuse_time_wait: bool,
     pub max_listeners: usize,
     pub max_control_packets: usize,
+    // Bounded FIFO of local/remote IP pairs with inferred initial/restart loss.
+    pub max_setup_cache_entries: usize,
     pub max_buffer_bytes: usize,
     pub hop_limit: u8,
     pub dscp: u8,
@@ -70,6 +72,7 @@ impl Default for EndpointConfig {
             reuse_time_wait: false,
             max_listeners: 64,
             max_control_packets: 64,
+            max_setup_cache_entries: 64,
             max_buffer_bytes: 256 * 1024 * 1024,
             hop_limit: 64,
             dscp: 0,
@@ -274,6 +277,9 @@ pub struct Endpoint {
     buffer_bytes: usize,
     per_connection_bytes: usize,
     receive_pool: Vec<ReceiveBuffer>,
+    // ponytail: conservative FIFO loss retention until eviction; add path-qualified
+    // aging only when measured deployment behavior warrants it.
+    setup_loss_cache: VecDeque<(IpAddr, IpAddr)>,
 }
 
 fn reserved_vec<T>(capacity: usize) -> Result<Vec<T>, EndpointError> {
@@ -304,7 +310,14 @@ impl Endpoint {
         now: Instant,
         address_policy: F,
     ) -> Result<Self, EndpointError> {
-        if config.connection.challenge_ack_limit == 0
+        if !(1..=1_024).contains(&config.max_setup_cache_entries)
+            || !config.connection.timebase.valid()
+            || config.connection.time_wait_us < 240_000_000
+            || config.connection.time_wait_us
+                < 2 * config.connection.timebase.max_segment_lifetime_us
+            || config.connection.timestamp_bytes_per_tick == 0
+            || config.connection.timestamp_bytes_per_tick >= 1 << 31
+            || config.connection.challenge_ack_limit == 0
             || config.connection.challenge_ack_interval_us == 0
             || config.max_connections == 0
             || config.connection.send_ip_payload_limit
@@ -325,6 +338,10 @@ impl Endpoint {
                 .filter(|&budget| budget >= if config.connection.timestamps { 40 } else { 28 })
                 .ok_or(Error::InvalidArgument)?;
         }
+        let mut setup_loss_cache = VecDeque::new();
+        setup_loss_cache
+            .try_reserve_exact(config.max_setup_cache_entries)
+            .map_err(|_| Error::NoMemory)?;
         let count = config.max_connections;
         let listeners_count = config.max_listeners;
         let event_capacity = count
@@ -392,6 +409,7 @@ impl Endpoint {
             deadlines: Deadlines::new(count).map_err(|_| Error::NoMemory)?,
             config,
             secret,
+            setup_loss_cache,
             now,
             isn_clock: (now / 4) as u32,
             last_isn_time: now,
@@ -424,6 +442,9 @@ impl Endpoint {
     fn clock(&mut self, now: Instant) -> Result<(), EndpointError> {
         if now < self.now {
             return Err(Error::TimeWentBackwards.into());
+        }
+        if self.config.connection.timestamps && now / 1_000 - self.now / 1_000 >= 1 << 31 {
+            return Err(Error::AmbiguousTimeJump.into());
         }
         self.now = now;
         Ok(())
@@ -656,6 +677,20 @@ impl Endpoint {
                         .saturating_sub(self.buffer_bytes))
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-7.1
+    //= reason=Endpoint derives offset using HMAC-SHA256 secret, tuple and ISS nonce in the separate ntcp timestamp offset domain before first output; ISS is an input, never the offset. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset so peer PAWS sees no random jump; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, echo/RTT/wrap and reuse rollback tests cover the policy.
+    //# It is therefore RECOMMENDED to generate a random, per-
+    //# connection offset to be used with the clock source when generating
+    //# the Timestamps option value (see Section 5.4).
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-7
+    //= reason=Endpoint derives offset using HMAC-SHA256 secret, tuple and ISS nonce in the separate ntcp timestamp offset domain before first output; ISS is an input, never the offset. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset so peer PAWS sees no random jump; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, echo/RTT/wrap and reuse rollback tests cover the policy.
+    //# It is therefore
+    //# RECOMMENDED to generate a random, per-connection offset to be used
+    //# with the clock source when generating the Timestamps option value
+    //# (see Section 5.4).
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-12
+    //= reason=Bounded local/remote-IP FIFO records transport-inferred initial/restart burst loss only, not setup success or unmeasured telemetry. Later connections select RFC3390/Rfc5681; cache capacity/eviction/no-loss behavior are tested. Retention is deliberately conservative until FIFO eviction; no deployment monitoring claim.
+    //# The sender SHOULD cache such information about connection setups using an initial window larger than allowed by RFC 3390, and new connections SHOULD fall back to the initial window allowed by RFC 3390 if there is evidence of performance issues.
     fn new_connection(
         &mut self,
         tuple: Tuple,
@@ -664,10 +699,18 @@ impl Endpoint {
     ) -> Result<Connection, Error> {
         let mut receive = self.receive_pool.pop();
         let pooled = receive.is_some();
-        let result = match syn {
+        let mut connection_config = self.config.connection.clone();
+        if connection_config.initial_window == crate::InitialWindow::Iw10
+            && self
+                .setup_loss_cache
+                .contains(&(tuple.local.ip(), tuple.remote.ip()))
+        {
+            connection_config.initial_window = crate::InitialWindow::Rfc5681;
+        }
+        let mut result = match syn {
             Some(syn) => Connection::passive_with_receive(
                 tuple,
-                self.config.connection.clone(),
+                connection_config,
                 iss,
                 self.now,
                 syn,
@@ -675,12 +718,19 @@ impl Endpoint {
             ),
             None => Connection::active_with_receive(
                 tuple,
-                self.config.connection.clone(),
+                connection_config,
                 iss,
                 self.now,
                 &mut receive,
             ),
         };
+        if let Ok(connection) = &mut result {
+            let mut domain = *b"ntcp timestamp offset\0\0\0\0";
+            let len = domain.len();
+            domain[len - 4..].copy_from_slice(&iss.to_be_bytes());
+            let tag = self.digest(&domain, tuple);
+            connection.set_timestamp_offset(u32::from_be_bytes(tag[..4].try_into().unwrap()));
+        }
         if let Some(receive) = receive {
             self.receive_pool.push(receive);
         }
@@ -933,6 +983,18 @@ impl Endpoint {
     }
 
     fn refresh(&mut self, index: usize) {
+        if let Some(slot) = &self.slots[index]
+            && slot.connection.iw_setup_loss()
+        {
+            let tuple = slot.connection.tuple();
+            let key = (tuple.local.ip(), tuple.remote.ip());
+            if !self.setup_loss_cache.contains(&key) {
+                if self.setup_loss_cache.len() == self.config.max_setup_cache_entries {
+                    self.setup_loss_cache.pop_front();
+                }
+                self.setup_loss_cache.push_back(key);
+            }
+        }
         if let Some(slot) = self.slots[index].as_ref()
             && (slot.connection.handshake_complete()
                 || (slot.connection.state() == State::Closed
@@ -1098,6 +1160,17 @@ impl Endpoint {
     //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
     //= reason=ACK-derived reset_for output provides the restarted, unsynchronized peer response; end-to-end restart test proves the sequence.
     //# A legitimate peer, after restart, would not have a TCB in the synchronized state. Thus, when the ACK arrives, the peer should send a RST segment back with the sequence number derived from the ACK field that caused the RST.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+    //= reason=Reactive RST uses (0,incoming TSval) independently of local TS configuration/negotiation when the IP payload budget permits 32 TCP bytes. At budgets 28..31 the optional TS is omitted rather than exceeding the path bound; this bounded SHOULD departure is tested for ACK/no-ACK resets. SYN-SENT and synchronized handshake rejection preserve the same echo policy.
+    //# While still under discussion, to enable research into this area it is
+    //# now RECOMMENDED that when generating an <RST>, if the segment causing
+    //# the <RST> to be generated contains a Timestamps option, the <RST>
+    //# should also contain a Timestamps option.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+    //= reason=Reactive RST uses (0,incoming TSval) independently of local TS configuration/negotiation when the IP payload budget permits 32 TCP bytes. At budgets 28..31 the optional TS is omitted rather than exceeding the path bound; this bounded SHOULD departure is tested for ACK/no-ACK resets. SYN-SENT and synchronized handshake rejection preserve the same echo policy.
+    //# In the <RST> segment,
+    //# SEG.TSecr SHOULD be set to SEG.TSval from the incoming segment and
+    //# SEG.TSval SHOULD be set to zero.
     fn reset_for(
         &mut self,
         ip: IpMetadata,
@@ -1152,23 +1225,24 @@ impl Endpoint {
                 source_route: route,
                 ..OutgoingIpv4Options::default()
             },
-            // Scope: Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial. Partial evidence; closure remains TODO.
+            // Scope: Reactive RST uses (0,incoming TSval) independently of local TS configuration/negotiation when the IP payload budget permits 32 TCP bytes. At budgets 28..31 the optional TS is omitted rather than exceeding the path bound; this bounded SHOULD departure is tested for ACK/no-ACK resets. SYN-SENT and synchronized handshake rejection preserve the same echo policy.
             //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
-            //= reason=Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial. Partial evidence; closure remains TODO.
+            //= reason=Reactive RST uses (0,incoming TSval) independently of local TS configuration/negotiation when the IP payload budget permits 32 TCP bytes. At budgets 28..31 the optional TS is omitted rather than exceeding the path bound; this bounded SHOULD departure is tested for ACK/no-ACK resets. SYN-SENT and synchronized handshake rejection preserve the same echo policy.
             //# While still under discussion, to enable research into this area it is
             //# now RECOMMENDED that when generating an <RST>, if the segment causing
             //# the <RST> to be generated contains a Timestamps option, the <RST>
             //# should also contain a Timestamps option.
-            // Scope: Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial. Partial evidence; closure remains TODO.
+            // Scope: Reactive RST uses (0,incoming TSval) independently of local TS configuration/negotiation when the IP payload budget permits 32 TCP bytes. At budgets 28..31 the optional TS is omitted rather than exceeding the path bound; this bounded SHOULD departure is tested for ACK/no-ACK resets. SYN-SENT and synchronized handshake rejection preserve the same echo policy.
             //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
-            //= reason=Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial. Partial evidence; closure remains TODO.
+            //= reason=Reactive RST uses (0,incoming TSval) independently of local TS configuration/negotiation when the IP payload budget permits 32 TCP bytes. At budgets 28..31 the optional TS is omitted rather than exceeding the path bound; this bounded SHOULD departure is tested for ACK/no-ACK resets. SYN-SENT and synchronized handshake rejection preserve the same echo policy.
             //# In the <RST> segment,
             //# SEG.TSecr SHOULD be set to SEG.TSval from the incoming segment and
             //# SEG.TSval SHOULD be set to zero.
-            segment.options.timestamps.map(|ts| ts.0).filter(|_| {
-                self.config.connection.timestamps
-                    && self.config.connection.send_ip_payload_limit >= 32
-            }),
+            segment
+                .options
+                .timestamps
+                .map(|ts| ts.0)
+                .filter(|_| self.config.connection.send_ip_payload_limit >= 32),
         ));
         self.control_count += 1;
     }
@@ -1391,6 +1465,15 @@ impl Endpoint {
             Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),
             Err(error) => return Err(error.into()),
         };
+        // Reuse keeps the old local virtual clock: peer PAWS must not see a
+        // random jump. Candidate failure leaves the old offset/timer untouched.
+        connection.set_timestamp_offset(
+            self.slots[index]
+                .as_ref()
+                .unwrap()
+                .connection
+                .timestamp_offset(),
+        );
         if let Err(error) = connection.set_application_timeout(application_timeout) {
             self.recycle_connection(connection);
             return Err(error.into());
@@ -2118,5 +2201,82 @@ mod recovery_observation_tests {
         assert!(a.connection_exists(replacement));
         assert!(!a.connection_exists(client));
         assert_eq!(a.transport_info(client), Err(EndpointError::InvalidHandle));
+    }
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-12
+    //= type=test
+    //= reason=Bounded local/remote-IP FIFO records transport-inferred initial/restart burst loss only, not setup success or unmeasured telemetry. Later connections select RFC3390/Rfc5681; cache capacity/eviction/no-loss behavior are tested. Retention is deliberately conservative until FIFO eviction; no deployment monitoring claim.
+    //# The sender SHOULD cache such information about connection setups using an initial window larger than allowed by RFC 3390, and new connections SHOULD fall back to the initial window allowed by RFC 3390 if there is evidence of performance issues.
+    fn iw10_setup_loss_cache_is_bounded_and_selects_fallback() {
+        let cfg = EndpointConfig {
+            max_connections: 16,
+            max_setup_cache_entries: 1,
+            connection: ConnectionConfig {
+                mss: 1_000,
+                nagle: false,
+                initial_window: InitialWindow::Iw10,
+                ..ConnectionConfig::default()
+            },
+            ..EndpointConfig::default()
+        };
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, |_| true).unwrap();
+        let mut now = 0;
+        for host in [2, 3] {
+            loop {
+                let output = a.poll_transmit(now, &mut [0; 2000], 16).unwrap();
+                if !output.more_work {
+                    break;
+                }
+            }
+            let local = "192.0.2.1:40000".parse().unwrap();
+            let remote: SocketAddr = if host == 2 {
+                "192.0.2.2:8080"
+            } else {
+                "192.0.2.3:8080"
+            }
+            .parse()
+            .unwrap();
+            let mut b = Endpoint::new(cfg.clone(), [2; 32], now, |_| true).unwrap();
+            let listener = b.listen(remote, 4).unwrap();
+            let client = a.connect(now, local, remote).unwrap();
+            let (tx, bytes) = packet(&mut a, now);
+            b.input(now, tx.ip, &bytes).unwrap();
+            let (tx, bytes) = packet(&mut b, now + 10);
+            a.input(now + 10, tx.ip, &bytes).unwrap();
+            let (tx, bytes) = packet(&mut a, now + 20);
+            b.input(now + 20, tx.ip, &bytes).unwrap();
+            b.accept(listener).unwrap();
+            // Merely opting in/establishing is not loss evidence.
+            assert!(a.setup_loss_cache.is_empty() || host == 3);
+            let mut other = local;
+            other.set_port(40_001);
+            let fresh = a.connect(now + 20, other, remote).unwrap();
+            assert_eq!(a.transport_info(fresh).unwrap().cwnd, 10_000);
+            a.write(client, &[7; 5_000]).unwrap();
+            // Poll all output including the unrelated fresh SYN, discard data.
+            loop {
+                let output = a.poll_transmit(now + 30, &mut [0; 2000], 16).unwrap();
+                if !output.more_work {
+                    break;
+                }
+            }
+            let deadline = a.slot(client).unwrap().connection.next_deadline().unwrap();
+            a.on_timeout(deadline, 16).unwrap();
+            assert!(a.slot(client).unwrap().connection.iw_setup_loss());
+            assert_eq!(a.setup_loss_cache.len(), 1);
+            assert_eq!(a.setup_loss_cache[0], (local.ip(), remote.ip()));
+            other.set_port(40_002);
+            let fallback = a.connect(deadline, other, remote).unwrap();
+            assert_eq!(a.transport_info(fallback).unwrap().cwnd, 4_000);
+            now = deadline + 100;
+        }
+        let evicted = a
+            .connect(
+                now,
+                "192.0.2.1:40003".parse().unwrap(),
+                "192.0.2.2:8080".parse().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(a.transport_info(evicted).unwrap().cwnd, 10_000);
     }
 }

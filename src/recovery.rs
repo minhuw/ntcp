@@ -186,7 +186,7 @@ pub enum InitialWindow {
 
 impl InitialWindow {
     //= https://www.rfc-editor.org/rfc/rfc6928#section-12
-    //= reason=No monitoring-backed default deployment is claimed: InitialWindow default and ConnectionConfig default select Rfc5681, and test explicitly asserts this. Iw10 is only explicit opt-in; sender monitoring/cache/fallback TODOs still apply when enabled.
+    //= reason=No monitoring-backed default deployment is claimed: InitialWindow default and ConnectionConfig default select Rfc5681, and test explicitly asserts this. Iw10 is only explicit opt-in; deployment monitoring TODOs still apply when enabled; bounded cache/fallback is implemented.
     //# An increased initial window MUST NOT be turned on by default on systems without such
     //# monitoring capabilities.
     //= https://www.rfc-editor.org/rfc/rfc6928#section-2
@@ -202,7 +202,7 @@ impl InitialWindow {
     //# If SMSS > 2190 bytes: IW = 2 * SMSS bytes and MUST NOT be more than 2 segments
     //# If (SMSS > 1095 bytes) and (SMSS <= 2190 bytes): IW = 3 * SMSS bytes and MUST NOT be more than 3 segments
     //# if SMSS <= 1095 bytes: IW = 4 * SMSS bytes and MUST NOT be more than 4 segments
-    fn bytes(self, mss: u32) -> u32 {
+    pub(crate) fn bytes(self, mss: u32) -> u32 {
         match self {
             Self::Rfc5681 => {
                 let segments = if mss > 2_190 {
@@ -291,7 +291,7 @@ impl Congestion {
 
     // SYN negotiation selects the byte bound anew; path changes preserve segment counts.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
-    //= reason=Default RFC5681 SYN/SYNACK loss rule (also conservatively retained for opt-in IW10, whose distinct RFC6928 recommendation remains TODO). Test forces each endpoint timeout and asserts one negotiated effective MSS after successful handshake; failed output cannot grow cwnd.
+    //= reason=Default RFC5681 SYN timeout selects one effective MSS; opt-in IW10 reduction is triggered by more than one committed retry, not merely the first timeout.
     //# Further, if the SYN or SYN/ACK is lost, the initial window used by a sender after a
     //# correctly transmitted SYN MUST be one segment consisting of at most SMSS bytes.
     pub(crate) fn set_initial_mss(&mut self, mss: u32, syn_timed_out: bool) {
@@ -1120,6 +1120,10 @@ impl Congestion {
     //= https://www.rfc-editor.org/rfc/rfc5681#section-4.1
     //= reason=restart_after_idle sets min(cwnd,selected IW), never increases a reduced cwnd; both algorithm choices assert reduced and grown values. iw10_transmit_idle_restart_and_data_rto covers the last-data idle trigger; default_initial_window_piecewise_boundaries and initial_window_uses_negotiated_effective_mss cover default IW calculation.
     //# For the purposes of this standard, we define RW = min(IW,cwnd).
+    pub(crate) fn limit_restart(&mut self, window: u32) {
+        self.cwnd = self.cwnd.min(window);
+    }
+
     pub(crate) fn restart_after_idle(&mut self) {
         self.cwnd = self.cwnd.min(self.initial_window());
         self.acknowledged = 0;

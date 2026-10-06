@@ -499,6 +499,7 @@ mod linux {
             preallocate_connections: 0,
             max_listeners: 1,
             max_control_packets: BUDGET,
+            max_setup_cache_entries: 64,
             max_buffer_bytes: MAX_FLOWS * (5 * 65536 + 1460),
             hop_limit: 64,
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2

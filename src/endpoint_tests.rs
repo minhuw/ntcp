@@ -3007,18 +3007,18 @@ fn time_wait_pending_candidate_timeout_restores_original_tuple() {
 }
 
 #[test]
-// Scope: Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial. Partial evidence; closure remains TODO.
+// Scope: Reactive RST uses (0,incoming TSval) independently of local TS configuration/negotiation when the IP payload budget permits 32 TCP bytes. At budgets 28..31 the optional TS is omitted rather than exceeding the path bound; this bounded SHOULD departure is tested for ACK/no-ACK resets. SYN-SENT and synchronized handshake rejection preserve the same echo policy.
 //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
 //= type=test
-//= reason=Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial. Partial evidence; closure remains TODO.
+//= reason=Reactive RST uses (0,incoming TSval) independently of local TS configuration/negotiation when the IP payload budget permits 32 TCP bytes. At budgets 28..31 the optional TS is omitted rather than exceeding the path bound; this bounded SHOULD departure is tested for ACK/no-ACK resets. SYN-SENT and synchronized handshake rejection preserve the same echo policy.
 //# While still under discussion, to enable research into this area it is
 //# now RECOMMENDED that when generating an <RST>, if the segment causing
 //# the <RST> to be generated contains a Timestamps option, the <RST>
 //# should also contain a Timestamps option.
-// Scope: Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial. Partial evidence; closure remains TODO.
+// Scope: Reactive RST uses (0,incoming TSval) independently of local TS configuration/negotiation when the IP payload budget permits 32 TCP bytes. At budgets 28..31 the optional TS is omitted rather than exceeding the path bound; this bounded SHOULD departure is tested for ACK/no-ACK resets. SYN-SENT and synchronized handshake rejection preserve the same echo policy.
 //= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
 //= type=test
-//= reason=Reactive RST echoes (0,incoming TSval) when timestamps config enabled and path budget>=32; endpoint and SYN-SENT paths filter it when local timestamp config is disabled. SHOULD applies to incoming TS independently of negotiation. Closure: test disabled config, no-ACK reset and insufficient-budget cases; preserve timestamp echo when encodable or document explicit standards-based bounded omission reason. Existing enabled-config endpoint assertion is partial. Partial evidence; closure remains TODO.
+//= reason=Reactive RST uses (0,incoming TSval) independently of local TS configuration/negotiation when the IP payload budget permits 32 TCP bytes. At budgets 28..31 the optional TS is omitted rather than exceeding the path bound; this bounded SHOULD departure is tested for ACK/no-ACK resets. SYN-SENT and synchronized handshake rejection preserve the same echo policy.
 //# In the <RST> segment,
 //# SEG.TSecr SHOULD be set to SEG.TSval from the incoming segment and
 //# SEG.TSval SHOULD be set to zero.
@@ -3086,7 +3086,16 @@ fn timestamp_ipv4_option_budget_and_paws_gate_route_updates() {
     let server = b.accept(listener).unwrap();
     let header = wire::parse(ack.ip, &bytes).unwrap().header;
     let changed = completed_route(&[10, 11]);
-    for (value, accepted) in [(0u32, false), (2, true)] {
+    let baseline = wire::parse(ack.ip, &bytes)
+        .unwrap()
+        .options
+        .timestamps
+        .unwrap()
+        .0;
+    for (value, accepted) in [
+        (baseline.wrapping_sub(1), false),
+        (baseline.wrapping_add(1), true),
+    ] {
         let mut options = [1, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 1];
         options[4..8].copy_from_slice(&value.to_be_bytes());
         let mut packet = [0; 32];
@@ -4182,4 +4191,179 @@ fn endpoint_rejects_zero_challenge_budget_configuration() {
             Err(EndpointError::Connection(Error::InvalidArgument))
         ));
     }
+}
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+//= type=test
+//= reason=Reactive RST uses (0,incoming TSval) independently of local TS configuration/negotiation when the IP payload budget permits 32 TCP bytes. At budgets 28..31 the optional TS is omitted rather than exceeding the path bound; this bounded SHOULD departure is tested for ACK/no-ACK resets. SYN-SENT and synchronized handshake rejection preserve the same echo policy.
+//# While still under discussion, to enable research into this area it is
+//# now RECOMMENDED that when generating an <RST>, if the segment causing
+//# the <RST> to be generated contains a Timestamps option, the <RST>
+//# should also contain a Timestamps option.
+//= https://www.rfc-editor.org/rfc/rfc7323#section-5.2
+//= type=test
+//= reason=Reactive RST uses (0,incoming TSval) independently of local TS configuration/negotiation when the IP payload budget permits 32 TCP bytes. At budgets 28..31 the optional TS is omitted rather than exceeding the path bound; this bounded SHOULD departure is tested for ACK/no-ACK resets. SYN-SENT and synchronized handshake rejection preserve the same echo policy.
+//# In the <RST> segment,
+//# SEG.TSecr SHOULD be set to SEG.TSval from the incoming segment and
+//# SEG.TSval SHOULD be set to zero.
+//= https://www.rfc-editor.org/rfc/rfc7323#section-7.1
+//= type=test
+//= reason=Endpoint derives offset using HMAC-SHA256 secret, tuple and ISS nonce in the separate ntcp timestamp offset domain before first output; ISS is an input, never the offset. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset so peer PAWS sees no random jump; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, echo/RTT/wrap and reuse rollback tests cover the policy.
+//# It is therefore RECOMMENDED to generate a random, per-
+//# connection offset to be used with the clock source when generating
+//# the Timestamps option value (see Section 5.4).
+//= https://www.rfc-editor.org/rfc/rfc7323#section-7
+//= type=test
+//= reason=Endpoint derives offset using HMAC-SHA256 secret, tuple and ISS nonce in the separate ntcp timestamp offset domain before first output; ISS is an input, never the offset. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset so peer PAWS sees no random jump; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, echo/RTT/wrap and reuse rollback tests cover the policy.
+//# It is therefore
+//# RECOMMENDED to generate a random, per-connection offset to be used
+//# with the clock source when generating the Timestamps option value
+//# (see Section 5.4).
+fn timestamp_privacy_echo_rtt_and_reactive_reset_without_local_enable() {
+    let (local, remote) = addresses();
+    let mut cfg = config();
+    cfg.connection.timestamps = true;
+    cfg.connection.delayed_ack_us = 0;
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let client = a.connect(0, local, remote).unwrap();
+    let syn = packets(&mut a, 1_000).pop().unwrap();
+    let first = wire::parse(syn.0, &syn.1)
+        .unwrap()
+        .options
+        .timestamps
+        .unwrap()
+        .0;
+    assert_ne!(first, 1);
+    b.input(1_000, syn.0, &syn.1).unwrap();
+    let synack = packets(&mut b, 2_000).pop().unwrap();
+    let reply = wire::parse(synack.0, &synack.1)
+        .unwrap()
+        .options
+        .timestamps
+        .unwrap();
+    assert_eq!(reply.1, first);
+    assert_ne!(reply.0.wrapping_sub(2), first.wrapping_sub(1));
+    a.input(2_000, synack.0, &synack.1).unwrap();
+    let ack = packets(&mut a, 2_000).pop().unwrap();
+    assert_eq!(
+        wire::parse(ack.0, &ack.1)
+            .unwrap()
+            .options
+            .timestamps
+            .unwrap(),
+        (first.wrapping_add(1), reply.0)
+    );
+    b.input(2_000, ack.0, &ack.1).unwrap();
+    b.accept(listener).unwrap();
+    let mut other = local;
+    other.set_port(local.port() + 1);
+    a.connect(2_000, other, remote).unwrap();
+    let second = packets(&mut a, 2_000).pop().unwrap();
+    assert_ne!(
+        wire::parse(second.0, &second.1)
+            .unwrap()
+            .options
+            .timestamps
+            .unwrap()
+            .0
+            .wrapping_sub(2),
+        first.wrapping_sub(1)
+    );
+    a.write(client, b"hello").unwrap();
+    let data = packets(&mut a, 3_000).pop().unwrap();
+    b.input(3_500, data.0, &data.1).unwrap();
+    let ack = packets(&mut b, 3_500).pop().unwrap();
+    assert_eq!(
+        wire::parse(ack.0, &ack.1)
+            .unwrap()
+            .options
+            .timestamps
+            .unwrap()
+            .1,
+        first.wrapping_add(2)
+    );
+    a.input(4_000, ack.0, &ack.1).unwrap();
+    assert_eq!(a.transport_info(client).unwrap().rtt_us, Some(1_000));
+
+    for budget in [28, 31, 32] {
+        for flags in [wire::SYN, wire::ACK] {
+            let mut cfg = config();
+            cfg.connection.send_ip_payload_limit = budget;
+            let mut endpoint = Endpoint::new(cfg, [3; 32], 0, test_policy).unwrap();
+            let h = wire::parse(syn.0, &syn.1).unwrap().header;
+            let input = tw_segment(syn.0, h, 123, 456, flags, Some((77, 0)));
+            endpoint.input(1_000, syn.0, &input).unwrap();
+            let reset = packets(&mut endpoint, 1_000).pop().unwrap();
+            let reset = wire::parse(reset.0, &reset.1).unwrap();
+            assert_eq!(reset.options.timestamps, (budget >= 32).then_some((0, 77)));
+            assert_eq!(
+                reset.header.flags,
+                if flags == wire::ACK {
+                    wire::RST
+                } else {
+                    wire::RST | wire::ACK
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn timestamp_offset_time_wait_reuse_and_rollback_keep_virtual_clock() {
+    let mut cfg = config();
+    cfg.connection.timestamps = true;
+    let (mut b, _, old, ip, h, ts) = time_wait_endpoint(cfg);
+    let duplicate_fin = tw_segment(
+        ip,
+        h,
+        h.acknowledgment.wrapping_sub(1),
+        h.sequence,
+        wire::FIN | wire::ACK,
+        Some((ts, 0)),
+    );
+    b.input(4_000, ip, &duplicate_fin).unwrap();
+    let output = packets(&mut b, 4_000).pop().unwrap();
+    let old_value = wire::parse(output.0, &output.1)
+        .unwrap()
+        .options
+        .timestamps
+        .unwrap()
+        .0;
+    let seq = h.acknowledgment.wrapping_add(100);
+    let syn = tw_segment(ip, h, seq, 0, wire::SYN, Some((ts.wrapping_add(1), 0)));
+    b.input(5_000, ip, &syn).unwrap();
+    assert_eq!(
+        b.poll_transmit(5_000, &mut [0; 19], 16),
+        Err(EndpointError::Connection(Error::OutputTooSmall))
+    );
+    let output = packets(&mut b, 5_000).pop().unwrap();
+    let synack = wire::parse(output.0, &output.1).unwrap();
+    assert_eq!(
+        synack.options.timestamps.unwrap().0,
+        old_value.wrapping_add(1)
+    );
+    let reset = tw_segment(
+        ip,
+        h,
+        seq.wrapping_add(1),
+        synack.header.sequence.wrapping_add(1),
+        wire::RST | wire::ACK,
+        None,
+    );
+    b.input(5_100, ip, &reset).unwrap();
+    assert_eq!(b.state(old), Ok(State::TimeWait));
+    b.input(6_000, ip, &duplicate_fin).unwrap();
+    let output = packets(&mut b, 6_000).pop().unwrap();
+    assert_eq!(
+        wire::parse(output.0, &output.1)
+            .unwrap()
+            .options
+            .timestamps
+            .unwrap()
+            .0,
+        old_value.wrapping_add(2)
+    );
 }

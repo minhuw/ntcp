@@ -41,6 +41,7 @@ pub struct Header {
 pub struct Options {
     pub mss: Option<u16>,
     pub window_scale: Option<u8>,
+    pub invalid_window_scale: Option<u8>,
     pub timestamps: Option<(u32, u32)>,
     pub sack_permitted: bool,
     pub sack_blocks: [Option<(u32, u32)>; 4],
@@ -192,14 +193,17 @@ fn read_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> 
                         //= reason=Parser clamps peer exponent to 14; local exponent search bounded 0..=14. Erratum 5585 is editorial; rejected 5586 does not replace the <2^30 requirement.
                         //# Thus, the shift count
                         //# MUST be limited to 14 (which allows windows of 2^30 = 1 GiB).
-                        // Scope: Mandatory clamp to 14 is implemented/tested; SHOULD log invalid exponent is absent (no event/diagnostic hook). Closure: provide bounded error notification/log integration and assert 15/255 trigger it while effective exponent remains 14. Do not waive logging merely because core is no_std. Partial evidence; closure remains TODO.
+                        // Scope: Parser preserves one invalid raw exponent for the bounded connection diagnostic while keeping the effective WS clamp at 14. Wire 15/255 vectors and connection event coalescing test the notification path.
                         //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
-                        //= reason=Mandatory clamp to 14 is implemented/tested; SHOULD log invalid exponent is absent (no event/diagnostic hook). Closure: provide bounded error notification/log integration and assert 15/255 trigger it while effective exponent remains 14. Do not waive logging merely because core is no_std. Partial evidence; closure remains TODO.
+                        //= reason=Parser preserves one invalid raw exponent for the bounded connection diagnostic while keeping the effective WS clamp at 14. Wire 15/255 vectors and connection event coalescing test the notification path.
                         //# If a
                         //# Window Scale option is received with a shift.cnt value larger than
                         //# 14, the TCP SHOULD log the error but MUST use 14 instead of the
                         //# specified value.
                         options.window_scale = Some(bytes[2].min(14));
+                        if bytes[2] > 14 {
+                            options.invalid_window_scale.get_or_insert(bytes[2]);
+                        }
                     }
                     4 if len == 2 => options.sack_permitted = true,
                     // RFC 2018 section 3: "A SACK option that specifies n blocks
@@ -620,15 +624,19 @@ mod tests {
             //= reason=Parser clamps peer exponent to 14; local exponent search bounded 0..=14. Erratum 5585 is editorial; rejected 5586 does not replace the <2^30 requirement.
             //# Thus, the shift count
             //# MUST be limited to 14 (which allows windows of 2^30 = 1 GiB).
-            // Scope: Mandatory clamp to 14 is implemented/tested; SHOULD log invalid exponent is absent (no event/diagnostic hook). Closure: provide bounded error notification/log integration and assert 15/255 trigger it while effective exponent remains 14. Do not waive logging merely because core is no_std. Partial evidence; closure remains TODO.
+            // Scope: Parser preserves one invalid raw exponent for the bounded connection diagnostic while keeping the effective WS clamp at 14. Wire 15/255 vectors and connection event coalescing test the notification path.
             //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
             //= type=test
-            //= reason=Mandatory clamp to 14 is implemented/tested; SHOULD log invalid exponent is absent (no event/diagnostic hook). Closure: provide bounded error notification/log integration and assert 15/255 trigger it while effective exponent remains 14. Do not waive logging merely because core is no_std. Partial evidence; closure remains TODO.
+            //= reason=Parser preserves one invalid raw exponent for the bounded connection diagnostic while keeping the effective WS clamp at 14. Wire 15/255 vectors and connection event coalescing test the notification path.
             //# If a
             //# Window Scale option is received with a shift.cnt value larger than
             //# 14, the TCP SHOULD log the error but MUST use 14 instead of the
             //# specified value.
             assert_eq!(parsed.options.window_scale, Some(scale.min(14)));
+            assert_eq!(
+                parsed.options.invalid_window_scale,
+                (scale > 14).then_some(scale)
+            );
             assert_eq!(parsed.header.flags, ACK | FIN | RST | PSH | URG);
         }
         let mut bytes = packet(ip, &[0; 4], &[]);

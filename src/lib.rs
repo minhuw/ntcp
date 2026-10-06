@@ -23,8 +23,8 @@ mod seq;
 pub mod wire;
 
 pub use connection::{
-    CloseReason, ConnectionConfig, ConnectionEvents, Error, Instant, KeepaliveConfig, NetworkError,
-    State, TransportInfo, Tuple,
+    CallerTimebase, CloseReason, ConnectionConfig, ConnectionEvents, Error, Instant,
+    KeepaliveConfig, NetworkError, State, TransportInfo, Tuple,
 };
 pub use endpoint::{
     AddressValidation, ConnectionId, Endpoint, EndpointConfig, EndpointError, Event,

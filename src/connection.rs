@@ -12,7 +12,32 @@ use crate::{
     wire::{self, ACK, CWR, ECE, FIN, Header, IpMetadata, PSH, RST, SYN, Segment, URG},
 };
 
+// Caller-owned monotonic microseconds, approximately proportional to real time.
+// No wall/system clock is sampled. Resolution is declared and validated below.
 pub type Instant = u64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallerTimebase {
+    pub units_per_second: u64,
+    pub resolution_us: u64,
+    pub max_segment_lifetime_us: u64,
+}
+impl Default for CallerTimebase {
+    fn default() -> Self {
+        Self {
+            units_per_second: 1_000_000,
+            resolution_us: 1,
+            max_segment_lifetime_us: 120_000_000,
+        }
+    }
+}
+impl CallerTimebase {
+    pub(crate) fn valid(self) -> bool {
+        self.units_per_second == 1_000_000
+            && (1..=1_000).contains(&self.resolution_us)
+            && (1..=255_000_000).contains(&self.max_segment_lifetime_us)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ConnectionConfig {
@@ -36,6 +61,9 @@ pub struct ConnectionConfig {
     pub recovery_algorithm: RecoveryAlgorithm,
     pub initial_window: InitialWindow,
     pub timestamps: bool,
+    pub timebase: CallerTimebase,
+    // Successful sequence-space bytes (including copies and SYN/FIN) per ms; <2^31.
+    pub timestamp_bytes_per_tick: u32,
     pub sack: bool,
     // Opt-in RFC 8985 time-based loss detection (requires negotiated SACK
     // and observed minimum RTT >4us with the current 1us time units).
@@ -101,6 +129,8 @@ impl Default for ConnectionConfig {
             recovery_algorithm: RecoveryAlgorithm::default(),
             initial_window: InitialWindow::default(),
             timestamps: false,
+            timebase: CallerTimebase::default(),
+            timestamp_bytes_per_tick: (1 << 30) - 1,
             sack: false,
             rack: false,
             prr: false,
@@ -210,6 +240,8 @@ pub enum Error {
     NoMemory,
     OutputTooSmall,
     TimeWentBackwards,
+    AmbiguousTimeJump,
+    TimestampBudgetExceeded,
     Wire(wire::WireError),
 }
 
@@ -229,6 +261,8 @@ pub struct ConnectionEvents {
     pub urgent: Option<u64>,
     pub retransmission_warning: bool,
     pub network_error: Option<NetworkError>,
+    // One notification per connection, coalesced in the existing bounded event queue.
+    pub invalid_window_scale: Option<u8>,
 }
 
 impl ConnectionEvents {
@@ -247,6 +281,16 @@ fn at_or_after(a: Seq, b: Seq) -> bool {
 
 fn due(deadline: Option<Instant>, now: Instant) -> bool {
     deadline.is_some_and(|deadline| now >= deadline)
+}
+
+// One initial/restart burst, not a duplicate original-transmission ledger.
+#[derive(Clone, Copy, Debug)]
+struct IwEpoch {
+    start: Seq,
+    end: Seq,
+    bytes: u32,
+    open: bool,
+    lost: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -288,6 +332,16 @@ pub(crate) struct Connection {
     peer_scale: u8,
     scaling: bool,
     timestamps: bool,
+    timestamp_offset: u32,
+    timestamp_tick: u64,
+    timestamp_bytes: u32,
+    invalid_scale_reported: bool,
+    iw_epoch: Option<IwEpoch>,
+    iw_started: bool,
+    iw_fallback: bool,
+    iw_setup_loss: bool,
+    syn_loss_detected: bool,
+    syn_retransmissions: u32,
     sack_send: bool,
     sack_receive: bool,
     sack_recovery: Option<SackRecovery>,
@@ -404,7 +458,10 @@ impl Connection {
         now: Instant,
         receive: &mut Option<ReceiveBuffer>,
     ) -> Result<Self, Error> {
-        if (config.tlp && (!config.rack || !config.sack))
+        if !config.timebase.valid()
+            || config.timestamp_bytes_per_tick == 0
+            || config.timestamp_bytes_per_tick >= 1 << 31
+            || (config.tlp && (!config.rack || !config.sack))
             || !(1..=60_000_000).contains(&config.rto_min_us)
             || config.send_capacity == 0
             || config.send_capacity >= 1 << 30
@@ -433,6 +490,7 @@ impl Connection {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.2
             //# For this specification the MSL is taken to be 2 minutes.
             || config.time_wait_us < 240_000_000
+            || config.time_wait_us < 2 * config.timebase.max_segment_lifetime_us
             || tuple.local.is_ipv4() != tuple.remote.is_ipv4()
             || config
                 .keepalive
@@ -499,6 +557,16 @@ impl Connection {
             peer_scale: 0,
             scaling: false,
             timestamps: false,
+            timestamp_offset: 0,
+            timestamp_tick: now / 1_000,
+            timestamp_bytes: 0,
+            invalid_scale_reported: false,
+            iw_epoch: None,
+            iw_started: false,
+            iw_fallback: false,
+            iw_setup_loss: false,
+            syn_loss_detected: false,
+            syn_retransmissions: 0,
             sack_send: false,
             sack_receive: false,
             sack_recovery: None,
@@ -994,6 +1062,7 @@ impl Connection {
         {
             return false;
         }
+        self.note_iw_loss(self.snd_una);
         self.reset_tlp();
         self.rack_entry_delivery = None;
         self.sack_recovery = Some(SackRecovery {
@@ -1054,7 +1123,8 @@ impl Connection {
         if retransmission_lost {
             self.congestion.retransmission_lost(self.data_flight());
         }
-        if self.rack.lowest_lost(self.mss as u32).is_some() {
+        if let Some((start, _)) = self.rack.lowest_lost(self.mss as u32) {
+            self.note_iw_loss(start);
             self.start_sack_recovery();
         }
         if let Some(mut recovery) = self.sack_recovery {
@@ -1222,9 +1292,9 @@ impl Connection {
         Ok(())
     }
 
-    // Scope: Embedding gap: TSval=(caller Instant/1000) mod 2^32 and backwards Instant is rejected; no contract/runtime test guarantees caller microseconds proportional to real time or bounds forward jumps. Closure: define and validate embedding clock requirements, test rate/jump limits and real monotonic clock integration; synthetic wrap vectors prove arithmetic only. Partial evidence; closure remains TODO.
+    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
-    //= reason=Embedding gap: TSval=(caller Instant/1000) mod 2^32 and backwards Instant is rejected; no contract/runtime test guarantees caller microseconds proportional to real time or bounds forward jumps. Closure: define and validate embedding clock requirements, test rate/jump limits and real monotonic clock integration; synthetic wrap vectors prove arithmetic only. Partial evidence; closure remains TODO.
+    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //# Values of this
     //# clock MUST be at least approximately proportional to real time, in
     //# order to measure actual RTT.
@@ -1236,9 +1306,26 @@ impl Connection {
     fn check_time(&self, now: Instant) -> Result<(), Error> {
         if now < self.now {
             Err(Error::TimeWentBackwards)
+        } else if self.config.timestamps && now / 1_000 - self.now / 1_000 >= 1 << 31 {
+            Err(Error::AmbiguousTimeJump)
         } else {
             Ok(())
         }
+    }
+
+    pub(crate) fn timestamp_offset(&self) -> u32 {
+        self.timestamp_offset
+    }
+
+    pub(crate) fn set_timestamp_offset(&mut self, offset: u32) {
+        self.timestamp_offset = offset;
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
+    //= reason=Successful TS-bearing sequence-space bytes (including retransmitted copies and SYN/FIN) are transactionally limited by configured nonzero timestamp_bytes_per_tick <2^31. Exhaustion returns TimestampBudgetExceeded with caller time and protocol state unchanged; next tick resets credit. Boundary/wrap/output rollback tests verify the gate. Physical clock truth remains separately external.
+    //# It MUST tick at least once for each 2^31 bytes sent.
+    fn timestamp_value(&self, now: Instant) -> u32 {
+        ((now / 1_000) as u32).wrapping_add(self.timestamp_offset)
     }
 
     // Classic RFC 3168 only: setup offers remain binding for receive feedback even
@@ -1354,6 +1441,12 @@ impl Connection {
     //= reason=learn_syn copies offered TSval into TS.Recent and ts_latest on both active/passive negotiation.
     //# TSval timestamps sent on <SYN> and <SYN,ACK> segments are used to
     //# initialize PAWS.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+    //= reason=Invalid SYN Window Scale is clamped to 14 and emits at most one invalid_window_scale event per connection; the existing coalesced bounded endpoint event queue carries the diagnostic. Values 15/255 and repeated negotiation are covered without unbounded logging.
+    //# If a
+    //# Window Scale option is received with a shift.cnt value larger than
+    //# 14, the TCP SHOULD log the error but MUST use 14 instead of the
+    //# specified value.
     fn learn_syn(&mut self, syn: &Segment<'_>) {
         self.learn_ecn(syn.header.flags);
         self.sack_send |= self.config.sack && syn.options.sack_permitted;
@@ -1372,6 +1465,15 @@ impl Connection {
         self.last_ack_sent = start;
         self.scaling = syn.options.window_scale.is_some();
         self.peer_scale = syn.options.window_scale.unwrap_or(0).min(14);
+        if let Some(scale) = syn
+            .options
+            .invalid_window_scale
+            .or_else(|| syn.options.window_scale.filter(|&scale| scale > 14))
+            && !self.invalid_scale_reported
+        {
+            self.events.invalid_window_scale = Some(scale);
+            self.invalid_scale_reported = true;
+        }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
         //# If an MSS Option is not received at connection setup, TCP implementations
         //# MUST assume a default send MSS of 536 (576 - 40) for IPv4 or 1220 (1280 -
@@ -1400,7 +1502,7 @@ impl Connection {
             .min(self.config.send_ip_payload_limit - 20 - if self.timestamps { 12 } else { 0 })
             as usize;
         self.congestion
-            .set_initial_mss(self.mss as u32, self.syn_timed_out);
+            .set_initial_mss(self.mss as u32, self.syn_loss_detected);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
         //# The window size MUST be treated as an unsigned number, or else large window
         //# sizes will appear like negative windows and TCP will not work (MUST-1).
@@ -2248,11 +2350,7 @@ impl Connection {
             if h.flags & ACK != 0 && !valid_ack {
                 if h.flags & RST == 0 {
                     self.pending_rst = Some((ack, false));
-                    self.reset_echo = segment
-                        .options
-                        .timestamps
-                        .filter(|_| self.config.timestamps)
-                        .map(|ts| ts.0);
+                    self.reset_echo = segment.options.timestamps.map(|ts| ts.0);
                 }
                 return Ok(());
             }
@@ -2287,15 +2385,15 @@ impl Connection {
         }
 
         // RFC 7323 sections 3.2 and 5.2: RST bypasses PAWS, and its
-        // timestamps never update connection state. Missing TS is silent loss.
-        // Scope: With negotiated TS, missing option silently returns, does not abort and later valid timestamp data succeeds; missing RST option is exempt.
+        // timestamps never update connection state. Missing TS data/ACK silently drops.
+        // Scope: Negotiated missing-TS data/ACK silently drops without abort; RST exempt. Only synchronized non-handshake SYN is challenged and dropped under selected RFC5961 MUST, never accepted or used to update TS/ACK/payload/metadata. Handshake paths retain TS checks. Narrow justified departure from silent SHOULD, not a blanket waiver.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
-        //= reason=With negotiated TS, missing option silently returns, does not abort and later valid timestamp data succeeds; missing RST option is exempt.
+        //= reason=Negotiated missing-TS data/ACK silently drops without abort; RST exempt. Only synchronized non-handshake SYN is challenged and dropped under selected RFC5961 MUST, never accepted or used to update TS/ACK/payload/metadata. Handshake paths retain TS checks. Narrow justified departure from silent SHOULD, not a blanket waiver.
         //# non-<RST> segment is received without a TSopt, a TCP SHOULD silently
         //# drop the segment.
-        // Scope: With negotiated TS, missing option silently returns, does not abort and later valid timestamp data succeeds; missing RST option is exempt.
+        // Scope: Negotiated missing-TS data/ACK silently drops without abort; RST exempt. Only synchronized non-handshake SYN is challenged and dropped under selected RFC5961 MUST, never accepted or used to update TS/ACK/payload/metadata. Handshake paths retain TS checks. Narrow justified departure from silent SHOULD, not a blanket waiver.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
-        //= reason=With negotiated TS, missing option silently returns, does not abort and later valid timestamp data succeeds; missing RST option is exempt.
+        //= reason=Negotiated missing-TS data/ACK silently drops without abort; RST exempt. Only synchronized non-handshake SYN is challenged and dropped under selected RFC5961 MUST, never accepted or used to update TS/ACK/payload/metadata. Handshake paths retain TS checks. Narrow justified departure from silent SHOULD, not a blanket waiver.
         //# A TCP MUST NOT abort a TCP connection because any
         //# segment lacks an expected TSopt.
         // Scope: TS-bearing ACK/data on an established unnegotiated fallback connection is processed normally: payload/window and local-clock RTT progress, no late TS negotiation, TS.Recent/age/latest mutation, PAWS dependence or outgoing TS.
@@ -2377,6 +2475,12 @@ impl Connection {
         let recent_valid = now.saturating_sub(self.ts_recent_at) <= 24 * 86_400_000_000;
         if self.timestamps && h.flags & RST == 0 {
             let Some((value, _)) = segment.options.timestamps else {
+                // Narrow SHOULD departure: SYN is never accepted; selected RFC5961
+                // MUST challenge wins without admitting data or updating TS state.
+                // Handshake SYNs and RST handling retain their original paths.
+                if h.flags & SYN != 0 && !self.handshake_pending() {
+                    self.challenge_ack();
+                }
                 return Ok(());
             };
             if recent_valid && !at_or_after(Seq(value), Seq(self.ts_recent)) {
@@ -2391,23 +2495,22 @@ impl Connection {
 
         // RFC 7323 5.3 R1 is checked above, including SYN: stale SYN is
         // challenged and dropped without timestamp or stream side effects.
-        // Missing TS still silently drops per 7323 3.2; the competing 5961
-        // 4.2 requirement remains an explicit conformance TODO. Neither RFC
-        // has a precedence erratum resolving that case. Handshake paths below
+        // Missing-TS non-handshake SYN follows the narrow SHOULD departure
+        // above; it is challenged, never accepted. Handshake paths below
         // retain their passive/SYN+ACK simultaneous-open handling.
         //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
-        //= reason=Partial evidence; TODO remains for negotiated-TS SYN lacking TSopt. RFC7323 3.2 recommends silent drop, while RFC5961 4.2 mandates a challenge; no listed erratum resolves this precedence. Valid/stale TS SYN challenges now precede window and metadata processing and are tested, including output arbitration. Missing-TS silence is explicitly tested, not waived.
+        //= reason=Selected RFC5961 mitigation challenges and drops synchronized non-handshake SYN regardless of TS presence/sequence, under the existing bounded challenge budget. Narrow RFC7323 missing-TS SHOULD departure accepts no data/ACK/metadata/TS updates; valid/stale TS still traverse PAWS and RST remains exempt. Precedence/output rollback matrix covers all three TS cases.
         //# Instead, the handling of the SYN in the synchronized state SHOULD be
         //# performed as follows:
         // Actor/condition: TCP endpoint; selected blind-attack mitigation.
         //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
-        //= reason=Partial evidence; TODO remains for negotiated-TS SYN lacking TSopt. RFC7323 3.2 recommends silent drop, while RFC5961 4.2 mandates a challenge; no listed erratum resolves this precedence. Valid/stale TS SYN challenges now precede window and metadata processing and are tested, including output arbitration. Missing-TS silence is explicitly tested, not waived.
+        //= reason=Selected RFC5961 mitigation challenges and drops synchronized non-handshake SYN regardless of TS presence/sequence, under the existing bounded challenge budget. Narrow RFC7323 missing-TS SHOULD departure accepts no data/ACK/metadata/TS updates; valid/stale TS still traverse PAWS and RST remains exempt. Precedence/output rollback matrix covers all three TS cases.
         //# 1) If the SYN bit is set, irrespective of the sequence number, TCP
         //# MUST send an ACK (also referred to as challenge ACK) to the remote
         //# peer:
         // Actor/condition: TCP endpoint; selected blind-attack mitigation.
         //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
-        //= reason=Partial evidence; TODO remains for negotiated-TS SYN lacking TSopt. RFC7323 3.2 recommends silent drop, while RFC5961 4.2 mandates a challenge; no listed erratum resolves this precedence. Valid/stale TS SYN challenges now precede window and metadata processing and are tested, including output arbitration. Missing-TS silence is explicitly tested, not waived.
+        //= reason=Selected RFC5961 mitigation challenges and drops synchronized non-handshake SYN regardless of TS presence/sequence, under the existing bounded challenge budget. Narrow RFC7323 missing-TS SHOULD departure accepts no data/ACK/metadata/TS updates; valid/stale TS still traverse PAWS and RST remains exempt. Precedence/output rollback matrix covers all three TS cases.
         //# After sending the acknowledgment, TCP MUST drop the unacceptable
         //# segment and stop processing further.
         // Actor/condition: TCP endpoint; selected blind-attack mitigation.
@@ -2738,11 +2841,7 @@ impl Connection {
         if self.handshake_pending() {
             if !after(ack, self.snd_una) {
                 self.pending_rst = Some((ack, false));
-                self.reset_echo = segment
-                    .options
-                    .timestamps
-                    .filter(|_| self.config.timestamps)
-                    .map(|ts| ts.0);
+                self.reset_echo = segment.options.timestamps.map(|ts| ts.0);
                 return Ok(());
             }
             self.accept_ack(ack, false, segment.options.timestamps.map(|ts| ts.1));
@@ -2880,7 +2979,10 @@ impl Connection {
                 self.data_high(),
                 &self.scoreboard,
                 now,
-                segment.options.timestamps.map(|ts| ts.1),
+                segment
+                    .options
+                    .timestamps
+                    .map(|ts| ts.1.wrapping_sub(self.timestamp_offset)),
                 self.timestamps,
                 self.mss as u32,
                 update.dsack,
@@ -2910,6 +3012,7 @@ impl Connection {
         } else {
             false
         };
+        let tlp_loss_start = self.tlp_end.map(|(start, _, _)| start);
         let tlp_repaired = self.tlp_ack(
             ack,
             advancing,
@@ -2927,6 +3030,9 @@ impl Connection {
         let tlp_reduced =
             tlp_repaired && self.congestion.on_tlp_repair(ack, tlp_flight, self.snd_nxt);
         if tlp_reduced {
+            if let Some(start) = tlp_loss_start {
+                self.note_iw_loss(start);
+            }
             self.ecn_cwr_pending |= self.ecn_feedback();
         }
         let was_rto_recovery = self.sack_post_rto.is_some();
@@ -3061,6 +3167,7 @@ impl Connection {
                 self.data_high(),
                 ece,
             ) {
+                self.note_iw_loss(self.snd_una);
                 self.retx_pending = true;
                 self.ecn_cwr_pending |= self.ecn_feedback();
                 self.limited_pending = false;
@@ -3235,13 +3342,16 @@ impl Connection {
     //# As specified in [RFC3390], the SYN/ACK and the acknowledgment of the SYN/ACK MUST NOT
     //# increase the size of the congestion window.
     //= https://www.rfc-editor.org/rfc/rfc6928#section-2
-    //= reason=IW10 first data-flight bound and handshake no-growth: negotiation test checks cwnd after active/passive handshake; idle/data-RTO trace emits exactly ten MSS before blocking. No claim of SYN-loss relaxation or monitoring/fallback support.
+    //= reason=IW10 first data-flight bound and handshake no-growth: negotiation test checks cwnd after active/passive handshake; idle/data-RTO trace emits exactly ten MSS before blocking. IW10 first-retry relaxation and bounded loss fallback are covered separately; no deployment monitoring claim.
     //# This change applies to the initial window of the connection in the first round-trip time
     //# (RTT) of data transmission during or following the TCP three-way handshake. Neither the
     //# SYN/ACK nor its ACK in the three-way handshake should increase the initial window size.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
     //= reason=Connection ACK parsing frees only new cumulative payload bytes, with one-byte division and delayed cumulative ACK byte ledger through wrap; data_flight_excludes_control_and_retains_sacked_payload separately excludes FIN ACK growth and SACK-only release.
     //# where N is the number of previously unacknowledged bytes acknowledged in the incoming ACK.
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-9
+    //= reason=IW10 divided/delayed new ACKs with outstanding flight restart at ACKtime+current RTO after estimator update; duplicate ACK does not restart, last new ACK cancels. RFC6298 universal timing audit remains separate.
+    //# To minimize spurious retransmissions, implementations MUST follow RFC 6298 [RFC6298] to restart the retransmission timer with the current value of RTO for each ACK received that acknowledges new data.
     fn accept_ack(&mut self, ack: Seq, ece: bool, echo: Option<u32>) {
         if !self.sack_receive {
             self.rack.acknowledge(
@@ -3249,7 +3359,7 @@ impl Connection {
                 self.data_high(),
                 &self.scoreboard,
                 self.now,
-                echo,
+                echo.map(|value| value.wrapping_sub(self.timestamp_offset)),
                 self.timestamps,
                 self.mss as u32,
                 false,
@@ -3265,6 +3375,9 @@ impl Connection {
             self.limited_sent = bytes;
         }
         let syn_ack = self.snd_una == self.iss && self.handshake_pending();
+        if !syn_ack && let Some(epoch) = &mut self.iw_epoch {
+            epoch.open = false;
+        }
         let bytes = ack
             .distance_from(self.send_base)
             .min(self.send.len() as u32);
@@ -3323,7 +3436,7 @@ impl Connection {
             //= reason=Four eight-packet bulk flights verify exact RFC6298 estimator history with one ordinary RTTM sample per flight; a mixed original-transmission RACK SACK sample adds a second unweighted local-clock update. This is not a sustained sliding-flight/per-RTT cadence bound: arbitrary frequent RACK samples still use fixed alpha/beta and may truncate history. Closure requires worst-case sampling-cadence/history evidence and weights/cadence adjustment if needed. RACK local-clock sampling is distinct from TSecr RTTM; Appendix G is a suggestion, not a mandatory exact formula. Partial evidence; closure remains TODO.
             //# to update the RTT estimator, an implementation SHOULD try to adhere
             //# to the spirit of the history specified in [RFC6298].
-            if !self.timestamps || echo == Some((sent / 1_000) as u32) {
+            if !self.timestamps || echo == Some(self.timestamp_value(sent)) {
                 let sample = self.now.saturating_sub(sent);
                 self.rtt.sample(sample);
                 self.tlp_fresh_rtt = true;
@@ -3652,6 +3765,12 @@ impl Connection {
     //= reason=Receive window bounded by explicit configured receive allocation, never rounds beyond backing; no speculative unlimited window growth.
     //# Hence, implementers should take care to not open the TCP window
     //# drastically beyond the requirements of the connection.
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-3
+    //= reason=Default storage advertises >=10 local RMSS on initial SYN/SYNACK; explicitly configured slow-link storage advertises <10. No bandwidth autodetection or deployment performance claim.
+    //# Some implementations advertise a small initial receive window (Table 2 in [Duk10]), effectively limiting how much window a remote host may use. In order to realize the full benefit of the large initial window, implementations are encouraged to advertise an initial receive window of at least 10 segments, except for the circumstances where a larger initial window is deemed harmful. (See Section 8 below.)
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-8
+    //= reason=Manual receive_capacity=4000 with local RMSS=1000 advertises four segments on both handshake directions; default capacity advertises >=10. Manual mitigation selected, no low-speed autodetection claim.
+    //# The negative impact can be mitigated by hosts directly connected to a low-speed link advertising an initial receive window smaller than 10 segments. This can be achieved either through manual configuration by the users or through the host stack auto-detecting the low- bandwidth links.
     fn advertised_window(&self, syn: bool) -> u16 {
         if syn {
             return self.syn_window;
@@ -4084,32 +4203,32 @@ impl Connection {
         //# If an <RST> is being generated
         //# because of a user abort, and Snd.TS.OK is set, then a Timestamps
         //# option SHOULD be included in the <RST>.
-        // Scope: Embedding/rate gap: fixed 1ms clock plus monotonic caller time does not prove tick per 2^31 bytes or per receive window; API permits repeated sends at identical Instant without byte-per-tick gate. Closure: specify/enforce supported link/clock rate and test bytes-per-tick boundary (including small windows); do not claim an 8Tbps example as an enforced deployment bound. Partial evidence; closure remains TODO.
+        // Scope: Successful TS-bearing sequence-space bytes (including retransmitted copies and SYN/FIN) are transactionally limited by configured nonzero timestamp_bytes_per_tick <2^31. Exhaustion returns TimestampBudgetExceeded with caller time and protocol state unchanged; next tick resets credit. Boundary/wrap/output rollback tests verify the gate. Physical clock truth remains separately external.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
-        //= reason=Embedding/rate gap: fixed 1ms clock plus monotonic caller time does not prove tick per 2^31 bytes or per receive window; API permits repeated sends at identical Instant without byte-per-tick gate. Closure: specify/enforce supported link/clock rate and test bytes-per-tick boundary (including small windows); do not claim an 8Tbps example as an enforced deployment bound. Partial evidence; closure remains TODO.
+        //= reason=Successful TS-bearing sequence-space bytes (including retransmitted copies and SYN/FIN) are transactionally limited by configured nonzero timestamp_bytes_per_tick <2^31. Exhaustion returns TimestampBudgetExceeded with caller time and protocol state unchanged; next tick resets credit. Boundary/wrap/output rollback tests verify the gate. Physical clock truth remains separately external.
         //# It MUST tick at least once for each 2^31 bytes sent.
-        // Scope: Embedding/rate gap: fixed 1ms clock plus monotonic caller time does not prove tick per 2^31 bytes or per receive window; API permits repeated sends at identical Instant without byte-per-tick gate. Closure: specify/enforce supported link/clock rate and test bytes-per-tick boundary (including small windows); do not claim an 8Tbps example as an enforced deployment bound. Partial evidence; closure remains TODO.
+        // Scope: Successful TS-bearing sequence-space bytes (including retransmitted copies and SYN/FIN) are transactionally limited by configured nonzero timestamp_bytes_per_tick <2^31. Exhaustion returns TimestampBudgetExceeded with caller time and protocol state unchanged; next tick resets credit. Boundary/wrap/output rollback tests verify the gate. Physical clock truth remains separately external.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
-        //= reason=Embedding/rate gap: fixed 1ms clock plus monotonic caller time does not prove tick per 2^31 bytes or per receive window; API permits repeated sends at identical Instant without byte-per-tick gate. Closure: specify/enforce supported link/clock rate and test bytes-per-tick boundary (including small windows); do not claim an 8Tbps example as an enforced deployment bound. Partial evidence; closure remains TODO.
+        //= reason=Successful TS-bearing sequence-space bytes (including retransmitted copies and SYN/FIN) are transactionally limited by configured nonzero timestamp_bytes_per_tick <2^31. Exhaustion returns TimestampBudgetExceeded with caller time and protocol state unchanged; next tick resets credit. Boundary/wrap/output rollback tests verify the gate. Physical clock truth remains separately external.
         //# In fact,
         //# in order to be useful to the sender for round-trip timing, the
         //# clock SHOULD tick at least once per window's worth of data, and
         //# even with the window extension defined in Section 2.2, 2^31
         //# bytes must be at least two windows.
-        // Scope: Arithmetic period is 2^32 milliseconds (>255 seconds), but caller time can jump/scale arbitrarily and no supported MSL/clock-rate contract proves physical recycle period. Closure: bind monotonic microsecond input to real-time rate and maximum MSL, validate/document embedding contract in code and add period/rate assertion; wrap test establishes arithmetic only. Partial evidence; closure remains TODO.
+        // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
-        //= reason=Arithmetic period is 2^32 milliseconds (>255 seconds), but caller time can jump/scale arbitrarily and no supported MSL/clock-rate contract proves physical recycle period. Closure: bind monotonic microsecond input to real-time rate and maximum MSL, validate/document embedding contract in code and add period/rate assertion; wrap test establishes arithmetic only. Partial evidence; closure remains TODO.
+        //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
         //# The recycling time of the timestamp clock MUST be greater than
         //# MSL seconds.
-        // Scope: Privacy recommendation unimplemented: TSval is raw caller time/1000 with no per-connection random offset. Closure: generate secret-derived/random per-connection offset with consistent serial/RTTM echo validation, avoid breaking TIME-WAIT freshness, and test unrelated connections differ while wrap/reuse and RTT remain correct. Optional feature disabled by default does not waive this recommendation when enabled. Partial evidence; closure remains TODO.
+        // Scope: Endpoint derives offset using HMAC-SHA256 secret, tuple and ISS nonce in the separate ntcp timestamp offset domain before first output; ISS is an input, never the offset. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset so peer PAWS sees no random jump; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, echo/RTT/wrap and reuse rollback tests cover the policy.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-7.1
-        //= reason=Privacy recommendation unimplemented: TSval is raw caller time/1000 with no per-connection random offset. Closure: generate secret-derived/random per-connection offset with consistent serial/RTTM echo validation, avoid breaking TIME-WAIT freshness, and test unrelated connections differ while wrap/reuse and RTT remain correct. Optional feature disabled by default does not waive this recommendation when enabled. Partial evidence; closure remains TODO.
+        //= reason=Endpoint derives offset using HMAC-SHA256 secret, tuple and ISS nonce in the separate ntcp timestamp offset domain before first output; ISS is an input, never the offset. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset so peer PAWS sees no random jump; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, echo/RTT/wrap and reuse rollback tests cover the policy.
         //# It is therefore RECOMMENDED to generate a random, per-
         //# connection offset to be used with the clock source when generating
         //# the Timestamps option value (see Section 5.4).
-        // Scope: Privacy recommendation unimplemented: TSval is raw caller time/1000 with no per-connection random offset. Closure: generate secret-derived/random per-connection offset with consistent serial/RTTM echo validation, avoid breaking TIME-WAIT freshness, and test unrelated connections differ while wrap/reuse and RTT remain correct. Optional feature disabled by default does not waive this recommendation when enabled. Partial evidence; closure remains TODO.
+        // Scope: Endpoint derives offset using HMAC-SHA256 secret, tuple and ISS nonce in the separate ntcp timestamp offset domain before first output; ISS is an input, never the offset. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset so peer PAWS sees no random jump; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, echo/RTT/wrap and reuse rollback tests cover the policy.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-7
-        //= reason=Privacy recommendation unimplemented: TSval is raw caller time/1000 with no per-connection random offset. Closure: generate secret-derived/random per-connection offset with consistent serial/RTTM echo validation, avoid breaking TIME-WAIT freshness, and test unrelated connections differ while wrap/reuse and RTT remain correct. Optional feature disabled by default does not waive this recommendation when enabled. Partial evidence; closure remains TODO.
+        //= reason=Endpoint derives offset using HMAC-SHA256 secret, tuple and ISS nonce in the separate ntcp timestamp offset domain before first output; ISS is an input, never the offset. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset so peer PAWS sees no random jump; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, echo/RTT/wrap and reuse rollback tests cover the policy.
         //# It is therefore
         //# RECOMMENDED to generate a random, per-connection offset to be used
         //# with the clock source when generating the Timestamps option value
@@ -4125,16 +4244,16 @@ impl Connection {
         //= reason=Negotiated ordinary ACK output echoes single retained TS.Recent; reactive RST overrides follow section 5.2.
         //# (3)  When a TSopt is sent, its TSecr field is set to the current
         //# TS.Recent value.
-        // Scope: TSval increments at1ms in caller microsecond units, but physical rate depends on embedding. Same real-clock gap as section4.1/5.4 MUSTs: closure requires validated monotonic real-time microsecond contract and rate/integration assertions, not synthetic Instant arithmetic alone. Partial evidence; closure remains TODO.
+        // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
-        //= reason=TSval increments at1ms in caller microsecond units, but physical rate depends on embedding. Same real-clock gap as section4.1/5.4 MUSTs: closure requires validated monotonic real-time microsecond contract and rate/integration assertions, not synthetic Instant arithmetic alone. Partial evidence; closure remains TODO.
+        //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
         //# Based upon these considerations, we choose a timestamp clock
         //# frequency in the range 1 ms to 1 sec per tick.
         let timestamp = if reset.is_some() && self.reset_echo.is_some() {
             self.reset_echo.map(|echo| (0, echo))
         } else if self.timestamps || syn && self.state == State::SynSent && self.config.timestamps {
             Some((
-                (now / 1_000) as u32,
+                self.timestamp_value(now),
                 if reset.map_or(self.state != State::SynSent, |(_, with_ack)| with_ack) {
                     self.ts_recent
                 } else {
@@ -4516,7 +4635,7 @@ impl Connection {
             let idle_restart =
                 self.flight() == 0 && now.saturating_sub(self.last_sent) >= self.rto();
             let cwnd = if idle_restart {
-                self.congestion.cwnd().min(self.initial_window())
+                self.congestion.cwnd().min(self.restart_window())
             } else {
                 self.congestion.cwnd()
             };
@@ -4689,7 +4808,7 @@ impl Connection {
         let idle_reduction = fresh_data
             && self.flight() == 0
             && now.saturating_sub(self.last_sent) >= self.rto()
-            && self.congestion.cwnd() > self.initial_window();
+            && self.congestion.cwnd() > self.restart_window();
         //= https://www.rfc-editor.org/rfc/rfc3168#section-5.2
         //= reason=Shared fresh-data output predicate excludes setup, pure ACK, reset, FIN-only, keepalive, persist and retransmitted packets. Fresh FIFO bytes (including Limited Transmit, recovery new data, data/FIN and original TLP) advance tracked sequence space and remain subject to loss recovery. Assertions cover special ECT/Not-ECT outputs, original TLP loss RTO and corrupted CE loss congestion response; no router marking claim.
         //# To ensure the reliable delivery of the congestion indication
@@ -4847,6 +4966,22 @@ impl Connection {
         if 20 + option_len + count > self.config.send_ip_payload_limit as usize {
             return Err(Error::InvalidArgument);
         }
+        let tick_bytes = if now / 1_000 == self.timestamp_tick {
+            self.timestamp_bytes
+        } else {
+            0
+        };
+        let timestamp_cost =
+            count as u32 + u32::from(flags & SYN != 0) + u32::from(flags & FIN != 0);
+        if timestamp.is_some()
+            && timestamp_cost
+                > self
+                    .config
+                    .timestamp_bytes_per_tick
+                    .saturating_sub(tick_bytes)
+        {
+            return Err(Error::TimestampBudgetExceeded);
+        }
         let size = wire::encode(
             ip,
             header,
@@ -4861,6 +4996,39 @@ impl Connection {
                 Error::Wire(error)
             }
         })?;
+        if syn && retransmitted {
+            self.syn_retransmissions = self.syn_retransmissions.saturating_add(1);
+            if self.config.initial_window == InitialWindow::Iw10 && self.syn_retransmissions > 1 {
+                self.syn_loss_detected = true;
+                self.congestion.limit_restart(self.mss as u32);
+            }
+        }
+        if fresh_data && self.config.initial_window == InitialWindow::Iw10 {
+            let idle = self.flight() == 0 && now.saturating_sub(self.last_sent) >= self.rto();
+            if !self.iw_started || idle {
+                self.iw_epoch = Some(IwEpoch {
+                    start: seq,
+                    end: seq,
+                    bytes: 0,
+                    open: true,
+                    lost: false,
+                });
+                self.iw_started = true;
+            }
+            if let Some(epoch) = &mut self.iw_epoch
+                && epoch.open
+            {
+                epoch.end = seq.wrapping_add(count as u32);
+                epoch.bytes = epoch.bytes.saturating_add(count as u32);
+                if epoch.lost && epoch.bytes > 4_096 {
+                    self.iw_fallback = true;
+                }
+            }
+        }
+        if timestamp.is_some() {
+            self.timestamp_tick = now / 1_000;
+            self.timestamp_bytes = tick_bytes + timestamp_cost;
+        }
         if !challenge {
             self.retransmit_burst = retransmit_burst;
         }
@@ -4960,6 +5128,7 @@ impl Connection {
             && count != 0
         {
             self.congestion.restart_after_idle();
+            self.congestion.limit_restart(self.restart_window());
         }
         if !challenge {
             if count != 0 && !keepalive {
@@ -5128,6 +5297,37 @@ impl Connection {
         Ok(Some(size))
     }
 
+    pub(crate) fn iw_setup_loss(&self) -> bool {
+        self.iw_setup_loss
+    }
+
+    fn note_iw_loss(&mut self, start: Seq) {
+        if let Some(epoch) = &mut self.iw_epoch
+            && at_or_after(start, epoch.start)
+            && after(epoch.end, start)
+        {
+            epoch.lost = true;
+            self.iw_setup_loss = true;
+            if epoch.bytes > 4_096 {
+                self.iw_fallback = true;
+            }
+        }
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= reason=Initial/restart epoch retains original byte range and bytes sent before first advancing data ACK. RTO, Reno/SACK/RACK loss and TLP repair latch inferred loss; >4096 bytes selects future RFC3390 restart bound without increasing cwnd. Wrap, initial/restart, fast/RTO, 4096/4097 and actual future burst tests cover fallback.
+    //# Furthermore, to limit any negative effect that a larger initial window may have on links with limited bandwidth or buffer space, implementations SHOULD fall back to RFC 3390 for the restart window (RW) if any packet loss is detected during either the initial window or a restart window, and more than 4 KB of data is sent.
+    fn restart_window(&self) -> u32 {
+        if self.iw_fallback {
+            InitialWindow::Rfc5681.bytes(self.mss as u32)
+        } else {
+            self.initial_window()
+        }
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= reason=IW10 retains its initial window after a first potentially spurious SYN timeout; only successfully encoded retransmissions count. More than one committed SYN/SYNACK retry reduces to one MSS; failed output and both endpoint roles tested. This is conservative inference, not physical loss proof.
+    //# For this reason, it is RECOMMENDED that implementations refrain from resetting the initial window to 1 segment, unless there have been more than one SYN or SYN/ACK retransmissions or true loss detection has been made.
     fn initial_window(&self) -> u32 {
         self.congestion.initial_window()
     }
@@ -5385,7 +5585,18 @@ impl Connection {
             //# A TCP endpoint MUST implement the basic congestion control algorithms
             //# slow start, congestion avoidance, and exponential backoff of RTO to
             //# avoid creating congestion collapse conditions (MUST-19).
-            self.congestion.on_timeout(self.data_flight(), self.snd_nxt);
+            if self.handshake_pending() {
+                // First SYN timeout may be spurious. More than one is the RFC6928
+                // conservative trigger, not proof of physical packet loss.
+                self.syn_loss_detected = self.config.initial_window != InitialWindow::Iw10
+                    || self.syn_retransmissions > 1;
+                if self.syn_loss_detected {
+                    self.congestion.on_timeout(self.data_flight(), self.snd_nxt);
+                }
+            } else {
+                self.note_iw_loss(self.snd_una);
+                self.congestion.on_timeout(self.data_flight(), self.snd_nxt);
+            }
             self.ecn_cwr_pending |= self.ecn_feedback();
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
             //# SYN retransmissions MUST be handled in the general way just described
@@ -7668,7 +7879,7 @@ mod tests {
     //# segment size.
     //= https://www.rfc-editor.org/rfc/rfc6928#section-12
     //= type=test
-    //= reason=No monitoring-backed default deployment is claimed: InitialWindow default and ConnectionConfig default select Rfc5681, and test explicitly asserts this. Iw10 is only explicit opt-in; sender monitoring/cache/fallback TODOs still apply when enabled.
+    //= reason=No monitoring-backed default deployment is claimed: InitialWindow default and ConnectionConfig default select Rfc5681, and test explicitly asserts this. Iw10 is only explicit opt-in; deployment monitoring TODOs still apply when enabled; bounded cache/fallback is implemented.
     //# An increased initial window MUST NOT be turned on by default on systems without such
     //# monitoring capabilities.
     //= https://www.rfc-editor.org/rfc/rfc6928#section-2
@@ -7682,7 +7893,7 @@ mod tests {
     //# min (10*MSS, max (2*MSS, 14600)) (1)
     //= https://www.rfc-editor.org/rfc/rfc6928#section-2
     //= type=test
-    //= reason=IW10 first data-flight bound and handshake no-growth: negotiation test checks cwnd after active/passive handshake; idle/data-RTO trace emits exactly ten MSS before blocking. No claim of SYN-loss relaxation or monitoring/fallback support.
+    //= reason=IW10 first data-flight bound and handshake no-growth: negotiation test checks cwnd after active/passive handshake; idle/data-RTO trace emits exactly ten MSS before blocking. IW10 first-retry relaxation and bounded loss fallback are covered separately; no deployment monitoring claim.
     //# This change applies to the initial window of the connection in the first round-trip time
     //# (RTT) of data transmission during or following the TCP three-way handshake. Neither the
     //# SYN/ACK nor its ACK in the three-way handshake should increase the initial window size.
@@ -7768,58 +7979,86 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
     //= type=test
-    //= reason=Default RFC5681 SYN/SYNACK loss rule (also conservatively retained for opt-in IW10, whose distinct RFC6928 recommendation remains TODO). Test forces each endpoint timeout and asserts one negotiated effective MSS after successful handshake; failed output cannot grow cwnd.
+    //= reason=Default RFC5681 SYN/SYNACK timeout reduces to one effective MSS. Opt-in IW10 preserves IW after one committed SYN retry and reduces only after more than one; failed output does not count. This is an inference policy, not proof of physical loss.
     //# Further, if the SYN or SYN/ACK is lost, the initial window used by a sender after a
     //# correctly transmitted SYN MUST be one segment consisting of at most SMSS bytes.
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= type=test
+    //= reason=IW10 retains its initial window after a first potentially spurious SYN timeout; only successfully encoded retransmissions count. More than one committed SYN/SYNACK retry reduces to one MSS; failed output and both endpoint roles tested. This is conservative inference, not physical loss proof.
+    //# For this reason, it is RECOMMENDED that implementations refrain from resetting the initial window to 1 segment, unless there have been more than one SYN or SYN/ACK retransmissions or true loss detection has been made.
     fn initial_window_syn_loss_and_output_retries_remain_conservative() {
         for policy in [InitialWindow::Rfc5681, InitialWindow::Iw10] {
             for lose_synack in [false, true] {
-                let mut cfg = config(65_536, 3_000);
-                cfg.initial_window = policy;
-                let mut peer_cfg = cfg.clone();
-                peer_cfg.mss = 1_000;
-                let mut a = Connection::active(tuple(), cfg, 100, 0).unwrap();
-                let initial = a.congestion.cwnd();
-                assert_eq!(a.transmit(0, &mut [0; 19]), Err(Error::OutputTooSmall));
-                assert_eq!(a.congestion.cwnd(), initial);
-                assert_eq!(a.rto_deadline, None);
-                let bytes = packet(&mut a, 0);
-                let syn = wire::parse(ip(tuple()), &bytes).unwrap();
-                if !lose_synack {
-                    a.timeout(1_000_000).unwrap();
-                    assert_eq!(a.congestion.cwnd(), 3_000);
+                for retries in [1, 2] {
+                    let mut cfg = config(65_536, 3_000);
+                    cfg.initial_window = policy;
+                    let mut peer_cfg = cfg.clone();
+                    peer_cfg.mss = 1_000;
+                    let mut a = Connection::active(tuple(), cfg, 100, 0).unwrap();
+                    let initial = a.congestion.cwnd();
+                    assert_eq!(a.transmit(0, &mut [0; 19]), Err(Error::OutputTooSmall));
+                    assert_eq!(a.congestion.cwnd(), initial);
+                    assert_eq!(a.rto_deadline, None);
+                    let bytes = packet(&mut a, 0);
+                    let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+                    let mut b =
+                        Connection::passive(reverse(tuple()), peer_cfg, 900, 10, &syn).unwrap();
+                    if lose_synack {
+                        packet(&mut b, 10);
+                    }
+                    let sender = if lose_synack { &mut b } else { &mut a };
+                    let mut now = 0;
+                    let mut retry_bytes = Vec::new();
+                    for retry in 1..=retries {
+                        now = sender.rto_deadline.unwrap();
+                        sender.timeout(now).unwrap();
+                        let before = sender.syn_retransmissions;
+                        assert_eq!(
+                            sender.transmit(now, &mut [0; 19]),
+                            Err(Error::OutputTooSmall)
+                        );
+                        assert_eq!(sender.syn_retransmissions, before);
+                        retry_bytes = packet(sender, now);
+                        assert_eq!(sender.syn_retransmissions, retry);
+                        assert_eq!(
+                            sender.congestion.cwnd(),
+                            if policy == InitialWindow::Iw10 && retry == 1 {
+                                sender.initial_window()
+                            } else {
+                                sender.mss as u32
+                            }
+                        );
+                    }
+                    if lose_synack {
+                        let segment = wire::parse(ip(reverse(tuple())), &retry_bytes).unwrap();
+                        a.input(now + 10, &segment).unwrap();
+                    } else {
+                        deliver(&mut b, &mut a, now + 10);
+                    }
+                    deliver(&mut a, &mut b, now + 20);
+                    let selected = if policy == InitialWindow::Iw10 {
+                        10_000
+                    } else {
+                        4_000
+                    };
+                    let reduced = policy == InitialWindow::Rfc5681 || retries > 1;
                     assert_eq!(
-                        a.transmit(1_000_000, &mut [0; 19]),
-                        Err(Error::OutputTooSmall)
+                        a.congestion.cwnd(),
+                        if !lose_synack && reduced {
+                            1_000
+                        } else {
+                            selected
+                        }
                     );
-                    packet(&mut a, 1_000_000);
-                }
-                let mut b =
-                    Connection::passive(reverse(tuple()), peer_cfg, 900, 1_000_000, &syn).unwrap();
-                if lose_synack {
-                    packet(&mut b, 1_000_000);
-                    b.timeout(2_000_000).unwrap();
-                    assert_eq!(b.congestion.cwnd(), 1_000);
                     assert_eq!(
-                        b.transmit(2_000_000, &mut [0; 19]),
-                        Err(Error::OutputTooSmall)
+                        b.congestion.cwnd(),
+                        if lose_synack && reduced {
+                            1_000
+                        } else {
+                            selected
+                        }
                     );
                 }
-                deliver(&mut b, &mut a, 2_000_010);
-                deliver(&mut a, &mut b, 2_000_020);
-                let selected = if policy == InitialWindow::Iw10 {
-                    10_000
-                } else {
-                    4_000
-                };
-                assert_eq!(
-                    a.congestion.cwnd(),
-                    if lose_synack { selected } else { 1_000 }
-                );
-                assert_eq!(
-                    b.congestion.cwnd(),
-                    if lose_synack { 1_000 } else { selected }
-                );
             }
         }
     }
@@ -7838,7 +8077,7 @@ mod tests {
     //# the restart window should never increase the size of cwnd).
     //= https://www.rfc-editor.org/rfc/rfc6928#section-2
     //= type=test
-    //= reason=IW10 first data-flight bound and handshake no-growth: negotiation test checks cwnd after active/passive handshake; idle/data-RTO trace emits exactly ten MSS before blocking. No claim of SYN-loss relaxation or monitoring/fallback support.
+    //= reason=IW10 first data-flight bound and handshake no-growth: negotiation test checks cwnd after active/passive handshake; idle/data-RTO trace emits exactly ten MSS before blocking. IW10 first-retry relaxation and bounded loss fallback are covered separately; no deployment monitoring claim.
     //# This change applies to the initial window of the connection in the first round-trip time
     //# (RTT) of data transmission during or following the TCP three-way handshake. Neither the
     //# SYN/ACK nor its ACK in the three-way handshake should increase the initial window size.
@@ -14973,20 +15212,20 @@ mod tests {
     // Actor/condition: TCP endpoint; selected blind-attack mitigation.
     //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
     //= type=test
-    //= reason=Partial evidence; TODO remains for negotiated-TS SYN lacking TSopt. RFC7323 3.2 recommends silent drop, while RFC5961 4.2 mandates a challenge; no listed erratum resolves this precedence. Valid/stale TS SYN challenges now precede window and metadata processing and are tested, including output arbitration. Missing-TS silence is explicitly tested, not waived.
+    //= reason=Selected RFC5961 mitigation challenges and drops synchronized non-handshake SYN regardless of TS presence/sequence, under the existing bounded challenge budget. Narrow RFC7323 missing-TS SHOULD departure accepts no data/ACK/metadata/TS updates; valid/stale TS still traverse PAWS and RST remains exempt. Precedence/output rollback matrix covers all three TS cases.
     //# Instead, the handling of the SYN in the synchronized state SHOULD be
     //# performed as follows:
     // Actor/condition: TCP endpoint; selected blind-attack mitigation.
     //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
     //= type=test
-    //= reason=Partial evidence; TODO remains for negotiated-TS SYN lacking TSopt. RFC7323 3.2 recommends silent drop, while RFC5961 4.2 mandates a challenge; no listed erratum resolves this precedence. Valid/stale TS SYN challenges now precede window and metadata processing and are tested, including output arbitration. Missing-TS silence is explicitly tested, not waived.
+    //= reason=Selected RFC5961 mitigation challenges and drops synchronized non-handshake SYN regardless of TS presence/sequence, under the existing bounded challenge budget. Narrow RFC7323 missing-TS SHOULD departure accepts no data/ACK/metadata/TS updates; valid/stale TS still traverse PAWS and RST remains exempt. Precedence/output rollback matrix covers all three TS cases.
     //# 1) If the SYN bit is set, irrespective of the sequence number, TCP
     //# MUST send an ACK (also referred to as challenge ACK) to the remote
     //# peer:
     // Actor/condition: TCP endpoint; selected blind-attack mitigation.
     //= https://www.rfc-editor.org/rfc/rfc5961#section-4.2
     //= type=test
-    //= reason=Partial evidence; TODO remains for negotiated-TS SYN lacking TSopt. RFC7323 3.2 recommends silent drop, while RFC5961 4.2 mandates a challenge; no listed erratum resolves this precedence. Valid/stale TS SYN challenges now precede window and metadata processing and are tested, including output arbitration. Missing-TS silence is explicitly tested, not waived.
+    //= reason=Selected RFC5961 mitigation challenges and drops synchronized non-handshake SYN regardless of TS presence/sequence, under the existing bounded challenge budget. Narrow RFC7323 missing-TS SHOULD departure accepts no data/ACK/metadata/TS updates; valid/stale TS still traverse PAWS and RST remains exempt. Precedence/output rollback matrix covers all three TS cases.
     //# After sending the acknowledgment, TCP MUST drop the unacceptable
     //# segment and stop processing further.
     // Actor/condition: TCP endpoint; selected blind-attack mitigation.
@@ -15291,8 +15530,7 @@ mod tests {
                     );
                     assert!(!a.accepted_metadata);
                     assert_eq!(a.receive.next(), next);
-                    let expected =
-                        (control == SYN && timestamp.is_some()) || (control == RST && offset == 1);
+                    let expected = (control == SYN) || (control == RST && offset == 1);
                     assert_eq!(a.challenge_ack_pending, expected);
                     if expected {
                         let sent_at = a.last_timestamp_sent_at;
@@ -18276,16 +18514,16 @@ mod tests {
     //= reason=Cross-reference to section 4.3: earliest delayed echo, OOO retained echo and hole-fill replacement use TS.Recent/Last.ACK.sent algorithm.
     //# The exact rules on which TSval MUST be echoed are given in
     //# Section 4.3.
-    // Scope: With negotiated TS, missing option silently returns, does not abort and later valid timestamp data succeeds; missing RST option is exempt.
+    // Scope: Negotiated missing-TS data/ACK silently drops without abort; RST exempt. Only synchronized non-handshake SYN is challenged and dropped under selected RFC5961 MUST, never accepted or used to update TS/ACK/payload/metadata. Handshake paths retain TS checks. Narrow justified departure from silent SHOULD, not a blanket waiver.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
     //= type=test
-    //= reason=With negotiated TS, missing option silently returns, does not abort and later valid timestamp data succeeds; missing RST option is exempt.
+    //= reason=Negotiated missing-TS data/ACK silently drops without abort; RST exempt. Only synchronized non-handshake SYN is challenged and dropped under selected RFC5961 MUST, never accepted or used to update TS/ACK/payload/metadata. Handshake paths retain TS checks. Narrow justified departure from silent SHOULD, not a blanket waiver.
     //# non-<RST> segment is received without a TSopt, a TCP SHOULD silently
     //# drop the segment.
-    // Scope: With negotiated TS, missing option silently returns, does not abort and later valid timestamp data succeeds; missing RST option is exempt.
+    // Scope: Negotiated missing-TS data/ACK silently drops without abort; RST exempt. Only synchronized non-handshake SYN is challenged and dropped under selected RFC5961 MUST, never accepted or used to update TS/ACK/payload/metadata. Handshake paths retain TS checks. Narrow justified departure from silent SHOULD, not a blanket waiver.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
     //= type=test
-    //= reason=With negotiated TS, missing option silently returns, does not abort and later valid timestamp data succeeds; missing RST option is exempt.
+    //= reason=Negotiated missing-TS data/ACK silently drops without abort; RST exempt. Only synchronized non-handshake SYN is challenged and dropped under selected RFC5961 MUST, never accepted or used to update TS/ACK/payload/metadata. Handshake paths retain TS checks. Narrow justified departure from silent SHOULD, not a blanket waiver.
     //# A TCP MUST NOT abort a TCP connection because any
     //# segment lacks an expected TSopt.
     // Scope: TS.Recent updates only for sequence<=Last.ACK.sent and nondecreasing/expired TSval. Existing test asserts delayed earliest echo, unchanged echo across OOO hole, and replacement/frontier advance on hole fill.
@@ -18601,17 +18839,17 @@ mod tests {
     //# <SYN,ACK> contain TSopt, the TSopt MUST be sent in every non-<RST>
     //# segment for the duration of the connection, and SHOULD be sent in an
     //# <RST> segment (see Section 5.2 for details).
-    // Scope: Embedding gap: TSval=(caller Instant/1000) mod 2^32 and backwards Instant is rejected; no contract/runtime test guarantees caller microseconds proportional to real time or bounds forward jumps. Closure: define and validate embedding clock requirements, test rate/jump limits and real monotonic clock integration; synthetic wrap vectors prove arithmetic only. Partial evidence; closure remains TODO.
+    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
     //= type=test
-    //= reason=Embedding gap: TSval=(caller Instant/1000) mod 2^32 and backwards Instant is rejected; no contract/runtime test guarantees caller microseconds proportional to real time or bounds forward jumps. Closure: define and validate embedding clock requirements, test rate/jump limits and real monotonic clock integration; synthetic wrap vectors prove arithmetic only. Partial evidence; closure remains TODO.
+    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //# Values of this
     //# clock MUST be at least approximately proportional to real time, in
     //# order to measure actual RTT.
-    // Scope: Arithmetic period is 2^32 milliseconds (>255 seconds), but caller time can jump/scale arbitrarily and no supported MSL/clock-rate contract proves physical recycle period. Closure: bind monotonic microsecond input to real-time rate and maximum MSL, validate/document embedding contract in code and add period/rate assertion; wrap test establishes arithmetic only. Partial evidence; closure remains TODO.
+    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
     //= type=test
-    //= reason=Arithmetic period is 2^32 milliseconds (>255 seconds), but caller time can jump/scale arbitrarily and no supported MSL/clock-rate contract proves physical recycle period. Closure: bind monotonic microsecond input to real-time rate and maximum MSL, validate/document embedding contract in code and add period/rate assertion; wrap test establishes arithmetic only. Partial evidence; closure remains TODO.
+    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //# The recycling time of the timestamp clock MUST be greater than
     //# MSL seconds.
     // Scope: Wire TS fields u32 network-order; TSval uses caller millisecond clock modulo 32 bits. Physical rate guarantees separately TODO.
@@ -18621,10 +18859,10 @@ mod tests {
     //# The Timestamps option carries two four-byte timestamp fields.  The
     //# TSval field contains the current value of the timestamp clock of the
     //# TCP sending the option.
-    // Scope: TSval increments at1ms in caller microsecond units, but physical rate depends on embedding. Same real-clock gap as section4.1/5.4 MUSTs: closure requires validated monotonic real-time microsecond contract and rate/integration assertions, not synthetic Instant arithmetic alone. Partial evidence; closure remains TODO.
+    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
     //= type=test
-    //= reason=TSval increments at1ms in caller microsecond units, but physical rate depends on embedding. Same real-clock gap as section4.1/5.4 MUSTs: closure requires validated monotonic real-time microsecond contract and rate/integration assertions, not synthetic Instant arithmetic alone. Partial evidence; closure remains TODO.
+    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //# Based upon these considerations, we choose a timestamp clock
     //# frequency in the range 1 ms to 1 sec per tick.
     fn timestamps_ip_budget_data_fin_keepalive_and_clock_wrap() {
@@ -18870,5 +19108,338 @@ mod tests {
         a.set_application_timeout(None).unwrap();
         assert_eq!(a.application_deadline(), None);
         assert_eq!(a.user_deadline(), Some(2_000 + a.config.user_timeout_us));
+    }
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+    //= type=test
+    //= reason=Invalid SYN Window Scale is clamped to 14 and emits at most one invalid_window_scale event per connection; the existing coalesced bounded endpoint event queue carries the diagnostic. Values 15/255 and repeated negotiation are covered without unbounded logging.
+    //# If a
+    //# Window Scale option is received with a shift.cnt value larger than
+    //# 14, the TCP SHOULD log the error but MUST use 14 instead of the
+    //# specified value.
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
+    //= type=test
+    //= reason=Successful TS-bearing sequence-space bytes (including retransmitted copies and SYN/FIN) are transactionally limited by configured nonzero timestamp_bytes_per_tick <2^31. Exhaustion returns TimestampBudgetExceeded with caller time and protocol state unchanged; next tick resets credit. Boundary/wrap/output rollback tests verify the gate. Physical clock truth remains separately external.
+    //# It MUST tick at least once for each 2^31 bytes sent.
+    fn timestamp_contract_offset_budget_and_scale_diagnostic() {
+        for (units, resolution) in [(1_000, 1), (1_000_000, 0), (1_000_000, 1_001)] {
+            let mut cfg = config(64, 8);
+            cfg.timebase = CallerTimebase {
+                units_per_second: units,
+                resolution_us: resolution,
+                ..CallerTimebase::default()
+            };
+            assert!(matches!(
+                Connection::active(tuple(), cfg, 100, 0),
+                Err(Error::InvalidArgument)
+            ));
+        }
+        let cfg = ConnectionConfig {
+            timestamps: true,
+            timestamp_bytes_per_tick: 8,
+            ..config(64, 20)
+        };
+        let mut a = Connection::active(tuple(), cfg.clone(), 100, 0).unwrap();
+        a.set_timestamp_offset(u32::MAX);
+        let mut bytes = packet(&mut a, 1_000);
+        let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(syn.options.timestamps, Some((0, 0)));
+        let scale_byte = 20
+            + syn
+                .raw_options
+                .windows(3)
+                .position(|w| w[..2] == [3, 3])
+                .unwrap()
+            + 2;
+        bytes[scale_byte] = 15;
+        bytes[16..18].fill(0);
+        let checksum = wire::checksum(ip(tuple()), &bytes).unwrap();
+        bytes[16..18].copy_from_slice(&checksum.to_be_bytes());
+        let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(syn.options.window_scale, Some(14));
+        assert_eq!(syn.options.invalid_window_scale, Some(15));
+        let mut invalid =
+            Connection::passive(reverse(tuple()), cfg.clone(), 800, 1_000, &syn).unwrap();
+        assert_eq!(invalid.peer_scale, 14);
+        assert_eq!(invalid.take_events().invalid_window_scale, Some(15));
+        bytes[scale_byte] = 255;
+        bytes[16..18].fill(0);
+        let checksum = wire::checksum(ip(tuple()), &bytes).unwrap();
+        bytes[16..18].copy_from_slice(&checksum.to_be_bytes());
+        let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+        let mut b = Connection::passive(reverse(tuple()), cfg, 900, 1_000, &syn).unwrap();
+        b.set_timestamp_offset(42);
+        assert_eq!(b.peer_scale, 14);
+        assert_eq!(b.take_events().invalid_window_scale, Some(255));
+        b.learn_syn(&syn);
+        assert_eq!(b.take_events().invalid_window_scale, None);
+        deliver(&mut b, &mut a, 2_000);
+        deliver(&mut a, &mut b, 2_000);
+        a.write(b"abcdefghijklmnop").unwrap();
+        let first = packet(&mut a, 3_000);
+        assert_eq!(
+            wire::parse(ip(tuple()), &first)
+                .unwrap()
+                .options
+                .timestamps
+                .unwrap()
+                .0,
+            2
+        );
+        let before = (
+            a.now,
+            a.snd_nxt,
+            a.timestamp_bytes,
+            a.sample,
+            a.rto_deadline,
+        );
+        assert_eq!(
+            a.transmit(3_000, &mut [0; 128]),
+            Err(Error::TimestampBudgetExceeded)
+        );
+        assert_eq!(
+            (
+                a.now,
+                a.snd_nxt,
+                a.timestamp_bytes,
+                a.sample,
+                a.rto_deadline
+            ),
+            before
+        );
+        let incoming = wire::parse(ip(tuple()), &first).unwrap();
+        b.input(3_500, &incoming).unwrap();
+        b.immediate_ack();
+        deliver(&mut b, &mut a, 4_000);
+        assert_eq!(a.rtt.srtt(), Some(1_000));
+        assert!(a.transmit(4_000, &mut [0; 128]).unwrap().is_some());
+        let now = a.now;
+        assert_eq!(
+            a.update_time(now + (1u64 << 31) * 1_000),
+            Err(Error::AmbiguousTimeJump)
+        );
+        assert_eq!(a.now, now);
+        assert_eq!(a.update_time(now - 1), Err(Error::TimeWentBackwards));
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= type=test
+    //= reason=Initial/restart epoch retains original byte range and bytes sent before first advancing data ACK. RTO, Reno/SACK/RACK loss and TLP repair latch inferred loss; >4096 bytes selects future RFC3390 restart bound without increasing cwnd. Wrap, initial/restart, fast/RTO, 4096/4097 and actual future burst tests cover fallback.
+    //# Furthermore, to limit any negative effect that a larger initial window may have on links with limited bandwidth or buffer space, implementations SHOULD fall back to RFC 3390 for the restart window (RW) if any packet loss is detected during either the initial window or a restart window, and more than 4 KB of data is sent.
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-9
+    //= type=test
+    //= reason=IW10 divided/delayed new ACKs with outstanding flight restart at ACKtime+current RTO after estimator update; duplicate ACK does not restart, last new ACK cancels. RFC6298 universal timing audit remains separate.
+    //# To minimize spurious retransmissions, implementations MUST follow RFC 6298 [RFC6298] to restart the retransmission timer with the current value of RTO for each ACK received that acknowledges new data.
+    fn iw10_loss_fallback_boundaries_restart_and_new_ack_timer() {
+        for total in [4_096, 4_097] {
+            for fast in [false, true] {
+                for restart in [false, true] {
+                    let cfg = ConnectionConfig {
+                        initial_window: InitialWindow::Iw10,
+                        // NewReno's initial guard requires prior data progress.
+                        // Reno covers first-flight fast loss; restarted flights
+                        // also exercise NewReno after the warmup ACK.
+                        recovery_algorithm: if fast && !restart {
+                            RecoveryAlgorithm::Reno
+                        } else {
+                            RecoveryAlgorithm::NewReno
+                        },
+                        nagle: false,
+                        rto_min_us: 1_000,
+                        ..config(65_536, 1_000)
+                    };
+                    let (mut a, _) = pair(cfg, u32::MAX - 2_000);
+                    let next = a.receive.next();
+                    let una = a.snd_una;
+                    inject(&mut a, 35, next, una, ACK, 32_767, b"");
+                    if restart {
+                        a.write(b"warmup").unwrap();
+                        packet(&mut a, 40);
+                        let next = a.receive.next();
+                        let end = a.snd_nxt;
+                        inject(&mut a, 100, next, end, ACK, 32_767, b"");
+                        a.update_time(2_000_000).unwrap();
+                    }
+                    a.write(&vec![7; total]).unwrap();
+                    a.flush().unwrap();
+                    let sent_at = if restart { 2_000_001 } else { 1_000 };
+                    let mut out = vec![0; 2_000];
+                    let start = a.snd_nxt;
+                    let mut bytes = 0;
+                    while let Some(n) = a.transmit(sent_at, &mut out).unwrap() {
+                        bytes += wire::parse(ip(tuple()), &out[..n]).unwrap().payload.len();
+                    }
+                    assert_eq!(bytes, total);
+                    assert_eq!(a.iw_epoch.unwrap().bytes, total as u32);
+                    if fast {
+                        let next = a.receive.next();
+                        for i in 1..=3 {
+                            inject(&mut a, sent_at + i, next, start, ACK, 32_767, b"");
+                        }
+                        assert!(a.retx_pending);
+                    } else {
+                        a.timeout(a.rto_deadline.unwrap()).unwrap();
+                        assert_eq!(a.congestion.cwnd(), 1_000);
+                    }
+                    assert!(a.iw_setup_loss());
+                    assert_eq!(a.iw_fallback, total > 4_096);
+                    let end = a.snd_nxt;
+                    let next = a.receive.next();
+                    let now = a.now + 100;
+                    let previous_rto = a.rto();
+                    // Divided new-data ACKs each restart; duplicates do not.
+                    for offset in [500, 1_000, total as u32] {
+                        inject(
+                            &mut a,
+                            now + u64::from(offset),
+                            next,
+                            start.wrapping_add(offset),
+                            ACK,
+                            32_767,
+                            b"",
+                        );
+                        if offset < total as u32 {
+                            assert_eq!(a.rto_deadline, Some(a.now + a.rto()));
+                            let deadline = a.rto_deadline;
+                            let duplicate_at = a.now + 1;
+                            inject(
+                                &mut a,
+                                duplicate_at,
+                                next,
+                                start.wrapping_add(offset),
+                                ACK,
+                                32_767,
+                                b"",
+                            );
+                            assert_eq!(a.rto_deadline, deadline);
+                        } else {
+                            assert_eq!(a.rto_deadline, None);
+                        }
+                    }
+                    assert_eq!(a.snd_una, end);
+                    if fast {
+                        assert_ne!(a.rto(), previous_rto);
+                    }
+                    // Grow after recovery, then observe the actual idle restart burst.
+                    a.congestion = Congestion::new(
+                        1_000,
+                        RecoveryAlgorithm::NewReno,
+                        InitialWindow::Iw10,
+                        a.iss,
+                    );
+                    a.write(&vec![9; 20_000]).unwrap();
+                    let now = a.now + a.rto() + 1;
+                    let mut sent = 0;
+                    while let Some(n) = a.transmit(now, &mut out).unwrap() {
+                        sent += wire::parse(ip(tuple()), &out[..n]).unwrap().payload.len();
+                    }
+                    assert_eq!(sent, if total > 4_096 { 4_000 } else { 10_000 });
+                }
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-3
+    //= type=test
+    //= reason=Default storage advertises >=10 local RMSS on initial SYN/SYNACK; explicitly configured slow-link storage advertises <10. No bandwidth autodetection or deployment performance claim.
+    //# Some implementations advertise a small initial receive window (Table 2 in [Duk10]), effectively limiting how much window a remote host may use. In order to realize the full benefit of the large initial window, implementations are encouraged to advertise an initial receive window of at least 10 segments, except for the circumstances where a larger initial window is deemed harmful. (See Section 8 below.)
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-8
+    //= type=test
+    //= reason=Manual receive_capacity=4000 with local RMSS=1000 advertises four segments on both handshake directions; default capacity advertises >=10. Manual mitigation selected, no low-speed autodetection claim.
+    //# The negative impact can be mitigated by hosts directly connected to a low-speed link advertising an initial receive window smaller than 10 segments. This can be achieved either through manual configuration by the users or through the host stack auto-detecting the low- bandwidth links.
+    fn iw10_initial_receive_window_and_manual_slow_link() {
+        for capacity in [65_536, 4_000] {
+            let cfg = ConnectionConfig {
+                initial_window: InitialWindow::Iw10,
+                ..config(capacity, 1_000)
+            };
+            let mut a = Connection::active(tuple(), cfg.clone(), 100, 0).unwrap();
+            let bytes = packet(&mut a, 0);
+            let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(syn.header.window, capacity.min(65_535) as u16);
+            assert_eq!(syn.header.window >= 10 * cfg.mss, capacity >= 10_000);
+            let mut b = Connection::passive(reverse(tuple()), cfg, 900, 10, &syn).unwrap();
+            let bytes = packet(&mut b, 10);
+            assert_eq!(
+                wire::parse(ip(reverse(tuple())), &bytes)
+                    .unwrap()
+                    .header
+                    .window,
+                syn.header.window
+            );
+        }
+    }
+    #[test]
+    fn iw10_sack_and_rack_losses_latch_initial_epoch() {
+        for rack in [false, true] {
+            let cfg = ConnectionConfig {
+                initial_window: InitialWindow::Iw10,
+                sack: true,
+                rack,
+                nagle: false,
+                ..config(65_536, 1_000)
+            };
+            let (mut a, _) = pair(cfg, u32::MAX - 2_000);
+            a.rack.sample(1_000, 30);
+            a.write(&[7; 5_000]).unwrap();
+            let start = a.snd_nxt;
+            for n in 1..=5 {
+                packet(&mut a, n * 1_000);
+            }
+            let next = a.receive.next();
+            let high = a.snd_nxt;
+            inject_sack(
+                &mut a,
+                10_000,
+                next,
+                start,
+                ACK,
+                32_767,
+                b"",
+                &[(start.wrapping_add(1_000).0, high.0)],
+            );
+            if !a.iw_fallback {
+                a.timeout(a.rack.deadline.unwrap()).unwrap();
+            }
+            assert!(a.iw_fallback && a.iw_setup_loss());
+            assert_eq!(a.restart_window(), 4_000);
+        }
+    }
+
+    #[test]
+    fn reactive_syn_sent_reset_echo_and_clock_profile_validation() {
+        for budget in [0, 1 << 31] {
+            let mut cfg = config(64, 8);
+            cfg.timestamp_bytes_per_tick = budget;
+            assert!(matches!(
+                Connection::active(tuple(), cfg, 100, 0),
+                Err(Error::InvalidArgument)
+            ));
+        }
+        for msl in [0, 255_000_001] {
+            let mut cfg = config(64, 8);
+            cfg.timebase.max_segment_lifetime_us = msl;
+            assert!(matches!(
+                Connection::active(tuple(), cfg, 100, 0),
+                Err(Error::InvalidArgument)
+            ));
+        }
+        let timebase = CallerTimebase::default();
+        assert!((1u64 << 32) * 1_000 > timebase.max_segment_lifetime_us);
+        for budget in [28, 31, 32] {
+            let cfg = ConnectionConfig {
+                send_ip_payload_limit: budget,
+                ..config(64, 8)
+            };
+            let mut a = Connection::active(tuple(), cfg, 100, 0).unwrap();
+            packet(&mut a, 0);
+            timestamp_input(&mut a, 1_000, Seq(900), Seq(99), ACK, Some((77, 0)), b"");
+            let output = packet(&mut a, 1_000);
+            let reset = wire::parse(ip(tuple()), &output).unwrap();
+            assert_eq!(reset.header.flags, RST);
+            assert_eq!(reset.options.timestamps, (budget >= 32).then_some((0, 77)));
+        }
     }
 }
