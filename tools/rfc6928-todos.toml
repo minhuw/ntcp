@@ -27,7 +27,7 @@ If the SYN or SYN/ACK is lost, the initial window used by a sender after a corre
 # 6928-014
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6928#section-2"
-reason = "Stack obligation after IW10 opt-in: estimator/backoff/Karn have partial existing evidence, but full RFC6298 audit remains dependent on the timer-worker integration. Exact section9 per-new-ACK restart/cancel evidence is now supplied; this does not discharge the universal timing audit."
+reason = "IW10 with the default1s RTO floor uses the integrated selected loss timer, per-copy RTO age/boundary protection, backoff and Karn-safe causal-round sampling. The supported IW10 plus subsecond-floor combination retains RFC6298's explicit profile obligations. Universal closure requires resolving that compatibility-policy choice; timer integration and sampling implementation are complete."
 quote = '''
 Implementations must also follow RFC 6298 [RFC6298] in order to avoid spurious RTO as described in Section 9.
 '''
