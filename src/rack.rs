@@ -679,6 +679,13 @@ impl Rack {
             .sum()
     }
 
+    // SACK/ACK splits are not short wire packets: use the committed span.
+    pub(crate) fn has_short_transmission(&self, mss: u32) -> bool {
+        self.intervals
+            .iter()
+            .any(|r| r.transmission_end.distance_from(r.transmission_start) < mss)
+    }
+
     pub(crate) fn counts(&self) -> Counts {
         let mut counts = Counts::default();
         for segment in self

@@ -867,11 +867,11 @@ impl Connection {
     //# PTO by TLP.max_ack_delay to accommodate a potentially delayed
     //# acknowledgment and reduce the risk of spurious retransmissions.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
-    //= reason=One second without SRTT; otherwise 2*SRTT plus peer ACK budget for one packet. Conservatively also waits at least SRTT+peer budget for stretched/short-packet ACKs, capped by unarmed RTO reference.
+    //= reason=One second without SRTT; otherwise 2*SRTT plus peer ACK budget for one packet. Short-packet flights also wait at least SRTT+peer budget for stretched ACKs, capped by unarmed RTO reference.
     //# Summarizing these considerations in pseudocode form, a sender SHOULD
     //# use the following logic to select the duration of a PTO:
     //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
-    //= reason=Implements one-second fallback, single-packet peer-delay inflation and RTO-reference cap. Larger flights conservatively floor PTO at SRTT+peer delay to mitigate stretched ACKs per section9.4.
+    //= reason=Implements one-second fallback, single-packet peer-delay inflation and RTO-reference cap. Larger flights containing short wire packets floor PTO at SRTT+peer delay per section9.4; full-sized flights use 2*SRTT.
     //# TLP_calc_PTO():
     //# If SRTT is available:
     //# PTO = 2 * SRTT
@@ -883,25 +883,29 @@ impl Connection {
     //# If Now() + PTO > TCP_RTO_expiration():
     //# PTO = TCP_RTO_expiration() - Now()
     //= https://www.rfc-editor.org/rfc/rfc8985#section-9.4
-    //= reason=Peer-delay inflation plus a conservative larger-flight floor cover delayed and stretched short-packet ACKs; PTO is still capped by the unarmed RTO reference.
+    //= reason=Peer-delay inflation plus a short-packet-flight floor cover delayed and stretched short-packet ACKs; PTO is still capped by the unarmed RTO reference.
     //# To mitigate this
     //# complication, before sending a TLP loss probe retransmission, the
     //# sender should attempt to wait long enough that the receiver has sent
     //# any delayed ACKs that it is withholding.
     fn schedule_tlp(&mut self) {
         if self.tlp_arm_eligible() {
-            // Short packets and stretched ACKs can delay feedback for more than
-            // one segment; section9.4 justifies the conservative larger-flight floor.
+            // Short packets may not reach the receiver's ACK-every-two-MSS
+            // threshold. Preserve their delay budget without postponing a
+            // full-sized flight's section7.2 PTO merely because SACK split it.
             let pto = self.rtt.srtt().map_or(1_000_000, |srtt| {
                 let delay = if self.rack.counts().unacked == 1 {
                     self.config.peer_max_ack_delay_us
                 } else {
                     0
                 };
-                srtt.saturating_mul(2)
-                    .saturating_add(delay)
-                    .max(srtt.saturating_add(self.config.peer_max_ack_delay_us))
-                    .max(1)
+                let pto = srtt.saturating_mul(2).saturating_add(delay);
+                if self.rack.has_short_transmission(self.mss as u32) {
+                    pto.max(srtt.saturating_add(self.config.peer_max_ack_delay_us))
+                } else {
+                    pto
+                }
+                .max(1)
             });
             self.tlp_deadline = self
                 .rto_deadline
@@ -5864,6 +5868,67 @@ mod tests {
             inject(&mut a, 600_000, next, ack, ACK, 16_000, &[]);
             assert_eq!(a.loss_timer, None);
             assert_eq!(a.tlp_end, None);
+        }
+    }
+
+    #[test]
+    fn full_mss_flight_partial_sack_preserves_two_srtt_pto_and_rto_fallback() {
+        for iss in [0, u32::MAX - 1999] {
+            for acknowledged in [0, 1] {
+                let (mut a, _) = tlp_pair(iss);
+                a.config.peer_max_ack_delay_us = 499_999;
+                let base = a.snd_una;
+                a.write(&[0x55; 4000]).unwrap();
+                for _ in 0..4 {
+                    packet(&mut a, 100_000);
+                }
+                assert_eq!(a.loss_timer, Some((LossTimer::Pto, 300_000)));
+                let next = a.receive.next();
+                inject_sack(
+                    &mut a,
+                    200_000,
+                    next,
+                    base.wrapping_add(acknowledged),
+                    ACK,
+                    65_535,
+                    b"",
+                    &[(base.wrapping_add(3999).0, base.wrapping_add(4000).0)],
+                );
+                // Only the last byte is SACKed, not a complete transmission:
+                // no RACK timer, recovery, or new RTT sample. Interval splits
+                // do not turn the original full-sized packets into short ones.
+                assert_eq!(a.rack.counts().sacked, 0);
+                assert_eq!(a.rack.ack_sample, None);
+                assert_eq!(a.rack.deadline, None);
+                assert!(a.sack_recovery.is_none());
+                assert!(!a.rack.has_short_transmission(a.mss as u32));
+                let pto = if acknowledged == 0 { 300_000 } else { 400_000 };
+                assert_eq!(a.loss_timer, Some((LossTimer::Pto, pto)));
+                let rto = a.rto();
+                a.timeout(pto - 1).unwrap();
+                assert!(!a.tlp_pending);
+                a.timeout(pto).unwrap();
+                assert!(a.tlp_pending);
+                assert!(!a.retx_pending);
+                assert_eq!(a.loss_timer, Some((LossTimer::Rto, pto + rto)));
+                assert_eq!(a.transmit(pto, &mut [0; 22]), Err(Error::OutputTooSmall));
+                assert!(a.tlp_pending);
+                let bytes = packet(&mut a, pto);
+                let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(seg.header.sequence, base.wrapping_add(3000).0);
+                assert_eq!(seg.payload, &[0x55; 1000]);
+                assert_eq!(
+                    a.rack.head_transmission(base.wrapping_add(3000)),
+                    Some((base.wrapping_add(4000), pto))
+                );
+                assert_eq!(a.loss_timer, Some((LossTimer::Rto, pto + rto)));
+                a.timeout(pto + rto).unwrap();
+                let bytes = packet(&mut a, pto + rto);
+                let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(seg.header.sequence, base.wrapping_add(acknowledged).0);
+                assert_eq!(seg.payload, &[0x55; 1000][acknowledged as usize..]);
+                assert!(a.rack.valid());
+            }
         }
     }
 
