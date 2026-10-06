@@ -249,12 +249,21 @@ impl ReceiveBuffer {
                 offset < range.end.distance_from(range.start)
                     && end.distance_from(range.start) <= range.end.distance_from(range.start)
             });
-            if let Some(index) = containing {
-                if count < limit {
-                    let range = self.ranges[index];
-                    blocks[count] = Some((range.start.0, range.end.0));
-                    count += 1;
-                }
+            // An above-ACK duplicate is distinguishable only with a containing
+            // second block. With one slot, send that full ordinary SACK instead.
+            if let Some(index) = containing
+                && limit == 1
+            {
+                let range = self.ranges[index];
+                blocks[0] = Some((range.start.0, range.end.0));
+                return blocks;
+            }
+            if let Some(index) = containing
+                && count < limit
+            {
+                let range = self.ranges[index];
+                blocks[count] = Some((range.start.0, range.end.0));
+                count += 1;
             }
         }
         for recency in 0..self.range_count {
@@ -621,6 +630,26 @@ mod tests {
         // An old prefix wins over a later, separate OOO duplicate region.
         receive_packet(&mut recv, Seq(2800), &[b'z'; 800]);
         assert_eq!(recv.sack_blocks(4)[0], Some((2800, 3000)));
+    }
+
+    #[test]
+    fn one_block_budget_preserves_full_range_and_below_ack_dsack() {
+        for start in [Seq(1000), Seq(u32::MAX - 12)] {
+            let mut recv = ReceiveBuffer::new(start, 64).unwrap();
+            receive_packet(&mut recv, start.wrapping_add(10), &[b'x'; 10]);
+            receive_packet(&mut recv, start.wrapping_add(12), &[b'x'; 3]);
+            let containing = Some((start.wrapping_add(10).0, start.wrapping_add(20).0));
+            let duplicate = Some((start.wrapping_add(12).0, start.wrapping_add(15).0));
+            assert_eq!(recv.sack_blocks(0), [None; 4]);
+            assert_eq!(recv.sack_blocks(1), [containing, None, None, None]);
+            // Planning a smaller option did not consume the pending duplicate.
+            assert_eq!(recv.sack_blocks(2), [duplicate, containing, None, None]);
+            receive_packet(&mut recv, start, &[b'y'; 10]);
+            recv.record_duplicate(start.wrapping_add(12), 3);
+            assert_eq!(recv.sack_blocks(1), [duplicate, None, None, None]);
+            recv.clear_dsack();
+            assert_eq!(recv.sack_blocks(1), [None; 4]);
+        }
     }
 
     #[test]
