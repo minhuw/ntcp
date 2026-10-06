@@ -107,10 +107,12 @@ class CoverageGate(unittest.TestCase):
         report["annotations"].append({
             "source": "todos.toml", "line": 1,
             "target_path": f"{PREFIX}9293", "type": "TODO",
+            "comment": "Needs validated adapter feedback before closure.",
         })
         summaries, errors = check(report)
         self.assertEqual(summaries["9293"]["todos"], 1)
-        self.assertTrue(errors)
+        self.assertTrue(any("Needs validated adapter feedback before closure." in e
+                            for e in errors))
         report["refs"].append({"spec": True, "citation": True, "test": True, "todo": True})
         spec["sections"][0]["lines"][0] = [[[0, len(RFCS)], 3, "Required behavior."]]
         summaries, errors = check(report)

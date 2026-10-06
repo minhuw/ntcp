@@ -6,6 +6,13 @@ use core::cmp::Ordering;
 
 const CAPACITY: usize = 256;
 
+// Linux Documentation/networking/ip-sysctl.rst: tcp_min_rtt_wlen defaults
+// to 300 seconds, balancing path migration against transient RTT inflation.
+const MIN_RTT_WINDOW: u64 = 300_000_000;
+const MIN_RTT_BUCKET: u64 = MIN_RTT_WINDOW / 3;
+// Even a 1-us minimum can reach any u64 SRTT with this multiplier.
+const MAX_MULTIPLIER: u128 = 4 * u64::MAX as u128;
+
 #[derive(Clone, Copy, Debug)]
 struct Interval {
     start: Seq,
@@ -41,10 +48,11 @@ pub(crate) struct Rack {
     latest: Option<(u64, Seq)>,
     fack: Option<Seq>,
     min_rtt: Option<u64>,
+    min_rtt_buckets: [Option<(u64, u64)>; 4],
     rtt: u64,
     reordering_seen: bool,
     pub(crate) reordering: u32,
-    multiplier: u8,
+    multiplier: u128,
     persist: u8,
     dsack_round: Option<Seq>,
     pub(crate) deadline: Option<u64>,
@@ -68,6 +76,7 @@ impl Rack {
             latest: None,
             fack: None,
             min_rtt: None,
+            min_rtt_buckets: [None; 4],
             rtt: 0,
             reordering_seen: false,
             reordering: 3,
@@ -84,12 +93,37 @@ impl Rack {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
-    //= reason=Takes min of accepted samples; acknowledge contributes eligible non-retransmitted full-transmission samples.
+    //= reason=Four fixed buckets conservatively estimate a recent 300-second minimum; acknowledge contributes only eligible non-retransmitted full-transmission samples.
     //# Use the RTT measurements obtained via [RFC6298] or [RFC7323] to
     //# update the estimated minimum RTT in RACK.min_RTT.
-    pub(crate) fn sample(&mut self, rtt: u64) {
-        // ponytail: lifetime minimum; a windowed min filter is needed for path migration.
-        self.min_rtt = Some(self.min_rtt.map_or(rtt, |old| old.min(rtt)));
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= reason=Retains all minima within the window and at most one extra bucket; longer paths replace old minima without allocation.
+    //# The sender SHOULD
+    //# track a windowed min-filtered estimate of recent RTT measurements
+    //# that can adapt when migrating to significantly longer paths rather
+    //# than tracking a simple global minimum of all RTT measurements.
+    pub(crate) fn sample(&mut self, rtt: u64, now: u64) {
+        // now is caller-supplied monotonic microseconds, as for acknowledge.
+        // ponytail: bucket minima retain samples for 300..400 seconds, giving
+        // a conservative (never higher) estimate of the exact 300-second min;
+        // use a full sample deque only if exact expiration becomes necessary.
+        // Like Linux tcp_update_rtt_min, aging happens on accepted samples,
+        // not on timers: idle time alone does not erase the ambiguity guard.
+        let epoch = now / MIN_RTT_BUCKET;
+        let bucket = &mut self.min_rtt_buckets[(epoch % 4) as usize];
+        *bucket = Some((
+            epoch,
+            bucket
+                .filter(|old| old.0 == epoch)
+                .map_or(rtt, |old| old.1.min(rtt)),
+        ));
+        self.min_rtt = self
+            .min_rtt_buckets
+            .iter()
+            .flatten()
+            .filter(|&&(time, _)| time <= epoch && epoch - time < 4)
+            .map(|&(_, value)| value)
+            .min();
         if self.latest.is_none() {
             self.rtt = rtt;
         }
@@ -328,7 +362,7 @@ impl Rack {
         if let Some((sent, end, rtt, retransmitted)) = newest {
             if !retransmitted {
                 self.ack_sample = Some(rtt);
-                self.sample(rtt);
+                self.sample(rtt, now);
             }
             self.rtt = rtt;
             if self.latest.is_none_or(|old| sent_after((sent, end), old)) {
@@ -342,7 +376,7 @@ impl Rack {
         }
         if dsack && self.dsack_round.is_none() {
             self.dsack_round = Some(high);
-            self.multiplier = self.multiplier.saturating_add(1);
+            self.multiplier = self.multiplier.saturating_add(1).min(MAX_MULTIPLIER);
             self.persist = 16;
             self.reordering_seen = true;
         }
@@ -375,7 +409,7 @@ impl Rack {
     //# round-trip time or zero if no round-trip time estimate is
     //# available.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-3.3.2
-    //= reason=Saturating multiplier result is capped at SRTT (zero if unavailable).
+    //= reason=u128 bounded multiplier/product allows every positive u64 minimum to reach SRTT; effective window is capped at SRTT (zero if unavailable).
     //# The RACK reordering window MUST be bounded, and this bound SHOULD
     //# be SRTT.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
@@ -383,7 +417,7 @@ impl Rack {
     //# Otherwise, if some reordering has been observed, then RACK does not
     //# trigger fast recovery based on DupThresh.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
-    //= reason=Implements zeroing after three complete SACKed logical segments or in recovery only without observed reordering; otherwise multiplies integer min_RTT/4 and caps at SRTT. Missing estimates yield zero.
+    //= reason=Implements zeroing after three complete SACKed logical segments or in recovery only without observed reordering; otherwise multiplies before integer division by four and caps at SRTT. Missing estimates yield zero.
     //# If RACK.reordering_seen is FALSE:
     //# If in Fast or RTO recovery:
     //# Return 0
@@ -394,9 +428,10 @@ impl Rack {
         if !self.reordering_seen && (recovery || self.counts().sacked >= 3) {
             return 0;
         }
-        (self.min_rtt.unwrap_or(0) / 4)
-            .saturating_mul(u64::from(self.multiplier))
-            .min(srtt.unwrap_or(0))
+        // Divide after multiplication, including minima below four us.
+        // An overflowing u128 product / 4 still exceeds every u64 SRTT.
+        ((u128::from(self.min_rtt.unwrap_or(0)).saturating_mul(self.multiplier) / 4)
+            .min(u128::from(srtt.unwrap_or(0)))) as u64
     }
 
     // RFC 8985 §6.2: maximum remaining eligible interval, not minimum.
@@ -577,7 +612,7 @@ mod tests {
             let seq = |n: u32| base.wrapping_add(n);
             let mut rack = Rack::new().unwrap();
             let mut scoreboard = Scoreboard::new();
-            rack.sample(100_000);
+            rack.sample(100_000, 0);
             for n in 0..4 {
                 rack.transmit(seq(n * 1000), seq((n + 1) * 1000), 100_000, false);
             }
@@ -632,13 +667,132 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Longer-path samples replace expired minima; bucket boundaries never discard in-window minima, idle time alone retains the guard, and equal/shorter samples update immediately.
+    //# The sender SHOULD
+    //# track a windowed min-filtered estimate of recent RTT measurements
+    //# that can adapt when migrating to significantly longer paths rather
+    //# than tracking a simple global minimum of all RTT measurements.
+    fn windowed_minimum_path_migration_and_boundaries() {
+        for start in [0, MIN_RTT_BUCKET - 1, MIN_RTT_BUCKET] {
+            let mut rack = Rack::new().unwrap();
+            rack.sample(100, start);
+            rack.sample(400, start + MIN_RTT_WINDOW);
+            assert_eq!(rack.min_rtt, Some(100)); // Inclusive window boundary.
+            rack.sample(400, start + MIN_RTT_WINDOW + MIN_RTT_BUCKET);
+            assert_eq!(rack.min_rtt, Some(400));
+            assert_eq!(rack.reo_window(false, Some(400)), 100);
+            rack.sample(50, start + MIN_RTT_WINDOW + MIN_RTT_BUCKET);
+            assert_eq!(rack.min_rtt, Some(50));
+        }
+        let mut boundary = Rack::new().unwrap();
+        boundary.sample(100, 0);
+        boundary.sample(400, 4 * MIN_RTT_BUCKET - 1);
+        assert_eq!(boundary.min_rtt, Some(100));
+        boundary.sample(400, 4 * MIN_RTT_BUCKET);
+        assert_eq!(boundary.min_rtt, Some(400)); // Old ring slot reused exactly here.
+
+        let mut rack = Rack::new().unwrap();
+        let mut scoreboard = Scoreboard::new();
+        rack.sample(100, 0);
+        rack.detect(10 * MIN_RTT_WINDOW, false, Some(400));
+        assert_eq!(rack.min_rtt, Some(100)); // No accepted sample, no aging.
+        let sent = 10 * MIN_RTT_WINDOW;
+        rack.transmit(Seq(0), Seq(1000), sent, false);
+        sack(&mut rack, &mut scoreboard, 1000, 1000, sent + 400, &[]);
+        assert_eq!(rack.min_rtt, Some(400));
+        assert_eq!(rack.ack_sample, Some(400));
+        // The new path minimum is also the retransmission ambiguity threshold.
+        rack.transmit(Seq(1000), Seq(2000), sent + 500, false);
+        rack.transmit(Seq(1000), Seq(2000), sent + 600, true);
+        let latest = rack.latest;
+        sack(&mut rack, &mut scoreboard, 2000, 2000, sent + 999, &[]);
+        assert_eq!(rack.latest, latest);
+        assert_eq!(rack.ack_sample, None);
+        assert_eq!(rack.min_rtt, Some(400));
+
+        // Epoch arithmetic does not overflow at the clock's representable end.
+        rack.sample(800, u64::MAX - 1);
+        assert_eq!(rack.min_rtt, Some(800));
+        rack.sample(700, u64::MAX);
+        assert_eq!(rack.min_rtt, Some(700));
+        rack.sample(0, u64::MAX);
+        assert_eq!(rack.min_rtt, Some(0));
+        assert_eq!(rack.reo_window(false, Some(u64::MAX)), 0);
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Four hundred distinct DSACK rounds grow beyond 255 to SRTT, duplicate same-round ACKs do not grow, and widened arithmetic reaches even u64::MAX caps without overflow.
+    //# If RACK.dsack_round is None AND
+    //# any DSACK option is present on latest received ACK:
+    //# RACK.dsack_round = SND.NXT
+    //# RACK.reo_wnd_mult += 1
+    //# RACK.reo_wnd_persist = 16
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Checks multiplication before division, absent/zero SRTT, and overflow-safe SRTT bounds for all representative u64 minima.
+    //# Return min(RACK.reo_wnd_mult * RACK.min_RTT / 4, SRTT)
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-3.3.2
+    //= type=test
+    //= reason=Effective window never exceeds SRTT, including maximum representable inputs.
+    //# The RACK reordering window MUST be bounded, and this bound SHOULD
+    //# be SRTT.
+    fn dsack_more_than_255_rounds_and_full_width_window_cap() {
+        let mut rack = Rack::new().unwrap();
+        let scoreboard = Scoreboard::new();
+        rack.sample(4, 0);
+        for round in 1..=400 {
+            let ack = Seq(round * 1000);
+            let high = ack.wrapping_add(1000);
+            rack.acknowledge(ack, high, &scoreboard, 0, None, false, 1000, true);
+            assert_eq!(rack.multiplier, u128::from(round) + 1);
+            assert_eq!(
+                rack.reo_window(false, Some(400)),
+                u64::from(round + 1).min(400)
+            );
+            rack.acknowledge(ack, high, &scoreboard, 0, None, false, 1000, true);
+            assert_eq!(rack.multiplier, u128::from(round) + 1);
+        }
+        for minimum in [1, 2, 3, 4, u64::MAX] {
+            rack.min_rtt = Some(minimum);
+            rack.multiplier = MAX_MULTIPLIER;
+            assert_eq!(rack.reo_window(false, Some(u64::MAX)), u64::MAX);
+            assert_eq!(rack.reo_window(true, Some(123)), 123);
+            assert_eq!(rack.reo_window(false, None), 0);
+            assert_eq!(rack.reo_window(false, Some(0)), 0);
+        }
+        rack.min_rtt = Some(3);
+        rack.multiplier = 2;
+        assert_eq!(rack.reo_window(false, Some(100)), 1);
+        rack.multiplier = MAX_MULTIPLIER;
+        rack.acknowledge(
+            Seq(500_000),
+            Seq(501_000),
+            &scoreboard,
+            0,
+            None,
+            false,
+            1000,
+            true,
+        );
+        assert_eq!(rack.multiplier, MAX_MULTIPLIER);
+        for _ in 0..16 {
+            rack.recovery_exit();
+        }
+        assert_eq!(rack.multiplier, 1);
+    }
+
+    #[test]
     fn lost_selection_keeps_packet_boundary_and_charges_redundant_suffix() {
         for base in [Seq(1), Seq(u32::MAX - 499)] {
             for prefix in [0, 123] {
                 let seq = |n: u32| base.wrapping_add(n);
                 let mut rack = Rack::new().unwrap();
                 let mut scoreboard = Scoreboard::new();
-                rack.sample(100);
+                rack.sample(100, 0);
                 rack.transmit(base, seq(1000), 0, false);
                 rack.transmit(seq(1000), seq(2000), 0, false);
                 rack.rto(200, base, Some(100));
@@ -723,7 +877,7 @@ mod tests {
             let end = base.wrapping_add(1000);
             let mut rack = Rack::new().unwrap();
             let mut scoreboard = Scoreboard::new();
-            rack.sample(100_000);
+            rack.sample(100_000, 0);
             rack.transmit(base, end, 100_000, false);
             rack.transmit(base.wrapping_add(12), end, 300_000, true);
             assert!(!rack.intervals[0].retransmitted);
@@ -948,7 +1102,7 @@ mod tests {
     fn maximum_timer_remaining_and_lost_retransmission() {
         let mut rack = Rack::new().unwrap();
         let mut scoreboard = Scoreboard::new();
-        rack.sample(100);
+        rack.sample(100, 0);
         for (i, time) in [0, 10, 20].into_iter().enumerate() {
             rack.transmit(
                 Seq(i as u32 * 1000),
@@ -1020,7 +1174,7 @@ mod tests {
     fn rto_marks_first_and_age_eligible_only_and_karn_rejects_early_retx_ack() {
         let mut rack = Rack::new().unwrap();
         let mut scoreboard = Scoreboard::new();
-        rack.sample(100);
+        rack.sample(100, 0);
         rack.transmit(Seq(0), Seq(1000), 0, false);
         rack.transmit(Seq(1000), Seq(2000), 999, false);
         rack.rto(1000, Seq(0), Some(100));
@@ -1089,7 +1243,7 @@ mod tests {
         ] {
             let mut rack = Rack::new().unwrap();
             let scoreboard = Scoreboard::new();
-            rack.sample(100_000);
+            rack.sample(100_000, 0);
             rack.transmit(Seq(0), Seq(1000), 100_000, false);
             rack.transmit(Seq(0), Seq(1000), 300_000, true);
             assert_eq!(
@@ -1150,13 +1304,13 @@ mod tests {
     fn original_reordering_and_zero_window_rules() {
         let mut unknown = Rack::new().unwrap();
         assert_eq!(unknown.reo_window(false, None), 0);
-        unknown.sample(100);
+        unknown.sample(100, 0);
         assert_eq!(unknown.reo_window(false, Some(100)), 25);
         assert_eq!(unknown.reo_window(true, Some(100)), 0);
         for retransmit in [false, true] {
             let mut rack = Rack::new().unwrap();
             let mut scoreboard = Scoreboard::new();
-            rack.sample(100);
+            rack.sample(100, 0);
             for i in 0..4 {
                 rack.transmit(Seq(i * 1000), Seq((i + 1) * 1000), 0, false);
             }
@@ -1292,7 +1446,7 @@ mod tests {
     fn dsack_new_round_cap_and_sixteen_recovery_decay() {
         let mut rack = Rack::new().unwrap();
         let mut scoreboard = Scoreboard::new();
-        rack.sample(100);
+        rack.sample(100, 0);
         rack.transmit(Seq(1000), Seq(2000), 0, false);
         sack(&mut rack, &mut scoreboard, 1000, 2000, 100, &[(0, 1000)]);
         assert_eq!(rack.multiplier, 2);
@@ -1333,7 +1487,7 @@ mod tests {
     fn rto_nonzero_window_age_boundary_and_first_exception() {
         for now in [124, 125] {
             let mut rack = Rack::new().unwrap();
-            rack.sample(100);
+            rack.sample(100, 0);
             rack.reordering_seen = true;
             rack.transmit(Seq(0), Seq(1000), 124, false);
             rack.transmit(Seq(1000), Seq(2000), 0, false);
@@ -1351,7 +1505,7 @@ mod tests {
     fn dsack_is_not_delivery_and_growth_is_bounded_per_round() {
         let mut rack = Rack::new().unwrap();
         let mut scoreboard = Scoreboard::new();
-        rack.sample(100);
+        rack.sample(100, 0);
         rack.transmit(Seq(1000), Seq(2000), 0, false);
         assert_eq!(
             sack(&mut rack, &mut scoreboard, 1000, 2000, 100, &[(0, 1000)]),

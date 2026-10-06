@@ -57,7 +57,8 @@ def check(report):
             a = annotations[index]
             errors.append(f"RFC {rfc}: incomplete requirement at {a['source']}:{a['line']}")
         for a in todos:
-            errors.append(f"RFC {rfc}: TODO at {a['source']}:{a['line']}")
+            reason = a.get("comment") or "Closure reason missing; explain the remaining obligation."
+            errors.append(f"RFC {rfc}: TODO at {a['source']}:{a['line']}: {reason}")
     return summaries, errors
 
 

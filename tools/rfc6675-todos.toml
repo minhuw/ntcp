@@ -19,19 +19,10 @@ be updated via the Update () routine.
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
-reason = "Normal recovery ACK tests cover updating/pipe and boundary exit, but no non-RACK test preserves SACKed new bytes beyond RecoveryPoint on exit; see the specific retention TODO. The procedure also relies on bounded scoreboard applicability."
+reason = "Normal non-RACK/non-PRR recovery ACK tests cover Update/pipe, fixed-boundary exit and retained SACKed new bytes used in later recovery (sack_recovery_exit_retains_new_data_advice_for_later_recovery). The umbrella remains open: a 65th disjoint scoreboard range clears advice and exits recovery into cumulative-only fallback, so RFC 6675 processing is not established for each arriving ACK across overflow; see Update/arbitrary-range TODOs."
 quote = '''
 Once a TCP is in the loss recovery phase, the following procedure MUST be
 used for each arriving ACK:
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
-reason = "No non-RACK connection test exits recovery with SACKed new bytes beyond the fixed RecoveryPoint and asserts those ranges survive, pipe is recomputed correctly and later recovery uses them. Add that boundary-crossing test; unit ACK-trim tests alone do not verify exit behavior."
-quote = '''
-Any information contained in the scoreboard for sequence numbers greater
-than the new value of HighACK SHOULD NOT be cleared when leaving the loss
-recovery phase.
 '''
 
 [[TODO]]
@@ -49,15 +40,4 @@ quote = '''
 Given the information provided in an ACK, each octet that is cumulatively
 ACKed or SACKed should be marked accordingly in the scoreboard data
 structure, and the total number of octets SACKed should be recorded.
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
-reason = "entry_pending chooses lowest unsacked hole, not necessarily HighACK+1 if peer SACK covers snd_una; accepted SACK ranges can begin at ACK. Add non-RACK connection test for a SACKed head and decide whether to reject such advisory range or retransmit head regardless. Existing entry test covers an unsacked head only. No production change in this audit."
-quote = '''
-(4.3) Retransmit the first data segment presumed dropped -- the segment
-starting with sequence number HighACK + 1. To prevent repeated
-retransmission of the same data or a premature rescue retransmission, set
-both HighRxt and RescueRxt to the highest sequence number in the
-retransmitted segment.
 '''

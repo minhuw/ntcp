@@ -10,16 +10,6 @@ than 1/4 of the minimum RTT of the connection.
 '''
 
 [[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.2"
-reason = "Behavior and test gap: Rack::sample tracks a lifetime global minimum. No windowed min-filter or path-migration adaptation exists; add an aging/windowed minimum and a longer-path regression."
-quote = '''
-The sender SHOULD
-track a windowed min-filtered estimate of recent RTT measurements
-that can adapt when migrating to significantly longer paths rather
-than tracking a simple global minimum of all RTT measurements.
-'''
-
-[[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.2"
 reason = "Behavior/profile gap: schedule_tlp additionally requires a fresh RTT and no tracked probe; tlp_eligible excludes FIN/closing and receive-window-shrink states. Thus it does not schedule after every new-data/advancing-ACK event outside the RFC-listed recovery/SACK exclusions. Fresh RTT correctly gates sending in section 7.3, but is applied early here. Add focused scheduling tests for these omitted contexts or document/implement their handling in the supported profile."
 quote = '''
@@ -97,22 +87,6 @@ reason = "Test gap: no isolated connection test with observed reordering and thr
 quote = '''
 Otherwise, if some reordering has been observed, then RACK does not
 trigger fast recovery based on DupThresh.
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.2"
-reason = "Bounded-state behavior gap: reo_wnd_mult is a saturating u8, so DSACK growth stops at 255 even if SRTT remains above 255*(min_RTT/4). The stated linear per-round increment is not supported beyond that ceiling; add a wider/capped-to-SRTT multiplier and a long adaptation regression if that range is part of the supported profile."
-quote = '''
-If RACK.dsack_round is not None AND
-SND.UNA >= RACK.dsack_round:
-RACK.dsack_round = None
-/* Grow the reordering window per round that sees DSACK.
-Reset the window after 16 DSACK-free recoveries */
-If RACK.dsack_round is None AND
-any DSACK option is present on latest received ACK:
-RACK.dsack_round = SND.NXT
-RACK.reo_wnd_mult += 1
-RACK.reo_wnd_persist = 16
 '''
 
 [[TODO]]

@@ -11,14 +11,6 @@ SHOULD generate them under all permitted circumstances.
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc2018#section-4"
-reason = "Negotiation matrix asserts flags, and disabled test covers both-disabled traffic, but no wire-output test injects OOO data for every asymmetric/no-peer-permission negotiation. Add directional non-SYN kind-4 injection and assert it cannot enable emitted kind 5."
-quote = '''
-If the data receiver has not received a SACK-Permitted option for a given
-connection, it MUST NOT send SACK options on that connection.
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc2018#section-4"
 reason = "Receive range-cap rejection sets sack_omit and emits a cumulative-only ACK even with retained noncontiguous data (sack_receiver_cap_rejection_sends_only_cumulative_ack). Tiny path budgets can also omit SACK. This is a bounded-resource SHOULD deviation, not full all-circumstances coverage; add connection tests documenting accepted OOO arrivals followed by constrained/batched ACKs and decide the profile policy."
 quote = '''
 If sent at all, SACK options SHOULD be included in all ACKs which do not ACK
@@ -51,16 +43,6 @@ reported SACK blocks (based on first SACK blocks in previous SACK options)
 that are not subsets of a SACK block already included in the SACK option
 being constructed.
 '''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc2018#section-5"
-reason = "Existing RTO test SACKs only bytes above the head. Add a connection case with a valid first block covering snd_una before timeout and assert the head is still retransmitted; owned scoreboard clear test alone cannot prove wire output regardless of the SACKed bit."
-quote = '''
-The data sender MUST retransmit the segment at the left edge of the window
-after a retransmit timeout, whether or not the SACKed bit is on for that
-segment.
-'''
-
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc2018#section-5"

@@ -831,7 +831,7 @@ impl Connection {
     //# as part of the Limited Transmit mechanism not be counted in FlightSize for
     //# the purpose of the above equation.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Entry initializes pipe from scoreboard and output increments for successful retransmission.
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Entry initializes pipe from scoreboard and successful entry retransmission recomputes SetPipe with committed HighRxt, including when advisory SACK covers the head.
     //# (4.4) Run SetPipe () Set a "pipe" variable to the number of outstanding
     //# octets currently "in the pipe"; this is the data which has been sent by the
     //# TCP sender but for which no cumulative or selective acknowledgment has been
@@ -1811,7 +1811,7 @@ impl Connection {
     //# RecoveryPoint signals the end of loss recovery, and the loss recovery phase
     //# MUST be terminated.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Exit does not clear scoreboard; Update trims only cumulatively ACKed ranges.
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Exit does not clear scoreboard; Update trims only cumulatively ACKed ranges. sack_recovery_exit_retains_new_data_advice_for_later_recovery checks retained new-data suffix, recomputed pipe and later IsLost entry across wrap.
     //# Any information contained in the scoreboard for sequence numbers greater
     //# than the new value of HighACK SHOULD NOT be cleared when leaving the loss
     //# recovery phase.
@@ -1844,7 +1844,7 @@ impl Connection {
     //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Three fresh evidence ACKs start recovery; repeated evidence is not counted.
     //# (1) If DupAcks >= DupThresh, go to step (4).
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. A single ACK carrying three one-byte discontiguous SACK ranges starts recovery immediately and emits a 17-byte first hole.
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. A single ACK carrying three one-byte discontiguous SACK ranges starts recovery immediately and emits one SMSS starting at snd_una regardless of advisory SACK edges.
     //# (2) If DupAcks < DupThresh but IsLost (HighACK + 1) returns true --
     //# indicating at least three segments have arrived above the current cumulative
     //# acknowledgment point, which is taken to indicate loss -- go to step (4).
@@ -2522,7 +2522,7 @@ impl Connection {
                 let sample = self.now.saturating_sub(sent);
                 self.rtt.sample(sample);
                 self.tlp_fresh_rtt = true;
-                self.rack.sample(sample);
+                self.rack.sample(sample, self.now);
                 if !syn_ack {
                     self.syn_timed_out = false;
                 }
@@ -2959,7 +2959,7 @@ impl Connection {
     //# starting with the octet HighData+1 and update HighData to reflect this
     //# transmission, then return to (3.2).
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. entry_pending selects first unsacked head and commits high_rxt/rescue_rxt on successful encode, not failure.
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. entry_pending retransmits snd_una regardless of advisory SACK, bounded by real data high, output and peer window; sack_entry_retransmits_sacked_head_transactionally checks committed exclusive HighRxt/RescueRxt and SetPipe after success, not failure.
     //# (4.3) Retransmit the first data segment presumed dropped -- the segment
     //# starting with sequence number HighACK + 1. To prevent repeated
     //# retransmission of the same data or a premature rescue retransmission, set
@@ -3175,19 +3175,15 @@ impl Connection {
                         .map(|(left, right)| (left, right, false, recovery.entry_pending));
                 }
             } else if recovery.entry_pending {
-                let range = self
-                    .scoreboard
-                    .lowest_hole(self.snd_una, self.data_high(), packet_mss as u32, false)
-                    .or_else(|| {
-                        after(self.data_high(), self.snd_una).then_some((
-                            self.snd_una,
-                            self.snd_una.wrapping_add(
-                                self.data_high()
-                                    .distance_from(self.snd_una)
-                                    .min(packet_mss as u32),
-                            ),
-                        ))
-                    });
+                // SACK is advisory: RFC 6675 entry always starts at HighACK+1.
+                let range = after(self.data_high(), self.snd_una).then_some((
+                    self.snd_una,
+                    self.snd_una.wrapping_add(
+                        self.data_high()
+                            .distance_from(self.snd_una)
+                            .min(packet_mss as u32),
+                    ),
+                ));
                 sack_segment = range.map(|(left, right)| (left, right, false, true));
             } else if self.prr.is_some_and(|prr| prr.credit() != 0)
                 || self.prr.is_none() && self.recovery_credit(recovery) >= self.mss as u32
@@ -3642,6 +3638,8 @@ impl Connection {
             }
             recovery.pipe = if self.rack_enabled() {
                 self.rack.pipe()
+            } else if sack_segment.is_some_and(|(_, _, _, entry)| entry) {
+                self.recovery_pipe(recovery.high_rxt)
             } else {
                 recovery.pipe.saturating_add(count as u32)
             };
@@ -3828,7 +3826,7 @@ impl Connection {
     //# After a retransmit timeout the data sender SHOULD turn off all of the SACKed
     //# bits, since the timeout might indicate that the data receiver has reneged.
     //= https://www.rfc-editor.org/rfc/rfc2018#section-5
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Timeout output retransmits snd_una; test verifies head sequence and guard.
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. sack_rto_discards_advice_retransmits_head_and_guards_epoch accepts a valid first SACK block covering snd_una through data_high before RTO, then verifies wire head sequence/payload and guard after timeout clears advice.
     //# The data sender MUST retransmit the segment at the left edge of the window
     //# after a retransmit timeout, whether or not the SACKed bit is on for that
     //# segment.
@@ -5624,6 +5622,11 @@ mod tests {
     //= https://www.rfc-editor.org/rfc/rfc2018#section-2
     //= type=test
     //# It MUST NOT be sent on non-SYN segments.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= type=test
+    //= reason=All active/passive permission combinations, both directions and timestamp modes inject kind 4 on accepted non-SYN OOO data. ACK wire output retains only SYN-negotiated kind-5 permission; disabled directions retain data but emit no SACK.
+    //# If the data receiver has not received a SACK-Permitted option for a given
+    //# connection, it MUST NOT send SACK options on that connection.
     fn sack_negotiation_directional_and_disabled_layout() {
         assert!(!ConnectionConfig::default().sack);
         for active in [false, true] {
@@ -5688,6 +5691,58 @@ mod tests {
                         (b.sack_receive, b.sack_send),
                         (active && passive, active && passive)
                     );
+                    for receiver in [&mut a, &mut b] {
+                        let permission = receiver.sack_send;
+                        let next = receiver.receive.next();
+                        let metadata = ip(reverse(receiver.tuple()));
+                        let mut options = vec![1; 4];
+                        if timestamps {
+                            options.extend_from_slice(&[1, 1, 8, 10]);
+                            options.extend_from_slice(&0u32.to_be_bytes());
+                            options.extend_from_slice(&receiver.ts_recent.to_be_bytes());
+                        }
+                        let mut bytes = [0; 128];
+                        let len = wire::encode(
+                            metadata,
+                            Header {
+                                source_port: receiver.tuple.remote.port(),
+                                destination_port: receiver.tuple.local.port(),
+                                sequence: next.wrapping_add(10).0,
+                                acknowledgment: receiver.snd_una.0,
+                                flags: ACK,
+                                window: 1024,
+                                urgent_pointer: 0,
+                            },
+                            &options,
+                            b"ooo",
+                            &mut bytes,
+                        )
+                        .unwrap();
+                        // Encoder correctly forbids non-SYN kind 4; inject it as peer input.
+                        bytes[20..24].copy_from_slice(&[4, 2, 1, 1]);
+                        bytes[16..18].fill(0);
+                        let checksum = wire::checksum(metadata, &bytes[..len]).unwrap();
+                        bytes[16..18].copy_from_slice(&checksum.to_be_bytes());
+                        let injected = wire::parse(metadata, &bytes[..len]).unwrap();
+                        assert!(injected.options.sack_permitted);
+                        assert_eq!(injected.header.flags & SYN, 0);
+                        receiver.input(40, &injected).unwrap();
+                        assert!(receiver.accepted_metadata);
+                        assert_eq!(receiver.sack_send, permission);
+                        assert_eq!(
+                            receiver.receive.sack_blocks(4)[0],
+                            Some((next.wrapping_add(10).0, next.wrapping_add(13).0))
+                        );
+                        let bytes = packet(receiver, 41);
+                        let ack = wire::parse(ip(receiver.tuple()), &bytes).unwrap();
+                        assert_eq!(ack.header.acknowledgment, next.0);
+                        assert_eq!(
+                            ack.options.sack_blocks[0],
+                            permission
+                                .then_some((next.wrapping_add(10).0, next.wrapping_add(13).0))
+                        );
+                        assert!(ack.options.sack_blocks.iter().skip(1).all(Option::is_none));
+                    }
                 }
             }
         }
@@ -6336,7 +6391,7 @@ mod tests {
     //# for this data octet, the loss recovery phase is terminated.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
     //= type=test
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. entry_pending selects first unsacked head and commits high_rxt/rescue_rxt on successful encode, not failure.
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. entry_pending retransmits snd_una regardless of advisory SACK, bounded by real data high, output and peer window; sack_entry_retransmits_sacked_head_transactionally checks committed exclusive HighRxt/RescueRxt and SetPipe after success, not failure.
     //# (4.3) Retransmit the first data segment presumed dropped -- the segment
     //# starting with sequence number HighACK + 1. To prevent repeated
     //# retransmission of the same data or a premature rescue retransmission, set
@@ -6344,7 +6399,7 @@ mod tests {
     //# retransmitted segment.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
     //= type=test
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Entry initializes pipe from scoreboard and output increments for successful retransmission.
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Entry initializes pipe from scoreboard and successful entry retransmission recomputes SetPipe with committed HighRxt, including when advisory SACK covers the head.
     //# (4.4) Run SetPipe () Set a "pipe" variable to the number of outstanding
     //# octets currently "in the pipe"; this is the data which has been sent by the
     //# TCP sender but for which no cumulative or selective acknowledgment has been
@@ -6424,7 +6479,138 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
     //= type=test
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. A single ACK carrying three one-byte discontiguous SACK ranges starts recovery immediately and emits a 17-byte first hole.
+    //= reason=Non-RACK/non-PRR entry with a valid SACKed head retransmits snd_una across wrap, clips to output/peer/data limits, and commits exclusive HighRxt/RescueRxt and recomputed pipe only after successful encoding.
+    //# (4.3) Retransmit the first data segment presumed dropped -- the segment
+    //# starting with sequence number HighACK + 1. To prevent repeated
+    //# retransmission of the same data or a premature rescue retransmission, set
+    //# both HighRxt and RescueRxt to the highest sequence number in the
+    //# retransmitted segment.
+    fn sack_entry_retransmits_sacked_head_transactionally() {
+        for iss in [100, u32::MAX - 1000] {
+            for (tail, window, ooo, expected) in [
+                (1024, 8192, false, 128),
+                (1024, 63, false, 63),
+                (1024, 8192, true, 116),
+                (31, 8192, false, 31),
+            ] {
+                let mut a = sack_flight(128, iss, 8);
+                let una = a.data_high().wrapping_add(0u32.wrapping_sub(tail));
+                sack_ack(&mut a, 190, una, &[]);
+                if ooo {
+                    let seq = a.receive.next().wrapping_add(10);
+                    inject_sack(&mut a, 191, seq, una, ACK, window, b"ooo", &[]);
+                }
+                for (i, size) in [8, 16, 24].into_iter().enumerate() {
+                    let seq = a.receive.next();
+                    inject_sack(
+                        &mut a,
+                        200 + i as u64,
+                        seq,
+                        una,
+                        ACK,
+                        window,
+                        &[],
+                        &[(una.0, una.wrapping_add(size).0)],
+                    );
+                }
+                assert_eq!(a.scoreboard.ranges(), &[(una, una.wrapping_add(24))]);
+                let before = a.sack_recovery.unwrap();
+                assert!(before.entry_pending);
+                let deadline = a.rto_deadline;
+                assert_eq!(a.transmit(203, &mut [0; 8]), Err(Error::OutputTooSmall));
+                let retry = a.sack_recovery.unwrap();
+                assert_eq!(
+                    (
+                        retry.high_rxt,
+                        retry.rescue_rxt,
+                        retry.pipe,
+                        retry.entry_pending
+                    ),
+                    (
+                        before.high_rxt,
+                        before.rescue_rxt,
+                        before.pipe,
+                        before.entry_pending
+                    )
+                );
+                assert_eq!(a.rto_deadline, deadline);
+                let bytes = packet(&mut a, 204);
+                let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(segment.header.sequence, una.0);
+                assert_eq!(segment.payload, &[0x77; 128][..expected]);
+                let recovery = a.sack_recovery.unwrap();
+                let end = una.wrapping_add(expected as u32);
+                assert!(!recovery.entry_pending);
+                assert_eq!(recovery.high_rxt, end);
+                assert_eq!(recovery.rescue_rxt, Some(end));
+                assert_eq!(recovery.pipe, a.recovery_pipe(end));
+                assert_eq!(a.scoreboard.ranges(), &[(una, una.wrapping_add(24))]);
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Non-RACK/non-PRR recovery sends new bytes beyond fixed RecoveryPoint, SACKs their suffix, exits with advice retained across wrap, recomputes pipe and uses retained advice to trigger later recovery on one new SACK ACK.
+    //# Any information contained in the scoreboard for sequence numbers greater
+    //# than the new value of HighACK SHOULD NOT be cleared when leaving the loss
+    //# recovery phase.
+    fn sack_recovery_exit_retains_new_data_advice_for_later_recovery() {
+        for iss in [100, u32::MAX - 1800] {
+            let mut a = sack_flight(128, iss, 12);
+            let una = a.snd_una;
+            let point = a.data_high();
+            a.write(&[9; 512]).unwrap();
+            sack_ack(&mut a, 200, una, &[(una.wrapping_add(128).0, point.0)]);
+            packet(&mut a, 201); // Entry retransmission.
+            for i in 0..4 {
+                let bytes = packet(&mut a, 202 + i);
+                let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(
+                    segment.header.sequence,
+                    point.wrapping_add(i as u32 * 128).0
+                );
+                assert_eq!(segment.payload, &[9; 128]);
+                assert_eq!(a.sack_recovery.unwrap().recovery_point, point);
+            }
+            let retained = (point.wrapping_add(128), point.wrapping_add(512));
+            sack_ack(&mut a, 210, una, &[(retained.0.0, retained.1.0)]);
+            let recovery = a.sack_recovery.unwrap();
+            assert_eq!(recovery.pipe, a.recovery_pipe(recovery.high_rxt));
+            sack_ack(&mut a, 211, point, &[]);
+            assert!(a.sack_recovery.is_none());
+            assert!(!a.congestion.in_recovery());
+            assert_eq!(a.scoreboard.ranges(), &[retained]);
+            assert_eq!(a.send.len(), 512);
+            assert_eq!(a.recovery_pipe(point), 0); // 384 retained SACKed bytes mark the head lost.
+            a.write(&[8; 128]).unwrap();
+            let bytes = packet(&mut a, 212);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+                retained.1.0
+            );
+            let high = a.snd_nxt;
+            sack_ack(&mut a, 213, point, &[(retained.1.0, high.0)]);
+            let recovery = a.sack_recovery.unwrap();
+            assert!(recovery.entry_pending); // Only one fresh SACK; retained bytes supply IsLost evidence.
+            assert_eq!(recovery.recovery_point, point.wrapping_add(640));
+            assert_eq!(recovery.pipe, 0);
+            assert_eq!(
+                a.scoreboard.ranges(),
+                &[(retained.0, point.wrapping_add(640))]
+            );
+            let bytes = packet(&mut a, 214);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.header.sequence, point.0);
+            assert_eq!(segment.payload, &[9; 128]);
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. A single ACK carrying three one-byte discontiguous SACK ranges starts recovery immediately and emits one SMSS starting at snd_una regardless of advisory SACK edges.
     //# (2) If DupAcks < DupThresh but IsLost (HighACK + 1) returns true --
     //# indicating at least three segments have arrived above the current cumulative
     //# acknowledgment point, which is taken to indicate loss -- go to step (4).
@@ -6445,7 +6631,7 @@ mod tests {
         let bytes = packet(&mut a, 201);
         let segment = wire::parse(ip(tuple()), &bytes).unwrap();
         assert_eq!(segment.header.sequence, una.0);
-        assert_eq!(segment.payload.len(), 17);
+        assert_eq!(segment.payload.len(), 128); // Entry does not clip at advisory SACK edges.
         // ACK trims arbitrary bytes; a retransmission starts from that offset.
         sack_ack(&mut a, 202, una.wrapping_add(7), &[]);
         assert_eq!(a.snd_una, una.wrapping_add(7));
@@ -6621,7 +6807,7 @@ mod tests {
     //# bits, since the timeout might indicate that the data receiver has reneged.
     //= https://www.rfc-editor.org/rfc/rfc2018#section-5
     //= type=test
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Timeout output retransmits snd_una; test verifies head sequence and guard.
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. sack_rto_discards_advice_retransmits_head_and_guards_epoch accepts a valid first SACK block covering snd_una through data_high before RTO, then verifies wire head sequence/payload and guard after timeout clears advice.
     //# The data sender MUST retransmit the segment at the left edge of the window
     //# after a retransmit timeout, whether or not the SACKed bit is on for that
     //# segment.
@@ -6668,7 +6854,8 @@ mod tests {
         packet(&mut a, 201);
         assert_eq!(a.rto_deadline, Some(201 + a.rto()));
         let deadline = a.rto_deadline.unwrap();
-        sack_ack(&mut a, 202, una, &[(una.wrapping_add(128).0, point.0)]);
+        sack_ack(&mut a, 202, una, &[(una.0, point.0)]);
+        assert_eq!(a.scoreboard.ranges(), &[(una, point)]); // Valid first block covers snd_una.
         assert_eq!(a.snd_una, una);
         assert_eq!(a.rto_deadline, Some(deadline));
         a.timeout(deadline).unwrap();
@@ -6677,10 +6864,9 @@ mod tests {
         assert_eq!(a.scoreboard.pipe(una, point, una, 128), 1024);
         assert!(a.sample.is_none());
         let bytes = packet(&mut a, deadline);
-        assert_eq!(
-            wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
-            una.0
-        );
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(segment.header.sequence, una.0);
+        assert_eq!(segment.payload, &[0x77; 128]);
         sack_ack(
             &mut a,
             deadline + 1,
@@ -6723,10 +6909,9 @@ mod tests {
         let deadline = a.rto_deadline.unwrap();
         a.timeout(deadline).unwrap();
         let bytes = packet(&mut a, deadline);
-        assert_eq!(
-            wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
-            una.0
-        );
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(segment.header.sequence, una.0);
+        assert_eq!(segment.payload, &[0x77; 128]);
         sack_ack(
             &mut a,
             deadline + 1,
