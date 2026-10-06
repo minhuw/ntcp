@@ -198,6 +198,12 @@ impl Scoreboard {
         })
     }
 
+    pub(crate) fn unsacked_bytes(&self, start: Seq, end: Seq) -> u32 {
+        self.holes(start, end)
+            .map(|(left, right)| right.distance_from(left))
+            .sum()
+    }
+
     // ponytail: bounded 65-by-64 range scans; cache suffix counts if profiling warrants it.
     pub(crate) fn pipe(&self, ack: Seq, high_data: Seq, high_rxt: Seq, mss: u32) -> u32 {
         let span = high_data.distance_from(ack);
@@ -375,6 +381,23 @@ mod tests {
         update(&mut s, 0, 1000, &[(101, 200)]);
         assert_eq!(s.len, 2);
         assert!(!s.is_lost(Seq(0), 100));
+    }
+
+    #[test]
+    fn unsacked_interval_counts_each_byte_once_across_wrap() {
+        for base in [0, u32::MAX - 150] {
+            let seq = |offset| Seq(base).wrapping_add(offset);
+            let mut s = Scoreboard::new();
+            let blocks =
+                [(100, 200), (300, 400)].map(|(left, right)| Some((seq(left).0, seq(right).0)));
+            s.update(seq(0), seq(600), &[blocks[0], blocks[1], None, None]);
+            assert_eq!(s.unsacked_bytes(seq(0), seq(600)), 400);
+            assert_eq!(s.unsacked_bytes(seq(150), seq(350)), 100);
+            assert_eq!(s.unsacked_bytes(seq(150), seq(180)), 0);
+            assert_eq!(s.unsacked_bytes(seq(450), seq(500)), 50);
+            assert_eq!(s.unsacked_bytes(seq(450), seq(450)), 0);
+            assert_eq!(s.unsacked_bytes(seq(500), seq(450)), 0);
+        }
     }
 
     #[test]

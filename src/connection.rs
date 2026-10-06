@@ -223,7 +223,8 @@ pub(crate) struct Connection {
     sack_receive: bool,
     sack_recovery: Option<SackRecovery>,
     sack_guard: Option<Seq>,
-    sack_post_rto: Option<Seq>,
+    // Retransmitted prefix and fixed data boundary at the most recent timeout.
+    sack_post_rto: Option<(Seq, Seq)>,
     sack_fallback: Option<Seq>,
     scoreboard: Scoreboard,
     sack_omit: bool,
@@ -1828,10 +1829,6 @@ impl Connection {
         }
         let next = self.receive.next();
         let window = self.receive_window();
-        if self.sack_send && !payload.is_empty() {
-            self.receive.record_duplicate(seq, payload.len());
-            self.sack_omit = false;
-        }
         if flags & URG != 0 && !self.read_closed {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5
             //# The urgent pointer MUST point to the sequence number of the octet
@@ -1873,6 +1870,12 @@ impl Connection {
         };
         let fin_position = seq.wrapping_add(payload.len() as u32);
         let fin = flags & FIN != 0 && fin_position.in_window(next, window) == Some(true);
+        if self.sack_send && (!payload.is_empty() || fin) {
+            // A valid FIN-only arrival supersedes the previous duplicate report;
+            // FIN itself is not a byte of data for D-SACK.
+            self.receive.record_duplicate(seq, payload.len());
+            self.sack_omit = false;
+        }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
         //# Segments with higher beginning sequence numbers SHOULD be held for later
         //# processing (SHLD-31).
@@ -1994,6 +1997,32 @@ impl Connection {
         }
     }
 
+    fn post_rto_pipe(&self) -> u32 {
+        let Some((high_rxt, boundary)) = self.sack_post_rto else {
+            return 0;
+        };
+        // RFC 6675 §5.1: fill fresh holes under slow start, not SetPipe.
+        // Timeout-era originals do not consume the new congestion window.
+        // Count the retransmitted prefix once, plus data first sent after RTO.
+        let retransmitted_end = if after(high_rxt, boundary) {
+            boundary
+        } else {
+            high_rxt
+        };
+        let retransmitted = if after(retransmitted_end, self.snd_una) {
+            self.scoreboard
+                .unsacked_bytes(self.snd_una, retransmitted_end)
+        } else {
+            0
+        };
+        let new_start = if after(boundary, self.snd_una) {
+            boundary
+        } else {
+            self.snd_una
+        };
+        retransmitted + self.scoreboard.unsacked_bytes(new_start, self.data_high())
+    }
+
     pub(crate) fn transmit(
         &mut self,
         now: Instant,
@@ -2069,7 +2098,13 @@ impl Connection {
         if reset.is_none() && !syn && live && self.sack_send && !self.sack_omit {
             let available = (40 - option_len)
                 .min((self.config.send_ip_payload_limit as usize).saturating_sub(20 + option_len))
-                .min(self.mss.saturating_sub(1));
+                // Pure ACK options are independent of MSS. Once reported, limit
+                // piggybacked SACKs to leave room for data on the next poll.
+                .min(if self.ack_pending {
+                    40
+                } else {
+                    self.mss.saturating_sub(1)
+                });
             let max_blocks = available.saturating_sub(4) / 8;
             let blocks = self.receive.sack_blocks(max_blocks);
             let n = blocks.iter().flatten().count();
@@ -2145,6 +2180,9 @@ impl Connection {
                         sack_segment = self
                             .scoreboard
                             .tail_hole(self.snd_una, self.data_high(), packet_mss as u32)
+                            // A clipped rescue would not contain the highest
+                            // outstanding byte but would consume RescueRxt.
+                            .filter(|&(_, right)| right.distance_from(self.snd_una) <= self.snd_wnd)
                             .map(|(left, right)| (left, right, true, false));
                     }
                 }
@@ -2160,13 +2198,8 @@ impl Connection {
             && !probe
             && !keepalive
             && self.sack_fallback.is_none()
-            && let Some(high_rxt) = self.sack_post_rto
-            && self.congestion.cwnd().saturating_sub(self.scoreboard.pipe(
-                self.snd_una,
-                self.data_high(),
-                high_rxt,
-                self.mss as u32,
-            )) >= self.mss as u32
+            && let Some((high_rxt, _)) = self.sack_post_rto
+            && self.congestion.cwnd().saturating_sub(self.post_rto_pipe()) >= self.mss as u32
         {
             self.scoreboard
                 .lowest_hole(high_rxt, self.data_high(), packet_mss as u32, false)
@@ -2295,12 +2328,8 @@ impl Connection {
                         .min(self.congestion.cwnd().saturating_sub(recovery.pipe))
                         as usize
                 }
-            } else if let Some(high_rxt) =
-                self.sack_post_rto.filter(|_| self.sack_fallback.is_none())
-            {
-                let pipe =
-                    self.scoreboard
-                        .pipe(self.snd_una, self.data_high(), high_rxt, self.mss as u32);
+            } else if self.sack_post_rto.is_some() && self.sack_fallback.is_none() {
+                let pipe = self.post_rto_pipe();
                 if cwnd.saturating_sub(pipe) >= self.mss as u32 {
                     self.snd_wnd
                         .saturating_sub(self.flight())
@@ -2523,11 +2552,11 @@ impl Connection {
             && !syn
             && !probe
             && count != 0
-            && let Some(old) = self.sack_post_rto
+            && let Some((old, boundary)) = self.sack_post_rto
         {
             let end = seq.wrapping_add(count as u32);
             if after(end, old) {
-                self.sack_post_rto = Some(end);
+                self.sack_post_rto = Some((end, boundary));
             }
         }
         if !keepalive
@@ -2696,7 +2725,7 @@ impl Connection {
                 self.scoreboard.clear();
                 self.sack_recovery = None;
                 self.sack_guard = Some(self.data_high());
-                self.sack_post_rto = Some(self.snd_una);
+                self.sack_post_rto = Some((self.snd_una, self.data_high()));
                 self.congestion.cancel_sack_recovery();
             }
             self.reset_limited_transmit();
@@ -2855,6 +2884,7 @@ mod tests {
         to.input(now, &segment).unwrap();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn inject_sack(
         to: &mut Connection,
         now: Instant,
@@ -3769,6 +3799,168 @@ mod tests {
         sack_ack(&mut a, 204, una.wrapping_add(30), &[]);
         assert_eq!(a.congestion.cwnd(), cwnd);
         assert!(a.sack_recovery.is_some());
+    }
+
+    #[test]
+    fn sack_small_mss_ack_report_does_not_starve_data() {
+        for (mss, timestamps) in [(8, false), (24, true)] {
+            let cfg = ConnectionConfig {
+                timestamps,
+                ..sack_config(mss)
+            };
+            let (mut a, _) = pair(cfg, 100);
+            let next = a.receive.next();
+            let una = a.snd_una;
+            inject_sack(
+                &mut a,
+                40,
+                next.wrapping_add(10),
+                una,
+                ACK,
+                8192,
+                &[2; 5],
+                &[],
+            );
+            a.write(&[1; 8]).unwrap();
+            assert_eq!(a.transmit(41, &mut [0; 20]), Err(Error::OutputTooSmall));
+            let bytes = packet(&mut a, 41);
+            let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(
+                seg.options.sack_blocks[0],
+                Some((next.wrapping_add(10).0, next.wrapping_add(15).0))
+            );
+            assert!(seg.payload.is_empty());
+            let bytes = packet(&mut a, 42);
+            let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert!(!seg.payload.is_empty());
+            assert!(seg.payload.len() + seg.raw_options.len() <= mss as usize);
+        }
+    }
+
+    #[test]
+    fn sack_rescue_waits_for_tail_to_fit_reopened_window() {
+        let mut a = sack_flight(128, 100, 8);
+        let una = a.snd_una;
+        let ranges = [
+            (una.wrapping_add(128).0, una.wrapping_add(256).0),
+            (una.wrapping_add(384).0, una.wrapping_add(768).0),
+        ];
+        sack_ack(&mut a, 200, una, &ranges);
+        for (now, offset) in [(201, 0), (202, 256)] {
+            let bytes = packet(&mut a, now);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+                una.wrapping_add(offset).0
+            );
+        }
+        let next = a.receive.next();
+        inject_sack(&mut a, 210, next, una.wrapping_add(384), ACK, 576, &[], &[]);
+        let old = a.sack_recovery.unwrap().rescue_rxt;
+        assert_eq!(a.transmit(211, &mut [0; 1024]), Ok(None));
+        assert_eq!(a.sack_recovery.unwrap().rescue_rxt, old);
+        inject_sack(
+            &mut a,
+            212,
+            next,
+            una.wrapping_add(384),
+            ACK,
+            8192,
+            &[],
+            &[],
+        );
+        let bytes = packet(&mut a, 213);
+        let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(seg.header.sequence, una.wrapping_add(896).0);
+        assert_eq!(seg.payload.len(), 128);
+        assert_eq!(
+            a.sack_recovery.unwrap().rescue_rxt,
+            Some(una.wrapping_add(1024))
+        );
+    }
+
+    #[test]
+    fn sack_post_rto_alternating_losses_fill_cwnd_with_retransmissions() {
+        let mut a = sack_flight(128, 100, 8);
+        let una = a.snd_una;
+        let point = a.data_high();
+        let deadline = a.rto_deadline.unwrap();
+        a.timeout(deadline).unwrap();
+        packet(&mut a, deadline);
+        let ranges = [(384, 512), (640, 768), (896, 1024)]
+            .map(|(l, r)| (una.wrapping_add(l).0, una.wrapping_add(r).0));
+        sack_ack(&mut a, deadline + 1, una.wrapping_add(256), &ranges);
+        assert_eq!(a.congestion.cwnd(), 256);
+        for (time, offset) in [(2, 256), (3, 512)] {
+            let bytes = packet(&mut a, deadline + time);
+            let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(seg.header.sequence, una.wrapping_add(offset).0);
+            assert_eq!(seg.payload.len(), 128);
+        }
+        assert_eq!(a.transmit(deadline + 4, &mut [0; 1024]), Ok(None));
+        assert_eq!(a.sack_guard, Some(point));
+        assert!(a.sack_recovery.is_none());
+        assert_eq!(a.send.len(), 768);
+        assert!(a.sample.is_none());
+
+        // New data consumes this slow-start window too, using the fixed RTO
+        // snapshot rather than the advancing HighData as its lower boundary.
+        a.write(&[9; 256]).unwrap();
+        sack_ack(&mut a, deadline + 5, una.wrapping_add(768), &ranges[2..]);
+        assert_eq!(a.congestion.cwnd(), 384);
+        for (time, offset) in [(6, 768), (7, 1024), (8, 1152)] {
+            let bytes = packet(&mut a, deadline + time);
+            let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(seg.header.sequence, una.wrapping_add(offset).0);
+            assert_eq!(seg.payload.len(), 128);
+        }
+        assert_eq!(a.post_rto_pipe(), 384);
+        assert_eq!(a.transmit(deadline + 9, &mut [0; 1024]), Ok(None));
+        sack_ack(&mut a, deadline + 10, point, &[]);
+        assert!(a.sack_post_rto.is_none());
+    }
+
+    #[test]
+    fn sack_fin_only_input_clears_previous_batched_dsack() {
+        let (mut a, _) = pair(sack_config(128), 100);
+        let next = a.receive.next();
+        let una = a.snd_una;
+        inject_sack(
+            &mut a,
+            40,
+            next.wrapping_add(10),
+            una,
+            ACK,
+            8192,
+            &[1; 10],
+            &[],
+        );
+        inject_sack(
+            &mut a,
+            41,
+            next.wrapping_add(12),
+            una,
+            ACK,
+            8192,
+            &[1; 3],
+            &[],
+        );
+        inject_sack(
+            &mut a,
+            42,
+            next.wrapping_add(30),
+            una,
+            ACK | FIN,
+            8192,
+            &[],
+            &[],
+        );
+        let bytes = packet(&mut a, 43);
+        let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(
+            seg.options.sack_blocks[0],
+            Some((next.wrapping_add(10).0, next.wrapping_add(20).0))
+        );
+        assert!(seg.options.sack_blocks[1].is_none());
     }
 
     #[test]
