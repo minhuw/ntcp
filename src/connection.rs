@@ -1257,8 +1257,7 @@ impl Connection {
         quoted_sequence: u32,
         error: NetworkError,
     ) -> Result<bool, Error> {
-        self.check_time(now)?;
-        self.now = now;
+        self.update_time(now)?;
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2
         //# Source Quench
         //# TCP implementations MUST silently discard any received ICMP Source
@@ -1316,13 +1315,30 @@ impl Connection {
 
     pub(crate) fn update_time(&mut self, now: Instant) -> Result<(), Error> {
         self.check_time(now)?;
+        // Endpoint validates caller clock gaps. A dormant connection may lag
+        // that serviced clock by more than the timestamp serial half-range.
+        let stale = |sent: Instant| (now / 1_000).saturating_sub(sent / 1_000) >= 1 << 31;
+        if self.sample.is_some_and(|(_, sent)| stale(sent))
+            || self.last_timestamp_sent_at.is_some_and(stale)
+        {
+            self.sample = None;
+            self.last_timestamp_sent_at = None;
+            self.tlp_fresh_rtt = false;
+            // Discard stale transmission history, not queued bytes or
+            // cleanup/retransmission deadlines; ordinary loss recovery remains.
+            if self.flight() != 0 {
+                self.rack.abandon(self.data_high());
+                self.prr = None;
+                self.rack_entry_delivery = None;
+            }
+        }
         self.now = now;
         Ok(())
     }
 
-    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
-    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //# Values of this
     //# clock MUST be at least approximately proportional to real time, in
     //# order to measure actual RTT.
@@ -1334,8 +1350,6 @@ impl Connection {
     fn check_time(&self, now: Instant) -> Result<(), Error> {
         if now < self.now {
             Err(Error::TimeWentBackwards)
-        } else if self.config.timestamps && now / 1_000 - self.now / 1_000 >= 1 << 31 {
-            Err(Error::AmbiguousTimeJump)
         } else {
             Ok(())
         }
@@ -2360,7 +2374,7 @@ impl Connection {
         // is later dropped. Endpoint rejects checksum-invalid packets before
         // this boundary; output failure alone must not consume the report.
         self.receive.clear_dsack();
-        self.now = now;
+        self.update_time(now)?;
         self.retransmit_burst = None;
         if self.state == State::Closed {
             return Ok(());
@@ -4321,9 +4335,9 @@ impl Connection {
         //# clock SHOULD tick at least once per window's worth of data, and
         //# even with the window extension defined in Section 2.2, 2^31
         //# bytes must be at least two windows.
-        // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+        // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
-        //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+        //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
         //# The recycling time of the timestamp clock MUST be greater than
         //# MSL seconds.
         // Scope: Endpoint derives offset using HMAC-SHA256 secret, tuple and ISS nonce in the separate ntcp timestamp offset domain before first output; ISS is an input, never the offset. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset so peer PAWS sees no random jump; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, echo/RTT/wrap and reuse rollback tests cover the policy.
@@ -4350,9 +4364,9 @@ impl Connection {
         //= reason=Negotiated ordinary ACK output echoes single retained TS.Recent; reactive RST overrides follow section 5.2.
         //# (3)  When a TSopt is sent, its TSecr field is set to the current
         //# TS.Recent value.
-        // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+        // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
-        //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+        //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
         //# Based upon these considerations, we choose a timestamp clock
         //# frequency in the range 1 ms to 1 sec per tick.
         let timestamp = if reset.is_some() && self.reset_echo.is_some() {
@@ -4490,10 +4504,29 @@ impl Connection {
                 option_len += sack_option_len;
             }
         }
+        let tick_bytes = if now / 1_000 == self.timestamp_tick {
+            self.timestamp_bytes
+        } else {
+            0
+        };
+        let timestamp_credit = if timestamp.is_some() {
+            self.config
+                .timestamp_bytes_per_tick
+                .saturating_sub(tick_bytes)
+        } else {
+            u32::MAX
+        };
         let packet_mss = self
             .mss
             .saturating_sub(sack_option_len)
-            .min((self.config.send_ip_payload_limit as usize).saturating_sub(20 + option_len));
+            .min((self.config.send_ip_payload_limit as usize).saturating_sub(20 + option_len))
+            // With zero credit, retain a plan so the transactional gate reports
+            // exhaustion instead of consuming the pending output obligation.
+            .min(if timestamp_credit == 0 {
+                usize::MAX
+            } else {
+                timestamp_credit as usize
+            });
         let mut burst_push = false;
         let mut sack_segment = None;
         if reset.is_none()
@@ -4891,6 +4924,12 @@ impl Connection {
             }
             sack_limited = false;
         }
+        // Data can fill the tick without room for FIN. Commit the data now and
+        // leave FIN queued (or outstanding on retransmission) for another tick.
+        if flags & FIN != 0 && count != 0 && count as u32 >= timestamp_credit {
+            flags &= !FIN;
+            new_fin = false;
+        }
         let retransmit_burst = (retransmitted && count != 0 && !probe && !keepalive).then(|| {
             let previous = self.retransmit_burst.filter(|&(end, _)| end == seq);
             (
@@ -5132,20 +5171,9 @@ impl Connection {
         if 20 + option_len + count > self.config.send_ip_payload_limit as usize {
             return Err(Error::InvalidArgument);
         }
-        let tick_bytes = if now / 1_000 == self.timestamp_tick {
-            self.timestamp_bytes
-        } else {
-            0
-        };
         let timestamp_cost =
             count as u32 + u32::from(flags & SYN != 0) + u32::from(flags & FIN != 0);
-        if timestamp.is_some()
-            && timestamp_cost
-                > self
-                    .config
-                    .timestamp_bytes_per_tick
-                    .saturating_sub(tick_bytes)
-        {
+        if timestamp_cost > timestamp_credit {
             return Err(Error::TimestampBudgetExceeded);
         }
         let size = wire::encode(
@@ -5212,7 +5240,7 @@ impl Connection {
             self.send
                 .collapse_push(seq.distance_from(self.send_base) as usize, count);
         }
-        self.now = now;
+        self.update_time(now)?;
         self.last_output_ecn = ecn;
         if syn {
             self.sack_receive |= sack_offer;
@@ -5507,7 +5535,21 @@ impl Connection {
     }
 
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        // A successfully filled tick can leave stream/control output queued.
+        // Derive its wakeup from committed credit: failed encodes do not arm a
+        // timer, and timeout advancing to the next tick removes this deadline.
+        let timestamp_wakeup = (self.timestamp_tick == self.now / 1_000
+            && self.timestamp_bytes >= self.config.timestamp_bytes_per_tick
+            && (self.syn_pending
+                || self.retx_pending
+                || self.probe_pending
+                || self.keepalive_pending
+                || self.synchronized()
+                    && (self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize
+                        || self.shutdown && self.fin_sequence.is_none())))
+        .then(|| self.timestamp_tick.saturating_add(1).saturating_mul(1_000));
         [
+            timestamp_wakeup,
             self.loss_timer.map(|(_, deadline)| deadline),
             self.ecn_pause,
             self.ack_deadline,
@@ -5642,8 +5684,7 @@ impl Connection {
     //# After each retransmit timeout, the highest sequence number transmitted so far is
     //# recorded in the variable recover.
     pub(crate) fn timeout(&mut self, now: Instant) -> Result<(), Error> {
-        self.check_time(now)?;
-        self.now = now;
+        self.update_time(now)?;
         self.retransmit_burst = None;
         let expired_loss = self
             .loss_timer
@@ -19980,17 +20021,17 @@ mod tests {
     //# <SYN,ACK> contain TSopt, the TSopt MUST be sent in every non-<RST>
     //# segment for the duration of the connection, and SHOULD be sent in an
     //# <RST> segment (see Section 5.2 for details).
-    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
     //= type=test
-    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //# Values of this
     //# clock MUST be at least approximately proportional to real time, in
     //# order to measure actual RTT.
-    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
     //= type=test
-    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //# The recycling time of the timestamp clock MUST be greater than
     //# MSL seconds.
     // Scope: Wire TS fields u32 network-order; TSval uses caller millisecond clock modulo 32 bits. Physical rate guarantees separately TODO.
@@ -20000,10 +20041,10 @@ mod tests {
     //# The Timestamps option carries two four-byte timestamp fields.  The
     //# TSval field contains the current value of the timestamp clock of the
     //# TCP sending the option.
-    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
     //= type=test
-    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //# Based upon these considerations, we choose a timestamp clock
     //# frequency in the range 1 ms to 1 sec per tick.
     fn timestamps_ip_budget_data_fin_keepalive_and_clock_wrap() {
@@ -20355,12 +20396,252 @@ mod tests {
         assert_eq!(a.rtt.srtt(), Some(1_000));
         assert!(a.transmit(4_000, &mut [0; 128]).unwrap().is_some());
         let now = a.now;
-        assert_eq!(
-            a.update_time(now + (1u64 << 31) * 1_000),
-            Err(Error::AmbiguousTimeJump)
-        );
-        assert_eq!(a.now, now);
+        let resumed = now + (1u64 << 31) * 1_000;
+        a.update_time(resumed).unwrap();
+        assert_eq!(a.now, resumed);
+        assert_eq!(a.sample, None);
+        assert_eq!(a.last_timestamp_sent_at, None);
         assert_eq!(a.update_time(now - 1), Err(Error::TimeWentBackwards));
+    }
+
+    #[test]
+    fn timestamp_credit_clips_below_mss_and_defers_full_packet_fin() {
+        for budget in [1, 8, 52] {
+            let cfg = ConnectionConfig {
+                timestamps: true,
+                nagle: false,
+                timestamp_bytes_per_tick: budget,
+                ..config(256, 64)
+            };
+            let (mut a, mut b) = pair(cfg, 100);
+            assert_eq!(a.mss, 52);
+            let data = [b'x'; 104];
+            a.write(&data).unwrap();
+            a.shutdown().unwrap();
+            let start = a.snd_nxt;
+            let mut received = Vec::new();
+            let mut now = 1_000;
+            while a.fin_sequence.is_none() {
+                let before = (
+                    a.now,
+                    a.snd_nxt,
+                    a.timestamp_bytes,
+                    a.sample,
+                    a.rto_deadline,
+                );
+                assert_eq!(a.transmit(now, &mut [0; 31]), Err(Error::OutputTooSmall));
+                assert_eq!(
+                    (
+                        a.now,
+                        a.snd_nxt,
+                        a.timestamp_bytes,
+                        a.sample,
+                        a.rto_deadline
+                    ),
+                    before
+                );
+                let bytes = deliver(&mut a, &mut b, now);
+                let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+                let fin = segment.header.flags & FIN != 0;
+                assert!(segment.payload.len() as u32 + u32::from(fin) <= budget);
+                assert_eq!(
+                    segment.header.sequence,
+                    start.wrapping_add(received.len() as u32).0
+                );
+                received.extend_from_slice(segment.payload);
+                if segment.payload.len() as u32 == budget {
+                    assert!(!fin);
+                }
+                if !fin {
+                    assert_eq!(a.next_deadline(), Some(now + 1_000));
+                    let before = (a.now, a.snd_nxt, a.sample, a.rto_deadline);
+                    assert_eq!(
+                        a.transmit(now, &mut [0; 256]),
+                        Err(Error::TimestampBudgetExceeded)
+                    );
+                    assert_eq!((a.now, a.snd_nxt, a.sample, a.rto_deadline), before);
+                }
+                b.immediate_ack();
+                deliver(&mut b, &mut a, now + 100);
+                now += 1_000;
+                a.timeout(now).unwrap();
+                assert!(a.next_deadline().is_none_or(|deadline| deadline > now));
+                assert!(now <= 106_000);
+            }
+            assert_eq!(received, data);
+            assert_eq!(a.fin_sequence, Some(start.wrapping_add(data.len() as u32)));
+            assert_eq!(a.state, State::FinWait2);
+            assert_eq!(a.rto_deadline, None);
+            let mut read = [0; 104];
+            assert_eq!(b.read(&mut read).unwrap(), data.len());
+            assert_eq!(read, data);
+        }
+    }
+
+    #[test]
+    fn timestamp_partial_credit_syn_fin_retransmit_and_zero_window_wakeup() {
+        let cfg = ConnectionConfig {
+            timestamps: true,
+            timestamp_bytes_per_tick: 8,
+            nagle: false,
+            ..config(256, 64)
+        };
+        let (mut a, mut b) = pair(cfg, 100);
+        a.write(b"seven!!").unwrap();
+        deliver(&mut a, &mut b, 1_000);
+        a.write(b"tail").unwrap();
+        let bytes = packet(&mut a, 1_000);
+        assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, b"t");
+        assert_eq!(a.timestamp_bytes, 8);
+        assert_eq!(a.next_deadline(), Some(2_000));
+        let before = (a.now, a.snd_nxt, a.rto_deadline);
+        assert_eq!(
+            a.transmit(1_000, &mut [0; 256]),
+            Err(Error::TimestampBudgetExceeded)
+        );
+        assert_eq!((a.now, a.snd_nxt, a.rto_deadline), before);
+        // Closing the window must leave persist/loss timers intact; the credit
+        // wake fires once, not repeatedly at the same timestamp.
+        a.snd_wnd = 0;
+        a.arm_work();
+        let loss = a.loss_timer;
+        a.timeout(2_000).unwrap();
+        assert_eq!(a.loss_timer, loss);
+        assert!(a.next_deadline().is_some_and(|deadline| deadline > 2_000));
+        assert_eq!(a.transmit(2_000, &mut [0; 256]), Ok(None));
+        a.snd_wnd = 256;
+        a.arm_work();
+        a.retx_pending = true;
+        let bytes = packet(&mut a, 2_000);
+        let retry = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(retry.payload, b"seven!!t");
+        assert_eq!(retry.header.sequence, 101);
+
+        // SYN spends one byte even before negotiation; pure ACK spends none.
+        let cfg = ConnectionConfig {
+            timestamps: true,
+            timestamp_bytes_per_tick: 1,
+            ..config(64, 20)
+        };
+        let mut c = Connection::active(tuple(), cfg, 100, 0).unwrap();
+        packet(&mut c, 0);
+        assert_eq!(c.timestamp_bytes, 1);
+        c.syn_pending = true;
+        assert_eq!(
+            c.transmit(0, &mut [0; 256]),
+            Err(Error::TimestampBudgetExceeded)
+        );
+        assert_eq!(c.next_deadline(), Some(1_000));
+        c.timeout(1_000).unwrap();
+        let retry = packet(&mut c, 1_000);
+        assert_eq!(
+            wire::parse(ip(tuple()), &retry).unwrap().header.flags & SYN,
+            SYN
+        );
+    }
+
+    #[test]
+    fn timestamp_stale_rtt_echo_cannot_alias_after_clock_recycle() {
+        for timestamps in [false, true] {
+            let cfg = ConnectionConfig {
+                timestamps,
+                sack: true,
+                rack: true,
+                ..config(256, 64)
+            };
+            let (mut a, _) = pair(cfg, 100);
+            a.write(b"old").unwrap();
+            packet(&mut a, 1_000);
+            let sample = a.sample;
+            let srtt = a.rtt.srtt();
+            let deadline = a.rto_deadline;
+            let end = a.snd_nxt;
+            let after_recycle = 1_000 + (1u64 << 32) * 1_000;
+            // An ACK encode failure may not invalidate state before commit.
+            a.immediate_ack();
+            assert_eq!(
+                a.transmit(after_recycle, &mut [0; 19]),
+                Err(Error::OutputTooSmall)
+            );
+            assert_eq!(a.now, 1_000);
+            assert_eq!(a.sample, sample);
+            assert_eq!(a.rto_deadline, deadline);
+            a.update_time(after_recycle).unwrap();
+            assert_eq!(a.sample, None);
+            assert_eq!(a.last_timestamp_sent_at, None);
+            assert!(!a.rack.valid());
+            assert_eq!(a.rto_deadline, deadline);
+            assert_eq!(a.send.len(), 3);
+            let next = a.receive.next();
+            timestamp_input(&mut a, after_recycle, next, end, ACK, Some((0, 1)), b"");
+            assert_eq!(a.snd_una, end);
+            assert_eq!(a.rtt.srtt(), srtt);
+            assert_eq!(a.send.len(), 0);
+            assert_eq!(a.rto_deadline, None);
+        }
+    }
+
+    #[test]
+    fn timestamp_long_idle_connections_resume_on_serviced_endpoint_clock() {
+        use crate::{Endpoint, EndpointConfig};
+
+        fn transfer(from: &mut Endpoint, to: &mut Endpoint, now: Instant) {
+            let mut out = [0; 256];
+            let tx = from
+                .poll_transmit(now, &mut out, 64)
+                .unwrap()
+                .packet
+                .unwrap();
+            to.input(now, tx.ip, &out[..tx.len]).unwrap();
+        }
+
+        for negotiated in [false, true] {
+            let cfg = EndpointConfig {
+                max_connections: 2,
+                connection: ConnectionConfig {
+                    timestamps: true,
+                    ..config(256, 64)
+                },
+                ..EndpointConfig::default()
+            };
+            let mut peer_cfg = cfg.clone();
+            peer_cfg.connection.timestamps = negotiated;
+            let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+            let mut b = Endpoint::new(peer_cfg, [2; 32], 0, |_| true).unwrap();
+            let listener = b.listen(tuple().remote, 1).unwrap();
+            let id = a.connect(0, tuple().local, tuple().remote).unwrap();
+            transfer(&mut a, &mut b, 0);
+            transfer(&mut b, &mut a, 10);
+            transfer(&mut a, &mut b, 20);
+            let peer = b.accept(listener).unwrap();
+            assert_eq!(a.next_deadline(), None);
+            let day = 86_400_000_000;
+            for d in 1..=26 {
+                assert!(!a.on_timeout(d * day, 64).unwrap());
+                assert!(!b.on_timeout(d * day, 64).unwrap());
+            }
+            // Endpoint time advances, while this idle connection has no work.
+            assert_eq!(a.write(id, b"resumed").unwrap(), 7);
+            transfer(&mut a, &mut b, 26 * day);
+            let mut read = [0; 7];
+            assert_eq!(b.read(peer, &mut read).unwrap(), 7);
+            assert_eq!(&read, b"resumed");
+            b.on_timeout(26 * day + 500_000, 64).unwrap();
+            transfer(&mut b, &mut a, 26 * day + 500_000);
+            assert_eq!(a.acknowledged(id).unwrap(), 7);
+            for d in 27..=52 {
+                a.on_timeout(d * day, 64).unwrap();
+                b.on_timeout(d * day, 64).unwrap();
+            }
+            a.abort(id).unwrap();
+            a.release(id).unwrap();
+            transfer(&mut a, &mut b, 52 * day);
+            assert_eq!(b.state(peer).unwrap(), State::Closed);
+            a.on_timeout(52 * day + 240_000_000, 64).unwrap();
+            a.poll_transmit(52 * day + 240_000_000, &mut [0; 256], 64)
+                .unwrap();
+            assert!(!a.connection_exists(id));
+        }
     }
 
     #[test]
