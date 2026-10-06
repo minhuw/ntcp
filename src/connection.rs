@@ -13814,7 +13814,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
     //= type=test
-    //= reason=Accepted negotiated ECE is propagated to shared duplicate-ACK recovery; connection Reno/NewReno traces assert no growth on third-entry or later ECE duplicates, preserved retransmission, and advancing/non-ECE contrasts. Recovery entry caps inflation and later ECE duplicates omit MSS growth.
+    //= reason=Negotiated non-SACK Reno/NewReno: ecn_duplicate_and_advancing_ack_growth_boundaries asserts entry/later duplicate-ECE suppression and advancing/non-ECE contrasts; ecn_duplicate_entry_below_threshold_and_covering_ack_exit traces successive reductions to cwnd<ssthresh, capped ECE entry and covering-ECE exit, normal non-ECE exit and preserved wire retransmission. No general inherited recovery-compliance claim.
     //# The sending
     //# TCP SHOULD NOT increase the congestion window in response to the
     //# receipt of an ECN-Echo ACK packet.
@@ -13874,6 +13874,81 @@ mod tests {
                     } else {
                         assert_eq!(a.congestion.cwnd(), before + 64);
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= type=test
+    //= reason=Reno/NewReno wire/control traces use successive ECE reductions to reach cwnd=64 below ssthresh=128, then assert duplicate-ECE recovery entry, Not-ECT retransmission and covering-ECE exit keep cwnd=64; otherwise-identical non-ECE exit restores 128. Includes sequence wrap; no private congestion state overrides.
+    //# The sending
+    //# TCP SHOULD NOT increase the congestion window in response to the
+    //# receipt of an ECN-Echo ACK packet.
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= type=test
+    //= reason=Otherwise-identical Reno/NewReno recovery traces contrast ECE exit capped at 64 with non-ECE exit restoring ssthresh/flight-bound 128, after duplicate-ECE entry below threshold.
+    //# TCP also follows the normal procedures for increasing the congestion window when it receives ACK packets without the ECN-Echo bit set [RFC2581].
+    fn ecn_duplicate_entry_below_threshold_and_covering_ack_exit() {
+        for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
+            for iss in [100, u32::MAX - 95] {
+                for exit_ece in [false, true] {
+                    let mut cfg = config(8192, 64);
+                    cfg.recovery_algorithm = algorithm;
+                    cfg.ecn = true;
+                    let (mut a, _) = pair(cfg, iss);
+                    let seq = a.receive.next();
+                    // Two real, separately covered ECN flights reach the MSS floor.
+                    for (now, expected) in [(40, 128), (50, 64)] {
+                        a.write(&[1; 64]).unwrap();
+                        let bytes = packet(&mut a, now);
+                        let data = wire::parse(ip(tuple()), &bytes).unwrap();
+                        assert_eq!(data.header.sequence, a.snd_una.0);
+                        assert_eq!(data.payload, &[1; 64]);
+                        assert_eq!(a.last_output_ecn(), 2);
+                        assert_eq!(data.header.flags & CWR != 0, now == 50);
+                        let end = a.snd_nxt;
+                        inject(&mut a, now + 1, seq, end, ACK | ECE, 8192, b"");
+                        assert_eq!(a.flight(), 0);
+                        assert_eq!(
+                            (a.congestion.cwnd(), a.congestion.ssthresh()),
+                            (expected, 128)
+                        );
+                        assert!(!a.retx_pending);
+                    }
+                    a.write(&[2; 64]).unwrap();
+                    let bytes = packet(&mut a, 60);
+                    let data = wire::parse(ip(tuple()), &bytes).unwrap();
+                    let una = a.snd_una;
+                    let end = a.snd_nxt;
+                    assert_eq!(data.header.sequence, una.0);
+                    assert_eq!(data.payload, &[2; 64]);
+                    assert_ne!(data.header.flags & CWR, 0);
+                    assert_eq!(a.flight(), 64);
+                    for count in 1..=3 {
+                        inject(&mut a, 60 + count, seq, una, ACK | ECE, 8192, b"");
+                        assert_eq!((a.congestion.cwnd(), a.congestion.ssthresh()), (64, 128));
+                        assert_eq!(a.congestion.in_recovery(), count == 3);
+                        assert_eq!(a.retx_pending, count == 3);
+                    }
+                    let bytes = packet(&mut a, 63);
+                    let retry = wire::parse(ip(tuple()), &bytes).unwrap();
+                    assert_eq!(retry.header.sequence, una.0);
+                    assert_eq!(retry.payload, &[2; 64]);
+                    assert_eq!(retry.header.flags & CWR, 0);
+                    assert_eq!(a.last_output_ecn(), 0);
+                    assert_eq!(a.snd_nxt, end);
+                    assert!(!a.retx_pending);
+                    let flags = ACK | if exit_ece { ECE } else { 0 };
+                    inject(&mut a, 64, seq, end, flags, 8192, b"");
+                    assert_eq!(a.congestion.cwnd(), if exit_ece { 64 } else { 128 });
+                    assert_eq!(a.congestion.ssthresh(), 128);
+                    assert!(!a.congestion.in_recovery());
+                    assert!(!a.retx_pending);
+                    assert_eq!(a.flight(), 0);
+                    assert_eq!(a.send.len(), 0);
+                    assert_eq!(a.rto_deadline, None);
                 }
             }
         }

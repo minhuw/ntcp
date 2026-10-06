@@ -495,6 +495,11 @@ impl Congestion {
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
     //= reason=Connection-boundary otherwise-identical ACK traces contrast ordinary MSS growth with advancing ECE suppression and non-ECE duplicate recovery inflation, for Reno/NewReno and ECN on/off.
     //# TCP also follows the normal procedures for increasing the congestion window when it receives ACK packets without the ECN-Echo bit set [RFC2581].
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= reason=Reno/NewReno ECE recovery exits cap the computed threshold/flight-bound at pre-ACK cwnd. ecn_duplicate_entry_below_threshold_and_covering_ack_exit traces real reductions to cwnd=64<ssthresh=128, duplicate-ECE entry and covering-ECE exit without growth, with non-ECE exit restoring 128; SACK exit already caps at cwnd. Ordinary advancing and duplicate growth contrasts are separately tested.
+    //# The sending
+    //# TCP SHOULD NOT increase the congestion window in response to the
+    //# receipt of an ECN-Echo ACK packet.
     pub(crate) fn on_ack_with_ecn(
         &mut self,
         ack: Seq,
@@ -540,6 +545,7 @@ impl Congestion {
             return false;
         }
         if self.fast_recovery {
+            let exit_cap = if ece { self.cwnd } else { MAX_WINDOW };
             if self.algorithm == RecoveryAlgorithm::Reno && relation.is_some() {
                 // Retain recover and the independent ECN epoch: exiting fast recovery
                 // must not allow a second reduction for the same flight.
@@ -547,14 +553,14 @@ impl Congestion {
                 //# When the next ACK arrives that acknowledges previously
                 //# unacknowledged data, a TCP MUST set cwnd to ssthresh (the value
                 //# set in step 2).
-                self.cwnd = self.ssthresh;
+                self.cwnd = self.ssthresh.min(exit_cap);
                 self.fast_recovery = false;
                 self.acknowledged = 0;
                 return false;
             }
             if matches!(relation, Some(Ordering::Equal | Ordering::Greater)) {
                 // RFC 6582 option (1) limits the burst after a full ACK.
-                self.cwnd = self.ssthresh.min(
+                self.cwnd = self.ssthresh.min(exit_cap).min(
                     flight_after_ack
                         .max(self.mss)
                         .saturating_add(self.mss)
@@ -802,7 +808,7 @@ impl Congestion {
     //# For each additional duplicate ACK received (after the third), cwnd MUST be incremented
     //# by SMSS.
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
-    //= reason=Accepted negotiated ECE is propagated to shared duplicate-ACK recovery; connection Reno/NewReno traces assert no growth on third-entry or later ECE duplicates, preserved retransmission, and advancing/non-ECE contrasts. Recovery entry caps inflation and later ECE duplicates omit MSS growth.
+    //= reason=Negotiated non-SACK Reno/NewReno: ecn_duplicate_and_advancing_ack_growth_boundaries asserts entry/later duplicate-ECE suppression and advancing/non-ECE contrasts; ecn_duplicate_entry_below_threshold_and_covering_ack_exit traces successive reductions to cwnd<ssthresh, capped ECE entry and covering-ECE exit, normal non-ECE exit and preserved wire retransmission. No general inherited recovery-compliance claim.
     //# The sending
     //# TCP SHOULD NOT increase the congestion window in response to the
     //# receipt of an ECN-Echo ACK packet.
@@ -848,7 +854,7 @@ impl Congestion {
     //# dropped packet.
     // Actor/condition: TCP sender/congestion controller; single CE indication in eligible original-flight epoch.
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
-    //= reason=Accepted negotiated ECE is propagated to shared duplicate-ACK recovery; connection Reno/NewReno traces assert no growth on third-entry or later ECE duplicates, preserved retransmission, and advancing/non-ECE contrasts. Recovery entry caps inflation and later ECE duplicates omit MSS growth.
+    //= reason=Negotiated non-SACK Reno/NewReno: ecn_duplicate_and_advancing_ack_growth_boundaries asserts entry/later duplicate-ECE suppression and advancing/non-ECE contrasts; ecn_duplicate_entry_below_threshold_and_covering_ack_exit traces successive reductions to cwnd<ssthresh, capped ECE entry and covering-ECE exit, normal non-ECE exit and preserved wire retransmission. No general inherited recovery-compliance claim.
     //# The sending
     //# TCP SHOULD NOT increase the congestion window in response to the
     //# receipt of an ECN-Echo ACK packet.
@@ -2430,7 +2436,7 @@ mod tests {
     // Actor/condition: TCP sender/congestion controller; single CE indication in eligible original-flight epoch.
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
     //= type=test
-    //= reason=Accepted negotiated ECE is propagated to shared duplicate-ACK recovery; connection Reno/NewReno traces assert no growth on third-entry or later ECE duplicates, preserved retransmission, and advancing/non-ECE contrasts. Recovery entry caps inflation and later ECE duplicates omit MSS growth.
+    //= reason=Negotiated non-SACK Reno/NewReno: ecn_duplicate_and_advancing_ack_growth_boundaries asserts entry/later duplicate-ECE suppression and advancing/non-ECE contrasts; ecn_duplicate_entry_below_threshold_and_covering_ack_exit traces successive reductions to cwnd<ssthresh, capped ECE entry and covering-ECE exit, normal non-ECE exit and preserved wire retransmission. No general inherited recovery-compliance claim.
     //# The sending
     //# TCP SHOULD NOT increase the congestion window in response to the
     //# receipt of an ECN-Echo ACK packet.
