@@ -233,6 +233,8 @@ pub(crate) struct Congestion {
     duplicate_acks: u8,
     // Exclusive SND.NXT, not the inclusive highest byte used in RFC 6582.
     recover: Option<Seq>,
+    initial_recover: Option<Seq>,
+    congestion_avoidance: bool,
     fast_recovery: bool,
     sack_recovery: bool,
     ecn_end: Option<Seq>,
@@ -244,16 +246,20 @@ pub(crate) struct Congestion {
     retransmitted_end: Option<Seq>,
 }
 
-// Partial evidence only; TODO remains. Constructor stores recover=None rather than initial send sequence; first-flight admission differs from literal initial comparison.
-//= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-//= reason=Partial evidence only; TODO remains. Constructor stores recover=None rather than initial send sequence; first-flight admission differs from literal initial comparison.
-//# When the TCP protocol control block is initialized, recover is set to the initial send
-//# sequence number.
 impl Congestion {
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=Initial ssthresh is the maximum serial-safe window; real initial-guard and first-loss traces assert it and its reduction.
+    //# The initial value of ssthresh SHOULD be set arbitrarily high (e.g., to the size of the largest
+    //# possible advertised window), but ssthresh MUST be reduced in response to congestion.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Inclusive initial ISS is stored separately as exclusive ISS+1; NewReno alone requires ACK greater than this boundary. Controller ISS/ISS+1/ISS+2 and wrapping vectors complement real first-flight suppression, subsequent-byte entry and timeout guards; Reno/SACK first-flight behavior is retained.
+    //# When the TCP protocol control block is initialized, recover is set to the initial send sequence
+    //# number.
     pub(crate) fn new(
         mss: u32,
         algorithm: RecoveryAlgorithm,
         initial_window: InitialWindow,
+        iss: Seq,
     ) -> Self {
         assert!(mss > 0);
         let mss = mss.min(MAX_WINDOW);
@@ -266,6 +272,10 @@ impl Congestion {
             acknowledged: 0,
             duplicate_acks: 0,
             recover: None,
+            // RFC6582 inclusive ISS is represented by exclusive ISS+1.
+            // Unlike a loss epoch, this guard applies only to NewReno.
+            initial_recover: Some(iss.wrapping_add(1)),
+            congestion_avoidance: false,
             fast_recovery: false,
             sack_recovery: false,
             ecn_end: None,
@@ -337,9 +347,9 @@ impl Congestion {
     //# A TCP endpoint MUST implement the basic congestion control algorithms slow start,
     //# congestion avoidance, and exponential backoff of RTO to avoid creating congestion
     //# collapse conditions (MUST-19).
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-1
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //# This document applies to TCP connections that are unable to use the TCP Selective
     //# Acknowledgment (SACK) option, either because the option is not locally supported or
     //# because the TCP peer did not indicate a willingness to use SACK.
@@ -350,19 +360,19 @@ impl Congestion {
     //# acknowledged before the fast recovery procedure is declared to be over.
     // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
-    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial recover representation remains separately open.
+    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial guard and strict admission are asserted by newreno_initial_boundary_and_loss_epoch_are_distinct.
     //# The NewReno modification applies to the fast recovery procedure that begins when three
     //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
     //# ACK arrives that acknowledges all of the data up to and including the data that was
     //# outstanding when the fast recovery procedure began.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //# The procedures specified in Section 3.2 of [RFC5681] are followed, with the
     //# modifications listed below.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //# When the third duplicate ACK is received, the TCP sender first checks the value of
     //# recover to see if the Cumulative Acknowledgment field covers more than recover. If so,
     //# the value of recover is incremented to the value of the highest sequence number
@@ -390,9 +400,9 @@ impl Congestion {
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
     //= reason=NewReno partial ACK schedules retx_pending; committed output starts at snd_una. newreno_partial_ack_wire_timer_and_exit_boundaries asserts each missing sequence/payload, continued recovery and failed-output rollback, including wrap.
     //# In this case, retransmit the first unacknowledged segment.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //# Deflate the congestion window by the amount of new data acknowledged by the Cumulative
     //# Acknowledgment field. If the partial ACK acknowledges at least one SMSS of new data,
     //# then add back SMSS bytes to the congestion window.
@@ -404,9 +414,9 @@ impl Congestion {
     //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //# Do not exit the fast recovery procedure (i.e., if any duplicate ACKs subsequently
     //# arrive, execute step 4 of Section 3.2 of [RFC5681]).
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //# Because the acknowledgment field contains the sequence number that the sender next
     //# expects to receive, the acknowledgment "ack_number" covers more than recover when
     //# ack_number - 1 > recover; i.e., at least one byte more of data is acknowledged beyond
@@ -428,14 +438,14 @@ impl Congestion {
     //# The use of the value of the duplicate acknowledgment counter for this purpose is not
     //# reliable, because it can be reset upon window updates and out-of- order
     //# acknowledgments.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //# Entry into fast recovery is only possible when the Cumulative Acknowledgment field
     //# covers more than the state variable recover.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //# When updating the Cumulative Acknowledgment field outside of fast recovery, the state
     //# variable recover may also need to be updated in order to continue to permit possible
     //# entry into fast recovery (Section 3.2, step 2). This issue arises when an update of
@@ -496,10 +506,42 @@ impl Congestion {
     //= reason=Connection-boundary otherwise-identical ACK traces contrast ordinary MSS growth with advancing ECE suppression and non-ECE duplicate recovery inflation, for Reno/NewReno and ECN on/off.
     //# TCP also follows the normal procedures for increasing the congestion window when it receives ACK packets without the ECN-Echo bit set [RFC2581].
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
-    //= reason=Reno/NewReno ECE recovery exits cap the computed threshold/flight-bound at pre-ACK cwnd. ecn_duplicate_entry_below_threshold_and_covering_ack_exit traces real reductions to cwnd=64<ssthresh=128, duplicate-ECE entry and covering-ECE exit without growth, with non-ECE exit restoring 128; SACK exit already caps at cwnd. Ordinary advancing and duplicate growth contrasts are separately tested.
+    //= reason=Positive-window Reno/NewReno ECE recovery exits cap at pre-ACK cwnd. Narrow zero-cwnd/zero-flight NewReno SHOULD departure restores RFC6582 option1 with RTO-length ECN pause; newreno_partial_zero_full_ece_restarts_after_ecn_pause proves liveness without waiving ordinary no-growth. ecn_duplicate_entry_below_threshold_and_covering_ack_exit traces real reductions to cwnd=64<ssthresh=128, duplicate-ECE entry and covering-ECE exit without growth, with non-ECE exit restoring 128; SACK exit already caps at cwnd. Ordinary advancing and duplicate growth contrasts are separately tested.
     //# The sending
     //# TCP SHOULD NOT increase the congestion window in response to the
     //# receipt of an ECN-Echo ACK packet.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=Actual bounded flight output followed one RTT later by delayed or one-byte divided ACKs: exact cumulative byte ledger and at most one SMSS increase for each of three flights, including wrap.
+    //# * SHOULD increment cwnd per equation (2) once per RTT
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=Actual bounded flight output followed one RTT later by delayed or one-byte divided ACKs: exact cumulative byte ledger and at most one SMSS increase for each of three flights, including wrap.
+    //# * MUST NOT increment cwnd by more than SMSS bytes
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=Actual bounded flight output followed one RTT later by delayed or one-byte divided ACKs: exact cumulative byte ledger and at most one SMSS increase for each of three flights, including wrap.
+    //# Note that during congestion avoidance, cwnd MUST NOT be
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.3
+    //= reason=NewReno/SACK/RACK/RACK+PRR actual entries and covering ACK exits give cwnd2000 below ssthresh4000; first next MSS ACK leaves cwnd unchanged, second grows by one MSS; RTO restores slow start. No global PRR/half-flight claim.
+    //# has been successfully retransmitted, cwnd MUST be set to no more than ssthresh and congestion
+    //# avoidance MUST be used to further increase cwnd.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=Actual bounded flight output followed one RTT later by delayed or one-byte divided ACKs: exact cumulative byte ledger and at most one SMSS increase for each of three flights, including wrap.
+    //# The RECOMMENDED way to increase cwnd during congestion avoidance is to count the number of
+    //# bytes that have been acknowledged by ACKs for new data. (A drawback of this implementation is
+    //# that it requires maintaining an additional state variable.) When the number of bytes
+    //# acknowledged reaches cwnd, then cwnd can be incremented by up to SMSS bytes. Note that during
+    //# congestion avoidance, cwnd MUST NOT be increased by more than SMSS bytes per RTT. This method
+    //# both allows TCPs to increase cwnd by one segment per RTT in the face of delayed ACKs and
+    //# provides robustness against ACK Division attacks.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.3
+    //= reason=NewReno/SACK/RACK/RACK+PRR actual entries and covering ACK exits give cwnd2000 below ssthresh4000; first next MSS ACK leaves cwnd unchanged, second grows by one MSS; RTO restores slow start. No global PRR/half-flight claim.
+    //# Finally, after all loss in the given window of segments has been successfully retransmitted,
+    //# cwnd MUST be set to no more than ssthresh and congestion avoidance MUST be used to further
+    //# increase cwnd.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Actual ten-segment loss trace with lost duplicate ACKs yields literal32-36+4=0, not an MSS floor. Partial hole repair ignores fresh-data credit; lost repair RTO restores one-MSS progress. Controller signed-expression vectors cover positive remainder and negative saturation. newreno_partial_zero_full_ece_restarts_after_ecn_pause covers zero/full-ECE liveness with an explicitly scoped RFC3168 SHOULD departure.
+    //# Deflate the congestion window by the amount of new data acknowledged by the Cumulative
+    //# Acknowledgment field. If the partial ACK acknowledges at least one SMSS of new data, then add
+    //# back SMSS bytes to the congestion window.
     pub(crate) fn on_ack_with_ecn(
         &mut self,
         ack: Seq,
@@ -515,6 +557,7 @@ impl Congestion {
         }) {
             self.retransmitted_end = None;
         }
+        self.observe_ack(ack);
         if acked == 0 {
             return false;
         }
@@ -540,6 +583,7 @@ impl Congestion {
                         .min(MAX_WINDOW),
                 );
                 self.sack_recovery = false;
+                self.congestion_avoidance = true;
                 self.acknowledged = 0;
             }
             return false;
@@ -555,10 +599,20 @@ impl Congestion {
                 //# set in step 2).
                 self.cwnd = self.ssthresh.min(exit_cap);
                 self.fast_recovery = false;
+                self.congestion_avoidance = true;
                 self.acknowledged = 0;
                 return false;
             }
             if matches!(relation, Some(Ordering::Equal | Ordering::Greater)) {
+                // Narrow departure from RFC3168 section6.1.2 no-growth SHOULD:
+                // a zero window with no flight has neither ACK clock nor RTO
+                // to restart it. Restore RFC6582 option (1) only here. The
+                // Connection retains its one-window ECN RTO-length send pause.
+                let exit_cap = if self.cwnd == 0 && flight_after_ack == 0 {
+                    MAX_WINDOW
+                } else {
+                    exit_cap
+                };
                 // RFC 6582 option (1) limits the burst after a full ACK.
                 self.cwnd = self.ssthresh.min(exit_cap).min(
                     flight_after_ack
@@ -567,15 +621,20 @@ impl Congestion {
                         .min(MAX_WINDOW),
                 );
                 self.fast_recovery = false;
+                self.congestion_avoidance = true;
                 self.acknowledged = 0;
                 return false;
             }
             if relation == Some(Ordering::Less) {
-                self.cwnd = self
-                    .cwnd
-                    .saturating_sub(acked)
-                    .saturating_add(if acked >= self.mss { self.mss } else { 0 })
-                    .clamp(self.mss, MAX_WINDOW);
+                // Saturate the complete signed expression, not its subtraction:
+                // an ACK may cover almost the entire inflated window.
+                self.cwnd = (i64::from(self.cwnd) - i64::from(acked)
+                    + if acked >= self.mss {
+                        i64::from(self.mss)
+                    } else {
+                        0
+                    })
+                .clamp(0, i64::from(MAX_WINDOW)) as u32;
                 return true;
             }
             return false; // Half-space comparisons are not valid TCP ACKs.
@@ -589,7 +648,7 @@ impl Congestion {
         if ece {
             return false;
         }
-        if self.cwnd < self.ssthresh {
+        if !self.congestion_avoidance && self.cwnd < self.ssthresh {
             self.cwnd = self
                 .cwnd
                 .saturating_add(acked.min(self.mss))
@@ -689,6 +748,10 @@ impl Congestion {
         true
     }
 
+    pub(crate) fn in_fast_recovery(&self) -> bool {
+        self.fast_recovery
+    }
+
     pub(crate) fn in_recovery(&self) -> bool {
         self.sack_recovery || self.fast_recovery
     }
@@ -714,84 +777,84 @@ impl Congestion {
     }
 
     // The caller checks RFC 5681's duplicate-ACK eligibility conditions.
-    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-2
-    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //# When in fast recovery, this variable records the send sequence number that must be
     //# acknowledged before the fast recovery procedure is declared to be over.
-    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
-    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial recover representation remains separately open.
+    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial guard and strict admission are asserted by newreno_initial_boundary_and_loss_epoch_are_distinct.
     //# The NewReno modification applies to the fast recovery procedure that begins when three
     //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
     //# ACK arrives that acknowledges all of the data up to and including the data that was
     //# outstanding when the fast recovery procedure began.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //# The procedures specified in Section 3.2 of [RFC5681] are followed, with the
     //# modifications listed below.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //# When the third duplicate ACK is received, the TCP sender first checks the value of
     //# recover to see if the Cumulative Acknowledgment field covers more than recover. If so,
     //# the value of recover is incremented to the value of the highest sequence number
     //# transmitted by the TCP so far. The TCP then enters fast retransmit (step 2 of Section
     //# 3.2 of [RFC5681]). If not, the TCP does not enter fast retransmit and does not reset
     //# ssthresh.
-    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //# Do not exit the fast recovery procedure (i.e., if any duplicate ACKs subsequently
     //# arrive, execute step 4 of Section 3.2 of [RFC5681]).
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //# Because the acknowledgment field contains the sequence number that the sender next
     //# expects to receive, the acknowledgment "ack_number" covers more than recover when
     //# ack_number - 1 > recover; i.e., at least one byte more of data is acknowledged beyond
     //# the highest byte that was outstanding when fast retransmit was last entered.
-    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //# This document also does not address issues of adjusting the duplicate acknowledgment
     //# threshold, but assumes the threshold specified in the IETF standards; the current
     //# standard is [RFC5681], which specifies a threshold of three duplicate acknowledgments.
-    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-4
-    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //# For a TCP sender that implements the algorithm specified in Section 3.2 of this
     //# document, the sender does not infer a packet drop from duplicate acknowledgments in
     //# this scenario. As always, the retransmit timer is the backup mechanism for inferring
     //# packet loss in this case.
-    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6
-    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //# An implementation may want to use a separate flag to record whether or not it is
     //# presently in the fast recovery procedure.
-    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6
-    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //# The use of the value of the duplicate acknowledgment counter for this purpose is not
     //# reliable, because it can be reset upon window updates and out-of- order
     //# acknowledgments.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //# Entry into fast recovery is only possible when the Cumulative Acknowledgment field
     //# covers more than the state variable recover.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //# When updating the Cumulative Acknowledgment field outside of fast recovery, the state
     //# variable recover may also need to be updated in order to continue to permit possible
     //# entry into fast recovery (Section 3.2, step 2). This issue arises when an update of
     //# the Cumulative Acknowledgment field results in a sequence wraparound that affects the
     //# ordering between the Cumulative Acknowledgment field and the state variable recover.
-    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6
-    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
+    //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only after initial NewReno and retained loss guards permit; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //# When three or more duplicate acknowledgments are received, the Cumulative
     //# Acknowledgment field doesn't cover more than recover, and a new fast recovery is not
     //# invoked, the sender should follow the guidance in Section 4.
@@ -812,7 +875,53 @@ impl Congestion {
     //# The sending
     //# TCP SHOULD NOT increase the congestion window in response to the
     //# receipt of an ECN-Echo ACK packet.
-    pub(crate) fn on_duplicate_ack(&mut self, flight: u32, highest_sent: Seq, ece: bool) -> bool {
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= reason=Initial guard clears on first validated progress beyond ISS+1; loss guard clears on first bounded cumulative advancement beyond recorded end. Ten bounded sub-half-space controller advancements span more than a full sequence cycle without stale initial state; existing timeout_marker_boundaries_and_wrap and integrated epoch tests assert loss-guard equality and wrapping entry.
+    //# When updating the Cumulative Acknowledgment field outside of fast recovery, the state variable
+    //# recover may also need to be updated in order to continue to permit possible entry into fast
+    //# recovery (Section 3.2, step 2). This issue arises when an update of the Cumulative
+    //# Acknowledgment field results in a sequence wraparound that affects the ordering between the
+    //# Cumulative Acknowledgment field and the state variable recover.
+    pub(crate) fn observe_ack(&mut self, ack: Seq) {
+        if self
+            .initial_recover
+            .is_some_and(|end| ack.serial_cmp(end) == Some(Ordering::Greater))
+        {
+            // Clear on the first bounded advancement; never retain a stale ISS
+            // across half-space or subsequent sequence wraps.
+            self.initial_recover = None;
+        }
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=No-SACK NewReno RFC5681 section3.2 layer: duplicate_ack_eligibility_and_intervening_advancement_reset, limited_transmit_is_one_packet_per_duplicate_and_excluded_from_threshold, fourth_duplicate_grants_fresh_mss_only_with_both_windows and wire partial/exit traces assert eligibility, exclusions, inflation and bounded output. Initial guard and zero partial deflation have dedicated tests; this is not a global enhanced-PRR/half-flight assertion.
+    //# The procedures specified in Section 3.2 of [RFC5681] are followed, with the modifications
+    //# listed below.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Real initial and retained loss-epoch third-duplicate suppression leaves threshold unchanged; cumulative progress beyond the boundary resets duplicates and admits entry. Active-recovery RTO and guarded duplicates also asserted. ECN shared epochs remain covered by existing tests.
+    //# When the third duplicate ACK is received, the TCP sender first checks the value of recover to
+    //# see if the Cumulative Acknowledgment field covers more than recover. If so, the value of
+    //# recover is incremented to the value of the highest sequence number transmitted by the TCP so
+    //# far. The TCP then enters fast retransmit (step 2 of Section 3.2 of [RFC5681]). If not, the TCP
+    //# does not enter fast retransmit and does not reset ssthresh.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= reason=Initial ISS+1 and loss-epoch exclusive end both require strictly greater cumulative ACK for NewReno. Equality suppression, later-byte entry, timeout and wrap are asserted by integrated traces and initial_recover_boundaries_and_long_bounded_progress.
+    //# Because the acknowledgment field contains the sequence number that the sender next expects to
+    //# receive, the acknowledgment "ack_number" covers more than recover when ack_number - 1 >
+    //# recover; i.e., at least one byte more of data is acknowledged beyond the highest byte that was
+    //# outstanding when fast retransmit was last entered.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= reason=Initial ISS+1 and loss-epoch exclusive end both require strictly greater cumulative ACK for NewReno. Equality suppression, later-byte entry, timeout and wrap are asserted by integrated traces and initial_recover_boundaries_and_long_bounded_progress.
+    //# Entry into fast recovery is only possible when the Cumulative Acknowledgment field covers more
+    //# than the state variable recover.
+    pub(crate) fn on_duplicate_ack(
+        &mut self,
+        ack: Seq,
+        flight: u32,
+        highest_sent: Seq,
+        ece: bool,
+    ) -> bool {
+        self.observe_ack(ack);
         if self.sack_recovery {
             return false;
         }
@@ -823,7 +932,10 @@ impl Congestion {
             return false;
         }
         self.duplicate_acks = self.duplicate_acks.saturating_add(1);
-        if self.duplicate_acks != 3 || self.recover.is_some() {
+        if self.duplicate_acks != 3
+            || self.recover.is_some()
+            || self.algorithm == RecoveryAlgorithm::NewReno && self.initial_recover.is_some()
+        {
             return false;
         }
         if self.ecn_end.is_none() && self.tlp_reduction_end.is_none() {
@@ -913,7 +1025,7 @@ impl Congestion {
 
     // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Stores exclusive highest_sent, exits both recovery flags, sets cwnd=MSS, resets duplicate count.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
-    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial recover representation remains separately open.
+    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial guard and strict admission are asserted by newreno_initial_boundary_and_loss_epoch_are_distinct.
     //# The NewReno modification applies to the fast recovery procedure that begins when three
     //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
     //# ACK arrives that acknowledges all of the data up to and including the data that was
@@ -962,6 +1074,11 @@ impl Congestion {
     //= https://www.rfc-editor.org/rfc/rfc3168#section-5.2
     //= reason=Endpoint corrupts the checksum of actual ECT data and submits it with CE; receiver drops without feedback or bytes. Sender timeout reduces cwnd and retransmits that same sequence/payload Not-ECT without CWR.
     //# Similarly, if a CE packet is dropped later in the network due to corruption (bit errors), the end nodes should still invoke congestion control, just as TCP would today in response to a dropped data packet.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.3
+    //= reason=Ordinary Reno/NewReno wire retransmissions, successive flights and wrap assert both window/threshold reductions; lost-fast-retransmission RTO uses bounded prior threshold rather than unchanged flight. Repeat RTO retains threshold. RACK lost-retransmission response is separately asserted in rack_replacement_loss_renews_response_without_cumulative_progress.
+    //# Loss in two successive windows of data, or the loss of a retransmission, should be taken as two
+    //# indications of congestion and, therefore, cwnd (and ssthresh) MUST be lowered twice in this
+    //# case.
     pub(crate) fn on_timeout(&mut self, flight: u32, highest_sent: Seq) {
         // Repeated RTOs for the same unacknowledged segment retain ssthresh.
         // RFC 3168 section 6.1.2: loss of a retransmission is new congestion,
@@ -970,6 +1087,13 @@ impl Congestion {
             && ((self.ecn_end.is_none() && self.tlp_reduction_end.is_none())
                 || self.retransmitted_end.is_some())
         {
+            let flight = if self.retransmitted_end.is_some() {
+                // Loss of a fast/SACK retransmission is a second congestion
+                // event; unchanged cumulative flight must not undo the first.
+                flight.min(self.cwnd).min(self.ssthresh)
+            } else {
+                flight
+            };
             self.reduce_threshold(flight);
         }
         self.ecn_end = None;
@@ -979,6 +1103,7 @@ impl Congestion {
         self.fast_recovery = false;
         self.sack_recovery = false;
         self.cwnd = self.mss;
+        self.congestion_avoidance = false;
         self.acknowledged = 0;
         self.reset_duplicate_acks();
     }
@@ -1112,6 +1237,70 @@ impl Prr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= type=test
+    //= reason=Initial guard clears on first validated progress beyond ISS+1; loss guard clears on first bounded cumulative advancement beyond recorded end. Ten bounded sub-half-space controller advancements span more than a full sequence cycle without stale initial state; existing timeout_marker_boundaries_and_wrap and integrated epoch tests assert loss-guard equality and wrapping entry.
+    //# When updating the Cumulative Acknowledgment field outside of fast recovery, the state variable
+    //# recover may also need to be updated in order to continue to permit possible entry into fast
+    //# recovery (Section 3.2, step 2). This issue arises when an update of the Cumulative
+    //# Acknowledgment field results in a sequence wraparound that affects the ordering between the
+    //# Cumulative Acknowledgment field and the state variable recover.
+    fn initial_recover_boundaries_and_long_bounded_progress() {
+        for iss in [Seq(100), Seq(u32::MAX - 1), Seq(u32::MAX)] {
+            for ack in [iss, iss.wrapping_add(1), iss.wrapping_add(2)] {
+                let mut c =
+                    Congestion::new(4, RecoveryAlgorithm::NewReno, InitialWindow::default(), iss);
+                assert_eq!(c.initial_recover, Some(iss.wrapping_add(1)));
+                assert_eq!(c.recover, None);
+                for i in 1..=3 {
+                    let entered = c.on_duplicate_ack(ack, 16, iss.wrapping_add(17), false);
+                    assert_eq!(entered, i == 3 && ack == iss.wrapping_add(2));
+                }
+                if ack != iss.wrapping_add(2) {
+                    assert_eq!(c.ssthresh(), MAX_WINDOW);
+                }
+            }
+            let mut c =
+                Congestion::new(4, RecoveryAlgorithm::NewReno, InitialWindow::default(), iss);
+            let mut ack = iss.wrapping_add(2);
+            c.on_ack(ack, 1, 0);
+            assert_eq!(c.initial_recover, None);
+            // Each advancement is bounded below half-space. Progress spans more
+            // than a full sequence cycle without resurrecting the stale ISS.
+            for _ in 0..10 {
+                ack = ack.wrapping_add(1 << 29);
+                c.on_ack(ack, 1 << 29, 0);
+                assert_eq!(c.initial_recover, None);
+            }
+            for i in 1..=3 {
+                assert_eq!(
+                    c.on_duplicate_ack(ack, 16, ack.wrapping_add(16), false),
+                    i == 3
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partial_deflation_saturates_the_whole_signed_expression() {
+        for (cwnd, acked, expected) in [(32, 36, 0), (31, 36, 0), (35, 36, 3), (2, 3, 0), (8, 4, 8)]
+        {
+            let mut c = Congestion::new(
+                4,
+                RecoveryAlgorithm::NewReno,
+                InitialWindow::default(),
+                Seq(0),
+            );
+            c.fast_recovery = true;
+            c.recover = Some(Seq(100));
+            c.cwnd = cwnd;
+            assert!(c.on_ack(Seq(50), acked, 4));
+            assert_eq!(c.cwnd(), expected);
+            assert!(c.in_recovery());
+        }
+    }
 
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc6937#section-3
@@ -1306,7 +1495,12 @@ mod tests {
     //# congestion response per the aforementioned principle in [RFC5681].
     fn rack_retransmission_loss_reduces_again_at_fixed_cumulative_flight() {
         for ecn in [false, true] {
-            let mut c = Congestion::new(1000, RecoveryAlgorithm::NewReno, InitialWindow::Iw10);
+            let mut c = Congestion::new(
+                1000,
+                RecoveryAlgorithm::NewReno,
+                InitialWindow::Iw10,
+                Seq(u32::MAX),
+            );
             if ecn {
                 assert!(c.on_ecn(Seq(1), 16_000, Seq(16_001)));
             }
@@ -1319,7 +1513,12 @@ mod tests {
             assert_eq!(c.recover, Some(Seq(16_001)));
             assert_eq!(c.ecn_end, None);
         }
-        let mut c = Congestion::new(1000, RecoveryAlgorithm::NewReno, InitialWindow::Iw10);
+        let mut c = Congestion::new(
+            1000,
+            RecoveryAlgorithm::NewReno,
+            InitialWindow::Iw10,
+            Seq(u32::MAX),
+        );
         assert!(c.on_ecn(Seq(1), 16_000, Seq(16_001)));
         assert_eq!((c.cwnd(), c.ssthresh()), (5000, 8000));
         c.retransmission_lost(16_000);
@@ -1540,7 +1739,12 @@ mod tests {
     //# recovery.
     fn tlp_reduction_epoch_shares_reduction_but_does_not_guard_recovery_entry() {
         for ecn in [false, true] {
-            let mut c = Congestion::new(1000, RecoveryAlgorithm::NewReno, InitialWindow::Iw10);
+            let mut c = Congestion::new(
+                1000,
+                RecoveryAlgorithm::NewReno,
+                InitialWindow::Iw10,
+                Seq(u32::MAX),
+            );
             if ecn {
                 assert!(c.on_ecn(Seq(1), 10_000, Seq(10_001)));
             }
@@ -1583,7 +1787,7 @@ mod tests {
             (u32::MAX, MAX_WINDOW),
         ] {
             for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
-                let c = Congestion::new(mss, algorithm, InitialWindow::Rfc5681);
+                let c = Congestion::new(mss, algorithm, InitialWindow::Rfc5681, Seq(u32::MAX));
                 assert_eq!(c.cwnd(), expected);
                 assert_eq!(c.initial_window(), expected);
             }
@@ -1592,7 +1796,12 @@ mod tests {
 
     #[test]
     fn tlp_loss_response_shares_ecn_and_recovery_epoch_guards() {
-        let mut c = Congestion::new(1000, RecoveryAlgorithm::NewReno, InitialWindow::Iw10);
+        let mut c = Congestion::new(
+            1000,
+            RecoveryAlgorithm::NewReno,
+            InitialWindow::Iw10,
+            Seq(u32::MAX),
+        );
         assert!(c.on_ecn(Seq(1), 8000, Seq(8001)));
         assert_eq!(c.ssthresh(), 4000);
         assert!(c.on_sack_recovery(Seq(7001), 2000, Seq(8001)));
@@ -1631,7 +1840,7 @@ mod tests {
             (u32::MAX, MAX_WINDOW),
         ] {
             for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
-                let mut c = Congestion::new(mss, algorithm, InitialWindow::Iw10);
+                let mut c = Congestion::new(mss, algorithm, InitialWindow::Iw10, Seq(u32::MAX));
                 assert_eq!(c.cwnd(), window);
                 c.on_ack(Seq(1), 1, 0);
                 c.restart_after_idle();
@@ -1642,7 +1851,12 @@ mod tests {
                 assert_eq!(c.cwnd(), mss.min(MAX_WINDOW));
             }
         }
-        let mut c = Congestion::new(3_000, RecoveryAlgorithm::default(), InitialWindow::Iw10);
+        let mut c = Congestion::new(
+            3_000,
+            RecoveryAlgorithm::default(),
+            InitialWindow::Iw10,
+            Seq(u32::MAX),
+        );
         c.set_initial_mss(1_000, false);
         assert_eq!(c.cwnd(), 10_000);
         c.set_mss(500);
@@ -1713,7 +1927,13 @@ mod tests {
     fn initial_slow_start_and_byte_counting() {
         for (mss, window) in [(500, 2_000), (1_000, 4_000), (1_460, 4_380), (3_000, 6_000)] {
             assert_eq!(
-                Congestion::new(mss, RecoveryAlgorithm::default(), InitialWindow::default()).cwnd(),
+                Congestion::new(
+                    mss,
+                    RecoveryAlgorithm::default(),
+                    InitialWindow::default(),
+                    Seq(u32::MAX)
+                )
+                .cwnd(),
                 window
             );
         }
@@ -1721,6 +1941,7 @@ mod tests {
             1_000,
             RecoveryAlgorithm::default(),
             InitialWindow::default(),
+            Seq(u32::MAX),
         );
         c.on_ack(Seq(100), 100, 0);
         assert_eq!(c.cwnd(), 4_100);
@@ -1743,9 +1964,9 @@ mod tests {
     }
 
     fn three_duplicates(c: &mut Congestion, flight: u32, end: Seq) -> bool {
-        assert!(!c.on_duplicate_ack(flight, end, false));
-        assert!(!c.on_duplicate_ack(flight, end, false));
-        c.on_duplicate_ack(flight, end, false)
+        assert!(!c.on_duplicate_ack(Seq(1), flight, end, false));
+        assert!(!c.on_duplicate_ack(Seq(1), flight, end, false));
+        c.on_duplicate_ack(Seq(1), flight, end, false)
     }
 
     #[test]
@@ -1763,7 +1984,8 @@ mod tests {
             for base in [Seq(0), Seq(u32::MAX - 3_999)] {
                 for extra in [0, 1] {
                     let end = base.wrapping_add(8_000);
-                    let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
+                    let mut c =
+                        Congestion::new(1_000, algorithm, InitialWindow::default(), Seq(u32::MAX));
                     c.acknowledged = 3_000;
                     assert!(c.on_sack_recovery(base, 8_000, end));
                     assert_eq!((c.cwnd(), c.ssthresh()), (4_000, 4_000));
@@ -1797,6 +2019,7 @@ mod tests {
             1_000,
             RecoveryAlgorithm::default(),
             InitialWindow::default(),
+            Seq(u32::MAX),
         );
         assert!(three_duplicates(&mut c, 8_000, Seq(8_000)));
         assert!(!c.on_sack_recovery(Seq(8_000), 2_000, Seq(12_000)));
@@ -1822,6 +2045,7 @@ mod tests {
                 1_000,
                 RecoveryAlgorithm::default(),
                 InitialWindow::default(),
+                Seq(u32::MAX),
             );
             assert!(c.on_sack_recovery(end.wrapping_add(u32::MAX - 7_999), 8_000, end));
             c.on_timeout(8_000, end);
@@ -1866,6 +2090,7 @@ mod tests {
                     1_000,
                     RecoveryAlgorithm::default(),
                     InitialWindow::default(),
+                    Seq(u32::MAX),
                 );
                 assert!(c.on_ecn(base, 16_000, end));
                 assert!(c.on_sack_recovery(
@@ -1880,6 +2105,7 @@ mod tests {
                 1_000,
                 RecoveryAlgorithm::default(),
                 InitialWindow::default(),
+                Seq(u32::MAX),
             );
             assert!(c.on_ecn(base, 16_000, end));
             assert!(c.on_sack_recovery(base, 4_000, end));
@@ -1900,6 +2126,7 @@ mod tests {
                     1_000,
                     RecoveryAlgorithm::default(),
                     InitialWindow::default(),
+                    Seq(u32::MAX),
                 );
                 assert!(c.on_ecn(base, 16_000, end));
                 assert!(c.on_sack_recovery(base, 16_000, end));
@@ -1912,7 +2139,7 @@ mod tests {
                 assert_eq!(c.retransmitted_end.is_some(), acked < 3_000);
                 assert_eq!(c.cwnd(), 8_000);
                 c.on_timeout(16_000 - acked, end);
-                assert_eq!(c.ssthresh(), if acked < 3_000 { 7_000 } else { 8_000 });
+                assert_eq!(c.ssthresh(), if acked < 3_000 { 4_000 } else { 8_000 });
                 assert!(!c.sack_recovery);
                 assert_eq!(c.cwnd(), 1_000);
             }
@@ -1929,21 +2156,21 @@ mod tests {
     // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
     //= type=test
-    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial recover representation remains separately open.
+    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial guard and strict admission are asserted by newreno_initial_boundary_and_loss_epoch_are_distinct.
     //# The NewReno modification applies to the fast recovery procedure that begins when three
     //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
     //# ACK arrives that acknowledges all of the data up to and including the data that was
     //# outstanding when the fast recovery procedure began.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Controller assertions only, not wire retransmission or timer management.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Controller assertions only, not wire retransmission or timer management.
     //# The procedures specified in Section 3.2 of [RFC5681] are followed, with the
     //# modifications listed below.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Controller assertions only, not wire retransmission or timer management.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Controller assertions only, not wire retransmission or timer management.
     //# When the third duplicate ACK is received, the TCP sender first checks the value of
     //# recover to see if the Cumulative Acknowledgment field covers more than recover. If so,
     //# the value of recover is incremented to the value of the highest sequence number
@@ -1975,10 +2202,10 @@ mod tests {
     //= type=test
     //= reason=NewReno partial ACK schedules retx_pending; committed output starts at snd_una. newreno_partial_ack_wire_timer_and_exit_boundaries asserts each missing sequence/payload, continued recovery and failed-output rollback, including wrap.
     //# In this case, retransmit the first unacknowledged segment.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Controller assertions only, not wire retransmission or timer management.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Controller assertions only, not wire retransmission or timer management.
     //# Deflate the congestion window by the amount of new data acknowledged by the Cumulative
     //# Acknowledgment field. If the partial ACK acknowledges at least one SMSS of new data,
     //# then add back SMSS bytes to the congestion window.
@@ -1988,10 +2215,10 @@ mod tests {
     //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
     //# Do not exit the fast recovery procedure (i.e., if any duplicate ACKs subsequently
     //# arrive, execute step 4 of Section 3.2 of [RFC5681]).
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Controller assertions only, not wire retransmission or timer management.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Controller assertions only, not wire retransmission or timer management.
     //# Because the acknowledgment field contains the sequence number that the sender next
     //# expects to receive, the acknowledgment "ack_number" covers more than recover when
     //# ack_number - 1 > recover; i.e., at least one byte more of data is acknowledged beyond
@@ -2023,10 +2250,10 @@ mod tests {
     //# The use of the value of the duplicate acknowledgment counter for this purpose is not
     //# reliable, because it can be reset upon window updates and out-of- order
     //# acknowledgments.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Controller assertions only, not wire retransmission or timer management.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Controller assertions only, not wire retransmission or timer management.
     //# Entry into fast recovery is only possible when the Cumulative Acknowledgment field
     //# covers more than the state variable recover.
     // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
@@ -2059,16 +2286,17 @@ mod tests {
             1_000,
             RecoveryAlgorithm::default(),
             InitialWindow::default(),
+            Seq(u32::MAX),
         );
         assert!(three_duplicates(&mut c, 8_000, Seq(8_000)));
         assert_eq!((c.ssthresh(), c.cwnd()), (4_000, 7_000));
-        assert!(!c.on_duplicate_ack(8_000, Seq(8_000), false));
+        assert!(!c.on_duplicate_ack(Seq(1), 8_000, Seq(8_000), false));
         assert_eq!(c.cwnd(), 8_000);
         assert!(c.on_ack(Seq(2_000), 2_000, 6_000));
         assert_eq!(c.cwnd(), 7_000);
         assert!(c.on_ack(Seq(2_500), 500, 5_500));
         assert_eq!(c.cwnd(), 6_500);
-        assert!(!c.on_duplicate_ack(5_500, Seq(8_000), false));
+        assert!(!c.on_duplicate_ack(Seq(1), 5_500, Seq(8_000), false));
         assert_eq!(c.cwnd(), 7_500);
         assert!(!c.on_ack(Seq(8_000), 5_500, 0));
         assert_eq!(c.cwnd(), 2_000);
@@ -2091,10 +2319,10 @@ mod tests {
     //# algorithms provided that the algorithms are conformant with the TCP
     //# specifications from the IETF Standards Track as described in RFC
     //# 2914, RFC 5033 [7], and RFC 8961 [15] (MAY-18).
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Both algorithms and sequence wrap tested separately.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-1
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Both algorithms and sequence wrap tested separately.
     //# This document applies to TCP connections that are unable to use the TCP Selective
     //# Acknowledgment (SACK) option, either because the option is not locally supported or
     //# because the TCP peer did not indicate a willingness to use SACK.
@@ -2129,10 +2357,10 @@ mod tests {
     //= type=test
     //= reason=NewReno partial ACK schedules retx_pending; committed output starts at snd_una. newreno_partial_ack_wire_timer_and_exit_boundaries asserts each missing sequence/payload, continued recovery and failed-output rollback, including wrap.
     //# In this case, retransmit the first unacknowledged segment.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Both algorithms and sequence wrap tested separately.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Both algorithms and sequence wrap tested separately.
     //# Deflate the congestion window by the amount of new data acknowledged by the Cumulative
     //# Acknowledgment field. If the partial ACK acknowledges at least one SMSS of new data,
     //# then add back SMSS bytes to the congestion window.
@@ -2149,10 +2377,10 @@ mod tests {
     //# avoid a possible burst of data when leaving fast recovery, in case the amount of new
     //# data that the sender is eligible to send due to the new value of the congestion window
     //# is large.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Both algorithms and sequence wrap tested separately.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Both algorithms and sequence wrap tested separately.
     //# When updating the Cumulative Acknowledgment field outside of fast recovery, the state
     //# variable recover may also need to be updated in order to continue to permit possible
     //# entry into fast recovery (Section 3.2, step 2). This issue arises when an update of
@@ -2176,7 +2404,8 @@ mod tests {
             for base in [Seq(0), Seq(u32::MAX - 3_999)] {
                 for acked in [500, 2_000, 8_000, 9_000] {
                     let end = base.wrapping_add(8_000);
-                    let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
+                    let mut c =
+                        Congestion::new(1_000, algorithm, InitialWindow::default(), Seq(u32::MAX));
                     assert!(three_duplicates(&mut c, 8_000, end));
                     // Control-only and ambiguous ACKs cannot exit recovery.
                     assert!(!c.on_ack(base, 0, 8_000));
@@ -2216,15 +2445,15 @@ mod tests {
     // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
     //= type=test
-    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial recover representation remains separately open.
+    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial guard and strict admission are asserted by newreno_initial_boundary_and_loss_epoch_are_distinct.
     //# The NewReno modification applies to the fast recovery procedure that begins when three
     //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
     //# ACK arrives that acknowledges all of the data up to and including the data that was
     //# outstanding when the fast recovery procedure began.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Timeout guard tested at ordinary and wrapping sequence boundaries.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Timeout guard tested at ordinary and wrapping sequence boundaries.
     //# When the third duplicate ACK is received, the TCP sender first checks the value of
     //# recover to see if the Cumulative Acknowledgment field covers more than recover. If so,
     //# the value of recover is incremented to the value of the highest sequence number
@@ -2237,10 +2466,10 @@ mod tests {
     //= reason=on_timeout stores exclusive highest_sent and clears recovery; timeout_marker_boundaries_and_wrap directly asserts active flag clear and marker replacement. newreno_partial_ack_wire_timer_and_exit_boundaries asserts active wire RTO at exact expiry.
     //# After a retransmit timeout, record the highest sequence number transmitted in the
     //# variable recover, and exit the fast recovery procedure if applicable.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Timeout guard tested at ordinary and wrapping sequence boundaries.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Timeout guard tested at ordinary and wrapping sequence boundaries.
     //# Because the acknowledgment field contains the sequence number that the sender next
     //# expects to receive, the acknowledgment "ack_number" covers more than recover when
     //# ack_number - 1 > recover; i.e., at least one byte more of data is acknowledged beyond
@@ -2259,16 +2488,16 @@ mod tests {
     //# document, the sender does not infer a packet drop from duplicate acknowledgments in
     //# this scenario. As always, the retransmit timer is the backup mechanism for inferring
     //# packet loss in this case.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Timeout guard tested at ordinary and wrapping sequence boundaries.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Timeout guard tested at ordinary and wrapping sequence boundaries.
     //# Entry into fast recovery is only possible when the Cumulative Acknowledgment field
     //# covers more than the state variable recover.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    // No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Timeout guard tested at ordinary and wrapping sequence boundaries.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
+    //= reason=No-SACK NewReno only; initial guard, literal partial deflation, wire repair and RTO have dedicated assertions, not a global enhanced-recovery claim. Timeout guard tested at ordinary and wrapping sequence boundaries.
     //# When updating the Cumulative Acknowledgment field outside of fast recovery, the state
     //# variable recover may also need to be updated in order to continue to permit possible
     //# entry into fast recovery (Section 3.2, step 2). This issue arises when an update of
@@ -2300,7 +2529,8 @@ mod tests {
     fn timeout_marker_boundaries_and_wrap() {
         for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
             for end in [Seq(10_000), Seq(0), Seq(u32::MAX)] {
-                let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
+                let mut c =
+                    Congestion::new(1_000, algorithm, InitialWindow::default(), Seq(u32::MAX));
                 c.on_timeout(10_000, end);
                 assert_eq!((c.cwnd(), c.ssthresh()), (1_000, 5_000));
                 c.on_timeout(2_000, end);
@@ -2338,7 +2568,7 @@ mod tests {
     //# For the purposes of this standard, we define RW = min(IW,cwnd).
     fn mss_idle_reset_and_saturation() {
         for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
-            let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
+            let mut c = Congestion::new(1_000, algorithm, InitialWindow::default(), Seq(u32::MAX));
             c.on_ack(Seq(1_000), 1_000, 0);
             c.set_mss(500);
             assert_eq!(c.cwnd(), 2_500);
@@ -2349,19 +2579,20 @@ mod tests {
             assert_eq!(c.cwnd(), 500);
             c.set_mss(1_000);
             assert_eq!(c.cwnd(), 1_000);
-            let mut c = Congestion::new(u32::MAX, algorithm, InitialWindow::default());
+            let mut c =
+                Congestion::new(u32::MAX, algorithm, InitialWindow::default(), Seq(u32::MAX));
             assert_eq!(c.cwnd(), MAX_WINDOW);
             c.on_ack(Seq(1), u32::MAX, u32::MAX);
             assert_eq!(c.cwnd(), MAX_WINDOW);
             assert!(three_duplicates(&mut c, u32::MAX, Seq(10)));
-            c.on_duplicate_ack(u32::MAX, Seq(10), false);
+            c.on_duplicate_ack(Seq(1), u32::MAX, Seq(10), false);
             assert_eq!((c.cwnd(), c.ssthresh()), (MAX_WINDOW, MAX_WINDOW));
             c.set_mss(u32::MAX);
             c.on_timeout(u32::MAX, Seq(10));
             assert_eq!((c.cwnd(), c.ssthresh()), (MAX_WINDOW, MAX_WINDOW));
-            let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
-            c.on_duplicate_ack(4_000, Seq(4_000), false);
-            c.on_duplicate_ack(4_000, Seq(4_000), false);
+            let mut c = Congestion::new(1_000, algorithm, InitialWindow::default(), Seq(u32::MAX));
+            c.on_duplicate_ack(Seq(1), 4_000, Seq(4_000), false);
+            c.on_duplicate_ack(Seq(1), 4_000, Seq(4_000), false);
             c.reset_duplicate_acks();
             assert!(three_duplicates(&mut c, 4_000, Seq(4_000)));
         }
@@ -2370,7 +2601,12 @@ mod tests {
     #[test]
     #[should_panic]
     fn zero_mss_rejected() {
-        Congestion::new(0, RecoveryAlgorithm::default(), InitialWindow::default());
+        Congestion::new(
+            0,
+            RecoveryAlgorithm::default(),
+            InitialWindow::default(),
+            Seq(u32::MAX),
+        );
     }
 
     #[test]
@@ -2380,6 +2616,7 @@ mod tests {
             1_000,
             RecoveryAlgorithm::default(),
             InitialWindow::default(),
+            Seq(u32::MAX),
         )
         .set_mss(0);
     }
@@ -2389,7 +2626,8 @@ mod tests {
             for base in [Seq(100), Seq(u32::MAX - 12_499)] {
                 for acked_retransmission in [0, 500, 1000] {
                     let end = base.wrapping_add(16_000);
-                    let mut c = Congestion::new(1000, algorithm, InitialWindow::default());
+                    let mut c =
+                        Congestion::new(1000, algorithm, InitialWindow::default(), Seq(u32::MAX));
                     assert!(c.on_ecn(base, 16_000, end));
                     assert_eq!(c.ssthresh(), 8000);
                     assert!(three_duplicates(&mut c, 16_000, end));
@@ -2460,7 +2698,8 @@ mod tests {
         for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
             for base in [Seq(0), Seq(u32::MAX - 3_999)] {
                 let end = base.wrapping_add(4_000);
-                let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
+                let mut c =
+                    Congestion::new(1_000, algorithm, InitialWindow::default(), Seq(u32::MAX));
                 assert!(c.on_ecn(base, 4_000, end));
                 assert_eq!((c.cwnd(), c.ssthresh()), (2_000, 2_000));
                 assert!(!c.on_ecn(end, 4_000, end));
@@ -2478,7 +2717,8 @@ mod tests {
                 assert!(!c.on_ecn(end, 2_000, end));
                 assert!(c.on_ecn(end.wrapping_add(1), 2_000, end.wrapping_add(2_000)));
 
-                let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
+                let mut c =
+                    Congestion::new(1_000, algorithm, InitialWindow::default(), Seq(u32::MAX));
                 assert!(three_duplicates(&mut c, 8_000, end));
                 let threshold = c.ssthresh();
                 assert!(!c.on_ecn(end, 8_000, end));
@@ -2487,7 +2727,8 @@ mod tests {
                 assert_eq!(c.cwnd(), 1_000);
                 assert!(!c.on_ecn(end, 2_000, end));
 
-                let mut c = Congestion::new(1_000, algorithm, InitialWindow::default());
+                let mut c =
+                    Congestion::new(1_000, algorithm, InitialWindow::default(), Seq(u32::MAX));
                 assert!(c.on_ecn(base, 8_000, end));
                 let threshold = c.ssthresh();
                 c.on_timeout(2_000, end);
