@@ -888,7 +888,7 @@ impl Connection {
     //# MUST NOT be used with RACK-TLP; instead, a modified recovery
     //# algorithm that carefully addresses such a case is needed.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
-    //= reason=Every newly detected lost retransmission calls Congestion::retransmission_lost, independently of the PRR option.
+    //= reason=Lost retransmissions receive one extra congestion response per committed-copy window, independently of the PRR option.
     //# In the absence of PRR [RFC6937], when RACK-TLP detects a lost
     //# retransmission, the congestion control MUST trigger an additional
     //# congestion response per the aforementioned principle in [RFC5681].
@@ -907,7 +907,7 @@ impl Connection {
     //# earlier segments as lost.  Then the sender would trigger a fast
     //# recovery to recover those losses.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
-    //= reason=Original losses share recovery entry; lost retransmissions within one detect call aggregate into one additional response. This does not establish grouping across multiple ACKs in one retransmission window.
+    //= reason=Original losses share recovery entry; Rack snapshots committed retransmission copies to group losses across ACKs, while successful replacements can trigger a later response.
     //# If multiple original transmissions or retransmissions were lost in a
     //# window, the congestion control specified in [RFC5681] only reacts
     //# once per window.
@@ -2210,6 +2210,7 @@ impl Connection {
         }
         let mut delivered = 0;
         let mut dsack = false;
+        let mut reo_grew = false;
         let tlp_flight = self.flight();
         let sack_evidence = if self.sack_receive
             && at_or_after(ack, self.snd_una)
@@ -2246,6 +2247,7 @@ impl Connection {
                 self.mss as u32,
                 update.dsack,
             );
+            reo_grew = self.rack.reo_grew;
             // Splitting at ACK/SACK edges can exhaust the ledger during this
             // call. Do not use its delivery or retain PRR after that transition.
             delivered = if self.rack.valid() {
@@ -2289,6 +2291,8 @@ impl Connection {
         if tlp_reduced {
             self.ecn_cwr_pending |= self.ecn_feedback();
         }
+        let was_rto_recovery = self.sack_post_rto.is_some();
+        let mut recovery_exited = false;
         if advancing {
             // Do not grow cwnd on the ACK that just triggered a loss reduction.
             self.accept_ack(
@@ -2304,11 +2308,14 @@ impl Connection {
                 self.sack_recovery = None;
                 self.prr = None;
                 self.rack_entry_delivery = None;
-                self.rack.recovery_exit();
+                recovery_exited = true;
             } else {
                 recovery.pipe = self.recovery_pipe(recovery.high_rxt);
                 self.sack_recovery = Some(recovery);
             }
+        }
+        if recovery_exited || was_rto_recovery && self.sack_post_rto.is_none() {
+            self.rack.recovery_exit(reo_grew);
         }
         if ecn_one {
             let deadline = now.saturating_add(self.rto());
@@ -5240,6 +5247,229 @@ mod tests {
                     (info.unacked, info.sacked, info.lost, info.retransmitted),
                     (0, 0, 0, 0)
                 );
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Same-ACK DSACK growth takes precedence at fast/RTO exit; 16 real DSACK-free RTO exits decay persistence across wrap.
+    //# Else if exiting Fast or RTO recovery:
+    //# RACK.reo_wnd_persist -= 1
+    //# If RACK.reo_wnd_persist <= 0:
+    //# RACK.reo_wnd_mult = 1
+    fn rack_dsack_exit_precedence_and_sixteen_rto_exits() {
+        for iss in [0, u32::MAX - 4999] {
+            for rto_exit in [false, true] {
+                let mut a = rack_flight(iss);
+                rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
+                a.timeout(225_000).unwrap();
+                packet(&mut a, 225_000);
+                let mut now = 325_000;
+                if rto_exit {
+                    now = a.rto_deadline.unwrap();
+                    a.timeout(now).unwrap();
+                    packet(&mut a, now);
+                    assert!(a.sack_post_rto.is_some());
+                }
+                rack_sack(&mut a, now + 100_000, 10_000, &[(0, 1000)]);
+                assert!(a.sack_recovery.is_none());
+                assert!(a.sack_post_rto.is_none());
+                assert_eq!(a.rack.adaptation(), (2, 16));
+                now += 100_001;
+                for round in 1..=16 {
+                    a.write(&[0x55; 1000]).unwrap();
+                    packet(&mut a, now);
+                    now = a.rto_deadline.unwrap();
+                    a.timeout(now).unwrap();
+                    assert!(a.sack_post_rto.is_some());
+                    packet(&mut a, now);
+                    now += 100_000;
+                    rack_sack(&mut a, now, 10_000 + round * 1000, &[]);
+                    assert!(a.sack_post_rto.is_none());
+                    assert_eq!(
+                        a.rack.adaptation(),
+                        (if round == 16 { 1 } else { 2 }, 16 - round as u8)
+                    );
+                    // Duplicate ACK must not count the same exit again.
+                    rack_sack(&mut a, now + 1, 10_000 + round * 1000, &[]);
+                    assert_eq!(a.rack.adaptation().1, 16 - round as u8);
+                    now += 2;
+                }
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Original out-of-order delivery establishes reordering before three additional complete segments are newly SACKed by one ACK; recovery waits until the reordering deadline.
+    //# Otherwise, if some reordering has been observed, then RACK does not
+    //# trigger fast recovery based on DupThresh.
+    fn rack_observed_reordering_three_sacks_wait_for_window() {
+        for iss in [0, u32::MAX - 4999] {
+            let mut a = rack_flight(iss);
+            rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
+            rack_sack(&mut a, 201_000, 0, &[(4000, 5000), (7000, 8000)]);
+            assert!(a.transport_info().reordering > 3);
+            assert_eq!(a.transport_info().sacked, 2);
+            // This ACK newly SACKs three whole segments, not partial bytes.
+            rack_sack(&mut a, 202_000, 0, &[(4000, 5000), (6000, 10_000)]);
+            assert_eq!(a.transport_info().sacked, 5);
+            assert_eq!(a.transport_info().lost, 0);
+            assert!(!a.transport_info().recovery);
+            let deadline = a.rack.deadline.unwrap();
+            assert_eq!(deadline, 227_000);
+            a.timeout(deadline - 1).unwrap();
+            assert!(!a.transport_info().recovery);
+            a.timeout(deadline).unwrap();
+            assert!(a.transport_info().recovery);
+            assert_eq!(a.transport_info().lost, 5);
+            let bytes = packet(&mut a, deadline);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+                iss.wrapping_add(1)
+            );
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.2
+    //= type=test
+    //= reason=Packet feedback loses two retransmissions on separate ACKs and selects them again below HighRxt, with PRR both enabled and disabled.
+    //# Therefore, the algorithm [RFC6675]
+    //# MUST NOT be used with RACK-TLP; instead, a modified recovery
+    //# algorithm that carefully addresses such a case is needed.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+    //= type=test
+    //= reason=Both PRR profiles reduce additionally for the first lost retransmission, not again for another committed copy in the same transmission window; output failure commits no transmission or credit.
+    //# In the absence of PRR [RFC6937], when RACK-TLP detects a lost
+    //# retransmission, the congestion control MUST trigger an additional
+    //# congestion response per the aforementioned principle in [RFC5681].
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+    //= type=test
+    //# If multiple original transmissions or retransmissions were lost in a
+    //# window, the congestion control specified in [RFC5681] only reacts
+    //# once per window.
+    fn rack_lost_retransmissions_select_again_and_reduce_once_per_window() {
+        for iss in [0, u32::MAX - 4999] {
+            for prr in [false, true] {
+                let mut a = rack_flight(iss);
+                a.config.prr = prr;
+                rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
+                a.timeout(225_000).unwrap();
+                for (now, offset) in [(225_000, 0), (226_000, 1000), (227_000, 2000)] {
+                    if offset != 0 {
+                        rack_sack(&mut a, now, 0, &[(7000, 8000 + offset)]);
+                    }
+                    let bytes = packet(&mut a, now);
+                    assert_eq!(
+                        wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+                        iss.wrapping_add(1 + offset)
+                    );
+                }
+                assert_eq!(a.congestion.ssthresh(), 5000);
+                assert_eq!(a.prr.is_some(), prr);
+                // Deliver the second retransmission: the first is lost again.
+                rack_sack(&mut a, 326_000, 0, &[(1000, 2000), (7000, 10_000)]);
+                assert_eq!((a.congestion.cwnd(), a.congestion.ssthresh()), (2500, 2500));
+                let send_credit = a.recovery_credit(a.sack_recovery.unwrap());
+                assert_eq!(send_credit, if prr { 1000 } else { 1500 });
+                let before = a.transport_info();
+                let credit = a.prr.map(|p| p.credit());
+                assert_eq!(
+                    a.transmit(326_000, &mut [0; 20]),
+                    Err(Error::OutputTooSmall)
+                );
+                assert_eq!(a.transport_info(), before);
+                assert_eq!(a.prr.map(|p| p.credit()), credit);
+                let bytes = packet(&mut a, 326_000);
+                assert!(
+                    wire::parse(ip(tuple()), &bytes).unwrap().payload.len() as u32 <= send_credit
+                );
+                assert_eq!(
+                    wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+                    iss.wrapping_add(1)
+                );
+                // Its ACK now loses the third retransmission on another ACK,
+                // still inside the original 10-MSS sequence window.
+                rack_sack(&mut a, 426_000, 2000, &[(7000, 10_000)]);
+                assert_eq!(a.congestion.ssthresh(), 2500);
+                let bytes = packet(&mut a, 426_000);
+                assert_eq!(
+                    wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+                    iss.wrapping_add(2001)
+                );
+                rack_sack(&mut a, 427_000, 2000, &[(7000, 10_000)]);
+                assert_eq!(a.congestion.ssthresh(), 2500);
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+    //= type=test
+    //= reason=Loss of a successfully committed replacement triggers another response with unchanged cumulative hole and SND.NXT, for PRR on/off and wrap. Distinct successful commits may share a timestamp; failed encoding changes no copy markers or credit.
+    //# In the absence of PRR [RFC6937], when RACK-TLP detects a lost
+    //# retransmission, the congestion control MUST trigger an additional
+    //# congestion response per the aforementioned principle in [RFC5681].
+    fn rack_replacement_loss_renews_response_without_cumulative_progress() {
+        for iss in [0, u32::MAX - 4999] {
+            for prr in [false, true] {
+                for same_timestamp in [false, true] {
+                    let mut a = rack_flight(iss);
+                    a.config.prr = prr;
+                    rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
+                    a.timeout(225_000).unwrap();
+                    for (now, offset) in [(225_000, 0), (226_000, 1000), (227_000, 2000)] {
+                        if offset != 0 {
+                            rack_sack(&mut a, now, 0, &[(7000, 8000 + offset)]);
+                        }
+                        let bytes = packet(&mut a, now);
+                        assert_eq!(
+                            wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+                            iss.wrapping_add(1 + offset)
+                        );
+                    }
+                    let flight = (a.snd_una, a.snd_nxt);
+                    rack_sack(&mut a, 326_000, 0, &[(1000, 2000), (7000, 10_000)]);
+                    assert_eq!(a.congestion.ssthresh(), 2500);
+                    // Failed output cannot renew the accounted first copy.
+                    let copies = alloc::format!("{:?}", a.rack);
+                    let credit = a.prr.map(|p| p.credit());
+                    assert_eq!(
+                        a.transmit(326_000, &mut [0; 20]),
+                        Err(Error::OutputTooSmall)
+                    );
+                    assert_eq!(alloc::format!("{:?}", a.rack), copies);
+                    assert_eq!(a.prr.map(|p| p.credit()), credit);
+                    rack_sack(&mut a, 326_000, 0, &[(1000, 2000), (7000, 10_000)]);
+                    assert_eq!(a.congestion.ssthresh(), 2500);
+                    // This actual commit renews the first copy, not SND.NXT.
+                    let bytes = packet(&mut a, 326_000);
+                    assert_eq!(
+                        wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+                        iss.wrapping_add(1)
+                    );
+                    let sent = if same_timestamp { 326_000 } else { 327_000 };
+                    rack_sack(&mut a, sent, 0, &[(1000, 3000), (7000, 10_000)]);
+                    let bytes = packet(&mut a, sent);
+                    assert_eq!(
+                        wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+                        iss.wrapping_add(3001)
+                    );
+                    // Deliver the later-sequence copy. Even a timestamp tie
+                    // detects the replacement at offset 0 as lost again.
+                    rack_sack(&mut a, sent + 100_000, 0, &[(1000, 4000), (7000, 10_000)]);
+                    assert_eq!((a.snd_una, a.snd_nxt), flight);
+                    assert_eq!((a.congestion.cwnd(), a.congestion.ssthresh()), (2000, 2000));
+                    let bytes = packet(&mut a, sent + 100_000);
+                    assert_eq!(
+                        wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+                        iss.wrapping_add(1)
+                    );
+                }
             }
         }
     }

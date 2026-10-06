@@ -31,6 +31,9 @@ struct Interval {
     sacked: bool,
     original_lost: bool,
     needs_retransmit: bool,
+    // This committed retransmission copy has not shared an extra loss response.
+    // Splits copy the marker; only successful retransmit commits renew it.
+    loss_response_pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -54,6 +57,7 @@ pub(crate) struct Rack {
     pub(crate) reordering: u32,
     multiplier: u128,
     persist: u8,
+    pub(crate) reo_grew: bool,
     dsack_round: Option<Seq>,
     pub(crate) deadline: Option<u64>,
     pub(crate) ack_sample: Option<u64>,
@@ -82,6 +86,7 @@ impl Rack {
             reordering: 3,
             multiplier: 1,
             persist: 0,
+            reo_grew: false,
             dsack_round: None,
             deadline: None,
             ack_sample: None,
@@ -198,6 +203,7 @@ impl Rack {
                     r.transmission_end = end;
                     r.sent = now;
                     r.retransmitted = true;
+                    r.loss_response_pending = true;
                     r.needs_retransmit = false;
                     r.sacked = false;
                 }
@@ -216,6 +222,7 @@ impl Rack {
                 sacked: false,
                 original_lost: false,
                 needs_retransmit: false,
+                loss_response_pending: false,
             });
         } else {
             self.abandon(end);
@@ -294,6 +301,7 @@ impl Rack {
         dsack: bool,
     ) -> u32 {
         self.ack_sample = None;
+        self.reo_grew = false;
         if let Some(boundary) = self.fallback {
             if !after(boundary, ack) {
                 self.fallback = None;
@@ -378,22 +386,31 @@ impl Rack {
             self.dsack_round = Some(high);
             self.multiplier = self.multiplier.saturating_add(1).min(MAX_MULTIPLIER);
             self.persist = 16;
+            self.reo_grew = true;
             self.reordering_seen = true;
         }
         delivered
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
-    //= reason=Helper decrements persistence and resets multiplier on zero. Connection calls this at fast recovery exit only.
+    //= reason=Fast/RTO exit decrements persistence unless this same ACK grew the window; resets multiplier on zero.
     //# Else if exiting Fast or RTO recovery:
     //# RACK.reo_wnd_persist -= 1
     //# If RACK.reo_wnd_persist <= 0:
     //# RACK.reo_wnd_mult = 1
-    pub(crate) fn recovery_exit(&mut self) {
+    pub(crate) fn recovery_exit(&mut self, grew: bool) {
+        if grew {
+            return;
+        }
         self.persist = self.persist.saturating_sub(1);
         if self.persist == 0 {
             self.multiplier = 1;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn adaptation(&self) -> (u128, u8) {
+        (self.multiplier, self.persist)
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8985#section-3.3.2
@@ -435,7 +452,7 @@ impl Rack {
     }
 
     // RFC 8985 §6.2: maximum remaining eligible interval, not minimum.
-    // Return whether a retransmission itself was newly lost (new congestion).
+    // Return whether newly lost retransmission copies require another response.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
     //= reason=Computes maximum remaining eligible deadline so all eligible intervals have expired when serviced; loss marking is one-shot until retransmit.
     //# For timely loss detection, it is RECOMMENDED that the
@@ -469,11 +486,19 @@ impl Rack {
             }
             let deadline = r.sent.saturating_add(self.rtt).saturating_add(window);
             if now >= deadline {
-                retransmission_lost |= r.retransmitted;
+                retransmission_lost |= r.retransmitted && r.loss_response_pending;
                 r.original_lost = true;
                 r.needs_retransmit = true;
             } else {
                 self.deadline = Some(self.deadline.map_or(deadline, |old| old.max(deadline)));
+            }
+        }
+        if retransmission_lost {
+            // Snapshot the currently committed transmission window. Later ACKs
+            // losing older copies share this response, but replacements sent
+            // after it renew their marker even with identical time/sequence.
+            for r in &mut self.intervals {
+                r.loss_response_pending = false;
             }
         }
         retransmission_lost
@@ -780,7 +805,7 @@ mod tests {
         );
         assert_eq!(rack.multiplier, MAX_MULTIPLIER);
         for _ in 0..16 {
-            rack.recovery_exit();
+            rack.recovery_exit(false);
         }
         assert_eq!(rack.multiplier, 1);
     }
@@ -1128,6 +1153,72 @@ mod tests {
     }
 
     #[test]
+    fn retransmission_copy_windows_survive_splits_and_renew_on_commit() {
+        for base in [0, u32::MAX - 1999] {
+            let seq = |offset| Seq(base).wrapping_add(offset);
+            let mut rack = Rack::new().unwrap();
+            let mut scoreboard = Scoreboard::new();
+            rack.sample(100, 0);
+            for i in 0..4 {
+                rack.transmit(seq(i * 1000), seq((i + 1) * 1000), 0, false);
+                rack.transmit(seq(i * 1000), seq((i + 1) * 1000), 100 + u64::from(i), true);
+            }
+            sack(
+                &mut rack,
+                &mut scoreboard,
+                base,
+                seq(4000).0,
+                201,
+                &[(seq(1000).0, seq(2000).0)],
+            );
+            assert!(rack.detect(201, true, Some(100)));
+            assert!(rack.intervals.iter().all(|r| !r.loss_response_pending));
+            // A split of an accounted, still outstanding copy stays accounted.
+            assert!(rack.split(seq(2500)));
+            sack(
+                &mut rack,
+                &mut scoreboard,
+                base,
+                seq(4000).0,
+                203,
+                &[(seq(1000).0, seq(2000).0), (seq(3000).0, seq(4000).0)],
+            );
+            assert!(!rack.detect(203, true, Some(100))); // Older third copy, later ACK.
+            assert!(
+                rack.intervals
+                    .iter()
+                    .filter(|r| r.start == seq(2000) || r.start == seq(2500))
+                    .all(|r| r.needs_retransmit && !r.loss_response_pending)
+            );
+            // Two successful replacements share the timestamp of the prior
+            // detect call, but constitute new, unaccounted committed copies.
+            rack.transmit(seq(0), seq(1000), 203, true);
+            assert!(rack.split(seq(500)));
+            assert!(
+                rack.intervals
+                    .iter()
+                    .filter(|r| r.start == seq(0) || r.start == seq(500))
+                    .all(|r| r.loss_response_pending)
+            );
+            rack.transmit(seq(2000), seq(3000), 203, true);
+            sack(
+                &mut rack,
+                &mut scoreboard,
+                base,
+                seq(4000).0,
+                303,
+                &[(seq(1000).0, seq(4000).0)],
+            );
+            assert!(rack.detect(303, true, Some(100)));
+            assert!(!rack.detect(303, true, Some(100))); // Response is one-shot.
+            // Partial retransmission renews just its successfully sent range.
+            rack.transmit(seq(0), seq(500), 303, true);
+            assert!(rack.intervals[0].loss_response_pending);
+            assert!(!rack.intervals[1].loss_response_pending);
+        }
+    }
+
+    #[test]
     fn capacity_overflow_disables_inference_until_flight_is_acked() {
         for split_overflow in [false, true] {
             let mut rack = Rack::new().unwrap();
@@ -1467,10 +1558,10 @@ mod tests {
         assert_eq!(rack.multiplier, 5);
         assert_eq!(rack.reo_window(false, Some(100)), 100); // Uncapped value is 125.
         for _ in 0..15 {
-            rack.recovery_exit();
+            rack.recovery_exit(false);
             assert_eq!(rack.multiplier, 5);
         }
-        rack.recovery_exit();
+        rack.recovery_exit(false);
         assert_eq!(rack.multiplier, 1);
         assert_eq!(rack.reo_window(false, Some(100)), 25);
     }
@@ -1515,7 +1606,7 @@ mod tests {
         sack(&mut rack, &mut scoreboard, 1000, 2000, 101, &[(0, 1000)]);
         assert_eq!(rack.reo_window(false, Some(100)), 50);
         for _ in 0..16 {
-            rack.recovery_exit();
+            rack.recovery_exit(false);
         }
         assert_eq!(rack.reo_window(false, Some(100)), 25);
     }
