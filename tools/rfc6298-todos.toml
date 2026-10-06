@@ -3,7 +3,7 @@
 # 6298:section-1:2
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6298#section-1"
-reason = "Global conformance is not established by estimator math: configured rto_min_us<1000000 intentionally departs from section2.4, and sampling-cadence/profile gaps below remain. Timer lifecycle now uses one selected loss timer, an unarmed RTO reference, per-copy head boundaries/elapsed age, and zero-window RTO probing versus unsent ZWP. Close the remaining sample-rate/profile obligations separately; do not use this as an implemented-defect waiver."
+reason = "Global conformance is not established by estimator math: configured rto_min_us<1000000 intentionally departs from section2.4, and the invalid-echo cadence/profile gaps below remain. Timer lifecycle now uses one selected loss timer, an unarmed RTO reference, per-copy head boundaries/elapsed age, and zero-window RTO probing versus unsent ZWP. Close the remaining invalid-echo cadence/profile obligations separately; do not use this as an implemented-defect waiver."
 quote = '''
 However, a TCP MUST NOT be more aggressive than the following algorithms allow.
 '''
@@ -20,19 +20,8 @@ be rounded up to 1 second.
 # 6298:section-3:3
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6298#section-3"
-reason = "One pending end/send-time sample starts on fresh output and clears on covered ACK; timestamp mismatch clears it without sampling, and same-millisecond timestamp reuse can suppress rearming. No assertion establishes >=one eligible measurement per RTT in continuous ACK-clocked flights, delayed/stretched ACKs, invalid echoes, ledger fallback, or RACK-only SACK delivery. Add an integrated sample-count trace per RTT and correct starvation if found; Karn-impossible flights must be identified separately."
+reason = "Causal-round gate and complete original ledger candidates now give eight actual updates over eight continuous sliding RTTs, including delayed/stretched ACKs, same-millisecond TS reuse and mixed RACK SACK delivery. Minimum cadence remains unresolved for negotiated non-RACK connections whose every advancing ACK has invalid TSecr: timestamps_rtt_validated_echo_and_karn requires no update for such an ACK even with a Karn-safe local original available. Preserving that upstream assertion and validated-echo contract conflicts with unconditional local-ledger fallback. Parent must decide whether independent local-clock measurements may bypass invalid TSecr in non-RACK mode; no assertion was weakened. Karn-impossible flights remain excluded."
 quote = '''
 A TCP implementation MUST take at least one RTT measurement per RTT (unless that
 is not possible per Karn's algorithm).
-'''
-
-# 6298:section-3:many-timestamp-samples
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6298#section-3"
-reason = "Timestamp per-ACK samples/many measurements per large window are suggested to avoid aliasing, but ordinary Connection sampling retains one pending flight sample; RACK only supplements nonadvancing SACK delivery with valid original ack_sample. No large-window count/aliasing assertions. Characterize rate under negotiated timestamps and add a large-window integrated test or explicitly justify a conservative one-per-RTT policy; minimum-rate MUST stays open."
-quote = '''
-However, when using the timestamp option, each ACK can be used as an RTT sample.
-RFC 1323 [JBB92] suggests that TCP connections utilizing large congestion
-windows should take many RTT samples per window of data to avoid aliasing
-effects in the estimated RTT.
 '''

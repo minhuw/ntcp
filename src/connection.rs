@@ -429,6 +429,7 @@ pub(crate) struct Connection {
     last_output_ecn: u8,
     pub(crate) accepted_metadata: bool,
     sample: Option<(Seq, Instant)>,
+    rtt_sample_after: Option<Instant>,
     syn_timed_out: bool,
     consecutive_timeouts: u32,
     route_advice_pending: bool,
@@ -648,6 +649,7 @@ impl Connection {
             last_output_ecn: 0,
             accepted_metadata: false,
             sample: None,
+            rtt_sample_after: None,
             syn_timed_out: false,
             consecutive_timeouts: 0,
             route_advice_pending: false,
@@ -3082,8 +3084,7 @@ impl Connection {
                 && !advancing
                 && let Some(sample) = self.rack.ack_sample
             {
-                self.rtt.sample(sample);
-                self.tlp_fresh_rtt = true;
+                self.update_rtt(sample);
             }
             update.newly_sacked != 0 && !update.overflow
         } else {
@@ -3356,6 +3357,22 @@ impl Connection {
         self.limited_end = None;
     }
 
+    // ponytail: one update per causal RTT, not per packet. Fixed RFC6298 weights
+    // retain round history even under ACK compression or arbitrarily dense SACKs.
+    // RFC6298's many-per-window suggestion trades aliasing for history loss here;
+    // use rate-adjusted weights only if per-packet RTO sampling becomes necessary.
+    // The ledger keeps in-flight candidates, so output need not rearm a timer.
+    fn update_rtt(&mut self, sample: u64) -> bool {
+        let sent = self.now.saturating_sub(sample);
+        if self.rtt_sample_after.is_some_and(|after| sent < after) {
+            return false;
+        }
+        self.rtt.sample(sample);
+        self.rtt_sample_after = Some(self.now.saturating_add(u64::from(sample == 0)));
+        self.tlp_fresh_rtt = true;
+        true
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
     //= reason=Partial cumulative ACK removes only covered bytes and reports progress; future ACK rejection additionally in rfc5961_ack_bounds_are_inclusive_and_reject_all_incoming_side_effects.
     //# If SND.UNA < SEG.ACK =< SND.NXT, then set SND.UNA <- SEG.ACK. Any segments on the
@@ -3400,9 +3417,9 @@ impl Connection {
     //# That is, RTT samples MUST NOT be made using segments that were retransmitted (and thus
     //# for which it is ambiguous whether the reply was for the first instance of the packet
     //# or a later instance).
-    // Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    // Continuous sliding flights use complete unambiguous local ledger candidates even without fresh output; actual update counts cover delayed/stretched ACKs and same-millisecond reuse. Negotiated non-RACK RTTM retains echo validation; invalid echoes and Karn-ambiguous originals are separately counted. Minimum-rate TODO remains for all-invalid non-RACK echoes because the upstream no-update assertion is preserved.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-3
-    //= reason=Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= reason=Continuous sliding flights use complete unambiguous local ledger candidates even without fresh output; actual update counts cover delayed/stretched ACKs and same-millisecond reuse. Negotiated non-RACK RTTM retains echo validation; invalid echoes and Karn-ambiguous originals are separately counted. Minimum-rate TODO remains for all-invalid non-RACK echoes because the upstream no-update assertion is preserved.
     //# A TCP implementation MUST take at least one RTT measurement per RTT (unless that is
     //# not possible per Karn's algorithm).
     // Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
@@ -3422,9 +3439,9 @@ impl Connection {
     //# implementation is using an RTO less than 3 seconds, the RTO MUST be re-initialized to
     //# 3 seconds when data transmission begins (i.e., after the three-way handshake
     //# completes).
-    // Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    // Conservative one-per-causal-RTT policy intentionally declines suggested many-per-window samples: RFC7323 section4.2 reports limited RTO benefit and fixed-weight history truncation. Large sliding flights and dense SACK delivery count one actual estimator update per round; rate-adjusted weights would be required before increasing rate.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-3
-    //= reason=Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= reason=Conservative one-per-causal-RTT policy intentionally declines suggested many-per-window samples: RFC7323 section4.2 reports limited RTO benefit and fixed-weight history truncation. Large sliding flights and dense SACK delivery count one actual estimator update per round; rate-adjusted weights would be required before increasing rate.
     //# However, when using the timestamp option, each ACK can be used as an RTT sample. RFC
     //# 1323 [JBB92] suggests that TCP connections utilizing large congestion windows should
     //# take many RTT samples per window of data to avoid aliasing effects in the estimated
@@ -3551,21 +3568,33 @@ impl Connection {
             //# the averaged RTT measurement only if the segment advances
             //# the left edge of the send window, i.e., SND.UNA is
             //# increased.
-            // Scope: Four eight-packet bulk flights verify exact RFC6298 estimator history with one ordinary RTTM sample per flight; a mixed original-transmission RACK SACK sample adds a second unweighted local-clock update. This is not a sustained sliding-flight/per-RTT cadence bound: arbitrary frequent RACK samples still use fixed alpha/beta and may truncate history. Closure requires worst-case sampling-cadence/history evidence and weights/cadence adjustment if needed. RACK local-clock sampling is distinct from TSecr RTTM; Appendix G is a suggestion, not a mandatory exact formula. Partial evidence; closure remains TODO.
+            // Scope: Ordinary RTTM and local-clock RACK delivery share a causal-round gate: next eligible original must be sent at or after the prior sampling ACK. Continuous sliding, delayed/stretched and same-tick flights count actual updates; dense SACK and mixed cumulative delivery retain exact RFC6298 history. Conservative one-per-RTT sampling avoids fixed-weight history truncation; Appendix G and many-per-window sampling are suggestions, not mandatory formulas.
             //= https://www.rfc-editor.org/rfc/rfc7323#section-4.2
-            //= reason=Four eight-packet bulk flights verify exact RFC6298 estimator history with one ordinary RTTM sample per flight; a mixed original-transmission RACK SACK sample adds a second unweighted local-clock update. This is not a sustained sliding-flight/per-RTT cadence bound: arbitrary frequent RACK samples still use fixed alpha/beta and may truncate history. Closure requires worst-case sampling-cadence/history evidence and weights/cadence adjustment if needed. RACK local-clock sampling is distinct from TSecr RTTM; Appendix G is a suggestion, not a mandatory exact formula. Partial evidence; closure remains TODO.
+            //= reason=Ordinary RTTM and local-clock RACK delivery share a causal-round gate: next eligible original must be sent at or after the prior sampling ACK. Continuous sliding, delayed/stretched and same-tick flights count actual updates; dense SACK and mixed cumulative delivery retain exact RFC6298 history. Conservative one-per-RTT sampling avoids fixed-weight history truncation; Appendix G and many-per-window sampling are suggestions, not mandatory formulas.
             //# to update the RTT estimator, an implementation SHOULD try to adhere
             //# to the spirit of the history specified in [RFC6298].
             if !self.timestamps || echo == Some(self.timestamp_value(sent)) {
                 let sample = self.now.saturating_sub(sent);
-                self.rtt.sample(sample);
-                self.tlp_fresh_rtt = true;
+                let updated = self.update_rtt(sample);
                 self.rack.sample(sample, self.now);
-                if !syn_ack {
+                if updated && !syn_ack {
                     self.syn_timed_out = false;
                 }
             }
             self.sample = None;
+        }
+        // A covered/mismatched pending RTTM must not starve the remaining flight.
+        // RACK's candidate is a complete, never-retransmitted original measured
+        // on the local clock. Without RACK, negotiated RTTM still needs a validated
+        // echo; never derive a send time from TSecr or remove its secret offset twice.
+        if let Some(sample) = self.rack.ack_sample
+            && (self.rack_enabled()
+                || !self.timestamps
+                || echo == Some(self.timestamp_value(self.now.saturating_sub(sample))))
+            && self.update_rtt(sample)
+            && !syn_ack
+        {
+            self.syn_timed_out = false;
         }
         if !syn_ack
             && self
@@ -5438,12 +5467,7 @@ impl Connection {
                 // Fresh sequence space sent afterwards may start a new sample;
                 // its ACK cannot predate its first transmission.
                 self.sample = None;
-            } else if self.sample.is_none()
-                && (timestamp.is_none()
-                    || self
-                        .last_timestamp_sent_at
-                        .is_none_or(|sent| sent / 1_000 != now / 1_000))
-            {
+            } else if self.sample.is_none() {
                 self.sample = Some((end, now));
             }
             if after(end, self.snd_nxt) {
@@ -19839,7 +19863,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc7323#section-4.2
     //= type=test
-    //= reason=Four eight-packet flights retain exact RFC6298 history with one ordinary RTTM sample per flight; a mixed local RACK SACK sample adds one unweighted update. Arbitrarily frequent RACK samples remain TODO, not a per-RTT cadence guarantee.
+    //= reason=Dense SACK and cumulative ACKs share one update per causal round; four bulk flights assert exact RFC6298 estimator history and actual update counts.
     //# to update the RTT estimator, an implementation SHOULD try to adhere
     //# to the spirit of the history specified in [RFC6298].
     fn timestamps_bulk_flight_history_and_mixed_rack_samples() {
@@ -19858,50 +19882,52 @@ mod tests {
                 let latency = if round < 2 { 100_000 } else { 200_000 };
                 a.write(&[1; 8 * 116]).unwrap(); // MSS less the negotiated TS option.
                 let mut ends = vec![];
-                let mut last = None;
                 for _ in 0..8 {
                     let bytes = packet(&mut a, sent);
                     let seg = wire::parse(ip(tuple()), &bytes).unwrap();
                     assert_eq!(seg.payload.len(), 116);
-                    last = Some(seg.header);
                     ends.push(Seq(seg.header.sequence).wrapping_add(116));
                 }
                 let pending = a.sample;
                 let next = a.receive.next();
                 let una = a.snd_una;
                 if rack {
-                    // A non-advancing original-transmission SACK adds a local-clock sample.
-                    let header = last.unwrap();
-                    let mut options = vec![1, 1, 8, 10];
-                    options.extend_from_slice(&((sent / 1000) as u32).to_be_bytes());
-                    options.extend_from_slice(&u32::MAX.to_be_bytes());
-                    options.extend_from_slice(&[1, 1, 5, 10]);
-                    options.extend_from_slice(&header.sequence.to_be_bytes());
-                    options.extend_from_slice(&ends[7].0.to_be_bytes());
-                    let mut bytes = [0; 64];
-                    let n = wire::encode(
-                        ip(reverse(tuple())),
-                        Header {
-                            source_port: 2000,
-                            destination_port: 1000,
-                            sequence: next.0,
-                            acknowledgment: una.0,
-                            flags: ACK,
-                            window: 8192,
-                            urgent_pointer: 0,
-                        },
-                        &options,
-                        b"",
-                        &mut bytes,
-                    )
-                    .unwrap();
-                    a.input(
-                        sent + latency,
-                        &wire::parse(ip(reverse(tuple())), &bytes[..n]).unwrap(),
-                    )
-                    .unwrap();
+                    // Dense SACK delivery uses the same estimator gate as RTTM.
+                    for end in &ends {
+                        let mut options = vec![1, 1, 8, 10];
+                        options.extend_from_slice(&((sent / 1000) as u32).to_be_bytes());
+                        options.extend_from_slice(&u32::MAX.to_be_bytes());
+                        options.extend_from_slice(&[1, 1, 5, 10]);
+                        options.extend_from_slice(
+                            &ends[0].wrapping_add(0u32.wrapping_sub(116)).0.to_be_bytes(),
+                        );
+                        options.extend_from_slice(&end.0.to_be_bytes());
+                        let mut bytes = [0; 64];
+                        let n = wire::encode(
+                            ip(reverse(tuple())),
+                            Header {
+                                source_port: 2000,
+                                destination_port: 1000,
+                                sequence: next.0,
+                                acknowledgment: una.0,
+                                flags: ACK,
+                                window: 8192,
+                                urgent_pointer: 0,
+                            },
+                            &options,
+                            b"",
+                            &mut bytes,
+                        )
+                        .unwrap();
+                        a.input(
+                            sent + latency,
+                            &wire::parse(ip(reverse(tuple())), &bytes[..n]).unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(a.rtt.updates, round as usize + 1);
+                        assert_eq!(a.sample, pending);
+                    }
                     expected.sample(latency);
-                    assert_eq!(a.sample, pending);
                 }
                 for (i, end) in ends.into_iter().enumerate() {
                     timestamp_input(
@@ -19913,7 +19939,7 @@ mod tests {
                         Some(((sent / 1000) as u32, (sent / 1000) as u32)),
                         b"",
                     );
-                    if i == 0 {
+                    if i == 0 && !rack {
                         expected.sample(latency + 1000);
                     }
                     assert_eq!(a.sample, None);
@@ -19923,7 +19949,151 @@ mod tests {
                     );
                 }
                 assert_eq!(a.send.len(), 0);
+                assert_eq!(a.rtt.updates, round as usize + 1);
             }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= type=test
+    //= reason=Continuous eight/64-packet sliding flights, immediate/delayed/stretched ACKs and repeated millisecond TSvals assert eight actual estimator updates in eight causal RTTs, with and without timestamps/RACK.
+    //# A TCP implementation MUST take at least one RTT measurement per RTT (unless that is
+    //# not possible per Karn's algorithm).
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-3
+    //= type=test
+    //= reason=64-packet windows intentionally use one update per causal RTT, retaining fixed-weight history instead of suggested per-ACK sampling; increasing rate requires adjusted weights.
+    //# However, when using the timestamp option, each ACK can be used as an RTT sample. RFC
+    //# 1323 [JBB92] suggests that TCP connections utilizing large congestion windows should
+    //# take many RTT samples per window of data to avoid aliasing effects in the estimated
+    //# RTT.
+    fn rtt_cadence_continuous_delayed_stretched_and_same_tick() {
+        for width in [8usize, 64] {
+            for timestamps in [false, true] {
+                for rack in [false, true] {
+                    for batch in [1usize, 2, 8] {
+                        for step in [100u64, 1_000] {
+                            let cfg = ConnectionConfig {
+                                timestamps,
+                                rack,
+                                nagle: false,
+                                initial_window: InitialWindow::Iw10,
+                                ..sack_config(128)
+                            };
+                            let (mut a, _) = pair(cfg, u32::MAX - 100);
+                            a.rtt = RttEstimator::new(1_000_000);
+                            a.rtt_sample_after = None;
+                            let mut flight = alloc::collections::VecDeque::new();
+                            let base = 2_000_000;
+                            let send_one = |a: &mut Connection, sent| {
+                                a.write(b"x").unwrap();
+                                let bytes = packet(a, sent);
+                                let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+                                assert_eq!(seg.payload, b"x");
+                                (
+                                    Seq(seg.header.sequence).wrapping_add(1),
+                                    sent,
+                                    seg.options.timestamps.map(|ts| ts.0),
+                                )
+                            };
+                            for i in 0..width {
+                                flight.push_back(send_one(&mut a, base + i as u64 * step));
+                            }
+                            for group in 0..width * 8 / batch {
+                                let mut delivered = Vec::new();
+                                for _ in 0..batch {
+                                    delivered.push(flight.pop_front().unwrap());
+                                }
+                                let &(ack, sent, echo) = delivered.last().unwrap();
+                                let now = sent + width as u64 * step;
+                                let next = a.receive.next();
+                                if timestamps {
+                                    timestamp_input(
+                                        &mut a,
+                                        now,
+                                        next,
+                                        ack,
+                                        ACK,
+                                        Some((now as u32 / 1000, echo.unwrap())),
+                                        b"",
+                                    );
+                                } else {
+                                    inject(&mut a, now, next, ack, ACK, 8192, b"");
+                                }
+                                // One update per window-sized causal round, even though
+                                // flight never drains and delayed ACKs cover multiple sends.
+                                assert_eq!(
+                                    a.rtt.updates,
+                                    1 + group * batch / width,
+                                    "TS={timestamps} RACK={rack} batch={batch} step={step}"
+                                );
+                                for (i, _) in delivered.iter().enumerate() {
+                                    flight.push_back(send_one(&mut a, now + i as u64 * step));
+                                }
+                            }
+                            assert_eq!(a.rtt.updates, 8);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rtt_cadence_invalid_echo_ledger_fallback_and_karn_counts() {
+        for rack in [false, true] {
+            let cfg = ConnectionConfig {
+                timestamps: true,
+                rack,
+                nagle: false,
+                initial_window: InitialWindow::Iw10,
+                ..sack_config(128)
+            };
+            let (mut a, _) = pair(cfg.clone(), u32::MAX - 100);
+            // Exercise the secret offset and millisecond wrap, not raw TSecr arithmetic.
+            a.timestamp_offset = u32::MAX - 2000;
+            a.rtt = RttEstimator::new(1_000_000);
+            a.rtt_sample_after = None;
+            a.write(&[1; 232]).unwrap();
+            packet(&mut a, 2_000_000);
+            let first = a.snd_nxt;
+            packet(&mut a, 2_000_000);
+            let end = a.snd_nxt;
+            let next = a.receive.next();
+            let echo = a.timestamp_value(2_000_000);
+            timestamp_input(
+                &mut a,
+                2_100_000,
+                next,
+                first,
+                ACK,
+                Some((3000, echo.wrapping_sub(1))),
+                b"",
+            );
+            // Invalid RTTM is not eligible; RACK may use independent local evidence.
+            assert_eq!(a.rtt.updates, usize::from(rack));
+            assert!(a.sample.is_none());
+            timestamp_input(&mut a, 2_100_000, next, end, ACK, Some((3000, echo)), b"");
+            assert_eq!(a.rtt.updates, 1); // No new output needed to rearm.
+
+            let (mut a, _) = pair(cfg, 100);
+            a.rtt = RttEstimator::new(1_000_000);
+            a.rtt_sample_after = None;
+            a.write(b"lost").unwrap();
+            packet(&mut a, 2_000_000);
+            a.timeout(3_000_000).unwrap();
+            packet(&mut a, 3_000_000);
+            let end = a.snd_nxt;
+            let next = a.receive.next();
+            let echo = a.timestamp_value(3_000_000);
+            timestamp_input(&mut a, 3_100_000, next, end, ACK, Some((4000, echo)), b"");
+            assert_eq!(a.rtt.updates, 0); // Matching echo does not undo Karn.
+            a.write(b"fresh").unwrap();
+            packet(&mut a, 3_100_000);
+            let end = a.snd_nxt;
+            let echo = a.timestamp_value(3_100_000);
+            timestamp_input(&mut a, 3_200_000, next, end, ACK, Some((4000, echo)), b"");
+            assert_eq!(a.rtt.updates, 1);
         }
     }
 
@@ -20347,10 +20517,10 @@ mod tests {
     //# the averaged RTT measurement only if the segment advances
     //# the left edge of the send window, i.e., SND.UNA is
     //# increased.
-    // Scope: Four eight-packet bulk flights verify exact RFC6298 estimator history with one ordinary RTTM sample per flight; a mixed original-transmission RACK SACK sample adds a second unweighted local-clock update. This is not a sustained sliding-flight/per-RTT cadence bound: arbitrary frequent RACK samples still use fixed alpha/beta and may truncate history. Closure requires worst-case sampling-cadence/history evidence and weights/cadence adjustment if needed. RACK local-clock sampling is distinct from TSecr RTTM; Appendix G is a suggestion, not a mandatory exact formula. Partial evidence; closure remains TODO.
+    // Scope: Ordinary RTTM and local-clock RACK delivery share a causal-round gate: next eligible original must be sent at or after the prior sampling ACK. Continuous sliding, delayed/stretched and same-tick flights count actual updates; dense SACK and mixed cumulative delivery retain exact RFC6298 history. Conservative one-per-RTT sampling avoids fixed-weight history truncation; Appendix G and many-per-window sampling are suggestions, not mandatory formulas.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-4.2
     //= type=test
-    //= reason=Four eight-packet bulk flights verify exact RFC6298 estimator history with one ordinary RTTM sample per flight; a mixed original-transmission RACK SACK sample adds a second unweighted local-clock update. This is not a sustained sliding-flight/per-RTT cadence bound: arbitrary frequent RACK samples still use fixed alpha/beta and may truncate history. Closure requires worst-case sampling-cadence/history evidence and weights/cadence adjustment if needed. RACK local-clock sampling is distinct from TSecr RTTM; Appendix G is a suggestion, not a mandatory exact formula. Partial evidence; closure remains TODO.
+    //= reason=Ordinary RTTM and local-clock RACK delivery share a causal-round gate: next eligible original must be sent at or after the prior sampling ACK. Continuous sliding, delayed/stretched and same-tick flights count actual updates; dense SACK and mixed cumulative delivery retain exact RFC6298 history. Conservative one-per-RTT sampling avoids fixed-weight history truncation; Appendix G and many-per-window sampling are suggestions, not mandatory formulas.
     //# to update the RTT estimator, an implementation SHOULD try to adhere
     //# to the spirit of the history specified in [RFC6298].
     fn timestamps_rtt_validated_echo_and_karn() {

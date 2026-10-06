@@ -10,14 +10,6 @@ order to measure actual RTT.
 '''
 
 [[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc7323#section-4.2"
-reason = "Four eight-packet bulk flights verify exact RFC6298 estimator history with one ordinary RTTM sample per flight; a mixed original-transmission RACK SACK sample adds a second unweighted local-clock update. This is not a sustained sliding-flight/per-RTT cadence bound: arbitrary frequent RACK samples still use fixed alpha/beta and may truncate history. Closure requires worst-case sampling-cadence/history evidence and weights/cadence adjustment if needed. RACK local-clock sampling is distinct from TSecr RTTM; Appendix G is a suggestion, not a mandatory exact formula."
-quote = '''
-to update the RTT estimator, an implementation SHOULD try to adhere
-to the spirit of the history specified in [RFC6298].
-'''
-
-[[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.4"
 reason = "Configured byte-per-tick ceiling enforces the 2^31-byte MUST but is not automatically reduced to a changing small peer window. Configure ceiling <= supported minimum window for per-window RTT cadence; dynamic per-window cadence or a justified SHOULD departure still requires implementation/evidence. No claim that the default 1GiB ceiling satisfies every small receive window."
 quote = '''
