@@ -190,20 +190,35 @@ impl InitialWindow {
     //# An increased initial window MUST NOT be turned on by default on systems without such
     //# monitoring capabilities.
     //= https://www.rfc-editor.org/rfc/rfc6928#section-2
-    //= reason=IW10 is optional and InitialWindow::default is Rfc5681; config default assertion confirms opt-in. This permission does not discharge IW10 fallback/monitoring obligations or default RFC5681 arithmetic TODO.
+    //= reason=IW10 is optional and InitialWindow::default is Rfc5681; config default assertion confirms opt-in. This permission does not discharge IW10 fallback/monitoring obligations. Default RFC5681 arithmetic is covered by default_initial_window_piecewise_boundaries and initial_window_uses_negotiated_effective_mss.
     //# This increase is optional: a TCP MAY start with an initial window that is smaller than
     //# 10 segments.
     //= https://www.rfc-editor.org/rfc/rfc6928#section-2
-    //= reason=Explicit InitialWindow::Iw10 computes min(10*MSS,max(2*MSS,14600)) with conservative integer cap. Tests assert representative small/normal/jumbo/overflow vectors, negotiated MSS/path/options and initial handshake value. Default RFC5681 arithmetic is a separate TODO.
+    //= reason=Explicit InitialWindow::Iw10 computes min(10*MSS,max(2*MSS,14600)) with conservative integer cap. Tests assert representative small/normal/jumbo/overflow vectors, negotiated MSS/path/options and initial handshake value. Default RFC5681 arithmetic is covered separately by default_initial_window_piecewise_boundaries and initial_window_uses_negotiated_effective_mss.
     //# min (10*MSS, max (2*MSS, 14600)) (1)
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //# IW, the initial value of cwnd, MUST be set using the following guidelines as an upper bound.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //# If SMSS > 2190 bytes: IW = 2 * SMSS bytes and MUST NOT be more than 2 segments
+    //# If (SMSS > 1095 bytes) and (SMSS <= 2190 bytes): IW = 3 * SMSS bytes and MUST NOT be more than 3 segments
+    //# if SMSS <= 1095 bytes: IW = 4 * SMSS bytes and MUST NOT be more than 4 segments
     fn bytes(self, mss: u32) -> u32 {
-        let (segments, cap) = match self {
-            Self::Rfc5681 => (4, 4_380),
-            Self::Iw10 => (10, 14_600),
-        };
-        mss.saturating_mul(segments)
-            .min(mss.saturating_mul(2).max(cap))
-            .min(MAX_WINDOW)
+        match self {
+            Self::Rfc5681 => {
+                let segments = if mss > 2_190 {
+                    2
+                } else if mss > 1_095 {
+                    3
+                } else {
+                    4
+                };
+                mss.saturating_mul(segments)
+            }
+            Self::Iw10 => mss
+                .saturating_mul(10)
+                .min(mss.saturating_mul(2).max(14_600)),
+        }
+        .min(MAX_WINDOW)
     }
 }
 
@@ -952,12 +967,12 @@ impl Congestion {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc6928#section-2
-    //= reason=Selected IW10 restart choice uses min(current cwnd, IW10); helper covers grown and reduced cwnd and changing MSS, and wire idle trace asserts burst limited to ten MSS. Idle-trigger last-data issue remains RFC5681 TODO; this evidence is the optional window value only.
+    //= reason=Selected IW10 restart choice uses min(current cwnd, IW10); helper covers grown and reduced cwnd and changing MSS, and wire idle trace asserts burst limited to ten MSS. iw10_transmit_idle_restart_and_data_rto covers the last-data idle trigger despite received requests and emitted pure ACKs; this evidence is the optional window value only.
     //# Optionally, a TCP MAY set the restart window to the minimum of the value used for the
     //# initial window and the current value of cwnd (in other words, using a larger value for
     //# the restart window should never increase the size of cwnd).
     //= https://www.rfc-editor.org/rfc/rfc5681#section-4.1
-    //= reason=restart_after_idle sets min(cwnd,selected IW), never increases a reduced cwnd; both algorithm choices assert reduced and grown values. Trigger and default IW calculation have separate TODOs.
+    //= reason=restart_after_idle sets min(cwnd,selected IW), never increases a reduced cwnd; both algorithm choices assert reduced and grown values. iw10_transmit_idle_restart_and_data_rto covers the last-data idle trigger; default_initial_window_piecewise_boundaries and initial_window_uses_negotiated_effective_mss cover default IW calculation.
     //# For the purposes of this standard, we define RW = min(IW,cwnd).
     pub(crate) fn restart_after_idle(&mut self) {
         self.cwnd = self.cwnd.min(self.initial_window());
@@ -1528,6 +1543,33 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //# IW, the initial value of cwnd, MUST be set using the following guidelines as an upper bound.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //# If SMSS > 2190 bytes: IW = 2 * SMSS bytes and MUST NOT be more than 2 segments
+    //# If (SMSS > 1095 bytes) and (SMSS <= 2190 bytes): IW = 3 * SMSS bytes and MUST NOT be more than 3 segments
+    //# if SMSS <= 1095 bytes: IW = 4 * SMSS bytes and MUST NOT be more than 4 segments
+    fn default_initial_window_piecewise_boundaries() {
+        for (mss, expected) in [
+            (1, 4),
+            (1_095, 4_380),
+            (1_096, 3_288),
+            (1_448, 4_344),
+            (2_190, 6_570),
+            (2_191, 4_382),
+            (u32::MAX, MAX_WINDOW),
+        ] {
+            for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
+                let c = Congestion::new(mss, algorithm, InitialWindow::Rfc5681);
+                assert_eq!(c.cwnd(), expected);
+                assert_eq!(c.initial_window(), expected);
+            }
+        }
+    }
+
+    #[test]
     fn tlp_loss_response_shares_ecn_and_recovery_epoch_guards() {
         let mut c = Congestion::new(1000, RecoveryAlgorithm::NewReno, InitialWindow::Iw10);
         assert!(c.on_ecn(Seq(1), 8000, Seq(8001)));
@@ -1542,17 +1584,17 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc6928#section-2
     //= type=test
-    //= reason=Selected IW10 restart choice uses min(current cwnd, IW10); helper covers grown and reduced cwnd and changing MSS, and wire idle trace asserts burst limited to ten MSS. Idle-trigger last-data issue remains RFC5681 TODO; this evidence is the optional window value only.
+    //= reason=Selected IW10 restart choice uses min(current cwnd, IW10); helper covers grown and reduced cwnd and changing MSS, and wire idle trace asserts burst limited to ten MSS. iw10_transmit_idle_restart_and_data_rto covers the last-data idle trigger despite received requests and emitted pure ACKs; this evidence is the optional window value only.
     //# Optionally, a TCP MAY set the restart window to the minimum of the value used for the
     //# initial window and the current value of cwnd (in other words, using a larger value for
     //# the restart window should never increase the size of cwnd).
     //= https://www.rfc-editor.org/rfc/rfc5681#section-4.1
     //= type=test
-    //= reason=restart_after_idle sets min(cwnd,selected IW), never increases a reduced cwnd; both algorithm choices assert reduced and grown values. Trigger and default IW calculation have separate TODOs.
+    //= reason=restart_after_idle sets min(cwnd,selected IW), never increases a reduced cwnd; both algorithm choices assert reduced and grown values. iw10_transmit_idle_restart_and_data_rto covers the last-data idle trigger; default_initial_window_piecewise_boundaries and initial_window_uses_negotiated_effective_mss cover default IW calculation.
     //# For the purposes of this standard, we define RW = min(IW,cwnd).
     //= https://www.rfc-editor.org/rfc/rfc6928#section-2
     //= type=test
-    //= reason=Explicit InitialWindow::Iw10 computes min(10*MSS,max(2*MSS,14600)) with conservative integer cap. Tests assert representative small/normal/jumbo/overflow vectors, negotiated MSS/path/options and initial handshake value. Default RFC5681 arithmetic is a separate TODO.
+    //= reason=Explicit InitialWindow::Iw10 computes min(10*MSS,max(2*MSS,14600)) with conservative integer cap. Tests assert representative small/normal/jumbo/overflow vectors, negotiated MSS/path/options and initial handshake value. Default RFC5681 arithmetic is covered separately by default_initial_window_piecewise_boundaries and initial_window_uses_negotiated_effective_mss.
     //# min (10*MSS, max (2*MSS, 14600)) (1)
     //= https://www.rfc-editor.org/rfc/rfc6928#section-2
     //= type=test
@@ -2267,7 +2309,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc5681#section-4.1
     //= type=test
-    //= reason=restart_after_idle sets min(cwnd,selected IW), never increases a reduced cwnd; both algorithm choices assert reduced and grown values. Trigger and default IW calculation have separate TODOs.
+    //= reason=restart_after_idle sets min(cwnd,selected IW), never increases a reduced cwnd; both algorithm choices assert reduced and grown values. iw10_transmit_idle_restart_and_data_rto covers the last-data idle trigger; default_initial_window_piecewise_boundaries and initial_window_uses_negotiated_effective_mss cover default IW calculation.
     //# For the purposes of this standard, we define RW = min(IW,cwnd).
     fn mss_idle_reset_and_saturation() {
         for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {

@@ -351,6 +351,7 @@ pub(crate) struct Connection {
     application_timeout_us: Option<u64>,
     application_progress_at: Instant,
     last_received: Instant,
+    // Successful data output only; ACKs and keepalives do not restart data-idle time.
     last_sent: Instant,
     retransmit_burst: Option<(Seq, u32)>,
     keepalive_deadline: Option<Instant>,
@@ -4675,6 +4676,9 @@ impl Connection {
                 self.sack_post_rto = Some((end, boundary));
             }
         }
+        //= https://www.rfc-editor.org/rfc/rfc5681#section-4.1
+        //# Therefore, a TCP SHOULD set cwnd to no more than RW before beginning transmission
+        //# if the TCP has not sent data in an interval exceeding the retransmission timeout.
         if !keepalive
             && self.flight() == 0
             && now.saturating_sub(self.last_sent) >= self.rto()
@@ -4682,7 +4686,9 @@ impl Connection {
         {
             self.congestion.restart_after_idle();
         }
-        self.last_sent = now;
+        if count != 0 && !keepalive {
+            self.last_sent = now;
+        }
         self.syn_pending = false;
         if flags & ACK != 0 {
             // Scope: Retains one pending echo value and last successfully committed ACK; separate ts_latest is TIME-WAIT freshness bookkeeping, not extra unprocessed echo queue.
@@ -5864,12 +5870,12 @@ mod tests {
     //# monitoring capabilities.
     //= https://www.rfc-editor.org/rfc/rfc6928#section-2
     //= type=test
-    //= reason=IW10 is optional and InitialWindow::default is Rfc5681; config default assertion confirms opt-in. This permission does not discharge IW10 fallback/monitoring obligations or default RFC5681 arithmetic TODO.
+    //= reason=IW10 is optional and InitialWindow::default is Rfc5681; config default assertion confirms opt-in. This permission does not discharge IW10 fallback/monitoring obligations. Default RFC5681 arithmetic is covered by default_initial_window_piecewise_boundaries and initial_window_uses_negotiated_effective_mss.
     //# This increase is optional: a TCP MAY start with an initial window that is smaller than
     //# 10 segments.
     //= https://www.rfc-editor.org/rfc/rfc6928#section-2
     //= type=test
-    //= reason=Explicit InitialWindow::Iw10 computes min(10*MSS,max(2*MSS,14600)) with conservative integer cap. Tests assert representative small/normal/jumbo/overflow vectors, negotiated MSS/path/options and initial handshake value. Default RFC5681 arithmetic is a separate TODO.
+    //= reason=Explicit InitialWindow::Iw10 computes min(10*MSS,max(2*MSS,14600)) with conservative integer cap. Tests assert representative small/normal/jumbo/overflow vectors, negotiated MSS/path/options and initial handshake value. Default RFC5681 arithmetic is covered separately by default_initial_window_piecewise_boundaries and initial_window_uses_negotiated_effective_mss.
     //# min (10*MSS, max (2*MSS, 14600)) (1)
     //= https://www.rfc-editor.org/rfc/rfc6928#section-2
     //= type=test
@@ -5877,6 +5883,10 @@ mod tests {
     //# This change applies to the initial window of the connection in the first round-trip time
     //# (RTT) of data transmission during or following the TCP three-way handshake. Neither the
     //# SYN/ACK nor its ACK in the three-way handshake should increase the initial window size.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= type=test
+    //= reason=Negotiated MSS, timestamp overhead and path limits select the piecewise default window; actual first-flight output is bounded, including failed encoding.
+    //# IW, the initial value of cwnd, MUST be set using the following guidelines as an upper bound.
     fn initial_window_uses_negotiated_effective_mss() {
         assert_eq!(
             ConnectionConfig::default().initial_window,
@@ -5891,11 +5901,16 @@ mod tests {
                 (3_000, 1_000, false, 65_515, 1_000, 4_000, 10_000),
                 (3_000, 1_460, false, 65_515, 1_460, 4_380, 14_600),
                 (1_000, 3_000, false, 65_515, 1_000, 4_000, 10_000),
-                (3_000, 1_460, true, 65_515, 1_448, 4_380, 14_480),
+                (1_095, 1_095, false, 65_515, 1_095, 4_380, 10_950),
+                (1_096, 1_096, false, 65_515, 1_096, 3_288, 10_960),
+                (2_190, 2_190, false, 65_515, 2_190, 6_570, 14_600),
+                (2_191, 2_191, false, 65_515, 2_191, 4_382, 14_600),
+                (3_000, 1_460, true, 65_515, 1_448, 4_344, 14_480),
                 (3_000, 3_000, true, 1_032, 1_000, 4_000, 10_000),
             ] {
                 let mut cfg = config(65_536, configured);
                 cfg.initial_window = policy;
+                cfg.nagle = false;
                 cfg.timestamps = timestamps;
                 cfg.send_ip_payload_limit = path_limit;
                 let mut peer_cfg = config(65_536, peer);
@@ -5919,6 +5934,24 @@ mod tests {
                 );
                 assert_eq!(a.congestion.cwnd(), a.initial_window());
                 assert_eq!(b.congestion.cwnd(), passive_iw);
+                a.write(&vec![7; 2 * a.initial_window() as usize]).unwrap();
+                assert_eq!(a.transmit(40, &mut [0; 19]), Err(Error::OutputTooSmall));
+                let mut sent = 0;
+                let mut out = vec![0; 65_535];
+                while let Some(size) = a.transmit(40, &mut out).unwrap() {
+                    let segment = wire::parse(ip(tuple()), &out[..size]).unwrap();
+                    assert!(segment.payload.len() <= effective as usize);
+                    sent += segment.payload.len();
+                }
+                // Sender SWS avoidance may retain a fractional-MSS IW10 tail.
+                assert!(sent <= a.initial_window() as usize);
+                assert_eq!(
+                    sent / effective as usize,
+                    a.initial_window() as usize / effective
+                );
+                if policy == InitialWindow::Rfc5681 {
+                    assert_eq!(sent, a.initial_window() as usize);
+                }
                 let before = a.congestion.cwnd();
                 let lowered = effective / 2;
                 a.lower_mss(lowered as u16 + if timestamps { 12 } else { 0 })
@@ -5999,7 +6032,7 @@ mod tests {
     //# the loss window, LW, which equals 1 full-sized segment (regardless of the value of IW).
     //= https://www.rfc-editor.org/rfc/rfc6928#section-2
     //= type=test
-    //= reason=Selected IW10 restart choice uses min(current cwnd, IW10); helper covers grown and reduced cwnd and changing MSS, and wire idle trace asserts burst limited to ten MSS. Idle-trigger last-data issue remains RFC5681 TODO; this evidence is the optional window value only.
+    //= reason=Selected IW10 restart choice uses min(current cwnd, IW10); helper covers grown and reduced cwnd and changing MSS, and wire idle trace asserts burst limited to ten MSS. iw10_transmit_idle_restart_and_data_rto covers the last-data idle trigger despite received requests and emitted pure ACKs; this evidence is the optional window value only.
     //# Optionally, a TCP MAY set the restart window to the minimum of the value used for the
     //# initial window and the current value of cwnd (in other words, using a larger value for
     //# the restart window should never increase the size of cwnd).
@@ -6014,21 +6047,38 @@ mod tests {
     //= reason=IW10 loss window remains one effective MSS; helper and wire trace assert timeout reduction, one retransmit and denied next output.
     //# These changes do NOT change the loss window, which must remain 1 segment of MSS bytes
     //# (to permit the lowest possible window size in the case of severe congestion).
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-4.1
+    //= type=test
+    //= reason=Default and IW10 restart after idle despite a received request and emitted pure ACK; failed output preserves cwnd and successful data stays within RW.
+    //# Therefore, a TCP SHOULD set cwnd to no more than RW before beginning transmission
+    //# if the TCP has not sent data in an interval exceeding the retransmission timeout.
     fn iw10_transmit_idle_restart_and_data_rto() {
-        for mss in [1_000, 1_460] {
+        for (policy, mss) in [
+            (InitialWindow::Rfc5681, 1_000),
+            (InitialWindow::Rfc5681, 1_460),
+            (InitialWindow::Iw10, 1_000),
+            (InitialWindow::Iw10, 1_460),
+        ] {
             let mut cfg = config(65_536, mss);
-            cfg.initial_window = InitialWindow::Iw10;
+            cfg.initial_window = policy;
             cfg.nagle = false;
             let (mut a, mut b) = pair(cfg, 100);
-            let iw = 10 * mss as u32;
+            let iw = a.initial_window();
             a.write(&vec![1; mss as usize]).unwrap();
             deliver(&mut a, &mut b, 40);
             b.immediate_ack();
             deliver(&mut b, &mut a, 50);
             assert!(a.congestion.cwnd() > iw);
-            a.write(&vec![2; 2 * iw as usize]).unwrap();
             let now = 50 + a.rto();
             let grown = a.congestion.cwnd();
+            b.write(&[9]).unwrap();
+            deliver(&mut b, &mut a, now);
+            a.immediate_ack();
+            let ack = packet(&mut a, now);
+            assert!(wire::parse(ip(tuple()), &ack).unwrap().payload.is_empty());
+            assert_eq!(a.last_sent, 40);
+            assert_eq!(a.congestion.cwnd(), grown);
+            a.write(&vec![2; 2 * iw as usize]).unwrap();
             assert_eq!(a.transmit(now, &mut [0; 19]), Err(Error::OutputTooSmall));
             assert_eq!(a.congestion.cwnd(), grown);
             let mut sent = 0;

@@ -3,7 +3,7 @@
 # 5681-001
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc5681#section-2"
-reason = "Ordinary transmit uses min(rwnd,cwnd), and Limited Transmit is the section 3.2 controlled exception. Negotiated SACK uses pipe; RACK/TLP/PRR require their modified-recovery scope (RFC8985/6937), not literal Reno inflation. No universal output assertion covers all paths; audit persist and recovery budgets plus IW bound and post-recovery growth gaps before claiming this global limit. TLP intentionally sends one probe beyond cwnd under RFC8985, which is not evidence for literal RFC5681."
+reason = "Ordinary transmit uses min(rwnd,cwnd), and Limited Transmit is the section 3.2 controlled exception. Negotiated SACK uses pipe; RACK/TLP/PRR require their modified-recovery scope (RFC8985/6937), not literal Reno inflation. No universal output assertion covers all paths; audit persist and recovery budgets plus post-recovery growth gaps before claiming this global limit. TLP intentionally sends one probe beyond cwnd under RFC8985, which is not evidence for literal RFC5681."
 quote = '''
 At any given time, a TCP MUST NOT send data with a sequence number higher than the sum of the highest acknowledged sequence number and the minimum of cwnd and rwnd.
 '''
@@ -11,25 +11,9 @@ At any given time, a TCP MUST NOT send data with a sequence number higher than t
 # 5681-002
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.1"
-reason = "Ordinary transmit uses min(rwnd,cwnd), and Limited Transmit is the section 3.2 controlled exception. Negotiated SACK uses pipe; RACK/TLP/PRR require their modified-recovery scope (RFC8985/6937), not literal Reno inflation. No universal output assertion covers all paths; audit persist and recovery budgets plus IW bound and post-recovery growth gaps before claiming this global limit. TLP intentionally sends one probe beyond cwnd under RFC8985, which is not evidence for literal RFC5681. Shared helper arithmetic is covered by initial_slow_start_and_byte_counting."
+reason = "Ordinary transmit uses min(rwnd,cwnd), and Limited Transmit is the section 3.2 controlled exception. Negotiated SACK uses pipe; RACK/TLP/PRR require their modified-recovery scope (RFC8985/6937), not literal Reno inflation. No universal output assertion covers all paths; audit persist and recovery budgets plus post-recovery growth gaps before claiming this global limit. TLP intentionally sends one probe beyond cwnd under RFC8985, which is not evidence for literal RFC5681. Shared helper arithmetic is covered by initial_slow_start_and_byte_counting."
 quote = '''
 The slow start and congestion avoidance algorithms MUST be used by a TCP sender to control the amount of outstanding data being injected into the network.
-'''
-
-# 5681-003
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.1"
-reason = "Default InitialWindow::Rfc5681 uses min(4*MSS,max(2*MSS,4380)), the RFC3390 formula rather than RFC5681 piecewise bounds. At effective MSS=1448 (timestamps), cwnd=4380 exceeds 3*MSS=4344; at MSS=1096 it is 4380 rather than <=3288. Existing initial_window_uses_negotiated_effective_mss asserts the former flawed value. Correct the default bound and add boundary/negotiated-MSS wire assertions. Iw10 is a separately opted-in RFC6928 experiment, not a waiver for the default."
-quote = '''
-IW, the initial value of cwnd, MUST be set using the following guidelines as an upper bound.
-'''
-
-# 5681-004
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.1"
-reason = "Default InitialWindow::Rfc5681 uses min(4*MSS,max(2*MSS,4380)), the RFC3390 formula rather than RFC5681 piecewise bounds. At effective MSS=1448 (timestamps), cwnd=4380 exceeds 3*MSS=4344; at MSS=1096 it is 4380 rather than <=3288. Existing initial_window_uses_negotiated_effective_mss asserts the former flawed value. Correct the default bound and add boundary/negotiated-MSS wire assertions. Iw10 is a separately opted-in RFC6928 experiment, not a waiver for the default."
-quote = '''
-If SMSS > 2190 bytes: IW = 2 * SMSS bytes and MUST NOT be more than 2 segments If (SMSS > 1095 bytes) and (SMSS <= 2190 bytes): IW = 3 * SMSS bytes and MUST NOT be more than 3 segments if SMSS <= 1095 bytes: IW = 4 * SMSS bytes and MUST NOT be more than 4 segments
 '''
 
 # 5681-009
@@ -107,17 +91,9 @@ When previously unsent data is available and the new value of cwnd and the recei
 # 5681-032
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc5681#section-3"
-reason = "Ordinary transmit uses min(rwnd,cwnd), and Limited Transmit is the section 3.2 controlled exception. Negotiated SACK uses pipe; RACK/TLP/PRR require their modified-recovery scope (RFC8985/6937), not literal Reno inflation. No universal output assertion covers all paths; audit persist and recovery budgets plus IW bound and post-recovery growth gaps before claiming this global limit. TLP intentionally sends one probe beyond cwnd under RFC8985, which is not evidence for literal RFC5681."
+reason = "Ordinary transmit uses min(rwnd,cwnd), and Limited Transmit is the section 3.2 controlled exception. Negotiated SACK uses pipe; RACK/TLP/PRR require their modified-recovery scope (RFC8985/6937), not literal Reno inflation. No universal output assertion covers all paths; audit persist and recovery budgets plus post-recovery growth gaps before claiming this global limit. TLP intentionally sends one probe beyond cwnd under RFC8985, which is not evidence for literal RFC5681."
 quote = '''
 In some situations, it may be beneficial for a TCP sender to be more conservative than the algorithms allow; however, a TCP MUST NOT be more aggressive than the following algorithms allow (that is, MUST NOT send data when the value of cwnd computed by the following algorithms would not allow the data to be sent).
-'''
-
-# 5681-033
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc5681#section-4.1"
-reason = "restart_after_idle computes min(IW,cwnd), and iw10_transmit_idle_restart_and_data_rto tests burst capping and failed-output atomicity. However Connection::transmit writes last_sent=now on every successful packet, including pure ACKs; idle eligibility therefore measures last packet, not last data. A request followed by a pure ACK can postpone reduction. Track last data transmission and add the receive-request/pure-ACK-after-idle regression; default IW arithmetic gap also affects RW."
-quote = '''
-Therefore, a TCP SHOULD set cwnd to no more than RW before beginning transmission if the TCP has not sent data in an interval exceeding the retransmission timeout.
 '''
 
 # 5681-037
