@@ -1,6 +1,6 @@
 use core::cmp::Ordering;
 
-use crate::seq::Seq;
+use crate::{connection::CallerTimebase, seq::Seq};
 
 const MIN_RTO: u64 = 1_000_000;
 const MAX_RTO: u64 = 60_000_000;
@@ -12,6 +12,7 @@ pub(crate) struct RttEstimator {
     variance: u64,
     rto: u64,
     minimum: u64,
+    timebase: CallerTimebase,
     #[cfg(test)]
     pub(crate) updates: usize,
 }
@@ -29,15 +30,21 @@ impl RttEstimator {
     //# (2.1) Until a round-trip time (RTT) measurement has been made for a segment sent
     //# between the sender and receiver, the sender SHOULD set RTO <- 1 second, though the
     //# "backing off" on repeated retransmission discussed in (5.5) still applies.
+    #[cfg(test)]
     pub(crate) fn new(minimum: u64) -> Self {
+        Self::with_timebase(minimum, CallerTimebase::default())
+    }
+
+    pub(crate) fn with_timebase(minimum: u64, timebase: CallerTimebase) -> Self {
         assert!((1..=MAX_RTO).contains(&minimum));
         Self {
-            minimum,
+            minimum: timebase.ticks_from_us(minimum),
+            timebase,
             #[cfg(test)]
             updates: 0,
             srtt: None,
             variance: 0,
-            rto: MIN_RTO,
+            rto: timebase.ticks_from_us(MIN_RTO),
         }
     }
 
@@ -54,93 +61,99 @@ impl RttEstimator {
     }
 
     // The caller excludes ambiguous retransmission samples (Karn's algorithm).
+    // G=1000us is conservative RTO policy padding, not a declaration or measurement
+    // of the physical clock resolution. Samples/averages retain caller ticks.
     // Estimator evidence for default/configured >=1s floors; G=1000us, K=4, alpha=1/8, beta=1/4. Explicit subsecond Linux compatibility is a scoped SHOULD departure, not universal MUST conformance; connection sampling/timer evidence is separate.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-1
     //= reason=Estimator evidence for default/configured >=1s floors; G=1000us, K=4, alpha=1/8, beta=1/4. Explicit subsecond Linux compatibility is a scoped SHOULD departure, not universal MUST conformance; connection sampling/timer evidence is separate.
     //# However, a TCP MUST NOT be more aggressive than the following algorithms allow.
-    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    // RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-2
-    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= reason=RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //# (2.2) When the first RTT measurement R is made, the host MUST set
-    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    // RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-2
-    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= reason=RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //# (2.3) When a subsequent RTT measurement R' is made, a host MUST set
-    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    // RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-2
-    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= reason=RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //# That is, updating RTTVAR and SRTT MUST be computed in the above order.
-    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    // RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-2
-    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= reason=RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //# The above SHOULD be computed using alpha=1/8 and beta=1/4 (as suggested in [JK88]).
-    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    // RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-2
-    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= reason=RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //# After the computation, a host MUST update RTO <- SRTT + max (G, K*RTTVAR)
     // Estimator evidence for default/configured >=1s floors; G=1000us, K=4, alpha=1/8, beta=1/4. Explicit subsecond Linux compatibility is a scoped SHOULD departure, not universal MUST conformance; connection sampling/timer evidence is separate.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-2
     //= reason=Estimator evidence for default/configured >=1s floors; G=1000us, K=4, alpha=1/8, beta=1/4. Explicit subsecond Linux compatibility is a scoped SHOULD departure, not universal MUST conformance; connection sampling/timer evidence is separate.
     //# (2.4) Whenever RTO is computed, if it is less than 1 second, then the RTO SHOULD be
     //# rounded up to 1 second.
-    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    // RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-2
-    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= reason=RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //# (2.5) A maximum value MAY be placed on RTO provided it is at least 60 seconds.
-    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    // RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-4
-    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= reason=RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //# However, if the K*RTTVAR term in the RTO calculation equals zero, the variance term
     //# MUST be rounded to G seconds (i.e., use the equation given in step 2.3).
-    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    // RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-2
-    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= reason=RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //# To compute the current RTO, a TCP sender maintains two state variables, SRTT (smoothed
     //# round-trip time) and RTTVAR (round-trip time variation). In addition, we assume a
     //# clock granularity of G seconds.
-    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    // RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-2
-    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= reason=RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //# SRTT <- R RTTVAR <- R/2 RTO <- SRTT + max (G, K*RTTVAR) where K = 4.
-    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    // RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-2
-    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= reason=RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //# RTTVAR <- (1 - beta) * RTTVAR + beta * |SRTT - R'| SRTT <- (1 - alpha) * SRTT + alpha
     //# * R'
-    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    // RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-2
-    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= reason=RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //# The value of SRTT used in the update to RTTVAR is its value before updating SRTT
     //# itself using the second assignment.
-    // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    // RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-5
-    //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= reason=RTT estimator only; integer caller ticks with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //# Note that after retransmitting, once a new RTT measurement is obtained (which can only
     //# happen when new data has been sent and acknowledged), the computations outlined in
     //# Section 2 are performed, including the computation of RTO, which may result in
     //# "collapsing" RTO back down after it has been subject to exponential back off (rule
     //# 5.5).
-    pub(crate) fn sample(&mut self, rtt_us: u64) {
+    pub(crate) fn sample(&mut self, rtt_ticks: u64) {
         #[cfg(test)]
         {
             self.updates += 1;
         }
         let srtt = match self.srtt {
             None => {
-                self.variance = rtt_us / 2;
-                rtt_us
+                self.variance = rtt_ticks / 2;
+                rtt_ticks
             }
             Some(old) => {
                 // Widen before averaging: even u64::MAX samples remain accurate.
                 self.variance =
-                    ((3 * self.variance as u128 + old.abs_diff(rtt_us) as u128) / 4) as u64;
-                ((7 * old as u128 + rtt_us as u128) / 8) as u64
+                    ((3 * self.variance as u128 + old.abs_diff(rtt_ticks) as u128) / 4) as u64;
+                ((7 * old as u128 + rtt_ticks as u128) / 8) as u64
             }
         };
         self.srtt = Some(srtt);
         self.rto = srtt
-            .saturating_add(self.variance.saturating_mul(4).max(1_000))
-            .clamp(self.minimum, MAX_RTO);
+            .saturating_add(
+                self.variance
+                    .saturating_mul(4)
+                    .max(self.timebase.ticks_from_us(1_000)),
+            )
+            .clamp(self.minimum, self.timebase.ticks_from_us(MAX_RTO));
     }
 
     // Partial evidence: exponential RTO backoff only; congestion-window algorithms are in
@@ -164,7 +177,10 @@ impl RttEstimator {
     //= reason=Estimator exponential doubling capped at 60 seconds; timeout caller invokes this before successful output commits the timer.
     //# (5.5) The host MUST set RTO <- RTO * 2 ("back off the timer").
     pub(crate) fn backoff(&mut self) {
-        self.rto = self.rto.saturating_mul(2).min(MAX_RTO);
+        self.rto = self
+            .rto
+            .saturating_mul(2)
+            .min(self.timebase.ticks_from_us(MAX_RTO));
     }
 }
 
@@ -1310,6 +1326,30 @@ impl Prr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caller_units_estimator_policy_bounds_and_tick_precision() {
+        for scale in [1, 1000] {
+            let timebase = crate::connection::CallerTimebase {
+                units_per_second: 1_000_000 * scale,
+                ..crate::connection::CallerTimebase::default()
+            };
+            let mut rtt = RttEstimator::with_timebase(200_000, timebase);
+            assert_eq!(rtt.rto(), 1_000_000 * scale);
+            rtt.sample(100_000 * scale);
+            assert_eq!(rtt.rto(), 300_000 * scale);
+            for _ in 0..32 {
+                rtt.backoff();
+            }
+            assert_eq!(rtt.rto(), 60_000_000 * scale);
+            rtt.sample(u64::MAX);
+            assert_eq!(rtt.rto(), 60_000_000 * scale);
+            let mut tiny = RttEstimator::with_timebase(1, timebase);
+            tiny.sample(1);
+            assert_eq!(tiny.srtt(), Some(1));
+            assert_eq!(tiny.rto(), 1 + 1000 * scale);
+        }
+    }
 
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6

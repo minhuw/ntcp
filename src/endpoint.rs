@@ -413,11 +413,11 @@ impl Endpoint {
             events: ReadyQueue::new(event_capacity).map_err(|_| Error::NoMemory)?,
             cleanup: ReadyQueue::new(listeners_count).map_err(|_| Error::NoMemory)?,
             deadlines: Deadlines::new(count).map_err(|_| Error::NoMemory)?,
+            isn_clock: (now / config.connection.timebase.ticks_from_us(4)) as u32,
             config,
             secret,
             setup_loss_cache,
             now,
-            isn_clock: (now / 4) as u32,
             last_isn_time: now,
             slots,
             generations,
@@ -451,7 +451,9 @@ impl Endpoint {
         }
         let granularity = self.config.connection.timestamp_granularity;
         if self.config.connection.timestamps
-            && granularity.tick(now) - granularity.tick(self.now) >= 1 << 31
+            && granularity.tick_in(now, self.config.connection.timebase)
+                - granularity.tick_in(self.now, self.config.connection.timebase)
+                >= 1 << 31
         {
             return Err(Error::AmbiguousTimeJump.into());
         }
@@ -507,7 +509,9 @@ impl Endpoint {
         //# (SHLD-1).
 
         let tag = self.digest(b"ntcp initial sequence", tuple);
-        let ticks = (self.now / 4).saturating_sub(self.last_isn_time / 4).max(1);
+        let ticks = (self.now / self.config.connection.timebase.ticks_from_us(4))
+            .saturating_sub(self.last_isn_time / self.config.connection.timebase.ticks_from_us(4))
+            .max(1);
         self.isn_clock = self.isn_clock.wrapping_add(ticks as u32);
         self.last_isn_time = self.now;
         u32::from_be_bytes(tag[..4].try_into().unwrap()).wrapping_add(self.isn_clock)
@@ -1190,7 +1194,9 @@ impl Endpoint {
         {
             return;
         }
-        if self.now.saturating_sub(self.control_epoch) >= 1_000_000 {
+        if self.now.saturating_sub(self.control_epoch)
+            >= self.config.connection.timebase.ticks_from_us(1_000_000)
+        {
             self.control_epoch = self.now;
             self.control_count = 0;
         }
@@ -1896,8 +1902,14 @@ impl Endpoint {
                             .and_then(|bytes| bytes.get(13))
                             .is_some_and(|flags| flags & RST != 0)
                     {
-                        slot.reset_deadline =
-                            Some(now.saturating_add(self.config.connection.time_wait_us));
+                        slot.reset_deadline = Some(
+                            now.saturating_add(
+                                self.config
+                                    .connection
+                                    .timebase
+                                    .ticks_from_us(self.config.connection.time_wait_us),
+                            ),
+                        );
                     }
                     slot.closed_output_drained = slot.connection.state() == State::Closed;
                     let hop_limit = slot.hop_limit;
@@ -1975,6 +1987,105 @@ mod recovery_observation_tests {
             .unwrap();
         bytes.truncate(packet.len);
         (packet, bytes)
+    }
+
+    #[test]
+    fn caller_units_endpoint_isn_control_epoch_deadlines_and_guards() {
+        use crate::connection::{CallerTimebase, TimestampGranularity};
+        for granularity in [
+            TimestampGranularity::Milliseconds,
+            TimestampGranularity::Microseconds,
+        ] {
+            let trace = |scale: u64| {
+                let timebase = CallerTimebase {
+                    units_per_second: 1_000_000 * scale,
+                    ..CallerTimebase::default()
+                };
+                let cfg = EndpointConfig {
+                    max_connections: 1,
+                    max_listeners: 1,
+                    max_control_packets: 1,
+                    connection: ConnectionConfig {
+                        timestamps: true,
+                        timestamp_granularity: granularity,
+                        timebase,
+                        send_capacity: 64,
+                        receive_capacity: 64,
+                        mss: 8,
+                        ..ConnectionConfig::default()
+                    },
+                    ..EndpointConfig::default()
+                };
+                let tuple = Tuple {
+                    local: "192.0.2.1:40000".parse().unwrap(),
+                    remote: "192.0.2.2:8080".parse().unwrap(),
+                };
+                let mut endpoint = Endpoint::new(cfg.clone(), [1; 32], 0, |_| true).unwrap();
+                let first_isn = endpoint.isn(tuple);
+                endpoint.clock(4000 * scale).unwrap();
+                let next_isn = endpoint.isn(tuple);
+                assert_eq!(next_isn.wrapping_sub(first_isn), 1000);
+                let id = endpoint
+                    .connect(4000 * scale, tuple.local, tuple.remote)
+                    .unwrap();
+                let (_, syn) = packet(&mut endpoint, 4000 * scale);
+                assert_eq!(endpoint.next_deadline(), Some(1_004_000 * scale));
+                assert_eq!(endpoint.transport_info(id).unwrap().rto_us, 1_000_000);
+                assert_eq!(
+                    endpoint.clock(4000 * scale - 1),
+                    Err(Error::TimeWentBackwards.into())
+                );
+                let half = (1u64 << 31) * granularity.tick_us() * scale;
+                assert_eq!(
+                    endpoint.clock(4000 * scale + half),
+                    Err(Error::AmbiguousTimeJump.into())
+                );
+                endpoint.clock(4000 * scale + half - 1).unwrap();
+                endpoint.clock(4000 * scale + half).unwrap();
+                // Control budget counts survive draining output until one physical second.
+                let mut control = Endpoint::new(cfg.clone(), [1; 32], 0, |_| true).unwrap();
+                let ip = IpMetadata {
+                    source: tuple.local.ip(),
+                    destination: tuple.remote.ip(),
+                };
+                let incoming = wire::parse(ip, &syn).unwrap();
+                control.reset_for(ip, &incoming, None);
+                assert_eq!(control.control_count, 1);
+                packet(&mut control, 0);
+                control.clock(1_000_000 * scale - 1).unwrap();
+                control.reset_for(ip, &incoming, None);
+                assert!(control.control.is_empty());
+                control.clock(1_000_000 * scale).unwrap();
+                control.reset_for(ip, &incoming, None);
+                assert_eq!(control.control.len(), 1);
+                let (_, reset) = packet(&mut control, 1_000_000 * scale);
+                let mut passive = Endpoint::new(cfg.clone(), [2; 32], 0, |_| true).unwrap();
+                passive.listen(tuple.remote, 1).unwrap();
+                passive.input(0, ip, &syn).unwrap();
+                let child = passive
+                    .connection_id(Tuple {
+                        local: tuple.remote,
+                        remote: tuple.local,
+                    })
+                    .unwrap();
+                passive.abort(child).unwrap();
+                let (_, reset_child) = packet(&mut passive, 0);
+                assert_ne!(reset_child[13] & RST, 0);
+                assert_eq!(
+                    passive.slots[child.slot].as_ref().unwrap().reset_deadline,
+                    Some(240_000_000 * scale)
+                );
+                assert_eq!(passive.next_deadline(), Some(240_000_000 * scale));
+                // Absolute end-of-clock deadlines saturate, rather than wrapping early.
+                let mut end = Endpoint::new(cfg, [1; 32], u64::MAX - 1, |_| true).unwrap();
+                end.connect(u64::MAX - 1, tuple.local, tuple.remote)
+                    .unwrap();
+                packet(&mut end, u64::MAX - 1);
+                assert_eq!(end.next_deadline(), Some(u64::MAX));
+                (first_isn, next_isn, syn, reset)
+            };
+            assert_eq!(trace(1), trace(1000));
+        }
     }
 
     #[test]

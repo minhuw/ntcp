@@ -1,6 +1,10 @@
 // Bounded transmission intervals shared by RACK selection and diagnostics.
 // Sequence ranges are exclusive and always smaller than half the sequence space.
-use crate::{connection::TimestampGranularity, sack::Scoreboard, seq::Seq};
+use crate::{
+    connection::{CallerTimebase, TimestampGranularity},
+    sack::Scoreboard,
+    seq::Seq,
+};
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
@@ -11,7 +15,7 @@ const CAPACITY: usize = 256;
 // to 300 seconds, balancing path migration against transient RTT inflation.
 const MIN_RTT_WINDOW: u64 = 300_000_000;
 const MIN_RTT_BUCKET: u64 = MIN_RTT_WINDOW / 3;
-// Even a 1-us minimum can reach any u64 SRTT with this multiplier.
+// Even a one-caller-tick minimum can reach any u64 SRTT with this multiplier.
 const MAX_MULTIPLIER: u128 = 4 * u64::MAX as u128;
 
 #[derive(Clone, Copy, Debug)]
@@ -65,6 +69,7 @@ pub(crate) struct Rack {
     // pushes/inserts stay inside the fallibly reserved admission capacity.
     intervals: Vec<Interval>,
     capacity: usize,
+    timebase: CallerTimebase,
     fallback: Option<Seq>,
     latest: Option<(u64, Seq)>,
     fack: Option<Seq>,
@@ -102,12 +107,18 @@ impl Rack {
             .checked_mul(core::mem::size_of::<Interval>())
     }
 
+    #[cfg(test)]
     pub(crate) fn with_capacity(capacity: usize) -> Result<Self, ()> {
+        Self::with_timebase(capacity, CallerTimebase::default())
+    }
+
+    pub(crate) fn with_timebase(capacity: usize, timebase: CallerTimebase) -> Result<Self, ()> {
         let mut intervals = Vec::new();
         intervals.try_reserve_exact(capacity).map_err(|_| ())?;
         Ok(Self {
             intervals,
             capacity,
+            timebase,
             fallback: None,
             latest: None,
             fack: None,
@@ -222,12 +233,6 @@ impl Rack {
         Some((end, head.sent))
     }
 
-    // Unknown RTT permits initialization, not a claim about the physical clock.
-    pub(crate) fn clock_compatible(&self, resolution_us: u64) -> bool {
-        self.min_rtt
-            .is_none_or(|rtt| u128::from(resolution_us) * 4 < u128::from(rtt))
-    }
-
     pub(crate) fn valid(&self) -> bool {
         self.fallback.is_none()
     }
@@ -243,13 +248,13 @@ impl Rack {
     //# that can adapt when migrating to significantly longer paths rather
     //# than tracking a simple global minimum of all RTT measurements.
     pub(crate) fn sample(&mut self, rtt: u64, now: u64) {
-        // now is caller-supplied monotonic microseconds, as for acknowledge.
+        // now and RTT are caller-supplied ticks, as for acknowledge.
         // ponytail: bucket minima retain samples for 300..400 seconds, giving
         // a conservative (never higher) estimate of the exact 300-second min;
         // use a full sample deque only if exact expiration becomes necessary.
         // Like Linux tcp_update_rtt_min, aging happens on accepted samples,
         // not on timers: idle time alone does not erase the ambiguity guard.
-        let epoch = now / MIN_RTT_BUCKET;
+        let epoch = now / self.timebase.ticks_from_us(MIN_RTT_BUCKET);
         let bucket = &mut self.min_rtt_buckets[(epoch % 4) as usize];
         *bucket = Some((
             epoch,
@@ -316,7 +321,7 @@ impl Rack {
     // per send-buffer byte plus control space; byte-edge splits cannot exhaust
     // that backing. Undersized synthetic ledgers retain a defensive fallback.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-4
-    //= reason=Capacity-backed intervals retain every committed original/retransmission timestamp, including arbitrary byte splits; physical caller clock resolution remains an external obligation.
+    //= reason=Capacity-backed intervals retain every committed original/retransmission timestamp, including arbitrary byte splits, in caller ticks without microsecond truncation. Physical precision finer than min_RTT/4 is a caller precondition, never measured or runtime-gated; violation leaves protocol timing guarantees unspecified, not Rust UB or memory-safety violations.
     //# For each data segment sent, the sender MUST store its most recent
     //# transmission time with a timestamp whose granularity is finer
     //# than 1/4 of the minimum RTT of the connection.
@@ -533,7 +538,7 @@ impl Rack {
                     && (!r.retransmitted
                         || (rtt >= self.min_rtt.unwrap_or(u64::MAX)
                             && timestamps.is_none_or(|granularity| {
-                                echo == Some(granularity.tick(r.sent) as u32)
+                                echo == Some(granularity.tick_in(r.sent, self.timebase) as u32)
                             })));
                 if eligible
                     && newest
@@ -624,7 +629,7 @@ impl Rack {
         if !self.reordering_seen && (recovery || self.counts().sacked >= 3) {
             return 0;
         }
-        // Divide after multiplication, including minima below four us.
+        // Divide after multiplication, including minima below four caller ticks.
         // An overflowing u128 product / 4 still exceeds every u64 SRTT.
         ((u128::from(self.min_rtt.unwrap_or(0)).saturating_mul(self.multiplier) / 4)
             .min(u128::from(srtt.unwrap_or(0)))) as u64
@@ -886,14 +891,44 @@ mod tests {
         assert_eq!(rack.fallback, Some(Seq(108)));
     }
     #[test]
-    fn clock_gate_uses_unclamped_observed_minimum_and_strict_resolution_bound() {
-        for minimum in 0..=5 {
-            let mut rack = Rack::with_capacity(4).unwrap();
-            assert!(rack.clock_compatible(1));
-            rack.sample(minimum, 0);
-            assert_eq!(rack.min_rtt, Some(minimum));
-            assert_eq!(rack.clock_compatible(1), minimum > 4);
-            assert!(!rack.clock_compatible(u64::MAX));
+    fn caller_units_scale_minimum_aging_and_retransmission_echoes() {
+        for scale in [1, 1000] {
+            let timebase = CallerTimebase {
+                units_per_second: 1_000_000 * scale,
+                ..CallerTimebase::default()
+            };
+            let mut rack = Rack::with_timebase(4, timebase).unwrap();
+            rack.sample(50 * scale, 0);
+            rack.sample(400 * scale, MIN_RTT_WINDOW * scale);
+            assert_eq!(rack.min_rtt, Some(50 * scale));
+            rack.sample(400 * scale, (MIN_RTT_WINDOW + MIN_RTT_BUCKET) * scale);
+            assert_eq!(rack.min_rtt, Some(400 * scale));
+            let mut bounded = Rack::with_timebase(1, timebase).unwrap();
+            bounded.transmit(Seq(0), Seq(2), 0, false);
+            bounded.transmit(Seq(1), Seq(2), scale, true);
+            assert!(!bounded.valid()); // Capacity fallback is unit-independent.
+            for granularity in [
+                TimestampGranularity::Milliseconds,
+                TimestampGranularity::Microseconds,
+            ] {
+                let mut rack = Rack::with_timebase(4, timebase).unwrap();
+                rack.sample(100_000 * scale, 0);
+                rack.transmit(Seq(0), Seq(1000), 100_000 * scale, false);
+                rack.transmit(Seq(0), Seq(1000), 300_000 * scale, true);
+                rack.acknowledge(
+                    Seq(1000),
+                    Seq(1000),
+                    &Scoreboard::new(),
+                    400_000 * scale,
+                    Some(granularity.tick(300_000) as u32),
+                    Some(granularity),
+                    1000,
+                    false,
+                );
+                assert_eq!(rack.latest, Some((300_000 * scale, Seq(1000))));
+                assert_eq!(rack.rtt, 100_000 * scale);
+                assert_eq!(rack.ack_sample, None); // Karn exclusion unchanged.
+            }
         }
     }
 

@@ -12,8 +12,13 @@ use crate::{
     wire::{self, ACK, CWR, ECE, FIN, Header, IpMetadata, PSH, RST, SYN, Segment, URG},
 };
 
-// Caller-owned monotonic microseconds, approximately proportional to real time.
-// No wall/system clock is sampled. Resolution is declared and validated below.
+// Caller-owned ticks in CallerTimebase units; deadlines use the same unit.
+// The caller supplies monotonic, consistent-rate time in its real or simulated
+// time domain, with precision at least as fine as the wire timestamp tick and
+// finer than min_RTT/4 when using RACK.
+// Violations leave protocol timing guarantees unspecified, never Rust undefined
+// behavior or memory-safety violations. Nondecreasing input and resource bounds are checked.
+// No wall/system clock is sampled.
 pub type Instant = u64;
 
 // Linux 22430ae5d90ab288b0ee2ad99ae941f4a666b694, include/net/tcp.h:
@@ -26,23 +31,31 @@ const PAWS_RECENT_EXPIRY_US: u64 = 2_147_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CallerTimebase {
+    // Supported caller units: 1_000_000 (microseconds, default) or
+    // 1_000_000_000 (nanoseconds). This is a unit, not a resolution declaration.
     pub units_per_second: u64,
-    pub resolution_us: u64,
     pub max_segment_lifetime_us: u64,
 }
 impl Default for CallerTimebase {
     fn default() -> Self {
         Self {
             units_per_second: 1_000_000,
-            resolution_us: 1,
             max_segment_lifetime_us: 120_000_000,
         }
     }
 }
 impl CallerTimebase {
+    // Config durations are microseconds; internal elapsed times retain caller ticks.
+    pub(crate) fn ticks_from_us(self, us: u64) -> u64 {
+        us.saturating_mul(self.units_per_second / 1_000_000)
+    }
+
+    pub(crate) fn us_from_ticks(self, ticks: u64) -> u64 {
+        ticks / (self.units_per_second / 1_000_000)
+    }
+
     pub(crate) fn valid(self) -> bool {
-        self.units_per_second == 1_000_000
-            && (1..=1_000).contains(&self.resolution_us)
+        matches!(self.units_per_second, 1_000_000 | 1_000_000_000)
             && (1..=255_000_000).contains(&self.max_segment_lifetime_us)
     }
 }
@@ -65,8 +78,13 @@ impl TimestampGranularity {
         }
     }
 
+    pub(crate) fn tick_in(self, now: Instant, timebase: CallerTimebase) -> u64 {
+        now / timebase.ticks_from_us(self.tick_us())
+    }
+
+    #[cfg(test)]
     pub(crate) fn tick(self, now: Instant) -> u64 {
-        now / self.tick_us()
+        self.tick_in(now, CallerTimebase::default())
     }
 }
 
@@ -100,8 +118,8 @@ pub struct ConnectionConfig {
     // Successful sequence-space bytes (including copies and SYN/FIN) per local timestamp tick; <2^31.
     pub timestamp_bytes_per_tick: u32,
     pub sack: bool,
-    // Opt-in RFC 8985 time-based loss detection (requires negotiated SACK
-    // and observed minimum RTT >4us with the current 1us time units).
+    // Opt-in RFC 8985 time-based loss detection (requires negotiated SACK).
+    // Physical clock precision is a caller precondition, not a runtime gate.
     pub rack: bool,
     // Opt-in PRR recovery pacing (requires negotiated SACK and valid ledger).
     pub prr: bool,
@@ -118,7 +136,7 @@ pub struct ConnectionConfig {
     pub rto_min_us: u64,
     pub retransmit_beyond_window: bool,
     pub delayed_ack_us: u64,
-    // Per-connection fixed-window challenge budget, in caller-clock microseconds.
+    // Per-connection fixed-window challenge budget, in microseconds.
     // ponytail: permits boundary bursts; use sliding windows if a rolling cap is needed.
     pub challenge_ack_limit: u32,
     pub challenge_ack_interval_us: u64,
@@ -155,8 +173,6 @@ impl Default for KeepaliveConfig {
 impl ConnectionConfig {
     pub(crate) fn valid_timestamp_timebase(&self) -> bool {
         self.timebase.valid()
-            && (!self.timestamps
-                || self.timebase.resolution_us <= self.timestamp_granularity.tick_us())
     }
 
     pub(crate) fn minimum_send_budget(&self) -> u16 {
@@ -582,8 +598,9 @@ impl Connection {
         //= https://www.rfc-editor.org/rfc/rfc6928#section-2
         //= reason=All initial-window choices share RFC6298 estimator and connection timer/sampling implementation. Default/configured >=1s floors retain the recommended floor; explicit subsecond Linux compatibility is a scoped departure, not universal inherited conformance.
         //# Implementations must also follow RFC 6298 [RFC6298] in order to avoid spurious RTO as described in Section 9.
-        let rtt = RttEstimator::new(config.rto_min_us);
-        let rack = Rack::with_capacity(config.send_capacity + 2).map_err(|_| Error::NoMemory)?;
+        let rtt = RttEstimator::with_timebase(config.rto_min_us, config.timebase);
+        let rack = Rack::with_timebase(config.send_capacity + 2, config.timebase)
+            .map_err(|_| Error::NoMemory)?;
         let scoreboard =
             Scoreboard::with_capacity(config.send_capacity).map_err(|_| Error::NoMemory)?;
         // Take pooled storage only after every fallible allocation has succeeded.
@@ -593,7 +610,7 @@ impl Connection {
                 ReceiveBuffer::new(Seq(0), config.receive_capacity).map_err(|_| Error::NoMemory)?
             }
         };
-        let timestamp_tick = config.timestamp_granularity.tick(now);
+        let timestamp_tick = config.timestamp_granularity.tick_in(now, config.timebase);
         Ok(Self {
             tuple,
             config,
@@ -831,9 +848,12 @@ impl Connection {
             cwnd: self.congestion.cwnd(),
             ssthresh: self.congestion.ssthresh(),
             mss: self.mss as u32,
-            rtt_us: self.rtt.srtt(),
-            rttvar_us: self.rtt.variance(),
-            rto_us: self.rto(),
+            rtt_us: self
+                .rtt
+                .srtt()
+                .map(|ticks| self.config.timebase.us_from_ticks(ticks)),
+            rttvar_us: self.config.timebase.us_from_ticks(self.rtt.variance()),
+            rto_us: self.config.timebase.us_from_ticks(self.rto()),
             send_used: self.send.len(),
             send_capacity: self.config.send_capacity,
             receive_used: self.receive_used,
@@ -859,8 +879,6 @@ impl Connection {
             && self.sack_send
             && self.rack.valid()
             && self.sack_fallback.is_none()
-            // The embedding must still certify its declared physical resolution.
-            && self.rack.clock_compatible(self.config.timebase.resolution_us)
     }
 
     fn tlp_arm_eligible(&self) -> bool {
@@ -947,20 +965,31 @@ impl Connection {
             // Short packets may not reach the receiver's ACK-every-two-MSS
             // threshold. Preserve their delay budget without postponing a
             // full-sized flight's section7.2 PTO merely because SACK split it.
-            let pto = self.rtt.srtt().map_or(1_000_000, |srtt| {
-                let delay = if self.rack.counts().unacked == 1 {
-                    self.config.peer_max_ack_delay_us
-                } else {
-                    0
-                };
-                let pto = srtt.saturating_mul(2).saturating_add(delay);
-                if self.rack.has_short_transmission(self.mss as u32) {
-                    pto.max(srtt.saturating_add(self.config.peer_max_ack_delay_us))
-                } else {
-                    pto
-                }
-                .max(1)
-            });
+            let pto =
+                self.rtt
+                    .srtt()
+                    .map_or(self.config.timebase.ticks_from_us(1_000_000), |srtt| {
+                        let delay = if self.rack.counts().unacked == 1 {
+                            self.config
+                                .timebase
+                                .ticks_from_us(self.config.peer_max_ack_delay_us)
+                        } else {
+                            0
+                        };
+                        let pto = srtt.saturating_mul(2).saturating_add(delay);
+                        if self.rack.has_short_transmission(self.mss as u32) {
+                            pto.max(
+                                srtt.saturating_add(
+                                    self.config
+                                        .timebase
+                                        .ticks_from_us(self.config.peer_max_ack_delay_us),
+                                ),
+                            )
+                        } else {
+                            pto
+                        }
+                        .max(1)
+                    });
             self.tlp_deadline = self
                 .rto_deadline
                 .map(|rto| self.now.saturating_add(pto).min(rto));
@@ -1268,7 +1297,10 @@ impl Connection {
         self.keepalive_pending = false;
         self.keepalive_deadline =
             if self.state == State::Established && self.send.len() == 0 && self.flight() == 0 {
-                keepalive.map(|k| self.now.saturating_add(k.idle_us))
+                keepalive.map(|k| {
+                    self.now
+                        .saturating_add(self.config.timebase.ticks_from_us(k.idle_us))
+                })
             } else {
                 None
             };
@@ -1370,8 +1402,12 @@ impl Connection {
         } else {
             TimestampGranularity::Milliseconds
         };
-        let stale =
-            |sent: Instant| granularity.tick(now).saturating_sub(granularity.tick(sent)) >= 1 << 31;
+        let stale = |sent: Instant| {
+            granularity
+                .tick_in(now, self.config.timebase)
+                .saturating_sub(granularity.tick_in(sent, self.config.timebase))
+                >= 1 << 31
+        };
         if self.sample.is_some_and(|(_, sent)| stale(sent))
             || self.last_timestamp_sent_at.is_some_and(stale)
         {
@@ -1390,15 +1426,15 @@ impl Connection {
         Ok(())
     }
 
-    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; fixed tick cadence and opt-in microsecond frequency are explicit policy exceptions, not literal conformance. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    // Scope: Caller obligation: physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase accepts microsecond/nanosecond units and MSL <=255s, independently of wire ms/us periods. Nondecreasing input, endpoint timestamp half-range gaps and resource bounds are checked; physical rate/drift/precision and actual network MSL cannot be established here. Peer PAWS expires independently at2147s. Fixed wire cadence and opt-in microsecond frequency remain scoped policy exceptions, not literal conformance.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
-    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; fixed tick cadence and opt-in microsecond frequency are explicit policy exceptions, not literal conformance. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    //= reason=Caller obligation: physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase accepts microsecond/nanosecond units and MSL <=255s, independently of wire ms/us periods. Nondecreasing input, endpoint timestamp half-range gaps and resource bounds are checked; physical rate/drift/precision and actual network MSL cannot be established here. Peer PAWS expires independently at2147s. Fixed wire cadence and opt-in microsecond frequency remain scoped policy exceptions, not literal conformance.
     //# Values of this
     //# clock MUST be at least approximately proportional to real time, in
     //# order to measure actual RTT.
-    // Scope: Every input/transmit checks nondecreasing Instant, TSval derived by fixed selected local tick scaling (default milliseconds) modulo2^32; repeated Instant intentionally repeats TSval. Physical rate and forward-jump safety separately TODO.
+    // Scope: Every input/transmit checks nondecreasing Instant, TSval derived by fixed selected local tick scaling (default milliseconds) modulo2^32; repeated Instant intentionally repeats TSval. Physical rate/precision remain caller obligations; endpoint timestamp half-range gap checks are separate.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
-    //= reason=Every input/transmit checks nondecreasing Instant, TSval derived by fixed selected local tick scaling (default milliseconds) modulo2^32; repeated Instant intentionally repeats TSval. Physical rate and forward-jump safety separately TODO.
+    //= reason=Every input/transmit checks nondecreasing Instant, TSval derived by fixed selected local tick scaling (default milliseconds) modulo2^32; repeated Instant intentionally repeats TSval. Physical rate/precision remain caller obligations; endpoint timestamp half-range gap checks are separate.
     //# The PAWS mechanism also puts a strong monotonicity requirement on the
     //# sender's timestamp clock.
     fn check_time(&self, now: Instant) -> Result<(), Error> {
@@ -1421,7 +1457,11 @@ impl Connection {
     //= reason=Successful TS-bearing sequence-space bytes (including retransmitted copies and SYN/FIN) are transactionally limited by configured nonzero timestamp_bytes_per_tick <2^31. Exhaustion returns TimestampBudgetExceeded with caller time and protocol state unchanged; next tick resets credit. Boundary/wrap/output rollback tests verify the gate. Physical clock truth remains separately external.
     //# It MUST tick at least once for each 2^31 bytes sent.
     fn timestamp_value(&self, now: Instant) -> u32 {
-        (self.config.timestamp_granularity.tick(now) as u32).wrapping_add(self.timestamp_offset)
+        (self
+            .config
+            .timestamp_granularity
+            .tick_in(now, self.config.timebase) as u32)
+            .wrapping_add(self.timestamp_offset)
     }
 
     // Classic RFC 3168 only: setup offers remain binding for receive feedback even
@@ -1634,9 +1674,11 @@ impl Connection {
     //# 3 seconds when data transmission begins (i.e., after the three-way handshake
     //# completes).
     fn rto(&self) -> u64 {
-        self.rtt
-            .rto()
-            .max(if self.syn_timed_out { 3_000_000 } else { 0 })
+        self.rtt.rto().max(if self.syn_timed_out {
+            self.config.timebase.ticks_from_us(3_000_000)
+        } else {
+            0
+        })
     }
 
     // FlightSize counts payload, not SYN/FIN sequence-space consumption.
@@ -1693,10 +1735,13 @@ impl Connection {
     //= reason=Validated nonzero per-connection count/interval tunables; caller-clock fixed windows, bounded successful-output counters, coalescing and transactional encode. No shared challenge counter; held erratum 4772 is considered, not treated as verified normative text.
     //# 1) The system administrator can configure the number of challenge ACKs that can be sent out in a given interval. For example, in any 5 second window, no more than 10 challenge ACKs should be sent.
     fn refresh_challenge_budget(&mut self, now: Instant) {
-        if self
-            .challenge_ack_start
-            .is_none_or(|start| now.saturating_sub(start) >= self.config.challenge_ack_interval_us)
-        {
+        if self.challenge_ack_start.is_none_or(|start| {
+            now.saturating_sub(start)
+                >= self
+                    .config
+                    .timebase
+                    .ticks_from_us(self.config.challenge_ack_interval_us)
+        }) {
             self.challenge_ack_start = Some(now);
             self.challenge_ack_sent = 0;
         }
@@ -1791,7 +1836,10 @@ impl Connection {
     fn time_wait(&mut self) {
         self.terminal(CloseReason::Normal);
         self.state = State::TimeWait;
-        self.time_wait_deadline = Some(self.now.saturating_add(self.config.time_wait_us));
+        self.time_wait_deadline = Some(
+            self.now
+                .saturating_add(self.config.timebase.ticks_from_us(self.config.time_wait_us)),
+        );
         self.immediate_ack();
     }
 
@@ -1799,11 +1847,13 @@ impl Connection {
     //# In particular, R2 for a SYN segment MUST be set large enough to provide
     //# retransmission of the segment for at least 3 minutes (MUST-23).
     fn user_timeout(&self) -> u64 {
-        if self.handshake_pending() {
-            self.config.user_timeout_us.max(180_000_000)
-        } else {
-            self.config.user_timeout_us
-        }
+        self.config
+            .timebase
+            .ticks_from_us(if self.handshake_pending() {
+                self.config.user_timeout_us.max(180_000_000)
+            } else {
+                self.config.user_timeout_us
+            })
     }
 
     fn user_timer_needed(&self) -> bool {
@@ -1864,7 +1914,10 @@ impl Connection {
     fn application_deadline(&self) -> Option<Instant> {
         self.application_timeout_us
             .filter(|_| self.application_timer_needed())
-            .map(|timeout| self.application_progress_at.saturating_add(timeout))
+            .map(|timeout| {
+                self.application_progress_at
+                    .saturating_add(self.config.timebase.ticks_from_us(timeout))
+            })
     }
 
     fn arm_work(&mut self) {
@@ -1925,7 +1978,10 @@ impl Connection {
         //# MUST NOT buffer data indefinitely (MUST-60),
         if unsent && self.snd_wnd != 0 {
             if self.sws_deadline.is_none() && !self.sws_override {
-                self.sws_deadline = Some(self.now.saturating_add(500_000));
+                self.sws_deadline = Some(
+                    self.now
+                        .saturating_add(self.config.timebase.ticks_from_us(500_000)),
+                );
             }
         } else {
             self.sws_deadline = None;
@@ -1940,8 +1996,10 @@ impl Connection {
                 && self.keepalive_deadline.is_none()
                 && !self.keepalive_pending
             {
-                self.keepalive_deadline =
-                    Some(self.last_received.saturating_add(keepalive.idle_us));
+                self.keepalive_deadline = Some(
+                    self.last_received
+                        .saturating_add(self.config.timebase.ticks_from_us(keepalive.idle_us)),
+                );
             }
         } else {
             self.keepalive_deadline = None;
@@ -2577,7 +2635,8 @@ impl Connection {
         //# TS.Recent is found to be invalid, then the segment is accepted,
         //# regardless of the failure of the timestamp check, and rule R3 updates
         //# TS.Recent with the TSval from the new segment.
-        let recent_valid = now.saturating_sub(self.ts_recent_at) < PAWS_RECENT_EXPIRY_US;
+        let recent_valid = now.saturating_sub(self.ts_recent_at)
+            < self.config.timebase.ticks_from_us(PAWS_RECENT_EXPIRY_US);
         if self.timestamps && h.flags & RST == 0 {
             let Some((value, _)) = segment.options.timestamps else {
                 // Narrow SHOULD departure: SYN is never accepted; selected RFC5961
@@ -2676,7 +2735,9 @@ impl Connection {
                 self.ts_latest = value;
             }
             self.immediate_ack();
-            self.time_wait_deadline = Some(now.saturating_add(self.config.time_wait_us));
+            self.time_wait_deadline = Some(
+                now.saturating_add(self.config.timebase.ticks_from_us(self.config.time_wait_us)),
+            );
             return Ok(());
         }
         let len = segment.payload.len() as u64
@@ -3912,7 +3973,13 @@ impl Connection {
             {
                 self.immediate_ack();
             } else if !self.ack_pending && self.ack_deadline.is_none() {
-                self.ack_deadline = Some(self.now.saturating_add(self.config.delayed_ack_us));
+                self.ack_deadline = Some(
+                    self.now.saturating_add(
+                        self.config
+                            .timebase
+                            .ticks_from_us(self.config.delayed_ack_us),
+                    ),
+                );
             }
         }
         if outcome.fin {
@@ -4460,9 +4527,9 @@ impl Connection {
         //# clock SHOULD tick at least once per window's worth of data, and
         //# even with the window extension defined in Section 2.2, 2^31
         //# bytes must be at least two windows.
-        // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; fixed tick cadence and opt-in microsecond frequency are explicit policy exceptions, not literal conformance. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+        // Scope: Caller obligation: physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase accepts microsecond/nanosecond units and MSL <=255s, independently of wire ms/us periods. Nondecreasing input, endpoint timestamp half-range gaps and resource bounds are checked; physical rate/drift/precision and actual network MSL cannot be established here. Peer PAWS expires independently at2147s. Fixed wire cadence and opt-in microsecond frequency remain scoped policy exceptions, not literal conformance.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
-        //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; fixed tick cadence and opt-in microsecond frequency are explicit policy exceptions, not literal conformance. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+        //= reason=Caller obligation: physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase accepts microsecond/nanosecond units and MSL <=255s, independently of wire ms/us periods. Nondecreasing input, endpoint timestamp half-range gaps and resource bounds are checked; physical rate/drift/precision and actual network MSL cannot be established here. Peer PAWS expires independently at2147s. Fixed wire cadence and opt-in microsecond frequency remain scoped policy exceptions, not literal conformance.
         //# The recycling time of the timestamp clock MUST be greater than
         //# MSL seconds.
         // Scope: Endpoint derives offset using HMAC-SHA256 secret, tuple and ISS nonce in the separate ntcp timestamp offset domain before first output; ISS is an input, never the offset. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset so peer PAWS sees no random jump; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, echo/RTT/wrap and reuse rollback tests cover the policy.
@@ -4489,9 +4556,9 @@ impl Connection {
         //= reason=Negotiated ordinary ACK output echoes single retained TS.Recent; reactive RST overrides follow section 5.2.
         //# (3)  When a TSopt is sent, its TSecr field is set to the current
         //# TS.Recent value.
-        // Scope: Approved timestamp frequency policy exception: default1ms is within the quoted chosen1ms..1s range; explicit opt-in1us is outside it, like Linux tcp_usec_ts at pinned22430ae5d90ab288b0ee2ad99ae941f4a666b694 include/net/tcp.h. No literal range compliance is claimed for microseconds. Declared resolution validation and independent2147s peer PAWS expiry remain; physical proportionality/drift/MSL obligations are separate TODOs.
+        // Scope: Approved timestamp frequency policy exception: default1ms is within the quoted chosen1ms..1s range; explicit opt-in1us is outside it, like Linux tcp_usec_ts at pinned22430ae5d90ab288b0ee2ad99ae941f4a666b694 include/net/tcp.h. No literal range compliance is claimed for microseconds. Independent2147s peer PAWS expiry remains; physical monotonicity/rate/precision and MSL are caller obligations, not measured or declared resolution gates.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
-        //= reason=Approved timestamp frequency policy exception: default1ms is within the quoted chosen1ms..1s range; explicit opt-in1us is outside it, like Linux tcp_usec_ts at pinned22430ae5d90ab288b0ee2ad99ae941f4a666b694 include/net/tcp.h. No literal range compliance is claimed for microseconds. Declared resolution validation and independent2147s peer PAWS expiry remain; physical proportionality/drift/MSL obligations are separate TODOs.
+        //= reason=Approved timestamp frequency policy exception: default1ms is within the quoted chosen1ms..1s range; explicit opt-in1us is outside it, like Linux tcp_usec_ts at pinned22430ae5d90ab288b0ee2ad99ae941f4a666b694 include/net/tcp.h. No literal range compliance is claimed for microseconds. Independent2147s peer PAWS expiry remains; physical monotonicity/rate/precision and MSL are caller obligations, not measured or declared resolution gates.
         //# Based upon these considerations, we choose a timestamp clock
         //# frequency in the range 1 ms to 1 sec per tick.
         let timestamp = if reset.is_some() && self.reset_echo.is_some() {
@@ -4629,7 +4696,12 @@ impl Connection {
                 option_len += sack_option_len;
             }
         }
-        let tick_bytes = if self.config.timestamp_granularity.tick(now) == self.timestamp_tick {
+        let tick_bytes = if self
+            .config
+            .timestamp_granularity
+            .tick_in(now, self.config.timebase)
+            == self.timestamp_tick
+        {
             self.timestamp_bytes
         } else {
             0
@@ -5335,7 +5407,10 @@ impl Connection {
             }
         }
         if timestamp.is_some() {
-            self.timestamp_tick = self.config.timestamp_granularity.tick(now);
+            self.timestamp_tick = self
+                .config
+                .timestamp_granularity
+                .tick_in(now, self.config.timebase);
             self.timestamp_bytes = tick_bytes + timestamp_cost;
         }
         if !challenge {
@@ -5579,7 +5654,10 @@ impl Connection {
             //# zero window has existed for the retransmission timeout period (SHLD-
             //# 29) (Section 3.8.1), and SHOULD increase exponentially the interval
             //# between successive probes (SHLD-30).
-            self.persist_interval = self.persist_interval.saturating_mul(2).min(60_000_000);
+            self.persist_interval = self
+                .persist_interval
+                .saturating_mul(2)
+                .min(self.config.timebase.ticks_from_us(60_000_000));
             if self.flight() != 0 {
                 self.rto_deadline = Some(now.saturating_add(self.persist_interval));
             } else {
@@ -5592,7 +5670,7 @@ impl Connection {
             self.keepalive_deadline = self
                 .config
                 .keepalive
-                .map(|k| now.saturating_add(k.interval_us));
+                .map(|k| now.saturating_add(self.config.timebase.ticks_from_us(k.interval_us)));
         }
         if count != 0 && !keepalive {
             if self.limited_pending && !retransmit && !probe {
@@ -5661,7 +5739,10 @@ impl Connection {
         // Derive its wakeup from committed credit: failed encodes do not arm a
         // timer, and timeout advancing to the next tick removes this deadline.
         let timestamp_wakeup = (self.timestamp_tick
-            == self.config.timestamp_granularity.tick(self.now)
+            == self
+                .config
+                .timestamp_granularity
+                .tick_in(self.now, self.config.timebase)
             && self.timestamp_bytes >= self.config.timestamp_bytes_per_tick
             && (self.syn_pending
                 || self.retx_pending
@@ -5671,9 +5752,11 @@ impl Connection {
                     && (self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize
                         || self.shutdown && self.fin_sequence.is_none())))
         .then(|| {
-            self.timestamp_tick
-                .saturating_add(1)
-                .saturating_mul(self.config.timestamp_granularity.tick_us())
+            self.timestamp_tick.saturating_add(1).saturating_mul(
+                self.config
+                    .timebase
+                    .ticks_from_us(self.config.timestamp_granularity.tick_us()),
+            )
         });
         [
             timestamp_wakeup,
@@ -6499,8 +6582,8 @@ mod tests {
     }
 
     #[test]
-    fn unrepresentable_clock_minimum_disables_rack_tlp_but_keeps_sack_recovery() {
-        for minimum in 1..=5 {
+    fn tiny_rtt_keeps_rack_and_tlp_active() {
+        for minimum in 0..=5 {
             let cfg = ConnectionConfig {
                 sack: true,
                 rack: true,
@@ -6514,63 +6597,10 @@ mod tests {
             for _ in 0..8 {
                 packet(&mut a, 100_000);
             }
-            assert!(a.rack_enabled());
             rack_sack(&mut a, 100_000 + minimum, 1000, &[]);
-            assert_eq!(a.rack.clock_compatible(1), minimum > 4);
-            assert_eq!(a.rack_enabled(), minimum > 4);
+            assert!(a.rack_enabled());
             assert!(a.rack.valid());
-            assert_eq!(a.rack.head_transmission(a.snd_una).unwrap().1, 100_000);
-            assert_eq!(
-                a.loss_timer.unwrap().0,
-                if minimum > 4 {
-                    LossTimer::Pto
-                } else {
-                    LossTimer::Rto
-                }
-            );
-            if minimum <= 4 {
-                rack_sack(&mut a, 100_010, 1000, &[(2000, 3000)]);
-                rack_sack(&mut a, 100_011, 1000, &[(2000, 4000)]);
-                rack_sack(&mut a, 100_012, 1000, &[(2000, 5000)]);
-                assert!(a.sack_recovery.is_some());
-                assert_eq!(a.rack.deadline, None);
-                assert_eq!(a.tlp_deadline, None);
-                let bytes = packet(&mut a, 100_012);
-                assert_eq!(
-                    wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
-                    1001
-                );
-                assert!(a.rack.valid());
-            }
-        }
-    }
-
-    #[test]
-    fn rack_clock_gate_uses_declared_resolution_at_strict_boundary() {
-        for resolution_us in [1, 10, 1_000] {
-            for minimum in [4 * resolution_us, 4 * resolution_us + 1] {
-                let cfg = ConnectionConfig {
-                    sack: true,
-                    rack: true,
-                    tlp: true,
-                    timebase: CallerTimebase {
-                        resolution_us,
-                        ..CallerTimebase::default()
-                    },
-                    ..config(64, 20)
-                };
-                let (mut a, _) = pair(cfg, 100);
-                // Isolate the data-path minimum from the fixture's 20us SYN RTT.
-                a.rack = Rack::with_capacity(a.config.send_capacity + 2).unwrap();
-                assert!(a.rack_enabled()); // Unknown minimum permits initialization.
-                a.rack.sample(minimum, 30);
-                let compatible = minimum > 4 * resolution_us;
-                assert_eq!(a.rack_enabled(), compatible);
-                a.write(b"clock").unwrap();
-                packet(&mut a, 100);
-                assert_eq!(a.tlp_arm_eligible(), compatible);
-                assert!(a.rack.valid());
-            }
+            assert_eq!(a.loss_timer.unwrap().0, LossTimer::Pto);
         }
     }
 
@@ -7003,6 +7033,248 @@ mod tests {
         assert!(a.take_events().connected);
         assert!(b.take_events().connected);
         (a, b)
+    }
+
+    // Exact physical-time traces in both caller units, independently of wire TS units.
+    #[test]
+    fn caller_units_wire_rtt_and_timer_equivalence() {
+        for granularity in [
+            TimestampGranularity::Milliseconds,
+            TimestampGranularity::Microseconds,
+        ] {
+            for rack in [false, true] {
+                let trace = |scale: u64| {
+                    let cfg = ConnectionConfig {
+                        timestamps: true,
+                        timestamp_granularity: granularity,
+                        timebase: CallerTimebase {
+                            units_per_second: 1_000_000 * scale,
+                            ..CallerTimebase::default()
+                        },
+                        sack: true,
+                        rack,
+                        tlp: rack,
+                        nagle: false,
+                        peer_max_ack_delay_us: 0,
+                        rto_min_us: 200_000,
+                        keepalive: Some(KeepaliveConfig {
+                            idle_us: 7_200_000_000,
+                            interval_us: 75_000_000,
+                            probes: 9,
+                            send_garbage: false,
+                        }),
+                        ..config(16_000, 1000)
+                    };
+                    // Start just before wire TS wrap; caller nanoseconds do not alter it.
+                    let start = (u64::from(u32::MAX) - 100) * granularity.tick_us();
+                    let at = |us| (start + us) * scale;
+                    let mut a = Connection::active(tuple(), cfg.clone(), 100, at(0)).unwrap();
+                    let syn_bytes = packet(&mut a, at(0));
+                    let syn = wire::parse(ip(tuple()), &syn_bytes).unwrap();
+                    let mut b =
+                        Connection::passive(reverse(tuple()), cfg, 900, at(50_000), &syn).unwrap();
+                    let synack = deliver(&mut b, &mut a, at(100_000));
+                    let ack = deliver(&mut a, &mut b, at(100_000));
+                    assert_eq!(a.rtt.srtt(), Some(100_000 * scale));
+                    assert_eq!(a.transport_info().rtt_us, Some(100_000));
+                    assert_eq!(a.rto(), 300_000 * scale);
+                    a.write(&[1; 1976]).unwrap();
+                    let first = deliver(&mut a, &mut b, at(100_001));
+                    assert_eq!(b.ack_deadline, Some(at(300_001)));
+                    let data_rto = a.rto_deadline.unwrap() / scale;
+                    let pto = a.tlp_deadline.map(|ticks| ticks / scale);
+                    let second = deliver(&mut a, &mut b, at(100_001));
+                    let data_ack = deliver(&mut b, &mut a, at(200_001));
+                    let info = a.transport_info();
+                    assert_eq!(info.rtt_us, Some(100_000));
+                    assert_eq!(info.rttvar_us, 37_500);
+                    assert_eq!(info.rto_us, 250_000);
+                    // All public setters take us; their resulting deadlines are caller ticks.
+                    a.set_keepalive(Some(KeepaliveConfig {
+                        idle_us: 100,
+                        interval_us: 50,
+                        probes: 2,
+                        send_garbage: false,
+                    }))
+                    .unwrap();
+                    assert_eq!(a.keepalive_deadline, Some(at(200_101)));
+                    a.timeout(at(200_101)).unwrap();
+                    let keepalive = packet(&mut a, at(200_101));
+                    assert_eq!(a.keepalive_deadline, Some(at(200_151)));
+                    a.set_keepalive(None).unwrap();
+                    a.write(b"timeout").unwrap();
+                    assert_eq!(a.sws_deadline, Some(at(700_101)));
+                    a.set_user_timeout(123).unwrap();
+                    a.set_application_timeout(Some(321)).unwrap();
+                    assert_eq!(a.user_deadline(), Some(at(200_224)));
+                    assert_eq!(a.application_deadline(), Some(at(200_422)));
+                    assert_eq!(a.next_deadline(), Some(at(200_224)));
+                    // Per-connection challenge epochs are physical durations, too.
+                    a.challenge_ack_start = Some(at(200_101));
+                    a.challenge_ack_sent = a.config.challenge_ack_limit;
+                    a.refresh_challenge_budget(at(1_200_100));
+                    assert_eq!(a.challenge_ack_sent, a.config.challenge_ack_limit);
+                    a.refresh_challenge_budget(at(1_200_101));
+                    assert_eq!(a.challenge_ack_sent, 0);
+                    a.update_time(at(200_102)).unwrap();
+                    assert_eq!(a.update_time(at(200_101)), Err(Error::TimeWentBackwards));
+                    a.time_wait();
+                    assert_eq!(a.time_wait_deadline, Some(at(240_200_102)));
+                    (
+                        vec![syn_bytes, synack, ack, first, second, data_ack, keepalive],
+                        info,
+                        data_rto,
+                        pto,
+                    )
+                };
+                assert_eq!(trace(1), trace(1000));
+            }
+        }
+    }
+
+    #[test]
+    fn nanoseconds_preserve_sub_microsecond_rtt_and_rack_window() {
+        for rack in [false, true] {
+            let cfg = ConnectionConfig {
+                sack: true,
+                rack,
+                tlp: rack,
+                peer_max_ack_delay_us: 0,
+                timebase: CallerTimebase {
+                    units_per_second: 1_000_000_000,
+                    ..CallerTimebase::default()
+                },
+                ..config(16_000, 1000)
+            };
+            let mut a = Connection::active(tuple(), cfg.clone(), 100, 0).unwrap();
+            let bytes = packet(&mut a, 0);
+            let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+            let mut b = Connection::passive(reverse(tuple()), cfg, 900, 0, &syn).unwrap();
+            deliver(&mut b, &mut a, 500);
+            deliver(&mut a, &mut b, 500);
+            assert_eq!(a.rtt.srtt(), Some(500));
+            assert_eq!(a.rtt.variance(), 250);
+            assert_eq!(a.transport_info().rtt_us, Some(0)); // diagnostics truncate, not internal samples
+            assert_eq!(a.rack_enabled(), rack);
+            a.write(&[1; 2000]).unwrap();
+            packet(&mut a, 1000);
+            packet(&mut a, 1000);
+            rack_sack(&mut a, 1500, 0, &[(1000, 2000)]);
+            assert_eq!(a.rack.ack_sample, Some(500));
+            assert_eq!(a.rack_enabled(), rack);
+            assert_eq!(a.rack.deadline, rack.then_some(1625));
+        }
+    }
+
+    #[test]
+    fn caller_units_syn_timeout_guard_and_persist_cap() {
+        for scale in [1, 1000] {
+            let cfg = ConnectionConfig {
+                timebase: CallerTimebase {
+                    units_per_second: 1_000_000 * scale,
+                    ..CallerTimebase::default()
+                },
+                rto_min_us: 200_000,
+                user_timeout_us: 1,
+                ..config(64, 8)
+            };
+            let mut a = Connection::active(tuple(), cfg.clone(), 100, 0).unwrap();
+            assert_eq!(a.user_deadline(), Some(180_000_000 * scale));
+            packet(&mut a, 0);
+            a.timeout(1_000_000 * scale).unwrap();
+            let bytes = packet(&mut a, 1_000_000 * scale);
+            let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+            let mut b =
+                Connection::passive(reverse(tuple()), cfg, 900, 1_000_000 * scale, &syn).unwrap();
+            deliver(&mut b, &mut a, 1_100_000 * scale);
+            deliver(&mut a, &mut b, 1_100_000 * scale);
+            assert_eq!(a.rto(), 3_000_000 * scale);
+            a.set_user_timeout(u64::MAX).unwrap();
+            a.write(b"a").unwrap();
+            deliver(&mut a, &mut b, 1_100_000 * scale);
+            b.timeout(1_300_000 * scale).unwrap();
+            deliver(&mut b, &mut a, 1_300_000 * scale);
+            assert_eq!(a.rto(), 600_000 * scale);
+            // Zero-window probe interval doubles in ticks but caps at physical 60s.
+            a.write(b"b").unwrap();
+            let seq = a.receive.next();
+            let ack = a.snd_una;
+            inject(&mut a, 1_300_000 * scale, seq, ack, ACK, 0, b"");
+            a.persist_interval = 40_000_000 * scale;
+            a.probe_pending = true;
+            packet(&mut a, 1_300_000 * scale);
+            assert_eq!(a.persist_interval, 60_000_000 * scale);
+        }
+    }
+
+    #[test]
+    fn caller_ticks_timestamp_wakeup_wrap_paws_and_overflow() {
+        for scale in [1, 1000] {
+            for granularity in [
+                TimestampGranularity::Milliseconds,
+                TimestampGranularity::Microseconds,
+            ] {
+                let cfg = ConnectionConfig {
+                    timestamps: true,
+                    timestamp_granularity: granularity,
+                    timestamp_bytes_per_tick: 1,
+                    timebase: CallerTimebase {
+                        units_per_second: 1_000_000 * scale,
+                        ..CallerTimebase::default()
+                    },
+                    ..config(64, 8)
+                };
+                let period = granularity.tick_us() * scale;
+                let wrap = (1u64 << 32) * period;
+                let mut a = Connection::active(tuple(), cfg.clone(), 100, wrap - period).unwrap();
+                packet(&mut a, wrap - period);
+                a.syn_pending = true;
+                assert_eq!(a.next_deadline(), Some(wrap));
+                assert_eq!(a.timestamp_value(wrap - period), u32::MAX);
+                assert_eq!(a.timestamp_value(wrap), 0);
+                a.update_time(wrap).unwrap();
+                assert_eq!(a.update_time(wrap - 1), Err(Error::TimeWentBackwards));
+                // Independent physical PAWS lifetime, regardless of either unit choice.
+                a.timestamps = true;
+                a.state = State::Established;
+                a.snd_una = a.snd_nxt;
+                a.ts_recent = 100;
+                a.ts_recent_at = wrap;
+                let next = a.receive.next();
+                let ack = a.snd_una;
+                timestamp_input(
+                    &mut a,
+                    wrap + PAWS_RECENT_EXPIRY_US * scale - 1,
+                    next,
+                    ack,
+                    ACK,
+                    Some((99, 0)),
+                    b"",
+                );
+                assert_eq!(a.ts_recent, 100);
+                timestamp_input(
+                    &mut a,
+                    wrap + PAWS_RECENT_EXPIRY_US * scale,
+                    next,
+                    ack,
+                    ACK,
+                    Some((99, 0)),
+                    b"",
+                );
+                assert_eq!(a.ts_recent, 99);
+                let mut end = Connection::active(tuple(), cfg, 100, u64::MAX - 1).unwrap();
+                packet(&mut end, u64::MAX - 1);
+                assert_eq!(end.rto_deadline, Some(u64::MAX));
+                end.syn_pending = true;
+                assert_eq!(end.next_deadline(), Some(u64::MAX));
+                end.set_user_timeout(u64::MAX).unwrap();
+                end.set_application_timeout(Some(u64::MAX)).unwrap();
+                assert_eq!(end.user_deadline(), Some(u64::MAX));
+                assert_eq!(end.application_deadline(), Some(u64::MAX));
+                end.time_wait();
+                assert_eq!(end.time_wait_deadline, Some(u64::MAX));
+            }
+        }
     }
 
     // Establish actual cumulative progress beyond ISS, retaining the original
@@ -14741,10 +15013,10 @@ mod tests {
         let before = (a.snd_nxt, a.next_deadline(), a.now);
         assert_eq!(a.transmit(200, &mut [0; 128]), Ok(None));
         assert_eq!((a.snd_nxt, a.next_deadline(), a.now), before);
-        // Scope: Every input/transmit checks nondecreasing Instant, TSval derived by fixed selected local tick scaling (default milliseconds) modulo2^32; repeated Instant intentionally repeats TSval. Physical rate and forward-jump safety separately TODO.
+        // Scope: Every input/transmit checks nondecreasing Instant, TSval derived by fixed selected local tick scaling (default milliseconds) modulo2^32; repeated Instant intentionally repeats TSval. Physical rate/precision remain caller obligations; endpoint timestamp half-range gap checks are separate.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
         //= type=test
-        //= reason=Every input/transmit checks nondecreasing Instant, TSval derived by fixed selected local tick scaling (default milliseconds) modulo2^32; repeated Instant intentionally repeats TSval. Physical rate and forward-jump safety separately TODO.
+        //= reason=Every input/transmit checks nondecreasing Instant, TSval derived by fixed selected local tick scaling (default milliseconds) modulo2^32; repeated Instant intentionally repeats TSval. Physical rate/precision remain caller obligations; endpoint timestamp half-range gap checks are separate.
         //# The PAWS mechanism also puts a strong monotonicity requirement on the
         //# sender's timestamp clock.
         assert_eq!(a.transmit(99, &mut [0; 128]), Err(Error::TimeWentBackwards));
@@ -20821,17 +21093,17 @@ mod tests {
     //# <SYN,ACK> contain TSopt, the TSopt MUST be sent in every non-<RST>
     //# segment for the duration of the connection, and SHOULD be sent in an
     //# <RST> segment (see Section 5.2 for details).
-    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; fixed tick cadence and opt-in microsecond frequency are explicit policy exceptions, not literal conformance. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    // Scope: Caller obligation: physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase accepts microsecond/nanosecond units and MSL <=255s, independently of wire ms/us periods. Nondecreasing input, endpoint timestamp half-range gaps and resource bounds are checked; physical rate/drift/precision and actual network MSL cannot be established here. Peer PAWS expires independently at2147s. Fixed wire cadence and opt-in microsecond frequency remain scoped policy exceptions, not literal conformance.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
     //= type=test
-    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; fixed tick cadence and opt-in microsecond frequency are explicit policy exceptions, not literal conformance. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    //= reason=Caller obligation: physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase accepts microsecond/nanosecond units and MSL <=255s, independently of wire ms/us periods. Nondecreasing input, endpoint timestamp half-range gaps and resource bounds are checked; physical rate/drift/precision and actual network MSL cannot be established here. Peer PAWS expires independently at2147s. Fixed wire cadence and opt-in microsecond frequency remain scoped policy exceptions, not literal conformance.
     //# Values of this
     //# clock MUST be at least approximately proportional to real time, in
     //# order to measure actual RTT.
-    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; fixed tick cadence and opt-in microsecond frequency are explicit policy exceptions, not literal conformance. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    // Scope: Caller obligation: physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase accepts microsecond/nanosecond units and MSL <=255s, independently of wire ms/us periods. Nondecreasing input, endpoint timestamp half-range gaps and resource bounds are checked; physical rate/drift/precision and actual network MSL cannot be established here. Peer PAWS expires independently at2147s. Fixed wire cadence and opt-in microsecond frequency remain scoped policy exceptions, not literal conformance.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
     //= type=test
-    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; fixed tick cadence and opt-in microsecond frequency are explicit policy exceptions, not literal conformance. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    //= reason=Caller obligation: physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase accepts microsecond/nanosecond units and MSL <=255s, independently of wire ms/us periods. Nondecreasing input, endpoint timestamp half-range gaps and resource bounds are checked; physical rate/drift/precision and actual network MSL cannot be established here. Peer PAWS expires independently at2147s. Fixed wire cadence and opt-in microsecond frequency remain scoped policy exceptions, not literal conformance.
     //# The recycling time of the timestamp clock MUST be greater than
     //# MSL seconds.
     // Scope: Wire TS fields u32 network-order; TSval uses selected local ticks (default milliseconds) modulo 32 bits. Physical rate guarantees separately TODO.
@@ -20841,10 +21113,10 @@ mod tests {
     //# The Timestamps option carries two four-byte timestamp fields.  The
     //# TSval field contains the current value of the timestamp clock of the
     //# TCP sending the option.
-    // Scope: Approved timestamp frequency policy exception: default1ms is within the quoted chosen1ms..1s range; explicit opt-in1us is outside it, like Linux tcp_usec_ts at pinned22430ae5d90ab288b0ee2ad99ae941f4a666b694 include/net/tcp.h. No literal range compliance is claimed for microseconds. Declared resolution validation and independent2147s peer PAWS expiry remain; physical proportionality/drift/MSL obligations are separate TODOs.
+    // Scope: Approved timestamp frequency policy exception: default1ms is within the quoted chosen1ms..1s range; explicit opt-in1us is outside it, like Linux tcp_usec_ts at pinned22430ae5d90ab288b0ee2ad99ae941f4a666b694 include/net/tcp.h. No literal range compliance is claimed for microseconds. Independent2147s peer PAWS expiry remains; physical monotonicity/rate/precision and MSL are caller obligations, not measured or declared resolution gates.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
     //= type=test
-    //= reason=Approved timestamp frequency policy exception: default1ms is within the quoted chosen1ms..1s range; explicit opt-in1us is outside it, like Linux tcp_usec_ts at pinned22430ae5d90ab288b0ee2ad99ae941f4a666b694 include/net/tcp.h. No literal range compliance is claimed for microseconds. Declared resolution validation and independent2147s peer PAWS expiry remain; physical proportionality/drift/MSL obligations are separate TODOs.
+    //= reason=Approved timestamp frequency policy exception: default1ms is within the quoted chosen1ms..1s range; explicit opt-in1us is outside it, like Linux tcp_usec_ts at pinned22430ae5d90ab288b0ee2ad99ae941f4a666b694 include/net/tcp.h. No literal range compliance is claimed for microseconds. Independent2147s peer PAWS expiry remains; physical monotonicity/rate/precision and MSL are caller obligations, not measured or declared resolution gates.
     //# Based upon these considerations, we choose a timestamp clock
     //# frequency in the range 1 ms to 1 sec per tick.
     fn timestamps_ip_budget_data_fin_keepalive_and_clock_wrap() {
@@ -21115,11 +21387,10 @@ mod tests {
     //= reason=Successful TS-bearing sequence-space bytes (including retransmitted copies and SYN/FIN) are transactionally limited by configured nonzero timestamp_bytes_per_tick <2^31. Exhaustion returns TimestampBudgetExceeded with caller time and protocol state unchanged; next tick resets credit. Boundary/wrap/output rollback tests verify the gate. Physical clock truth remains separately external.
     //# It MUST tick at least once for each 2^31 bytes sent.
     fn timestamp_contract_offset_budget_and_scale_diagnostic() {
-        for (units, resolution) in [(1_000, 1), (1_000_000, 0), (1_000_000, 1_001)] {
+        for units in [0, 1_000, 1_000_001, u64::MAX] {
             let mut cfg = config(64, 8);
             cfg.timebase = CallerTimebase {
                 units_per_second: units,
-                resolution_us: resolution,
                 ..CallerTimebase::default()
             };
             assert!(matches!(
@@ -21218,10 +21489,10 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
     //= type=test
-    //= reason=Approved frequency exception: default milliseconds lies in the chosen1ms..1s range, explicit microseconds lies outside it. Both local/peer modes, secret-offset wrap, mixed echoes and resolution validation are asserted, not universal literal range compliance or physical clock evidence.
+    //= reason=Approved frequency exception: default milliseconds lies in the chosen1ms..1s range, explicit microseconds lies outside it. Both local/peer modes, secret-offset wrap, mixed echoes and caller-unit validation are asserted, not universal literal range compliance or physical clock evidence.
     //# Based upon these considerations, we choose a timestamp clock
     //# frequency in the range 1 ms to 1 sec per tick.
-    fn timestamp_units_mixed_peer_echo_wrap_and_resolution() {
+    fn timestamp_units_mixed_peer_echo_wrap_and_timebase() {
         use crate::{Endpoint, EndpointConfig};
         assert_eq!(
             ConnectionConfig::default().timestamp_granularity,
@@ -21310,31 +21581,6 @@ mod tests {
                 );
                 endpoint.on_timeout(half - 1, 64).unwrap();
                 endpoint.on_timeout(half, 64).unwrap();
-                for resolution in [1, 2, 1_000] {
-                    for enabled in [false, true] {
-                        let mut invalid = cfg.clone();
-                        invalid.timestamps = enabled;
-                        invalid.timebase.resolution_us = resolution;
-                        let valid = !enabled || resolution <= granularity.tick_us();
-                        assert_eq!(
-                            Connection::active(tuple(), invalid.clone(), 0, 0).is_ok(),
-                            valid
-                        );
-                        assert_eq!(
-                            Endpoint::new(
-                                EndpointConfig {
-                                    connection: invalid,
-                                    ..EndpointConfig::default()
-                                },
-                                [1; 32],
-                                0,
-                                |_| true
-                            )
-                            .is_ok(),
-                            valid
-                        );
-                    }
-                }
             }
         }
     }

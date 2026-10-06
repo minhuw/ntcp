@@ -2,7 +2,7 @@
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7323#section-4.1"
-reason = "External clock evidence: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s. Backward time is rejected; long inactivity invalidates stale RTT history while preserving lifecycle progress. Secret-offset TSval advances in fixed local ticks (default 1ms, opt-in 1us), with a 2^32-tick period; enabled timestamps require declared resolution no coarser than the tick. Peer PAWS expiry is independent. Physical rate, drift and real network MSL require the embedding runtime's clock guarantees and measurements."
+reason = "External caller obligation: physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase validates microsecond/nanosecond units and MSL <=255s, not actual resolution. Backward inputs and endpoint timestamp half-range clock gaps are rejected; long inactivity invalidates stale RTT history while preserving lifecycle progress. Secret-offset wire TSval uses independent ms/us periods modulo2^32; peer PAWS expiry remains independent. Physical rate/drift/precision and actual network MSL require embedding guarantees and evidence."
 quote = '''
 Values of this
 clock MUST be at least approximately proportional to real time, in
