@@ -43,8 +43,8 @@ class CoverageGate(unittest.TestCase):
         for rfc in RFCS:
             sections = "section-3*" if rfc == 9293 else "*"
             self.assertIn(f"workbench/duvet/requirements/**/rfc{rfc}/{sections}.toml", patterns)
-        self.assertIn("tools/rfc*-additions.toml", patterns)
-        self.assertIn("tools/rfc*-todos.toml", patterns)
+        self.assertIn("duvet/rfc*-additions.toml", patterns)
+        self.assertIn("duvet/rfc*-todos.toml", patterns)
 
     def test_all_requested_rfcs_require_complete_spans_and_inventory(self):
         report = complete_report()
@@ -71,7 +71,7 @@ class CoverageGate(unittest.TestCase):
     def test_wrapper_selects_ci_explicitly_and_preserves_overrides(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            tools = root / "tools"
+            tools = root / "duvet"
             tools.mkdir()
             for name in ("rfc-report.sh", "duvet.toml", "check_rfc_coverage.py"):
                 shutil.copyfile(Path(__file__).parent / name, tools / name)

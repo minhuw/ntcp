@@ -47,10 +47,10 @@ pattern = "workbench/duvet/requirements/**/rfc3168/*.toml"
 pattern = "workbench/duvet/requirements/**/rfc5961/*.toml"
 
 [[requirement]]
-pattern = "tools/rfc*-additions.toml"
+pattern = "duvet/rfc*-additions.toml"
 
 [[requirement]]
-pattern = "tools/rfc*-todos.toml"
+pattern = "duvet/rfc*-todos.toml"
 
 [[specification]]
 source = "https://www.rfc-editor.org/rfc/rfc9293"

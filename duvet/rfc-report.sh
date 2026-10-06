@@ -10,7 +10,7 @@ if ! cargo install --list --root "$root" 2>/dev/null | grep -Fxq "duvet v$versio
 fi
 
 mkdir -p workbench/duvet
-cp tools/duvet.toml workbench/duvet/config.toml
+cp duvet/duvet.toml workbench/duvet/config.toml
 # Duvet 0.4.3 ignores CI when snapshots are disabled; select its gate explicitly.
 has_ci=0
 for argument do
@@ -20,4 +20,4 @@ if [ "$has_ci" -eq 0 ]; then
     set -- --ci true "$@"
 fi
 "$root/bin/duvet" report --config-path workbench/duvet/config.toml --require-tests true "$@"
-exec python3 tools/check_rfc_coverage.py
+exec python3 duvet/check_rfc_coverage.py
