@@ -1,14 +1,6 @@
 # Agent-only annotation audit: official RFC quotes, whitespace reflow only.
 
 [[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.4"
-reason = "Bytes are retained and initial new data is constrained; nonzero shrink and delayed data within prior receive promise (wrap/batching) are tested. Scaled quantization-aware first/sub-scale retransmission policy remains unimplemented by default; opt-in beyond-window retry is not that policy. Closure requires bounded per-original retry knowledge and the exact first/sub-scale rule across SACK/RACK paths."
-quote = '''
-Implementations MUST ensure that they handle a shrinking
-window, as specified in Section 4.2.2.16 of [RFC1122].
-'''
-
-[[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7323#section-4.1"
 reason = "External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled."
 quote = '''
@@ -51,16 +43,6 @@ quote = '''
 Setting the DF bit implies the use of Path MTU Discovery as described
 in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
 that implements PAWS MUST also implement Path MTU Discovery.
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.4"
-reason = "Default retransmit clips to latest snd_wnd, even first retry after scaled rounding retraction; opt-in retransmit_beyond_window ignores window for all retries, not the exact first/sub-scale rule. No per-original first-retry or quantization distinction. Closure: preserve bounded first-transmission/first-retry knowledge and scale-unit tolerance, test original-valid first retry beyond edge and subsequent retries near/far edge across wrap and SACK/RACK paths."
-quote = '''
-4)  On first retransmission, or if the sequence number is out of
-window by less than 2^Rcv.Wind.Shift, then do normal
-retransmission(s) without regard to the receiver window as long
-as the original segment was in window when it was sent.
 '''
 
 [[TODO]]

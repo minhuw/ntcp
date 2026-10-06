@@ -22,6 +22,8 @@ struct Interval {
     original_start: Seq,
     original_end: Seq,
     original_sent: u64,
+    originally_in_window: bool,
+    successful_retries: u32,
     transmission_start: Seq,
     transmission_end: Seq,
     sent: u64,
@@ -37,6 +39,16 @@ struct Interval {
     // This committed retransmission copy has not shared an extra loss response.
     // Splits copy the marker; only successful retransmit commits renew it.
     loss_response_pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OriginalRetrySpan {
+    pub original_start: Seq,
+    pub original_end: Seq,
+    pub originally_in_window: bool,
+    pub successful_retries: u32,
+    // A retry-coverage split may precede the immutable original boundary.
+    pub retry_end: Seq,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -128,6 +140,67 @@ impl Rack {
                     r.original_retransmitted,
                 )
             })
+    }
+
+    pub(crate) fn original_retry_span(
+        &self,
+        seq: Seq,
+        proposed_end: Seq,
+    ) -> Option<OriginalRetrySpan> {
+        if !self.valid() || !after(proposed_end, seq) {
+            return None;
+        }
+        let index = self
+            .intervals
+            .iter()
+            .position(|r| !after(r.start, seq) && after(r.end, seq))?;
+        let head = self.intervals[index];
+        let end = self.intervals[index..]
+            .iter()
+            .take_while(|r| {
+                r.original_start == head.original_start
+                    && r.original_end == head.original_end
+                    && r.successful_retries == head.successful_retries
+            })
+            .last()?
+            .end;
+        Some(OriginalRetrySpan {
+            original_start: head.original_start,
+            original_end: head.original_end,
+            originally_in_window: head.originally_in_window,
+            successful_retries: head.successful_retries,
+            retry_end: if after(end, proposed_end) {
+                proposed_end
+            } else {
+                end
+            },
+        })
+    }
+
+    // These two commits are called only after successful wire encoding. Window
+    // validity belongs to the complete original, not its surviving ACK suffix.
+    pub(crate) fn commit_original_window(&mut self, start: Seq, end: Seq, in_window: bool) {
+        for r in &mut self.intervals {
+            if r.original_start == start && r.original_end == end {
+                r.originally_in_window = in_window;
+            }
+        }
+    }
+
+    pub(crate) fn commit_retry_span(&mut self, start: Seq, end: Seq) {
+        if !after(end, start) || !self.valid() {
+            return;
+        }
+        if !self.split(start) || !self.split(end) {
+            let boundary = self.intervals.last().map_or(end, |r| r.end);
+            self.abandon(boundary);
+            return;
+        }
+        for r in &mut self.intervals {
+            if !after(start, r.start) && !after(r.end, end) {
+                r.successful_retries = r.successful_retries.saturating_add(1);
+            }
+        }
     }
 
     // Preserve the last successful wire packet boundary, including partial ACKs.
@@ -296,6 +369,8 @@ impl Rack {
                 original_start: start,
                 original_end: end,
                 original_sent: now,
+                originally_in_window: false,
+                successful_retries: 0,
                 transmission_start: start,
                 transmission_end: end,
                 sent: now,
@@ -734,6 +809,80 @@ mod tests {
         )
     }
 
+    #[test]
+    fn original_retry_identity_and_coverage_survive_sack_ack_and_replacement() {
+        for base in [Seq(100), Seq(u32::MAX - 9)] {
+            let end = base.wrapping_add(24);
+            let mut rack = Rack::with_capacity(26).unwrap();
+            let mut scoreboard = Scoreboard::new();
+            rack.transmit(base, end, 10, false);
+            rack.commit_original_window(base, end, true);
+            rack.transmit(base, base.wrapping_add(8), 20, true);
+            rack.commit_retry_span(base, base.wrapping_add(8));
+            // A replacement changes RACK's copy/time, not original identity.
+            rack.transmit(base.wrapping_add(4), base.wrapping_add(6), 30, true);
+            rack.commit_retry_span(base.wrapping_add(4), base.wrapping_add(6));
+            sack(
+                &mut rack,
+                &mut scoreboard,
+                base.wrapping_add(2).0,
+                end.0,
+                40,
+                &[(base.wrapping_add(5).0, base.wrapping_add(10).0)],
+            );
+            for (offset, retries, retry_end) in [(2, 1, 4), (4, 2, 6), (6, 1, 8), (8, 0, 24)] {
+                let span = rack
+                    .original_retry_span(base.wrapping_add(offset), end)
+                    .unwrap();
+                assert_eq!(span.original_start, base);
+                assert_eq!(span.original_end, end);
+                assert!(span.originally_in_window);
+                assert_eq!(span.successful_retries, retries);
+                assert_eq!(span.retry_end, base.wrapping_add(retry_end));
+                assert_eq!(
+                    rack.original_transmission(base.wrapping_add(offset)),
+                    Some((base, end, 10, true))
+                );
+            }
+            assert_eq!(rack.original_retry_span(base, end), None);
+            // Pure queries, unrelated ACKs and splits never spend suffix credit.
+            let suffix = rack
+                .original_retry_span(base.wrapping_add(10), end)
+                .unwrap();
+            sack(
+                &mut rack,
+                &mut scoreboard,
+                base.wrapping_add(3).0,
+                end.0,
+                50,
+                &[],
+            );
+            assert_eq!(
+                rack.original_retry_span(base.wrapping_add(10), end)
+                    .unwrap(),
+                suffix
+            );
+        }
+    }
+
+    #[test]
+    fn retry_coverage_overflow_discards_permission_not_payload_or_inferred_time() {
+        let mut rack = Rack::with_capacity(1).unwrap();
+        rack.transmit(Seq(100), Seq(108), 10, false);
+        rack.commit_original_window(Seq(100), Seq(108), true);
+        assert!(
+            rack.original_retry_span(Seq(100), Seq(108))
+                .unwrap()
+                .originally_in_window
+        );
+        rack.commit_retry_span(Seq(100), Seq(104));
+        assert!(!rack.valid());
+        assert_eq!(rack.original_retry_span(Seq(104), Seq(108)), None);
+        assert_eq!(rack.head_transmission(Seq(100)), None);
+        rack.transmit(Seq(104), Seq(108), 20, true);
+        assert_eq!(rack.original_retry_span(Seq(104), Seq(108)), None);
+        assert_eq!(rack.fallback, Some(Seq(108)));
+    }
     #[test]
     fn clock_gate_uses_unclamped_observed_minimum_and_strict_resolution_bound() {
         for minimum in 0..=5 {

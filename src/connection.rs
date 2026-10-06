@@ -3875,9 +3875,9 @@ impl Connection {
     //# o  The window field (SEG.WND) of every outgoing segment, with the
     //# exception of <SYN> segments, MUST be right-shifted by
     //# Rcv.Wind.Shift bits:
-    // Scope: Bytes are retained and initial new data is constrained; nonzero shrink and delayed data within prior receive promise (wrap/batching) are tested. Scaled quantization-aware first/sub-scale retransmission policy remains unimplemented by default; opt-in beyond-window retry is not that policy. Closure requires bounded per-original retry knowledge and the exact first/sub-scale rule across SACK/RACK paths. Partial evidence; closure remains TODO.
+    // Scope: Shrinking windows retain payload; original validity and retry coverage implement scaled first/sub-scale permission with conservative overflow fallback and separate persist.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
-    //= reason=Bytes are retained and initial new data is constrained; nonzero shrink and delayed data within prior receive promise (wrap/batching) are tested. Scaled quantization-aware first/sub-scale retransmission policy remains unimplemented by default; opt-in beyond-window retry is not that policy. Closure requires bounded per-original retry knowledge and the exact first/sub-scale rule across SACK/RACK paths. Partial evidence; closure remains TODO.
+    //= reason=Shrinking windows retain payload; capacity-backed original validity and retry coverage implement scaled first/sub-scale retry permission with conservative overflow fallback and separate persist behavior.
     //# Implementations MUST ensure that they handle a shrinking
     //# window, as specified in Section 4.2.2.16 of [RFC1122].
     // Scope: Receive window bounded by explicit configured receive allocation, never rounds beyond backing; no speculative unlimited window growth.
@@ -3945,6 +3945,40 @@ impl Connection {
             self.snd_una
         };
         retransmitted + self.scoreboard.unsacked_bytes(new_start, self.data_high())
+    }
+
+    // Pure planning shared by cumulative RTO/Reno, SACK/RACK and TLP data.
+    // Persist deliberately bypasses this rule and never consumes retry credit.
+    fn retry_limit(&self, seq: Seq, proposed: u32) -> u32 {
+        let proposed = proposed.min(self.data_high().distance_from(seq));
+        let window = self.snd_wnd.saturating_sub(seq.distance_from(self.snd_una));
+        if self.snd_wnd == 0 {
+            return 0;
+        }
+        if self.scaling
+            && let Some(span) = self
+                .rack
+                .original_retry_span(seq, seq.wrapping_add(proposed))
+        {
+            let limit = span.retry_end.distance_from(seq);
+            if self.config.retransmit_beyond_window {
+                return limit;
+            }
+            let edge = self.snd_una.wrapping_add(self.snd_wnd);
+            // RFC7323 tests the segment's sequence number (SEG.SEQ), not
+            // its last byte; permitted retries still stop at original/coverage edges.
+            let near_edge = seq.in_window(self.snd_una, self.snd_wnd) == Some(true)
+                || seq.distance_from(edge) < (1u32 << self.peer_scale);
+            if span.originally_in_window && (span.successful_retries == 0 || near_edge) {
+                return limit;
+            }
+            return limit.min(window);
+        }
+        if self.config.retransmit_beyond_window {
+            proposed
+        } else {
+            proposed.min(window)
+        }
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
@@ -4602,7 +4636,10 @@ impl Connection {
                             .tail_hole(self.snd_una, self.data_high(), packet_mss as u32)
                             // A clipped rescue would not contain the highest
                             // outstanding byte but would consume RescueRxt.
-                            .filter(|&(_, right)| right.distance_from(self.snd_una) <= self.snd_wnd)
+                            .filter(|&(left, right)| {
+                                self.retry_limit(left, right.distance_from(left))
+                                    == right.distance_from(left)
+                            })
                             .map(|(left, right)| (left, right, true, false));
                     }
                 }
@@ -4656,11 +4693,7 @@ impl Connection {
             post_rto_segment.or(sack_segment.map(|(left, right, _, _)| (left, right)))
         {
             seq = left;
-            let credit = if self.config.retransmit_beyond_window && self.snd_wnd != 0 {
-                self.data_high().distance_from(seq)
-            } else {
-                self.snd_wnd.saturating_sub(seq.distance_from(self.snd_una))
-            };
+            let credit = self.retry_limit(seq, right.distance_from(left));
             let credit = self.prr.map_or(credit, |prr| credit.min(prr.credit()));
             count = self.send.copy(
                 seq.distance_from(self.send_base) as usize,
@@ -4684,9 +4717,10 @@ impl Connection {
                     .copy(offset, &mut self.scratch[..unsent.min(packet_mss)]);
             } else if let Some((left, right)) = self.rack.tail_segment(packet_mss as u32) {
                 seq = left;
+                let limit = self.retry_limit(left, right.distance_from(left)) as usize;
                 count = self.send.copy(
                     seq.distance_from(self.send_base) as usize,
-                    &mut self.scratch[..right.distance_from(left) as usize],
+                    &mut self.scratch[..limit],
                 );
                 retransmitted = count != 0;
             }
@@ -4707,23 +4741,18 @@ impl Connection {
                 //# retransmit old data beyond SND.UNA+SND.WND (MAY-7), but SHOULD NOT
                 //# time out the connection if data beyond the right window edge is not
                 //# acknowledged (SHLD-17).
-                // Scope: This MAY permits in-window-only subsequent retries; default selects it. Explicit retransmit_beyond_window opt-in is a separate policy, not claimed as selecting this MAY.
+                // Scope: Subsequent retries clip to the current window unless original-valid sub-scale permission applies. Explicit retransmit_beyond_window opt-in remains a separate policy.
                 //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
-                //= reason=This MAY permits in-window-only subsequent retries; default selects it. Explicit retransmit_beyond_window opt-in is a separate policy, not claimed as selecting this MAY.
+                //= reason=Subsequent retries clip to the current window unless original-valid sub-scale permission applies. Explicit retransmit_beyond_window opt-in remains a separate policy.
                 //# 5)  Subsequent retransmissions MAY only be sent if they are within
                 //# the window announced by the most recent <ACK>.
-                // Scope: Default retransmit clips to latest snd_wnd, even first retry after scaled rounding retraction; opt-in retransmit_beyond_window ignores window for all retries, not the exact first/sub-scale rule. No per-original first-retry or quantization distinction. Closure: preserve bounded first-transmission/first-retry knowledge and scale-unit tolerance, test original-valid first retry beyond edge and subsequent retries near/far edge across wrap and SACK/RACK paths. Partial evidence; closure remains TODO.
+                // Scope: Capacity-backed original identity and per-coverage successful retries implement first/sub-scale permission; normal retries share pure planning and post-encode commit, with persist separate.
                 //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
-                //= reason=Default retransmit clips to latest snd_wnd, even first retry after scaled rounding retraction; opt-in retransmit_beyond_window ignores window for all retries, not the exact first/sub-scale rule. No per-original first-retry or quantization distinction. Closure: preserve bounded first-transmission/first-retry knowledge and scale-unit tolerance, test original-valid first retry beyond edge and subsequent retries near/far edge across wrap and SACK/RACK paths. Partial evidence; closure remains TODO.
+                //= reason=Capacity-backed original identity and per-coverage successful retries implement first/sub-scale permission; all normal retry paths share pure planning and post-encode commit, while zero-window persist is separate.
                 //# 4)  On first retransmission, or if the sequence number is out of
                 //# window by less than 2^Rcv.Wind.Shift, then do normal
                 //# retransmission(s) without regard to the receiver window as long
                 //# as the original segment was in window when it was sent.
-                let window = if self.config.retransmit_beyond_window && self.snd_wnd != 0 {
-                    self.flight()
-                } else {
-                    self.snd_wnd
-                };
                 let boundary = if self.consecutive_timeouts != 0 {
                     self.rack
                         .head_transmission(seq)
@@ -4731,10 +4760,7 @@ impl Connection {
                 } else {
                     self.flight()
                 };
-                packet_mss
-                    .min(window as usize)
-                    .min(self.flight() as usize)
-                    .min(boundary as usize)
+                self.retry_limit(seq, (packet_mss as u32).min(boundary)) as usize
             };
             count = self.send.copy(offset, &mut self.scratch[..limit]);
             retransmitted = seq != self.snd_nxt;
@@ -5280,6 +5306,18 @@ impl Connection {
             }
             self.rack
                 .transmit(seq, seq.wrapping_add(count as u32), now, retransmitted);
+            let end = seq.wrapping_add(count as u32);
+            if retransmitted && !probe {
+                self.rack.commit_retry_span(seq, end);
+            } else if !retransmitted {
+                self.rack.commit_original_window(
+                    seq,
+                    end,
+                    !probe
+                        && seq.distance_from(self.snd_una) < self.snd_wnd
+                        && end.distance_from(self.snd_una) <= self.snd_wnd,
+                );
+            }
             if !self.rack.valid() {
                 self.prr = None;
                 self.rack_entry_delivery = None;
@@ -6440,6 +6478,140 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
+    //= type=test
+    //= reason=Successful original validity, failure rollback, persist/challenge exclusion, partial ACK coverage and original packet caps are asserted at the wire boundary, including wrap.
+    //# 4)  On first retransmission, or if the sequence number is out of
+    //# window by less than 2^Rcv.Wind.Shift, then do normal
+    //# retransmission(s) without regard to the receiver window as long
+    //# as the original segment was in window when it was sent.
+    fn scaled_retry_wire_commit_partial_ack_and_persist_are_independent() {
+        for iss in [100, u32::MAX - 4] {
+            let (mut a, _) = pair(config(65_536, 8), iss);
+            assert!(a.scaling && a.peer_scale == 1);
+            a.write(b"abcdefghijklmnop").unwrap();
+            packet(&mut a, 40);
+            packet(&mut a, 41);
+            let una = a.snd_una;
+            let next = a.receive.next();
+            let original = a.rack.original_retry_span(una, a.snd_nxt).unwrap();
+            assert!(original.originally_in_window);
+            assert_eq!(original.original_end, una.wrapping_add(8));
+            assert_eq!(original.successful_retries, 0);
+            inject(&mut a, 50, next, una, ACK, 0, b"");
+            let persist = a.loss_timer.unwrap().1;
+            a.timeout(persist).unwrap();
+            let bytes = packet(&mut a, persist);
+            assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, b"a");
+            assert_eq!(
+                a.rack.original_retry_span(una, a.snd_nxt).unwrap(),
+                original
+            );
+            inject(&mut a, persist + 1, next, una, ACK, 1, b"");
+            a.retx_pending = true;
+            a.config.send_ip_payload_limit = 24; // actually emit only the prefix
+            assert_eq!(
+                a.transmit(persist + 2, &mut [0; 23]),
+                Err(Error::OutputTooSmall)
+            );
+            assert_eq!(
+                a.rack.original_retry_span(una, a.snd_nxt).unwrap(),
+                original
+            );
+            a.challenge_ack_pending = true;
+            let bytes = packet(&mut a, persist + 2);
+            assert!(wire::parse(ip(tuple()), &bytes).unwrap().payload.is_empty());
+            assert_eq!(
+                a.rack.original_retry_span(una, a.snd_nxt).unwrap(),
+                original
+            );
+            let bytes = packet(&mut a, persist + 3);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.header.sequence, una.0);
+            assert_eq!(segment.payload, b"abcd"); // exceeds the two-byte current window
+            let prefix = a.rack.original_retry_span(una, a.snd_nxt).unwrap();
+            assert_eq!(prefix.successful_retries, 1);
+            assert_eq!(prefix.retry_end, una.wrapping_add(4));
+            let suffix = a
+                .rack
+                .original_retry_span(una.wrapping_add(4), a.snd_nxt)
+                .unwrap();
+            assert_eq!(suffix.successful_retries, 0);
+            assert_eq!(suffix.original_start, una);
+            assert_eq!(suffix.original_end, una.wrapping_add(8));
+            a.config.send_ip_payload_limit = 65_535;
+            inject(&mut a, persist + 4, next, una.wrapping_add(2), ACK, 1, b"");
+            a.retx_pending = true;
+            let bytes = packet(&mut a, persist + 5);
+            assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, b"cd");
+            assert_eq!(
+                a.rack
+                    .original_retry_span(a.snd_una, a.snd_nxt)
+                    .unwrap()
+                    .successful_retries,
+                2
+            );
+            inject(&mut a, persist + 6, next, una.wrapping_add(4), ACK, 1, b"");
+            a.retx_pending = true;
+            let bytes = packet(&mut a, persist + 7);
+            assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, b"efgh");
+            assert_eq!(
+                a.rack
+                    .original_retry_span(a.snd_una, a.snd_nxt)
+                    .unwrap()
+                    .successful_retries,
+                1
+            );
+            // Neither retry ever crossed into the second original packet.
+            assert_eq!(
+                a.rack
+                    .original_retry_span(una.wrapping_add(8), a.snd_nxt)
+                    .unwrap()
+                    .successful_retries,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn scaled_retry_strict_sequence_distance_and_conservative_fallbacks() {
+        for iss in [100, u32::MAX - 20000] {
+            for scale in [0, 1, 14] {
+                let (mut a, _) = pair(config(131_072, 32_768), iss);
+                // Negotiation extremes without allocating a 1GiB receive buffer.
+                a.peer_scale = scale;
+                a.snd_wnd = 65_536;
+                a.write(&[0x55; 32_768]).unwrap();
+                packet(&mut a, 40);
+                let una = a.snd_una;
+                let high = a.snd_nxt;
+                a.snd_wnd = 1;
+                assert_eq!(a.retry_limit(una, 32_768), 32_768);
+                a.rack.commit_retry_span(una, high);
+                let edge = una.wrapping_add(1);
+                let unit = 1u32 << scale;
+                for distance in [unit - 1, unit, unit + 1] {
+                    let seq = edge.wrapping_add(distance);
+                    assert_eq!(a.retry_limit(seq, 16), if distance < unit { 16 } else { 0 });
+                }
+                // Serially inside the latest window is normal retransmission.
+                assert_eq!(a.retry_limit(una, 32_768), 32_768);
+                a.scaling = false;
+                assert_eq!(a.retry_limit(una, 32_768), 1);
+                a.scaling = true;
+                a.rack.commit_original_window(una, high, false);
+                assert_eq!(a.retry_limit(una, 32_768), 1);
+                a.rack.abandon(high);
+                assert_eq!(a.retry_limit(una, 32_768), 1);
+                a.config.retransmit_beyond_window = true;
+                assert_eq!(a.retry_limit(una, 32_768), 32_768);
+                a.snd_wnd = 0;
+                assert_eq!(a.retry_limit(una, 32_768), 0);
+            }
+        }
+    }
+
+    #[test]
     fn rack_retransmission_echo_normalizes_secret_timestamp_offset() {
         for sack in [false, true] {
             for offset in [42, u32::MAX - 250] {
@@ -6491,6 +6663,179 @@ mod tests {
         }
     }
 
+    #[test]
+    fn scaled_reno_and_newreno_entry_use_original_valid_window() {
+        for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
+            for iss in [100, u32::MAX - 20] {
+                let cfg = ConnectionConfig {
+                    recovery_algorithm: algorithm,
+                    initial_window: InitialWindow::Iw10,
+                    ..config(65_536, 8)
+                };
+                let (mut a, _) = primed_pair(cfg, iss);
+                a.write(b"abcdefghijklmnopqrstuvwx").unwrap();
+                for now in 40..43 {
+                    packet(&mut a, now);
+                }
+                let una = a.snd_una;
+                let next = a.receive.next();
+                for now in 50..54 {
+                    inject(&mut a, now, next, una, ACK, 1, b"");
+                }
+                assert!(a.retx_pending);
+                let before = a.rack.original_retry_span(una, a.snd_nxt).unwrap();
+                assert_eq!(a.transmit(54, &mut [0; 27]), Err(Error::OutputTooSmall));
+                assert_eq!(a.rack.original_retry_span(una, a.snd_nxt).unwrap(), before);
+                let bytes = packet(&mut a, 54);
+                let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(segment.header.sequence, una.0);
+                assert_eq!(segment.payload, b"abcdefgh");
+                assert_eq!(
+                    a.rack
+                        .original_retry_span(una, a.snd_nxt)
+                        .unwrap()
+                        .successful_retries,
+                    1
+                );
+                if algorithm == RecoveryAlgorithm::NewReno {
+                    inject(&mut a, 55, next, una.wrapping_add(8), ACK, 1, b"");
+                    let bytes = packet(&mut a, 56);
+                    assert_eq!(
+                        wire::parse(ip(tuple()), &bytes).unwrap().payload,
+                        b"ijklmnop"
+                    );
+                    assert_eq!(
+                        a.rack
+                            .original_retry_span(a.snd_una, a.snd_nxt)
+                            .unwrap()
+                            .successful_retries,
+                        1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_sack_entry_nextseg_rescue_and_post_rto_commit_exact_coverage() {
+        for iss in [100, u32::MAX - 500] {
+            let mut a = sack_flight(128, iss, 8);
+            a.peer_scale = 1;
+            let una = a.snd_una;
+            let ranges = [
+                (una.wrapping_add(128).0, una.wrapping_add(256).0),
+                (una.wrapping_add(384).0, una.wrapping_add(768).0),
+            ];
+            sack_ack(&mut a, 200, una, &ranges);
+            for (now, offset) in [(201, 0), (202, 256)] {
+                // Entry then NextSeg: both originals were valid, even though
+                // this latest window contains neither complete wire segment.
+                a.snd_wnd = 2;
+                let seq = una.wrapping_add(offset);
+                let before = a.rack.original_retry_span(seq, a.snd_nxt).unwrap();
+                assert_eq!(before.successful_retries, 0);
+                assert_eq!(a.transmit(now, &mut [0; 147]), Err(Error::OutputTooSmall));
+                assert_eq!(a.rack.original_retry_span(seq, a.snd_nxt).unwrap(), before);
+                let bytes = packet(&mut a, now);
+                let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(segment.header.sequence, seq.0);
+                assert_eq!(segment.payload, &[0x77; 128]);
+                assert_eq!(
+                    a.rack
+                        .original_retry_span(seq, a.snd_nxt)
+                        .unwrap()
+                        .successful_retries,
+                    1
+                );
+            }
+            let next = a.receive.next();
+            inject_sack(&mut a, 210, next, una.wrapping_add(384), ACK, 1, &[], &[]);
+            let bytes = packet(&mut a, 211);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.header.sequence, una.wrapping_add(896).0);
+            assert_eq!(segment.payload, &[0x77; 128]);
+            assert_eq!(a.sack_recovery.unwrap().rescue_rxt, Some(a.snd_nxt));
+            assert_eq!(
+                a.rack
+                    .original_retry_span(una.wrapping_add(896), a.snd_nxt)
+                    .unwrap()
+                    .successful_retries,
+                1
+            );
+
+            let mut a = sack_flight(128, iss, 8);
+            a.peer_scale = 1;
+            let una = a.snd_una;
+            let deadline = a.rto_deadline.unwrap();
+            a.timeout(deadline).unwrap();
+            a.snd_wnd = 2;
+            let bytes = packet(&mut a, deadline);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().payload,
+                &[0x77; 128]
+            );
+            let ranges = [(384, 512), (640, 768), (896, 1024)]
+                .map(|(l, r)| (una.wrapping_add(l).0, una.wrapping_add(r).0));
+            sack_ack(&mut a, deadline + 1, una.wrapping_add(256), &ranges);
+            for (time, offset) in [(2, 256), (3, 512)] {
+                a.snd_wnd = 2;
+                let bytes = packet(&mut a, deadline + time);
+                let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+                let seq = una.wrapping_add(offset);
+                assert_eq!(segment.header.sequence, seq.0);
+                assert_eq!(segment.payload, &[0x77; 128]);
+                assert_eq!(
+                    a.rack
+                        .original_retry_span(seq, a.snd_nxt)
+                        .unwrap()
+                        .successful_retries,
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_tlp_tail_retry_commits_but_zero_window_persist_does_not() {
+        for iss in [100, u32::MAX - 1999] {
+            let (mut a, _) = tlp_pair(iss);
+            a.write(&[0x55; 4000]).unwrap();
+            for _ in 0..4 {
+                packet(&mut a, 100_000);
+            }
+            let base = a.send_base;
+            let tail = base.wrapping_add(3000);
+            let pto = a.tlp_deadline.unwrap();
+            a.timeout(pto).unwrap();
+            a.snd_wnd = 2;
+            let before = a.rack.original_retry_span(tail, a.snd_nxt).unwrap();
+            assert_eq!(a.transmit(pto, &mut [0; 1019]), Err(Error::OutputTooSmall));
+            assert_eq!(a.rack.original_retry_span(tail, a.snd_nxt).unwrap(), before);
+            let bytes = packet(&mut a, pto);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.header.sequence, tail.0);
+            assert_eq!(segment.payload, &[0x55; 1000]);
+            assert_eq!(
+                a.rack
+                    .original_retry_span(tail, a.snd_nxt)
+                    .unwrap()
+                    .successful_retries,
+                1
+            );
+            assert_eq!(a.retry_limit(tail, 1000), 0); // already retried and far outside
+            let next = a.receive.next();
+            inject(&mut a, pto + 1, next, base, ACK, 0, &[]);
+            let before = a.rack.original_retry_span(base, a.snd_nxt).unwrap();
+            let deadline = a.loss_timer.unwrap().1;
+            a.timeout(deadline).unwrap();
+            let bytes = packet(&mut a, deadline);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().payload,
+                &[0x55; 1]
+            );
+            assert_eq!(a.rack.original_retry_span(base, a.snd_nxt).unwrap(), before);
+        }
+    }
     fn config(capacity: usize, mss: u16) -> ConnectionConfig {
         ConnectionConfig {
             send_capacity: capacity,
@@ -10128,6 +10473,9 @@ mod tests {
     fn prr_short_output_and_sub_mss_new_data_gate() {
         for iss in [0, u32::MAX - 4999] {
             let mut a = rack_flight(iss);
+            // An originally out-of-window packet has no RFC7323 exception.
+            a.rack
+                .commit_original_window(a.snd_una, a.snd_una.wrapping_add(1000), false);
             rack_sack(&mut a, 200_000, 0, &[(1000, 7000)]);
             a.timeout(225_000).unwrap();
             // Shrink rwnd to bound the entry retransmit to a short payload.
@@ -10507,7 +10855,16 @@ mod tests {
                         if offset != 0 {
                             rack_sack(&mut a, now, 0, &[(7000, 8000 + offset)]);
                         }
+                        a.snd_wnd = 2; // first valid retry even for out-of-window originals
                         let bytes = packet(&mut a, now);
+                        let seq = a.iss.wrapping_add(1 + offset);
+                        assert_eq!(
+                            a.rack
+                                .original_retry_span(seq, a.snd_nxt)
+                                .unwrap()
+                                .successful_retries,
+                            1
+                        );
                         assert_eq!(
                             wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
                             iss.wrapping_add(1 + offset)
@@ -10528,7 +10885,15 @@ mod tests {
                     rack_sack(&mut a, 326_000, 0, &[(1000, 2000), (7000, 10_000)]);
                     assert_eq!(a.congestion.ssthresh(), 2500);
                     // This actual commit renews the first copy, not SND.NXT.
+                    a.snd_wnd = 2; // replacement SEG.SEQ is still in window
                     let bytes = packet(&mut a, 326_000);
+                    assert_eq!(
+                        a.rack
+                            .original_retry_span(a.snd_una, a.snd_nxt)
+                            .unwrap()
+                            .successful_retries,
+                        2
+                    );
                     assert_eq!(
                         wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
                         iss.wrapping_add(1)
@@ -10545,7 +10910,15 @@ mod tests {
                     rack_sack(&mut a, sent + 100_000, 0, &[(1000, 4000), (7000, 10_000)]);
                     assert_eq!((a.snd_una, a.snd_nxt), flight);
                     assert_eq!((a.congestion.cwnd(), a.congestion.ssthresh()), (2000, 2000));
+                    a.snd_wnd = 2;
                     let bytes = packet(&mut a, sent + 100_000);
+                    assert_eq!(
+                        a.rack
+                            .original_retry_span(a.snd_una, a.snd_nxt)
+                            .unwrap()
+                            .successful_retries,
+                        3
+                    );
                     assert_eq!(
                         wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
                         iss.wrapping_add(1)
@@ -11904,6 +12277,8 @@ mod tests {
                 (31, 8192, false, 31),
             ] {
                 let mut a = sack_flight(128, iss, 8);
+                // Exercise the conservative policy without negotiated scaling.
+                a.scaling = false;
                 let una = a.data_high().wrapping_add(0u32.wrapping_sub(tail));
                 sack_ack(&mut a, 190, una, &[]);
                 if ooo {
@@ -12992,6 +13367,8 @@ mod tests {
     #[test]
     fn sack_rescue_waits_for_tail_to_fit_reopened_window() {
         let mut a = sack_flight(128, 100, 8);
+        // Exercise the conservative policy without negotiated scaling.
+        a.scaling = false;
         let una = a.snd_una;
         let ranges = [
             (una.wrapping_add(128).0, una.wrapping_add(256).0),
@@ -13317,6 +13694,8 @@ mod tests {
     fn sack_tiny_mss_option_budget_and_shrink_remain_safe() {
         for mss in [1, 4, 12, 13] {
             let (mut a, _) = pair(sack_config(mss), 100);
+            // Exercise the conservative policy without negotiated scaling.
+            a.scaling = false;
             let una = a.snd_una;
             let next = a.receive.next();
             inject_sack(&mut a, 40, next.wrapping_add(4), una, ACK, 8192, &[2], &[]);
@@ -13327,6 +13706,8 @@ mod tests {
             assert!(seg.options.sack_blocks.iter().flatten().count() <= 1);
         }
         let mut a = sack_flight(128, 100, 8);
+        // Exercise the conservative policy without negotiated scaling.
+        a.scaling = false;
         let una = a.snd_una;
         let end = a.data_high();
         sack_ack(&mut a, 200, una, &[(una.wrapping_add(128).0, end.0)]);
@@ -15971,10 +16352,10 @@ mod tests {
     //# but SHOULD NOT
     //# time out the connection if data beyond the right window edge is not
     //# acknowledged (SHLD-17).
-    // Scope: Bytes are retained and initial new data is constrained; nonzero shrink and delayed data within prior receive promise (wrap/batching) are tested. Scaled quantization-aware first/sub-scale retransmission policy remains unimplemented by default; opt-in beyond-window retry is not that policy. Closure requires bounded per-original retry knowledge and the exact first/sub-scale rule across SACK/RACK paths. Partial evidence; closure remains TODO.
+    // Scope: Shrinking windows retain payload; original validity and retry coverage implement scaled first/sub-scale permission with conservative overflow fallback and separate persist.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
     //= type=test
-    //= reason=Bytes are retained and initial new data is constrained; nonzero shrink and delayed data within prior receive promise (wrap/batching) are tested. Scaled quantization-aware first/sub-scale retransmission policy remains unimplemented by default; opt-in beyond-window retry is not that policy. Closure requires bounded per-original retry knowledge and the exact first/sub-scale rule across SACK/RACK paths. Partial evidence; closure remains TODO.
+    //= reason=Shrinking windows retain payload; capacity-backed original validity and retry coverage implement scaled first/sub-scale retry permission with conservative overflow fallback and separate persist behavior.
     //# Implementations MUST ensure that they handle a shrinking
     //# window, as specified in Section 4.2.2.16 of [RFC1122].
     // Scope: Fresh-data branch saturates latest-window credit after flight subtraction; no new data after shrinking below flight; retransmit policy never sends unsent tail.
@@ -15983,10 +16364,10 @@ mod tests {
     //= reason=Fresh-data branch saturates latest-window credit after flight subtraction; no new data after shrinking below flight; retransmit policy never sends unsent tail.
     //# 3)  The initial transmission MUST be within the window announced by
     //# the most recent <ACK>.
-    // Scope: Default retransmit clips to latest snd_wnd, even first retry after scaled rounding retraction; opt-in retransmit_beyond_window ignores window for all retries, not the exact first/sub-scale rule. No per-original first-retry or quantization distinction. Closure: preserve bounded first-transmission/first-retry knowledge and scale-unit tolerance, test original-valid first retry beyond edge and subsequent retries near/far edge across wrap and SACK/RACK paths. Partial evidence; closure remains TODO.
+    // Scope: Capacity-backed original identity and per-coverage successful retries implement first/sub-scale permission; normal retries share pure planning and post-encode commit, with persist separate.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
     //= type=test
-    //= reason=Default retransmit clips to latest snd_wnd, even first retry after scaled rounding retraction; opt-in retransmit_beyond_window ignores window for all retries, not the exact first/sub-scale rule. No per-original first-retry or quantization distinction. Closure: preserve bounded first-transmission/first-retry knowledge and scale-unit tolerance, test original-valid first retry beyond edge and subsequent retries near/far edge across wrap and SACK/RACK paths. Partial evidence; closure remains TODO.
+    //= reason=Capacity-backed original identity and per-coverage successful retries implement first/sub-scale permission; all normal retry paths share pure planning and post-encode commit, while zero-window persist is separate.
     //# 4)  On first retransmission, or if the sequence number is out of
     //# window by less than 2^Rcv.Wind.Shift, then do normal
     //# retransmission(s) without regard to the receiver window as long
@@ -15996,6 +16377,8 @@ mod tests {
             let mut cfg = config(64, 8);
             cfg.user_timeout_us = 5_000_000;
             let (mut a, _) = pair(cfg, iss);
+            // Exercise the conservative policy without negotiated scaling.
+            a.scaling = false;
             a.write(b"abcdefghijkl").unwrap();
             packet(&mut a, 40);
             let next = a.receive.next();
@@ -17007,6 +17390,8 @@ mod tests {
             let mut cfg = config(64, 8);
             cfg.user_timeout_us = 5_000_000;
             let (mut a, _) = pair(cfg, iss);
+            // Exercise the conservative policy without negotiated scaling.
+            a.scaling = false;
             a.write(b"abcdefgh").unwrap();
             packet(&mut a, 40);
             let seq = a.receive.next();
@@ -17050,10 +17435,10 @@ mod tests {
     //# time out the connection if data beyond the right window edge is not
     //# acknowledged (SHLD-17).
     #[test]
-    // Scope: This MAY permits in-window-only subsequent retries; default selects it. Explicit retransmit_beyond_window opt-in is a separate policy, not claimed as selecting this MAY.
+    // Scope: Subsequent retries clip to the current window unless original-valid sub-scale permission applies. Explicit retransmit_beyond_window opt-in remains a separate policy.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
     //= type=test
-    //= reason=This MAY permits in-window-only subsequent retries; default selects it. Explicit retransmit_beyond_window opt-in is a separate policy, not claimed as selecting this MAY.
+    //= reason=Subsequent retries clip to the current window unless original-valid sub-scale permission applies. Explicit retransmit_beyond_window opt-in remains a separate policy.
     //# 5)  Subsequent retransmissions MAY only be sent if they are within
     //# the window announced by the most recent <ACK>.
     fn optional_beyond_window_retransmission_never_sends_new_bytes() {
@@ -17063,6 +17448,8 @@ mod tests {
                 cfg.retransmit_beyond_window = enabled;
                 cfg.user_timeout_us = 5_000_000;
                 let (mut a, _) = pair(cfg, iss);
+                // Exercise the conservative policy without negotiated scaling.
+                a.scaling = false;
                 a.write(b"abcdefghijklmnop").unwrap();
                 packet(&mut a, 40); // Only the first eight bytes have been sent.
                 let seq = a.receive.next();
@@ -20514,7 +20901,9 @@ mod tests {
         a.retx_pending = true;
         let bytes = packet(&mut a, 2_000);
         let retry = wire::parse(ip(tuple()), &bytes).unwrap();
-        assert_eq!(retry.payload, b"seven!!t");
+        // Retry credit also respects the original seven-byte packet boundary.
+        assert_eq!(retry.payload, b"seven!!");
+        assert_eq!(a.timestamp_bytes, 7);
         assert_eq!(retry.header.sequence, 101);
 
         // SYN spends one byte even before negotiation; pure ACK spends none.
