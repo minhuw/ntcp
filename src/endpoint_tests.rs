@@ -2233,7 +2233,7 @@ fn received_dscp_is_validated_per_connection_and_independent_of_send_dscp() {
 #[test]
 fn optional_stream_controls_refresh_endpoint_work_and_charge_marker_storage() {
     let (mut a, mut b, listener, client) = endpoints();
-    assert_eq!(a.buffer_bytes(), 3 * 1024 + 2 * 1024 + 64);
+    assert_eq!(a.buffer_bytes(), connection_charge(&config()));
     pump(&mut a, &mut b, 0);
     let server = b.accept(listener).unwrap();
     while a.next_event().is_some() {}
@@ -2892,7 +2892,7 @@ fn time_wait_reuse_capacity_and_listener_pressure_leave_old_record_unchanged() {
             cfg.max_connections = 4;
         }
         if pressure == 1 {
-            cfg.max_buffer_bytes = 5 * 1024 + 64;
+            cfg.max_buffer_bytes = connection_charge(&cfg);
         }
         let (mut b, listener, old, ip, h, ts) = time_wait_endpoint(cfg);
         if pressure == 0 {
@@ -3474,6 +3474,7 @@ fn connection_charge(cfg: &EndpointConfig) -> usize {
     3 * cfg.connection.receive_capacity
         + 2 * cfg.connection.send_capacity
         + usize::from(cfg.connection.mss)
+        + crate::rack::Rack::storage_bytes(cfg.connection.send_capacity).unwrap()
 }
 
 #[test]

@@ -4,6 +4,7 @@ use crate::{sack::Scoreboard, seq::Seq};
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
+#[cfg(test)]
 const CAPACITY: usize = 256;
 
 // Linux Documentation/networking/ip-sysctl.rst: tcp_min_rtt_wlen defaults
@@ -18,7 +19,9 @@ struct Interval {
     start: Seq,
     end: Seq,
     // Splits retain the original logical segment identity.
+    original_start: Seq,
     original_end: Seq,
+    original_sent: u64,
     transmission_start: Seq,
     transmission_end: Seq,
     sent: u64,
@@ -46,7 +49,10 @@ pub(crate) struct Counts {
 
 #[derive(Debug)]
 pub(crate) struct Rack {
+    // No Clone/snapshot on packet paths: split copies one Interval and all
+    // pushes/inserts stay inside the fallibly reserved admission capacity.
     intervals: Vec<Interval>,
+    capacity: usize,
     fallback: Option<Seq>,
     latest: Option<(u64, Seq)>,
     fack: Option<Seq>,
@@ -71,11 +77,25 @@ fn sent_after(a: (u64, Seq), b: (u64, Seq)) -> bool {
 }
 
 impl Rack {
-    pub(crate) fn new() -> Result<Self, ()> {
+    #[cfg(test)]
+    fn new() -> Result<Self, ()> {
+        Self::with_capacity(CAPACITY)
+    }
+
+    // One interval per outstanding octet is the worst case after arbitrary
+    // retransmission/SACK splits; reserve control space as well.
+    pub(crate) fn storage_bytes(send_capacity: usize) -> Option<usize> {
+        send_capacity
+            .checked_add(2)?
+            .checked_mul(core::mem::size_of::<Interval>())
+    }
+
+    pub(crate) fn with_capacity(capacity: usize) -> Result<Self, ()> {
         let mut intervals = Vec::new();
-        intervals.try_reserve_exact(CAPACITY).map_err(|_| ())?;
+        intervals.try_reserve_exact(capacity).map_err(|_| ())?;
         Ok(Self {
             intervals,
+            capacity,
             fallback: None,
             latest: None,
             fack: None,
@@ -91,6 +111,48 @@ impl Rack {
             deadline: None,
             ack_sample: None,
         })
+    }
+
+    // Immutable original wire span/time plus whether any of that original
+    // packet has been retransmitted. Used by scaled-window first-retry policy.
+    #[allow(dead_code)] // Consumer is the parallel TCP-options integration.
+    pub(crate) fn original_transmission(&self, start: Seq) -> Option<(Seq, Seq, u64, bool)> {
+        self.intervals
+            .iter()
+            .find(|r| !after(r.start, start) && after(r.end, start))
+            .map(|r| {
+                (
+                    r.original_start,
+                    r.original_end,
+                    r.original_sent,
+                    r.original_retransmitted,
+                )
+            })
+    }
+
+    // Preserve the last successful wire packet boundary, including partial ACKs.
+    pub(crate) fn head_transmission(&self, start: Seq) -> Option<(Seq, u64)> {
+        let first = self
+            .intervals
+            .iter()
+            .position(|r| !after(r.start, start) && after(r.end, start))?;
+        let head = self.intervals[first];
+        let end = self.intervals[first..]
+            .iter()
+            .take_while(|r| {
+                r.sent == head.sent
+                    && r.transmission_start == head.transmission_start
+                    && r.transmission_end == head.transmission_end
+            })
+            .last()?
+            .end;
+        Some((end, head.sent))
+    }
+
+    // Unknown RTT permits initialization, not a claim about the physical clock.
+    pub(crate) fn clock_compatible(&self, resolution_us: u64) -> bool {
+        self.min_rtt
+            .is_none_or(|rtt| u128::from(resolution_us) * 4 < u128::from(rtt))
     }
 
     pub(crate) fn valid(&self) -> bool {
@@ -149,7 +211,7 @@ impl Rack {
         else {
             return true;
         };
-        if self.intervals.len() == CAPACITY {
+        if self.intervals.len() == self.capacity {
             return false;
         }
         let mut right = self.intervals[i];
@@ -159,10 +221,11 @@ impl Rack {
         true
     }
 
-    // Called only after encoding succeeds. Overflow disables time-based inference
-    // until the entire incompletely represented flight is cumulatively ACKed.
+    // Called only after encoding succeeds. Production reserves one interval
+    // per send-buffer byte plus control space; byte-edge splits cannot exhaust
+    // that backing. Undersized synthetic ledgers retain a defensive fallback.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-4
-    //= reason=Partial evidence: every represented committed transmission stores the caller microsecond timestamp, including retransmissions.
+    //= reason=Capacity-backed intervals retain every committed original/retransmission timestamp, including arbitrary byte splits; physical caller clock resolution remains an external obligation.
     //# For each data segment sent, the sender MUST store its most recent
     //# transmission time with a timestamp whose granularity is finer
     //# than 1/4 of the minimum RTT of the connection.
@@ -208,11 +271,13 @@ impl Rack {
                     r.sacked = false;
                 }
             }
-        } else if self.intervals.len() < CAPACITY {
+        } else if self.intervals.len() < self.capacity {
             self.intervals.push(Interval {
                 start,
                 end,
+                original_start: start,
                 original_end: end,
+                original_sent: now,
                 transmission_start: start,
                 transmission_end: end,
                 sent: now,
@@ -645,6 +710,60 @@ mod tests {
             1000,
             update.dsack,
         )
+    }
+
+    #[test]
+    fn clock_gate_uses_unclamped_observed_minimum_and_strict_resolution_bound() {
+        for minimum in 0..=5 {
+            let mut rack = Rack::with_capacity(4).unwrap();
+            assert!(rack.clock_compatible(1));
+            rack.sample(minimum, 0);
+            assert_eq!(rack.min_rtt, Some(minimum));
+            assert_eq!(rack.clock_compatible(1), minimum > 4);
+            assert!(!rack.clock_compatible(u64::MAX));
+        }
+    }
+
+    #[test]
+    fn capacity_backing_keeps_every_byte_timestamp_after_splits() {
+        let mut rack = Rack::with_capacity(514).unwrap();
+        let storage = (rack.intervals.as_ptr(), rack.intervals.capacity());
+        rack.transmit(Seq(0), Seq(512), 0, false);
+        for byte in 0..512 {
+            rack.transmit(Seq(byte), Seq(byte + 1), byte as u64 + 1, true);
+        }
+        assert!(rack.valid());
+        assert_eq!(
+            (rack.intervals.as_ptr(), rack.intervals.capacity()),
+            storage
+        );
+        assert_eq!(rack.intervals.len(), 512);
+        assert_eq!(
+            rack.original_transmission(Seq(255)),
+            Some((Seq(0), Seq(512), 0, true))
+        );
+        for byte in 0..512 {
+            assert_eq!(
+                rack.head_transmission(Seq(byte)),
+                Some((Seq(byte + 1), byte as u64 + 1))
+            );
+        }
+        rack.acknowledge(
+            Seq(511),
+            Seq(512),
+            &Scoreboard::new(),
+            1000,
+            None,
+            false,
+            512,
+            false,
+        );
+        assert_eq!(
+            (rack.intervals.as_ptr(), rack.intervals.capacity()),
+            storage
+        );
+        assert_eq!(Rack::storage_bytes(usize::MAX), None);
+        assert!(Rack::with_capacity(usize::MAX).is_err());
     }
 
     #[test]

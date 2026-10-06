@@ -3,7 +3,7 @@
 # 6298:section-1:2
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6298#section-1"
-reason = "Global conformance is not established by estimator math: configured rto_min_us<1000000 intentionally departs from section2.4, and timer/sample-rate/profile gaps below remain. Close each applicable algorithm TODO and test conservative RTO behavior under retransmit, ACK, zero-window and optional RACK/TLP transitions; do not use this as an implemented-defect waiver."
+reason = "Global conformance is not established by estimator math: configured rto_min_us<1000000 intentionally departs from section2.4, and sampling-cadence/profile gaps below remain. Timer lifecycle now uses one selected loss timer, an unarmed RTO reference, per-copy head boundaries/elapsed age, and zero-window RTO probing versus unsent ZWP. Close the remaining sample-rate/profile obligations separately; do not use this as an implemented-defect waiver."
 quote = '''
 However, a TCP MUST NOT be more aggressive than the following algorithms allow.
 '''
@@ -26,25 +26,6 @@ A TCP implementation MUST take at least one RTT measurement per RTT (unless that
 is not possible per Karn's algorithm).
 '''
 
-# 6298:section-5:1
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
-reason = "retransmission_uses_partial_ack_base_and_never_sends_unsent_tail now proves head expiry, exact ACK/duplicate deadlines, running-send nonrestart, output failure and last-emission boundaries. It also exposes early coalesced tail retransmission: fresh ijk sent at rearmed deadline-1 is retransmitted inside defghijk at deadline (age1us, RTO2s). Fix per-byte last-emission eligibility before closure. Fast retransmit and negotiated RACK/TLP are distinct early-loss algorithms, not proof of timer conformance. Add last-emission-time assertions for head packets at just-before and exact expiry across partial ACKs, wrap, failed output, configured floors, SACK retransmit and persist transitions; resolve any actual early timer-driven retransmission."
-quote = '''
-An implementation MUST manage the retransmission timer(s) in such a way that a
-segment is never retransmitted too early, i.e., less than one RTO after the
-previous transmission of that segment.
-'''
-
-# 6298:section-5:2
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
-reason = "Recommended timer steps5.1-5.6 are added individually. Zero-window arm_work disables RTO in favor of persist; successful recovery retransmits re-arm RTO (RFC6675 section6 optional variant), and RACK/TLP changes loss-timer scheduling. Close individual lifecycle/profile test gaps rather than claiming universal standard timer behavior."
-quote = '''
-The following is the RECOMMENDED algorithm for managing the retransmission
-timer:
-'''
-
 # 6298:section-3:many-timestamp-samples
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6298#section-3"
@@ -54,24 +35,4 @@ However, when using the timestamp option, each ACK can be used as an RTT sample.
 RFC 1323 [JBB92] suggests that TCP connections utilizing large congestion
 windows should take many RTT samples per window of data to avoid aliasing
 effects in the estimated RTT.
-'''
-
-# 6298:section-5:5.1
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
-reason = "Ordinary send and retransmission commits arm at now+RTO; exact first-data arming and RTO retransmit rearm are asserted. Zero-window output uses persist and suppresses RTO, and later-new-packet nonrestart plus failed-output rollback are now asserted by retransmission_uses_partial_ack_base_and_never_sends_unsent_tail and newreno_partial_ack_wire_timer_and_exit_boundaries. Persist profile reconciliation remains. Add standard data-first-send/running-send/failure timer assertions plus zero-window role reconciliation; RFC6675 retransmit rearm is a scoped optional variant, not a defect waiver."
-quote = '''
-(5.1) Every time a packet containing data is sent (including a retransmission),
-if the timer is not running, start it running so that it will expire after RTO
-seconds (for the current value of RTO).
-'''
-
-# 6298:section-5:5.3
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6298#section-5"
-reason = "Exact advancing cumulative/first and later NewReno partial ACK deadlines=ACKtime+RTO and duplicate/old ACK nonrestart are now asserted by retransmission_uses_partial_ack_base_and_never_sends_unsent_tail and newreno_partial_ack_wire_timer_and_exit_boundaries. Nonadvancing-SACK and persist selection/return still need exact deadline traces. Add exact advancing/duplicate/nonadvancing-SACK timer assertions, and persist selection/return coverage. Do not substitute successful-retransmit timer assertions."
-quote = '''
-(5.3) When an ACK is received that acknowledges new data, restart the
-retransmission timer so that it will expire after RTO seconds (for the current
-value of RTO).
 '''

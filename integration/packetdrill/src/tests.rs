@@ -1066,11 +1066,29 @@ fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
         ("upstream-sack", 8 * 1024 * 1024),
     ] {
         let mut owner = Owner::new(profile(&format!("{name},local=192.0.2.1")).unwrap()).unwrap();
-        // Core accounts for receive data/presence/urgent maps, send storage and MSS scratch.
-        let per_connection = 3 * receive_capacity + 2 * 65536 + 1460;
+        // Learn the core's private metadata charge from the first connection;
+        // verify it covers buffers and at least one timestamp per send octet.
+        let first = owner
+            .endpoint
+            .connect(
+                0,
+                SocketAddr::new(local().into(), 40000),
+                SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080),
+            )
+            .unwrap();
+        assert_eq!(
+            owner
+                .endpoint
+                .transport_info(first)
+                .unwrap()
+                .receive_capacity,
+            receive_capacity
+        );
+        let per_connection = owner.endpoint.buffer_bytes();
+        assert!(per_connection >= 3 * receive_capacity + 2 * 65536 + 1460 + 8 * (65536 + 2));
         let max_bytes = 32 * 1024 * 1024;
         let count = LIMIT.min(max_bytes / per_connection);
-        for i in 0..count {
+        for i in 1..count {
             owner
                 .endpoint
                 .connect(

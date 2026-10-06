@@ -37,13 +37,17 @@ pub struct ConnectionConfig {
     pub initial_window: InitialWindow,
     pub timestamps: bool,
     pub sack: bool,
-    // Opt-in RFC 8985 time-based loss detection (requires negotiated SACK).
+    // Opt-in RFC 8985 time-based loss detection (requires negotiated SACK
+    // and observed minimum RTT >4us with the current 1us time units).
     pub rack: bool,
     // Opt-in RFC 6937 PRR-CRB recovery pacing (requires negotiated SACK).
     pub prr: bool,
     // Opt-in RFC 8985 tail loss probes; requires rack and sack configuration
     // and negotiated SACK. At most one probe per outstanding flight.
     pub tlp: bool,
+    // Peer delayed-ACK budget, independent of our receive ACK policy. Default
+    // covers RFC 9293's <500ms bound; tune only with knowledge of the peer.
+    pub peer_max_ack_delay_us: u64,
     // RTT-derived RTO floor, 1..=60_000_000 us. Values below one second are an
     // explicit deviation from RFC 6298 section 2.4's SHOULD floor. Initial
     // RTO remains one second; the post-SYN-timeout three-second guard remains.
@@ -101,6 +105,7 @@ impl Default for ConnectionConfig {
             rack: false,
             prr: false,
             tlp: false,
+            peer_max_ack_delay_us: 499_999,
             rto_min_us: 1_000_000,
             retransmit_beyond_window: false,
             delayed_ack_us: 200_000,
@@ -127,6 +132,14 @@ pub struct Tuple {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum LossTimer {
+    Rack,
+    Pto,
+    Rto,
+    Zwp,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum State {
     Closed,
     SynSent,
@@ -150,7 +163,7 @@ pub struct TransportInfo {
     pub state: State,
     pub recovery: bool,
     pub loss: bool,
-    // False after bounded ledger overflow; segment counts are unavailable.
+    // False only after explicit diagnostic abandonment; capacity-backed production flights retain every byte interval.
     pub ledger_valid: bool,
     pub unacked: u32,
     pub sacked: u32,
@@ -316,6 +329,7 @@ pub(crate) struct Connection {
     shutdown: bool,
     read_closed: bool,
     fin_sequence: Option<Seq>,
+    fin_sent_at: Option<Instant>,
     syn_pending: bool,
     ack_pending: bool,
     challenge_ack_pending: bool,
@@ -345,7 +359,9 @@ pub(crate) struct Connection {
     syn_timed_out: bool,
     consecutive_timeouts: u32,
     route_advice_pending: bool,
+    // Unarmed RFC 6298 reference expiration, retained for PTO cap/fallback.
     rto_deadline: Option<Instant>,
+    loss_timer: Option<(LossTimer, Instant)>,
     ack_deadline: Option<Instant>,
     unacked_segments: u8,
     unacked_bytes: u32,
@@ -451,7 +467,7 @@ impl Connection {
             Seq(iss),
         );
         let rtt = RttEstimator::new(config.rto_min_us);
-        let rack = Rack::new().map_err(|_| Error::NoMemory)?;
+        let rack = Rack::with_capacity(config.send_capacity + 2).map_err(|_| Error::NoMemory)?;
         // Take pooled storage only after every fallible allocation has succeeded.
         let receive = match receive.take() {
             Some(receive) => receive,
@@ -520,6 +536,7 @@ impl Connection {
             shutdown: false,
             read_closed: false,
             fin_sequence: None,
+            fin_sent_at: None,
             syn_pending: true,
             ack_pending: false,
             challenge_ack_pending: false,
@@ -550,6 +567,7 @@ impl Connection {
             consecutive_timeouts: 0,
             route_advice_pending: false,
             rto_deadline: None,
+            loss_timer: None,
             ack_deadline: None,
             unacked_segments: 0,
             unacked_bytes: 0,
@@ -703,16 +721,22 @@ impl Connection {
     //# on a per-connection basis ("SACK scoreboard" has the same meaning
     //# here as in [RFC6675], Section 3).
     fn rack_enabled(&self) -> bool {
-        self.config.rack && self.sack_receive && self.sack_send && self.rack.valid()
+        self.config.rack
+            && self.sack_receive
+            && self.sack_send
+            && self.rack.valid()
+            && self.sack_fallback.is_none()
+            // Enforce what the 1us representation can prove; the embedding
+            // must still certify its physical resolution (options clock contract).
+            && self.rack.clock_compatible(1)
     }
 
-    fn tlp_eligible(&self) -> bool {
+    fn tlp_arm_eligible(&self) -> bool {
         self.config.tlp
             && self.rack_enabled()
-            && matches!(self.state, State::Established | State::CloseWait)
-            && self.fin_sequence.is_none()
+            && self.synchronized()
             && self.flight() != 0
-            && self.snd_wnd >= self.flight()
+            && self.snd_wnd != 0
             && !self.congestion.in_recovery()
             && self.sack_post_rto.is_none()
             && self.consecutive_timeouts == 0
@@ -721,8 +745,34 @@ impl Connection {
             && self.rack.deadline.is_none()
     }
 
+    fn tlp_eligible(&self) -> bool {
+        self.tlp_arm_eligible() && self.data_high() != self.snd_una
+    }
+
+    // Only this value is armed. The protocol-specific deadlines are candidate
+    // expirations, not independent timers; RTO remains an unarmed reference.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-8
+    //# The RACK reordering timer, the TLP PTO timer, the RTO, and Zero
+    //# Window Probe (ZWP) timer [RFC793] are mutually exclusive and are used
+    //# in different scenarios.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-8
+    //# When arming a RACK reordering timer or TLP
+    //# PTO timer, the sender SHOULD cancel any other pending timers.
+    fn select_loss_timer(&mut self) {
+        self.loss_timer = if let Some(deadline) = self.rack.deadline {
+            self.tlp_deadline = None;
+            Some((LossTimer::Rack, deadline))
+        } else if let Some(deadline) = self.tlp_deadline {
+            Some((LossTimer::Pto, deadline))
+        } else if let Some(deadline) = self.persist_deadline {
+            Some((LossTimer::Zwp, deadline))
+        } else {
+            self.rto_deadline.map(|deadline| (LossTimer::Rto, deadline))
+        };
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
-    //= reason=Conditional evidence: new-data and advancing-ACK callers schedule only outside recovery, complete SACK, zero/shrunken window, FIN and invalid-ledger states, with a fresh RTT and no outstanding probe.
+    //= reason=New-data and advancing cumulative ACK events arm PTO outside recovery/SACKed flights. Expiry gates do not constrain arming; closing data and absent-SRTT flights are covered.
     //# The sender SHOULD start or
     //# restart a loss probe PTO timer after transmitting new data (that was
     //# not itself a loss probe) or upon receiving an ACK that cumulatively
@@ -730,20 +780,20 @@ impl Connection {
     //# recovery, or segments have been SACKed (i.e., RACK.segs_sacked is not
     //# zero).
     //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
-    //= reason=Partial arithmetic evidence: missing SRTT uses 500000*2 = one second before the RTO cap. Fresh-sample eligibility normally makes this fallback unreachable.
+    //= reason=Absent SRTT arms a one-second PTO capped by the unarmed RTO reference; expiry skips unsampled probes and restores RTO.
     //# Second, when there is no SRTT estimate available, the PTO SHOULD be 1
     //# second.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
-    //= reason=Optional inflation is not selected: PTO remains 2*SRTT even for a single segment; no TLP.max_ack_delay budget is modeled. This is evidence of the permitted non-inflating choice, not delayed-ACK mitigation.
+    //= reason=Single original outstanding packet adds explicit peer_max_ack_delay_us, default499999us for RFC9293 delayed ACK bound, independently of our receiver ACK policy.
     //# Third, when the FlightSize is one segment, the sender MAY inflate the
     //# PTO by TLP.max_ack_delay to accommodate a potentially delayed
     //# acknowledgment and reduce the risk of spurious retransmissions.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
-    //= reason=2*SRTT or one second, capped by current RTO; optional single-segment delay inflation omitted.
+    //= reason=One second without SRTT; otherwise 2*SRTT plus peer ACK budget for one packet. Conservatively also waits at least SRTT+peer budget for stretched/short-packet ACKs, capped by unarmed RTO reference.
     //# Summarizing these considerations in pseudocode form, a sender SHOULD
     //# use the following logic to select the duration of a PTO:
     //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
-    //= reason=2*SRTT or one second capped by RTO; permitted single-segment inflation not implemented.
+    //= reason=Implements one-second fallback, single-packet peer-delay inflation and RTO-reference cap. Larger flights conservatively floor PTO at SRTT+peer delay to mitigate stretched ACKs per section9.4.
     //# TLP_calc_PTO():
     //# If SRTT is available:
     //# PTO = 2 * SRTT
@@ -754,19 +804,32 @@ impl Connection {
     //#
     //# If Now() + PTO > TCP_RTO_expiration():
     //# PTO = TCP_RTO_expiration() - Now()
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.4
+    //= reason=Peer-delay inflation plus a conservative larger-flight floor cover delayed and stretched short-packet ACKs; PTO is still capped by the unarmed RTO reference.
+    //# To mitigate this
+    //# complication, before sending a TLP loss probe retransmission, the
+    //# sender should attempt to wait long enough that the receiver has sent
+    //# any delayed ACKs that it is withholding.
     fn schedule_tlp(&mut self) {
-        if self.tlp_eligible()
-            && self.tlp_fresh_rtt
-            && self.tlp_end.is_none()
-            && self.tlp_flight.is_none()
-            && !self.tlp_pending
-        {
-            self.tlp_deadline = self.rto_deadline.map(|rto| {
-                self.now
-                    .saturating_add(self.rtt.srtt().unwrap_or(500_000).saturating_mul(2).max(1))
-                    .min(rto)
+        if self.tlp_arm_eligible() {
+            // Short packets and stretched ACKs can delay feedback for more than
+            // one segment; section9.4 justifies the conservative larger-flight floor.
+            let pto = self.rtt.srtt().map_or(1_000_000, |srtt| {
+                let delay = if self.rack.counts().unacked == 1 {
+                    self.config.peer_max_ack_delay_us
+                } else {
+                    0
+                };
+                srtt.saturating_mul(2)
+                    .saturating_add(delay)
+                    .max(srtt.saturating_add(self.config.peer_max_ack_delay_us))
+                    .max(1)
             });
+            self.tlp_deadline = self
+                .rto_deadline
+                .map(|rto| self.now.saturating_add(pto).min(rto));
         }
+        self.select_loss_timer();
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8985#section-7.1
@@ -1514,6 +1577,7 @@ impl Connection {
         self.probe_pending = false;
         self.keepalive_pending = false;
         self.rto_deadline = None;
+        self.loss_timer = None;
         self.ack_deadline = None;
         self.persist_deadline = None;
         self.shrink_unanswered_since = None;
@@ -1607,9 +1671,10 @@ impl Connection {
 
     fn arm_work(&mut self) {
         if !self.synchronized() {
+            self.select_loss_timer();
             return;
         }
-        if !self.tlp_eligible() {
+        if !self.tlp_arm_eligible() {
             self.tlp_deadline = None;
             self.tlp_pending = false;
         }
@@ -1620,17 +1685,24 @@ impl Connection {
         //# If the window shrinks to zero, the TCP implementation MUST probe it in the
         //# standard way (described below) (MUST-35).
         if self.snd_wnd == 0 && pending {
-            if self.persist_deadline.is_none() && !self.probe_pending {
-                //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
-                //# The transmitting host SHOULD send the first zero-window probe when a
-                //# zero window has existed for the retransmission timeout period (SHLD-
-                //# 29) (Section 3.8.1),
-                if self.persist_interval == 0 {
-                    self.persist_interval = self.rto();
-                }
-                self.persist_deadline = Some(self.now.saturating_add(self.persist_interval));
+            self.rack.deadline = None;
+            if self.persist_interval == 0 {
+                self.persist_interval = self.rto();
             }
-            self.rto_deadline = None;
+            if self.flight() == 0 {
+                if self.persist_deadline.is_none() && !self.probe_pending {
+                    self.persist_deadline = Some(self.now.saturating_add(self.persist_interval));
+                }
+                self.rto_deadline = None;
+            } else {
+                // Outstanding bytes use RTO, including the required post-PTO
+                // fallback. Unsent-only work uses ZWP; both expirations probe
+                // a closed window with the same exponential backoff.
+                self.persist_deadline = None;
+                if self.rto_deadline.is_none() && !self.probe_pending {
+                    self.rto_deadline = Some(self.now.saturating_add(self.persist_interval));
+                }
+            }
         } else {
             self.persist_deadline = None;
             self.probe_pending = false;
@@ -1668,6 +1740,7 @@ impl Connection {
             self.keepalive_deadline = None;
             self.keepalive_pending = false;
         }
+        self.select_loss_timer();
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.2
@@ -2789,7 +2862,9 @@ impl Connection {
                     .update(ack, self.data_high(), &segment.options.sack_blocks);
             dsack = update.dsack;
             if update.overflow {
-                self.rack.abandon(self.data_high());
+                // SACK advice exhaustion disables inference, never timestamp
+                // retention: normal RTO still needs each latest wire boundary.
+                self.rack.deadline = None;
                 self.prr = None;
                 self.rack_entry_delivery = None;
                 let boundary = self.data_high();
@@ -2811,8 +2886,8 @@ impl Connection {
                 update.dsack,
             );
             reo_grew = self.rack.reo_grew;
-            // Splitting at ACK/SACK edges can exhaust the ledger during this
-            // call. Do not use its delivery or retain PRR after that transition.
+            // Capacity backing preserves timestamp splits. Advice fallback
+            // cannot retain a PRR epoch based on the discarded scoreboard.
             delivered = if self.rack.valid() {
                 ledger_delivery
             } else {
@@ -3267,6 +3342,9 @@ impl Connection {
             self.retx_pending = true;
         }
         self.rto_deadline = if self.flight() == 0 {
+            if self.snd_wnd == 0 && self.persist_interval != 0 {
+                self.persist_deadline = self.rto_deadline;
+            }
             None
         } else {
             Some(self.now.saturating_add(self.rto()))
@@ -4366,12 +4444,28 @@ impl Connection {
                 } else {
                     self.snd_wnd
                 };
-                packet_mss.min(window as usize).min(self.flight() as usize)
+                let boundary = if self.consecutive_timeouts != 0 {
+                    self.rack
+                        .head_transmission(seq)
+                        .map_or(self.flight(), |(end, _)| end.distance_from(seq))
+                } else {
+                    self.flight()
+                };
+                packet_mss
+                    .min(window as usize)
+                    .min(self.flight() as usize)
+                    .min(boundary as usize)
             };
             count = self.send.copy(offset, &mut self.scratch[..limit]);
             retransmitted = seq != self.snd_nxt;
             if self.fin_sequence == Some(seq.wrapping_add(count as u32))
                 && !probe
+                && (self.consecutive_timeouts == 0
+                    || count == 0
+                    || self
+                        .rack
+                        .head_transmission(seq)
+                        .is_some_and(|(_, sent)| self.fin_sent_at.is_some_and(|fin| fin <= sent)))
                 && self.snd_wnd > count as u32
             {
                 flags |= FIN;
@@ -4812,13 +4906,13 @@ impl Connection {
         if flags & ACK != 0 {
             self.sack_omit = false;
         }
-        if count != 0 && !syn && !keepalive && !probe {
+        if count != 0 && !syn && !keepalive {
             self.rack
                 .transmit(seq, seq.wrapping_add(count as u32), now, retransmitted);
             if !self.rack.valid() {
                 self.prr = None;
                 self.rack_entry_delivery = None;
-            } else if let Some(prr) = &mut self.prr {
+            } else if !probe && let Some(prr) = &mut self.prr {
                 prr.sent(count as u32);
             }
         }
@@ -4964,6 +5058,9 @@ impl Connection {
         if timestamp.is_some() {
             self.last_timestamp_sent_at = Some(now);
         }
+        if flags & FIN != 0 {
+            self.fin_sent_at = Some(now);
+        }
         if new_fin {
             self.fin_sequence = Some(seq.wrapping_add(count as u32));
             self.state = if self.state == State::CloseWait {
@@ -4990,7 +5087,11 @@ impl Connection {
             //# 29) (Section 3.8.1), and SHOULD increase exponentially the interval
             //# between successive probes (SHLD-30).
             self.persist_interval = self.persist_interval.saturating_mul(2).min(60_000_000);
-            self.persist_deadline = Some(now.saturating_add(self.persist_interval));
+            if self.flight() != 0 {
+                self.rto_deadline = Some(now.saturating_add(self.persist_interval));
+            } else {
+                self.persist_deadline = Some(now.saturating_add(self.persist_interval));
+            }
         }
         if keepalive {
             self.keepalive_pending = false;
@@ -5007,7 +5108,7 @@ impl Connection {
                 // RFC 6675 repeats SetPipe across output polls for this ACK.
                 // Reno and the RACK/PRR profiles retain one-packet credit.
                 self.limited_pending = self.sack_recovery_enabled()
-                    && !self.config.rack
+                    && !self.rack_enabled()
                     && !self.config.prr
                     && self
                         .congestion
@@ -5033,12 +5134,9 @@ impl Connection {
 
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         [
-            self.rack.deadline,
-            self.tlp_deadline,
-            self.rto_deadline,
+            self.loss_timer.map(|(_, deadline)| deadline),
             self.ecn_pause,
             self.ack_deadline,
-            self.persist_deadline,
             self.sws_deadline,
             self.time_wait_deadline,
             self.keepalive_deadline,
@@ -5091,7 +5189,7 @@ impl Connection {
     //# initiated until HighACK is greater than or equal to the new value of
     //# RecoveryPoint.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
-    //= reason=Services the RACK deadline by re-running detect_rack; RTO takes priority if already due.
+    //= reason=Services only the selected RACK timer by re-running detect_rack; the retained RTO expiration is an unarmed fallback reference.
     //# For timely loss detection, it is RECOMMENDED that the
     //# sender install a reordering timer.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
@@ -5099,12 +5197,12 @@ impl Connection {
     //# When the PTO timer expires, the sender MUST check whether both of the
     //# following conditions are met before sending a loss probe:
     //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
-    //= reason=At PTO expiration failed send eligibility leaves no pending probe and rearms RTO for nonzero/nonzero-window flight.
+    //= reason=At PTO expiration failed send eligibility leaves no pending probe and rearms the selected RTO for every outstanding flight, including a zero window.
     //# If either one of these two conditions is not met, then the sender
     //# MUST skip sending a loss probe and MUST proceed to re-arm the RTO
     //# timer, as specified at the end of this section.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
-    //= reason=PTO expiry rearms RTO before attempting output when flight and window are nonzero; successful probe commit rearms again.
+    //= reason=PTO expiry rearms RTO before attempting output whenever flight is nonzero; successful probe commit rearms again. Zero-window RTO expiration probes flow control without a congestion response.
     //# After attempting to send a loss probe, regardless of whether a loss
     //# probe was sent, the sender MUST re-arm the RTO timer, not the PTO
     //# timer, if the FlightSize is not zero.
@@ -5117,27 +5215,27 @@ impl Connection {
     //#
     //#    DeliveredData = change_in(snd.una) + change_in(SACKd)
     //#    prr_delivered += DeliveredData
-    // Partial evidence only; TODO remains. Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    // Selected RTO enforces latest wire-span boundary and elapsed age before loss/backoff; output failure preserves pending state, and successful commit rearms. Global sampling/floor profile obligations remain separate.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-1
-    //= reason=Partial evidence only; TODO remains. Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //= reason=Selected RTO enforces latest wire-span boundary and elapsed age before loss/backoff; output failure preserves pending state, and successful commit rearms. Global sampling/floor profile obligations remain separate.
     //# However, a TCP MUST NOT be more aggressive than the following algorithms allow.
-    // Partial evidence only; TODO remains. Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    // Selected RTO enforces latest wire-span boundary and elapsed age before loss/backoff; output failure preserves pending state, and successful commit rearms. Global sampling/floor profile obligations remain separate.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-5
-    //= reason=Partial evidence only; TODO remains. Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //= reason=Selected RTO enforces latest wire-span boundary and elapsed age before loss/backoff; output failure preserves pending state, and successful commit rearms. Global sampling/floor profile obligations remain separate.
     //# An implementation MUST manage the retransmission timer(s) in such a way that a segment
     //# is never retransmitted too early, i.e., less than one RTO after the previous
     //# transmission of that segment.
-    // Partial evidence only; TODO remains. Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    // Selected RTO enforces latest wire-span boundary and elapsed age before loss/backoff; output failure preserves pending state, and successful commit rearms. Global sampling/floor profile obligations remain separate.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-5
-    //= reason=Partial evidence only; TODO remains. Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //= reason=Selected RTO enforces latest wire-span boundary and elapsed age before loss/backoff; output failure preserves pending state, and successful commit rearms. Global sampling/floor profile obligations remain separate.
     //# The following is the RECOMMENDED algorithm for managing the retransmission timer:
     // Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-5
     //= reason=Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
     //# (5.5) The host MUST set RTO <- RTO * 2 ("back off the timer").
-    // Partial evidence only; TODO remains. Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    // Selected RTO enforces latest wire-span boundary and elapsed age before loss/backoff; output failure preserves pending state, and successful commit rearms. Global sampling/floor profile obligations remain separate.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-5
-    //= reason=Partial evidence only; TODO remains. Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
+    //= reason=Selected RTO enforces latest wire-span boundary and elapsed age before loss/backoff; output failure preserves pending state, and successful commit rearms. Global sampling/floor profile obligations remain separate.
     //# (5.7) If the timer expires awaiting the ACK of a SYN segment and the TCP
     //# implementation is using an RTO less than 3 seconds, the RTO MUST be re-initialized to
     //# 3 seconds when data transmission begins (i.e., after the three-way handshake
@@ -5173,6 +5271,10 @@ impl Connection {
         self.check_time(now)?;
         self.now = now;
         self.retransmit_burst = None;
+        let expired_loss = self
+            .loss_timer
+            .filter(|&(_, deadline)| now >= deadline)
+            .map(|(timer, _)| timer);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.8
         //= reason=Closes protocol state here; terminal handle storage is reclaimed on release.
         //# If the time-wait timeout expires on a connection, delete the TCB, enter the
@@ -5199,7 +5301,7 @@ impl Connection {
         if due(self.ecn_pause, now) {
             self.ecn_pause = None;
         }
-        if due(self.rack.deadline, now) && !due(self.rto_deadline, now) {
+        if expired_loss == Some(LossTimer::Rack) {
             let delivery = self
                 .rack_entry_delivery
                 .take()
@@ -5215,17 +5317,38 @@ impl Connection {
         }
         // PTO takes precedence at an RTO-capped tie. Attempts do not back off
         // RTO or reduce cwnd; only successfully encoded probes consume state.
-        if due(self.tlp_deadline, now) {
+        if expired_loss == Some(LossTimer::Pto) {
             self.tlp_deadline = None;
             self.tlp_pending = self.tlp_eligible()
                 && self.tlp_fresh_rtt
                 && self.tlp_end.is_none()
                 && self.tlp_flight.is_none();
-            if self.flight() != 0 && self.snd_wnd != 0 {
+            if self.flight() != 0 {
                 self.rto_deadline = Some(now.saturating_add(self.rto()));
             }
         }
-        if due(self.rto_deadline, now) {
+        let head_sent = self
+            .rack
+            .head_transmission(self.snd_una)
+            .map(|(_, sent)| sent)
+            .or_else(|| {
+                (self.fin_sequence == Some(self.snd_una))
+                    .then_some(self.fin_sent_at)
+                    .flatten()
+            });
+        if expired_loss == Some(LossTimer::Rto) && self.synchronized() && self.snd_wnd == 0 {
+            // Unacknowledged flight retains the post-PTO RTO. Its expiration
+            // probes the closed window without treating flow control as loss.
+            self.rto_deadline = None;
+            self.probe_pending = true;
+            if self.persist_interval == 0 {
+                self.persist_interval = self.rto();
+            }
+        } else if expired_loss == Some(LossTimer::Rto)
+            && head_sent.is_some_and(|sent| now.saturating_sub(sent) < self.rto())
+        {
+            self.rto_deadline = head_sent.map(|sent| sent.saturating_add(self.rto()));
+        } else if expired_loss == Some(LossTimer::Rto) {
             self.reset_tlp();
             self.prr = None;
             self.rack_entry_delivery = None;
@@ -5278,7 +5401,7 @@ impl Connection {
         if due(self.ack_deadline, now) {
             self.immediate_ack();
         }
-        if due(self.persist_deadline, now) {
+        if expired_loss == Some(LossTimer::Zwp) {
             self.persist_deadline = None;
             self.probe_pending = true;
         }
@@ -5301,6 +5424,7 @@ impl Connection {
                 self.keepalive_pending = true;
             }
         }
+        self.select_loss_timer();
         Ok(())
     }
 }
@@ -5309,6 +5433,363 @@ impl Connection {
 mod tests {
     use super::*;
     use alloc::{vec, vec::Vec};
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-8
+    //= type=test
+    //# The RACK reordering timer, the TLP PTO timer, the RTO, and Zero
+    //# Window Probe (ZWP) timer [RFC793] are mutually exclusive and are used
+    //# in different scenarios.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-8
+    //= type=test
+    //# When arming a RACK reordering timer or TLP
+    //# PTO timer, the sender SHOULD cancel any other pending timers.
+    fn selected_loss_timer_transition_matrix_and_independent_ack() {
+        let (mut a, _) = tlp_pair(0);
+        assert_eq!(a.loss_timer, None);
+        a.write(&[1; 4000]).unwrap();
+        for _ in 0..4 {
+            packet(&mut a, 100_000);
+        }
+        assert_eq!(a.loss_timer, Some((LossTimer::Pto, 300_000)));
+        assert_eq!(a.rto_deadline, Some(400_000)); // unarmed reference
+        a.ack_deadline = Some(150_000);
+        assert_eq!(a.next_deadline(), Some(150_000));
+        a.timeout(150_000).unwrap();
+        assert!(a.ack_pending);
+        assert_eq!(a.loss_timer, Some((LossTimer::Pto, 300_000)));
+        packet(&mut a, 150_000);
+        rack_sack(&mut a, 200_000, 0, &[(3000, 4000)]);
+        assert_eq!(a.loss_timer, Some((LossTimer::Rack, 225_000)));
+        assert_eq!(a.tlp_deadline, None);
+        a.timeout(225_000).unwrap();
+        assert_eq!(a.loss_timer, Some((LossTimer::Rto, 400_000)));
+        assert_eq!(
+            a.transmit(225_000, &mut [0; 19]),
+            Err(Error::OutputTooSmall)
+        );
+        assert_eq!(a.loss_timer, Some((LossTimer::Rto, 400_000)));
+        packet(&mut a, 225_000);
+        let rto = a.rto();
+        let rto_expiry = 225_000 + rto;
+        let seq = a.receive.next();
+        let una = a.snd_una;
+        inject(&mut a, 226_000, seq, una, ACK, 0, &[]);
+        assert_eq!(a.loss_timer, Some((LossTimer::Rto, rto_expiry)));
+        assert_eq!(a.persist_deadline, None);
+        let cwnd = a.congestion.cwnd();
+        a.timeout(rto_expiry).unwrap();
+        assert!(a.probe_pending);
+        assert_eq!(a.loss_timer, None);
+        packet(&mut a, rto_expiry);
+        assert_eq!(a.congestion.cwnd(), cwnd); // flow control is not congestion
+        assert_eq!(a.loss_timer, Some((LossTimer::Rto, rto_expiry + 2 * rto)));
+        let high = a.snd_nxt;
+        inject(&mut a, rto_expiry + 1, seq, high, ACK, 0, &[]);
+        assert_eq!(a.loss_timer, None);
+        a.write(b"x").unwrap();
+        assert_eq!(a.loss_timer.unwrap().0, LossTimer::Zwp);
+        let expiry = a.loss_timer.unwrap().1;
+        a.timeout(expiry).unwrap();
+        assert_eq!(a.transmit(expiry, &mut [0; 20]), Err(Error::OutputTooSmall));
+        assert_eq!(a.loss_timer, None);
+        packet(&mut a, expiry);
+        assert_eq!(a.loss_timer.unwrap().0, LossTimer::Rto); // now outstanding
+        let high = a.snd_nxt;
+        inject(&mut a, expiry + 1, seq, high, ACK, 64, &[]);
+        assert_eq!(a.loss_timer, None);
+        a.shutdown().unwrap();
+        packet(&mut a, expiry + 2);
+        assert_eq!(a.state, State::FinWait1);
+        assert_eq!(a.loss_timer.unwrap().0, LossTimer::Rto);
+        a.time_wait();
+        assert_eq!(a.loss_timer, None);
+        assert_eq!(a.next_deadline(), a.time_wait_deadline);
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
+    //= type=test
+    //# Second, when there is no SRTT estimate available, the PTO SHOULD be 1
+    //# second.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= type=test
+    //# If either one of these two conditions is not met, then the sender
+    //# MUST skip sending a loss probe and MUST proceed to re-arm the RTO
+    //# timer, as specified at the end of this section.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= type=test
+    //# After attempting to send a loss probe, regardless of whether a loss
+    //# probe was sent, the sender MUST re-arm the RTO timer, not the PTO
+    //# timer, if the FlightSize is not zero.
+    fn pto_arming_is_independent_of_expiry_gates_and_restores_rto() {
+        for gate in 0..4 {
+            let (mut a, _) = tlp_pair(0);
+            if gate == 0 {
+                a.rtt = RttEstimator::new(1_000_000);
+                a.tlp_fresh_rtt = false;
+            }
+            a.write(&[1; 1000]).unwrap();
+            packet(&mut a, 100_000);
+            if gate == 1 {
+                a.tlp_fresh_rtt = false;
+            }
+            if gate == 2 {
+                a.tlp_end = Some((a.snd_una, a.snd_nxt, true));
+            }
+            let expiry = a.tlp_deadline.unwrap();
+            assert_eq!(expiry, if gate == 0 { 1_100_000 } else { 300_000 });
+            if gate == 3 {
+                // Already-armed PTO observes a zero window at expiry; RTO is
+                // mandatory even though its eventual output is a window probe.
+                a.snd_wnd = 0;
+            }
+            let now = expiry + 1_000_000; // elapsed unarmed RTO must not also fire
+            let rto = a.rto();
+            a.timeout(now).unwrap();
+            assert!(!a.tlp_pending);
+            assert!(!a.retx_pending);
+            assert_eq!(a.rto(), rto);
+            assert_eq!(a.loss_timer, Some((LossTimer::Rto, now + rto)));
+            assert_eq!(a.transmit(now, &mut [0; 2000]), Ok(None));
+        }
+        // Scheduling also occurs with an old probe still tracked, and uses
+        // the reference cap without arming that reference as a second timer.
+        let (mut a, _) = tlp_pair(0);
+        a.tlp_end = Some((a.snd_una, a.snd_una.wrapping_add(1), true));
+        a.write(&[1; 1000]).unwrap();
+        packet(&mut a, 100_000);
+        a.rto_deadline = Some(150_000);
+        a.schedule_tlp();
+        assert_eq!(a.loss_timer, Some((LossTimer::Pto, 150_000)));
+        a.timeout(150_000).unwrap();
+        assert!(!a.tlp_pending);
+        assert_eq!(a.loss_timer, Some((LossTimer::Rto, 450_000)));
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.4
+    //= type=test
+    //# To mitigate this
+    //# complication, before sending a TLP loss probe retransmission, the
+    //# sender should attempt to wait long enough that the receiver has sent
+    //# any delayed ACKs that it is withholding.
+    fn pto_peer_ack_budget_covers_delayed_and_stretched_short_packets() {
+        for stretched in [false, true] {
+            let (mut a, _) = tlp_pair(0);
+            a.config.peer_max_ack_delay_us = 499_999;
+            a.config.rto_min_us = 1_000_000;
+            a.rtt = RttEstimator::new(1_000_000);
+            a.rtt.sample(100_000);
+            a.set_nagle(false);
+            a.write(&[1; 300]).unwrap();
+            packet(&mut a, 100_000);
+            if stretched {
+                a.write(&[2; 300]).unwrap();
+                packet(&mut a, 100_001);
+            }
+            let deadline = a.loss_timer.unwrap().1;
+            assert!(deadline >= 600_000);
+            a.timeout(599_999).unwrap();
+            assert!(!a.tlp_pending);
+            let next = a.receive.next();
+            let ack = a.snd_nxt;
+            inject(&mut a, 600_000, next, ack, ACK, 16_000, &[]);
+            assert_eq!(a.loss_timer, None);
+            assert_eq!(a.tlp_end, None);
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= type=test
+    //# An implementation MUST manage the retransmission timer(s) in such a way that a segment
+    //# is never retransmitted too early, i.e., less than one RTO after the previous
+    //# transmission of that segment.
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= type=test
+    //= reason=First-send arming, advancing-ACK restart, running new-data nonrestart, earliest wire-span retry, output rollback and last-emission age are asserted; window probing/selected timer transitions are separately covered.
+    //# The following is the RECOMMENDED algorithm for managing the
+    //# retransmission timer:
+    fn rto_variable_packets_partial_ack_fresh_tail_and_failed_output() {
+        for iss in [100, u32::MAX - 3] {
+            for floor in [100_000, 1_000_000] {
+                for mode in 0..3 {
+                    let mut cfg = config(64, 8);
+                    cfg.rto_min_us = floor;
+                    cfg.sack = mode != 0;
+                    cfg.rack = mode == 2;
+                    let (mut a, _) = pair(cfg, iss);
+                    a.set_nagle(false);
+                    a.write(b"abcde").unwrap();
+                    packet(&mut a, 40);
+                    let seq = a.receive.next();
+                    let partial = a.snd_una.wrapping_add(2);
+                    inject(&mut a, 50, seq, partial, ACK, 64, &[]);
+                    let expiry = a.rto_deadline.unwrap();
+                    a.write(b"fgh").unwrap();
+                    packet(&mut a, expiry - 1);
+                    assert_eq!(a.loss_timer, Some((LossTimer::Rto, expiry)));
+                    a.timeout(expiry - 1).unwrap();
+                    assert!(!a.retx_pending);
+                    let old_rto = a.rto();
+                    a.timeout(expiry).unwrap();
+                    let before = (
+                        a.loss_timer,
+                        a.now,
+                        a.rack.head_transmission(partial),
+                        a.sample,
+                    );
+                    assert_eq!(
+                        a.transmit(expiry + 1, &mut [0; 22]),
+                        Err(Error::OutputTooSmall)
+                    );
+                    assert_eq!(
+                        (
+                            a.loss_timer,
+                            a.now,
+                            a.rack.head_transmission(partial),
+                            a.sample
+                        ),
+                        before
+                    );
+                    let bytes = packet(&mut a, expiry + 1);
+                    let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+                    assert_eq!(seg.payload, b"cde");
+                    assert_eq!(seg.header.sequence, partial.0);
+                    assert!(expiry + 1 - 40 >= old_rto);
+                    let tail = partial.wrapping_add(3);
+                    assert_eq!(a.rack.head_transmission(tail).unwrap().1, expiry - 1);
+                    inject(&mut a, expiry + 2, seq, tail, ACK, 64, &[]);
+                    let expiry2 = a.loss_timer.unwrap().1;
+                    let interval = a.rto();
+                    a.timeout(expiry2 - 1).unwrap();
+                    assert!(!a.retx_pending);
+                    a.timeout(expiry2).unwrap();
+                    let bytes = packet(&mut a, expiry2);
+                    assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, b"fgh");
+                    assert!(expiry2 - (expiry - 1) >= interval);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pto_new_data_fin_and_closing_ack_keep_loss_timer() {
+        for close_wait in [false, true] {
+            let (mut a, _) = tlp_pair(0);
+            if close_wait {
+                a.state = State::CloseWait;
+            }
+            a.write(b"closing").unwrap();
+            a.shutdown().unwrap();
+            packet(&mut a, 100_000);
+            assert_eq!(
+                a.state,
+                if close_wait {
+                    State::LastAck
+                } else {
+                    State::FinWait1
+                }
+            );
+            assert_eq!(a.loss_timer.unwrap().0, LossTimer::Pto);
+            if !close_wait {
+                a.state = State::Closing;
+            }
+            let next = a.receive.next();
+            let ack = a.snd_una.wrapping_add(1);
+            inject(&mut a, 110_000, next, ack, ACK, 16_000, &[]);
+            assert_eq!(a.loss_timer.unwrap().0, LossTimer::Pto);
+            let expiry = a.loss_timer.unwrap().1;
+            a.timeout(expiry).unwrap();
+            let bytes = packet(&mut a, expiry);
+            assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, b"losing");
+            assert_eq!(a.loss_timer.unwrap().0, LossTimer::Rto);
+        }
+    }
+
+    #[test]
+    fn rto_reference_cannot_retransmit_fresh_data_or_fin_or_starve_ack_timer() {
+        for fin in [false, true] {
+            let (mut a, _) = pair(config(64, 8), 100);
+            if fin {
+                a.shutdown().unwrap();
+            } else {
+                a.write(b"abc").unwrap();
+            }
+            packet(&mut a, 40);
+            let rto = a.rto();
+            // A stale reference (for example after RTT growth on SACK feedback)
+            // cannot bypass the latest successful emission's elapsed-age gate.
+            a.rto_deadline = Some(50);
+            a.ack_deadline = Some(50);
+            a.select_loss_timer();
+            a.timeout(50).unwrap();
+            assert!(a.ack_pending);
+            assert!(!a.retx_pending);
+            assert_eq!(a.rto(), rto);
+            assert_eq!(a.loss_timer, Some((LossTimer::Rto, 40 + rto)));
+            packet(&mut a, 50); // independent ACK, not an early retransmission
+            a.timeout(40 + rto - 1).unwrap();
+            assert!(!a.retx_pending);
+            a.timeout(40 + rto).unwrap();
+            assert!(a.retx_pending);
+            let bytes = packet(&mut a, 40 + rto);
+            let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+            if fin {
+                assert_ne!(seg.header.flags & FIN, 0);
+            } else {
+                assert_eq!(seg.payload, b"abc");
+            }
+        }
+    }
+
+    #[test]
+    fn unrepresentable_clock_minimum_disables_rack_tlp_but_keeps_sack_recovery() {
+        for minimum in 1..=5 {
+            let cfg = ConnectionConfig {
+                sack: true,
+                rack: true,
+                tlp: true,
+                peer_max_ack_delay_us: 0,
+                initial_window: InitialWindow::Iw10,
+                ..config(16_000, 1000)
+            };
+            let (mut a, _) = pair(cfg, 0);
+            a.write(&[1; 8000]).unwrap();
+            for _ in 0..8 {
+                packet(&mut a, 100_000);
+            }
+            assert!(a.rack_enabled());
+            rack_sack(&mut a, 100_000 + minimum, 1000, &[]);
+            assert_eq!(a.rack.clock_compatible(1), minimum > 4);
+            assert_eq!(a.rack_enabled(), minimum > 4);
+            assert!(a.rack.valid());
+            assert_eq!(a.rack.head_transmission(a.snd_una).unwrap().1, 100_000);
+            assert_eq!(
+                a.loss_timer.unwrap().0,
+                if minimum > 4 {
+                    LossTimer::Pto
+                } else {
+                    LossTimer::Rto
+                }
+            );
+            if minimum <= 4 {
+                rack_sack(&mut a, 100_010, 1000, &[(2000, 3000)]);
+                rack_sack(&mut a, 100_011, 1000, &[(2000, 4000)]);
+                rack_sack(&mut a, 100_012, 1000, &[(2000, 5000)]);
+                assert!(a.sack_recovery.is_some());
+                assert_eq!(a.rack.deadline, None);
+                assert_eq!(a.tlp_deadline, None);
+                let bytes = packet(&mut a, 100_012);
+                assert_eq!(
+                    wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+                    1001
+                );
+                assert!(a.rack.valid());
+            }
+        }
+    }
 
     fn config(capacity: usize, mss: u16) -> ConnectionConfig {
         ConnectionConfig {
@@ -7585,6 +8066,7 @@ mod tests {
             rack: true,
             prr: true,
             tlp: true,
+            peer_max_ack_delay_us: 0,
             rto_min_us: 200_000,
             ..config(65_536, 1000)
         };
@@ -7660,6 +8142,7 @@ mod tests {
                 rack: true,
                 prr: true,
                 tlp: true,
+                peer_max_ack_delay_us: 0,
                 rto_min_us: 200_000,
                 initial_window: InitialWindow::Iw10,
                 ..config(65_536, 1000)
@@ -8003,7 +8486,7 @@ mod tests {
                 }
                 a.write(&[0x66; 1000]).unwrap();
                 packet(&mut a, 400_002);
-                assert_eq!(a.tlp_deadline, None); // no fresh RTT, no second probe
+                assert_eq!(a.loss_timer.unwrap().0, LossTimer::Pto); // arming is separate from send eligibility
                 rack_sack(&mut a, 500_002, 5000, &[]);
                 assert_eq!(a.tlp_end, None);
                 assert_eq!(
@@ -8101,8 +8584,8 @@ mod tests {
             assert!(a.tlp_pending);
             if mode == 0 {
                 inject_sack(&mut a, 300_001, Seq(901), Seq(1), ACK, 0, &[], &[]);
-                assert!(a.persist_deadline.is_some());
-                assert_eq!(a.rto_deadline, None);
+                assert!(a.persist_deadline.is_none());
+                assert_eq!(a.loss_timer.unwrap().0, LossTimer::Rto);
             } else if mode == 1 {
                 rack_sack(&mut a, 300_001, 0, &[(3000, 4000)]);
                 assert_eq!(a.rack.counts().sacked, 1);
@@ -8159,6 +8642,7 @@ mod tests {
             sack: true,
             rack: true,
             tlp: true,
+            peer_max_ack_delay_us: 0,
             rto_min_us: 200_000,
             ..config(65_536, 1000)
         };
@@ -8177,7 +8661,7 @@ mod tests {
         a.write(&[0x55; 1000]).unwrap();
         deliver(&mut a, &mut b, 1_100_000);
         assert_eq!(a.rto_deadline, Some(4_100_000));
-        assert_eq!(a.tlp_deadline, None);
+        assert_eq!(a.tlp_deadline, Some(2_100_000)); // unsampled PTO is armed
         b.timeout(1_300_000).unwrap();
         deliver(&mut b, &mut a, 1_300_000);
         assert!(!a.syn_timed_out);
@@ -8250,6 +8734,7 @@ mod tests {
         for (sack, rack) in [(false, false), (true, false), (false, true)] {
             let cfg = ConnectionConfig {
                 tlp: true,
+                peer_max_ack_delay_us: 0,
                 sack,
                 rack,
                 ..config(4096, 1000)
@@ -8273,7 +8758,7 @@ mod tests {
         a.tlp_fresh_rtt = false;
         a.write(&[0x55; 1000]).unwrap();
         packet(&mut a, 100_000);
-        assert_eq!(a.tlp_deadline, None);
+        assert_eq!(a.tlp_deadline, Some(300_000));
         a.tlp_fresh_rtt = true;
         a.rto_deadline = Some(150_000);
         a.schedule_tlp();
@@ -8335,7 +8820,8 @@ mod tests {
             for i in 0..65 {
                 rack_sack(&mut a, 226_000, 0, &[(i * 2, i * 2 + 1)]);
             }
-            assert!(!a.rack.valid());
+            assert!(a.rack.valid()); // timestamps survive advice exhaustion
+            assert!(!a.rack_enabled());
             assert!(a.prr.is_none());
             assert!(a.rack_entry_delivery.is_none());
             assert!(a.sack_recovery.is_none());
@@ -8399,8 +8885,8 @@ mod tests {
             inject(&mut a, 226_000, seq, una, ACK, 0, &[]);
             let before = a.prr.unwrap();
             assert_eq!(before.credit(), 0);
-            assert!(a.rto_deadline.is_none());
-            let persist = a.persist_deadline.unwrap();
+            assert_eq!(a.loss_timer.unwrap().0, LossTimer::Rto);
+            let persist = a.loss_timer.unwrap().1;
             a.timeout(persist).unwrap();
             assert!(a.probe_pending);
             assert!(a.prr.is_some());
@@ -8905,7 +9391,9 @@ mod tests {
         for i in 0..65 {
             rack_sack(&mut a, 200_001 + i as u64, 0, &[(i * 2, i * 2 + 1)]);
         }
-        assert!(!a.rack.valid());
+        assert!(a.rack.valid()); // do not discard per-byte timestamps
+        assert!(!a.rack_enabled());
+        assert!(a.rack.head_transmission(a.snd_una).is_some());
         assert_eq!(a.rack_entry_delivery, None);
         assert!(a.prr.is_none());
     }
@@ -9111,11 +9599,11 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc6937#section-2
     //= type=test
-    //= reason=Ledger split exhaustion cancels active PRR and retained delivery before fallback ACK accounting; signed delivery equality is claimed only for valid active epochs.
+    //= reason=Capacity-backed ledger preserves delivery attribution and active PRR across more than256 original packets and partial ACK splits; no PRR algorithm change.
     //# With SACK,
     //# DeliveredData can be computed precisely as the change in snd.una,
     //# plus the (signed) change in SACKd.
-    fn rack_ack_split_overflow_disables_active_prr_and_uses_byte_pipe_fallback() {
+    fn rack_ack_splits_preserve_active_prr_beyond_old_ledger_limit() {
         for iss in [0, u32::MAX - 99] {
             let (mut a, _) = tlp_pair(iss);
             a.set_nagle(false);
@@ -9127,27 +9615,14 @@ mod tests {
                 packet(&mut a, 100_000);
             }
             assert_eq!(a.rack.counts().unacked, 256);
-            assert!(a.rack.valid());
             assert!(a.start_sack_recovery());
-            assert!(a.prr.is_some());
-            assert!(a.rack_entry_delivery.is_none());
-            // Cumulative ACK cuts the first actual two-byte segment; the SACK
-            // simultaneously supplies one byte of fallback delivery at the tail.
             rack_sack(&mut a, 200_000, 1, &[(256, 257)]);
-            assert!(!a.rack.valid());
-            assert!(a.prr.is_none());
-            assert!(a.rack_entry_delivery.is_none());
+            assert!(a.rack.valid());
+            assert!(a.prr.is_some());
             assert_eq!(a.snd_una, base.wrapping_add(1));
             assert_eq!(a.flight(), 256);
             assert_eq!(a.scoreboard.unsacked_bytes(a.snd_una, a.data_high()), 255);
-            let recovery = a.sack_recovery.unwrap();
-            assert_eq!(
-                recovery.pipe,
-                a.scoreboard
-                    .pipe(a.snd_una, a.data_high(), recovery.high_rxt, a.mss as u32)
-            );
-            assert_eq!(a.tlp_deadline, None);
-            assert_eq!(a.tlp_end, None);
+            assert_eq!(a.rack.head_transmission(a.snd_una).unwrap().1, 100_000);
         }
     }
 
@@ -11275,7 +11750,7 @@ mod tests {
                     &[],
                 );
                 let deadline = if probing {
-                    a.persist_deadline
+                    a.loss_timer.map(|(_, deadline)| deadline)
                 } else {
                     a.keepalive_deadline
                 }
@@ -12289,10 +12764,10 @@ mod tests {
     //# (i.e., SEND buffer should be returned with "ok" response). If the ACK is a duplicate
     //# (SEG.ACK =< SND.UNA), it can be ignored. If the ACK acks something not yet sent (SEG.ACK
     //# > SND.NXT), then send an ACK, drop the segment, and return.
-    // Partial evidence only; TODO remains. Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    // Partial-ACK/wrap trace verifies successful emission times and original packet boundaries; rto_variable_packets_partial_ack_fresh_tail_and_failed_output also covers configured floors and SACK/RACK.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-5
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    //= reason=Partial-ACK/wrap trace verifies successful emission times and original packet boundaries; rto_variable_packets_partial_ack_fresh_tail_and_failed_output also covers configured floors and SACK/RACK.
     //# An implementation MUST manage the retransmission timer(s) in such a way that a segment
     //# is never retransmitted too early, i.e., less than one RTO after the previous
     //# transmission of that segment.
@@ -12301,10 +12776,10 @@ mod tests {
     //= type=test
     //= reason=Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
     //# (5.5) The host MUST set RTO <- RTO * 2 ("back off the timer").
-    // Partial evidence only; TODO remains. Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    // Partial-ACK/wrap trace verifies successful emission times and original packet boundaries; rto_variable_packets_partial_ack_fresh_tail_and_failed_output also covers configured floors and SACK/RACK.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-5
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    //= reason=Partial-ACK/wrap trace verifies successful emission times and original packet boundaries; rto_variable_packets_partial_ack_fresh_tail_and_failed_output also covers configured floors and SACK/RACK.
     //# (5.1) Every time a packet containing data is sent (including a retransmission), if the
     //# timer is not running, start it running so that it will expire after RTO seconds (for
     //# the current value of RTO).
@@ -12314,10 +12789,10 @@ mod tests {
     //= reason=Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
     //# (5.2) When all outstanding data has been acknowledged, turn off the retransmission
     //# timer.
-    // Partial evidence only; TODO remains. Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    // Partial-ACK/wrap trace verifies successful emission times and original packet boundaries; rto_variable_packets_partial_ack_fresh_tail_and_failed_output also covers configured floors and SACK/RACK.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-5
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
+    //= reason=Partial-ACK/wrap trace verifies successful emission times and original packet boundaries; rto_variable_packets_partial_ack_fresh_tail_and_failed_output also covers configured floors and SACK/RACK.
     //# (5.3) When an ACK is received that acknowledges new data, restart the retransmission
     //# timer so that it will expire after RTO seconds (for the current value of RTO).
     // Ordinary non-SACK RTO with partial cumulative ACK and sequence wrap.
@@ -12380,7 +12855,7 @@ mod tests {
         let bytes = packet(&mut a, second);
         let seg = wire::parse(ip(tuple()), &bytes).unwrap();
         assert_eq!(seg.header.sequence, ack.0);
-        assert_eq!(seg.payload, b"defghijk");
+        assert_eq!(seg.payload, b"defgh"); // fresh tail is only 1us old
         assert_eq!(second - deadline, interval);
         assert_eq!(a.rto_deadline, Some(second + a.rto()));
         // Separately exercise actual two-peer loss recovery.
@@ -12708,7 +13183,7 @@ mod tests {
         assert_eq!(a.snd_wnd, 0);
         a.write(b"efgh").unwrap();
         for _ in 0..3 {
-            let when = a.persist_deadline.unwrap();
+            let when = a.loss_timer.unwrap().1;
             a.timeout(when).unwrap();
             deliver(&mut a, &mut b, when);
             deliver(&mut b, &mut a, when);
@@ -12717,7 +13192,7 @@ mod tests {
         assert_eq!(b.read(&mut [0; 4]), Ok(4));
         let when = a.now + 10;
         let _lost = packet(&mut b, when);
-        let when = a.persist_deadline.unwrap();
+        let when = a.loss_timer.unwrap().1;
         // No timeout while waiting to send a probe, even when persist
         // backoff exceeds the configured data timeout.
         assert_eq!(a.user_deadline(), None);
@@ -13872,7 +14347,7 @@ mod tests {
         let first_rto = a.rto();
         assert_eq!(a.persist_interval, first_rto);
         assert_eq!(a.persist_deadline, Some(a.now + first_rto));
-        let deadline = a.persist_deadline.unwrap();
+        let deadline = a.loss_timer.unwrap().1;
         a.arm_work();
         assert_eq!(a.persist_deadline, Some(deadline));
         a.timeout(deadline).unwrap();
@@ -13886,7 +14361,7 @@ mod tests {
         assert_eq!(a.persist_interval, first_rto);
         packet(&mut a, deadline);
         assert_eq!(a.persist_interval, 2 * first_rto);
-        let second = a.persist_deadline.unwrap();
+        let second = a.loss_timer.unwrap().1;
         // A responsive, still-closed window must not restart the backoff.
         let ack = a.snd_nxt;
         inject(&mut a, deadline + 1, next, ack, ACK, 0, b"");
@@ -14138,12 +14613,9 @@ mod tests {
             }
             inject(&mut a, 16_000_001, next, una, ACK, 64, b"");
             assert_eq!(a.user_deadline(), Some(21_000_001));
-            // Reopening lets the pending retransmission recover the entire flight.
+            // Reopening retries the latest head transmission, not untouched bytes.
             let bytes = packet(&mut a, 16_000_001);
-            assert_eq!(
-                wire::parse(ip(tuple()), &bytes).unwrap().payload,
-                b"abcdefgh"
-            );
+            assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, b"abc");
             assert_eq!(a.snd_nxt, high);
             // ACK only the original flight; the unsent tail survived the shrink.
             inject(&mut a, 16_000_002, next, high, ACK, 64, b"");
@@ -14636,7 +15108,7 @@ mod tests {
                     }
                     now = match work {
                         "tlp" => a.tlp_deadline.unwrap(),
-                        "persist" => a.persist_deadline.unwrap(),
+                        "persist" => a.loss_timer.unwrap().1,
                         _ => a.rto_deadline.unwrap(),
                     };
                     a.timeout(now).unwrap();
@@ -15023,7 +15495,7 @@ mod tests {
         assert_eq!(b.advertised_edge, edge);
         a.write(b"efgh").unwrap();
         for _ in 0..10 {
-            let deadline = a.persist_deadline.unwrap();
+            let deadline = a.loss_timer.unwrap().1;
             a.timeout(deadline).unwrap();
             let bytes = deliver(&mut a, &mut b, deadline);
             assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 1);
@@ -15042,7 +15514,7 @@ mod tests {
             assert_eq!(a.state(), State::Established);
         }
         // No response to the next probe: retain the resource/liveness bound.
-        let when = a.persist_deadline.unwrap();
+        let when = a.loss_timer.unwrap().1;
         a.timeout(when).unwrap();
         packet(&mut a, when);
         let deadline = a.user_deadline().unwrap();
@@ -15068,9 +15540,9 @@ mod tests {
             let una = a.snd_una;
             let high = a.snd_nxt;
             inject(&mut a, 50, seq, una, ACK, 0, b"");
-            assert_eq!(a.rto_deadline, None);
+            assert_eq!(a.loss_timer.unwrap().0, LossTimer::Rto);
             assert_eq!(a.user_deadline(), None);
-            let when = a.persist_deadline.unwrap();
+            let when = a.loss_timer.unwrap().1;
             a.timeout(when).unwrap();
             let bytes = packet(&mut a, when);
             let probe = wire::parse(ip(tuple()), &bytes).unwrap();
@@ -15100,7 +15572,7 @@ mod tests {
             let bytes = packet(&mut a, when);
             assert_eq!(
                 wire::parse(ip(tuple()), &bytes).unwrap().payload,
-                b"abcdefgh"
+                b"a" // timer retry respects the latest probe transmission boundary
             );
         }
     }
@@ -15206,7 +15678,7 @@ mod tests {
                 }
                 assert!(last - 50 > a.user_timeout());
                 inject(&mut a, last + 1, seq, una, ACK, 0, b"");
-                let deadline = a.persist_deadline.unwrap();
+                let deadline = a.loss_timer.unwrap().1;
                 a.timeout(deadline).unwrap();
                 let probe = packet(&mut a, deadline);
                 assert_eq!(wire::parse(ip(tuple()), &probe).unwrap().payload, b"a");
@@ -15385,7 +15857,7 @@ mod tests {
             deliver(&mut b, &mut a, 40);
             assert_eq!(b.receive_window(), 0);
             a.write(&[2; 64]).unwrap();
-            let deadline = a.persist_deadline.unwrap();
+            let deadline = a.loss_timer.unwrap().1;
             a.timeout(deadline).unwrap();
             a.ecn_cwr_pending = enabled;
             let bytes = packet(&mut a, deadline);
@@ -16061,7 +16533,7 @@ mod tests {
         a.snd_wnd = 0;
         a.ecn_cwr_pending = true;
         a.arm_work();
-        let deadline = a.persist_deadline.unwrap();
+        let deadline = a.loss_timer.unwrap().1;
         a.timeout(deadline).unwrap();
         let probe = packet(&mut a, deadline);
         assert_eq!(a.last_output_ecn(), 0);

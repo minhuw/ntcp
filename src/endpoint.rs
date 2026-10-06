@@ -342,6 +342,11 @@ impl Endpoint {
                     .and_then(|send| n.checked_add(send))
             })
             .and_then(|n| n.checked_add(usize::from(config.connection.mss)))
+            .and_then(|n| {
+                n.checked_add(crate::rack::Rack::storage_bytes(
+                    config.connection.send_capacity,
+                )?)
+            })
             .ok_or(EndpointError::LimitReached)?;
         if config.preallocate_connections > count {
             return Err(EndpointError::LimitReached);

@@ -1,99 +1,10 @@
-# Genuine behavior/embedding and focused-test gaps; no conformance waivers.
+# Physical clock conformance is an embedding obligation, not a software waiver.
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8985#section-4"
-reason = "Behavior/embedding gap: Instant is caller-supplied integer microseconds, without a declared/validated clock resolution and timebase capable of granularity finer than min_RTT/4 (RTT <= 4 us cannot satisfy this with 1 us units). Conformance also requires timestamp interval storage coverage for every outstanding segment: the 256-interval overflow fallback discards per-segment timestamps and disables RACK until cumulative flight completion. A safe fallback is not evidence of the timestamp MUST for arbitrary flights."
+reason = "External embedding gap: Instant is caller-supplied integer microseconds. Capacity-backed timestamp intervals now cover every outstanding byte/segment (send_capacity+2 reserved and endpoint-charged before connection allocation), but software tests cannot certify the caller clock's actual physical resolution/timebase or scheduling. Deployment must supply measured/declared effective clock resolution finer than min_RTT/4. Observed minRTT <=4us now disables active RACK/TLP rather than clamping RTT, retaining every timestamp and normal SACK/RTO recovery. Active support at those RTTs cannot satisfy strict finer-than with current1us units and requires a separately approved finer-unit API/timebase migration. The options worker owns the general declared clock contract; its resolution can feed the private Rack::clock_compatible(resolution_us) gate without duplicating public clock types. Retain this TODO until external clock evidence and supported RTT input are supplied; do not treat safe timestamp storage as physical proof."
 quote = '''
 For each data segment sent, the sender MUST store its most recent
 transmission time with a timestamp whose granularity is finer
 than 1/4 of the minimum RTT of the connection.
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.2"
-reason = "Behavior/profile gap: schedule_tlp applies expiry send gates (fresh RTT and no tracked probe) to timer arming; tlp_eligible also excludes FIN/closing and receive-window-shrink states. Separate arm eligibility on new-data/advancing-ACK events from section 7.3 expiry send eligibility, including absent-SRTT arming with the one-second PTO. Add focused tests for these contexts; current exclusions do not establish the scheduling SHOULD."
-quote = '''
-The sender SHOULD start or
-restart a loss probe PTO timer after transmitting new data (that was
-not itself a loss probe) or upon receiving an ACK that cumulatively
-acknowledges new data unless it is already in fast recovery, RTO
-recovery, or segments have been SACKed (i.e., RACK.segs_sacked is not
-zero).
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.2"
-reason = "Test gap: no direct absent-SRTT PTO interval/arming test. Scheduling requires a fresh RTT, so an unsampled connection does not arm the one-second PTO. Separate timer arming from the expiry send gate and assert the one-second interval without permitting an unsampled probe."
-quote = '''
-Second, when there is no SRTT estimate available, the PTO SHOULD be 1
-second.
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.2"
-reason = "Test gap: PTO formula lacks a direct absent-SRTT vector; the fresh-RTT arm restriction also prevents testing the one-second scheduled PTO. Separate arming from expiry gates and test both. Optional single-segment delay inflation is not implemented; omission of that MAY is not itself a mandatory-behavior defect."
-quote = '''
-Summarizing these considerations in pseudocode form, a sender SHOULD
-use the following logic to select the duration of a PTO:
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.3"
-reason = "Test gap: existing tests mostly prevent scheduling when freshness/probe gates fail. Add an already-armed PTO expiry test invalidating each send gate independently, asserting no probe and RTO rearm for outstanding flight. There is also a real mandatory-rearm interaction: zero-window outstanding flight is routed to persist rather than RTO. Reconcile the loss-timer selection with this MUST and test the zero-window transition, rather than treating persist as a blanket exception."
-quote = '''
-If either one of these two conditions is not met, then the sender
-MUST skip sending a loss probe and MUST proceed to re-arm the RTO
-timer, as specified at the end of this section.
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.3"
-reason = "Behavior/test qualification: zero-window outstanding flight selects persist instead of the mandated post-attempt RTO rearm. Resolve that timer-selection interaction and add already-armed PTO skip-expiry tests for each failed send gate, including zero-window transition; ordinary failed-output and successful-output paths do not cover these skips."
-quote = '''
-After attempting to send a loss probe, regardless of whether a loss
-probe was sent, the sender MUST re-arm the RTO timer, not the PTO
-timer, if the FlightSize is not zero.
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8985#section-8"
-reason = "Behavior gap: schedule_tlp and detect retain an armed rto_deadline while PTO/RACK is armed, and next_deadline minimizes independent timers. Priority guards do not implement cancellation. Select a single armed loss timer and preserve the RTO reference expiration separately for PTO capping/fallback; an RTO reference timestamp may remain stored without being armed. Test transitions and cancellation, not merely concurrent fallback deadlines."
-quote = '''
-When arming a RACK reordering timer or TLP
-PTO timer, the sender SHOULD cancel any other pending timers.
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.2"
-reason = "Test/profile gap: no direct absent-SRTT formula/arming test: scheduling normally requires a fresh sample, incorrectly merging arming with expiry send eligibility. Test the one-second arm interval, the RTO-reference cap, and the unsampled expiry skip/rearm separately. Optional TLP.max_ack_delay inflation is not selected; do not cite evidence for that branch."
-quote = '''
-TLP_calc_PTO():
-If SRTT is available:
-PTO = 2 * SRTT
-If FlightSize is one segment:
-PTO += TLP.max_ack_delay
-Else:
-PTO = 1 sec
-
-If Now() + PTO > TCP_RTO_expiration():
-PTO = TCP_RTO_expiration() - Now()
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8985#section-8"
-reason = "Behavior gap: rack.deadline/tlp_deadline/rto_deadline coexist as armed deadlines, with next_deadline selecting the minimum; persist is independently routed. Implement a single selected loss timer across RACK/PTO/RTO/ZWP, preserving a separate unarmed RTO reference for capping/fallback. Assert mutual exclusion at ACK, transmit, expiry and zero-window transitions; eligibility guards alone do not establish it."
-quote = '''
-The RACK reordering timer, the TLP PTO timer, the RTO, and Zero
-Window Probe (ZWP) timer [RFC793] are mutually exclusive and are used
-in different scenarios.
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8985#section-9.4"
-reason = "Behavior/test gap: PTO uses 2*SRTT without an explicit peer delayed-ACK budget (TLP.max_ack_delay optional inflation is omitted). No focused test establishes sufficient waiting for a delayed/stretched ACK receiver before retransmitted probe or DSACK-based delayed-ACK recovery disambiguation."
-quote = '''
-To mitigate this
-complication, before sending a TLP loss probe retransmission, the
-sender should attempt to wait long enough that the receiver has sent
-any delayed ACKs that it is withholding.
 '''
