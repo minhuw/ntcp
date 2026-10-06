@@ -2096,8 +2096,14 @@ impl Connection {
         }
         let mut sack_option_len = 0;
         if reset.is_none() && !syn && live && self.sack_send && !self.sack_omit {
+            let control_payload = usize::from(
+                probe || keepalive && self.config.keepalive.is_some_and(|k| k.send_garbage),
+            );
             let available = (40 - option_len)
-                .min((self.config.send_ip_payload_limit as usize).saturating_sub(20 + option_len))
+                .min(
+                    (self.config.send_ip_payload_limit as usize)
+                        .saturating_sub(20 + option_len + control_payload),
+                )
                 // Pure ACK options are independent of MSS. Once reported, limit
                 // piggybacked SACKs to leave room for data on the next poll.
                 .min(if self.ack_pending {
@@ -2625,9 +2631,9 @@ impl Connection {
                 State::FinWait1
             };
         }
-        if retransmit {
+        if retransmit && length != 0 {
             self.retx_pending = false;
-            if length != 0 && self.snd_wnd != 0 && self.flight() > self.snd_wnd {
+            if self.snd_wnd != 0 && self.flight() > self.snd_wnd {
                 // Commit only after encode succeeds; retries cannot postpone
                 // the deadline for the oldest still-unanswered retransmission.
                 self.shrink_unanswered_since.get_or_insert(now);
@@ -3834,6 +3840,102 @@ mod tests {
             let seg = wire::parse(ip(tuple()), &bytes).unwrap();
             assert!(!seg.payload.is_empty());
             assert!(seg.payload.len() + seg.raw_options.len() <= mss as usize);
+        }
+    }
+
+    #[test]
+    fn sack_only_ack_preserves_pending_rto_retransmission() {
+        for (mss, timestamps) in [(8, false), (24, true)] {
+            let cfg = ConnectionConfig {
+                timestamps,
+                ..sack_config(mss)
+            };
+            let (mut a, _) = pair(cfg, 100);
+            let una = a.snd_una;
+            a.write(&[7; 8]).unwrap();
+            let sent = packet(&mut a, 40);
+            assert_eq!(wire::parse(ip(tuple()), &sent).unwrap().payload, &[7; 8]);
+            let timeout = a.rto_deadline.unwrap();
+            a.timeout(timeout).unwrap();
+            assert!(a.retx_pending);
+            let next = a.receive.next();
+            inject_sack(
+                &mut a,
+                timeout,
+                next.wrapping_add(10),
+                una,
+                ACK,
+                8192,
+                &[2; 5],
+                &[],
+            );
+            assert_eq!(
+                a.transmit(timeout, &mut [0; 20]),
+                Err(Error::OutputTooSmall)
+            );
+            assert!(a.retx_pending);
+            let bytes = packet(&mut a, timeout);
+            let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert!(seg.payload.is_empty());
+            assert!(seg.options.sack_blocks[0].is_some());
+            assert!(a.retx_pending);
+            let bytes = packet(&mut a, timeout);
+            let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(seg.header.sequence, una.0);
+            assert_eq!(seg.payload, &[7; 8]);
+            assert!(!a.retx_pending);
+        }
+    }
+
+    #[test]
+    fn sack_options_leave_path_space_for_probe_and_keepalive_octets() {
+        for timestamps in [false, true] {
+            for probing in [false, true] {
+                let limit = if timestamps { 44 } else { 32 };
+                let cfg = ConnectionConfig {
+                    timestamps,
+                    send_ip_payload_limit: limit,
+                    keepalive: Some(KeepaliveConfig {
+                        idle_us: 100_000,
+                        interval_us: 100_000,
+                        probes: 3,
+                        send_garbage: true,
+                    }),
+                    ..sack_config(64)
+                };
+                let (mut a, _) = pair(cfg, 100);
+                if probing {
+                    a.write(&[7; 3]).unwrap();
+                    packet(&mut a, 40);
+                }
+                let next = a.receive.next();
+                let una = a.snd_una;
+                inject_sack(
+                    &mut a,
+                    41,
+                    next.wrapping_add(10),
+                    una,
+                    ACK,
+                    if probing { 0 } else { 8192 },
+                    &[2; 5],
+                    &[],
+                );
+                let deadline = if probing {
+                    a.persist_deadline
+                } else {
+                    a.keepalive_deadline
+                }
+                .unwrap();
+                a.timeout(deadline).unwrap();
+                assert!(if probing {
+                    a.probe_pending
+                } else {
+                    a.keepalive_pending
+                });
+                let bytes = packet(&mut a, deadline);
+                assert!(bytes.len() <= limit as usize);
+                assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 1);
+            }
         }
     }
 
