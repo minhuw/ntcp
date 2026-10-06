@@ -1342,9 +1342,9 @@ impl Connection {
         }
     }
 
-    // Partial evidence only; TODO remains. syn_timed_out imposes at least 3000000us until an unambiguous data RTT sample; timeout sets the flag during handshake, including passive SYN-ACK.
+    // syn_timed_out imposes >=3s until fresh data sample; synack_timeout_roles_first_data_and_fresh_sample_guard asserts passive/simultaneous timeout deadlines and release, active role covered by tlp_small_rto_floor_preserves_initial_and_syn_timeout_guard.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-5
-    //= reason=Partial evidence only; TODO remains. syn_timed_out imposes at least 3000000us until an unambiguous data RTT sample; timeout sets the flag during handshake, including passive SYN-ACK.
+    //= reason=syn_timed_out imposes >=3s until fresh data sample; synack_timeout_roles_first_data_and_fresh_sample_guard asserts passive/simultaneous timeout deadlines and release, active role covered by tlp_small_rto_floor_preserves_initial_and_syn_timeout_guard.
     //# (5.7) If the timer expires awaiting the ACK of a SYN segment and the TCP
     //# implementation is using an RTO less than 3 seconds, the RTO MUST be re-initialized to
     //# 3 seconds when data transmission begins (i.e., after the three-way handshake
@@ -3007,13 +3007,11 @@ impl Connection {
     //# Section 2 are performed, including the computation of RTO, which may result in
     //# "collapsing" RTO back down after it has been subject to exponential back off (rule
     //# 5.5).
-    // Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= reason=NewReno partial ACK schedules retx_pending; committed output starts at snd_una. newreno_partial_ack_wire_timer_and_exit_boundaries asserts each missing sequence/payload, continued recovery and failed-output rollback, including wrap.
     //# In this case, retransmit the first unacknowledged segment.
-    // Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= reason=Selected RFC6298 restart-on-every-advancing-ACK variant, not RFC3782 first-only variant. newreno_partial_ack_wire_timer_and_exit_boundaries asserts first/later partial deadlines=ACKtime+RTO, duplicate nonrestart and committed retransmission rearm.
     //# For the first partial ACK that arrives during fast recovery, also reset the retransmit
     //# timer.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
@@ -3192,14 +3190,12 @@ impl Connection {
     //# The receiver SHOULD send an ACK for every valid segment that arrives
     //# containing new data, and each of these "duplicate" ACKs SHOULD bear a SACK
     //# option.
-    // Partial evidence only; TODO remains. Receiver ACK scheduling independent of sender algorithm/SACK; non-left-edge, out_of_order and advanced>count (hole fill releases queued bytes) force immediate_ack, clearing delayed timer.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-5
-    //= reason=Partial evidence only; TODO remains. Receiver ACK scheduling independent of sender algorithm/SACK; non-left-edge, out_of_order and advanced>count (hole fill releases queued bytes) force immediate_ack, clearing delayed timer.
+    //= reason=newreno_partial_ack_wire_timer_and_exit_boundaries asserts immediate ACK pending and no delayed deadline for OOO pure data and hole-fill partial ACKs, with other pure-data holes still outstanding.
     //# [RFC5681] specifies that "Out-of-order data segments SHOULD be acknowledged
     //# immediately, in order to accelerate loss recovery".
-    // Partial evidence only; TODO remains. Receiver ACK scheduling independent of sender algorithm/SACK; non-left-edge, out_of_order and advanced>count (hole fill releases queued bytes) force immediate_ack, clearing delayed timer.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-5
-    //= reason=Partial evidence only; TODO remains. Receiver ACK scheduling independent of sender algorithm/SACK; non-left-edge, out_of_order and advanced>count (hole fill releases queued bytes) force immediate_ack, clearing delayed timer.
+    //= reason=newreno_partial_ack_wire_timer_and_exit_boundaries receives pure-data hole fills while another hole remains, asserts ack_pending and ack_deadline=None despite delayed ACK enabled, and immediately emits cumulative partial ACKs.
     //# Echoing [RFC5681], our recommendation is that the data receiver send an immediate
     //# acknowledgment for an out-of-order segment, even when that out-of-order segment fills
     //# a hole in the buffer.
@@ -3742,17 +3738,14 @@ impl Connection {
     //= reason=Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
     //# The procedures specified in Section 3.2 of [RFC5681] are followed, with the
     //# modifications listed below.
-    // Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= reason=NewReno partial ACK schedules retx_pending; committed output starts at snd_una. newreno_partial_ack_wire_timer_and_exit_boundaries asserts each missing sequence/payload, continued recovery and failed-output rollback, including wrap.
     //# In this case, retransmit the first unacknowledged segment.
-    // Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= reason=newreno_partial_ack_wire_timer_and_exit_boundaries asserts no fresh output with flight>=cwnd, one fresh MSS with credit, rwnd/SWS suppression then permission, MSS payload bounds and failed-output rollback.
     //# Send a new segment if permitted by the new value of cwnd.
-    // Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6
-    //= reason=Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= reason=Selected full-ACK option1 cwnd=min(ssthresh,max(FlightSize,SMSS)+SMSS). Lost-duplicate-ACK wire trace newreno_partial_ack_wire_timer_and_exit_boundaries polls to exhaustion: two fresh MSS at zero flight, one at residual one-MSS flight.
     //# In Section 3.2, step 3 above, it is noted that implementations should take measures to
     //# avoid a possible burst of data when leaving fast recovery, in case the amount of new
     //# data that the sender is eligible to send due to the new value of the congestion window
@@ -4960,14 +4953,14 @@ impl Connection {
     //# value of RTO after the doubling operation outlined in 5.5).
     // Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
-    //= reason=Partial evidence only; TODO remains. Due RTO calls on_timeout with exclusive snd_nxt and schedules retransmission. Existing tests do not assert timeout-driven exit from active no-SACK NewReno recovery.
+    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial recover representation remains separately open.
     //# The NewReno modification applies to the fast recovery procedure that begins when three
     //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
     //# ACK arrives that acknowledges all of the data up to and including the data that was
     //# outstanding when the fast recovery procedure began.
     // Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Partial evidence only; TODO remains. Due RTO calls on_timeout with exclusive snd_nxt and schedules retransmission. Existing tests do not assert that active no-SACK NewReno RTO both clears recovery and replaces recover.
+    //= reason=on_timeout stores exclusive highest_sent and clears recovery; timeout_marker_boundaries_and_wrap directly asserts active flag clear and marker replacement. newreno_partial_ack_wire_timer_and_exit_boundaries asserts active wire RTO at exact expiry.
     //# After a retransmit timeout, record the highest sequence number transmitted in the
     //# variable recover, and exit the fast recovery procedure if applicable.
     // Due RTO clears sample and PRR/SACK recovery, backs off, records exclusive snd_nxt recovery epoch, then sets SYN/head retransmission pending. Output commit re-arms; no emission on timeout alone.
@@ -5194,6 +5187,312 @@ mod tests {
             Connection::passive(tuple(), cfg, iss, 10, &syn).unwrap()
         };
         (connection, bytes)
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=on_timeout stores exclusive highest_sent and clears recovery; timeout_marker_boundaries_and_wrap directly asserts active flag clear and marker replacement. newreno_partial_ack_wire_timer_and_exit_boundaries asserts active wire RTO at exact expiry.
+    //# After a retransmit timeout, record the highest sequence number transmitted in the variable recover, and exit the fast recovery procedure if applicable.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
+    //= type=test
+    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial recover representation remains separately open.
+    //# The NewReno modification applies to the fast recovery procedure that begins when three duplicate ACKs are received and ends when either a retransmission timeout occurs or an ACK arrives that acknowledges all of the data up to and including the data that was outstanding when the fast recovery procedure began.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-5
+    //= type=test
+    //= reason=newreno_partial_ack_wire_timer_and_exit_boundaries asserts immediate ACK pending and no delayed deadline for OOO pure data and hole-fill partial ACKs, with other pure-data holes still outstanding.
+    //# [RFC5681] specifies that "Out-of-order data segments SHOULD be acknowledged
+    //# immediately, in order to accelerate loss recovery".
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=NewReno partial ACK schedules retx_pending; committed output starts at snd_una. newreno_partial_ack_wire_timer_and_exit_boundaries asserts each missing sequence/payload, continued recovery and failed-output rollback, including wrap.
+    //# In this case, retransmit the first unacknowledged segment.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=No-SACK IW10 wire trace: partial ACK head retransmission, pure-data hole fills, first/later advancing ACK timer restart, stale duplicate nonrestart, output rollback, full-ACK zero/nonzero flight burst cap and active recovery RTO; controller timeout_marker_boundaries_and_wrap asserts replaced exclusive marker.
+    //# For the first partial ACK that arrives during fast recovery, also reset the
+    //# retransmit timer.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-5
+    //= type=test
+    //= reason=newreno_partial_ack_wire_timer_and_exit_boundaries receives pure-data hole fills while another hole remains, asserts ack_pending and ack_deadline=None despite delayed ACK enabled, and immediately emits cumulative partial ACKs.
+    //# Echoing [RFC5681], our recommendation is that the data receiver send an
+    //# immediate acknowledgment for an out-of-order segment, even when that
+    //# out-of-order segment fills a hole in the buffer.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-6
+    //= type=test
+    //= reason=Selected full-ACK option1 cwnd=min(ssthresh,max(FlightSize,SMSS)+SMSS). Lost-duplicate-ACK wire trace newreno_partial_ack_wire_timer_and_exit_boundaries polls to exhaustion: two fresh MSS at zero flight, one at residual one-MSS flight.
+    //# In Section 3.2, step 3 above, it is noted that implementations should take
+    //# measures to avoid a possible burst of data when leaving fast recovery, in case
+    //# the amount of new data that the sender is eligible to send due to the new value
+    //# of the congestion window is large.
+    //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
+    //= type=test
+    //= reason=newreno_partial_ack_wire_timer_and_exit_boundaries asserts no fresh output with flight>=cwnd, one fresh MSS with credit, rwnd/SWS suppression then permission, MSS payload bounds and failed-output rollback.
+    //# Send a new segment if permitted by the new value of cwnd.
+    fn newreno_partial_ack_wire_timer_and_exit_boundaries() {
+        for iss in [100, u32::MAX - 20] {
+            for (send_credit, limit_window, timeout_exit) in [
+                (false, false, false),
+                (true, false, false),
+                (true, true, false),
+                (false, false, true),
+            ] {
+                let fresh_bytes = if send_credit { 4 } else { 0 };
+                let cfg = ConnectionConfig {
+                    initial_window: InitialWindow::Iw10,
+                    ..config(128, 4)
+                };
+                let (mut a, mut b) = pair(cfg, iss);
+                a.set_nagle(false);
+                let data: Vec<u8> = (0..80).collect();
+                a.write(&data).unwrap();
+                let base = a.snd_una;
+                let mut flight = Vec::new();
+                for _ in 0..10 {
+                    flight.push(packet(&mut a, 40));
+                }
+                let original_end = a.snd_nxt;
+                for i in [1, 3, 5, 7, 8, 9] {
+                    let seg = wire::parse(ip(tuple()), &flight[i]).unwrap();
+                    b.input(50, &seg).unwrap();
+                    assert!(b.ack_pending);
+                    assert_eq!(b.ack_deadline, None);
+                    let ack = packet(&mut b, 50);
+                    if i <= 5 {
+                        a.input(50, &wire::parse(ip(reverse(tuple())), &ack).unwrap())
+                            .unwrap();
+                    } // Later duplicate ACKs are lost: no artificial inflation.
+                }
+                assert!(a.congestion.in_recovery());
+                assert_eq!((a.flight(), a.congestion.cwnd()), (40, 32));
+                if timeout_exit {
+                    let bytes = packet(&mut a, 60); // Fast retransmit is lost.
+                    assert_eq!(
+                        wire::parse(ip(tuple()), &bytes).unwrap().payload,
+                        &data[..4]
+                    );
+                    let deadline = a.rto_deadline.unwrap();
+                    let next = a.receive.next();
+                    let una = a.snd_una;
+                    inject(&mut a, 61, next, una, ACK, 128, b"");
+                    assert_eq!(a.rto_deadline, Some(deadline));
+                    a.timeout(deadline - 1).unwrap();
+                    assert!(a.congestion.in_recovery());
+                    assert_eq!(a.transmit(deadline - 1, &mut [0; 128]), Ok(None));
+                    a.timeout(deadline).unwrap();
+                    assert!(!a.congestion.in_recovery());
+                    assert_eq!(a.congestion.cwnd(), 4);
+                    assert_eq!(
+                        a.transmit(deadline, &mut [0; 19]),
+                        Err(Error::OutputTooSmall)
+                    );
+                    assert!(a.retx_pending);
+                    let bytes = packet(&mut a, deadline);
+                    let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+                    assert_eq!(seg.header.sequence, base.0);
+                    assert_eq!(seg.payload, &data[..4]);
+                    assert_eq!(a.snd_nxt, original_end);
+                    assert_eq!(a.rto_deadline, Some(deadline + a.rto()));
+                    continue;
+                }
+                for (index, now) in [(0, 60), (2, 80), (4, 100), (6, 120)] {
+                    let before = (a.snd_nxt, a.rto_deadline, a.retx_pending, a.now);
+                    assert_eq!(a.transmit(now, &mut [0; 19]), Err(Error::OutputTooSmall));
+                    assert_eq!((a.snd_nxt, a.rto_deadline, a.retx_pending, a.now), before);
+                    let bytes = deliver(&mut a, &mut b, now);
+                    let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+                    assert_eq!(seg.header.sequence, base.wrapping_add(index * 4).0);
+                    assert_eq!(
+                        seg.payload,
+                        &data[index as usize * 4..index as usize * 4 + 4]
+                    );
+                    assert_eq!(a.rto_deadline, Some(now + a.rto()));
+                    if index == 2 || index == 4 {
+                        assert!(a.flight() >= a.congestion.cwnd());
+                        assert_eq!(a.transmit(now, &mut [0; 128]), Ok(None));
+                    }
+                    if index == 6 && fresh_bytes != 0 {
+                        if limit_window {
+                            let next = a.receive.next();
+                            let una = a.snd_una;
+                            inject(&mut a, now, next, una, ACK, 18, b"");
+                            assert_eq!(a.snd_wnd, 18); // SWS avoids a two-byte fragment.
+                            assert_eq!(a.transmit(now, &mut [0; 128]), Ok(None));
+                            inject(&mut a, now, next, una, ACK, 20, b"");
+                            assert_eq!(a.snd_wnd, 20);
+                        }
+                        let deadline = a.rto_deadline;
+                        let high = a.snd_nxt;
+                        assert_eq!(a.transmit(now, &mut [0; 19]), Err(Error::OutputTooSmall));
+                        assert_eq!((a.snd_nxt, a.rto_deadline), (high, deadline));
+                        let fresh = packet(&mut a, now);
+                        let seg = wire::parse(ip(tuple()), &fresh).unwrap();
+                        assert_eq!(seg.header.sequence, original_end.0);
+                        assert_eq!(seg.payload, &data[40..40 + fresh_bytes]);
+                        assert_eq!(a.rto_deadline, deadline);
+                    }
+                    assert!(b.ack_pending);
+                    assert_eq!(b.ack_deadline, None); // Pure-data hole fill, delayed ACK enabled.
+                    let ack_bytes = deliver(&mut b, &mut a, now + 1);
+                    let ack = wire::parse(ip(reverse(tuple())), &ack_bytes).unwrap();
+                    let covered = if index == 6 { 40 } else { index * 4 + 8 };
+                    assert_eq!(ack.header.acknowledgment, base.wrapping_add(covered).0);
+                    assert_eq!(a.acknowledged(), covered as u64);
+                    if index != 6 {
+                        assert_eq!(a.flight(), 40 - covered);
+                        assert_eq!(a.congestion.cwnd(), 32 - covered + (index / 2 + 1) * 4);
+                        assert!(a.congestion.in_recovery());
+                        assert_eq!(a.rto_deadline, Some(now + 1 + a.rto()));
+                        let deadline = a.rto_deadline;
+                        let next = a.receive.next();
+                        let una = a.snd_una;
+                        inject(
+                            &mut a,
+                            now + 2,
+                            next,
+                            una.wrapping_add(u32::MAX),
+                            ACK,
+                            128,
+                            b"",
+                        );
+                        assert_eq!(a.rto_deadline, deadline);
+                    }
+                }
+                assert!(!a.congestion.in_recovery());
+                assert_eq!(a.flight(), fresh_bytes as u32);
+                assert_eq!(a.congestion.cwnd(), 8);
+                let deadline = a.rto_deadline;
+                let next = a.receive.next();
+                let una = a.snd_una;
+                inject(&mut a, 125, next, una, ACK, 128, b"");
+                assert_eq!(a.rto_deadline, deadline);
+                let mut sent = 0;
+                let mut out = [0; 128];
+                let mut next_data = 40 + fresh_bytes;
+                while let Some(n) = a.transmit(130, &mut out).unwrap() {
+                    let seg = wire::parse(ip(tuple()), &out[..n]).unwrap();
+                    assert_eq!(seg.header.sequence, base.wrapping_add(next_data as u32).0);
+                    assert_eq!(seg.payload, &data[next_data..next_data + 4]);
+                    next_data += 4;
+                    sent += 1;
+                }
+                assert_eq!(sent, if fresh_bytes == 4 { 1 } else { 2 });
+                assert_eq!(a.flight(), 8);
+            }
+        }
+    }
+
+    #[test]
+    // Characterization, not RFC6582 partial-deflation conformance: the MSS clamp
+    // is reachable with lost ACKs. The partial-deflation TODO remains open.
+    fn newreno_nearly_full_partial_ack_reaches_mss_clamp() {
+        for iss in [100, u32::MAX - 20] {
+            for delivered_duplicates in [3, 8] {
+                let cfg = ConnectionConfig {
+                    initial_window: InitialWindow::Iw10,
+                    ..config(128, 4)
+                };
+                let (mut a, mut b) = pair(cfg, iss);
+                a.write(&[0x55; 40]).unwrap();
+                let mut flight = Vec::new();
+                for _ in 0..10 {
+                    flight.push(packet(&mut a, 40));
+                }
+                for (count, bytes) in flight[1..9].iter().enumerate() {
+                    b.input(50, &wire::parse(ip(tuple()), bytes).unwrap())
+                        .unwrap();
+                    let ack = packet(&mut b, 50);
+                    if count < delivered_duplicates {
+                        a.input(50, &wire::parse(ip(reverse(tuple())), &ack).unwrap())
+                            .unwrap();
+                    }
+                }
+                assert_eq!(a.flight(), 40);
+                let cwnd = a.congestion.cwnd();
+                assert_eq!(cwnd, if delivered_duplicates == 3 { 32 } else { 52 });
+                deliver(&mut a, &mut b, 60);
+                deliver(&mut b, &mut a, 61);
+                assert_eq!(a.acknowledged(), 36);
+                assert_eq!(a.flight(), 4);
+                assert!(a.congestion.in_recovery());
+                assert_eq!(
+                    a.congestion.cwnd(),
+                    if delivered_duplicates == 3 { 4 } else { 20 }
+                );
+                // Literal cwnd - newly_acked + SMSS is zero in the lost-ACK case.
+                if delivered_duplicates == 3 {
+                    assert_eq!(cwnd as i64 - 36 + 4, 0);
+                }
+                let bytes = deliver(&mut a, &mut b, 62);
+                assert_eq!(
+                    wire::parse(ip(tuple()), &bytes).unwrap().payload,
+                    &[0x55; 4]
+                );
+                b.timeout(200_062).unwrap();
+                deliver(&mut b, &mut a, 200_062);
+                assert!(!a.congestion.in_recovery());
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-5
+    //= type=test
+    //= reason=Passive and simultaneous-open SYN-ACK RTO, wrap and failed output; first data exactly now+3s, fresh unambiguous data sample releases guard and next output arms now+1s. Active role separately covered by tlp_small_rto_floor_preserves_initial_and_syn_timeout_guard.
+    //# (5.7) If the timer expires awaiting the ACK of a SYN segment and the TCP
+    //# implementation is using an RTO less than 3 seconds, the RTO MUST be
+    //# re-initialized to 3 seconds when data transmission begins (i.e., after the
+    //# three-way handshake completes).
+    fn synack_timeout_roles_first_data_and_fresh_sample_guard() {
+        for simultaneous in [false, true] {
+            for iss in [100, u32::MAX] {
+                let (mut a, _) = opening_for_close(config(64, 8), iss, simultaneous);
+                let lost = packet(&mut a, 20);
+                assert_eq!(
+                    wire::parse(ip(tuple()), &lost).unwrap().header.flags & (SYN | ACK),
+                    SYN | ACK
+                );
+                let deadline = a.rto_deadline.unwrap();
+                a.timeout(deadline - 1).unwrap();
+                assert_eq!(a.transmit(deadline - 1, &mut [0; 128]), Ok(None));
+                a.timeout(deadline).unwrap();
+                let before = (a.snd_nxt, a.rto_deadline, a.syn_pending, a.now);
+                assert_eq!(
+                    a.transmit(deadline, &mut [0; 19]),
+                    Err(Error::OutputTooSmall)
+                );
+                assert_eq!((a.snd_nxt, a.rto_deadline, a.syn_pending, a.now), before);
+                packet(&mut a, deadline);
+                let next = a.receive.next();
+                inject(
+                    &mut a,
+                    deadline + 10,
+                    next,
+                    Seq(iss).wrapping_add(1),
+                    ACK,
+                    64,
+                    b"",
+                );
+                assert_eq!(a.state(), State::Established);
+                assert!(a.syn_timed_out);
+                assert_eq!(a.rto(), 3_000_000);
+                a.write(b"abcdefgh").unwrap();
+                let bytes = packet(&mut a, deadline + 20);
+                assert_eq!(
+                    wire::parse(ip(tuple()), &bytes).unwrap().payload,
+                    b"abcdefgh"
+                );
+                assert_eq!(a.rto_deadline, Some(deadline + 20 + 3_000_000));
+                let end = a.snd_nxt;
+                inject(&mut a, deadline + 100_020, next, end, ACK, 64, b"");
+                assert!(!a.syn_timed_out);
+                assert_eq!(a.rto(), 1_000_000);
+                assert_eq!(a.rto_deadline, None);
+                a.write(b"fresh").unwrap();
+                packet(&mut a, deadline + 100_030);
+                assert_eq!(a.rto_deadline, Some(deadline + 1_100_030));
+            }
+        }
     }
 
     #[test]
@@ -10975,7 +11274,13 @@ mod tests {
         inject(&mut a, 50, next, ack, ACK, 64, b"");
         assert_eq!(a.acknowledged(), 3);
         let high = a.snd_nxt;
+        assert_eq!(a.rto_deadline, Some(50 + a.rto()));
+        let next = a.receive.next();
+        inject(&mut a, 60, next, ack, ACK, 64, b"");
+        assert_eq!(a.rto_deadline, Some(50 + a.rto()));
         let deadline = a.rto_deadline.unwrap();
+        a.timeout(deadline - 1).unwrap();
+        assert!(!a.retx_pending);
         a.timeout(deadline).unwrap();
         assert!(a.retx_pending);
         assert_eq!(a.snd_nxt, high);
@@ -10994,6 +11299,22 @@ mod tests {
         assert!(a.sample.is_none());
         assert!(a.rto() >= 2_000_000);
         assert_eq!(a.rto_deadline, Some(deadline + a.rto()));
+        let interval = a.rto();
+        let second = deadline + interval;
+        a.timeout(second - 1).unwrap();
+        let fresh = packet(&mut a, second - 1);
+        let seg = wire::parse(ip(tuple()), &fresh).unwrap();
+        assert_eq!(seg.header.sequence, high.0);
+        assert_eq!(seg.payload, b"ijk");
+        assert_eq!(a.rto_deadline, Some(second));
+        assert!(!a.retx_pending);
+        a.timeout(second).unwrap();
+        let bytes = packet(&mut a, second);
+        let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(seg.header.sequence, ack.0);
+        assert_eq!(seg.payload, b"defghijk");
+        assert_eq!(second - deadline, interval);
+        assert_eq!(a.rto_deadline, Some(second + a.rto()));
         // Separately exercise actual two-peer loss recovery.
         let (mut c, mut d) = pair(config(64, 8), 100);
         c.write(b"lost").unwrap();
@@ -11414,16 +11735,14 @@ mod tests {
     //# o A TCP implementation MAY send an ACK segment acknowledging RCV.NXT when a
     //# valid segment arrives that is in the window but not at the left window edge
     //# (MAY-13).
-    // Partial evidence only; TODO remains. Out-of-order data with queued FIN and sequence wrap; not a pure-data partial-hole-fill test.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-5
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Out-of-order data with queued FIN and sequence wrap; not a pure-data partial-hole-fill test.
+    //= reason=newreno_partial_ack_wire_timer_and_exit_boundaries asserts immediate ACK pending and no delayed deadline for OOO pure data and hole-fill partial ACKs, with other pure-data holes still outstanding.
     //# [RFC5681] specifies that "Out-of-order data segments SHOULD be acknowledged
     //# immediately, in order to accelerate loss recovery".
-    // Partial evidence only; TODO remains. Out-of-order data with queued FIN and sequence wrap; not a pure-data partial-hole-fill test.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-5
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Out-of-order data with queued FIN and sequence wrap; not a pure-data partial-hole-fill test.
+    //= reason=newreno_partial_ack_wire_timer_and_exit_boundaries receives pure-data hole fills while another hole remains, asserts ack_pending and ack_deadline=None despite delayed ACK enabled, and immediately emits cumulative partial ACKs.
     //# Echoing [RFC5681], our recommendation is that the data receiver send an immediate
     //# acknowledgment for an out-of-order segment, even when that out-of-order segment fills
     //# a hole in the buffer.
@@ -11744,16 +12063,15 @@ mod tests {
     //= reason=Repeated shutdown is idempotent and never creates a second FIN.
     //# An "ok" response would be acceptable, too, as long as a second FIN is not emitted (the
     //# first FIN may be retransmitted, though).
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Ordinary first-flight end-to-end single-loss fast retransmit.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-5
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Ordinary first-flight end-to-end single-loss fast retransmit.
+    //= reason=newreno_partial_ack_wire_timer_and_exit_boundaries asserts immediate ACK pending and no delayed deadline for OOO pure data and hole-fill partial ACKs, with other pure-data holes still outstanding.
     //# [RFC5681] specifies that "Out-of-order data segments SHOULD be acknowledged
     //# immediately, in order to accelerate loss recovery".
     // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Ordinary first-flight end-to-end single-loss fast retransmit.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno single-loss wire trace proves third-duplicate entry and full-ACK completion, not active-recovery timeout exit.
+    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial recover representation remains separately open.
     //# The NewReno modification applies to the fast recovery procedure that begins when three
     //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
     //# ACK arrives that acknowledges all of the data up to and including the data that was
@@ -11777,10 +12095,9 @@ mod tests {
     //# This document also does not address issues of adjusting the duplicate acknowledgment
     //# threshold, but assumes the threshold specified in the IETF standards; the current
     //# standard is [RFC5681], which specifies a threshold of three duplicate acknowledgments.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Ordinary first-flight end-to-end single-loss fast retransmit.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-5
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Ordinary first-flight end-to-end single-loss fast retransmit.
+    //= reason=newreno_partial_ack_wire_timer_and_exit_boundaries receives pure-data hole fills while another hole remains, asserts ack_pending and ack_deadline=None despite delayed ACK enabled, and immediately emits cumulative partial ACKs.
     //# Echoing [RFC5681], our recommendation is that the data receiver send an immediate
     //# acknowledgment for an out-of-order segment, even when that out-of-order segment fills
     //# a hole in the buffer.

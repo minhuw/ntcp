@@ -1,30 +1,5 @@
 # Unresolved behavior/profile/test gaps are not exceptions or waivers.
 
-# 6582:section-3.2:timeout
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6582#section-3.2"
-reason = "Partial evidence: timeout_marker_boundaries_and_wrap proves recover marker boundaries and replacement outside active recovery, not timeout-driven exit. Add an active no-SACK NewReno RTO assertion that fast recovery clears and recover is replaced by the new highest transmitted sequence; marker-only evidence does not close the combined requirement."
-quote = '''
-After a retransmit timeout, record the highest sequence number transmitted in the variable recover, and exit the fast recovery procedure if applicable.
-'''
-
-# 6582:section-3.1:recovery-lifetime
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6582#section-3.1"
-reason = "Partial evidence establishes third-duplicate entry and full-ACK exit. timeout_marker_boundaries_and_wrap times out outside recovery or after full-ACK exit; it does not assert active NewReno timeout exit. Close with an active no-SACK NewReno RTO regression asserting recovery clears and recover is replaced, alongside existing entry/full-ACK evidence."
-quote = '''
-The NewReno modification applies to the fast recovery procedure that begins when three duplicate ACKs are received and ends when either a retransmission timeout occurs or an ACK arrives that acknowledges all of the data up to and including the data that was outstanding when the fast recovery procedure began.
-'''
-
-# 6582:section-5:1
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6582#section-5"
-reason = "Immediate OOO ACK scheduling is implemented and the queued-FIN OOO test asserts ack_pending. RFC6582 section5 additionally emphasizes a pure-data hole-fill producing a partial ACK. Existing fast_retransmit test covers a full-window fill; queued-FIN test is not pure-data partial progress. Add a two-hole receiver trace asserting immediate cumulative partial ACK with ack_deadline=None after the first hole is filled, despite enabled delayed ACK."
-quote = '''
-[RFC5681] specifies that "Out-of-order data segments SHOULD be acknowledged
-immediately, in order to accelerate loss recovery".
-'''
-
 # 6582:section-1:applicability
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6582#section-1"
@@ -38,7 +13,7 @@ supported or because the TCP peer did not indicate a willingness to use SACK.
 # 6582:section-3.2:inherited-procedure
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6582#section-3.2"
-reason = "RFC6582 layers on RFC5681 fast retransmit/recovery. This audit maps specific NewReno changes and single-loss wire entry, but initialization/partial-output/timer TODOs preclude a complete inherited-procedure claim. Link parent RFC5681 section3.2 inventory and existing assertion evidence for eligibility, Limited Transmit exclusion, threshold reduction, duplicate inflation and bounded output; close the NewReno-specific gaps rather than treating the cross-reference as outside scope."
+reason = "RFC6582 layers on RFC5681 fast retransmit/recovery. This audit maps specific NewReno changes and single-loss wire entry, but initialization and reachable partial-deflation arithmetic gaps preclude a complete inherited-procedure claim; partial wire output/timer assertions now exist in newreno_partial_ack_wire_timer_and_exit_boundaries. Link parent RFC5681 section3.2 inventory and existing assertion evidence for eligibility, Limited Transmit exclusion, threshold reduction, duplicate inflation and bounded output; close the NewReno-specific gaps rather than treating the cross-reference as outside scope."
 quote = '''
 The procedures specified in Section 3.2 of [RFC5681] are followed, with the
 modifications listed below.
@@ -66,39 +41,14 @@ retransmit (step 2 of Section 3.2 of [RFC5681]). If not, the TCP does not enter
 fast retransmit and does not reset ssthresh.
 '''
 
-# 6582:section-3.2:partial-retransmit
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6582#section-3.2"
-reason = "NewReno controller returns true on partial ACK; accept_ack sets retx_pending and transmit uses snd_una. Existing controller tests assert true/fast_recovery and math, not actual partial-ACK retransmission. retransmission_uses_partial_ack_base_and_never_sends_unsent_tail is RTO, and SACK multiloss is a different algorithm. Add no-SACK two-loss integrated trace asserting first missing wire sequence/payload after each partial ACK, output failure rollback and no premature recovery exit."
-quote = '''
-In this case, retransmit the first unacknowledged segment.
-'''
-
 # 6582:section-3.2:partial-deflation
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc6582#section-3.2"
-reason = "Controller subtracts acked and adds MSS only when acked>=MSS; tests assert500/2000-byte examples. It additionally clamps result to>=MSS, not stated in the literal equation. Add nearly-full partial ACK and large-ACK cases with actual flight evolution to determine whether clamp is reachable; resolve any raised-cwnd deviation or prove invariant making clamp inert. Implemented arithmetic examples are partial evidence, not a waiver."
+reason = "newreno_nearly_full_partial_ack_reaches_mss_clamp proves the floor is reachable: IW10/MSS4 flight40, three delivered dupACKs and five lost ACKs gives cwnd32; partial ACK36 leaves flight4 and yields cwnd4 instead of literal32-36+4=0. All eight delivered dupACKs gives52->20. Normal and wrap wire traces establish actual flight; resolve saturation/floor arithmetic before closure."
 quote = '''
 Deflate the congestion window by the amount of new data acknowledged by the
 Cumulative Acknowledgment field. If the partial ACK acknowledges at least one
 SMSS of new data, then add back SMSS bytes to the congestion window.
-'''
-
-# 6582:section-3.2:partial-new-send
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6582#section-3.2"
-reason = "After pending head retransmission, transmit new-data branch uses cwnd/rwnd credit; existing controller math cannot prove that NewReno emits permitted fresh data after a partial ACK. Add integrated multiple-loss trace asserting both suppression when flight>=cwnd and fresh-data emission when credit remains, including packet/output/rwnd limits. PRR credit tests are not NewReno evidence."
-quote = '''
-Send a new segment if permitted by the new value of cwnd.
-'''
-
-# 6582:section-3.2:partial-timer
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6582#section-3.2"
-reason = "accept_ack restarts on every advancing cumulative ACK, therefore also the first partial ACK; the selected RFC6298 timer policy is not the first-only RFC3782 variant. No actual NewReno partial-ACK timer assertion exists. Add exact first and later partial ACK deadline=ACKtime+RTO, duplicate ACK nonrestart, and output rearm assertions. Identify variant explicitly; section8/AppendixA acknowledge alternate timer variants, not absent test coverage."
-quote = '''
-For the first partial ACK that arrives during fast recovery, also reset the
-retransmit timer.
 '''
 
 # 6582:section-3.2:strict-reentry
@@ -111,27 +61,6 @@ next expects to receive, the acknowledgment "ack_number" covers more than
 recover when ack_number - 1 > recover; i.e., at least one byte more of data is
 acknowledged beyond the highest byte that was outstanding when fast retransmit
 was last entered.
-'''
-
-# 6582:section-5:hole-fill-ack
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6582#section-5"
-reason = "receive_text immediately ACKs OOO data and fills releasing queued bytes (advanced>count). Existing queued-FIN OOO and single-loss full-ACK tests do not isolate a pure-data partial hole fill with another hole still pending. Add receiver two-hole trace asserting immediate cumulative partial ACK and cleared delayed-ACK deadline."
-quote = '''
-Echoing [RFC5681], our recommendation is that the data receiver send an
-immediate acknowledgment for an out-of-order segment, even when that
-out-of-order segment fills a hole in the buffer.
-'''
-
-# 6582:section-6:exit-burst
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc6582#section-6"
-reason = "Selected option1 limits full-ACK cwnd to FlightSize+SMSS (or2SMSS at zero), with controller math tested. No integrated NewReno ACK-loss/window-update scenario asserts actual post-exit burst bound; repeated polls can emit all window credit. Add such a trace counting wire new-data packets, distinguishing FlightSize zero and nonzero. General pacing/maxburst mechanisms are not required choices; do not cite PRR tests as NewReno burst evidence."
-quote = '''
-In Section 3.2, step 3 above, it is noted that implementations should take
-measures to avoid a possible burst of data when leaving fast recovery, in case
-the amount of new data that the sender is eligible to send due to the new value
-of the congestion window is large.
 '''
 
 # 6582:section-6:only-reentry

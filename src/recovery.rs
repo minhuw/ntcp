@@ -350,7 +350,7 @@ impl Congestion {
     //# acknowledged before the fast recovery procedure is declared to be over.
     // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno full-ACK exit uses exclusive recover; equality covers the prior flight and greater ACK clears the guard. This ACK path does not establish active-recovery timeout exit.
+    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial recover representation remains separately open.
     //# The NewReno modification applies to the fast recovery procedure that begins when three
     //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
     //# ACK arrives that acknowledges all of the data up to and including the data that was
@@ -387,9 +387,8 @@ impl Congestion {
     //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //# If this ACK does *not* acknowledge all of the data up to and including recover, then
     //# this is a partial ACK.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= reason=NewReno partial ACK schedules retx_pending; committed output starts at snd_una. newreno_partial_ack_wire_timer_and_exit_boundaries asserts each missing sequence/payload, continued recovery and failed-output rollback, including wrap.
     //# In this case, retransmit the first unacknowledged segment.
     // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
@@ -397,9 +396,8 @@ impl Congestion {
     //# Deflate the congestion window by the amount of new data acknowledged by the Cumulative
     //# Acknowledgment field. If the partial ACK acknowledges at least one SMSS of new data,
     //# then add back SMSS bytes to the congestion window.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= reason=newreno_partial_ack_wire_timer_and_exit_boundaries asserts no fresh output with flight>=cwnd, one fresh MSS with credit, rwnd/SWS suppression then permission, MSS payload bounds and failed-output rollback.
     //# Send a new segment if permitted by the new value of cwnd.
     // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
@@ -413,9 +411,8 @@ impl Congestion {
     //# expects to receive, the acknowledgment "ack_number" covers more than recover when
     //# ack_number - 1 > recover; i.e., at least one byte more of data is acknowledged beyond
     //# the highest byte that was outstanding when fast retransmit was last entered.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. recover is an exclusive end; equal ACK fully covers the prior flight, greater ACK clears the reentry guard. Separate fast_recovery flag survives duplicate-counter resets.
+    //= reason=Selected full-ACK option1 cwnd=min(ssthresh,max(FlightSize,SMSS)+SMSS). Lost-duplicate-ACK wire trace newreno_partial_ack_wire_timer_and_exit_boundaries polls to exhaustion: two fresh MSS at zero flight, one at residual one-MSS flight.
     //# In Section 3.2, step 3 above, it is noted that implementations should take measures to
     //# avoid a possible burst of data when leaving fast recovery, in case the amount of new
     //# data that the sender is eligible to send due to the new value of the congestion window
@@ -715,7 +712,7 @@ impl Congestion {
     //# acknowledged before the fast recovery procedure is declared to be over.
     // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Three eligible duplicate ACKs enter only with no retained recover guard; stores exclusive highest_sent. Existing ECN/loss epochs may conservatively retain ssthresh.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno eligible third-duplicate entry stores exclusive highest_sent. Entry evidence does not establish active-recovery timeout exit.
+    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial recover representation remains separately open.
     //# The NewReno modification applies to the fast recovery procedure that begins when three
     //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
     //# ACK arrives that acknowledges all of the data up to and including the data that was
@@ -895,14 +892,14 @@ impl Congestion {
 
     // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Stores exclusive highest_sent, exits both recovery flags, sets cwnd=MSS, resets duplicate count.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
-    //= reason=Partial evidence only; TODO remains. on_timeout clears recovery flags and records exclusive highest_sent, but existing marker tests time out outside recovery or after full-ACK exit; active no-SACK NewReno timeout exit is not asserted.
+    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial recover representation remains separately open.
     //# The NewReno modification applies to the fast recovery procedure that begins when three
     //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
     //# ACK arrives that acknowledges all of the data up to and including the data that was
     //# outstanding when the fast recovery procedure began.
     // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Stores exclusive highest_sent, exits both recovery flags, sets cwnd=MSS, resets duplicate count.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Partial evidence only; TODO remains. on_timeout clears recovery flags and records exclusive highest_sent. Marker boundaries are tested separately, not the combined active no-SACK NewReno RTO exit and recover replacement.
+    //= reason=on_timeout stores exclusive highest_sent and clears recovery; timeout_marker_boundaries_and_wrap directly asserts active flag clear and marker replacement. newreno_partial_ack_wire_timer_and_exit_boundaries asserts active wire RTO at exact expiry.
     //# After a retransmit timeout, record the highest sequence number transmitted in the
     //# variable recover, and exit the fast recovery procedure if applicable.
     // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Stores exclusive highest_sent, exits both recovery flags, sets cwnd=MSS, resets duplicate count.
@@ -1908,7 +1905,7 @@ mod tests {
     // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno controller assertions establish third-duplicate entry and full-ACK exit, not active-recovery timeout exit, wire retransmission or timer management.
+    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial recover representation remains separately open.
     //# The NewReno modification applies to the fast recovery procedure that begins when three
     //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
     //# ACK arrives that acknowledges all of the data up to and including the data that was
@@ -1950,10 +1947,9 @@ mod tests {
     //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
     //# If this ACK does *not* acknowledge all of the data up to and including recover, then
     //# this is a partial ACK.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= reason=NewReno partial ACK schedules retx_pending; committed output starts at snd_una. newreno_partial_ack_wire_timer_and_exit_boundaries asserts each missing sequence/payload, continued recovery and failed-output rollback, including wrap.
     //# In this case, retransmit the first unacknowledged segment.
     // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
@@ -1983,10 +1979,9 @@ mod tests {
     //# This document also does not address issues of adjusting the duplicate acknowledgment
     //# threshold, but assumes the threshold specified in the IETF standards; the current
     //# standard is [RFC5681], which specifies a threshold of three duplicate acknowledgments.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Controller assertions only, not wire retransmission or timer management.
+    //= reason=Selected full-ACK option1 cwnd=min(ssthresh,max(FlightSize,SMSS)+SMSS). Lost-duplicate-ACK wire trace newreno_partial_ack_wire_timer_and_exit_boundaries polls to exhaustion: two fresh MSS at zero flight, one at residual one-MSS flight.
     //# In Section 3.2, step 3 above, it is noted that implementations should take measures to
     //# avoid a possible burst of data when leaving fast recovery, in case the amount of new
     //# data that the sender is eligible to send due to the new value of the congestion window
@@ -2106,10 +2101,9 @@ mod tests {
     //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
     //# If this ACK does *not* acknowledge all of the data up to and including recover, then
     //# this is a partial ACK.
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //= reason=NewReno partial ACK schedules retx_pending; committed output starts at snd_una. newreno_partial_ack_wire_timer_and_exit_boundaries asserts each missing sequence/payload, continued recovery and failed-output rollback, including wrap.
     //# In this case, retransmit the first unacknowledged segment.
     // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
@@ -2124,10 +2118,9 @@ mod tests {
     //= reason=Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
     //# Do not exit the fast recovery procedure (i.e., if any duplicate ACKs subsequently
     //# arrive, execute step 4 of Section 3.2 of [RFC5681]).
-    // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Both algorithms and sequence wrap tested separately.
+    //= reason=Selected full-ACK option1 cwnd=min(ssthresh,max(FlightSize,SMSS)+SMSS). Lost-duplicate-ACK wire trace newreno_partial_ack_wire_timer_and_exit_boundaries polls to exhaustion: two fresh MSS at zero flight, one at residual one-MSS flight.
     //# In Section 3.2, step 3 above, it is noted that implementations should take measures to
     //# avoid a possible burst of data when leaving fast recovery, in case the amount of new
     //# data that the sender is eligible to send due to the new value of the congestion window
@@ -2199,7 +2192,7 @@ mod tests {
     // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.1
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno marker boundaries/wrap are tested, but timeouts occur outside recovery or after full-ACK exit; active-recovery timeout exit is not asserted.
+    //= reason=No-SACK NewReno wire entry, partial-ACK continuation, full-ACK exit and active-recovery RTO exit are asserted by newreno_partial_ack_wire_timer_and_exit_boundaries. timeout_marker_boundaries_and_wrap asserts timeout marker replacement; initial recover representation remains separately open.
     //# The NewReno modification applies to the fast recovery procedure that begins when three
     //# duplicate ACKs are received and ends when either a retransmission timeout occurs or an
     //# ACK arrives that acknowledges all of the data up to and including the data that was
@@ -2217,7 +2210,7 @@ mod tests {
     // Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Ordinary no-SACK NewReno marker boundaries/wrap and replacement are tested outside active recovery; no assertion combines recovery exit with recover replacement during active-recovery RTO.
+    //= reason=on_timeout stores exclusive highest_sent and clears recovery; timeout_marker_boundaries_and_wrap directly asserts active flag clear and marker replacement. newreno_partial_ack_wire_timer_and_exit_boundaries asserts active wire RTO at exact expiry.
     //# After a retransmit timeout, record the highest sequence number transmitted in the
     //# variable recover, and exit the fast recovery procedure if applicable.
     // Partial evidence only; TODO remains. Ordinary no-SACK NewReno (default) only; not selectable Reno or negotiated-SACK RACK/PRR recovery. Timeout guard tested at ordinary and wrapping sequence boundaries.
@@ -2302,6 +2295,14 @@ mod tests {
                 assert!(!c.on_ack(end.wrapping_add(4_000), 2_999, 0));
                 c.on_timeout(8_000, end.wrapping_add(8_000));
                 assert_eq!(c.ssthresh(), 4_000);
+                c.on_ack(end.wrapping_add(8_001), 1, 7_999);
+                assert!(three_duplicates(&mut c, 7_999, end.wrapping_add(16_000)));
+                assert!(c.fast_recovery);
+                let new_end = end.wrapping_add(20_000);
+                c.on_timeout(11_999, new_end);
+                assert!(!c.fast_recovery);
+                assert_eq!(c.recover, Some(new_end));
+                assert_eq!(c.cwnd(), 1_000);
             }
         }
     }
