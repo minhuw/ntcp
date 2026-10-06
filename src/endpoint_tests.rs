@@ -2265,7 +2265,7 @@ fn optional_stream_controls_refresh_endpoint_work_and_charge_marker_storage() {
     );
 
     let mut limited = config();
-    limited.max_buffer_bytes = 3 * 1024 + 2 * 1024 + 64 - 1;
+    limited.max_buffer_bytes = connection_charge(&config()) - 1;
     let mut endpoint = Endpoint::new(limited, [3; 32], 0, test_policy).unwrap();
     let (local, remote) = addresses();
     assert_eq!(
@@ -3482,6 +3482,7 @@ fn application_timeout_does_not_close_healthy_fin_wait2_receive_half() {
 fn connection_charge(cfg: &EndpointConfig) -> usize {
     3 * cfg.connection.receive_capacity
         + 2 * cfg.connection.send_capacity
+        + crate::sack::Scoreboard::allocation_bytes(cfg.connection.send_capacity).unwrap()
         + usize::from(cfg.connection.mss)
         + crate::rack::Rack::storage_bytes(cfg.connection.send_capacity).unwrap()
 }

@@ -116,6 +116,20 @@ impl Default for KeepaliveConfig {
     }
 }
 
+impl ConnectionConfig {
+    pub(crate) fn minimum_send_budget(&self) -> u16 {
+        if self.timestamps && self.sack {
+            44
+        } else if self.timestamps {
+            40
+        } else if self.sack {
+            32
+        } else {
+            28
+        }
+    }
+}
+
 impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
@@ -363,6 +377,7 @@ pub(crate) struct Connection {
     rack_entry_delivery: Option<(u64, u32)>,
     receive_used: usize,
     sack_omit: bool,
+    sack_data_turn: bool,
     ts_recent: u32,
     ts_latest: u32,
     ts_recent_at: Instant,
@@ -468,14 +483,7 @@ impl Connection {
             || config.receive_capacity == 0
             || config.receive_capacity > (65535usize << 14)
             || config.receive_ip_payload_limit < 21
-            || config.send_ip_payload_limit
-                < if config.timestamps {
-                    40
-                } else if config.sack {
-                    32
-                } else {
-                    28
-                }
+            || config.send_ip_payload_limit < config.minimum_send_budget()
             || config.mss == 0
             || config.mss > if tuple.local.is_ipv4() { 65495 } else { 65515 }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.3
@@ -526,6 +534,8 @@ impl Connection {
         );
         let rtt = RttEstimator::new(config.rto_min_us);
         let rack = Rack::with_capacity(config.send_capacity + 2).map_err(|_| Error::NoMemory)?;
+        let scoreboard =
+            Scoreboard::with_capacity(config.send_capacity).map_err(|_| Error::NoMemory)?;
         // Take pooled storage only after every fallible allocation has succeeded.
         let receive = match receive.take() {
             Some(receive) => receive,
@@ -573,7 +583,7 @@ impl Connection {
             sack_guard: None,
             sack_post_rto: None,
             sack_fallback: None,
-            scoreboard: Scoreboard::new(),
+            scoreboard,
             rack,
             tlp_deadline: None,
             tlp_pending: false,
@@ -584,6 +594,7 @@ impl Connection {
             rack_entry_delivery: None,
             receive_used: 0,
             sack_omit: false,
+            sack_data_turn: false,
             ts_recent: 0,
             ts_latest: 0,
             ts_recent_at: now,
@@ -2459,9 +2470,9 @@ impl Connection {
         //= reason=PAWS-valid in-sequence text advances receive frontier; later gap fill advances through queued data. Negotiated TS assertion covers this path.
         //# R4)  If an arriving segment is in sequence (i.e., at the left window
         //# edge), then accept it normally.
-        // Scope: Valid timestamp OOO data queued and echoed correctly, but receive range metadata capped at64 rejects otherwise in-window 65th disjoint arrival. Core safe fallback does not establish unconditional queueing of arbitrary allowed fragmentation. Closure: represent accepted receive-window fragmentation with capacity-accounted bounded metadata, preserve retained-byte correctness, and test65-range/bridging/PAWS combinations; ordinary SACK report suppression is separately RFC2018 TODO. Partial evidence; closure remains TODO.
+        // Scope: Timestamp-validated in-window data uses capacity-backed presence bits, without a range-count admission gate. Alternating-window and timestamp fragmentation tests cover more than 64 intervals, gap filling, retained delivery and wrap.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
-        //= reason=Valid timestamp OOO data queued and echoed correctly, but receive range metadata capped at64 rejects otherwise in-window 65th disjoint arrival. Core safe fallback does not establish unconditional queueing of arbitrary allowed fragmentation. Closure: represent accepted receive-window fragmentation with capacity-accounted bounded metadata, preserve retained-byte correctness, and test65-range/bridging/PAWS combinations; ordinary SACK report suppression is separately RFC2018 TODO. Partial evidence; closure remains TODO.
+        //= reason=Timestamp-validated in-window data uses capacity-backed presence bits, without a range-count admission gate. Alternating-window and timestamp fragmentation tests cover more than 64 intervals, gap filling, retained delivery and wrap.
         //# R5)  Otherwise, treat the segment as a normal in-window,
         //# out-of-sequence TCP segment (e.g., queue it for later delivery
         //# to the user).
@@ -4337,6 +4348,8 @@ impl Connection {
             option_len += 4;
         }
         let mut sack_option_len = 0;
+        let mut sack_first = None;
+        let mut sack_limited = false;
         if reset.is_none() && !syn && live && self.sack_send && !self.sack_omit {
             let control_payload = usize::from(
                 probe || keepalive && self.config.keepalive.is_some_and(|k| k.send_garbage),
@@ -4348,15 +4361,30 @@ impl Connection {
                 )
                 // Pure ACK options are independent of MSS. Once reported, limit
                 // piggybacked SACKs to leave room for data on the next poll.
-                .min(if self.ack_pending {
+                .min(if self.ack_pending && !self.sack_data_turn {
                     40
                 } else {
                     self.mss.saturating_sub(1)
                 });
+            let full_available = (40 - option_len)
+                .min((self.config.send_ip_payload_limit as usize).saturating_sub(20 + option_len));
             let max_blocks = available.saturating_sub(4) / 8;
+            sack_limited = self
+                .receive
+                .sack_blocks(full_available.saturating_sub(4) / 8)
+                .iter()
+                .flatten()
+                .count()
+                > self
+                    .receive
+                    .sack_blocks(max_blocks)
+                    .iter()
+                    .flatten()
+                    .count();
             let blocks = self.receive.sack_blocks(max_blocks);
             let n = blocks.iter().flatten().count();
             if n != 0 {
+                sack_first = blocks[0];
                 options[option_len..option_len + 4].copy_from_slice(&[1, 1, 5, (2 + n * 8) as u8]);
                 for (index, &(left, right)) in blocks.iter().flatten().enumerate() {
                     let offset = option_len + 4 + index * 8;
@@ -4725,6 +4753,27 @@ impl Connection {
                 new_fin = true;
             }
         }
+        // A data turn blocked by cwnd/window/SWS is still a full-report ACK,
+        // never a budget-reduced empty packet that can perpetuate ACK work.
+        if count == 0 && sack_limited && self.ack_pending {
+            option_len -= sack_option_len;
+            let available = (40 - option_len)
+                .min((self.config.send_ip_payload_limit as usize).saturating_sub(20 + option_len));
+            let blocks = self.receive.sack_blocks(available.saturating_sub(4) / 8);
+            let n = blocks.iter().flatten().count();
+            sack_first = blocks[0];
+            sack_option_len = if n == 0 { 0 } else { 4 + n * 8 };
+            if n != 0 {
+                options[option_len..option_len + 4].copy_from_slice(&[1, 1, 5, (2 + n * 8) as u8]);
+                for (index, &(left, right)) in blocks.iter().flatten().enumerate() {
+                    let offset = option_len + 4 + index * 8;
+                    options[offset..offset + 4].copy_from_slice(&left.to_be_bytes());
+                    options[offset + 4..offset + 8].copy_from_slice(&right.to_be_bytes());
+                }
+                option_len += sack_option_len;
+            }
+            sack_limited = false;
+        }
         let retransmit_burst = (retransmitted && count != 0 && !probe && !keepalive).then(|| {
             let previous = self.retransmit_burst.filter(|&(end, _)| end == seq);
             (
@@ -5069,9 +5118,13 @@ impl Connection {
         //# D-SACK blocks in subsequent packets only if the receiver receives two
         //# duplicate segments.)
         if sack_option_len != 0 && flags & ACK != 0 {
-            self.receive.clear_dsack();
+            self.receive.commit_sack(sack_first.unwrap());
         }
         if flags & ACK != 0 {
+            self.sack_data_turn = count == 0 && sack_option_len >= self.mss;
+            if !sack_limited {
+                self.receive.commit_report();
+            }
             self.sack_omit = false;
         }
         if count != 0 && !syn && !keepalive {
@@ -5145,7 +5198,8 @@ impl Connection {
             //# last segment sent.  Last.ACK.sent will equal RCV.NXT except when
             //# <ACK>s have been delayed.
             self.last_ack_sent = self.receive.next();
-            self.ack_pending = false;
+            self.ack_pending =
+                self.sack_send && (sack_limited || self.receive.has_pending_report());
             self.ack_deadline = None;
             self.unacked_segments = 0;
             self.unacked_bytes = 0;
@@ -5155,9 +5209,9 @@ impl Connection {
                 0
             };
             let edge = self.receive.next().wrapping_add((window as u32) << shift);
-            // Scope: Packet-level regression accepts and delivers a delayed byte beyond the latest floor-rounded encoded edge but within a prior committed ACK promise, including wrap and batched hole fill with storage bounded. General retention is still limited by the fixed 64-range metadata cap; closure requires capacity-accounted arbitrary fragmentation and retention/report policy, not a waiver based on ordinary contiguous tests. Partial evidence; closure remains TODO.
+            // Scope: Previously committed receive promises remain valid across scaled rounding and wrap. Capacity-backed presence bits accept arbitrary fragmentation without an interval-count limit; tests combine delayed promised bytes, batching and complete retained delivery.
             //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
-            //= reason=Packet-level regression accepts and delivers a delayed byte beyond the latest floor-rounded encoded edge but within a prior committed ACK promise, including wrap and batched hole fill with storage bounded. General retention is still limited by the fixed 64-range metadata cap; closure requires capacity-accounted arbitrary fragmentation and retention/report policy, not a waiver based on ordinary contiguous tests. Partial evidence; closure remains TODO.
+            //= reason=Previously committed receive promises remain valid across scaled rounding and wrap. Capacity-backed presence bits accept arbitrary fragmentation without an interval-count limit; tests combine delayed promised bytes, batching and complete retained delivery.
             //# 1)  The receiver MUST honor, as in window, any segment that would
             //# have been in window for any <ACK> sent by the receiver.
             // Scope: Tracks maximum successful advertised edge independently of current quantized field; not advanced on failed output.
@@ -9054,16 +9108,14 @@ mod tests {
             rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
             a.timeout(225_000).unwrap();
             assert!(a.prr.is_some());
-            // Scoreboard exhaustion, distinct from ledger split exhaustion
-            // tested below, also terminates rather than debits the epoch.
+            // More than 64 intervals no longer invalidate SACK/PRR state.
             for i in 0..65 {
                 rack_sack(&mut a, 226_000, 0, &[(i * 2, i * 2 + 1)]);
             }
-            assert!(a.rack.valid()); // timestamps survive advice exhaustion
-            assert!(!a.rack_enabled());
-            assert!(a.prr.is_none());
-            assert!(a.rack_entry_delivery.is_none());
-            assert!(a.sack_recovery.is_none());
+            assert!(a.rack.valid());
+            assert!(a.prr.is_some());
+            assert!(a.sack_recovery.is_some());
+            assert!(a.scoreboard.ranges().len() > 64);
         }
     }
 
@@ -9626,15 +9678,16 @@ mod tests {
         assert_eq!(a.rack_entry_delivery, None);
         let mut a = rack_flight(0);
         rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
-        // Disjoint byte advice overflows the scoreboard without minting credit.
+        // Disjoint byte advice preserves timer-entry evidence beyond 64 ranges.
+        let pending = a.rack_entry_delivery;
+        let prr = a.prr.is_some();
         for i in 0..65 {
             rack_sack(&mut a, 200_001 + i as u64, 0, &[(i * 2, i * 2 + 1)]);
         }
-        assert!(a.rack.valid()); // do not discard per-byte timestamps
-        assert!(!a.rack_enabled());
+        assert!(a.rack.valid());
         assert!(a.rack.head_transmission(a.snd_una).is_some());
-        assert_eq!(a.rack_entry_delivery, None);
-        assert!(a.prr.is_none());
+        assert_eq!(a.rack_entry_delivery, pending);
+        assert_eq!(a.prr.is_some(), prr);
     }
 
     #[test]
@@ -10153,7 +10206,9 @@ mod tests {
     fn sack_syn_path_budget_validated() {
         for sack in [false, true] {
             for timestamps in [false, true] {
-                let bound = if timestamps {
+                let bound = if timestamps && sack {
+                    44
+                } else if timestamps {
                     40
                 } else if sack {
                     32
@@ -10174,10 +10229,24 @@ mod tests {
                 cfg.send_ip_payload_limit = bound;
                 let mut a = Connection::active(tuple(), cfg.clone(), 100, 0).unwrap();
                 let syn = packet(&mut a, 0);
-                assert_eq!(syn.len(), bound as usize);
+                assert_eq!(
+                    syn.len(),
+                    if timestamps && sack {
+                        40
+                    } else {
+                        bound as usize
+                    }
+                );
                 let syn = wire::parse(ip(tuple()), &syn).unwrap();
                 let mut b = Connection::passive(reverse(tuple()), cfg, 900, 10, &syn).unwrap();
-                assert_eq!(deliver(&mut b, &mut a, 20).len(), bound as usize);
+                assert_eq!(
+                    deliver(&mut b, &mut a, 20).len(),
+                    if timestamps && sack {
+                        40
+                    } else {
+                        bound as usize
+                    }
+                );
                 deliver(&mut a, &mut b, 30);
                 let payload = usize::from(bound) - 20 - if timestamps { 12 } else { 0 };
                 assert_eq!(a.mss, payload);
@@ -11398,11 +11467,12 @@ mod tests {
     }
 
     #[test]
-    fn sack_sender_overflow_cumulative_only_until_flight_covered() {
-        let mut a = sack_flight(128, 100, 8);
+    fn sack_sender_alternating_flight_retains_advice_until_rto() {
+        let mut a = sack_flight(128, u32::MAX - 100, 8);
         let una = a.snd_una;
         let end = a.data_high();
-        for i in 0..65 {
+        let storage = a.scoreboard.ranges().as_ptr();
+        for i in 0..512 {
             sack_ack(
                 &mut a,
                 200 + i as u64,
@@ -11410,21 +11480,25 @@ mod tests {
                 &[(una.wrapping_add(2 * i + 1).0, una.wrapping_add(2 * i + 2).0)],
             );
         }
-        assert_eq!(a.sack_fallback, Some(end));
-        assert!(a.sack_recovery.is_none());
-        assert_eq!(a.scoreboard.pipe(una, end, una, 128), 1024);
-        for now in 300..305 {
-            sack_ack(&mut a, now, una, &[(una.wrapping_add(128).0, end.0)]);
-        }
-        assert_eq!(a.scoreboard.pipe(una, end, una, 128), 1024);
-        assert!(a.sack_recovery.is_none());
-        sack_ack(&mut a, 310, end, &[]);
         assert!(a.sack_fallback.is_none());
-        assert!(a.sack_guard.is_none());
+        assert_eq!(a.scoreboard.ranges().len(), 512);
+        assert_eq!(a.scoreboard.ranges().as_ptr(), storage);
+        assert_eq!(a.scoreboard.unsacked_bytes(una, end), 512);
+        assert_eq!(a.send.len(), 1024); // Advice never frees payload.
+        a.timeout(a.rto_deadline.unwrap()).unwrap();
+        assert!(a.scoreboard.ranges().is_empty());
+        let deadline = a.now;
+        let bytes = packet(&mut a, deadline);
+        let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(seg.header.sequence, una.0);
+        assert!(!seg.payload.is_empty());
+        assert_eq!(a.send.len(), 1024);
+        sack_ack(&mut a, deadline + 1, end, &[]);
+        assert_eq!(a.send.len(), 0);
     }
 
     #[test]
-    fn sack_receiver_cap_rejection_sends_only_cumulative_ack() {
+    fn sack_receiver_more_than_64_fragments_survive_failed_output() {
         let (mut a, _) = pair(sack_config(128), 100);
         let next = a.receive.next();
         let una = a.snd_una;
@@ -11451,13 +11525,17 @@ mod tests {
             &[2],
             &[],
         );
-        assert!(a.sack_omit);
+        assert!(!a.sack_omit);
+        assert_eq!(a.receive_used, 65);
         assert_eq!(a.transmit(111, &mut [0; 8]), Err(Error::OutputTooSmall));
-        assert!(a.sack_omit);
+        assert!(!a.sack_omit);
         let bytes = packet(&mut a, 111);
         let ack = wire::parse(ip(tuple()), &bytes).unwrap();
         assert_eq!(ack.header.acknowledgment, next.0);
-        assert!(ack.options.sack_blocks.iter().all(Option::is_none));
+        assert_eq!(
+            ack.options.sack_blocks[0],
+            Some((next.wrapping_add(201).0, next.wrapping_add(202).0))
+        );
         inject_sack(&mut a, 112, next, una, ACK, 8192, &[3; 128], &[]);
         let bytes = packet(&mut a, 113);
         assert_eq!(
@@ -11867,8 +11945,8 @@ mod tests {
             data.options.sack_blocks[..3],
             [
                 Some((next.wrapping_add(50).0, next.wrapping_add(55).0)),
-                Some((next.wrapping_add(30).0, next.wrapping_add(35).0)),
                 Some((next.wrapping_add(10).0, next.wrapping_add(15).0)),
+                Some((next.wrapping_add(30).0, next.wrapping_add(35).0)),
             ]
         );
         assert_eq!(data.payload, &[7; 88]);
@@ -11959,7 +12037,7 @@ mod tests {
     fn sack_options_leave_path_space_for_probe_and_keepalive_octets() {
         for timestamps in [false, true] {
             for probing in [false, true] {
-                let limit = if timestamps { 40 } else { 32 };
+                let limit = if timestamps { 44 } else { 32 };
                 let cfg = ConnectionConfig {
                     timestamps,
                     send_ip_payload_limit: limit,
@@ -12131,6 +12209,204 @@ mod tests {
             Some((next.wrapping_add(10).0, next.wrapping_add(20).0))
         );
         assert!(seg.options.sack_blocks[1].is_none());
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= type=test
+    //= reason=Six batched arrivals preserve individual full-report ACK work; failed encoding commits neither report history nor pending anchors, and successful first-block history differs from unreported arrival order.
+    //# * The SACK option SHOULD be filled out by repeating the most recently
+    //# reported SACK blocks (based on first SACK blocks in previous SACK options)
+    //# that are not subsets of a SACK block already included in the SACK option
+    //# being constructed.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= type=test
+    //= reason=Six arrivals before output produce six SACK-bearing ACKs within poll-driven work, without collapsing the pending arrival bitmap to one ACK boolean.
+    //# The receiver SHOULD send an ACK for every valid segment that arrives
+    //# containing new data, and each of these "duplicate" ACKs SHOULD bear a SACK
+    //# option.
+    fn sack_history_and_batched_reports_commit_only_after_encode() {
+        for iss in [100, u32::MAX - 100] {
+            let (mut a, _) = pair(sack_config(128), iss);
+            let next = a.receive.next();
+            let una = a.snd_una;
+            let block =
+                |offset| Some((next.wrapping_add(offset).0, next.wrapping_add(offset + 1).0));
+            for offset in [10, 30, 50, 70, 90, 110] {
+                inject_sack(
+                    &mut a,
+                    40,
+                    next.wrapping_add(offset),
+                    una,
+                    ACK,
+                    8192,
+                    &[1],
+                    &[],
+                );
+            }
+            let mut firsts = alloc::vec::Vec::new();
+            for offset in [110, 10, 30, 50, 70, 90] {
+                let planned = a.receive.sack_blocks(4);
+                assert_eq!(planned[0], block(offset));
+                let before = alloc::format!("{:?}", a.receive);
+                assert_eq!(a.transmit(41, &mut [0; 8]), Err(Error::OutputTooSmall));
+                assert_eq!(alloc::format!("{:?}", a.receive), before);
+                assert_eq!(a.receive.sack_blocks(4), planned);
+                let bytes = packet(&mut a, 41);
+                let report = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(report.options.sack_blocks, planned);
+                firsts.push(report.options.sack_blocks[0]);
+                if offset == 30 {
+                    assert_eq!(
+                        report.options.sack_blocks,
+                        [block(30), block(10), block(110), block(50)]
+                    );
+                }
+            }
+            assert_eq!(firsts.len(), 6);
+            assert_eq!(a.transmit(41, &mut [0; 256]), Ok(None));
+            inject_sack(
+                &mut a,
+                42,
+                next.wrapping_add(130),
+                una,
+                ACK,
+                8192,
+                &[1],
+                &[],
+            );
+            let bytes = packet(&mut a, 42);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes)
+                    .unwrap()
+                    .options
+                    .sack_blocks,
+                [block(130), block(90), block(70), block(50)]
+            );
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= type=test
+    //= reason=Full 4/3-slot reports alternate with data at MSS 1/4/12/13; no full report is discarded to make progress, output failure preserves report work, and all payload reaches the wire.
+    //# * The data receiver SHOULD include as many distinct SACK blocks as possible
+    //# in the SACK option.
+    fn sack_full_reports_do_not_starve_low_mss_data() {
+        for timestamps in [false, true] {
+            for mss in [1, 4, 12, 13] {
+                let (mut a, _) = pair(
+                    ConnectionConfig {
+                        timestamps,
+                        ..sack_config(mss)
+                    },
+                    100,
+                );
+                let next = a.receive.next();
+                let una = a.snd_una;
+                for offset in [10, 30, 50, 70, 90, 110] {
+                    inject_sack(
+                        &mut a,
+                        40,
+                        next.wrapping_add(offset),
+                        una,
+                        ACK,
+                        8192,
+                        &[1],
+                        &[],
+                    );
+                }
+                a.write(&[7; 20]).unwrap();
+                let slots = if timestamps { 3 } else { 4 };
+                let mut sent = 0;
+                let mut full = 0;
+                for now in 41..141 {
+                    assert_eq!(a.transmit(now, &mut [0; 8]), Err(Error::OutputTooSmall));
+                    let bytes = packet(&mut a, now);
+                    let report = wire::parse(ip(tuple()), &bytes).unwrap();
+                    if report.payload.is_empty() {
+                        assert_eq!(
+                            report.options.sack_blocks.iter().flatten().count(),
+                            slots,
+                            "ts={timestamps} mss={mss} now={now} turn={} flight={} pending={} flags={}",
+                            a.sack_data_turn,
+                            a.flight(),
+                            a.ack_pending,
+                            report.header.flags
+                        );
+                        full += 1;
+                    } else {
+                        assert!(report.payload.iter().all(|&byte| byte == 7));
+                        sent += report.payload.len();
+                        let ack = a.snd_nxt;
+                        sack_ack(&mut a, now, ack, &[]);
+                    }
+                    if sent == 20 && !a.ack_pending {
+                        break;
+                    }
+                }
+                assert_eq!(sent, 20);
+                assert!(full >= 6);
+                assert!(!a.ack_pending);
+            }
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
+    //= type=test
+    //= reason=Timestamp-valid 128 disjoint bytes are retained across sequence wrap, failed output and bridging, while a PAWS-stale extra byte is rejected rather than fabricated.
+    //# R5)  Otherwise, treat the segment as a normal in-window,
+    //# out-of-sequence TCP segment (e.g., queue it for later delivery
+    //# to the user).
+    fn timestamp_fragmentation_retains_every_allowed_byte() {
+        let (mut a, _) = pair(
+            ConnectionConfig {
+                timestamps: true,
+                ..sack_config(128)
+            },
+            u32::MAX - 100,
+        );
+        let next = a.receive.next();
+        let una = a.snd_una;
+        timestamp_input(&mut a, 39_000, next, una, ACK, Some((40, 0)), b"i");
+        assert_eq!(a.read(&mut [0; 1]), Ok(1));
+        packet(&mut a, 39_000);
+        let next = a.receive.next();
+        for offset in (1..256).step_by(2) {
+            timestamp_input(
+                &mut a,
+                40_000,
+                next.wrapping_add(offset),
+                una,
+                ACK,
+                Some((40, 0)),
+                &[1],
+            );
+        }
+        assert_eq!(a.receive_used, 128);
+        assert_eq!(a.transmit(41_000, &mut [0; 8]), Err(Error::OutputTooSmall));
+        packet(&mut a, 41_000);
+        timestamp_input(
+            &mut a,
+            42_000,
+            next.wrapping_add(300),
+            una,
+            ACK,
+            Some((1, 0)),
+            &[9],
+        );
+        assert_eq!(a.receive_used, 128);
+        timestamp_input(&mut a, 43_000, next, una, ACK, Some((43, 0)), &[2; 256]);
+        assert_eq!(a.receive_used, 256);
+        let mut out = [0; 256];
+        assert_eq!(a.read(&mut out), Ok(256));
+        assert!(
+            out.iter()
+                .enumerate()
+                .all(|(i, &byte)| byte == if i % 2 == 0 { 2 } else { 1 })
+        );
+        assert_eq!(a.receive_used, 0);
     }
 
     #[test]
@@ -12825,7 +13101,9 @@ mod tests {
                         let mut cfg = config(131072, 300);
                         cfg.ecn = false;
                         cfg.receive_ip_payload_limit = 200;
-                        cfg.send_ip_payload_limit = if local_ts {
+                        cfg.send_ip_payload_limit = if local_ts && local_sack {
+                            44
+                        } else if local_ts {
                             40
                         } else if local_sack {
                             32
@@ -14135,10 +14413,10 @@ mod tests {
     //# o  The window field (SEG.WND) of every outgoing segment, with the
     //# exception of <SYN> segments, MUST be right-shifted by
     //# Rcv.Wind.Shift bits:
-    // Scope: Packet-level regression accepts and delivers a delayed byte beyond the latest floor-rounded encoded edge but within a prior committed ACK promise, including wrap and batched hole fill with storage bounded. General retention is still limited by the fixed 64-range metadata cap; closure requires capacity-accounted arbitrary fragmentation and retention/report policy, not a waiver based on ordinary contiguous tests. Partial evidence; closure remains TODO.
+    // Scope: Previously committed receive promises remain valid across scaled rounding and wrap. Capacity-backed presence bits accept arbitrary fragmentation without an interval-count limit; tests combine delayed promised bytes, batching and complete retained delivery.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
     //= type=test
-    //= reason=Packet-level regression accepts and delivers a delayed byte beyond the latest floor-rounded encoded edge but within a prior committed ACK promise, including wrap and batched hole fill with storage bounded. General retention is still limited by the fixed 64-range metadata cap; closure requires capacity-accounted arbitrary fragmentation and retention/report policy, not a waiver based on ordinary contiguous tests. Partial evidence; closure remains TODO.
+    //= reason=Previously committed receive promises remain valid across scaled rounding and wrap. Capacity-backed presence bits accept arbitrary fragmentation without an interval-count limit; tests combine delayed promised bytes, batching and complete retained delivery.
     //# 1)  The receiver MUST honor, as in window, any segment that would
     //# have been in window for any <ACK> sent by the receiver.
     // Scope: Tracks maximum successful advertised edge independently of current quantized field; not advanced on failed output.
@@ -18647,10 +18925,10 @@ mod tests {
     //= reason=PAWS-valid in-sequence text advances receive frontier; later gap fill advances through queued data. Negotiated TS assertion covers this path.
     //# R4)  If an arriving segment is in sequence (i.e., at the left window
     //# edge), then accept it normally.
-    // Scope: Valid timestamp OOO data queued and echoed correctly, but receive range metadata capped at64 rejects otherwise in-window 65th disjoint arrival. Core safe fallback does not establish unconditional queueing of arbitrary allowed fragmentation. Closure: represent accepted receive-window fragmentation with capacity-accounted bounded metadata, preserve retained-byte correctness, and test65-range/bridging/PAWS combinations; ordinary SACK report suppression is separately RFC2018 TODO. Partial evidence; closure remains TODO.
+    // Scope: Timestamp-validated in-window data uses capacity-backed presence bits, without a range-count admission gate. Alternating-window and timestamp fragmentation tests cover more than 64 intervals, gap filling, retained delivery and wrap.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
     //= type=test
-    //= reason=Valid timestamp OOO data queued and echoed correctly, but receive range metadata capped at64 rejects otherwise in-window 65th disjoint arrival. Core safe fallback does not establish unconditional queueing of arbitrary allowed fragmentation. Closure: represent accepted receive-window fragmentation with capacity-accounted bounded metadata, preserve retained-byte correctness, and test65-range/bridging/PAWS combinations; ordinary SACK report suppression is separately RFC2018 TODO. Partial evidence; closure remains TODO.
+    //= reason=Timestamp-validated in-window data uses capacity-backed presence bits, without a range-count admission gate. Alternating-window and timestamp fragmentation tests cover more than 64 intervals, gap filling, retained delivery and wrap.
     //# R5)  Otherwise, treat the segment as a normal in-window,
     //# out-of-sequence TCP segment (e.g., queue it for later delivery
     //# to the user).

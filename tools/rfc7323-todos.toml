@@ -9,14 +9,6 @@ window, as specified in Section 4.2.2.16 of [RFC1122].
 '''
 
 [[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc7323#section-2.4"
-reason = "Packet-level regression accepts and delivers a delayed byte beyond the latest floor-rounded encoded edge but within a prior committed ACK promise, including wrap and batched hole fill with storage bounded. General retention is still limited by the fixed 64-range metadata cap; closure requires capacity-accounted arbitrary fragmentation and retention/report policy, not a waiver based on ordinary contiguous tests."
-quote = '''
-1)  The receiver MUST honor, as in window, any segment that would
-have been in window for any <ACK> sent by the receiver.
-'''
-
-[[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7323#section-4.1"
 reason = "External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input and >=2^31-ms event gaps are rejected. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled."
 quote = '''
@@ -69,15 +61,6 @@ quote = '''
 window by less than 2^Rcv.Wind.Shift, then do normal
 retransmission(s) without regard to the receiver window as long
 as the original segment was in window when it was sent.
-'''
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.3"
-reason = "Valid timestamp OOO data queued and echoed correctly, but receive range metadata capped at64 rejects otherwise in-window 65th disjoint arrival. Core safe fallback does not establish unconditional queueing of arbitrary allowed fragmentation. Closure: represent accepted receive-window fragmentation with capacity-accounted bounded metadata, preserve retained-byte correctness, and test65-range/bridging/PAWS combinations; ordinary SACK report suppression is separately RFC2018 TODO."
-quote = '''
-R5)  Otherwise, treat the segment as a normal in-window,
-out-of-sequence TCP segment (e.g., queue it for later delivery
-to the user).
 '''
 
 [[TODO]]

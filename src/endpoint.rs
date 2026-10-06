@@ -320,8 +320,7 @@ impl Endpoint {
             || config.connection.challenge_ack_limit == 0
             || config.connection.challenge_ack_interval_us == 0
             || config.max_connections == 0
-            || config.connection.send_ip_payload_limit
-                < if config.connection.timestamps { 40 } else { 28 }
+            || config.connection.send_ip_payload_limit < config.connection.minimum_send_budget()
             || config.max_listeners == 0
             || config.hop_limit == 0
             || config.dscp > 63
@@ -335,7 +334,7 @@ impl Endpoint {
                 .send_ip_payload_limit
                 .min(65515)
                 .checked_sub(40)
-                .filter(|&budget| budget >= if config.connection.timestamps { 40 } else { 28 })
+                .filter(|&budget| budget >= config.connection.minimum_send_budget())
                 .ok_or(Error::InvalidArgument)?;
         }
         let mut setup_loss_cache = VecDeque::new();
@@ -347,6 +346,9 @@ impl Endpoint {
         let event_capacity = count
             .checked_add(listeners_count)
             .ok_or(EndpointError::LimitReached)?;
+        // The existing conservative 3*receive charge covers payload, the
+        // 2-bit presence/PUSH map and the new 1-bit pending-report map.
+        // Sender interval storage is a separate additive admission charge.
         let per_connection_bytes = config
             .connection
             .receive_capacity
@@ -357,6 +359,10 @@ impl Endpoint {
                     .send_capacity
                     .checked_mul(2)
                     .and_then(|send| n.checked_add(send))
+            })
+            .and_then(|n| {
+                crate::sack::Scoreboard::allocation_bytes(config.connection.send_capacity)
+                    .and_then(|sack| n.checked_add(sack))
             })
             .and_then(|n| n.checked_add(usize::from(config.connection.mss)))
             .and_then(|n| {

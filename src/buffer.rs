@@ -102,22 +102,6 @@ pub(crate) struct ReceiveOutcome {
     pub out_of_order: bool,
 }
 
-const MAX_OOO_RANGES: usize = 64;
-
-#[derive(Clone, Copy, Debug)]
-struct ReceiveRange {
-    start: Seq,
-    end: Seq,
-    // Dense ranks: zero is newest, so no arrival counter can wrap.
-    recency: u8,
-}
-
-const EMPTY_RANGE: ReceiveRange = ReceiveRange {
-    start: Seq(0),
-    end: Seq(0),
-    recency: 0,
-};
-
 #[derive(Debug)]
 pub(crate) struct ReceiveBuffer {
     // A set presence bit implies the payload byte in that slot was initialized.
@@ -132,8 +116,15 @@ pub(crate) struct ReceiveBuffer {
     contiguous_len: usize,
     fin_sequence: Option<Seq>,
     eof: bool,
-    ranges: [ReceiveRange; MAX_OOO_RANGES],
-    range_count: usize,
+    occupied: usize,
+    latest: Option<Seq>,
+    reported: [Option<Seq>; 4],
+    // One first-new-byte anchor per arrival, independent of wire history.
+    // Input never allocates reporting work; application-read anchors become
+    // cumulative-only debt, bounded by capacity even if output is exhausted.
+    report_pending: Vec<u8>,
+    report_debt: usize,
+    pending_first: Option<Seq>,
     dsack: Option<(Seq, Seq)>,
 }
 
@@ -156,6 +147,11 @@ impl ReceiveBuffer {
             // Zeroed bytes clear every bit; the allocation uses Vec's exact layout.
             Vec::from_raw_parts(pointer, metadata_len, metadata_len)
         };
+        let mut report_pending = Vec::new();
+        report_pending
+            .try_reserve_exact(capacity.div_ceil(8))
+            .map_err(|_| ())?;
+        report_pending.resize(capacity.div_ceil(8), 0);
         Ok(Self {
             data,
             pushed: false,
@@ -165,8 +161,12 @@ impl ReceiveBuffer {
             contiguous_len: 0,
             fin_sequence: None,
             eof: false,
-            ranges: [EMPTY_RANGE; MAX_OOO_RANGES],
-            range_count: 0,
+            occupied: 0,
+            latest: None,
+            reported: [None; 4],
+            report_pending,
+            report_debt: 0,
+            pending_first: None,
             dsack: None,
         })
     }
@@ -179,8 +179,12 @@ impl ReceiveBuffer {
         self.contiguous_len = 0;
         self.fin_sequence = None;
         self.eof = false;
-        self.ranges.fill(EMPTY_RANGE);
-        self.range_count = 0;
+        self.occupied = 0;
+        self.latest = None;
+        self.reported = [None; 4];
+        self.report_pending.fill(0);
+        self.report_debt = 0;
+        self.pending_first = None;
         self.dsack = None;
     }
 
@@ -220,7 +224,7 @@ impl ReceiveBuffer {
     }
 
     pub(crate) fn has_data(&self) -> bool {
-        self.contiguous_len != 0 || self.range_count != 0
+        self.occupied != 0
     }
 
     pub(crate) fn take_push(&mut self) -> bool {
@@ -277,16 +281,15 @@ impl ReceiveBuffer {
             ));
             return;
         }
-        for range in &self.ranges[..self.range_count] {
-            let left = start.max(range.start.distance_from(frontier) as i64);
-            let right = end.min(range.end.distance_from(frontier) as i64);
-            if left < right {
-                self.dsack = Some((
-                    frontier.wrapping_add(left as u32),
-                    frontier.wrapping_add(right as u32),
-                ));
-                break;
-            }
+        let left = self.find_presence(self.contiguous_len + start as usize, true);
+        let right = self
+            .find_presence(left, false)
+            .min(self.contiguous_len + end as usize);
+        if left < right {
+            self.dsack = Some((
+                self.read_base.wrapping_add(left as u32),
+                self.read_base.wrapping_add(right as u32),
+            ));
         }
     }
 
@@ -301,7 +304,7 @@ impl ReceiveBuffer {
     //# containing the segment which triggered this ACK, unless that segment
     //# advanced the Acknowledgment Number field in the header.
     //= https://www.rfc-editor.org/rfc/rfc2018#section-4
-    //= reason=Retained distinct ranges have dense arrival-recency ranks; focused RFC examples check repeated blocks and subset-eliminating merge.
+    //= reason=Four successful first-block anchors provide report history; anchors resolve through the presence bitmap after merges and cumulative advancement. Encoding failure does not change history.
     //# * The SACK option SHOULD be filled out by repeating the most recently
     //# reported SACK blocks (based on first SACK blocks in previous SACK options)
     //# that are not subsets of a SACK block already included in the SACK option
@@ -355,95 +358,198 @@ impl ReceiveBuffer {
             return blocks;
         }
         let mut count = 0;
-        let mut containing = None;
-        if let Some((start, end)) = self.dsack {
-            blocks[count] = Some((start.0, end.0));
-            count += 1;
-            containing = self.ranges[..self.range_count].iter().position(|range| {
-                let offset = start.distance_from(range.start);
-                offset < range.end.distance_from(range.start)
-                    && end.distance_from(range.start) <= range.end.distance_from(range.start)
-            });
-            // An above-ACK duplicate is distinguishable only with a containing
-            // second block. With one slot, send that full ordinary SACK instead.
-            if let Some(index) = containing
-                && limit == 1
-            {
-                let range = self.ranges[index];
-                blocks[0] = Some((range.start.0, range.end.0));
-                return blocks;
+        fn add(
+            blocks: &mut [Option<(u32, u32)>; 4],
+            count: &mut usize,
+            limit: usize,
+            range: Option<(Seq, Seq)>,
+        ) {
+            if let Some((left, right)) = range {
+                let block = Some((left.0, right.0));
+                if *count < limit && !blocks[..*count].contains(&block) {
+                    blocks[*count] = block;
+                    *count += 1;
+                }
             }
-            if let Some(index) = containing
-                && count < limit
-            {
-                let range = self.ranges[index];
-                blocks[count] = Some((range.start.0, range.end.0));
+        }
+        if let Some(duplicate) = self.dsack {
+            let containing = self.block_at(duplicate.0);
+            if containing.is_none() || limit > 1 {
+                add(&mut blocks, &mut count, limit, Some(duplicate));
+            }
+            if let Some((left, right)) = containing {
+                blocks[count] = Some((left.0, right.0));
                 count += 1;
             }
         }
-        for recency in 0..self.range_count {
-            if count == limit {
+        add(
+            &mut blocks,
+            &mut count,
+            limit,
+            self.report_anchor().and_then(|seq| self.block_at(seq)),
+        );
+        for &seq in &self.reported {
+            add(
+                &mut blocks,
+                &mut count,
+                limit,
+                seq.and_then(|seq| self.block_at(seq)),
+            );
+        }
+        // Fill unused wire slots with actual retained blocks, not arrival history.
+        let mut offset = self.contiguous_len;
+        while count < limit {
+            let left = self.find_presence(offset, true);
+            if left == self.data.len() {
                 break;
             }
-            for (index, range) in self.ranges[..self.range_count].iter().enumerate() {
-                if range.recency as usize == recency && Some(index) != containing {
-                    blocks[count] = Some((range.start.0, range.end.0));
-                    count += 1;
-                    break;
-                }
+            let right = self.find_presence(left, false);
+            let range = (
+                self.read_base.wrapping_add(left as u32),
+                self.read_base.wrapping_add(right as u32),
+            );
+            let block = Some((range.0.0, range.1.0));
+            if !blocks[..count].contains(&block) {
+                blocks[count] = block;
+                count += 1;
             }
+            offset = right;
         }
         blocks
     }
 
-    fn remove_range(&mut self, index: usize) {
-        let recency = self.ranges[index].recency;
-        self.ranges.copy_within(index + 1..self.range_count, index);
-        self.range_count -= 1;
-        for range in &mut self.ranges[..self.range_count] {
-            if range.recency > recency {
-                range.recency -= 1;
+    // Called only after a SACK-bearing packet has been successfully encoded.
+    pub(crate) fn commit_sack(&mut self, first: (u32, u32)) {
+        let anchor = Seq(first.0);
+        let mut history = [None; 4];
+        history[0] = Some(anchor);
+        let mut count = 1;
+        for &old in &self.reported {
+            if old != Some(anchor) && old.is_some() && count < history.len() {
+                history[count] = old;
+                count += 1;
+            }
+        }
+        self.reported = history;
+        self.dsack = None;
+    }
+
+    pub(crate) fn has_pending_report(&self) -> bool {
+        self.report_debt != 0
+    }
+
+    fn pending(&self, seq: Seq) -> bool {
+        let offset = seq.distance_from(self.read_base) as usize;
+        offset < self.data.len() && {
+            let index = self.index(offset);
+            self.report_pending[index / 8] & (1 << (index % 8)) != 0
+        }
+    }
+
+    fn report_anchor(&self) -> Option<Seq> {
+        if let Some(latest) = self.latest
+            && self.pending(latest)
+        {
+            return Some(latest);
+        }
+        self.pending_first.or(self.latest)
+    }
+
+    pub(crate) fn commit_report(&mut self) {
+        self.report_debt = self.report_debt.saturating_sub(1);
+        if let Some(anchor) = self.report_anchor()
+            && self.pending(anchor)
+        {
+            let offset = anchor.distance_from(self.read_base) as usize;
+            let index = self.index(offset);
+            self.report_pending[index / 8] &= !(1 << (index % 8));
+            if self.pending_first == Some(anchor) {
+                self.pending_first = self.find_pending(offset + 1);
             }
         }
     }
 
-    // Preflight the union before touching presence/data. A span at the frontier
-    // consumes ranges instead of needing a temporary 65th slot.
-    fn track_range(&mut self, mut left: usize, mut right: usize) -> bool {
-        let mut first = 0;
-        while first < self.range_count
-            && (self.ranges[first].end.distance_from(self.read_base) as usize) < left
-        {
-            first += 1;
-        }
-        let mut last = first;
-        while last < self.range_count
-            && (self.ranges[last].start.distance_from(self.read_base) as usize) <= right
-        {
-            left = left.min(self.ranges[last].start.distance_from(self.read_base) as usize);
-            right = right.max(self.ranges[last].end.distance_from(self.read_base) as usize);
-            last += 1;
-        }
-        let contiguous = left == self.contiguous_len;
-        if self.range_count - (last - first) + usize::from(!contiguous) > MAX_OOO_RANGES {
-            return false;
-        }
-        for _ in first..last {
-            self.remove_range(first);
-        }
-        if !contiguous {
-            self.ranges.copy_within(first..self.range_count, first + 1);
-            for range in &mut self.ranges[..self.range_count + 1] {
-                range.recency += 1;
+    fn find_pending(&self, mut offset: usize) -> Option<Seq> {
+        while offset < self.data.len() {
+            let index = self.index(offset);
+            if index.is_multiple_of(8)
+                && index + 8 <= self.data.len()
+                && offset + 8 <= self.data.len()
+            {
+                let bits = self.report_pending[index / 8];
+                if bits == 0 {
+                    offset += 8;
+                    continue;
+                }
+                return Some(
+                    self.read_base
+                        .wrapping_add((offset + bits.trailing_zeros() as usize) as u32),
+                );
             }
-            self.ranges[first] = ReceiveRange {
-                start: self.read_base.wrapping_add(left as u32),
-                end: self.read_base.wrapping_add(right as u32),
-                recency: 0,
-            };
-            self.range_count += 1;
+            if self.report_pending[index / 8] & (1 << (index % 8)) != 0 {
+                return Some(self.read_base.wrapping_add(offset as u32));
+            }
+            offset += 1;
         }
-        true
+        None
+    }
+
+    fn block_at(&self, seq: Seq) -> Option<(Seq, Seq)> {
+        let offset = seq.distance_from(self.read_base) as usize;
+        if offset < self.contiguous_len
+            || offset >= self.data.len()
+            || !self.is_present(self.index(offset))
+        {
+            return None;
+        }
+        // Scan packed presence words backwards as well as forwards. Ring edges
+        // and the unaligned ends use single-slot checks; PUSH bits are ignored.
+        let mut left = offset;
+        while left > self.contiguous_len {
+            let index = self.index(left - 1);
+            if index % 32 == 31 && left - self.contiguous_len >= 32 {
+                let byte = index / 4 - 7;
+                let word = u64::from_le_bytes(self.metadata[byte..byte + 8].try_into().unwrap())
+                    & 0x5555_5555_5555_5555;
+                if word == 0x5555_5555_5555_5555 {
+                    left -= 32;
+                    continue;
+                }
+            }
+            if !self.is_present(index) {
+                break;
+            }
+            left -= 1;
+        }
+        let right = self.find_presence(offset, false);
+        Some((
+            self.read_base.wrapping_add(left as u32),
+            self.read_base.wrapping_add(right as u32),
+        ))
+    }
+
+    // Bounded by the byte window; skips 32 slots per packed word, without
+    // crossing the physical ring edge or reading beyond the metadata allocation.
+    fn find_presence(&self, mut offset: usize, present: bool) -> usize {
+        let capacity = self.data.len();
+        while offset < capacity {
+            let index = self.index(offset);
+            if index.is_multiple_of(32) && index + 32 <= capacity && offset + 32 <= capacity {
+                let byte = index / 4;
+                let word = u64::from_le_bytes(self.metadata[byte..byte + 8].try_into().unwrap());
+                let matching = (if present { word } else { !word }) & 0x5555_5555_5555_5555;
+                if matching == 0 {
+                    offset += 32;
+                    continue;
+                }
+                return offset + matching.trailing_zeros() as usize / 2;
+            }
+            if self.is_present(index) == present {
+                return offset;
+            }
+            offset += 1;
+        }
+        capacity
     }
 
     fn index(&self, offset: usize) -> usize {
@@ -483,10 +589,18 @@ impl ReceiveBuffer {
             // Presence guarantees an initialized payload byte.
             *dst = unsafe { self.data[index].assume_init() };
             self.set_present(index, false);
+            self.occupied -= 1;
+            self.report_pending[index / 8] &= !(1 << (index % 8));
         }
         self.head = self.index(count);
         self.read_base = self.read_base.wrapping_add(count as u32);
         self.contiguous_len -= count;
+        if self
+            .pending_first
+            .is_some_and(|seq| seq.distance_from(self.read_base) as usize >= self.data.len())
+        {
+            self.pending_first = self.find_pending(0);
+        }
         count
     }
 
@@ -508,6 +622,7 @@ impl ReceiveBuffer {
         push: bool,
     ) -> ReceiveOutcome {
         let previous_next = self.next();
+        let had_holes = self.occupied > self.contiguous_len;
         let mut outcome = ReceiveOutcome {
             new_bytes: 0,
             sack_overflow: false,
@@ -523,12 +638,7 @@ impl ReceiveBuffer {
         let data_limit = self
             .fin_sequence
             .map_or(capacity, |end| end.distance_from(self.read_base) as usize);
-        let start = sequence.distance_from(self.read_base) as i32 as i64;
-        let left = start.max(self.contiguous_len as i64);
-        let right = (start + payload.len() as i64).min(data_limit as i64);
-        if left < right {
-            outcome.sack_overflow = !self.track_range(left as usize, right as usize);
-        }
+        let mut new_anchor = None;
         for (offset, &byte) in payload.iter().enumerate() {
             let position = sequence.wrapping_add(offset as u32);
             let distance = position.distance_from(self.read_base) as usize;
@@ -539,13 +649,33 @@ impl ReceiveBuffer {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
             //# If a segment's contents straddle the boundary between old and new, only the
             //# new parts are processed.
-            if !outcome.sack_overflow && !self.is_present(index) {
+            if !self.is_present(index) {
                 self.data[index].write(byte);
                 self.set_present(index, true);
                 outcome.new_bytes += 1;
+                self.occupied += 1;
+                new_anchor.get_or_insert(position);
             }
         }
 
+        if let Some(anchor) = new_anchor
+            && (outcome.out_of_order || had_holes)
+        {
+            let offset = anchor.distance_from(self.read_base) as usize;
+            let index = self.index(offset);
+            self.report_pending[index / 8] |= 1 << (index % 8);
+            if self
+                .pending_first
+                .is_none_or(|old| offset < old.distance_from(self.read_base) as usize)
+            {
+                self.pending_first = Some(anchor);
+            }
+            // ponytail: after application reads, cumulative-only ACK debt is
+            // coalesced at capacity under prolonged output exhaustion. Retained
+            // fragments keep individual anchors; use driver backpressure if
+            // every already-consumed arrival must retain a separate ACK.
+            self.report_debt = self.report_debt.saturating_add(1).min(capacity);
+        }
         if push && !payload.is_empty() {
             let last = sequence.wrapping_add(payload.len() as u32 - 1);
             let distance = last.distance_from(self.read_base) as usize;
@@ -588,6 +718,14 @@ impl ReceiveBuffer {
             outcome.fin = true;
         }
         outcome.advanced = self.next() != previous_next;
+        self.latest = None;
+        if !outcome.advanced && !payload.is_empty() {
+            let offset = sequence.distance_from(self.read_base) as usize;
+            let left = self.find_presence(offset.max(self.contiguous_len), true);
+            if left < data_limit && left < offset.saturating_add(payload.len()) {
+                self.latest = new_anchor.or(Some(self.read_base.wrapping_add(left as u32)));
+            }
+        }
         outcome
     }
 }
@@ -597,6 +735,10 @@ mod tests {
     use super::*;
 
     fn receive_packet(recv: &mut ReceiveBuffer, sequence: Seq, payload: &[u8]) -> ReceiveOutcome {
+        if let Some(first) = recv.sack_blocks(4)[0] {
+            recv.commit_sack(first);
+        }
+        recv.commit_report();
         recv.record_duplicate(sequence, payload.len());
         let behind = recv.next().distance_from(sequence);
         let skip = if behind < 1 << 31 {
@@ -638,17 +780,14 @@ mod tests {
                 recv.read_base.wrapping_add(offset as u32),
             ));
         }
-        let actual: Vec<_> = recv.ranges[..recv.range_count]
-            .iter()
-            .map(|r| (r.start, r.end))
-            .collect();
-        assert_eq!(actual, expected);
-        let mut ranks: Vec<_> = recv.ranges[..recv.range_count]
-            .iter()
-            .map(|r| r.recency as usize)
-            .collect();
-        ranks.sort_unstable();
-        assert_eq!(ranks, (0..recv.range_count).collect::<Vec<_>>());
+        for &(left, right) in &expected {
+            assert_eq!(recv.block_at(left), Some((left, right)));
+            assert_eq!(
+                recv.block_at(right.wrapping_add(u32::MAX)),
+                Some((left, right))
+            );
+        }
+        assert_eq!(recv.occupied, occupied_data(recv).iter().flatten().count());
     }
 
     #[test]
@@ -695,7 +834,7 @@ mod tests {
     //# advanced the Acknowledgment Number field in the header.
     //= https://www.rfc-editor.org/rfc/rfc2018#section-4
     //= type=test
-    //= reason=Retained distinct ranges have dense arrival-recency ranks; focused RFC examples check repeated blocks and subset-eliminating merge.
+    //= reason=Four successful first-block anchors provide report history; anchors resolve through the presence bitmap after merges and cumulative advancement. Encoding failure does not change history.
     //# * The SACK option SHOULD be filled out by repeating the most recently
     //# reported SACK blocks (based on first SACK blocks in previous SACK options)
     //# that are not subsets of a SACK block already included in the SACK option
@@ -761,6 +900,8 @@ mod tests {
             assert_eq!(recv.sack_blocks(3), blocks);
             assert_eq!(recv.sack_blocks(1), [blocks[0], None, None, None]);
             assert_ranges(&recv);
+            recv.commit_sack(blocks[0].unwrap());
+            recv.commit_report();
         }
         recv.insert(Seq(6500), &[2; 500], false);
         assert_eq!(
@@ -970,48 +1111,96 @@ mod tests {
     }
 
     #[test]
-    fn overflow_is_transactional_and_bridging_at_capacity_succeeds() {
-        let mut recv = ReceiveBuffer::new(Seq(u32::MAX - 64), 256).unwrap();
-        let start = recv.next();
-        for offset in (1..128).step_by(2) {
-            assert_eq!(
-                receive_packet(&mut recv, start.wrapping_add(offset), b"a").new_bytes,
-                1
+    fn exhausted_output_bounds_report_work_without_losing_readable_bytes() {
+        let mut recv = ReceiveBuffer::new(Seq(u32::MAX - 7), 17).unwrap();
+        let storage = (
+            recv.data.as_ptr(),
+            recv.metadata.as_ptr(),
+            recv.report_pending.as_ptr(),
+        );
+        for _ in 0..8 {
+            let start = recv.next();
+            for offset in (1..17).step_by(2) {
+                assert_eq!(
+                    recv.insert(start.wrapping_add(offset), b"a", false)
+                        .new_bytes,
+                    1
+                );
+            }
+            recv.insert(start, &[b'b'; 17], false);
+            let mut out = [0; 17];
+            assert_eq!(recv.read(&mut out), 17);
+            assert!(
+                out.iter()
+                    .enumerate()
+                    .all(|(i, &byte)| byte == if i % 2 == 0 { b'b' } else { b'a' })
             );
+            assert_eq!(recv.reported, [None; 4]); // Arrival is not report history.
+            assert!(recv.report_debt <= 17);
+            assert_eq!(recv.sack_blocks(4), [None; 4]); // Read data is never fabricated as queued SACK.
         }
-        assert_eq!(recv.range_count, 64);
-        let old_blocks = recv.sack_blocks(4);
-        let old_data = occupied_data(&recv);
-        let old_metadata = recv.metadata.clone();
-        recv.record_duplicate(start.wrapping_add(130), 3);
-        let rejected = recv.insert_with_push(start.wrapping_add(130), b"xyz", true, true);
-        assert!(rejected.sack_overflow);
-        assert_eq!(recv.fin_sequence, Some(start.wrapping_add(133)));
-        assert!(!rejected.fin && !rejected.advanced && !recv.take_push());
-        assert_eq!(rejected.new_bytes, 0);
-        assert_eq!(occupied_data(&recv), old_data);
-        assert_eq!(recv.metadata, old_metadata);
-        assert_eq!(recv.sack_blocks(4), old_blocks);
-        let bridge = receive_packet(&mut recv, start.wrapping_add(2), b"z");
-        assert!(!bridge.sack_overflow);
-        assert_eq!(bridge.new_bytes, 1);
-        assert_eq!(recv.range_count, 63);
-        receive_packet(&mut recv, start.wrapping_add(130), b"x");
-        assert_eq!(recv.range_count, 64);
-        assert!(!receive_packet(&mut recv, start, b"b").sack_overflow);
-        assert_eq!(recv.next(), start.wrapping_add(4));
-        assert_ranges(&recv);
-        let result = receive_packet(&mut recv, start.wrapping_add(4), &[b'c'; 127]);
-        assert!(!result.sack_overflow);
-        assert_eq!(recv.range_count, 0);
-        assert_ranges(&recv);
-        let mut out = [0; 131];
-        assert_eq!(recv.read(&mut out), 131);
-        assert_eq!(&out[..4], b"baza");
-        for offset in (5..128).step_by(2) {
-            assert_eq!(out[offset], b'a');
+        assert_eq!(recv.report_debt, 17);
+        for _ in 0..17 {
+            recv.commit_report();
         }
-        assert_eq!(out[130], b'x');
+        assert!(!recv.has_pending_report());
+        assert_eq!(
+            (
+                recv.data.as_ptr(),
+                recv.metadata.as_ptr(),
+                recv.report_pending.as_ptr()
+            ),
+            storage
+        );
+    }
+
+    #[test]
+    fn alternating_window_retains_every_byte_across_wrap_and_bridges() {
+        for capacity in [255, 256, 8192] {
+            let start = Seq(u32::MAX - 64);
+            let mut recv = ReceiveBuffer::new(start, capacity).unwrap();
+            for offset in (1..capacity).step_by(2) {
+                let outcome =
+                    recv.insert_with_push(start.wrapping_add(offset as u32), b"a", false, true);
+                assert_eq!(outcome.new_bytes, 1);
+                assert!(!outcome.sack_overflow);
+                assert_eq!(
+                    recv.sack_blocks(4)[0],
+                    Some((
+                        start.wrapping_add(offset as u32).0,
+                        start.wrapping_add(offset as u32 + 1).0
+                    ))
+                );
+            }
+            assert_ranges(&recv);
+            for offset in (0..capacity).step_by(2) {
+                assert_eq!(
+                    recv.insert(start.wrapping_add(offset as u32), b"b", false)
+                        .new_bytes,
+                    1
+                );
+            }
+            assert_eq!(recv.readable(), capacity);
+            assert!(recv.take_push());
+            assert_eq!(recv.sack_blocks(4), [None; 4]);
+            let mut out = alloc::vec![0; capacity];
+            assert_eq!(recv.read(&mut out), capacity);
+            assert!(
+                out.iter()
+                    .enumerate()
+                    .all(|(i, b)| *b == if i % 2 == 0 { b'b' } else { b'a' })
+            );
+            assert!(!recv.has_data());
+            // Reuse at a non-word-aligned ring head.
+            let next = recv.next();
+            recv.insert(next, b"abc", false);
+            recv.read(&mut out[..3]);
+            let next = recv.next();
+            recv.insert(next.wrapping_add(33), b"xyz", true);
+            recv.insert(next, &[b'q'; 33], false);
+            assert!(recv.eof());
+            assert_eq!(recv.read(&mut out), 36);
+        }
     }
 
     #[test]

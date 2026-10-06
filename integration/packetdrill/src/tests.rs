@@ -1085,7 +1085,10 @@ fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
             receive_capacity
         );
         let per_connection = owner.endpoint.buffer_bytes();
-        assert!(per_connection >= 3 * receive_capacity + 2 * 65536 + 1460 + 8 * (65536 + 2));
+        assert!(
+            per_connection
+                >= 3 * receive_capacity + 2 * 65536 + 1460 + 8 * (65536 + 2) + (65536 / 2 + 4) * 8
+        );
         let max_bytes = 32 * 1024 * 1024;
         let count = LIMIT.min(max_bytes / per_connection);
         for i in 1..count {

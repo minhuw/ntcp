@@ -1,7 +1,11 @@
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 use crate::seq::Seq;
 
+#[cfg(test)]
 const CAPACITY: usize = 64;
 const HALF_SPACE: u32 = 1 << 31;
 const EMPTY: (Seq, Seq) = (Seq(0), Seq(0));
@@ -15,20 +19,41 @@ pub(crate) struct UpdateOutcome {
 
 // Advisory byte ranges only: the caller retains data until cumulative ACK and
 // calls clear on RTO. All edges, including high_data and high_rxt, are exclusive.
-#[derive(Clone, Debug)]
+// Intentionally not Clone: packet processing must not copy this heap storage.
+#[derive(Debug)]
 pub(crate) struct Scoreboard {
-    ranges: [(Seq, Seq); CAPACITY],
+    ranges: Vec<(Seq, Seq)>,
+    capacity: usize,
     len: usize,
     ack: Seq,
 }
 
 impl Scoreboard {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
-        Self {
-            ranges: [EMPTY; CAPACITY],
+        Self::with_capacity(CAPACITY * 2).unwrap()
+    }
+
+    pub(crate) fn with_capacity(send_capacity: usize) -> Result<Self, ()> {
+        let capacity = send_capacity.div_ceil(2);
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(capacity.checked_add(4).ok_or(())?)
+            .map_err(|_| ())?;
+        ranges.resize(capacity + 4, EMPTY);
+        Ok(Self {
+            ranges,
+            capacity,
             len: 0,
             ack: Seq(0),
-        }
+        })
+    }
+
+    pub(crate) fn allocation_bytes(send_capacity: usize) -> Option<usize> {
+        send_capacity
+            .div_ceil(2)
+            .checked_add(4)?
+            .checked_mul(core::mem::size_of::<(Seq, Seq)>())
     }
 
     pub(crate) fn ranges(&self) -> &[(Seq, Seq)] {
@@ -40,7 +65,7 @@ impl Scoreboard {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc2018#section-5
-    //= reason=Within ordinary capacity (at most 64 disjoint ranges), valid in-flight ranges persist as a union, duplicates count once and cumulative ACK trims them. A 65th disjoint range clears advice; see RFC 2018 section-5 recording TODO.
+    //= reason=Admission preallocates ceil(send_capacity/2) intervals plus four temporary slots: every possible disjoint byte union inside the configured flight fits, without incoming-SACK allocation.
     //# When receiving an ACK containing a SACK option, the data sender SHOULD
     //# record the selective acknowledgment for future reference.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-3
@@ -81,10 +106,11 @@ impl Scoreboard {
         }
 
         // Trim before counting new delivery, even when no SACK is present.
-        let mut pending = [EMPTY; CAPACITY + 4];
+
         let mut count = 0;
         let mut old_bytes = 0;
-        for &(left, right) in &self.ranges[..self.len] {
+        for index in 0..self.len {
+            let (left, right) = self.ranges[index];
             if right.serial_cmp(ack) != Some(Ordering::Greater) {
                 continue;
             }
@@ -93,7 +119,7 @@ impl Scoreboard {
             } else {
                 ack
             };
-            pending[count] = (left, right);
+            self.ranges[count] = (left, right);
             count += 1;
             old_bytes += right.distance_from(left);
         }
@@ -161,33 +187,33 @@ impl Scoreboard {
                 continue;
             }
             if let Some(range) = valid(block) {
-                pending[count] = range;
+                self.ranges[count] = range;
                 count += 1;
             }
         }
 
         // Temporary room for the four incoming blocks avoids false overflow
         // when a later block joins intervals introduced by an earlier block.
-        pending[..count].sort_unstable_by_key(|&(left, _)| left.distance_from(ack));
+        self.ranges[..count].sort_unstable_by_key(|&(left, _)| left.distance_from(ack));
         let mut merged = 0;
         for index in 0..count {
-            let (left, right) = pending[index];
-            if merged > 0 && left.distance_from(ack) <= pending[merged - 1].1.distance_from(ack) {
-                if right.distance_from(ack) > pending[merged - 1].1.distance_from(ack) {
-                    pending[merged - 1].1 = right;
+            let (left, right) = self.ranges[index];
+            if merged > 0 && left.distance_from(ack) <= self.ranges[merged - 1].1.distance_from(ack)
+            {
+                if right.distance_from(ack) > self.ranges[merged - 1].1.distance_from(ack) {
+                    self.ranges[merged - 1].1 = right;
                 }
             } else {
-                pending[merged] = (left, right);
+                self.ranges[merged] = (left, right);
                 merged += 1;
             }
         }
-        if merged > CAPACITY {
+        if merged > self.capacity {
             self.clear();
             outcome.overflow = true;
             return outcome;
         }
         self.len = merged;
-        self.ranges[..merged].copy_from_slice(&pending[..merged]);
         let bytes: u32 = self.ranges[..merged]
             .iter()
             .map(|&(left, right)| right.distance_from(left))
@@ -208,21 +234,25 @@ impl Scoreboard {
             return false;
         }
         let above = seq.wrapping_add(1);
-        let mut ranges = 0;
-        let mut bytes = 0u64;
-        for &(left, right) in &self.ranges[..self.len] {
-            if right.serial_cmp(above) != Some(Ordering::Greater) {
-                continue;
-            }
-            ranges += 1;
-            let start = if left.serial_cmp(above) == Some(Ordering::Greater) {
-                left
-            } else {
-                above
-            };
-            bytes += u64::from(right.distance_from(start));
+        let first = self.ranges[..self.len].partition_point(|&(_, right)| {
+            right.distance_from(self.ack) <= above.distance_from(self.ack)
+        });
+        let ranges = &self.ranges[first..self.len];
+        if ranges.len() >= 3 {
+            return true;
         }
-        ranges >= 3 || bytes > 2 * u64::from(mss)
+        let bytes: u64 = ranges
+            .iter()
+            .map(|&(left, right)| {
+                let start = if left.serial_cmp(above) == Some(Ordering::Greater) {
+                    left
+                } else {
+                    above
+                };
+                u64::from(right.distance_from(start))
+            })
+            .sum();
+        bytes > 2 * u64::from(mss)
     }
 
     // Each yielded interval is wholly unsacked, so IsLost is constant within it:
@@ -275,7 +305,7 @@ impl Scoreboard {
             .sum()
     }
 
-    // ponytail: bounded 65-by-64 range scans; cache suffix counts if profiling warrants it.
+    // Interval traversal with logarithmic loss queries; no per-octet flight scans.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-4
     //= reason=Exclusive edges translate RFC inclusive byte variables. Independent per-octet oracle checks both additive conditions, SACK exclusion, unaligned edges and wrapping sequence space.
     //# This routine traverses the sequence space from HighACK to HighData and MUST
@@ -381,6 +411,54 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-3
+    //= type=test
+    //= reason=Capacity-derived storage represents an alternating byte subset through the entire configured send window, with stable allocation, wrap, bridges and cumulative trim.
+    //# The algorithms presented here allow this, but require the ability to mark
+    //# arbitrary sequence number ranges as having been selectively acknowledged.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Every valid alternating-window byte is retained and counted once, including more than 64 intervals; one full bridge merges them without overflow or allocation.
+    //# Given the information provided in an ACK, each octet that is cumulatively
+    //# ACKed or SACKed should be marked accordingly in the scoreboard data
+    //# structure, and the total number of octets SACKed should be recorded.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5
+    //= type=test
+    //= reason=Whole configured byte-window fragmentation retains every advice interval across successive ACKs without changing allocation.
+    //# When receiving an ACK containing a SACK option, the data sender SHOULD
+    //# record the selective acknowledgment for future reference.
+    fn configured_capacity_covers_every_alternating_byte_and_bridge() {
+        for capacity in [1usize, 127, 128, 8192] {
+            let mut s = Scoreboard::with_capacity(capacity).unwrap();
+            let start = Seq(u32::MAX - 62);
+            let end = start.wrapping_add(capacity as u32);
+            let pointer = s.ranges.as_ptr();
+            for offset in (0..capacity).step_by(2) {
+                let left = start.wrapping_add(offset as u32);
+                let outcome = s.update(
+                    start,
+                    end,
+                    &[Some((left.0, left.wrapping_add(1).0)), None, None, None],
+                );
+                assert!(!outcome.overflow);
+                assert_eq!(outcome.newly_sacked, 1);
+                assert_eq!(s.ranges.as_ptr(), pointer);
+            }
+            assert_eq!(s.ranges().len(), capacity.div_ceil(2));
+            assert_eq!(s.unsacked_bytes(start, end), capacity as u32 / 2);
+            let outcome = s.update(start, end, &[Some((start.0, end.0)), None, None, None]);
+            assert!(!outcome.overflow);
+            assert_eq!(outcome.newly_sacked, capacity as u32 / 2);
+            assert_eq!(s.ranges(), &[(start, end)]);
+            assert_eq!(s.pipe(start, end, start, 1), 0);
+            s.update(end, end, &[None; 4]);
+            assert!(s.ranges().is_empty());
+            s.clear();
+            assert_eq!(s.ranges.as_ptr(), pointer);
+        }
+    }
+
+    #[test]
     //= https://www.rfc-editor.org/rfc/rfc2018#section-8
     //= type=test
     //= reason=Owned storage/scoreboard check SACKs even the head, confirms exact retained payload, clears advice on RTO, and releases only explicit cumulative ACK bytes. Connection-level wire assertions remain separate.
@@ -420,7 +498,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc2018#section-5
     //= type=test
-    //= reason=Within ordinary capacity (at most 64 disjoint ranges), valid in-flight ranges persist as a union, duplicates count once and cumulative ACK trims them. A 65th disjoint range clears advice; see RFC 2018 section-5 recording TODO.
+    //= reason=Admission preallocates ceil(send_capacity/2) intervals plus four temporary slots: every possible disjoint byte union inside the configured flight fits, without incoming-SACK allocation.
     //# When receiving an ACK containing a SACK option, the data sender SHOULD
     //# record the selective acknowledgment for future reference.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-3
