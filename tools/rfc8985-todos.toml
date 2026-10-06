@@ -1,8 +1,8 @@
-# Physical clock conformance is an embedding obligation, not a software waiver.
+# Clock precision is a caller-contract obligation.
 
-[[TODO]]
+[[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc8985#section-4"
-reason = "External caller obligation: physically monotonic, consistent-rate time with precision finer than min_RTT/4 and suitable scheduling. Internal timestamps and RTT retain caller microsecond or nanosecond ticks; no declared resolution or observed-RTT precision gate disables RACK/TLP. Capacity-backed intervals cover all outstanding bytes/segments, with bounded capacity fallback and ordinary SACK/RTO recovery retained. Software tests cannot certify physical rate/precision or scheduling. Violations leave protocol timing guarantees unspecified, never Rust UB or memory-safety violations; retain this TODO for external physical evidence, not an API migration."
+reason = "Caller-contract scope: the embedding guarantees effective transmission-timestamp precision finer than min_RTT/4 in its real or simulated time domain, including the chosen caller unit. Instant states this precondition. Rack::transmit stores committed send times and RTT calculations retain caller microsecond or nanosecond ticks; RACK remains enabled at small RTTs. Capacity-backed storage and its bounded fallback remain enforced. Physical clock precision belongs to the provider; violating the contract leaves protocol timing guarantees unspecified while memory safety and resource bounds remain enforced. This exception scopes the external precision obligation; transmission recording remains implementation evidence."
 quote = '''
 For each data segment sent, the sender MUST store its most recent
 transmission time with a timestamp whose granularity is finer

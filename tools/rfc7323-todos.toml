@@ -1,17 +1,17 @@
 # Agent-only annotation audit: official RFC quotes, whitespace reflow only.
 
-[[TODO]]
+[[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc7323#section-4.1"
-reason = "External caller obligation: physically monotonic, consistent-rate time with sufficient precision for protocol timing; violation leaves timing guarantees unspecified, never Rust UB or memory-safety violations. CallerTimebase validates microsecond/nanosecond units and MSL <=255s, not actual resolution. Backward inputs and endpoint timestamp half-range clock gaps are rejected; long inactivity invalidates stale RTT history while preserving lifecycle progress. Secret-offset wire TSval uses independent ms/us periods modulo2^32; peer PAWS expiry remains independent. Physical rate/drift/precision and actual network MSL require embedding guarantees and evidence."
+reason = "Caller-contract scope: the embedding supplies monotonic, consistently scaled time in its real or simulated time domain, with sufficient precision. Instant and CallerTimebase state this precondition; caller_units_endpoint_isn_control_epoch_deadlines_and_guards tests unit conversion, backward-input rejection and timestamp half-range guards. Physical clock rate and precision belong to the provider. Violating the contract leaves protocol timing guarantees unspecified while memory safety and resource bounds remain enforced."
 quote = '''
 Values of this
 clock MUST be at least approximately proportional to real time, in
 order to measure actual RTT.
 '''
 
-[[TODO]]
+[[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.4"
-reason = "Configured timestamp period is 2^32 selected ticks (default milliseconds, opt-in microseconds) and validated MSL is at most255s. Long inactivity safely expires stale timing history. Establishing the relationship to physical packet lifetime requires the embedding runtime's clock and network-MSL guarantees."
+reason = "Caller-contract scope: the embedding guarantees consistently scaled time and the configured maximum segment lifetime for its network or simulation. CallerTimebase::valid bounds MSL to 255 seconds; TimestampGranularity produces a wrap period of 2^32 milliseconds or microseconds, both greater than that bound. caller_units_endpoint_isn_control_epoch_deadlines_and_guards tests independent caller/wire units and half-range guards. Actual packet lifetime and clock rate remain provider obligations; the implementation enforces the numeric relationship under those preconditions."
 quote = '''
 The recycling time of the timestamp clock MUST be greater than
 MSL seconds.
