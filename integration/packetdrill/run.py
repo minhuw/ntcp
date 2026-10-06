@@ -17,7 +17,11 @@ ROOT = HERE.parent.parent
 PIN = json.loads((HERE / 'upstream.json').read_text())
 
 
-def preflight(text):
+TCP_INFO_FIELDS = {'tcpi_ca_state', 'tcpi_unacked', 'tcpi_sacked',
+                   'tcpi_lost', 'tcpi_retrans', 'tcpi_reordering'}
+
+
+def preflight(text, embedded_tcp_info=False):
     # Conservative safety/capability screening, NOT a second packetdrill parser.
     # Upstream --dry_run remains the authority for script syntax.
     # Inspect raw text conservatively, including comments: do not accidentally
@@ -26,7 +30,13 @@ def preflight(text):
     if '`' in text:
         reasons.append('shell setup/assertions target Linux, not the ntcp backend')
     if '%{' in text or '}%' in text:
-        reasons.append('embedded code is outside the supported adapter profile')
+        if embedded_tcp_info:
+            unknown = set(re.findall(r'\btcpi_\w+\b', text)) - TCP_INFO_FIELDS
+            if unknown:
+                reasons.append('embedded code requires unsupported TCP_INFO fields: '
+                               + ', '.join(sorted(unknown)))
+        else:
+            reasons.append('embedded code requires a hash-audited TCP_INFO mapping')
     allowed = {'local_ip', 'remote_ip', 'tolerance_usecs', 'tcp_ts_tick_usecs',
                'strict_segments', 'ip_version', 'mss', 'tcp_ts_ecr_scaled'}
     for option in re.findall(r'^\s*--([\w_-]+)', text, re.M):
@@ -63,7 +73,7 @@ def adapt_source(directory, relative, manifest, so_flags):
             or source.count(b'`') != 2):
         raise ValueError('expected exactly one audited setup command and replacement')
     generated = source.replace(command, replacement, 1)
-    reasons = preflight(generated.decode())
+    reasons = preflight(generated.decode(), entry.get('embedded_tcp_info') is True)
     if reasons:
         raise ValueError('; '.join(reasons))
     return generated, {**entry, 'generated_sha256': hashlib.sha256(generated).hexdigest()}
@@ -256,15 +266,19 @@ def main():
                     row.update(status='syntax_error' if code is not None and not expired
                                else 'environment_error', log=log)
                 else:
-                    reasons = preflight(text)
+                    embedded_tcp_info = (row['adapted'] and
+                                         row['adaptation'].get('embedded_tcp_info') is True)
+                    reasons = preflight(text, embedded_tcp_info)
                     if variant not in ('native-ipv4', 'ipv4'):
                         reasons.append('the adapter implements IPv4 only')
                     if reasons:
                         row.update(status='unsupported', reasons=reasons)
                     else:
                         # Namespace isolation is required, never fall back to host.
+                        preload = ['env', 'PYTHONOPTIMIZE=0', f'LD_PRELOAD={plugin}'] if embedded_tcp_info else []
+                        row['effective_flags']['preload'] = str(plugin) if embedded_tcp_info else None
                         argv = ['unshare', '--user', '--map-root-user', '--net',
-                                str(runner), f'--so_filename={plugin}',
+                                *preload, str(runner), f'--so_filename={plugin}',
                                 f'--so_flags={so_flags}', *flags, str(execution_script)]
                         code, expired, log = invoke(argv, execution_script.parent, args.timeout)
                         row.update(status=outcome(code, expired, log), returncode=code,

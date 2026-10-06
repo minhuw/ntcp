@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import os
 import signal
 import sys
 import tempfile
@@ -22,6 +23,13 @@ class RunnerChecks(unittest.TestCase):
         self.assertEqual(preflight('0 > S. 0:0(0) ack 1 <mss 1460,sackOK>'), [])
         self.assertEqual(preflight('0 < S 0:0(0) win 1000 <sackOK>'), [])
         self.assertEqual(preflight('--tolerance_usecs=10000\n0 > . 1:1(0) ack 1'), [])
+
+    def test_embedded_code_requires_audited_capability_and_known_fields(self):
+        text = '0 %{ assert tcpi_lost == 0 }%'
+        self.assertTrue(preflight(text))
+        self.assertEqual(preflight(text, embedded_tcp_info=True), [])
+        self.assertTrue(preflight('0 %{ assert tcpi_pacing_rate == 0 }%', True))
+        self.assertTrue(preflight('`sysctl something`\n' + text, True))
 
     def test_upstream_variants_preserve_wrapper_parameters(self):
         both = dict(variants(Path('basic.pkt'), True))
@@ -233,6 +241,27 @@ class AdaptationChecks(unittest.TestCase):
             self.assertTrue(preflight(self.source.decode()))  # upstream still refuses it
             self.assertEqual(preflight(generated.decode()), [])
 
+    def test_embedded_assertions_preserved_and_hash_bound(self):
+        entry = self.manifest['scripts'][self.name]
+        path = self.directory / self.name
+        original = self.source + b'0 %{ assert tcpi_lost == 0 }%\n'
+        path.write_bytes(original)
+        entry['source_sha256'] = hashlib.sha256(original).hexdigest()
+        with self.assertRaises(ValueError):
+            adapt_source(self.directory, self.name, self.manifest, self.flags)
+        entry['embedded_tcp_info'] = True
+        generated, audit = adapt_source(self.directory, self.name, self.manifest, self.flags)
+        self.assertTrue(generated.endswith(b'0 %{ assert tcpi_lost == 0 }%\n'))
+        self.assertTrue(audit['embedded_tcp_info'])
+        path.write_bytes(original.replace(b'== 0', b'== 1'))
+        with self.assertRaisesRegex(ValueError, 'hash differs'):
+            adapt_source(self.directory, self.name, self.manifest, self.flags)
+        original = original.replace(b'tcpi_lost', b'tcpi_pacing_rate')
+        path.write_bytes(original)
+        entry['source_sha256'] = hashlib.sha256(original).hexdigest()
+        with self.assertRaisesRegex(ValueError, 'unsupported TCP_INFO'):
+            adapt_source(self.directory, self.name, self.manifest, self.flags)
+
     def test_source_and_setup_changes_rejected_with_same_revision(self):
         for relative in (self.name, 'common/defaults.sh'):
             path = self.directory / relative
@@ -318,6 +347,20 @@ class AdaptationChecks(unittest.TestCase):
         for invocation in calls[1::2]:
             self.assertEqual(invocation[:4], ['unshare', '--user', '--map-root-user', '--net'])
             self.assertIn(f'--so_filename={plugin}', invocation)
+            entry = next(entry for name, entry in self.manifest['scripts'].items()
+                         if Path(name).name == Path(invocation[-1]).name)
+            embedded = entry.get('embedded_tcp_info') is True
+            self.assertEqual(f'LD_PRELOAD={plugin}' in invocation, embedded)
+            self.assertEqual('PYTHONOPTIMIZE=0' in invocation, embedded)
+            if embedded:
+                # Exercise the actual interpreter under the selected environment override.
+                with patch.dict(os.environ, {'PYTHONOPTIMIZE': '1'}):
+                    code, expired, log = invoke(
+                        ['env', invocation[5], sys.executable, '-c', 'assert False'],
+                        checkout, 5)
+                self.assertEqual(code, 1)
+                self.assertFalse(expired)
+                self.assertIn('AssertionError', log)
         for filters, expected_counts, expected_calls in (
             (['--variant', 'ipv4', '--script', self.name], {'passed': 1}, 2),
             (['--variant', 'ipv4'], {'passed': 1, 'failed': count - 1}, 2 * count),

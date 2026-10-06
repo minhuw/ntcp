@@ -12,7 +12,8 @@
 +0 write(4, ..., 7300) = 7300
 +0 > . 1:1461(1460) ack 1 win 65535
 +0 > . 1461:2921(1460) ack 1 win 65535
-+0 > . 2921:4381(1460) ack 1 win 65535
+// Automatic PUSH also terminates the initial congestion-window burst.
++0 > P. 2921:4381(1460) ack 1 win 65535
 +0 < . 1:1(0) ack 1 win 65535 <nop,nop,sack 1461:2921>
 +0 > . 4381:5841(1460) ack 1 win 65535
 +0 < . 1:1(0) ack 1 win 65535 <nop,nop,sack 1461:4381>

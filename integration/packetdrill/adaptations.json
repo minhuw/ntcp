@@ -131,7 +131,7 @@
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "SACK/window-scale handshake, passive close and post-close reset; peer omits timestamps",
-        "ntcp_settings": {"sack": true, "timestamps": true, "ecn": false, "mss": 1460, "receive_capacity": 8388608, "window_scale": 8, "endpoint_max_buffer_bytes": 33554432, "congestion_control": "NewReno"}
+        "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "CRB", "ecn": false, "mss": 1460, "receive_capacity": 8388608, "window_scale": 8, "endpoint_max_buffer_bytes": 33554432, "congestion_control": "NewReno"}
       }
     },
     "ts_recent/fin_tsval.pkt": {
@@ -147,8 +147,91 @@
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "SACK/timestamp handshake and FIN timestamp progression; peer omits window scaling",
-        "ntcp_settings": {"sack": true, "timestamps": true, "ecn": false, "mss": 1460, "receive_capacity": 8388608, "window_scale": 8, "endpoint_max_buffer_bytes": 33554432, "congestion_control": "NewReno"}
+        "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "CRB", "ecn": false, "mss": 1460, "receive_capacity": 8388608, "window_scale": 8, "endpoint_max_buffer_bytes": 33554432, "congestion_control": "NewReno"}
       }
+    },
+    "sack/sack-route-refresh-ip-tos.pkt": {
+      "source_sha256": "bb81fc984053853bc5891c9e6081539920f3313b995cb56e887d82ba4a7abd04",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4", "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "mapping": {"linux_defaults_reproduced": false, "assertions_preserved": true, "scope": "IPv4 TOS/DF controls and selective retransmission", "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "CRB", "receive_capacity": 8388608, "ecn": false, "congestion_control": "NewReno"}}
+    },
+    "sack/sack-shift-sacked-2-6-8-3-9-nofack.pkt": {
+      "source_sha256": "bb59cdf5e2bd04b93aba1611718589a799c245f524a514c06e7c70956d559114",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4", "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "embedded_tcp_info": true,
+      "mapping": {"linux_defaults_reproduced": false, "assertions_preserved": true, "scope": "SACK range shifts with unchanged TCP_INFO assertions over live transport state", "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "CRB", "receive_capacity": 8388608, "ecn": false, "congestion_control": "NewReno"}}
+    },
+    "sack/sack-shift-sacked-7-3-4-8-9-fack.pkt": {
+      "source_sha256": "2a03adf13ac63a8c2fdf6dfe53a2533bff60ed0ae4c194ca1c44dc4991270c5d",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4", "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "embedded_tcp_info": true,
+      "mapping": {"linux_defaults_reproduced": false, "assertions_preserved": true, "scope": "RACK timer, SACK range shifts and live TCP_INFO assertions", "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "CRB", "receive_capacity": 8388608, "ecn": false, "congestion_control": "NewReno"}}
+    },
+    "sack/sack-shift-sacked-7-5-6-8-9-fack.pkt": {
+      "source_sha256": "6801395a10a2ff12d2b592e781d8135cc719113eb9d9ea92bf5d024cba4e95d7",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4", "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "embedded_tcp_info": true,
+      "mapping": {"linux_defaults_reproduced": false, "assertions_preserved": true, "scope": "RACK timer, SACK range shifts and live TCP_INFO assertions", "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "CRB", "receive_capacity": 8388608, "ecn": false, "congestion_control": "NewReno"}}
+    },
+    "fast_retransmit/fr-4pkt-sack.pkt": {
+      "source_sha256": "8757d3c2629272099d7a1f58c9add1de80821abc75f8b2ee245efcefdcca5d5c",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4", "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "mapping": {"linux_defaults_reproduced": false, "assertions_preserved": true, "scope": "Four-segment SACK fast retransmit", "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "CRB", "receive_capacity": 8388608, "ecn": false, "congestion_control": "NewReno"}}
+    },
+    "fast_retransmit/fr-4pkt-fack-last-byte.pkt": {
+      "source_sha256": "48417e7646583308d05e76d64656556bd2f61052504e2173d39be926ebfe7d77",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4", "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "mapping": {"linux_defaults_reproduced": false, "assertions_preserved": true, "scope": "Tail-byte SACK recovery", "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "CRB", "receive_capacity": 8388608, "ecn": false, "congestion_control": "NewReno"}}
+    },
+    "fast_retransmit/fr-4pkt-fack-last-mss.pkt": {
+      "source_sha256": "2cd06f233c10a8ca5a895251ca026a3690d15708b75112546b150ba72f3075d2",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4", "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "mapping": {"linux_defaults_reproduced": false, "assertions_preserved": true, "scope": "Tail-segment SACK recovery", "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "CRB", "receive_capacity": 8388608, "ecn": false, "congestion_control": "NewReno"}}
+    },
+    "limited_transmit/limited-transmit-sack.pkt": {
+      "source_sha256": "39d66783f8042c09de3ca7fa2ac702c9d4447299b31037358240b853333db3a1",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4", "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "mapping": {"linux_defaults_reproduced": false, "assertions_preserved": true, "scope": "SACK evidence driven Limited Transmit", "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "CRB", "receive_capacity": 8388608, "ecn": false, "congestion_control": "NewReno"}}
     }
   }
 }
