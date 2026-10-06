@@ -360,22 +360,16 @@ impl Rack {
     }
 
     pub(crate) fn lowest_lost(&self, mss: u32) -> Option<(Seq, Seq)> {
-        let i = self
+        let first = self
             .intervals
             .iter()
-            .position(|r| !r.sacked && r.needs_retransmit)?;
-        let start = self.intervals[i].start;
-        let mut end = start;
-        for r in &self.intervals[i..] {
-            if r.start != end || r.sacked || !r.needs_retransmit {
-                break;
-            }
-            end = r.end;
-            if end.distance_from(start) >= mss {
-                return Some((start, start.wrapping_add(mss)));
-            }
-        }
-        Some((start, end))
+            .find(|r| !r.sacked && r.needs_retransmit)?;
+        // RFC 6675 §4 starts at the lowest unSACKed byte, up to SMSS;
+        // §5.1 leaves post-RTO packetization unspecified. Keep RACK's original
+        // packet boundary: SACK splits account bytes, not new packets (RFC 2018 §5).
+        // A redundant suffix is allowed, but never include the next packet.
+        let size = first.original_end.distance_from(first.start).min(mss);
+        Some((first.start, first.start.wrapping_add(size)))
     }
 
     pub(crate) fn pipe(&self) -> u32 {
@@ -491,6 +485,80 @@ mod tests {
                 ),
                 1000
             );
+        }
+    }
+
+    #[test]
+    fn lost_selection_keeps_packet_boundary_and_charges_redundant_suffix() {
+        for base in [Seq(1), Seq(u32::MAX - 499)] {
+            for prefix in [0, 123] {
+                let seq = |n: u32| base.wrapping_add(n);
+                let mut rack = Rack::new().unwrap();
+                let mut scoreboard = Scoreboard::new();
+                rack.sample(100);
+                rack.transmit(base, seq(1000), 0, false);
+                rack.transmit(seq(1000), seq(2000), 0, false);
+                rack.rto(200, base, Some(100));
+                let blocks = [(seq(999).0, seq(2000).0), (base.0, seq(prefix).0)];
+                let blocks = &blocks[..if prefix == 0 { 1 } else { 2 }];
+                assert_eq!(
+                    sack(&mut rack, &mut scoreboard, base.0, seq(2000).0, 300, blocks),
+                    1001 + prefix
+                );
+                assert_eq!(rack.pipe(), 0);
+                assert_eq!(rack.counts().sacked, 1);
+                let advice = scoreboard.ranges().to_vec();
+                // Large credit must not reach the wholly SACKed next packet.
+                assert_eq!(rack.lowest_lost(2000), Some((seq(prefix), seq(1000))));
+                // MSS or congestion credit clips even the redundant suffix.
+                assert_eq!(
+                    rack.lowest_lost(300),
+                    Some((seq(prefix), seq(prefix + 300)))
+                );
+                let (start, end) = rack.lowest_lost(1000).unwrap();
+                rack.transmit(start, end, 400, true);
+                assert_eq!(rack.pipe(), 1000 - prefix);
+                assert_eq!(rack.lowest_lost(1000), None);
+                assert_eq!(scoreboard.ranges(), advice);
+                assert_eq!(
+                    sack(&mut rack, &mut scoreboard, base.0, seq(2000).0, 500, blocks),
+                    0
+                );
+                assert_eq!(rack.pipe(), 999 - prefix);
+                assert_eq!(
+                    sack(
+                        &mut rack,
+                        &mut scoreboard,
+                        seq(2000).0,
+                        seq(2000).0,
+                        600,
+                        &[]
+                    ),
+                    999 - prefix
+                );
+                assert_eq!(rack.pipe(), 0);
+                assert_eq!(rack.lowest_lost(1000), None);
+            }
+        }
+    }
+
+    #[test]
+    fn lost_selection_never_extends_past_transmitted_high() {
+        for base in [Seq(1), Seq(u32::MAX - 499)] {
+            let end = base.wrapping_add(777);
+            let mut rack = Rack::new().unwrap();
+            let mut scoreboard = Scoreboard::new();
+            rack.transmit(base, end, 0, false);
+            rack.rto(200, base, None);
+            sack(
+                &mut rack,
+                &mut scoreboard,
+                base.0,
+                end.0,
+                300,
+                &[(base.wrapping_add(776).0, end.0)],
+            );
+            assert_eq!(rack.lowest_lost(1000), Some((base, end)));
         }
     }
 
