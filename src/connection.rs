@@ -5044,6 +5044,51 @@ mod tests {
         a
     }
 
+    #[test]
+    fn rack_single_sacked_segment_uses_same_rtt_window_for_four_and_ten_packets() {
+        for iss in [100, u32::MAX - 4999] {
+            for (segments, sacked_index) in [(4, 3), (10, 7)] {
+                let cfg = ConnectionConfig {
+                    sack: true,
+                    rack: true,
+                    prr: true,
+                    initial_window: InitialWindow::Iw10,
+                    ..config(65_536, 1000)
+                };
+                let mut a = Connection::active(tuple(), cfg.clone(), iss, 0).unwrap();
+                let bytes = packet(&mut a, 0);
+                let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+                let mut b = Connection::passive(reverse(tuple()), cfg, 900, 0, &syn).unwrap();
+                deliver(&mut b, &mut a, 100_000);
+                deliver(&mut a, &mut b, 100_000);
+                a.write(&vec![0x55; segments * 1000]).unwrap();
+                for _ in 0..segments {
+                    packet(&mut a, 100_000);
+                }
+                rack_sack(
+                    &mut a,
+                    200_000,
+                    0,
+                    &[(sacked_index * 1000, (sacked_index + 1) * 1000)],
+                );
+                // RFC 8985: one SACKed segment and no observed reordering use
+                // min_RTT/4. Flight length changes the loss count, not this delay.
+                assert_eq!(a.rtt.srtt(), Some(100_000));
+                assert_eq!(a.rack.deadline, Some(225_000));
+                assert_eq!(a.next_deadline(), Some(225_000));
+                a.timeout(224_999).unwrap();
+                assert!(!a.transport_info().recovery);
+                assert_eq!(a.transmit(224_999, &mut [0; 1500]), Ok(None));
+                a.timeout(225_000).unwrap();
+                assert!(a.transport_info().recovery);
+                let bytes = packet(&mut a, 225_000);
+                let retransmit = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(retransmit.header.sequence, iss.wrapping_add(1));
+                assert_eq!(retransmit.payload.len(), 1000);
+            }
+        }
+    }
+
     fn rack_sack(a: &mut Connection, now: u64, ack_offset: u32, blocks: &[(u32, u32)]) {
         let base = a.iss.wrapping_add(1);
         let blocks: Vec<_> = blocks

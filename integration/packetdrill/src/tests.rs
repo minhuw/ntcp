@@ -163,15 +163,16 @@ fn abi_table_null_counts_vectors_variadics_and_host_clock() {
             -1
         );
         assert_eq!(*__errno_location(), EFAULT);
-        assert_eq!(libc::close(fd), 0);
     }
     n = TCP_INFO_SIZE as socklen_t;
     unsafe {
         assert_eq!(
-            getsockopt(fd, IPPROTO_TCP, TCP_INFO, info.as_mut_ptr().cast(), &mut n),
+            getsockopt(-1, IPPROTO_TCP, TCP_INFO, info.as_mut_ptr().cast(), &mut n),
             -1
         );
         assert_eq!(*__errno_location(), EBADF);
+        // Keep fd reserved until dup2 atomically replaces our own descriptor.
+        // Closing first lets parallel tests reuse it before the assertions or dup2.
         let host = libc::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         assert!(host >= 0);
         if host != fd {
@@ -467,6 +468,200 @@ fn socket_sends_wait_for_handshake_without_core_buffering() {
         ntcp::wire::parse(tx.ip, &tcp[..tx.len]).unwrap().payload,
         &[1, 2, 3, 4]
     );
+}
+
+#[test]
+fn owner_loop_emits_pure_handshake_ack_before_pending_send_data() {
+    for selected in [Profile::Baseline, Profile::UpstreamWindow8] {
+        let adapter = Adapter::start((local(), selected)).unwrap();
+        let fd = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+            .unwrap()
+            .value as i32;
+        let remote = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080);
+        assert_eq!(
+            call(&adapter, 5, fd, 0, encode_addr(remote), 0).err(),
+            Some(EINPROGRESS)
+        );
+        let syn = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap();
+        let (outgoing_ip, tcp) = parse_frame(&syn.bytes).unwrap();
+        let sent = ntcp::wire::parse(outgoing_ip, tcp).unwrap().header;
+        let (mut blocking, _) = request(10, fd, F_SETFL, vec![], 0);
+        blocking.b = 0;
+        adapter.call(blocking).unwrap();
+        let (send, sent_reply) = request(7, fd, 0, b"data".to_vec(), 0);
+        adapter.tx.send(send).unwrap();
+        // FIFO barrier proves SEND is pending before the SYNACK arrives.
+        call(&adapter, 17, fd, 0, vec![], 0).unwrap();
+        assert!(matches!(
+            sent_reply.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        // Also queue a packet read: it must observe this iteration's pure ACK.
+        let (read, packet_reply) = request(15, 0, 0, vec![], BYTES);
+        adapter.tx.send(read).unwrap();
+        call(&adapter, 17, fd, 0, vec![], 0).unwrap();
+        assert!(matches!(
+            packet_reply.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let ip = IpMetadata {
+            source: outgoing_ip.destination,
+            destination: outgoing_ip.source,
+        };
+        let header = ntcp::wire::Header {
+            source_port: sent.destination_port,
+            destination_port: sent.source_port,
+            sequence: 100,
+            acknowledgment: sent.sequence.wrapping_add(1),
+            flags: ntcp::wire::SYN | ntcp::wire::ACK,
+            window: 65535,
+            urgent_pointer: 0,
+        };
+        let mut tcp = [0; 64];
+        let len = ntcp::wire::encode(ip, header, &[], &[], &mut tcp).unwrap();
+        let bytes = frame(
+            ntcp::Transmit {
+                connection: None,
+                ip,
+                len,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+                ipv4_options: Default::default(),
+            },
+            &tcp[..len],
+        )
+        .unwrap();
+        call(&adapter, 14, 0, 0, bytes, 0).unwrap();
+        assert_eq!(
+            sent_reply
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap()
+                .value,
+            4
+        );
+        let ack = packet_reply
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        let (ip, tcp) = parse_frame(&ack.bytes).unwrap();
+        let ack = ntcp::wire::parse(ip, tcp).unwrap();
+        assert_eq!(ack.header.flags, ntcp::wire::ACK);
+        assert_eq!(ack.header.acknowledgment, 101);
+        assert_eq!(ack.header.sequence, sent.sequence.wrapping_add(1));
+        assert!(
+            ack.payload.is_empty(),
+            "{selected:?}: handshake ACK carried SEND data"
+        );
+        let data = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap();
+        let (ip, tcp) = parse_frame(&data.bytes).unwrap();
+        let data = ntcp::wire::parse(ip, tcp).unwrap();
+        assert_eq!(data.header.sequence, ack.header.sequence);
+        assert_eq!(data.header.acknowledgment, 101);
+        assert_eq!(data.payload, b"data");
+    }
+}
+
+#[test]
+fn owner_loop_preserves_pending_send_read_fifo_on_refused_handshake() {
+    let (mut send, _) = request(7, 0, 0, b"data".to_vec(), 0);
+    let (mut read, _) = request(6, 0, 0, vec![], 4);
+    // Rendezvous replies make out-of-order completion fail: an early READ
+    // reply blocks the owner before it can answer the earlier SEND.
+    let (send_reply, sent) = mpsc::sync_channel(0);
+    let (read_reply, read_result) = mpsc::sync_channel(0);
+    send.reply = send_reply;
+    read.reply = read_reply;
+    let (ready, barrier) = mpsc::sync_channel(1);
+    let (requests, incoming) = mpsc::sync_channel(1);
+    let join = thread::spawn(move || {
+        let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+        let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
+        let remote = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080);
+        let (mut connect, _) = request(5, fd, 0, encode_addr(remote), 0);
+        assert_eq!(owner.execute_at_now(&mut connect).err(), Some(EINPROGRESS));
+        let (tx, packet) = poll_frame(&mut owner).unwrap();
+        let syn = packet_header(&packet);
+        owner.sockets.get_mut(&fd).unwrap().nonblock = false;
+        send.fd = fd;
+        read.fd = fd;
+        assert!(!owner.retry(&mut send));
+        assert!(!owner.retry(&mut read));
+        owner.pending.push_back(send);
+        owner.pending.push_back(read);
+        // Begin with real blocked requests in SEND/READ order.
+        assert_eq!(
+            owner.pending.iter().map(|r| r.op).collect::<Vec<_>>(),
+            [7, 6]
+        );
+        let ip = IpMetadata {
+            source: tx.ip.destination,
+            destination: tx.ip.source,
+        };
+        let header = ntcp::wire::Header {
+            source_port: syn.destination_port,
+            destination_port: syn.source_port,
+            sequence: 0,
+            acknowledgment: syn.sequence.wrapping_add(1),
+            flags: ntcp::wire::RST | ntcp::wire::ACK,
+            window: 0,
+            urgent_pointer: 0,
+        };
+        let mut tcp = [0; 64];
+        let len = ntcp::wire::encode(ip, header, &[], &[], &mut tcp).unwrap();
+        let rst = frame(
+            ntcp::Transmit {
+                connection: None,
+                ip,
+                len,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+                ipv4_options: Default::default(),
+            },
+            &tcp[..len],
+        )
+        .unwrap();
+        ready.send((fd, rst)).unwrap();
+        owner.run(incoming, &AtomicBool::new(false));
+        assert!(owner.pending.is_empty());
+        assert_eq!(owner.sockets[&fd].error, 0);
+    });
+    let (fd, rst) = barrier.recv_timeout(Duration::from_secs(3)).unwrap();
+    // Each barrier is answered after a full error-free owner iteration with
+    // both requests pending. Idle retries must not rotate SEND behind READ.
+    for _ in 0..3 {
+        let (r, reply) = request(17, fd, 0, vec![], 0);
+        requests.try_send(r).unwrap();
+        assert_eq!(
+            reply
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap()
+                .value,
+            0
+        );
+        assert!(matches!(sent.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(matches!(
+            read_result.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+    let (r, reply) = request(14, 0, 0, rst, 0);
+    requests.try_send(r).unwrap();
+    reply.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+    let send_result = sent.recv_timeout(Duration::from_secs(3));
+    let received = read_result.recv_timeout(Duration::from_secs(3));
+    // Drain both replies and disconnect before asserting; even a reordered
+    // SEND must leave its rendezvous after the earlier receive times out.
+    drop(sent);
+    drop(read_result);
+    drop(requests);
+    join.join().unwrap();
+    assert_eq!(send_result.unwrap().err(), Some(ECONNREFUSED));
+    // Preserve the existing underlying closed-state READ error mapping.
+    assert_eq!(received.unwrap().err(), Some(ENOTCONN));
 }
 
 #[test]

@@ -435,18 +435,17 @@ impl Owner {
                     self.detached.push_back(id);
                 }
             }
-            // Retry queued reads before generating ACKs so their window credit
-            // can be coalesced with the ACK for the newly received data.
-            for _ in 0..self.pending.len().min(BUDGET) {
+            // Only error-free application reads precede output: coalesce their
+            // window credit without stealing an earlier request's socket error.
+            // Emit the handshake ACK before a pending SEND queues data.
+            // Dequeue one bounded batch so requeued reads cannot run twice.
+            let mut after_output: [Option<(Request, bool)>; BUDGET] = std::array::from_fn(|_| None);
+            for slot in after_output.iter_mut().take(self.pending.len().min(BUDGET)) {
                 let mut request = self.pending.pop_front().unwrap();
-                match self.execute_at_now(&mut request) {
-                    Ok(Some(response)) => {
-                        let _ = request.reply.send(Ok(response));
-                    }
-                    Ok(None) => self.pending.push_back(request),
-                    Err(e) => {
-                        let _ = request.reply.send(Err(e));
-                    }
+                let early =
+                    request.op == 6 && self.sockets.get(&request.fd).is_some_and(|s| s.error == 0);
+                if !early || !self.retry(&mut request) {
+                    *slot = Some((request, early));
                 }
             }
             for _ in 0..BUDGET {
@@ -483,6 +482,13 @@ impl Owner {
                     }
                 }
             }
+            // Requeue blocked reads and other requests in their original order.
+            // An idle iteration must preserve who consumes a later socket error.
+            for (mut request, retried) in after_output.into_iter().flatten() {
+                if retried || !self.retry(&mut request) {
+                    self.pending.push_back(request);
+                }
+            }
             self.gc_ip_options();
             let wait = self
                 .endpoint
@@ -497,14 +503,8 @@ impl Owner {
                         let _ = request.reply.send(Err(EAGAIN));
                         continue;
                     }
-                    match self.execute_at_now(&mut request) {
-                        Ok(Some(response)) => {
-                            let _ = request.reply.send(Ok(response));
-                        }
-                        Ok(None) => self.pending.push_back(request),
-                        Err(e) => {
-                            let _ = request.reply.send(Err(e));
-                        }
+                    if !self.retry(&mut request) {
+                        self.pending.push_back(request);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -570,6 +570,18 @@ impl Owner {
                 }
             }
         }
+    }
+    fn retry(&mut self, request: &mut Request) -> bool {
+        match self.execute_at_now(request) {
+            Ok(Some(response)) => {
+                let _ = request.reply.send(Ok(response));
+            }
+            Ok(None) => return false,
+            Err(e) => {
+                let _ = request.reply.send(Err(e));
+            }
+        }
+        true
     }
     fn execute_at_now(&mut self, r: &mut Request) -> Result<Option<Response>> {
         // Application operations must not inherit the clock of an old packet.
