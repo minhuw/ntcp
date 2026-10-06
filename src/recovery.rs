@@ -124,6 +124,9 @@ pub(crate) struct Congestion {
     fast_recovery: bool,
     sack_recovery: bool,
     ecn_end: Option<Seq>,
+    // TLP repair reduces congestion without starting recovery. This epoch
+    // shares that reduction with later original losses, never bars recovery.
+    tlp_reduction_end: Option<Seq>,
     timeout_retransmitted: bool,
     // Exclusive end of successfully emitted, still-unacknowledged retransmissions.
     retransmitted_end: Option<Seq>,
@@ -149,6 +152,7 @@ impl Congestion {
             fast_recovery: false,
             sack_recovery: false,
             ecn_end: None,
+            tlp_reduction_end: None,
             timeout_retransmitted: false,
             retransmitted_end: None,
         }
@@ -223,6 +227,12 @@ impl Congestion {
         }
         self.reset_duplicate_acks();
         self.timeout_retransmitted = false;
+        if self
+            .tlp_reduction_end
+            .is_some_and(|end| ack.serial_cmp(end) == Some(Ordering::Greater))
+        {
+            self.tlp_reduction_end = None;
+        }
         let relation = self.recover.and_then(|recover| ack.serial_cmp(recover));
         if relation == Some(Ordering::Greater) {
             // Reno/NewReno retain the epoch at equality; SACK entry checks coverage.
@@ -301,6 +311,33 @@ impl Congestion {
         false
     }
 
+    pub(crate) fn on_tlp_repair(&mut self, ack: Seq, flight: u32, highest_sent: Seq) -> bool {
+        if self.in_recovery()
+            || self
+                .recover
+                .is_some_and(|end| ack.serial_cmp(end) != Some(Ordering::Greater))
+            || self
+                .tlp_reduction_end
+                .is_some_and(|end| ack.serial_cmp(end) != Some(Ordering::Greater))
+        {
+            return false;
+        }
+        if self
+            .ecn_end
+            .is_some_and(|end| ack.serial_cmp(end) == Some(Ordering::Greater))
+        {
+            self.ecn_end = None;
+        }
+        if self.ecn_end.is_none() {
+            self.reduce_threshold(flight);
+        }
+        self.tlp_reduction_end = Some(highest_sent);
+        self.cwnd = self.cwnd.min(self.ssthresh);
+        self.acknowledged = 0;
+        self.reset_duplicate_acks();
+        true
+    }
+
     pub(crate) fn on_sack_recovery(&mut self, ack: Seq, flight: u32, highest_sent: Seq) -> bool {
         if self.sack_recovery
             || self.fast_recovery
@@ -319,7 +356,11 @@ impl Congestion {
         {
             self.ecn_end = None;
         }
-        if self.ecn_end.is_none() {
+        if self.ecn_end.is_none()
+            && self
+                .tlp_reduction_end
+                .is_none_or(|end| ack.serial_cmp(end) == Some(Ordering::Greater))
+        {
             self.reduce_threshold(flight);
         }
         self.recover = Some(highest_sent);
@@ -342,6 +383,7 @@ impl Congestion {
         self.reduce_threshold(flight.min(self.cwnd).min(self.ssthresh));
         self.cwnd = self.cwnd.min(self.ssthresh);
         self.ecn_end = None;
+        self.tlp_reduction_end = None;
     }
 
     pub(crate) fn cancel_sack_recovery(&mut self) {
@@ -362,7 +404,7 @@ impl Congestion {
         if self.duplicate_acks != 3 || self.recover.is_some() {
             return false;
         }
-        if self.ecn_end.is_none() {
+        if self.ecn_end.is_none() && self.tlp_reduction_end.is_none() {
             self.reduce_threshold(flight);
         }
         self.cwnd = self
@@ -379,8 +421,11 @@ impl Congestion {
     // Loss recovery and ECN share the threshold reduction, not retransmit state.
     pub(crate) fn on_ecn(&mut self, ack: Seq, flight: u32, highest_sent: Seq) -> bool {
         if self
-            .ecn_end
+            .tlp_reduction_end
             .is_some_and(|end| ack.serial_cmp(end) != Some(Ordering::Greater))
+            || self
+                .ecn_end
+                .is_some_and(|end| ack.serial_cmp(end) != Some(Ordering::Greater))
             || self
                 .recover
                 .is_some_and(|end| ack.serial_cmp(end) != Some(Ordering::Greater))
@@ -416,11 +461,13 @@ impl Congestion {
         // RFC 3168 section 6.1.2: loss of a retransmission is new congestion,
         // even inside the ECN epoch. An original-flight loss shares its reduction.
         if !self.timeout_retransmitted
-            && (self.ecn_end.is_none() || self.retransmitted_end.is_some())
+            && ((self.ecn_end.is_none() && self.tlp_reduction_end.is_none())
+                || self.retransmitted_end.is_some())
         {
             self.reduce_threshold(flight);
         }
         self.ecn_end = None;
+        self.tlp_reduction_end = None;
         self.timeout_retransmitted = true;
         self.recover = Some(highest_sent);
         self.fast_recovery = false;
@@ -650,6 +697,32 @@ mod tests {
                 rtt.sample(1);
             }
             assert_eq!(rtt.rto(), minimum.max(1001));
+        }
+    }
+
+    #[test]
+    fn tlp_reduction_epoch_shares_reduction_but_does_not_guard_recovery_entry() {
+        for ecn in [false, true] {
+            let mut c = Congestion::new(1000, RecoveryAlgorithm::NewReno, InitialWindow::Iw10);
+            if ecn {
+                assert!(c.on_ecn(Seq(1), 10_000, Seq(10_001)));
+            }
+            assert!(c.on_tlp_repair(Seq(5001), 10_000, Seq(10_001)));
+            assert_eq!(c.ssthresh(), 5000);
+            assert_eq!(c.recover, None);
+            assert_eq!(c.tlp_reduction_end, Some(Seq(10_001)));
+            assert!(!c.in_recovery());
+            assert!(!c.on_tlp_repair(Seq(5001), 5000, Seq(10_001)));
+            assert!(!c.on_ecn(Seq(5001), 5000, Seq(10_001)));
+            assert!(c.on_sack_recovery(Seq(5001), 5000, Seq(10_001)));
+            assert_eq!(c.ssthresh(), 5000);
+            assert!(c.in_recovery());
+            assert!(!c.on_ack(Seq(10_001), 5000, 0));
+            assert!(!c.in_recovery());
+            assert!(!c.on_ack(Seq(10_002), 1, 0));
+            assert_eq!(c.tlp_reduction_end, None);
+            assert!(c.on_sack_recovery(Seq(10_002), 4000, Seq(14_002)));
+            assert_eq!(c.ssthresh(), 2000); // A genuinely later flight reduces again.
         }
     }
 

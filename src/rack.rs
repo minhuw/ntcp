@@ -16,6 +16,11 @@ struct Interval {
     transmission_end: Seq,
     sent: u64,
     retransmitted: bool,
+    // Any retransmission of the original packet makes its untouched pieces
+    // ambiguous too; their ACK may have been solicited by that retransmission.
+    original_retransmitted: bool,
+    // One-shot byte delivery attribution is independent of transmission state.
+    delivered: bool,
     sacked: bool,
     original_lost: bool,
     needs_retransmit: bool,
@@ -126,6 +131,19 @@ impl Rack {
                 self.abandon(boundary);
                 return;
             }
+            for segment in self
+                .intervals
+                .chunk_by_mut(|a, b| a.original_end == b.original_end)
+            {
+                if segment
+                    .iter()
+                    .any(|r| after(end, r.start) && after(r.end, start))
+                {
+                    for r in segment {
+                        r.original_retransmitted = true;
+                    }
+                }
+            }
             for r in &mut self.intervals {
                 if !after(start, r.start) && !after(r.end, end) {
                     r.transmission_start = start;
@@ -145,6 +163,8 @@ impl Rack {
                 transmission_end: end,
                 sent: now,
                 retransmitted: false,
+                original_retransmitted: false,
+                delivered: false,
                 sacked: false,
                 original_lost: false,
                 needs_retransmit: false,
@@ -192,8 +212,11 @@ impl Rack {
             let cumulative = !after(r.end, ack);
             let covered = cumulative || scoreboard.unsacked_bytes(r.start, r.end) == 0;
             if covered && !r.sacked {
-                delivered += r.end.distance_from(r.start);
-                if !r.retransmitted
+                if !r.delivered {
+                    delivered += r.end.distance_from(r.start);
+                    r.delivered = true;
+                }
+                if !r.original_retransmitted
                     && let Some(fack) = self.fack
                     && after(fack, r.end)
                 {
@@ -216,6 +239,7 @@ impl Rack {
                         r.transmission_end,
                     ) == 0;
                 let eligible = complete
+                    && (r.retransmitted || !r.original_retransmitted)
                     && (!r.retransmitted
                         || (rtt >= self.min_rtt.unwrap_or(u64::MAX)
                             && (!timestamps || echo == Some((r.sent / 1000) as u32))));
@@ -299,7 +323,9 @@ impl Rack {
         let window = self.reo_window(true, srtt);
         self.deadline = None;
         for r in &mut self.intervals {
+            // RTO discards prior SACK advice (possible receiver reneging).
             r.sacked = false;
+            r.delivered = false;
             if r.start == ack || now >= r.sent.saturating_add(self.rtt).saturating_add(window) {
                 r.original_lost = true;
                 r.needs_retransmit = true;
@@ -406,6 +432,97 @@ mod tests {
             1000,
             update.dsack,
         )
+    }
+
+    #[test]
+    fn partial_sack_delivery_is_one_shot_across_tail_probe_and_resets_at_rto() {
+        for base in [Seq(0), Seq(u32::MAX - 1999)] {
+            let seq = |n: u32| base.wrapping_add(n);
+            let mut rack = Rack::new().unwrap();
+            let mut scoreboard = Scoreboard::new();
+            rack.sample(100_000);
+            for n in 0..4 {
+                rack.transmit(seq(n * 1000), seq((n + 1) * 1000), 100_000, false);
+            }
+            assert_eq!(
+                sack(
+                    &mut rack,
+                    &mut scoreboard,
+                    base.0,
+                    seq(4000).0,
+                    200_000,
+                    &[(seq(3500).0, seq(4000).0)]
+                ),
+                500
+            );
+            rack.transmit(seq(3000), seq(4000), 300_000, true);
+            assert_eq!(
+                sack(
+                    &mut rack,
+                    &mut scoreboard,
+                    base.0,
+                    seq(4000).0,
+                    400_000,
+                    &[(seq(3000).0, seq(4000).0)]
+                ),
+                500
+            );
+            assert_eq!(
+                sack(
+                    &mut rack,
+                    &mut scoreboard,
+                    base.0,
+                    seq(4000).0,
+                    400_001,
+                    &[(seq(3000).0, seq(4000).0)]
+                ),
+                0
+            );
+            rack.rto(500_000, base, Some(100_000));
+            scoreboard.clear(); // Possible receiver reneging starts fresh attribution.
+            assert_eq!(
+                sack(
+                    &mut rack,
+                    &mut scoreboard,
+                    base.0,
+                    seq(4000).0,
+                    600_000,
+                    &[(seq(3000).0, seq(4000).0)]
+                ),
+                1000
+            );
+        }
+    }
+
+    #[test]
+    fn clipped_retransmit_makes_untouched_original_prefix_rtt_ambiguous() {
+        for base in [Seq(0), Seq(u32::MAX - 499)] {
+            let end = base.wrapping_add(1000);
+            let mut rack = Rack::new().unwrap();
+            let mut scoreboard = Scoreboard::new();
+            rack.sample(100_000);
+            rack.transmit(base, end, 100_000, false);
+            rack.transmit(base.wrapping_add(12), end, 300_000, true);
+            assert!(!rack.intervals[0].retransmitted);
+            assert!(rack.intervals[0].original_retransmitted);
+            assert!(rack.intervals[1].retransmitted);
+            assert_eq!(
+                sack(
+                    &mut rack,
+                    &mut scoreboard,
+                    base.0,
+                    end.0,
+                    300_001,
+                    &[(base.0, end.0)]
+                ),
+                1000
+            );
+            assert_eq!(rack.ack_sample, None);
+            assert_eq!(rack.latest, None);
+            assert_eq!(rack.min_rtt, Some(100_000));
+            assert!(!rack.detect(300_001, false, Some(100_000)));
+            assert_eq!(rack.deadline, None);
+        }
     }
 
     #[test]
