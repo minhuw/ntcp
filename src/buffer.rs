@@ -6,6 +6,8 @@ use alloc::{
     vec::Vec,
 };
 
+use core::mem::MaybeUninit;
+
 use crate::seq::Seq;
 
 #[derive(Debug)]
@@ -119,9 +121,13 @@ const EMPTY_RANGE: ReceiveRange = ReceiveRange {
 #[derive(Debug)]
 pub(crate) struct ReceiveBuffer {
     // Data and push marks share fixed slots; presence includes out-of-order data.
-    data: Vec<(u8, bool)>,
+    // A set presence bit implies the entire tuple in that slot was initialized.
+    // Every typed payload access checks presence first; clearing presence makes
+    // the slot inaccessible until insertion writes a new entire tuple. Unset
+    // slots may contain uninitialized bytes, including invalid bool representations.
+    data: Vec<MaybeUninit<(u8, bool)>>,
     pushed: bool,
-    present: Vec<bool>,
+    present: Vec<u8>,
     read_base: Seq,
     head: usize,
     contiguous_len: usize,
@@ -137,23 +143,19 @@ impl ReceiveBuffer {
         if capacity == 0 || capacity >= 1usize << 31 {
             return Err(());
         }
-        let data_layout = Layout::array::<(u8, bool)>(capacity).map_err(|_| ())?;
-        // Zero is a valid u8 and bool representation. Allocate with the exact
-        // Vec layout, preserving fallible allocation and allocator-owned zero pages.
-        let data = unsafe {
-            let pointer = alloc_zeroed(data_layout).cast::<(u8, bool)>();
-            if pointer.is_null() {
-                return Err(());
-            }
-            Vec::from_raw_parts(pointer, capacity, capacity)
-        };
-        let present_layout = Layout::array::<bool>(capacity).map_err(|_| ())?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(capacity).map_err(|_| ())?;
+        // MaybeUninit elements need no initialization, and capacity was reserved.
+        unsafe { data.set_len(capacity) };
+        let presence_len = capacity.div_ceil(8);
+        let present_layout = Layout::array::<u8>(presence_len).map_err(|_| ())?;
         let present = unsafe {
-            let pointer = alloc_zeroed(present_layout).cast::<bool>();
+            let pointer = alloc_zeroed(present_layout);
             if pointer.is_null() {
                 return Err(());
             }
-            Vec::from_raw_parts(pointer, capacity, capacity)
+            // Zeroed bytes clear every bit; the allocation uses Vec's exact layout.
+            Vec::from_raw_parts(pointer, presence_len, presence_len)
         };
         Ok(Self {
             data,
@@ -351,12 +353,27 @@ impl ReceiveBuffer {
         (self.head + offset) % self.data.len()
     }
 
+    fn is_present(&self, index: usize) -> bool {
+        self.present[index / 8] & (1 << (index % 8)) != 0
+    }
+
+    fn set_present(&mut self, index: usize, present: bool) {
+        let mask = 1 << (index % 8);
+        if present {
+            self.present[index / 8] |= mask;
+        } else {
+            self.present[index / 8] &= !mask;
+        }
+    }
+
     pub(crate) fn read(&mut self, out: &mut [u8]) -> usize {
         let count = out.len().min(self.contiguous_len);
         for (offset, dst) in out[..count].iter_mut().enumerate() {
             let index = self.index(offset);
-            *dst = self.data[index].0;
-            self.present[index] = false;
+            assert!(self.is_present(index));
+            // Presence guarantees an initialized tuple, including its bool.
+            *dst = unsafe { self.data[index].assume_init_ref() }.0;
+            self.set_present(index, false);
         }
         self.head = self.index(count);
         self.read_base = self.read_base.wrapping_add(count as u32);
@@ -413,9 +430,9 @@ impl ReceiveBuffer {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
             //# If a segment's contents straddle the boundary between old and new, only the
             //# new parts are processed.
-            if !outcome.sack_overflow && !self.present[index] {
-                self.data[index] = (byte, false);
-                self.present[index] = true;
+            if !outcome.sack_overflow && !self.is_present(index) {
+                self.data[index].write((byte, false));
+                self.set_present(index, true);
                 outcome.new_bytes += 1;
             }
         }
@@ -427,8 +444,9 @@ impl ReceiveBuffer {
             // never re-notify a mark already passed by the contiguous frontier.
             if distance >= self.contiguous_len && distance < data_limit {
                 let index = self.index(distance);
-                if self.present[index] {
-                    self.data[index].1 = true;
+                if self.is_present(index) {
+                    // Presence guarantees initialization before borrowing the bool.
+                    unsafe { self.data[index].assume_init_mut() }.1 = true;
                 }
             }
         }
@@ -442,14 +460,15 @@ impl ReceiveBuffer {
             // ponytail: O(capacity) on a new FIN; track the highest occupied
             // position if this scan becomes material. Never erase accepted data.
             if distance < capacity
-                && !(distance..capacity).any(|offset| self.present[self.index(offset)])
+                && !(distance..capacity).any(|offset| self.is_present(self.index(offset)))
             {
                 self.fin_sequence = Some(end);
             }
         }
-        while self.contiguous_len < capacity && self.present[self.index(self.contiguous_len)] {
+        while self.contiguous_len < capacity && self.is_present(self.index(self.contiguous_len)) {
             let index = self.index(self.contiguous_len);
-            self.pushed |= core::mem::take(&mut self.data[index].1);
+            // The loop's presence guard guarantees the entire tuple is initialized.
+            self.pushed |= core::mem::take(&mut unsafe { self.data[index].assume_init_mut() }.1);
             self.contiguous_len += 1;
         }
         // This buffer consumes FIN once after preceding data; SYN processing is in the
@@ -480,16 +499,27 @@ mod tests {
         recv.insert(sequence.wrapping_add(skip as u32), &payload[skip..], false)
     }
 
+    fn occupied_data(recv: &ReceiveBuffer) -> Vec<Option<(u8, bool)>> {
+        (0..recv.data.len())
+            .map(|index| {
+                recv.is_present(index).then(|| {
+                    // Only occupied slots have initialized tuples; never inspect holes.
+                    unsafe { *recv.data[index].assume_init_ref() }
+                })
+            })
+            .collect()
+    }
+
     fn assert_ranges(recv: &ReceiveBuffer) {
         let mut expected = Vec::new();
         let mut offset = recv.contiguous_len;
         while offset < recv.data.len() {
-            if !recv.present[recv.index(offset)] {
+            if !recv.is_present(recv.index(offset)) {
                 offset += 1;
                 continue;
             }
             let start = offset;
-            while offset < recv.data.len() && recv.present[recv.index(offset)] {
+            while offset < recv.data.len() && recv.is_present(recv.index(offset)) {
                 offset += 1;
             }
             expected.push((
@@ -680,7 +710,7 @@ mod tests {
         }
         assert_eq!(recv.range_count, 64);
         let old_blocks = recv.sack_blocks(4);
-        let old_data = recv.data.clone();
+        let old_data = occupied_data(&recv);
         let old_present = recv.present.clone();
         recv.record_duplicate(start.wrapping_add(130), 3);
         let rejected = recv.insert_with_push(start.wrapping_add(130), b"xyz", true, true);
@@ -688,7 +718,7 @@ mod tests {
         assert_eq!(recv.fin_sequence, Some(start.wrapping_add(133)));
         assert!(!rejected.fin && !rejected.advanced && !recv.take_push());
         assert_eq!(rejected.new_bytes, 0);
-        assert_eq!(recv.data, old_data);
+        assert_eq!(occupied_data(&recv), old_data);
         assert_eq!(recv.present, old_present);
         assert_eq!(recv.sack_blocks(4), old_blocks);
         let bridge = receive_packet(&mut recv, start.wrapping_add(2), b"z");
@@ -780,7 +810,7 @@ mod tests {
         //# Segments with higher beginning sequence numbers SHOULD be held for later
         //# processing (SHLD-31).
         assert_eq!(recv.readable(), 0);
-        assert_eq!(recv.present.iter().filter(|&&p| p).count(), 4);
+        assert_eq!(recv.present.iter().map(|p| p.count_ones()).sum::<u32>(), 4);
         let result = recv.insert(start.wrapping_add(u32::MAX), b"!abXYZ", false);
         assert_eq!(result.new_bytes, 2);
         assert!(result.advanced);
@@ -798,7 +828,7 @@ mod tests {
         assert_eq!(&out[..6], b"cdefgh");
         assert_eq!(recv.read(&mut out), 0);
         assert_eq!(recv.next(), Seq(5));
-        assert_eq!(recv.present.iter().filter(|&&p| p).count(), 0);
+        assert_eq!(recv.present.iter().map(|p| p.count_ones()).sum::<u32>(), 0);
     }
 
     #[test]
@@ -901,7 +931,7 @@ mod tests {
             );
         }
         assert_eq!(recv.readable(), 0);
-        assert_eq!(recv.present.iter().filter(|&&p| p).count(), 32);
+        assert_eq!(recv.present.iter().map(|p| p.count_ones()).sum::<u32>(), 32);
         for offset in (0..64).step_by(2) {
             assert_eq!(
                 recv.insert(Seq(offset), &[offset as u8], false).new_bytes,
@@ -909,7 +939,7 @@ mod tests {
             );
         }
         assert_eq!(recv.readable(), 64);
-        assert_eq!(recv.present.iter().filter(|&&p| p).count(), 64);
+        assert_eq!(recv.present.iter().map(|p| p.count_ones()).sum::<u32>(), 64);
         let mut out = [0; 64];
         assert_eq!(recv.read(&mut out), 64);
         for (offset, &byte) in out.iter().enumerate() {
@@ -923,10 +953,9 @@ mod tests {
     }
 
     #[test]
-    fn zeroed_storage_and_constant_time_data_presence_agree() {
+    fn empty_presence_and_constant_time_data_presence_agree() {
         let mut recv = ReceiveBuffer::new(Seq(u32::MAX - 8), 8192).unwrap();
-        assert!(recv.data.iter().all(|&value| value == (0, false)));
-        assert!(recv.present.iter().all(|&value| !value));
+        assert!(recv.present.iter().all(|&value| value == 0));
         assert!(!recv.has_data());
         assert_eq!(recv.reset_start(Seq(10)), Ok(()));
         recv.insert(Seq(12), b"cd", false);
@@ -936,8 +965,68 @@ mod tests {
         assert!(recv.has_data());
         assert_eq!(recv.read(&mut [0; 4]), 4);
         assert!(!recv.has_data());
-        assert!(recv.present.iter().all(|&value| !value));
+        assert!(recv.present.iter().all(|&value| value == 0));
         assert_eq!(recv.reset_start(Seq(20)), Ok(()));
+    }
+
+    #[test]
+    fn byte_bitset_exact_capacity_wrap_overlap_push_and_fin() {
+        for capacity in (1..=9).chain([15, 17, 63, 65, 70, 127, 129]) {
+            let mut recv = ReceiveBuffer::new(Seq(u32::MAX - 3), capacity).unwrap();
+            assert_eq!(recv.data.len(), capacity);
+            assert_eq!(recv.present.len(), capacity.div_ceil(8));
+            assert!(
+                core::mem::size_of_val(recv.data.as_slice()) + recv.present.len() <= 3 * capacity
+            );
+            let storage = (recv.data.as_ptr(), recv.present.as_ptr());
+            let payload: Vec<_> = (0..capacity).map(|i| i as u8).collect();
+            let mut out = alloc::vec![0; capacity];
+            for _ in 0..3 {
+                let start = recv.next();
+                assert_eq!(recv.right_edge(), start.wrapping_add(capacity as u32));
+                let last = start.wrapping_add(capacity as u32 - 1);
+                recv.insert_with_push(last, &payload[capacity - 1..], false, true);
+                // Duplicate PSH changes only the mark, not the stored byte.
+                assert_eq!(recv.insert_with_push(last, b"!", false, true).new_bytes, 0);
+                recv.insert(start, &payload, false);
+                assert!(recv.take_push());
+                assert!(!recv.take_push());
+                assert_eq!(recv.insert(recv.right_edge(), b"!", false).new_bytes, 0);
+                assert_ranges(&recv);
+                // Moving the head by one crosses bit-byte and ring boundaries
+                // over successive cycles; cleared slots must be fully rewritten.
+                assert_eq!(recv.read(&mut out[..1]), 1);
+                assert_eq!(out[0], payload[0]);
+                let next = recv.next();
+                assert_eq!(recv.insert(next, b"z", false).new_bytes, 1);
+                assert!(!recv.take_push());
+                assert_eq!(recv.read(&mut out), capacity);
+                assert_eq!(&out[..capacity - 1], &payload[1..]);
+                assert_eq!(out[capacity - 1], b'z');
+                assert!(recv.present.iter().all(|&byte| byte == 0));
+                assert!(!recv.has_data());
+                assert_eq!((recv.data.as_ptr(), recv.present.as_ptr()), storage);
+            }
+            let start = recv.next();
+            let fin = start.wrapping_add(capacity as u32 - 1);
+            recv.insert(fin, b"", true);
+            recv.insert_with_push(start, &payload[..capacity - 1], false, true);
+            assert!(recv.eof());
+            assert_eq!(recv.next(), fin.wrapping_add(1));
+            assert_eq!(recv.read(&mut out), capacity - 1);
+            assert_eq!(&out[..capacity - 1], &payload[..capacity - 1]);
+            assert!(recv.present.iter().all(|&byte| byte == 0));
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn read_checks_presence_before_accessing_uninitialized_tuple() {
+        let mut recv = ReceiveBuffer::new(Seq(0), 1).unwrap();
+        // Deliberately break the frontier invariant: read must still reject a
+        // hole before it could read an uninitialized u8 or bool.
+        recv.contiguous_len = 1;
+        recv.read(&mut [0]);
     }
 
     #[test]
