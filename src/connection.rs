@@ -2969,7 +2969,7 @@ impl Connection {
             }
         } else if !advancing
             && ack == self.snd_una
-            && self.flight() != 0
+            && self.data_flight() != 0
             && segment.payload.is_empty()
             && h.flags & FIN == 0
             && self.snd_wnd == old_window
@@ -5790,10 +5790,14 @@ mod tests {
     //# After receiving 3 duplicate ACKs, TCP performs a retransmission of what appears to be the
     //# missing segment, without waiting for the retransmission timer to expire.
     fn duplicate_ack_eligibility_and_intervening_advancement_reset() {
-        for variant in 0..7 {
+        for variant in 0..8 {
             let (mut a, _) = pair(config(128, 4), 100);
             prime_newreno(&mut a);
-            if variant != 0 {
+            if variant == 7 {
+                a.shutdown().unwrap();
+                packet(&mut a, 40);
+                assert_eq!((a.flight(), a.data_flight()), (1, 0));
+            } else if variant != 0 {
                 a.write(&[1; 16]).unwrap();
                 for _ in 0..4 {
                     packet(&mut a, 40);
