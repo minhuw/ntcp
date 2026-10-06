@@ -20,7 +20,7 @@ pattern = "workbench/duvet/requirements/**/rfc6675/*.toml"
 pattern = "workbench/duvet/requirements/**/rfc8985/*.toml"
 
 [[requirement]]
-pattern = "workbench/duvet/requirements/**/rfc6937/*.toml"
+pattern = "workbench/duvet/requirements/**/rfc9937/*.toml"
 
 [[requirement]]
 pattern = "workbench/duvet/requirements/**/rfc6298/*.toml"
@@ -72,7 +72,7 @@ source = "https://www.rfc-editor.org/rfc/rfc8985"
 format = "ietf"
 
 [[specification]]
-source = "https://www.rfc-editor.org/rfc/rfc6937"
+source = "https://www.rfc-editor.org/rfc/rfc9937"
 format = "ietf"
 
 [[specification]]

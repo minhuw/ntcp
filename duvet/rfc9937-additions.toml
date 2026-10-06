@@ -1,0 +1,196 @@
+# RFC9937 operative prose/pseudocode omitted by keyword extraction.
+# Exact official text, whitespace only; no invented BCP14 levels.
+# Evidence profile: prr=true, Rfc9937, valid payload ledger; LegacyInitialCredit excluded.
+
+# entry-equations
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.1"
+quote = '''
+ssthresh = CongCtrlAlg()      // Target flight size in recovery
+prr_delivered = 0             // Total bytes delivered in recovery
+prr_out = 0                   // Total bytes sent in recovery
+'''
+
+# recoverfs-equations
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.1"
+quote = '''
+RecoverFS = SND.NXT - SND.UNA
+// Bytes SACKed before entering recovery will not be
+// marked as delivered during recovery:
+RecoverFS -= (bytes SACKed in scoreboard)
+// Include the (common) case of selectively ACKed bytes:
+RecoverFS += (bytes newly SACKed)
+// Include the (rare) case of cumulatively ACKed bytes:
+RecoverFS += (bytes newly cumulatively acknowledged)
+'''
+
+# recoverfs-constant
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.1"
+quote = '''
+Upon entering fast
+recovery, PRR initializes RecoverFS, and RecoverFS remains constant
+during a given fast recovery episode.
+'''
+
+# ack-boundary
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.2"
+quote = '''
+On every ACK starting or during fast recovery, excluding the ACK that
+concludes a PRR episode, PRR executes the following steps.
+'''
+
+# sack-delivery
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.2"
+quote = '''
+With SACK, DeliveredData can be computed precisely as the
+change in SND.UNA, plus the signed change in quantity of data marked
+SACKed in the scoreboard.  Thus, in the special case when there are
+no SACKed sequence ranges in the scoreboard before or after the ACK,
+DeliveredData is the change in SND.UNA.
+'''
+
+# nonsack-delivery
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.2"
+quote = '''
+In recovery without SACK,
+DeliveredData is estimated to be 1 SMSS on each received duplicate
+ACK (i.e., SND.UNA did not change).  When SND.UNA advances (i.e., a
+full or partial ACK), DeliveredData is the change in SND.UNA, minus 1
+SMSS for each preceding duplicate ACK.
+'''
+
+# nonsack-cap
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.2"
+quote = '''
+As a mitigation, if not using SACK, then PRR
+disallows incrementing DeliveredData when the total bytes delivered
+in a PRR episode would exceed the estimated data outstanding upon
+entering recovery (RecoverFS).
+'''
+
+# zero-delivery
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.2"
+quote = '''
+if (DeliveredData is 0)
+   Return
+'''
+
+# accumulate
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.2"
+quote = '''
+prr_delivered += DeliveredData
+'''
+
+# inflight-input
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.2"
+quote = '''
+inflight = (estimated volume of in-flight data)
+'''
+
+# safeack
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.2"
+quote = '''
+SafeACK = (SND.UNA advances and no further loss indicated)
+'''
+
+# proportional
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.2"
+quote = '''
+if (inflight > ssthresh) {
+   // Proportional Rate Reduction
+   // This uses integer division, rounding up:
+   #define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
+   out = DIV_ROUND_UP(prr_delivered * ssthresh, RecoverFS)
+   SndCnt = out - prr_out
+'''
+
+# reduction
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.2"
+quote = '''
+} else {
+   // PRR-CRB by default
+   SndCnt = MAX(prr_delivered - prr_out, DeliveredData)
+   if (SafeACK) {
+      // PRR-SSRB when recovery is making good progress
+      SndCnt += SMSS
+   }
+   // Attempt to catch up, as permitted
+   SndCnt = MIN(ssthresh - inflight, SndCnt)
+}
+'''
+
+# forced-first
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.2"
+quote = '''
+if (prr_out is 0 AND SndCnt is 0) {
+   // Force a fast retransmit upon entering recovery
+   SndCnt = SMSS
+}
+'''
+
+# window
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.2"
+quote = '''
+cwnd = inflight + SndCnt
+'''
+
+# transmit
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.3"
+quote = '''
+On any data transmission or retransmission, PRR executes the
+following:
+
+   prr_out += (data sent)
+'''
+
+# episode-end
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.4"
+quote = '''
+A PRR episode ends upon either completing fast recovery or before
+initiating a new PRR episode due to a new congestion control response
+episode.
+'''
+
+# completion
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.4"
+quote = '''
+On the completion of a PRR episode, PRR executes the following:
+
+   cwnd = ssthresh
+'''
+
+# outside-response
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-11.2"
+quote = '''
+PRR does not modify
+the congestion control cwnd increase or decrease mechanisms outside
+of congestion control response episodes.
+'''
+
+# byte-security
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-13"
+quote = '''
+Implementers that change PRR from counting bytes to segments have to
+be cautious about the effects of ACK splitting attacks [Savage99],
+where the receiver acknowledges partial segments for the purpose of
+confusing the sender's congestion accounting.
+'''

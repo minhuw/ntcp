@@ -709,13 +709,33 @@ impl Rack {
         }
     }
 
-    pub(crate) fn mark_scoreboard_losses(&mut self, scoreboard: &Scoreboard, mss: u32) {
+    // Ordinary fast retransmit / NewReno partial ACK marks the missing head.
+    // Retain the original packet edge across short retries and ledger splits.
+    pub(crate) fn mark_head_lost(&mut self) {
+        if let Some(end) = self.intervals.first().map(|r| r.original_end) {
+            for r in self
+                .intervals
+                .iter_mut()
+                .take_while(|r| r.original_end == end)
+            {
+                if !r.sacked {
+                    r.original_lost = true;
+                    r.needs_retransmit = true;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn mark_scoreboard_losses(&mut self, scoreboard: &Scoreboard, mss: u32) -> bool {
+        let mut newly_lost = false;
         for r in &mut self.intervals {
             if !r.sacked && !r.retransmitted && scoreboard.is_lost(r.start, mss) {
+                newly_lost |= !r.needs_retransmit;
                 r.original_lost = true;
                 r.needs_retransmit = true;
             }
         }
+        newly_lost
     }
 
     // SACK splits are byte accounting, not packet boundaries. Include even the
@@ -753,6 +773,14 @@ impl Rack {
         Some((first.start, first.start.wrapping_add(size)))
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
+    //= reason=Valid payload ledger: unsacked and not-needs_retransmit intervals count once; successful retransmission clears needs_retransmit for only emitted bytes. Exact reordered original, lost-copy and replacement pipe values are asserted. SYN/FIN sequence space is not payload data.
+    //# SACK-enabled connections using RACK-TLP loss detection
+    //# [RFC8985] or other loss detection algorithms MUST calculate inflight
+    //# by starting with SND.NXT - SND.UNA, subtracting out bytes SACKed in
+    //# the scoreboard, subtracting out bytes marked lost in the scoreboard,
+    //# and adding bytes in the scoreboard that have been retransmitted since
+    //# they were last marked lost.
     pub(crate) fn pipe(&self) -> u32 {
         self.intervals
             .iter()

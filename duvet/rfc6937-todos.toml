@@ -1,3 +1,0 @@
-# No remaining strict Rfc6937Crb TODOs in the negotiated-SACK/valid-ledger profile.
-# Non-RACK literal Scoreboard::pipe and RFC8985 modified Rack::pipe have separate evidence.
-# LegacyInitialCredit is compatibility-only, not RFC6937 conformance evidence.

@@ -293,12 +293,6 @@ impl Scoreboard {
         })
     }
 
-    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
-    //= reason=For a valid ledger, interval length minus unsacked_bytes gives the covered range union without requiring a stored SACKd scalar. PRR signed-delivery and entry-epoch gaps remain separate TODOs.
-    //# SACKd: The total number of bytes that the scoreboard indicates have
-    //# been delivered to the receiver.  This can be computed by scanning
-    //# the scoreboard and counting the total number of bytes covered by
-    //# all SACK blocks.  If SACK is not in use, SACKd is not defined.
     pub(crate) fn unsacked_bytes(&self, start: Seq, end: Seq) -> u32 {
         self.holes(start, end)
             .map(|(left, right)| right.distance_from(left))
@@ -528,13 +522,6 @@ mod tests {
     //# sender will turn on the SACKed flags for all segments in the retransmission
     //# queue that are wholly contained within that block. This requires
     //# straightforward sequence number comparisons.
-    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
-    //= type=test
-    //= reason=Asserts total covered bytes from the disjoint union, overlapping blocks, duplicate blocks and cumulative-ACK trimming; this is representation evidence rather than PRR delivery-epoch equivalence.
-    //# SACKd: The total number of bytes that the scoreboard indicates have
-    //# been delivered to the receiver.  This can be computed by scanning
-    //# the scoreboard and counting the total number of bytes covered by
-    //# all SACK blocks.  If SACK is not in use, SACKd is not defined.
     fn unaligned_union_adjacency_duplicates_and_ack_trim() {
         let mut s = Scoreboard::new();
         assert_eq!(

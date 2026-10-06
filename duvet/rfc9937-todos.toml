@@ -1,0 +1,29 @@
+# Unresolved RFC9937 obligations/evidence; not conformance waivers.
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-3"
+feature = "RFC9937-rwnd"
+reason = "Literal applicability gap, not a PRR credit defect: transmit/retry_limit and ordinary_output_policy_matrix, selected_recovery_output_policy_matrix, rfc9937_safe_ack_short_output_window_stall_and_ending_ack bound ordinary/new and active-PRR output by rwnd. However scaled_retry_wire_commit_partial_ack_and_persist_are_independent permits original-valid old-data retries beyond a shrunken window, and probe_and_shrink_output_policy_matrix emits a prescribed zero-window probe after PRR cancellation. Reconcile this unqualified definition with RFC9293 section3.8.6.1 before claiming all-path literal compliance; do not silently exempt all recovery."
+quote = '''
+At any given time, a connection MUST
+NOT send data with a sequence number higher than the sum of
+SND.UNA and rwnd.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-3"
+feature = "RFC9937-cwnd"
+reason = "Literal applicability gap outside active PRR: RFC9937 byte credit and cwnd=inflight+SndCnt are asserted by strict_ack and selected_recovery_output_policy_matrix, but probe_and_shrink_output_policy_matrix deliberately asserts one RFC8985 TLP new-data overcommit when flight equals cwnd. Resolve the scope of this unqualified definition versus RFC8985 section7.2 before all-path closure. LegacyInitialCredit is not conformance evidence."
+quote = '''
+At any given time, a connection MUST
+NOT send data if inflight (see below) matches or exceeds cwnd.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.4"
+feature = "RFC9937-pacing"
+reason = "No elapsed-time transmission pacer is implemented. PRR ACK-clocking and caller-driven polling are not evidence for this pacing recommendation. strict_prr_full_minimal_isolated_and_burst_loss_traces and output_policy intentionally drain multiple packets at one timestamp. Closure requires an explicit assessed SHOULD exception or a paced scheduler with burst/idle-restart tests; neither is supplied here."
+quote = '''
+It is RECOMMENDED that implementations use pacing to reduce the
+burstiness of data traffic.
+'''
