@@ -7,8 +7,10 @@ use sha2::Sha256;
 
 use crate::{
     Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options, SourceRoute, TimestampRequest,
+    buffer::ReceiveBuffer,
     connection::{Connection, ConnectionConfig, ConnectionEvents, Error, Instant, State, Tuple},
     schedule::{Deadlines, ReadyQueue},
+    seq::Seq,
     wire::{self, ACK, Header, IpMetadata, RST, SYN},
 };
 
@@ -46,6 +48,7 @@ pub enum AddressValidation {
 #[derive(Clone, Debug)]
 pub struct EndpointConfig {
     pub max_connections: usize,
+    pub preallocate_connections: usize,
     pub ipv4_options_enabled: bool,
     pub error_reports: bool,
     pub reuse_time_wait: bool,
@@ -61,6 +64,7 @@ impl Default for EndpointConfig {
     fn default() -> Self {
         Self {
             max_connections: 1024,
+            preallocate_connections: 0,
             ipv4_options_enabled: false,
             error_reports: true,
             reuse_time_wait: false,
@@ -263,6 +267,7 @@ pub struct Endpoint {
     control_turn: bool,
     buffer_bytes: usize,
     per_connection_bytes: usize,
+    receive_pool: Vec<ReceiveBuffer>,
 }
 
 fn reserved_vec<T>(capacity: usize) -> Result<Vec<T>, EndpointError> {
@@ -330,6 +335,21 @@ impl Endpoint {
             })
             .and_then(|n| n.checked_add(usize::from(config.connection.mss)))
             .ok_or(EndpointError::LimitReached)?;
+        if config.preallocate_connections > count {
+            return Err(EndpointError::LimitReached);
+        }
+        let buffer_bytes = config
+            .preallocate_connections
+            .checked_mul(per_connection_bytes)
+            .filter(|&bytes| bytes <= config.max_buffer_bytes)
+            .ok_or(EndpointError::LimitReached)?;
+        let mut receive_pool = reserved_vec(config.preallocate_connections)?;
+        for _ in 0..config.preallocate_connections {
+            receive_pool.push(
+                ReceiveBuffer::new(Seq(0), config.connection.receive_capacity)
+                    .map_err(|_| Error::NoMemory)?,
+            );
+        }
         let mut slots = reserved_vec(count)?;
         slots.resize_with(count, || None);
         let mut generations = reserved_vec(count)?;
@@ -371,8 +391,9 @@ impl Endpoint {
             control_epoch: now,
             control_count: 0,
             control_turn: true,
-            buffer_bytes: 0,
+            buffer_bytes,
             per_connection_bytes,
+            receive_pool,
         })
     }
 
@@ -611,11 +632,56 @@ impl Endpoint {
 
     fn has_capacity(&self) -> bool {
         !self.free.is_empty()
-            && self.per_connection_bytes
-                <= self
-                    .config
-                    .max_buffer_bytes
-                    .saturating_sub(self.buffer_bytes)
+            && (!self.receive_pool.is_empty()
+                || self.per_connection_bytes
+                    <= self
+                        .config
+                        .max_buffer_bytes
+                        .saturating_sub(self.buffer_bytes))
+    }
+
+    fn new_connection(
+        &mut self,
+        tuple: Tuple,
+        iss: u32,
+        syn: Option<&wire::Segment<'_>>,
+    ) -> Result<Connection, Error> {
+        let mut receive = self.receive_pool.pop();
+        let pooled = receive.is_some();
+        let result = match syn {
+            Some(syn) => Connection::passive_with_receive(
+                tuple,
+                self.config.connection.clone(),
+                iss,
+                self.now,
+                syn,
+                &mut receive,
+            ),
+            None => Connection::active_with_receive(
+                tuple,
+                self.config.connection.clone(),
+                iss,
+                self.now,
+                &mut receive,
+            ),
+        };
+        if let Some(receive) = receive {
+            self.receive_pool.push(receive);
+        }
+        if result.is_ok() && !pooled {
+            self.buffer_bytes += self.per_connection_bytes;
+        }
+        result
+    }
+
+    fn recycle_connection(&mut self, connection: Connection) {
+        if self.receive_pool.len() < self.config.preallocate_connections {
+            let mut receive = connection.into_receive();
+            receive.clear();
+            self.receive_pool.push(receive);
+        } else {
+            self.buffer_bytes -= self.per_connection_bytes;
+        }
     }
 
     fn insert(
@@ -625,18 +691,30 @@ impl Endpoint {
         fallback: Option<ConnectionId>,
     ) -> Result<ConnectionId, EndpointError> {
         let tuple = connection.tuple();
-        let index = *self.free.last().ok_or(EndpointError::LimitReached)?;
-        if let Some(old) = fallback {
-            if !self
-                .tuples
-                .replace(self.hash(tuple), tuple, old.slot, index)
-            {
-                return Err(EndpointError::AddressInUse);
+        let admission = (|| {
+            let index = *self.free.last().ok_or(EndpointError::LimitReached)?;
+            if let Some(old) = fallback {
+                if !self
+                    .tuples
+                    .replace(self.hash(tuple), tuple, old.slot, index)
+                {
+                    return Err(EndpointError::AddressInUse);
+                }
+            } else {
+                self.tuples.insert(self.hash(tuple), tuple, index)?;
             }
+            Ok(index)
+        })();
+        let index = match admission {
+            Ok(index) => index,
+            Err(error) => {
+                self.recycle_connection(connection);
+                return Err(error);
+            }
+        };
+        if let Some(old) = fallback {
             self.slots[old.slot].as_mut().unwrap().mapped = false;
             self.output.remove(old.slot);
-        } else {
-            self.tuples.insert(self.hash(tuple), tuple, index)?;
         }
         self.free.pop();
         self.slots[index] = Some(Slot {
@@ -654,7 +732,6 @@ impl Endpoint {
             explicit_route: false,
             received_ipv4_options: None,
         });
-        self.buffer_bytes += self.per_connection_bytes;
         let id = self.id(index);
         if let Some(parent) = listener {
             self.listeners[parent.slot]
@@ -676,8 +753,8 @@ impl Endpoint {
         self.clock(now)?;
         let tuple = Tuple { local, remote };
         self.admission(tuple)?;
-        let connection =
-            Connection::active(tuple, self.config.connection.clone(), self.isn(tuple), now)?;
+        let iss = self.isn(tuple);
+        let connection = self.new_connection(tuple, iss, None)?;
         self.insert(connection, None, None)
     }
 
@@ -819,7 +896,7 @@ impl Endpoint {
         self.events.remove(index);
         self.advice.remove(index);
         self.deadlines.set(index, None);
-        self.buffer_bytes -= self.per_connection_bytes;
+        self.recycle_connection(slot.connection);
         if let Some(generation) = self.generations[index].checked_add(1) {
             self.generations[index] = generation;
             self.free.push(index);
@@ -1156,18 +1233,16 @@ impl Endpoint {
                 return Ok(InputDisposition::Dropped);
             }
             let application_timeout = record.application_timeout_us;
-            let mut connection = match Connection::passive(
-                tuple,
-                self.config.connection.clone(),
-                self.isn(tuple),
-                now,
-                &segment,
-            ) {
+            let iss = self.isn(tuple);
+            let mut connection = match self.new_connection(tuple, iss, Some(&segment)) {
                 Ok(connection) => connection,
                 Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),
                 Err(error) => return Err(error.into()),
             };
-            connection.set_application_timeout(application_timeout)?;
+            if let Err(error) = connection.set_application_timeout(application_timeout) {
+                self.recycle_connection(connection);
+                return Err(error.into());
+            }
             match self.insert(connection, Some(listener), None) {
                 Ok(id) => {
                     let slot = self.slots[id.slot].as_mut().unwrap();
@@ -1229,13 +1304,15 @@ impl Endpoint {
             .reuse_iss(candidate);
         // Allocate the entire bounded child before transferring tuple ownership.
         // The old timer/record survives independently until its original expiry.
-        let mut connection =
-            match Connection::passive(tuple, self.config.connection.clone(), iss, self.now, syn) {
-                Ok(connection) => connection,
-                Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),
-                Err(error) => return Err(error.into()),
-            };
-        connection.set_application_timeout(application_timeout)?;
+        let mut connection = match self.new_connection(tuple, iss, Some(syn)) {
+            Ok(connection) => connection,
+            Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),
+            Err(error) => return Err(error.into()),
+        };
+        if let Err(error) = connection.set_application_timeout(application_timeout) {
+            self.recycle_connection(connection);
+            return Err(error.into());
+        }
         let id = self.insert(connection, Some(listener), Some(self.id(index)))?;
         let slot = self.slots[id.slot].as_mut().unwrap();
         slot.received_dscp = Some(traffic_class >> 2);
@@ -1702,6 +1779,62 @@ mod recovery_observation_tests {
             .unwrap();
         bytes.truncate(packet.len);
         (packet, bytes)
+    }
+
+    #[test]
+    fn receive_pool_transfers_charges_and_restores_failed_table_insertions() {
+        for target in [0, 1] {
+            let config = EndpointConfig {
+                max_connections: 1,
+                max_listeners: 1,
+                preallocate_connections: target,
+                connection: ConnectionConfig {
+                    receive_capacity: 17,
+                    send_capacity: 17,
+                    mss: 8,
+                    ..ConnectionConfig::default()
+                },
+                ..EndpointConfig::default()
+            };
+            let tuple = Tuple {
+                local: "192.0.2.1:40000".parse().unwrap(),
+                remote: "192.0.2.2:8080".parse().unwrap(),
+            };
+            let mut endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
+            let charge = endpoint.per_connection_bytes;
+            let pool_capacity = endpoint.receive_pool.capacity();
+            // A full bounded probe table can fail insertion after construction.
+            endpoint.tuples.entries.fill(Entry::Occupied(tuple, 0));
+            let connection = endpoint.new_connection(tuple, 100, None).unwrap();
+            assert!(endpoint.receive_pool.is_empty());
+            assert_eq!(endpoint.buffer_bytes(), charge);
+            assert_eq!(
+                endpoint.insert(connection, None, None),
+                Err(EndpointError::LimitReached)
+            );
+            assert_eq!(endpoint.receive_pool.len(), target);
+            assert_eq!(endpoint.buffer_bytes(), target * charge);
+            endpoint.tuples.entries.fill(Entry::Empty);
+            let id = endpoint.connect(0, tuple.local, tuple.remote).unwrap();
+            assert!(endpoint.receive_pool.is_empty());
+            assert_eq!(endpoint.buffer_bytes(), charge);
+            let mut remote = tuple.remote;
+            remote.set_port(remote.port() + 1);
+            assert_eq!(
+                endpoint.connect(0, tuple.local, remote),
+                Err(EndpointError::LimitReached)
+            );
+            endpoint.abort(id).unwrap();
+            endpoint.release(id).unwrap();
+            endpoint.poll_transmit(0, &mut [0; 128], 16).unwrap();
+            assert_eq!(endpoint.receive_pool.len(), target);
+            assert_eq!(endpoint.receive_pool.capacity(), pool_capacity);
+            assert_eq!(endpoint.buffer_bytes(), target * charge);
+            assert_eq!(
+                endpoint.buffer_bytes(),
+                (endpoint.slots.iter().flatten().count() + endpoint.receive_pool.len()) * charge
+            );
+        }
     }
 
     #[test]

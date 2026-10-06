@@ -342,6 +342,9 @@ impl Owner {
             // Real receive storage: 8 MiB requires scale 8, not 7 (65535 << 7).
             Profile::UpstreamWindow8 | Profile::UpstreamSack => 8 * 1024 * 1024,
         };
+        // Reserve owned receive storage before packetdrill starts timed events.
+        // Its mlockall(MCL_FUTURE) makes first-touch allocation synchronous.
+        config.preallocate_connections = usize::from(profile == Profile::UpstreamSack);
         config.connection.mss = 1460;
         config.connection.initial_window = if profile == Profile::UpstreamSack {
             ntcp::InitialWindow::Iw10
@@ -351,6 +354,12 @@ impl Owner {
         config.connection.timestamps = profile == Profile::UpstreamSack;
         config.connection.rack = profile == Profile::UpstreamSack;
         config.connection.prr = profile == Profile::UpstreamSack;
+        config.connection.tlp = profile == Profile::UpstreamSack;
+        if profile == Profile::UpstreamSack {
+            // Explicit Linux timing compatibility; the core keeps RFC 6298's
+            // recommended one-second floor as its default.
+            config.connection.rto_min_us = 200_000;
+        }
         config.connection.sack = matches!(profile, Profile::Sack | Profile::UpstreamSack);
         config.connection.recovery_algorithm = ntcp::RecoveryAlgorithm::NewReno;
         config.connection.receive_ip_payload_limit = 65515;

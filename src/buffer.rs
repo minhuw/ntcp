@@ -171,6 +171,19 @@ impl ReceiveBuffer {
         })
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.metadata.fill(0);
+        self.pushed = false;
+        self.read_base = Seq(0);
+        self.head = 0;
+        self.contiguous_len = 0;
+        self.fin_sequence = None;
+        self.eof = false;
+        self.ranges.fill(EMPTY_RANGE);
+        self.range_count = 0;
+        self.dsack = None;
+    }
+
     pub(crate) fn reset_start(&mut self, start: Seq) -> Result<(), ()> {
         if self.fin_sequence.is_some() || self.has_data() {
             return Err(());
@@ -551,6 +564,40 @@ mod tests {
             .collect();
         ranks.sort_unstable();
         assert_eq!(ranks, (0..recv.range_count).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn clear_reuses_storage_without_exposing_old_payload_push_fin_or_sack() {
+        let mut recv = ReceiveBuffer::new(Seq(u32::MAX - 3), 17).unwrap();
+        let storage = (recv.data.as_ptr(), recv.metadata.as_ptr());
+        for complete in [false, true] {
+            let start = recv.next();
+            recv.insert_with_push(start, b"ab", false, true);
+            recv.read(&mut [0; 1]); // Move the ring head; leave unread text.
+            recv.insert_with_push(start.wrapping_add(5), b"old", true, true);
+            recv.record_duplicate(start.wrapping_add(5), 3);
+            if complete {
+                recv.insert(start.wrapping_add(2), b"cde", false);
+                assert!(recv.eof());
+            }
+            assert!(recv.has_data());
+            recv.clear();
+            assert_eq!((recv.data.as_ptr(), recv.metadata.as_ptr()), storage);
+            assert!(recv.metadata.iter().all(|&byte| byte == 0));
+            assert!(occupied_data(&recv).iter().all(Option::is_none));
+            assert!(!recv.has_data() && !recv.eof() && !recv.take_push());
+            assert_eq!(recv.head, 0);
+            assert_eq!(recv.fin_sequence, None);
+            assert_eq!(recv.sack_blocks(4), [None; 4]);
+            recv.reset_start(Seq(100)).unwrap();
+            let mut out = [0xaa; 17];
+            assert_eq!(recv.read(&mut out), 0);
+            assert_eq!(recv.insert(Seq(100), b"new", false).new_bytes, 3);
+            assert!(!recv.take_push());
+            assert_eq!(recv.read(&mut out), 3);
+            assert_eq!(&out[..3], b"new");
+            assert_eq!(&out[3..], &[0xaa; 14]);
+        }
     }
 
     #[test]

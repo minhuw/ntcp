@@ -493,6 +493,7 @@ mod linux {
         let address_policy = tun_address_policy(local, interface_subnet(&tun, local)?);
         let config = EndpointConfig {
             max_connections: MAX_FLOWS,
+            preallocate_connections: 0,
             max_listeners: 1,
             max_control_packets: BUDGET,
             max_buffer_bytes: MAX_FLOWS * (5 * 65536 + 1460),

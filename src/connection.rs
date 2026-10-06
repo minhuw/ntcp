@@ -350,16 +350,28 @@ pub(crate) struct Connection {
     application_progress_at: Instant,
     last_received: Instant,
     last_sent: Instant,
+    retransmit_burst: Option<(Seq, u32)>,
     keepalive_deadline: Option<Instant>,
     keepalive_probes: u32,
 }
 
 impl Connection {
+    #[cfg(test)]
     pub(crate) fn active(
+        tuple: Tuple,
+        config: ConnectionConfig,
+        iss: u32,
+        now: Instant,
+    ) -> Result<Self, Error> {
+        Self::active_with_receive(tuple, config, iss, now, &mut None)
+    }
+
+    pub(crate) fn active_with_receive(
         tuple: Tuple,
         mut config: ConnectionConfig,
         iss: u32,
         now: Instant,
+        receive: &mut Option<ReceiveBuffer>,
     ) -> Result<Self, Error> {
         if (config.tlp && (!config.rack || !config.sack))
             || !(1..=60_000_000).contains(&config.rto_min_us)
@@ -400,8 +412,6 @@ impl Connection {
         config.receive_ip_payload_limit = config.receive_ip_payload_limit.min(family_limit);
         config.send_ip_payload_limit = config.send_ip_payload_limit.min(family_limit);
         let send = SendBuffer::new(config.send_capacity).map_err(|_| Error::NoMemory)?;
-        let receive =
-            ReceiveBuffer::new(Seq(0), config.receive_capacity).map_err(|_| Error::NoMemory)?;
         let mut scratch = Vec::new();
         scratch
             .try_reserve_exact(config.mss as usize)
@@ -415,6 +425,14 @@ impl Connection {
         let congestion =
             Congestion::new(mss as u32, config.recovery_algorithm, config.initial_window);
         let rtt = RttEstimator::new(config.rto_min_us);
+        let rack = Rack::new().map_err(|_| Error::NoMemory)?;
+        // Take pooled storage only after every fallible allocation has succeeded.
+        let receive = match receive.take() {
+            Some(receive) => receive,
+            None => {
+                ReceiveBuffer::new(Seq(0), config.receive_capacity).map_err(|_| Error::NoMemory)?
+            }
+        };
         Ok(Self {
             tuple,
             config,
@@ -446,7 +464,7 @@ impl Connection {
             sack_post_rto: None,
             sack_fallback: None,
             scoreboard: Scoreboard::new(),
-            rack: Rack::new().map_err(|_| Error::NoMemory)?,
+            rack,
             tlp_deadline: None,
             tlp_pending: false,
             tlp_end: None,
@@ -516,11 +534,13 @@ impl Connection {
             application_progress_at: now,
             last_received: now,
             last_sent: now,
+            retransmit_burst: None,
             keepalive_deadline: None,
             keepalive_probes: 0,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn passive(
         tuple: Tuple,
         config: ConnectionConfig,
@@ -528,14 +548,29 @@ impl Connection {
         now: Instant,
         syn: &Segment<'_>,
     ) -> Result<Self, Error> {
+        Self::passive_with_receive(tuple, config, iss, now, syn, &mut None)
+    }
+
+    pub(crate) fn passive_with_receive(
+        tuple: Tuple,
+        config: ConnectionConfig,
+        iss: u32,
+        now: Instant,
+        syn: &Segment<'_>,
+        receive: &mut Option<ReceiveBuffer>,
+    ) -> Result<Self, Error> {
         if syn.header.flags & (SYN | ACK | RST) != SYN {
             return Err(Error::InvalidArgument);
         }
-        let mut connection = Self::active(tuple, config, iss, now)?;
+        let mut connection = Self::active_with_receive(tuple, config, iss, now, receive)?;
         connection.passive_open = true;
         connection.learn_syn(syn);
         connection.state = State::SynReceived;
         Ok(connection)
+    }
+
+    pub(crate) fn into_receive(self) -> ReceiveBuffer {
+        self.receive
     }
 
     pub(crate) fn tuple(&self) -> Tuple {
@@ -1523,6 +1558,7 @@ impl Connection {
         self.accepted_metadata = false;
         self.check_time(now)?;
         self.now = now;
+        self.retransmit_burst = None;
         if self.state == State::Closed {
             return Ok(());
         }
@@ -2794,6 +2830,27 @@ impl Connection {
                 new_fin = true;
             }
         }
+        let retransmit_burst = (retransmitted && count != 0 && !probe && !keepalive).then(|| {
+            let previous = self.retransmit_burst.filter(|&(end, _)| end == seq);
+            (
+                seq.wrapping_add(count as u32),
+                previous
+                    .map_or(0, |(_, bytes)| bytes)
+                    .saturating_add(count as u32),
+            )
+        });
+        if self.sack_receive && retransmit_burst.is_some_and(|(_, bytes)| bytes > packet_mss as u32)
+        {
+            let offset = seq.distance_from(self.send_base) as usize;
+            let end = seq.wrapping_add(count as u32);
+            let queued_end = self.send_base.wrapping_add(self.send.len() as u32);
+            // Flush the final multi-segment recovery burst, analogous to Linux's
+            // GSO PUSH policy. Single-segment repairs retain their original marks.
+            burst_push = self.scoreboard.unsacked_bytes(end, queued_end) == 0
+                && self
+                    .send
+                    .pushed(offset, self.send.len().saturating_sub(offset));
+        }
         if count != 0
             && !keepalive
             && (burst_push
@@ -2893,6 +2950,7 @@ impl Connection {
                 Error::Wire(error)
             }
         })?;
+        self.retransmit_burst = retransmit_burst;
         // Commit only the encoded (possibly clamped) urgent coverage, and only
         // after successful output. Retransmissions must not move it backwards.
         if flags & URG != 0 {
@@ -3118,6 +3176,7 @@ impl Connection {
     pub(crate) fn timeout(&mut self, now: Instant) -> Result<(), Error> {
         self.check_time(now)?;
         self.now = now;
+        self.retransmit_burst = None;
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.8
         //= reason=Closes protocol state here; terminal handle storage is reclaimed on release.
         //# If the time-wait timeout expires on a connection, delete the TCB, enter the
@@ -3799,9 +3858,9 @@ mod tests {
             let bytes = packet(&mut a, 1_200_000);
             let p = wire::parse(ip(tuple()), &bytes).unwrap();
             assert_eq!(p.header.sequence, base.wrapping_add(3000).0);
-            // Post-RTO recovery is byte-selective: the advisory SACKed byte
-            // is excluded, unlike the whole-original-segment TLP above.
-            assert_eq!(p.payload, &[0x55; 999]);
+            // RACK retains the original packet boundary while the scoreboard
+            // still preserves advisory delivery of the final byte.
+            assert_eq!(p.payload, &[0x55; 1000]);
             rack_sack(&mut a, 1_300_000, 4000, &[]);
             assert_eq!(a.flight(), 0);
             assert_eq!(a.rto_deadline, None);
@@ -4185,6 +4244,49 @@ mod tests {
                     wire::parse(ip(tuple()), &bytes).unwrap().header.flags & PSH != 0,
                     push && i == 1
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_burst_push_preserves_explicit_control_and_unsent_suffix() {
+        for (iss, holes) in [
+            (0, 1),
+            (0, 2),
+            (u32::MAX - 12_000, 1),
+            (u32::MAX - 12_000, 2),
+        ] {
+            for push in [false, true] {
+                for unsent in [false, true] {
+                    let mut a = rack_flight(iss);
+                    rack_sack(&mut a, 200_000, 10_000, &[]);
+                    a.write_with_push(&[0x55; 6000], push).unwrap();
+                    for _ in 0..6 {
+                        packet(&mut a, 200_000);
+                    }
+                    if unsent {
+                        a.write_with_push(&[0x66; 1000], push).unwrap();
+                    }
+                    rack_sack(&mut a, 300_000, 10_000, &[(10_000 + holes * 1000, 16_000)]);
+                    for i in 0..holes {
+                        assert_eq!(
+                            a.transmit(300_000, &mut [0; 20]),
+                            Err(Error::OutputTooSmall)
+                        );
+                        let bytes = packet(&mut a, 300_000);
+                        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+                        assert_eq!(
+                            segment.header.sequence,
+                            a.iss.wrapping_add(10_001 + i * 1000).0
+                        );
+                        assert_eq!(segment.payload.len(), 1000);
+                        assert_eq!(
+                            segment.header.flags & PSH != 0,
+                            push && !unsent && holes > 1 && i + 1 == holes
+                        );
+                    }
+                    assert_eq!(a.send.pushed(5999, 1), push);
+                }
             }
         }
     }

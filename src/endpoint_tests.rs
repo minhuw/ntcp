@@ -3171,3 +3171,196 @@ fn application_timeout_does_not_close_healthy_fin_wait2_receive_half() {
         .unwrap();
     assert_eq!(a.close_reason(client), Ok(Some(CloseReason::TimedOut)));
 }
+
+fn connection_charge(cfg: &EndpointConfig) -> usize {
+    3 * cfg.connection.receive_capacity
+        + 2 * cfg.connection.send_capacity
+        + usize::from(cfg.connection.mss)
+}
+
+#[test]
+fn receive_preallocation_validates_limits_and_overflow_before_allocating() {
+    assert_eq!(EndpointConfig::default().preallocate_connections, 0);
+    let mut cfg = config();
+    cfg.preallocate_connections = cfg.max_connections + 1;
+    assert!(matches!(
+        Endpoint::new(cfg.clone(), [1; 32], 0, test_policy),
+        Err(EndpointError::LimitReached)
+    ));
+    cfg.preallocate_connections = 2;
+    cfg.max_buffer_bytes = 2 * connection_charge(&cfg) - 1;
+    assert!(matches!(
+        Endpoint::new(cfg.clone(), [1; 32], 0, test_policy),
+        Err(EndpointError::LimitReached)
+    ));
+    cfg.max_buffer_bytes += 1;
+    let endpoint = Endpoint::new(cfg, [1; 32], 0, test_policy).unwrap();
+    assert_eq!(endpoint.buffer_bytes(), 2 * connection_charge(&config()));
+    let mut cfg = config();
+    cfg.max_connections = usize::MAX / 2;
+    cfg.preallocate_connections = cfg.max_connections;
+    cfg.max_buffer_bytes = usize::MAX;
+    assert!(matches!(
+        Endpoint::new(cfg, [1; 32], 0, test_policy),
+        Err(EndpointError::LimitReached)
+    ));
+    let mut cfg = config();
+    cfg.connection.receive_capacity = usize::MAX;
+    cfg.preallocate_connections = 1;
+    assert!(matches!(
+        Endpoint::new(cfg, [1; 32], 0, test_policy),
+        Err(EndpointError::LimitReached)
+    ));
+}
+
+#[test]
+fn receive_preallocation_failed_constructors_preserve_reserved_budget() {
+    let (local, remote) = addresses();
+    for preallocate in [0, 1] {
+        let mut cfg = config();
+        cfg.preallocate_connections = preallocate;
+        cfg.connection.mss = 0;
+        let charge = connection_charge(&cfg);
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+        b.listen(remote, 1).unwrap();
+        let mut peer = Endpoint::new(config(), [3; 32], 0, test_policy).unwrap();
+        peer.connect(0, local, remote).unwrap();
+        let syn = packets(&mut peer, 0).pop().unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                a.connect(0, local, remote),
+                Err(EndpointError::Connection(Error::InvalidArgument))
+            );
+            assert_eq!(
+                b.input(0, syn.0, &syn.1),
+                Err(EndpointError::Connection(Error::InvalidArgument))
+            );
+            assert_eq!(a.buffer_bytes(), preallocate * charge);
+            assert_eq!(b.buffer_bytes(), preallocate * charge);
+            assert!(packets(&mut a, 0).is_empty());
+            assert!(packets(&mut b, 0).is_empty());
+        }
+    }
+}
+
+#[test]
+fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
+    let (local, remote) = addresses();
+    let mut cfg = config();
+    cfg.preallocate_connections = 1;
+    let charge = connection_charge(&cfg);
+    cfg.max_buffer_bytes = 2 * charge;
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    assert_eq!((a.buffer_bytes(), b.buffer_bytes()), (charge, charge));
+    let first = a.connect(0, local, remote).unwrap();
+    assert_eq!(a.buffer_bytes(), charge);
+    assert_eq!(
+        a.connect(0, local, remote),
+        Err(EndpointError::AddressInUse)
+    );
+    let mut other_local = local;
+    other_local.set_port(local.port() + 1);
+    let second = a.connect(0, other_local, remote).unwrap();
+    assert_eq!(a.buffer_bytes(), 2 * charge);
+    let mut third_local = local;
+    third_local.set_port(local.port() + 2);
+    assert_eq!(
+        a.connect(0, third_local, remote),
+        Err(EndpointError::LimitReached)
+    );
+    pump(&mut a, &mut b, 0);
+    let servers = [b.accept(listener).unwrap(), b.accept(listener).unwrap()];
+    assert_eq!(b.buffer_bytes(), 2 * charge);
+    // Reclaim two allocations into a one-entry pool: only one charge survives.
+    for id in [first, second] {
+        a.abort(id).unwrap();
+        a.release(id).unwrap();
+        assert!(a.connection_exists(id));
+        assert!(a.poll_transmit(0, &mut [0; 1], 1).is_err());
+        packets(&mut a, 0);
+        assert!(!a.connection_exists(id));
+    }
+    assert_eq!(a.buffer_bytes(), charge);
+    for id in servers {
+        b.abort(id).unwrap();
+        b.release(id).unwrap();
+        packets(&mut b, 0);
+    }
+    assert_eq!(b.buffer_bytes(), charge);
+    // At the reserved budget, active and passive opens must still be admitted.
+    let fresh = a.connect(0, local, remote).unwrap();
+    pump(&mut a, &mut b, 0);
+    let server = b.accept(listener).unwrap();
+    assert_ne!(fresh, first);
+    assert_eq!((a.buffer_bytes(), b.buffer_bytes()), (charge, charge));
+    a.write(fresh, b"old bytes").unwrap();
+    a.shutdown(fresh).unwrap();
+    pump(&mut a, &mut b, 0);
+    assert_eq!(b.state(server), Ok(State::CloseWait));
+    // Keep old unread payload and EOF in the receive buffer through abort/reclaim.
+    b.abort(server).unwrap();
+    b.release(server).unwrap();
+    pump(&mut a, &mut b, 0);
+    a.release(fresh).unwrap();
+    packets(&mut a, 0);
+    assert_eq!((a.buffer_bytes(), b.buffer_bytes()), (charge, charge));
+    let replacement = a.connect(1, local, remote).unwrap();
+    pump(&mut a, &mut b, 1);
+    let server = b.accept(listener).unwrap();
+    assert_eq!(b.readable_bytes(server), Ok(0));
+    assert_eq!(
+        b.read(server, &mut [0; 16]),
+        Err(EndpointError::Connection(Error::WouldBlock))
+    );
+    while let Some(event) = b.next_event() {
+        if let Event::Connection(id, events) = event {
+            assert_eq!(id, server);
+            assert!(!events.pushed && !events.half_closed && !events.readable);
+        }
+    }
+    a.write(replacement, b"new").unwrap();
+    pump(&mut a, &mut b, 1);
+    let mut out = [0xaa; 16];
+    assert_eq!(b.read(server, &mut out), Ok(3));
+    assert_eq!(&out[..3], b"new");
+    assert_eq!(&out[3..], &[0xaa; 13]);
+    assert_eq!((a.buffer_bytes(), b.buffer_bytes()), (charge, charge));
+}
+
+#[test]
+fn receive_preallocation_time_wait_fallback_keeps_ownership_and_charges() {
+    let mut cfg = config();
+    cfg.preallocate_connections = 2;
+    let charge = connection_charge(&cfg);
+    cfg.max_buffer_bytes = 2 * charge;
+    let (mut b, _, old, ip, h, _) = time_wait_endpoint(cfg);
+    let tuple = Tuple {
+        local: addresses().1,
+        remote: addresses().0,
+    };
+    b.release(old).unwrap();
+    let seq = h.acknowledgment.wrapping_add(100);
+    let syn = tw_segment(ip, h, seq, 0, wire::SYN, None);
+    assert_eq!(b.input(4_000, ip, &syn), Ok(InputDisposition::Processed));
+    let child = b.connection_id(tuple).unwrap();
+    assert_ne!(child, old);
+    assert!(b.connection_exists(old));
+    assert_eq!(b.buffer_bytes(), 2 * charge);
+    packets(&mut b, 4_000);
+    let rst = tw_segment(ip, h, seq + 1, 0, wire::RST, None);
+    b.input(5_000, ip, &rst).unwrap();
+    packets(&mut b, 5_000);
+    assert_eq!(b.connection_id(tuple), Some(old));
+    assert!(b.connection_exists(old));
+    assert!(!b.connection_exists(child));
+    assert_eq!(b.buffer_bytes(), 2 * charge);
+    b.on_timeout(240_003_000, 64).unwrap();
+    packets(&mut b, 240_003_000);
+    assert!(!b.connection_exists(old));
+    assert_eq!(b.buffer_bytes(), 2 * charge);
+    assert!(b.connect(240_003_000, tuple.local, tuple.remote).is_ok());
+    assert_eq!(b.buffer_bytes(), 2 * charge);
+}
