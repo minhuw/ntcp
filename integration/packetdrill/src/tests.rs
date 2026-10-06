@@ -623,6 +623,69 @@ fn upstream_sack_profile_negotiates_combined_options_and_peer_fallback() {
 }
 
 #[test]
+fn upstream_sack_rto_uses_linux_floor_while_baseline_keeps_core_floor() {
+    for (profile, initial_rto, floor) in [
+        (Profile::Baseline, 1_000_000, 1_000_000),
+        (Profile::UpstreamSack, 300_000, 200_000),
+    ] {
+        let mut owner = Owner::new((local(), profile)).unwrap();
+        let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
+        let (mut connect, _) = request(
+            5,
+            fd,
+            0,
+            encode_addr(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080)),
+            0,
+        );
+        assert_eq!(owner.execute(&mut connect).err(), Some(EINPROGRESS));
+        let id = owner.connection(fd).unwrap();
+        let mut tcp = vec![0; BYTES];
+        let mut now = owner.now();
+        let tx = owner
+            .endpoint
+            .poll_transmit(now, &mut tcp, BUDGET)
+            .unwrap()
+            .packet
+            .unwrap();
+        let syn = ntcp::wire::parse(tx.ip, &tcp[..tx.len]).unwrap().header;
+        let (ip, mut reply) = reverse_ack(tx, syn, syn.sequence.wrapping_add(1));
+        reply.sequence = 100;
+        reply.flags |= ntcp::wire::SYN;
+        let len =
+            ntcp::wire::encode(ip, reply, &[2, 4, 5, 180, 1, 1, 4, 2], &[], &mut tcp).unwrap();
+        now += 100_000;
+        owner.endpoint.input(now, ip, &tcp[..len]).unwrap();
+        let info = owner.endpoint.transport_info(id).unwrap();
+        assert_eq!(info.state, State::Established);
+        assert_eq!(info.rtt_us, Some(100_000));
+        assert_eq!(info.rto_us, initial_rto, "{profile:?}");
+        // Drain the handshake ACK, then reduce RTTVAR with three 100 ms samples.
+        owner.endpoint.poll_transmit(now, &mut tcp, BUDGET).unwrap();
+        for _ in 0..3 {
+            owner.endpoint.write(id, b"data").unwrap();
+            let tx = owner
+                .endpoint
+                .poll_transmit(now, &mut tcp, BUDGET)
+                .unwrap()
+                .packet
+                .unwrap();
+            let sent = ntcp::wire::parse(tx.ip, &tcp[..tx.len]).unwrap();
+            let (ip, reply) = reverse_ack(
+                tx,
+                sent.header,
+                sent.header.sequence.wrapping_add(sent.payload.len() as u32),
+            );
+            let len = ntcp::wire::encode(ip, reply, &[], &[], &mut tcp).unwrap();
+            now += 100_000;
+            owner.endpoint.input(now, ip, &tcp[..len]).unwrap();
+        }
+        let info = owner.endpoint.transport_info(id).unwrap();
+        assert_eq!(info.rtt_us, Some(100_000));
+        assert_eq!(info.rto_us, floor, "{profile:?}");
+    }
+}
+
+#[test]
 fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
     for (name, receive_capacity) in [
         ("baseline", 65535),
