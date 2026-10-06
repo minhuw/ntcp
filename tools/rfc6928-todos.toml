@@ -1,9 +1,9 @@
 # Open semantic/test gaps and explicitly scoped optional/actor exceptions.
 
 # 6928-001
-[[TODO]]
+[[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
-reason = "External operational validation TODO for supported IW10 opt-in usage: the actor enabling IW10 (vendor or operator) must supply deployment before/after performance measurements or a justified SHOULD decision. Default-disabled configuration evidence is scoped implementation evidence only, not deployment satisfaction. Instrumentation may be external; no new built-in transport telemetry API is required. Sender cache/fallback and default-enablement obligations remain separate."
+reason = "Explicit user-approved implementation-audit scope exception: before/after performance monitoring is owed by the vendor/operator enabling IW10 in a deployment, not by the runtime implementation audit. No deployment measurements or satisfaction are claimed. IW10 remains default-disabled and user-selected; bounded sender cache/fallback and timer obligations retain implementation evidence. Deployment actor must still monitor before/after enabling IW10 or justify a SHOULD departure; external instrumentation suffices."
 quote = '''
 Anyone (stack vendors, network administrators, etc.) turning on a larger initial window SHOULD ensure that the performance is monitored before and after that change.
 '''
@@ -11,7 +11,7 @@ Anyone (stack vendors, network administrators, etc.) turning on a larger initial
 # 6928-003
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
-reason = "Conditional instruction to deployment users observing service deterioration: they must disable IW10/use RFC3390 at deployment. This library neither observes application media quality nor operates a deployment; users can select Rfc5681 per ConnectionConfig. No deployment result is claimed; Bounded inferred-loss sender cache/fallback is implemented; vendor deployment monitoring remains TODO."
+reason = "Conditional instruction to deployment users observing service deterioration: they must disable IW10/use RFC3390 at deployment. This library neither observes application media quality nor operates a deployment; users can select Rfc5681 per ConnectionConfig. No deployment result is claimed; Bounded inferred-loss sender cache/fallback is implemented; vendor deployment monitoring is excluded from this implementation audit, not satisfied."
 quote = '''
 If users observe any significant deterioration of performance, they SHOULD fall back to an initial window as allowed by RFC 3390 for safety reasons.
 '''
@@ -25,17 +25,17 @@ If the SYN or SYN/ACK is lost, the initial window used by a sender after a corre
 '''
 
 # 6928-014
-[[TODO]]
+[[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc6928#section-2"
-reason = "IW10 with the default1s RTO floor uses the integrated selected loss timer, per-copy RTO age/boundary protection, backoff and Karn-safe causal-round sampling. The supported IW10 plus subsecond-floor combination retains RFC6298's explicit profile obligations. Universal closure requires resolving that compatibility-policy choice; timer integration and sampling implementation are complete."
+reason = "IW10 with default or configured >=1s sampled floor inherits implemented RFC6298 estimator, Karn-safe causal-round sampling, selected loss timer, per-copy age/boundary safeguards and backoff. Evidence: rto_variable_packets_partial_ack_fresh_tail_and_failed_output, rtt_cadence_continuous_delayed_stretched_and_same_tick, iw10_loss_fallback_boundaries_restart_and_new_ack_timer and tlp_small_rto_floor_preserves_initial_and_syn_timeout_guard. Scope exception only for IW10 combined with explicitly user-selected subsecond rto_min_us: approved Linux compatibility departs from RFC6298 section2.4 SHOULD rounding and may be more aggressive; no universal inherited RFC6298 MUST pass is claimed. Default1s, initial1s and post-SYN-timeout3s safeguards remain."
 quote = '''
 Implementations must also follow RFC 6298 [RFC6298] in order to avoid spurious RTO as described in Section 9.
 '''
 
 # 6928-015
-[[TODO]]
+[[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc6928#section-1"
-reason = "ConnectionConfig provides Rfc5681/Iw10 selection; existing tests establish default-disabled IW10 and explicit opt-in only. External operational validation remains TODO for supported opt-in usage: the actor enabling IW10 must supply deployment before/after metrics and evidence of reasonable monitoring effort for application/service interactions. External instrumentation is sufficient; no built-in transport API is prescribed. Settable configuration alone does not establish deployment satisfaction."
+reason = "ConnectionConfig implements settable Rfc5681/Iw10 selection, with default-disabled IW10 and explicit opt-in evidenced by source/tests. Explicit user-approved implementation-audit scope exception only for deployment monitoring effort and application/service interactions: enabling vendors/operators retain that obligation outside this audit. No deployment safety/monitoring result or evidence supporting IW>10 is claimed; the implemented IW10 bound, cache/fallback and timer requirements are not excluded."
 quote = '''
 We recommend that all TCP implementations have a settable TCP IW parameter, as long as there is a reasonable effort to monitor for possible interactions with other Internet applications and services as described in Section 12. Furthermore, Section 10 details why 10 segments may be an appropriate value, and while that value may continue to rise in the future, this document does not include any supporting evidence for values of IW larger than 10.
 '''
@@ -51,7 +51,7 @@ Note that all the test results described in this document were based on the regu
 # 6928-017
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc6928#section-3"
-reason = "Content-provider actor must measure domain-sharded application concurrency and consider reducing parallel retrievals. This TCP library is neither a content provider nor an HTTP scheduling implementation; sender and stack-vendor deployment monitoring remain TODO, not waived by this outside-role exception."
+reason = "Content-provider actor must measure domain-sharded application concurrency and consider reducing parallel retrievals. This TCP library is neither a content provider nor an HTTP scheduling implementation; sender implementation obligations remain audited; stack-vendor deployment monitoring is separately excluded, not satisfied."
 quote = '''
 When web browsers open simultaneous TCP connections to the same destination, they are working against TCP's congestion control mechanisms [FF99]. Combining this behavior with larger initial windows further increases the burstiness and unfairness to other traffic in the network. If a larger initial window causes harm to any other flows, then local application tuning will reveal that having fewer concurrent connections yields better performance for some users. Any content provider deploying IW10 in conjunction with content distributed across multiple domains is explicitly encouraged to perform measurement experiments to detect such problems, and to consider reducing the number of concurrent connections used to retrieve their content.
 '''
@@ -59,7 +59,7 @@ When web browsers open simultaneous TCP connections to the same destination, the
 # 6928-019
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc6928#section-4"
-reason = "HTTP browser/application concurrency actor, not a TCP transport library. ntcp does not create HTTP requests or allocate domains; no application-concurrency conformance is claimed. IW10 sender/vendor monitoring TODOs remain."
+reason = "HTTP browser/application concurrency actor, not a TCP transport library. ntcp does not create HTTP requests or allocate domains; no application-concurrency conformance is claimed. IW10 sender implementation obligations remain audited; vendor monitoring is separately excluded, not satisfied."
 quote = '''
 we argue that the browsers and other application need to respect HTTP 1.1 regulation and stop increasing the number of simultaneous TCP connections.
 '''
@@ -81,9 +81,9 @@ Further experiments are required before a larger initial window shall be enabled
 '''
 
 # 6928-023
-[[TODO]]
+[[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
-reason = "External operational validation TODO for supported IW10 opt-in usage: the actor enabling IW10 must supply before/after deployment rates of packet loss, ECN marking and segment retransmission scoped to the initial burst. Measurements may use external instrumentation; missing deployment evidence is not a missing mandatory library telemetry feature. Default-disabled implementation evidence does not satisfy opt-in deployment monitoring; bounded sender cache/fallback is implementation evidence only."
+reason = "Explicit user-approved implementation-audit scope exception: deployment actors enabling IW10 must monitor initial-burst packet-loss, ECN-marking and retransmission rates using deployment instrumentation. This audit excludes descriptions/evidence of deployment monitoring, not implementation loss/ECN/retransmission behavior or bounded sender fallback. No rates, production measurements or deployment satisfaction are claimed; no mandatory built-in telemetry API is inferred."
 quote = '''
 Key metrics to monitor are the rate of packet losses, ECN marking, and segment retransmissions during the initial burst.
 '''
@@ -107,7 +107,7 @@ It is important also to take into account hosts that do not implement a larger i
 # 6928-026
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
-reason = "Publishing measurements and studying real-time traffic are tasks for experiment researchers/TCPM participants, not TCP runtime behavior. No experiment results are invented or claimed; vendor deployment monitoring remains TODO; bounded sender fallback is implemented."
+reason = "Publishing measurements and studying real-time traffic are tasks for experiment researchers/TCPM participants, not TCP runtime behavior. No experiment results are invented or claimed; vendor deployment monitoring is excluded from this implementation audit, not satisfied; bounded sender fallback is implemented."
 quote = '''
 The IETF TCPM working group is very much interested in further reports from experiments with this specification and encourages the publication of such measurement data. By now, there are no adequate studies available that either prove or do not prove the impact of IW10 to real-time traffic. Further experimentation in this direction is encouraged.
 '''
@@ -115,7 +115,7 @@ The IETF TCPM working group is very much interested in further reports from expe
 # 6928-027
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc6928#section-12"
-reason = "Network-wide flow observation actor is network researchers/operators, beyond this endpoint library. This does not excuse the library sender cache/fallback SHOULD or the enabling actor's deployment-monitoring evidence TODOs; external instrumentation is sufficient."
+reason = "Network-wide flow observation actor is network researchers/operators, beyond this endpoint library. This does not excuse the library sender cache/fallback SHOULD or the enabling actor's deployment-monitoring obligations outside this audit; external instrumentation is sufficient."
 quote = '''
 As use of IW10 becomes more prevalent, monitoring and analysis of flows throughout the network will be needed to assess the impact across the spectrum of scenarios found on the real Internet.
 '''
@@ -139,7 +139,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 # 6928-030
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc6928#section-7"
-reason = "Fairness evaluation between IW10 and baseline flows is a network research/experiment task. No empirical fairness evidence is claimed for this library; opt-in deployment monitoring TODOs remain; bounded cache/fallback is implemented."
+reason = "Fairness evaluation between IW10 and baseline flows is a network research/experiment task. No empirical fairness evidence is claimed for this library; opt-in deployment monitoring is excluded from this implementation audit, not satisfied; bounded cache/fallback is implemented."
 quote = '''
 Although no severe unfairness has been detected on all the known tests so far, further study on this topic may be warranted.
 '''

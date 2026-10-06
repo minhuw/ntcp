@@ -54,9 +54,9 @@ impl RttEstimator {
     }
 
     // The caller excludes ambiguous retransmission samples (Karn's algorithm).
-    // Partial evidence only; TODO remains. RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    // Estimator evidence for default/configured >=1s floors; G=1000us, K=4, alpha=1/8, beta=1/4. Explicit subsecond Linux compatibility is a scoped SHOULD departure, not universal MUST conformance; connection sampling/timer evidence is separate.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-1
-    //= reason=Partial evidence only; TODO remains. RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= reason=Estimator evidence for default/configured >=1s floors; G=1000us, K=4, alpha=1/8, beta=1/4. Explicit subsecond Linux compatibility is a scoped SHOULD departure, not universal MUST conformance; connection sampling/timer evidence is separate.
     //# However, a TCP MUST NOT be more aggressive than the following algorithms allow.
     // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-2
@@ -78,9 +78,9 @@ impl RttEstimator {
     //= https://www.rfc-editor.org/rfc/rfc6298#section-2
     //= reason=RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
     //# After the computation, a host MUST update RTO <- SRTT + max (G, K*RTTVAR)
-    // Partial evidence only; TODO remains. RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    // Estimator evidence for default/configured >=1s floors; G=1000us, K=4, alpha=1/8, beta=1/4. Explicit subsecond Linux compatibility is a scoped SHOULD departure, not universal MUST conformance; connection sampling/timer evidence is separate.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-2
-    //= reason=Partial evidence only; TODO remains. RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
+    //= reason=Estimator evidence for default/configured >=1s floors; G=1000us, K=4, alpha=1/8, beta=1/4. Explicit subsecond Linux compatibility is a scoped SHOULD departure, not universal MUST conformance; connection sampling/timer evidence is separate.
     //# (2.4) Whenever RTO is computed, if it is less than 1 second, then the RTO SHOULD be
     //# rounded up to 1 second.
     // RTT estimator only; integer microseconds with G=1000us, K=4, alpha=1/8, beta=1/4; caller sampling and timer lifecycle audited separately.
@@ -194,7 +194,7 @@ pub enum InitialWindow {
 
 impl InitialWindow {
     //= https://www.rfc-editor.org/rfc/rfc6928#section-12
-    //= reason=No monitoring-backed default deployment is claimed: InitialWindow default and ConnectionConfig default select Rfc5681, and test explicitly asserts this. Iw10 is only explicit opt-in; deployment monitoring TODOs still apply when enabled; bounded cache/fallback is implemented.
+    //= reason=No monitoring-backed default deployment is claimed: InitialWindow default and ConnectionConfig default select Rfc5681, and test explicitly asserts this. Iw10 is only explicit opt-in; deployment monitoring remains owed by the enabling actor outside this implementation audit; bounded cache/fallback is implemented.
     //# An increased initial window MUST NOT be turned on by default on systems without such
     //# monitoring capabilities.
     //= https://www.rfc-editor.org/rfc/rfc6928#section-2
@@ -1798,10 +1798,10 @@ mod tests {
     //= type=test
     //= reason=Default one-second minimum and estimator granularity.
     //# After the computation, a host MUST update RTO <- SRTT + max (G, K*RTTVAR)
-    // Partial evidence only; TODO remains. Default one-second minimum and estimator granularity.
+    // Default one-second minimum and estimator granularity are implemented; explicit subsecond compatibility is separately scoped, not universal floor compliance.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-2
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Default one-second minimum and estimator granularity.
+    //= reason=Default one-second minimum and estimator granularity are implemented; explicit subsecond compatibility is separately scoped, not universal floor compliance.
     //# (2.4) Whenever RTO is computed, if it is less than 1 second, then the RTO SHOULD be
     //# rounded up to 1 second.
     // Default one-second minimum and estimator granularity.
@@ -1846,10 +1846,10 @@ mod tests {
     //# (2.1) Until a round-trip time (RTT) measurement has been made for a segment sent
     //# between the sender and receiver, the sender SHOULD set RTO <- 1 second, though the
     //# "backing off" on repeated retransmission discussed in (5.5) still applies.
-    // Partial evidence only; TODO remains. Explicit configurable floor includes subsecond deviation, not universal RFC floor compliance.
+    // Approved user-selected Linux-compatible subsecond SHOULD departure; assertions preserve initial1s, sampled floor, exact doubling and60s cap, not universal RFC floor compliance.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-2
     //= type=test
-    //= reason=Partial evidence only; TODO remains. Explicit configurable floor includes subsecond deviation, not universal RFC floor compliance.
+    //= reason=Approved user-selected Linux-compatible subsecond SHOULD departure; assertions preserve initial1s, sampled floor, exact doubling and60s cap, not universal RFC floor compliance.
     //# (2.4) Whenever RTO is computed, if it is less than 1 second, then the RTO SHOULD be
     //# rounded up to 1 second.
     // Explicit configurable floor includes subsecond deviation, not universal RFC floor compliance.
@@ -1867,8 +1867,12 @@ mod tests {
         for minimum in [1, 200_000, 1_000_000, MAX_RTO] {
             let mut rtt = RttEstimator::new(minimum);
             assert_eq!(rtt.rto(), 1_000_000);
+            rtt.backoff();
+            assert_eq!(rtt.rto(), 2_000_000);
             rtt.sample(100_000);
             assert_eq!(rtt.rto(), 300_000u64.max(minimum));
+            rtt.backoff();
+            assert_eq!(rtt.rto(), (300_000u64.max(minimum) * 2).min(MAX_RTO));
             for _ in 0..100 {
                 rtt.backoff();
             }

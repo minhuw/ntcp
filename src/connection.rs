@@ -59,6 +59,9 @@ pub struct ConnectionConfig {
     pub nagle: bool,
     pub ecn: bool,
     pub recovery_algorithm: RecoveryAlgorithm,
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-1
+    //= reason=Settable Rfc5681/Iw10 selection with default-disabled IW10; deployment monitoring/application interactions remain enabling-actor obligations explicitly excluded from this implementation audit, not satisfied. No evidence for IW>10 is claimed.
+    //# We recommend that all TCP implementations have a settable TCP IW parameter, as long as there is a reasonable effort to monitor for possible interactions with other Internet applications and services as described in Section 12. Furthermore, Section 10 details why 10 segments may be an appropriate value, and while that value may continue to rise in the future, this document does not include any supporting evidence for values of IW larger than 10.
     pub initial_window: InitialWindow,
     pub timestamps: bool,
     pub timebase: CallerTimebase,
@@ -537,6 +540,9 @@ impl Connection {
             config.initial_window,
             Seq(iss),
         );
+        //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+        //= reason=All initial-window choices share RFC6298 estimator and connection timer/sampling implementation. Default/configured >=1s floors retain the recommended floor; explicit subsecond Linux compatibility is a scoped departure, not universal inherited conformance.
+        //# Implementations must also follow RFC 6298 [RFC6298] in order to avoid spurious RTO as described in Section 9.
         let rtt = RttEstimator::new(config.rto_min_us);
         let rack = Rack::with_capacity(config.send_capacity + 2).map_err(|_| Error::NoMemory)?;
         let scoreboard =
@@ -3403,9 +3409,9 @@ impl Connection {
     //= reason=Validated advancing ACK sample from ordinary estimator also updates Rack::sample.
     //# Use the RTT measurements obtained via [RFC6298] or [RFC7323] to
     //# update the estimated minimum RTT in RACK.min_RTT.
-    // Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    // Default/configured >=1s timing evidence; subsecond compatibility is a scoped departure, not universal MUST conformance. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-1
-    //= reason=Partial evidence only; TODO remains. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
+    //= reason=Default/configured >=1s timing evidence; subsecond compatibility is a scoped departure, not universal MUST conformance. Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
     //# However, a TCP MUST NOT be more aggressive than the following algorithms allow.
     // Validated advancing cumulative ACK; updates eligible sample, then disables RTO for zero flight or restarts at now+current RTO. Zero-window arm_work can select persist; SACK/RACK delivery alone is not cumulative ACK progress.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-3
@@ -4233,9 +4239,9 @@ impl Connection {
     //# On any data transmission or retransmission:
     //#
     //#    prr_out += (data sent) // strictly less than or equal to sndcnt
-    // Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    // Default/configured >=1s timing evidence; subsecond compatibility is a scoped departure, not universal MUST conformance. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-1
-    //= reason=Partial evidence only; TODO remains. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
+    //= reason=Default/configured >=1s timing evidence; subsecond compatibility is a scoped departure, not universal MUST conformance. Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
     //# However, a TCP MUST NOT be more aggressive than the following algorithms allow.
     // Successful encode commit only; ordinary data starts an absent RTO and retransmission re-arms it. SYN/FIN count as sequence space. RACK/TLP loss detection and persist are separate paths, not evidence for literal RTO timing in every profile.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-3
@@ -5700,9 +5706,9 @@ impl Connection {
     //#
     //#    DeliveredData = change_in(snd.una) + change_in(SACKd)
     //#    prr_delivered += DeliveredData
-    // Selected RTO enforces latest wire-span boundary and elapsed age before loss/backoff; output failure preserves pending state, and successful commit rearms. Global sampling/floor profile obligations remain separate.
+    // Selected RTO enforces latest wire-span boundary and elapsed age before loss/backoff; output failure preserves pending state, and successful commit rearms. Sampling cadence is separately evidenced; approved subsecond compatibility is a scoped departure, not universal MUST conformance.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-1
-    //= reason=Selected RTO enforces latest wire-span boundary and elapsed age before loss/backoff; output failure preserves pending state, and successful commit rearms. Global sampling/floor profile obligations remain separate.
+    //= reason=Selected RTO enforces latest wire-span boundary and elapsed age before loss/backoff; output failure preserves pending state, and successful commit rearms. Sampling cadence is separately evidenced; approved subsecond compatibility is a scoped departure, not universal MUST conformance.
     //# However, a TCP MUST NOT be more aggressive than the following algorithms allow.
     // Selected RTO enforces latest wire-span boundary and elapsed age before loss/backoff; output failure preserves pending state, and successful commit rearms. Global sampling/floor profile obligations remain separate.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-5
@@ -6167,6 +6173,14 @@ mod tests {
     //= reason=First-send arming, advancing-ACK restart, running new-data nonrestart, earliest wire-span retry, output rollback and last-emission age are asserted; window probing/selected timer transitions are separately covered.
     //# The following is the RECOMMENDED algorithm for managing the
     //# retransmission timer:
+    //= https://www.rfc-editor.org/rfc/rfc6298#section-1
+    //= type=test
+    //= reason=Default/configured >=1s timer evidence plus explicitly selected subsecond compatibility departure; asserts no early retry, per-copy boundaries, ACK restart and failed-output preservation. Sampling cadence and estimator bounds are separately tested; not universal MUST conformance for subsecond floors.
+    //# However, a TCP MUST NOT be more aggressive than the following algorithms allow.
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-2
+    //= type=test
+    //= reason=Inherited timer evidence; IW10 ACK restart/fallback and causal-round sampling are separately tested. Approved subsecond compatibility is separately excepted, not universal inherited RFC6298 conformance.
+    //# Implementations must also follow RFC 6298 [RFC6298] in order to avoid spurious RTO as described in Section 9.
     fn rto_variable_packets_partial_ack_fresh_tail_and_failed_output() {
         for iss in [100, u32::MAX - 3] {
             for floor in [100_000, 1_000_000] {
@@ -8744,7 +8758,7 @@ mod tests {
     //# segment size.
     //= https://www.rfc-editor.org/rfc/rfc6928#section-12
     //= type=test
-    //= reason=No monitoring-backed default deployment is claimed: InitialWindow default and ConnectionConfig default select Rfc5681, and test explicitly asserts this. Iw10 is only explicit opt-in; deployment monitoring TODOs still apply when enabled; bounded cache/fallback is implemented.
+    //= reason=No monitoring-backed default deployment is claimed: InitialWindow default and ConnectionConfig default select Rfc5681, and test explicitly asserts this. Iw10 is only explicit opt-in; deployment monitoring remains owed by the enabling actor outside this implementation audit; bounded cache/fallback is implemented.
     //# An increased initial window MUST NOT be turned on by default on systems without such
     //# monitoring capabilities.
     //= https://www.rfc-editor.org/rfc/rfc6928#section-2
@@ -8766,6 +8780,10 @@ mod tests {
     //= type=test
     //= reason=Negotiated MSS, timestamp overhead and path limits select the piecewise default window; actual first-flight output is bounded, including failed encoding.
     //# IW, the initial value of cwnd, MUST be set using the following guidelines as an upper bound.
+    //= https://www.rfc-editor.org/rfc/rfc6928#section-1
+    //= type=test
+    //= reason=Settable Rfc5681/Iw10 selection with default-disabled IW10; deployment monitoring/application interactions remain enabling-actor obligations explicitly excluded from this implementation audit, not satisfied. No evidence for IW>10 is claimed.
+    //# We recommend that all TCP implementations have a settable TCP IW parameter, as long as there is a reasonable effort to monitor for possible interactions with other Internet applications and services as described in Section 12. Furthermore, Section 10 details why 10 segments may be an appropriate value, and while that value may continue to rise in the future, this document does not include any supporting evidence for values of IW larger than 10.
     fn initial_window_uses_negotiated_effective_mss() {
         assert_eq!(
             ConnectionConfig::default().initial_window,

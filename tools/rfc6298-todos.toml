@@ -1,17 +1,17 @@
-# Unresolved behavior/profile/test gaps are not exceptions or waivers.
+# Scoped compatibility departures; default-profile source/test evidence is retained.
 
 # 6298:section-1:2
-[[TODO]]
+[[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc6298#section-1"
-reason = "Global conformance is not established by estimator math: configured rto_min_us<1000000 intentionally departs from section2.4, and the profile gap below remains. Timer lifecycle now uses one selected loss timer, an unarmed RTO reference, per-copy head boundaries/elapsed age, and zero-window RTO probing versus unsent ZWP. Close the remaining profile obligation separately; do not use this as an implemented-defect waiver."
+reason = "Default and configured >=1000000us sampled floors retain RFC6298 timing: RttEstimator arithmetic/backoff plus Connection selected loss timer, per-copy wire boundaries/elapsed age, Karn-safe causal-round sampling and zero-window RTO probing are implemented. Evidence: rtt_floor_granularity_and_extremes, configurable_rto_floor_keeps_initial_and_backoff_bounds, rto_variable_packets_partial_ack_fresh_tail_and_failed_output and rtt_cadence_continuous_delayed_stretched_and_same_tick. Scope exception only for explicitly user-selected rto_min_us<1000000 Linux timing compatibility (UpstreamSack selects200000): this approved SHOULD-floor departure can be more aggressive and is not a universal RFC6298 MUST pass. Initial1s, post-SYN-timeout3s and exponential backoff remain enforced; no timer defect is waived."
 quote = '''
 However, a TCP MUST NOT be more aggressive than the following algorithms allow.
 '''
 
 # 6298:section-2:8
-[[TODO]]
+[[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc6298#section-2"
-reason = "Default minimum1000000 satisfies the floor (rtt_floor_granularity_and_extremes). Opt-in rto_min_us=1..999999 intentionally permits subsecond sampled RTO; configurable_rto_floor_keeps_initial_and_backoff_bounds asserts this deviation. Do not mark that implemented deviation outside scope. Closure: retain >=1s for an RFC6298-conformant profile, or explicitly resolve the SHOULD departure with a justified alternate-spec/profile decision and targeted tests."
+reason = "Default rto_min_us=1000000 and configured >=1s floors implement rounding up to at least1s; estimator floor/granularity and configurable-floor tests provide source evidence. Explicit user-selected subsecond floors are an approved RFC6298 section2.4 SHOULD departure for Linux timing compatibility (200000us in UpstreamSack), avoiding a forced1s sampled delay when reproducing Linux behavior. This profile accepts increased spurious-timeout risk and does not claim universal RFC6298 MUST conformance. Initial1s, post-SYN-timeout3s and bounded exponential backoff are unchanged. Exception is limited to the subsecond sampled floor, not sampling or timer lifecycle."
 quote = '''
 (2.4) Whenever RTO is computed, if it is less than 1 second, then the RTO SHOULD
 be rounded up to 1 second.
