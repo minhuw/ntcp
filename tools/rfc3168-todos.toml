@@ -1,13 +1,5 @@
 # Open behavior/evidence gaps; partial annotations are not waivers.
 
-# 3168-A021 | IP adapter | IPv4 and IPv6 traffic class encoding
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-5"
-reason = "IPv4 adapter ECN/DSCP/checksum/DF matrix is asserted. The example has no IPv6 packet encoder/parser: core IpMetadata support alone cannot prove IPv6 Traffic Class plumbing. Full IPv6 adapter implementation and end-to-end evidence are outside this bounded TCP ECN fix; mandatory obligation remains open, not waived."
-quote = '''
-Bits 6 and 7 in the IPv4 TOS octet are designated as the ECN field. The IPv4 TOS octet corresponds to the Traffic Class octet in IPv6, and the ECN field is defined identically in both cases.
-'''
-
 # 3168-A039 | TCP endpoint | packet not sent as ECN-capable
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1"

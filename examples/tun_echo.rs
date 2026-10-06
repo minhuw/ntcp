@@ -1,4 +1,4 @@
-// Run as: tun_echo TUN_NAME LOCAL_IPV4 TCP_PORT [PEER_IPV4:PORT].
+// Run as: tun_echo TUN_NAME LOCAL_IP TCP_PORT [PEER_SOCKET_ADDR].
 // The caller must configure the TUN interface (MTU 1500) and routes beforehand.
 // This adapter exchanges IP packets, not Ethernet frames; it does not configure
 // the host or implement ARP, routing, IP fragmentation, or ICMP.
@@ -12,7 +12,7 @@ mod linux {
     use std::{
         fs::{File, OpenOptions},
         io::{self, Read, Write},
-        net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
         os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
         time::Instant,
     };
@@ -254,6 +254,205 @@ mod linux {
         Ok(total_len)
     }
 
+    const IPV6_HEADER: usize = 40;
+
+    fn unicast_v6(ip: Ipv6Addr) -> bool {
+        // No zone handling: reject link/site-local, mapped IPv4 and loopback addresses.
+        !ip.is_unspecified()
+            && !ip.is_multicast()
+            && !ip.is_loopback()
+            && !ip.is_unicast_link_local()
+            && ip.segments()[0] & 0xffc0 != 0xfec0
+            && ip.to_ipv4_mapped().is_none()
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-5
+    //= type=implementation
+    //= reason=Direct-TCP IPv6 base-header adapter extracts the identical ECN field from Traffic Class; extension headers, fragmentation and jumbograms are scoped adapter limits.
+    //# Bits 6 and 7 in the IPv4 TOS octet are designated as the ECN field. The IPv4 TOS octet corresponds to the Traffic Class octet in IPv6, and the ECN field is defined identically in both cases.
+    fn parse_ipv6(packet: &[u8], local: Ipv6Addr) -> Option<(IpMetadata, u8, &[u8])> {
+        if packet.len() < IPV6_HEADER || packet[0] >> 4 != 6 {
+            return None;
+        }
+        let payload_len = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
+        // ponytail: direct TCP only; add an extension-header walker if needed.
+        // Next Header 6 excludes every extension/fragment header; zero length
+        // excludes jumbograms. Require exact TUN packet bounds and a live hop.
+        if payload_len == 0
+            || packet.len() != IPV6_HEADER + payload_len
+            || packet[6] != 6
+            || packet[7] == 0
+        {
+            return None;
+        }
+        let source = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).ok()?);
+        let destination = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).ok()?);
+        if destination != local || !unicast_v6(source) || !unicast_v6(destination) {
+            return None;
+        }
+        Some((
+            IpMetadata {
+                source: source.into(),
+                destination: destination.into(),
+            },
+            (packet[0] << 4) | (packet[1] >> 4),
+            &packet[IPV6_HEADER..],
+        ))
+    }
+
+    fn build_ipv6(packet: &mut [u8], transmit: ntcp::Transmit) -> io::Result<usize> {
+        let (IpAddr::V6(source), IpAddr::V6(destination)) =
+            (transmit.ip.source, transmit.ip.destination)
+        else {
+            return Err(invalid("expected IPv6 transmit addresses"));
+        };
+        let total = transmit
+            .len
+            .checked_add(IPV6_HEADER)
+            .ok_or_else(|| invalid("IPv6 length overflow"))?;
+        if total > MTU
+            || total > packet.len()
+            || transmit.len == 0
+            || transmit.hop_limit == 0
+            || transmit.dscp > 63
+            || transmit.ecn > 3
+            || !unicast_v6(source)
+            || !unicast_v6(destination)
+            || transmit.ipv4_options != ntcp::OutgoingIpv4Options::default()
+        {
+            return Err(invalid("invalid outgoing IPv6 base-header packet"));
+        }
+        let header = &mut packet[..IPV6_HEADER];
+        header.fill(0);
+        let class = (transmit.dscp << 2) | transmit.ecn;
+        header[0] = 0x60 | (class >> 4);
+        header[1] = class << 4;
+        header[4..6].copy_from_slice(&(transmit.len as u16).to_be_bytes());
+        header[6] = 6;
+        header[7] = transmit.hop_limit;
+        header[8..24].copy_from_slice(&source.octets());
+        header[24..40].copy_from_slice(&destination.octets());
+        Ok(total)
+    }
+
+    fn checked_peer(value: &str, local: IpAddr) -> io::Result<SocketAddr> {
+        let peer: SocketAddr = value
+            .parse()
+            .map_err(|_| invalid("invalid peer socket address"))?;
+        if peer.is_ipv4() != local.is_ipv4()
+            || peer.port() == 0
+            || matches!(peer, SocketAddr::V6(ip) if ip.scope_id() != 0 || ip.flowinfo() != 0)
+            || !match peer.ip() {
+                IpAddr::V4(ip) => unicast(ip),
+                IpAddr::V6(ip) => unicast_v6(ip),
+            }
+        {
+            return Err(invalid(
+                "peer must be unscoped unicast and match local address family",
+            ));
+        }
+        Ok(peer)
+    }
+
+    fn input_frame(
+        endpoint: &mut Endpoint,
+        time: u64,
+        packet: &[u8],
+        local: IpAddr,
+        options_enabled: bool,
+        timestamp: u32,
+    ) -> io::Result<()> {
+        match local {
+            IpAddr::V4(local) => {
+                if let Some((ip, tcp, options)) =
+                    parse_ipv4_options(packet, local, options_enabled, timestamp)
+                {
+                    endpoint
+                        .input_with_ipv4_options(time, ip, packet[1], options, tcp)
+                        .map_err(engine)?;
+                }
+            }
+            IpAddr::V6(local) => {
+                if let Some((ip, class, tcp)) = parse_ipv6(packet, local) {
+                    endpoint
+                        .input_with_traffic_class(time, ip, class, tcp)
+                        .map_err(engine)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn build_frame(
+        packet: &mut [u8],
+        transmit: ntcp::Transmit,
+        timestamp: u32,
+    ) -> io::Result<usize> {
+        match transmit.ip.source {
+            IpAddr::V4(_) => build_ipv4_options(packet, transmit, timestamp),
+            IpAddr::V6(_) => build_ipv6(packet, transmit),
+        }
+    }
+
+    fn tun_v6_policy(local: Ipv6Addr) -> impl Fn(AddressValidation) -> bool {
+        let valid = |ip| matches!(ip, IpAddr::V6(ip) if unicast_v6(ip));
+        move |request| match request {
+            AddressValidation::Bind { local: bind } => bind == IpAddr::V6(local) && valid(bind),
+            AddressValidation::Open {
+                local: source,
+                remote: destination,
+            } => source == IpAddr::V6(local) && valid(source) && valid(destination),
+            AddressValidation::Route {
+                source,
+                destination,
+                hop,
+            } => source == IpAddr::V6(local) && valid(source) && valid(destination) && valid(hop),
+            AddressValidation::Incoming {
+                source,
+                destination,
+            } => destination == IpAddr::V6(local) && valid(source) && valid(destination),
+        }
+    }
+
+    fn interface_ipv6(tun: &File, local: Ipv6Addr) -> io::Result<()> {
+        // SAFETY: zero initializes ifreq; the live TUN fd writes its actual name.
+        let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(tun.as_raw_fd(), libc::TUNGETIFF, &mut request) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut addresses = std::ptr::null_mut();
+        // SAFETY: getifaddrs initializes the list pointer on success.
+        if unsafe { libc::getifaddrs(&mut addresses) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut found = false;
+        let mut cursor = addresses;
+        // SAFETY: traverse the live getifaddrs list, checking nullable addresses
+        // and family before casting; names are NUL-terminated by the kernel.
+        unsafe {
+            let name = std::ffi::CStr::from_ptr(request.ifr_name.as_ptr());
+            while let Some(entry) = cursor.as_ref() {
+                if !entry.ifa_addr.is_null()
+                    && (*entry.ifa_addr).sa_family as i32 == libc::AF_INET6
+                    && std::ffi::CStr::from_ptr(entry.ifa_name) == name
+                {
+                    let address = &*entry.ifa_addr.cast::<libc::sockaddr_in6>();
+                    found |= Ipv6Addr::from(address.sin6_addr.s6_addr) == local
+                        && address.sin6_scope_id == 0;
+                }
+                cursor = entry.ifa_next;
+            }
+            libc::freeifaddrs(addresses);
+        }
+        if found && unicast_v6(local) {
+            Ok(())
+        } else {
+            Err(invalid(
+                "local IPv6 address must be an unscoped address assigned to this TUN",
+            ))
+        }
+    }
+
     fn open_tun(name: &str) -> io::Result<File> {
         if name.is_empty() || name.len() >= libc::IFNAMSIZ || name.as_bytes().contains(&0) {
             return Err(invalid(
@@ -465,20 +664,38 @@ mod linux {
         let args: Vec<_> = std::env::args().collect();
         if !matches!(args.len(), 4 | 5) {
             return Err(invalid(
-                "usage: tun_echo TUN_NAME LOCAL_IPV4 TCP_PORT [PEER_IPV4:PORT]",
+                "usage: tun_echo TUN_NAME LOCAL_IP TCP_PORT [PEER_SOCKET_ADDR]",
             ));
         }
-        let local: Ipv4Addr = args[2]
+        let local: IpAddr = args[2]
             .parse()
-            .map_err(|_| invalid("invalid local IPv4 address"))?;
+            .map_err(|_| invalid("invalid local IP address"))?;
         let port: u16 = args[3].parse().map_err(|_| invalid("invalid TCP port"))?;
-        if !unicast(local) || port == 0 {
-            return Err(invalid("expected a unicast IPv4 address and nonzero port"));
+        if !match local {
+            IpAddr::V4(ip) => unicast(ip),
+            IpAddr::V6(ip) => unicast_v6(ip),
+        } || port == 0
+        {
+            return Err(invalid(
+                "expected an unscoped unicast IP address and nonzero port",
+            ));
         }
         let ipv4_options_enabled = match std::env::var("NTCP_IPV4_OPTIONS") {
             Ok(value) => options_enabled(Some(&value))?,
             Err(std::env::VarError::NotPresent) => options_enabled(None)?,
             Err(_) => return Err(invalid("invalid NTCP_IPV4_OPTIONS")),
+        };
+        if local.is_ipv6() && ipv4_options_enabled {
+            return Err(invalid("IPv4 option configuration is unsupported for IPv6"));
+        }
+        let peer = args
+            .get(4)
+            .map(|value| checked_peer(value, local))
+            .transpose()?;
+        let header_len = if local.is_ipv4() {
+            IP_HEADER
+        } else {
+            IPV6_HEADER
         };
         let timestamps = match std::env::var("NTCP_TIMESTAMPS") {
             Ok(value) if value == "1" => true,
@@ -493,7 +710,13 @@ mod linux {
         let secret = acquire_secret()?;
         let mut tun = open_tun(&args[1])?;
         let start = Instant::now();
-        let address_policy = tun_address_policy(local, interface_subnet(&tun, local)?);
+        let address_policy: Box<dyn Fn(AddressValidation) -> bool> = match local {
+            IpAddr::V4(ip) => Box::new(tun_address_policy(ip, interface_subnet(&tun, ip)?)),
+            IpAddr::V6(ip) => {
+                interface_ipv6(&tun, ip)?;
+                Box::new(tun_v6_policy(ip))
+            }
+        };
         let config = EndpointConfig {
             max_connections: MAX_FLOWS,
             preallocate_connections: 0,
@@ -514,29 +737,28 @@ mod linux {
                 sack,
                 send_capacity: 65536,
                 receive_capacity: 65536,
-                mss: 1460,
-                receive_ip_payload_limit: (MTU - IP_HEADER) as u16,
-                send_ip_payload_limit: (MTU - IP_HEADER) as u16,
+                mss: (MTU - header_len - 20) as u16,
+                receive_ip_payload_limit: (MTU - header_len) as u16,
+                send_ip_payload_limit: (MTU - header_len) as u16,
                 ..ConnectionConfig::default()
             },
         };
         let mut endpoint =
             Endpoint::new(config, secret, now(start), address_policy).map_err(engine)?;
         let listener = endpoint
-            .listen(SocketAddr::new(local.into(), port), MAX_FLOWS)
+            .listen(SocketAddr::new(local, port), MAX_FLOWS)
             .map_err(engine)?;
         let mut flows = Vec::with_capacity(MAX_FLOWS);
-        if let Some(peer) = args.get(4) {
-            let peer: std::net::SocketAddrV4 =
-                peer.parse().map_err(|_| invalid("invalid IPv4 peer"))?;
+        if let Some(peer) = peer {
             let id = endpoint
-                .connect(now(start), SocketAddr::new(local.into(), port), peer.into())
+                .connect(now(start), SocketAddr::new(local, port), peer)
                 .map_err(engine)?;
             flows.push(Flow::new(id));
         }
-        // Enough input space for any IPv4 datagram, so read cannot silently turn
-        // an oversized datagram into a seemingly valid truncated packet.
-        let mut input = [0u8; 65536];
+        // One byte beyond the largest non-jumbo IPv6 datagram: a truncated
+        // oversized frame cannot masquerade as an exact-length base-header packet.
+        // IPv4 total-length handling remains unchanged.
+        let mut input = [0u8; 65576];
         // Reserve all output storage BEFORE polling: generation commits a send.
         let mut output = [0u8; MTU];
         let mut accepting = false;
@@ -552,16 +774,14 @@ mod linux {
                         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "TUN closed"));
                     }
                     Ok(len) => {
-                        if let Some((ip, tcp, options)) = parse_ipv4_options(
+                        input_frame(
+                            &mut endpoint,
+                            now(start),
                             &input[..len],
                             local,
                             ipv4_options_enabled,
                             (start.elapsed().as_millis() as u32) | 0x8000_0000,
-                        ) {
-                            endpoint
-                                .input_with_ipv4_options(now(start), ip, input[1], options, tcp)
-                                .map_err(engine)?;
-                        }
+                        )?;
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -619,10 +839,10 @@ mod linux {
             // Each call spends one engine work unit, at most 32 units/packets.
             for _ in 0..BUDGET {
                 let polled = endpoint
-                    .poll_transmit(now(start), &mut output[IP_HEADER..], 1)
+                    .poll_transmit(now(start), &mut output[header_len..], 1)
                     .map_err(engine)?;
                 if let Some(packet) = polled.packet {
-                    let len = build_ipv4_options(
+                    let len = build_frame(
                         &mut output,
                         packet,
                         (start.elapsed().as_millis() as u32) | 0x8000_0000,
@@ -738,6 +958,246 @@ mod linux {
 
             // Exercise the real OS path, not a statistical entropy test.
             let _secret = acquire_secret().unwrap();
+        }
+
+        fn v6_transmit(len: usize) -> ntcp::Transmit {
+            ntcp::Transmit {
+                connection: None,
+                ip: IpMetadata {
+                    source: "2001:db8::1".parse().unwrap(),
+                    destination: "2001:db8::2".parse().unwrap(),
+                },
+                len,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+                ipv4_options: ntcp::OutgoingIpv4Options::default(),
+            }
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-5
+        //= type=test
+        //= reason=All 64 DSCP values and four ECN values are packed/extracted across both IPv6 Traffic Class nibbles; flow-label high nibble is independent. Bounds, address and direct-TCP scope rejection are asserted.
+        //# Bits 6 and 7 in the IPv4 TOS octet are designated as the ECN field. The IPv4 TOS octet corresponds to the Traffic Class octet in IPv6, and the ECN field is defined identically in both cases.
+        #[test]
+        fn ipv6_base_header_matrix_and_rejections() {
+            let local = "2001:db8::2".parse().unwrap();
+            let mut bytes = [0xa5; MTU];
+            for dscp in 0..64 {
+                for ecn in 0..4 {
+                    for hop_limit in [1, 64, 255] {
+                        let mut transmit = v6_transmit(20);
+                        transmit.dscp = dscp;
+                        transmit.ecn = ecn;
+                        transmit.hop_limit = hop_limit;
+                        let len = build_frame(&mut bytes, transmit, 0).unwrap();
+                        assert_eq!(len, 60);
+                        assert_eq!(bytes[0], 0x60 | (dscp >> 2));
+                        assert_eq!(bytes[1], ((dscp << 2) | ecn) << 4);
+                        assert_eq!(&bytes[4..8], &[0, 20, 6, hop_limit]);
+                        assert_eq!(&bytes[40..60], &[0xa5; 20]);
+                        for flow_nibble in 0..16 {
+                            bytes[1] = (bytes[1] & 0xf0) | flow_nibble;
+                            let (ip, class, tcp) = parse_ipv6(&bytes[..len], local).unwrap();
+                            assert_eq!(ip, transmit.ip);
+                            assert_eq!(class, (dscp << 2) | ecn);
+                            assert_eq!(tcp, &[0xa5; 20]);
+                        }
+                    }
+                }
+            }
+            let len = build_frame(&mut bytes, v6_transmit(20), 0).unwrap();
+            for truncated in 0..len {
+                assert!(parse_ipv6(&bytes[..truncated], local).is_none());
+            }
+            assert!(parse_ipv6(&bytes[..len + 1], local).is_none());
+            assert!(parse_ipv6(&bytes[..len], "2001:db8::3".parse().unwrap()).is_none());
+            for (offset, value) in [(0, 0x40), (4, 1), (5, 19), (5, 21), (7, 0)] {
+                let mut bad = bytes;
+                bad[offset] = value;
+                assert!(parse_ipv6(&bad[..len], local).is_none());
+            }
+            // Hop-by-hop (including jumbo), routing, fragment, ESP, AH,
+            // destination options, no-next-header, UDP and unknown protocols.
+            for next in [0, 43, 44, 50, 51, 60, 59, 17, 255] {
+                let mut bad = bytes;
+                bad[6] = next;
+                assert!(parse_ipv6(&bad[..len], local).is_none());
+            }
+            let mut jumbo = bytes;
+            jumbo[4..6].fill(0);
+            assert!(parse_ipv6(&jumbo[..40], local).is_none());
+            for address in [
+                "::",
+                "ff02::1",
+                "fe80::1",
+                "fec0::1",
+                "::1",
+                "::ffff:192.0.2.1",
+            ] {
+                let address: Ipv6Addr = address.parse().unwrap();
+                for offset in [8, 24] {
+                    let mut bad = bytes;
+                    bad[offset..offset + 16].copy_from_slice(&address.octets());
+                    assert!(
+                        parse_ipv6(&bad[..len], if offset == 24 { address } else { local })
+                            .is_none()
+                    );
+                    let mut transmit = v6_transmit(20);
+                    if offset == 8 {
+                        transmit.ip.source = address.into();
+                    } else {
+                        transmit.ip.destination = address.into();
+                    }
+                    assert!(build_frame(&mut bad, transmit, 0).is_err());
+                }
+            }
+            let local_ip = IpAddr::V6(local);
+            assert!(checked_peer("[2001:db8::1]:8080", local_ip).is_ok());
+            for peer in [
+                "192.0.2.1:8080",
+                "[2001:db8::1]:0",
+                "[2001:db8::1%2]:8080",
+                "[fe80::1]:8080",
+                "[ff02::1]:8080",
+                "invalid",
+            ] {
+                assert!(checked_peer(peer, local_ip).is_err());
+            }
+            assert!(checked_peer("[2001:db8::1]:8080", "192.0.2.2".parse().unwrap()).is_err());
+            let policy = tun_v6_policy(local);
+            assert!(policy(AddressValidation::Bind {
+                local: local.into()
+            }));
+            assert!(!policy(AddressValidation::Bind {
+                local: "2001:db8::3".parse().unwrap()
+            }));
+            assert!(!policy(AddressValidation::Incoming {
+                source: "192.0.2.1".parse().unwrap(),
+                destination: local.into()
+            }));
+            for payload in [1, 20, MTU - IPV6_HEADER] {
+                let len = build_frame(&mut bytes, v6_transmit(payload), 0).unwrap();
+                assert_eq!(len, IPV6_HEADER + payload);
+                assert_eq!(parse_ipv6(&bytes[..len], local).unwrap().2.len(), payload);
+            }
+            let before = bytes;
+            for payload in [0, MTU - IPV6_HEADER + 1, usize::MAX] {
+                assert!(build_frame(&mut bytes, v6_transmit(payload), 0).is_err());
+                assert_eq!(bytes, before);
+            }
+            assert!(build_frame(&mut bytes[..59], v6_transmit(20), 0).is_err());
+            for (dscp, ecn, hop) in [(64, 0, 64), (0, 4, 64), (0, 0, 0)] {
+                let mut transmit = v6_transmit(20);
+                transmit.dscp = dscp;
+                transmit.ecn = ecn;
+                transmit.hop_limit = hop;
+                assert!(build_frame(&mut bytes, transmit, 0).is_err());
+            }
+            let mut transmit = v6_transmit(20);
+            transmit.ip.destination = "192.0.2.2".parse().unwrap();
+            assert!(build_frame(&mut bytes, transmit, 0).is_err());
+            transmit = v6_transmit(20);
+            transmit.ipv4_options.record_route_slots = Some(1);
+            assert!(build_frame(&mut bytes, transmit, 0).is_err());
+            let (v4, len, _) = packet();
+            assert!(parse_ipv6(&v4[..len], local).is_none());
+            assert!(parse_ipv4(&bytes[..60], Ipv4Addr::new(192, 0, 2, 2)).is_none());
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc3168#section-5
+        //= type=test
+        //= reason=Two actual IPv6 Endpoints negotiate ECN through the runtime base-header encoder/input dispatch, transmit ECT data, receive CE Traffic Class, emit ECE feedback and then CWR data. This is privilege-free adapter evidence, not a live kernel TUN/routing test.
+        //# Bits 6 and 7 in the IPv4 TOS octet are designated as the ECN field. The IPv4 TOS octet corresponds to the Traffic Class octet in IPv6, and the ECN field is defined identically in both cases.
+        #[test]
+        fn ipv6_framed_handshake_and_ecn_feedback() {
+            fn transfer(
+                from: &mut Endpoint,
+                to: &mut Endpoint,
+                local: IpAddr,
+                time: u64,
+                mark_ce: bool,
+            ) -> Vec<(u8, u8, usize)> {
+                let mut bytes = [0; MTU];
+                let mut observed = Vec::new();
+                for _ in 0..BUDGET {
+                    // Same pre-commit header reservation as the TUN runtime.
+                    let polled = from
+                        .poll_transmit(time, &mut bytes[IPV6_HEADER..], 1)
+                        .unwrap();
+                    if let Some(transmit) = polled.packet {
+                        let len = build_frame(&mut bytes, transmit, 0).unwrap();
+                        let IpAddr::V6(local_v6) = local else {
+                            panic!("wrong family")
+                        };
+                        let (ip, class, tcp) = parse_ipv6(&bytes[..len], local_v6).unwrap();
+                        let segment = ntcp::wire::parse(ip, tcp).unwrap();
+                        assert_eq!(class >> 2, 37);
+                        assert_eq!(bytes[7], 64);
+                        observed.push((segment.header.flags, class & 3, segment.payload.len()));
+                        if mark_ce && !segment.payload.is_empty() {
+                            assert_eq!(class & 3, 2, "negotiated data must be ECT(0)");
+                            bytes[1] = (bytes[1] & 0xcf) | 0x30;
+                        }
+                        input_frame(to, time, &bytes[..len], local, false, 0).unwrap();
+                    }
+                    if !polled.more_work {
+                        return observed;
+                    }
+                }
+                panic!("IPv6 framed transfer exceeded bounded work budget");
+            }
+            let a: Ipv6Addr = "2001:db8::1".parse().unwrap();
+            let b: Ipv6Addr = "2001:db8::2".parse().unwrap();
+            let mut cfg = EndpointConfig {
+                dscp: 37,
+                ..EndpointConfig::default()
+            };
+            cfg.connection.nagle = false;
+            cfg.connection.mss = (MTU - IPV6_HEADER - 20) as u16;
+            cfg.connection.receive_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
+            cfg.connection.send_ip_payload_limit = (MTU - IPV6_HEADER) as u16;
+            let mut client = Endpoint::new(cfg.clone(), [1; 32], 0, tun_v6_policy(a)).unwrap();
+            let mut server = Endpoint::new(cfg, [2; 32], 0, tun_v6_policy(b)).unwrap();
+            let local = SocketAddr::new(a.into(), 1234);
+            let remote = SocketAddr::new(b.into(), 8080);
+            let listener = server.listen(remote, 1).unwrap();
+            let id = client.connect(0, local, remote).unwrap();
+            let syn = transfer(&mut client, &mut server, b.into(), 0, false);
+            assert_eq!(syn.len(), 1);
+            assert_eq!(
+                syn[0],
+                (ntcp::wire::SYN | ntcp::wire::ECE | ntcp::wire::CWR, 0, 0)
+            );
+            let synack = transfer(&mut server, &mut client, a.into(), 0, false);
+            assert_eq!(synack.len(), 1);
+            assert_eq!(
+                synack[0],
+                (ntcp::wire::SYN | ntcp::wire::ACK | ntcp::wire::ECE, 0, 0)
+            );
+            transfer(&mut client, &mut server, b.into(), 0, false);
+            let accepted = server.accept(listener).unwrap();
+            assert_eq!(client.state(id).unwrap(), State::Established);
+            assert_eq!(server.state(accepted).unwrap(), State::Established);
+            client.write(id, b"CE-marked data").unwrap();
+            let data = transfer(&mut client, &mut server, b.into(), 1, true);
+            assert!(data.iter().any(|&(_, ecn, len)| ecn == 2 && len == 14));
+            server.on_timeout(300_000, BUDGET).unwrap();
+            let feedback = transfer(&mut server, &mut client, a.into(), 300_000, false);
+            assert!(
+                feedback
+                    .iter()
+                    .any(|&(flags, ecn, len)| flags & ntcp::wire::ECE != 0 && ecn == 0 && len == 0)
+            );
+            let mut received = [0; 32];
+            let count = server.read(accepted, &mut received).unwrap();
+            assert_eq!(&received[..count], b"CE-marked data");
+            client.write(id, b"after feedback").unwrap();
+            let cwr = transfer(&mut client, &mut server, b.into(), 300_001, false);
+            assert!(
+                cwr.iter()
+                    .any(|&(flags, ecn, len)| flags & ntcp::wire::CWR != 0 && ecn == 2 && len > 0)
+            );
         }
 
         fn test_policy(local: Ipv4Addr) -> impl Fn(AddressValidation) -> bool {
@@ -1134,7 +1594,7 @@ mod linux {
         #[test]
         //= https://www.rfc-editor.org/rfc/rfc3168#section-5
         //= type=test
-        //= reason=IPv4 adapter ECN/DSCP/checksum/DF matrix is asserted. The example has no IPv6 packet encoder/parser: core IpMetadata support alone cannot prove IPv6 Traffic Class plumbing. Full IPv6 adapter implementation and end-to-end evidence are outside this bounded TCP ECN fix; mandatory obligation remains open, not waived.
+        //= reason=IPv4 ECN/DSCP/checksum/DF matrix complements the IPv6 direct-TCP base-header matrix and two-Endpoint framed ECN feedback test.
         //# Bits 6 and 7 in the IPv4 TOS octet are designated as the ECN field. The IPv4 TOS octet corresponds to the Traffic Class octet in IPv6, and the ECN field is defined identically in both cases.
         // Actor/condition: IP adapter; IPv4 and IPv6 traffic class encoding.
         //= https://www.rfc-editor.org/rfc/rfc3168#section-5.3
