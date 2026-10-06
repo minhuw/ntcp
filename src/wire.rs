@@ -111,6 +111,29 @@ pub fn checksum(ip: IpMetadata, segment: &[u8]) -> Result<u16, WireError> {
 //# There is no guarantee that senders will use this option, so receivers MUST
 //# be prepared to process options even if they do not begin on a word
 //# boundary (MUST-64).
+//= https://www.rfc-editor.org/rfc/rfc2018#section-2
+//= reason=Kind 4 accepts exactly length 2; malformed lengths/truncation are rejected. SYN authorization is separately cited.
+//# This two-byte option may be sent in a SYN by a TCP that has been extended to
+//# receive (and presumably process) the SACK option once the connection has
+//# opened.
+//= https://www.rfc-editor.org/rfc/rfc2018#section-3
+//= reason=Codec decodes two full-width big-endian u32 edges per block and preserves wire order, including wrapping values.
+//# Each contiguous block of data queued at the data receiver is defined in the
+//# SACK option by two 32-bit unsigned integers in network byte order:
+//= https://www.rfc-editor.org/rfc/rfc2018#section-3
+//= reason=Parser accepts lengths 10/18/26/34; encoder 40-byte option cap admits 3 with padded timestamps and rejects 4.
+//# A SACK option that specifies n blocks will have a length of 8*n+2 bytes, so
+//# the 40 bytes available for TCP options can specify a maximum of 4 blocks. It
+//# is expected that SACK will often be used in conjunction with the Timestamp
+//# option used for RTTM [Jacobson92], which takes an additional 10 bytes (plus
+//# two bytes of padding); thus a maximum of 3 SACK blocks will be allowed in
+//# this case.
+//= https://www.rfc-editor.org/rfc/rfc2018#section-2
+//= reason=Wire codec recognizes the specified option kind; tests parse literal raw kind bytes and round-trip them.
+//# Kind: 4
+//= https://www.rfc-editor.org/rfc/rfc2018#section-3
+//= reason=Wire codec recognizes the specified option kind; tests parse literal raw kind bytes and round-trip them.
+//# Kind: 5
 fn read_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> {
     let mut options = Options::default();
     while let Some(&kind) = bytes.first() {
@@ -245,6 +268,9 @@ pub fn parse(ip: IpMetadata, bytes: &[u8]) -> Result<Segment<'_>, WireError> {
     })
 }
 
+//= https://www.rfc-editor.org/rfc/rfc2018#section-2
+//= reason=Output rejects kind 4 without SYN; parsing remains flag-independent.
+//# It MUST NOT be sent on non-SYN segments.
 pub fn encode(
     ip: IpMetadata,
     header: Header,
@@ -754,6 +780,24 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-3
+    //= type=test
+    //= reason=Codec decodes two full-width big-endian u32 edges per block and preserves wire order, including wrapping values.
+    //# Each contiguous block of data queued at the data receiver is defined in the
+    //# SACK option by two 32-bit unsigned integers in network byte order:
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-3
+    //= type=test
+    //= reason=One through four blocks retain full edges across alignment offsets, IPv4/IPv6 and independent checksum checks.
+    //# A SACK option that specifies n blocks will have a length of 8*n+2 bytes, so
+    //# the 40 bytes available for TCP options can specify a maximum of 4 blocks. It
+    //# is expected that SACK will often be used in conjunction with the Timestamp
+    //# option used for RTTM [Jacobson92], which takes an additional 10 bytes (plus
+    //# two bytes of padding); thus a maximum of 3 SACK blocks will be allowed in
+    //# this case.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-3
+    //= type=test
+    //= reason=Wire codec recognizes the specified option kind; tests parse literal raw kind bytes and round-trip them.
+    //# Kind: 5
     fn sack_round_trip_preserves_full_edges_and_dsack_order() {
         // First block below the cumulative ACK is deliberately left first (DSACK).
         let blocks = [
@@ -799,6 +843,14 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-2
+    //= type=test
+    //= reason=Output rejects kind 4 without SYN; parsing remains flag-independent.
+    //# It MUST NOT be sent on non-SYN segments.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-2
+    //= type=test
+    //= reason=Wire codec recognizes the specified option kind; tests parse literal raw kind bytes and round-trip them.
+    //# Kind: 4
     fn sack_permitted_syn_only_on_output_and_idempotent() {
         let raw = [4, 2, 4, 2];
         for ip in ips() {
@@ -819,6 +871,12 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-2
+    //= type=test
+    //= reason=Kind 4 accepts exactly length 2; malformed lengths/truncation are rejected. SYN authorization is separately cited.
+    //# This two-byte option may be sent in a SYN by a TCP that has been extended to
+    //# receive (and presumably process) the SACK option once the connection has
+    //# opened.
     fn sack_malformed_lengths_truncation_and_repeated_option() {
         let ip = ips()[0];
         let mut malformed = vec![
@@ -872,6 +930,15 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-3
+    //= type=test
+    //= reason=Parser accepts lengths 10/18/26/34; encoder 40-byte option cap admits 3 with padded timestamps and rejects 4.
+    //# A SACK option that specifies n blocks will have a length of 8*n+2 bytes, so
+    //# the 40 bytes available for TCP options can specify a maximum of 4 blocks. It
+    //# is expected that SACK will often be used in conjunction with the Timestamp
+    //# option used for RTTM [Jacobson92], which takes an additional 10 bytes (plus
+    //# two bytes of padding); thus a maximum of 3 SACK blocks will be allowed in
+    //# this case.
     fn sack_timestamp_option_budget() {
         let ip = ips()[0];
         for count in 1..=4 {

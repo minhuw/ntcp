@@ -1,0 +1,257 @@
+# Behavioral rules and governing pseudocode not captured by BCP14 extraction.
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.2"
+reason = "The optional single-segment delayed-ACK inflation is not selected: schedule_tlp uses 2*SRTT capped by RTO. RFC 8985 explicitly permits this choice with MAY. The separate absent-SRTT scheduling and section 9.4 delayed-ACK mitigation gaps remain tracked."
+quote = '''
+Third, when the FlightSize is one segment, the sender MAY inflate the
+PTO by TLP.max_ack_delay to accommodate a potentially delayed
+acknowledgment and reduce the risk of spurious retransmissions.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-4"
+quote = '''
+TLP requires RACK.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.1"
+quote = '''
+Upon transmitting a new segment or retransmitting an old segment,
+record the time in Segment.xmit_ts and set Segment.lost to FALSE.
+Upon retransmitting a segment, set Segment.retransmitted to TRUE.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.2"
+quote = '''
+Use the RTT measurements obtained via [RFC6298] or [RFC7323] to
+update the estimated minimum RTT in RACK.min_RTT.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-5.1"
+quote = '''
+Denotes the time when the full sequence range of RACK.segment was
+selectively or cumulatively acknowledged.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.2"
+quote = '''
+Given the information provided in an ACK, each segment
+cumulatively ACKed or SACKed is marked as delivered in the
+scoreboard.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.2"
+quote = '''
+To avoid spurious inferences, ignore a segment as invalid if any of
+its sequence range has been retransmitted before and if either of two
+conditions is true:
+
+1.  The Timestamp Echo Reply field (TSecr) of the ACK's timestamp
+option [RFC7323], if available, indicates the ACK was not
+acknowledging the last retransmission of the segment.
+
+2.  The segment was last retransmitted less than RACK.min_rtt ago.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.2"
+quote = '''
+Among all the segments newly ACKed or SACKed by this ACK that pass
+the checks above, update the RACK.rtt to be the RTT sample calculated
+using this ACK.  Furthermore, record the most recent Segment.xmit_ts
+in RACK.xmit_ts if it is ahead of RACK.xmit_ts.  If Segment.xmit_ts
+equals RACK.xmit_ts (e.g., due to clock granularity limits), then
+compare Segment.end_seq and RACK.end_seq to break the tie when
+deciding whether to update the RACK.segment's associated state.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.2"
+quote = '''
+If a never-retransmitted segment
+that's below RACK.fack is (selectively or cumulatively) acknowledged,
+it has been delivered out of order.  The sender sets
+RACK.reordering_seen to TRUE if such a segment is identified.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.2"
+quote = '''
+Otherwise, if some reordering has been observed, then RACK does not
+trigger fast recovery based on DupThresh.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.2"
+quote = '''
+If RACK.dsack_round is not None AND
+SND.UNA >= RACK.dsack_round:
+RACK.dsack_round = None
+/* Grow the reordering window per round that sees DSACK.
+Reset the window after 16 DSACK-free recoveries */
+If RACK.dsack_round is None AND
+any DSACK option is present on latest received ACK:
+RACK.dsack_round = SND.NXT
+RACK.reo_wnd_mult += 1
+RACK.reo_wnd_persist = 16
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.2"
+quote = '''
+Else if exiting Fast or RTO recovery:
+RACK.reo_wnd_persist -= 1
+If RACK.reo_wnd_persist <= 0:
+RACK.reo_wnd_mult = 1
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.2"
+quote = '''
+RACK_detect_loss():
+timeout = 0
+RACK.reo_wnd = RACK_update_reo_wnd()
+For each segment, Segment, not acknowledged yet:
+If RACK_sent_after(RACK.xmit_ts, RACK.end_seq,
+Segment.xmit_ts, Segment.end_seq):
+remaining = Segment.xmit_ts + RACK.rtt +
+RACK.reo_wnd - Now()
+If remaining <= 0:
+Segment.lost = TRUE
+Segment.xmit_ts = INFINITE_TS
+Else:
+timeout = max(remaining, timeout)
+Return timeout
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.2"
+quote = '''
+When an ACK
+is received or the RACK reordering timer expires, call
+RACK_detect_loss_and_arm_timer().
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.3"
+quote = '''
+Upon RTO timer expiration, RACK marks the first outstanding segment
+as lost (since it was sent an RTO ago); for all the other segments,
+RACK only marks the segment as lost if the time elapsed since the
+segment was transmitted is at least the sum of the recent RTT and the
+reordering window.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.1"
+quote = '''
+Reset TLP.is_retrans and TLP.end_seq when initiating a connection,
+fast recovery, or RTO recovery.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.2"
+quote = '''
+TLP_calc_PTO():
+If SRTT is available:
+PTO = 2 * SRTT
+If FlightSize is one segment:
+PTO += TLP.max_ack_delay
+Else:
+PTO = 1 sec
+
+If Now() + PTO > TCP_RTO_expiration():
+PTO = TCP_RTO_expiration() - Now()
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.3"
+quote = '''
+First, there is no other previous loss probe still in flight.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.3"
+quote = '''
+Second, the sender has obtained an RTT measurement since the last
+loss probe transmission or the start of the connection, whichever
+was later.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.4.1"
+quote = '''
+More specifically, RACK_detect_loss() (Step 5) would mark those
+earlier segments as lost.  Then the sender would trigger a fast
+recovery to recover those losses.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.4.2"
+quote = '''
+TLP_process_ack(ACK):
+If TLP.end_seq is not None AND ACK's ack. number >= TLP.end_seq:
+If not TLP.is_retrans:
+TLP.end_seq = None    /* TLP of new data delivered */
+Else if ACK has a DSACK option matching TLP.end_seq:
+TLP.end_seq = None    /* Case 1, above */
+Else If ACK's ack. number > TLP.end_seq:
+TLP.end_seq = None    /* Repaired the single loss */
+(Invoke congestion control to react to
+the loss event the probe has repaired)
+Else If ACK is a DupAck without any SACK option:
+TLP.end_seq = None     /* Case 2, above */
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-8"
+quote = '''
+The RACK reordering timer, the TLP PTO timer, the RTO, and Zero
+Window Probe (ZWP) timer [RFC793] are mutually exclusive and are used
+in different scenarios.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-9.3"
+quote = '''
+The only exception -- the only way in which RACK-TLP modulates the
+congestion control algorithm -- is that one outstanding loss probe
+can be sent even if the congestion window is fully used.  However,
+this temporary overcommit is accounted for and credited in the in-
+flight data tracked for congestion control, so that congestion
+control will erase the overcommit upon the next ACK.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-9.4"
+quote = '''
+To mitigate this
+complication, before sending a TLP loss probe retransmission, the
+sender should attempt to wait long enough that the receiver has sent
+any delayed ACKs that it is withholding.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-9.3"
+quote = '''
+If multiple original transmissions or retransmissions were lost in a
+window, the congestion control specified in [RFC5681] only reacts
+once per window.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.2"
+quote = '''
+If RACK.reordering_seen is FALSE:
+If in Fast or RTO recovery:
+Return 0
+Else if RACK.segs_sacked >= DupThresh:
+Return 0
+Return min(RACK.reo_wnd_mult * RACK.min_RTT / 4, SRTT)
+'''

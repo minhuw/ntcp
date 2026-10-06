@@ -311,6 +311,17 @@ impl Congestion {
         false
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.4.2
+    //= reason=Loss/ECN/recovery epochs guard the congestion reduction for a repaired tail loss.
+    //# If the TLP
+    //# sender does not receive such an indication, then it MUST assume that
+    //# the original data segment, the TLP retransmission, or a corresponding
+    //# ACK was lost for congestion control purposes.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.4.2
+    //= reason=Reduces cwnd/threshold as a recovery event without retransmitting repaired bytes; shares prior ECN/loss reduction epoch.
+    //# The sender then
+    //# SHOULD invoke a congestion control response equivalent to a fast
+    //# recovery.
     pub(crate) fn on_tlp_repair(&mut self, ack: Seq, flight: u32, highest_sent: Seq) -> bool {
         if self.in_recovery()
             || self
@@ -338,6 +349,14 @@ impl Congestion {
         true
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= reason=Chooses the congestion target from flight, preserving shared ECN/TLP epochs. PRR entry and flight snapshot orchestration are caller-owned.
+    //# ssthresh = CongCtrlAlg()  // Target cwnd after recovery
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+    //= reason=Recovery/ECN/TLP epochs prevent repeated original-flight reductions; retransmission losses use a separate additional response.
+    //# If multiple original transmissions or retransmissions were lost in a
+    //# window, the congestion control specified in [RFC5681] only reacts
+    //# once per window.
     pub(crate) fn on_sack_recovery(&mut self, ack: Seq, flight: u32, highest_sent: Seq) -> bool {
         if self.sack_recovery
             || self.fast_recovery
@@ -376,6 +395,11 @@ impl Congestion {
         self.sack_recovery || self.fast_recovery
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+    //= reason=Additional loss response reduces threshold from bounded current cwnd/threshold rather than unchanged cumulative flight.
+    //# In the absence of PRR [RFC6937], when RACK-TLP detects a lost
+    //# retransmission, the congestion control MUST trigger an additional
+    //# congestion response per the aforementioned principle in [RFC5681].
     pub(crate) fn retransmission_lost(&mut self, flight: u32) {
         // A new loss of a retransmission is additional congestion, not another
         // reduction of the unchanged original cumulative flight. Exclude Reno
@@ -489,6 +513,18 @@ impl Congestion {
 }
 
 // RFC 6937 section 3, Conservative Reduction Bound (byte units).
+//= https://www.rfc-editor.org/rfc/rfc6937#section-1
+//= reason=Byte-unit CRB selection only; no SSRB implementation and no claim that initial credit satisfies strict packet conservation.
+//# We describe two slightly different Reduction Bound algorithms:
+//# Conservative Reduction Bound (CRB), which is strictly packet
+//# conserving; and a Slow Start Reduction Bound (SSRB), which is more
+//# aggressive than CRB by, at most, 1 segment per ACK.
+//= https://www.rfc-editor.org/rfc/rfc6937#section-8
+//= reason=Byte-unit CRB selection only; no SSRB implementation and no claim that initial credit satisfies strict packet conservation.
+//# Implementers that change PRR from counting bytes to segments have to
+//# be cautious about the effects of ACK splitting attacks [Savage99],
+//# where the receiver acknowledges partial segments for the purpose of
+//# confusing the sender's congestion accounting.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Prr {
     recover_fs: u32,
@@ -498,6 +534,18 @@ pub(crate) struct Prr {
 }
 
 impl Prr {
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= reason=Initializes byte counters and caller-supplied flight; initial MSS credit is a separate policy, not evidence of strict CRB entry conformance.
+    //# At the beginning of recovery, initialize PRR state.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= reason=Initializes byte counters and caller-supplied flight; initial MSS credit is a separate policy, not evidence of strict CRB entry conformance.
+    //# prr_delivered = 0         // Total bytes delivered during recovery
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= reason=Initializes byte counters and caller-supplied flight; initial MSS credit is a separate policy, not evidence of strict CRB entry conformance.
+    //# prr_out = 0               // Total bytes sent during recovery
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= reason=Initializes byte counters and caller-supplied flight; initial MSS credit is a separate policy, not evidence of strict CRB entry conformance.
+    //# RecoverFS = snd.nxt-snd.una // FlightSize at the start of recovery
     pub(crate) fn new(flight: u32, mss: u32) -> Self {
         Self {
             recover_fs: flight.max(1),
@@ -507,6 +555,29 @@ impl Prr {
         }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= reason=Byte-budget equations only, with nonnegative saturation and widened ceiling arithmetic. Caller supplies delivery, pipe and threshold; entry guarantee can override this bound.
+    //# if (pipe > ssthresh) {
+    //#    // Proportional Rate Reduction
+    //#    sndcnt = CEIL(prr_delivered * ssthresh / RecoverFS) - prr_out
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= reason=Byte-budget equations only, with nonnegative saturation and widened ceiling arithmetic. Caller supplies delivery, pipe and threshold; entry guarantee can override this bound.
+    //# if (conservative) {    // PRR-CRB
+    //#   limit = prr_delivered - prr_out
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= reason=Byte-budget equations only, with nonnegative saturation and widened ceiling arithmetic. Caller supplies delivery, pipe and threshold; entry guarantee can override this bound.
+    //# // Attempt to catch up, as permitted by limit
+    //# sndcnt = MIN(ssthresh - pipe, limit)
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3.1
+    //= reason=Byte-budget equations only, with nonnegative saturation and widened ceiling arithmetic. Caller supplies delivery, pipe and threshold; entry guarantee can override this bound.
+    //# Transmission is controlled
+    //# by the sending limit, which is set to prr_delivered - prr_out.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+    //= reason=PRR-CRB accounts newly delivered bytes and pipe against threshold; no claim of CRB/SSRB alternatives beyond implemented CRB.
+    //# The Proportional Rate
+    //# Reduction (PRR) algorithm [RFC6937] is RECOMMENDED for the specific
+    //# congestion control actions taken upon the losses detected by RACK-
+    //# TLP.
     pub(crate) fn acknowledge(&mut self, delivered: u32, pipe: u32, threshold: u32) {
         // Duplicate ACKs cannot add delivery, but must not revoke unspent
         // credit (including after failed output). Recompute the cumulative bound.
@@ -522,6 +593,8 @@ impl Prr {
         self.credit = allowed.saturating_sub(self.out).min(u64::from(u32::MAX)) as u32;
     }
 
+    // Entry policy, not an RFC 6937 CRB equation: this may permit out > delivered.
+    // The section 3/4 entry and conservation TODOs deliberately remain open.
     pub(crate) fn guarantee_initial(&mut self, mss: u32) {
         self.credit = self.credit.max(mss);
     }
@@ -530,6 +603,11 @@ impl Prr {
         self.credit
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= reason=Accounts actual bytes supplied by caller and consumes credit. Caller must enforce bytes <= credit and commit only after successful output; this helper does not enforce the sending bound.
+    //# On any data transmission or retransmission:
+    //#
+    //#    prr_out += (data sent) // strictly less than or equal to sndcnt
     pub(crate) fn sent(&mut self, bytes: u32) {
         self.out = self.out.saturating_add(u64::from(bytes));
         self.credit = self.credit.saturating_sub(bytes);
@@ -541,6 +619,22 @@ mod tests {
     use super::*;
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Checks proportional budget, CRB headroom, actual sent subtraction, duplicate ACK with no further credit, and timer-entry accounting; does not validate connection delivery epoch.
+    //# if (pipe > ssthresh) {
+    //#    // Proportional Rate Reduction
+    //#    sndcnt = CEIL(prr_delivered * ssthresh / RecoverFS) - prr_out
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Checks proportional budget, CRB headroom, actual sent subtraction, duplicate ACK with no further credit, and timer-entry accounting; does not validate connection delivery epoch.
+    //# if (conservative) {    // PRR-CRB
+    //#   limit = prr_delivered - prr_out
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Checks proportional budget, CRB headroom, actual sent subtraction, duplicate ACK with no further credit, and timer-entry accounting; does not validate connection delivery epoch.
+    //# // Attempt to catch up, as permitted by limit
+    //# sndcnt = MIN(ssthresh - pipe, limit)
     fn prr_crb_proportional_conservative_bound_and_no_duplicate_credit() {
         let mut prr = Prr::new(10_000, 1000);
         prr.acknowledge(3000, 7000, 5000);
@@ -573,6 +667,20 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-4
+    //= type=test
+    //= reason=Checks repeated zero-delivery updates retain unspent credit in both branches; delivery/out counters stay unchanged until successful sent. Helper simulation, not an application-stall integration test.
+    //# The missed opportunities to send
+    //# due to stalls are treated like banked voluntary window reductions;
+    //# specifically, they cause prr_delivered - prr_out to be significantly
+    //# positive.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Checks repeated zero-delivery updates retain unspent credit in both branches; delivery/out counters stay unchanged until successful sent. Helper simulation, not an application-stall integration test.
+    //# On every ACK during recovery compute:
+    //#
+    //#    DeliveredData = change_in(snd.una) + change_in(SACKd)
+    //#    prr_delivered += DeliveredData
     fn prr_duplicate_ack_preserves_banked_credit_without_minting_delivery() {
         for (pipe, expected) in [(7000, 1500), (3000, 2000)] {
             let mut prr = Prr::new(10_000, 1000);
@@ -596,6 +704,111 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Independent byte-budget vectors only; convergence tests the equation at delivered=RecoverFS, not connection exit. No network ACK-splitting proof.
+    //# if (pipe > ssthresh) {
+    //#    // Proportional Rate Reduction
+    //#    sndcnt = CEIL(prr_delivered * ssthresh / RecoverFS) - prr_out
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Independent byte-budget vectors only; convergence tests the equation at delivered=RecoverFS, not connection exit. No network ACK-splitting proof.
+    //# if (conservative) {    // PRR-CRB
+    //#   limit = prr_delivered - prr_out
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Independent byte-budget vectors only; convergence tests the equation at delivered=RecoverFS, not connection exit. No network ACK-splitting proof.
+    //# // Attempt to catch up, as permitted by limit
+    //# sndcnt = MIN(ssthresh - pipe, limit)
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Independent byte-budget vectors only; convergence tests the equation at delivered=RecoverFS, not connection exit. No network ACK-splitting proof.
+    //# On any data transmission or retransmission:
+    //#
+    //#    prr_out += (data sent) // strictly less than or equal to sndcnt
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-4
+    //= type=test
+    //= reason=Independent byte-budget vectors only; convergence tests the equation at delivered=RecoverFS, not connection exit. No network ACK-splitting proof.
+    //# If there are minimal losses, PRR will converge to exactly the target
+    //# window chosen by the congestion control algorithm.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-8
+    //= type=test
+    //= reason=Independent byte-budget vectors only; convergence tests the equation at delivered=RecoverFS, not connection exit. No network ACK-splitting proof.
+    //# Implementers that change PRR from counting bytes to segments have to
+    //# be cautious about the effects of ACK splitting attacks [Savage99],
+    //# where the receiver acknowledges partial segments for the purpose of
+    //# confusing the sender's congestion accounting.
+    fn prr_crb_equation_vectors_in_bytes() {
+        // Non-half thresholds, CEIL rounding, branch equality, banked delivery,
+        // partial-byte ACKs, overconsumption saturation and widened multiplication.
+        for (flight, threshold, pipe, delivered, out, expected) in [
+            (10_000, 7000, 8000, 1001, 0, 701),
+            (10_000, 7000, 8000, 1001, 700, 1),
+            (10_000, 7000, 7000, 1001, 0, 0),
+            (10_000, 7000, 6999, 1001, 0, 1),
+            (10_000, 7000, 3000, 3000, 1000, 2000),
+            (10_000, 7000, 6998, 3000, 1000, 2),
+            (10_000, 7000, 8000, 1, 0, 1),
+            (10_000, 7000, 8000, 1, 2, 0),
+            (10_000, 7000, 1000, 1, 2, 0),
+            (10_000, 7000, 8000, 10_000, 0, 7000),
+            (u32::MAX, u32::MAX - 1, u32::MAX, u32::MAX, 0, u32::MAX - 1),
+        ] {
+            let mut prr = Prr::new(flight, 1000);
+            prr.sent(out);
+            prr.acknowledge(delivered, pipe, threshold);
+            assert_eq!(prr.credit(), expected);
+            assert_eq!(prr.delivered, u64::from(delivered));
+            assert_eq!(prr.out, u64::from(out));
+            prr.sent(expected);
+            assert_eq!(prr.credit(), 0);
+            assert_eq!(prr.out, u64::from(out) + u64::from(expected));
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Characterizes zero counters, flight retention and initial-MSS override exceeding delivered bytes; explicitly exposes a strict-bound gap, not a passing conformance assertion.
+    //# At the beginning of recovery, initialize PRR state.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Characterizes zero counters, flight retention and initial-MSS override exceeding delivered bytes; explicitly exposes a strict-bound gap, not a passing conformance assertion.
+    //# prr_delivered = 0         // Total bytes delivered during recovery
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Characterizes zero counters, flight retention and initial-MSS override exceeding delivered bytes; explicitly exposes a strict-bound gap, not a passing conformance assertion.
+    //# prr_out = 0               // Total bytes sent during recovery
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Characterizes zero counters, flight retention and initial-MSS override exceeding delivered bytes; explicitly exposes a strict-bound gap, not a passing conformance assertion.
+    //# RecoverFS = snd.nxt-snd.una // FlightSize at the start of recovery
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-4
+    //= type=test
+    //= reason=Characterizes zero counters, flight retention and initial-MSS override exceeding delivered bytes; explicitly exposes a strict-bound gap, not a passing conformance assertion.
+    //# Under all conditions and sequences of events during recovery, PRR-CRB
+    //# strictly bounds the data transmitted to be equal to or less than the
+    //# amount of data delivered to the receiver.
+    fn prr_initial_state_and_guarantee_are_not_delivery() {
+        let mut prr = Prr::new(10_000, 1000);
+        assert_eq!((prr.recover_fs, prr.delivered, prr.out), (10_000, 0, 0));
+        assert_eq!(prr.credit(), 1000); // Characterize policy, not a CRB waiver.
+        prr.acknowledge(0, 3000, 5000);
+        assert_eq!(prr.credit(), 0);
+        prr.guarantee_initial(1000);
+        assert_eq!((prr.delivered, prr.out, prr.credit()), (0, 0, 1000));
+        prr.sent(1000);
+        assert_eq!((prr.delivered, prr.out, prr.credit()), (0, 1000, 0));
+        assert!(prr.out > prr.delivered); // Strict conservation is not established.
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+    //= type=test
+    //= reason=Checks additional reductions at fixed cumulative flight, including prior ECN.
+    //# In the absence of PRR [RFC6937], when RACK-TLP detects a lost
+    //# retransmission, the congestion control MUST trigger an additional
+    //# congestion response per the aforementioned principle in [RFC5681].
     fn rack_retransmission_loss_reduces_again_at_fixed_cumulative_flight() {
         for ecn in [false, true] {
             let mut c = Congestion::new(1000, RecoveryAlgorithm::NewReno, InitialWindow::Iw10);
@@ -701,6 +914,12 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.4.2
+    //= type=test
+    //= reason=Asserts sharing original-flight reduction and a separate reduction for a later flight.
+    //# The sender then
+    //# SHOULD invoke a congestion control response equivalent to a fast
+    //# recovery.
     fn tlp_reduction_epoch_shares_reduction_but_does_not_guard_recovery_entry() {
         for ecn in [false, true] {
             let mut c = Congestion::new(1000, RecoveryAlgorithm::NewReno, InitialWindow::Iw10);
@@ -820,6 +1039,10 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Congestion target selection only: asserts SACK entry threshold and shared ECN epoch; not PRR sending or entry conservation.
+    //# ssthresh = CongCtrlAlg()  // Target cwnd after recovery
     fn sack_entry_partial_and_full_ack() {
         for algorithm in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
             for base in [Seq(0), Seq(u32::MAX - 3_999)] {
@@ -906,6 +1129,10 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Congestion target selection only: asserts SACK entry threshold and shared ECN epoch; not PRR sending or entry conservation.
+    //# ssthresh = CongCtrlAlg()  // Target cwnd after recovery
     fn sack_ecn_epoch_shares_only_current_reduction() {
         for base in [Seq(0), Seq(u32::MAX - 3_999)] {
             let end = base.wrapping_add(16_000);

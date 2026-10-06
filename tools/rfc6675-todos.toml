@@ -1,0 +1,98 @@
+# Agent audit: exact RFC wording, whitespace reflow only. RFC 6675 algorithm
+# evidence applies to negotiated non-RACK/non-PRR SACK; RACK is audited separately.
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-4"
+reason = "Functions exist, but bounded Update discards advice on a 65th disjoint range; full arbitrary-range algorithm applicability is not established. See section-3 and Update TODOs. No exception for resource fallback."
+quote = '''
+For the purposes of the algorithm defined in this document, the scoreboard
+SHOULD implement the following functions:
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+reason = "Validated normal-profile ACKs call Update, but scoreboard overflow transitions to cumulative-only fallback and subsequent SACK ACKs do not update it before flight coverage. Preserve this bounded-domain algorithm gap rather than claiming every SACK ACK is handled by RFC 6675."
+quote = '''
+Upon the receipt of any ACK containing SACK information, the scoreboard MUST
+be updated via the Update () routine.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+reason = "Normal recovery ACK tests cover updating/pipe and boundary exit, but no non-RACK test preserves SACKed new bytes beyond RecoveryPoint on exit; see the specific retention TODO. The procedure also relies on bounded scoreboard applicability."
+quote = '''
+Once a TCP is in the loss recovery phase, the following procedure MUST be
+used for each arriving ACK:
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+reason = "No non-RACK connection test exits recovery with SACKed new bytes beyond the fixed RecoveryPoint and asserts those ranges survive, pipe is recomputed correctly and later recovery uses them. Add that boundary-crossing test; unit ACK-trim tests alone do not verify exit behavior."
+quote = '''
+Any information contained in the scoreboard for sequence numbers greater
+than the new value of HighACK SHOULD NOT be cleared when leaving the loss
+recovery phase.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-3"
+reason = "Scoreboard is bounded to 64 disjoint ranges; a 65th clears advice and Connection disables SACK inference until cumulative flight coverage. This conservative fallback avoids fabricated delivery, but does not mark all arbitrary ranges for RFC 6675 recovery. Add/profile capacity-limit applicability explicitly; no implementation waiver."
+quote = '''
+The algorithms presented here allow this, but require the ability to mark
+arbitrary sequence number ranges as having been selectively acknowledged.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-4"
+reason = "On 65th disjoint range Update clears all SACK information rather than marking each valid octet. Existing overflow test confirms bounded fallback, not full Update compliance; connection also suppresses subsequent inference until flight ACK. Track as algorithm-domain limitation, not green coverage."
+quote = '''
+Given the information provided in an ACK, each octet that is cumulatively
+ACKed or SACKed should be marked accordingly in the scoreboard data
+structure, and the total number of octets SACKed should be recorded.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+reason = "entry_pending chooses lowest unsacked hole, not necessarily HighACK+1 if peer SACK covers snd_una; accepted SACK ranges can begin at ACK. Add non-RACK connection test for a SACKed head and decide whether to reject such advisory range or retransmit head regardless. Existing entry test covers an unsacked head only. No production change in this audit."
+quote = '''
+(4.3) Retransmit the first data segment presumed dropped -- the segment
+starting with sequence number HighACK + 1. To prevent repeated
+retransmission of the same data or a premature rescue retransmission, set
+both HighRxt and RescueRxt to the highest sequence number in the
+retransmitted segment.
+'''
+
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-4"
+reason = "Connection passes packet_mss, not SMSS, to lowest_hole(..., true), which uses it for IsLost. Piggybacked SACK can reduce 128 to 116: 240 SACKed bytes then exceed 2*116 but not 2*128 and incorrectly promote a nonlost hole over unsent data. Full-SMSS helper/priority tests do not cover this integration gap. No production fix in this audit."
+quote = '''
+NextSeg () MUST return the sequence number range of the next segment that is
+to be transmitted, per the following rules:
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-4"
+reason = "Connection uses the output packet budget as the IsLost SMSS parameter via lowest_hole(..., true); reduced option budgets can fabricate a rule-(1) candidate. See NextSeg/rule (1.c) TODOs; ordinary full-SMSS-budget evidence is partial only."
+quote = '''
+(1) If there exists a smallest unSACKed sequence number 'S2' that meets the
+following three criteria for determining loss, the sequence range of one
+segment of up to SMSS octets starting with S2 MUST be returned.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-4"
+reason = "lowest_hole helper correctly applies its supplied SMSS, but Connection supplies packet_mss. With SMSS=128 and piggyback budget=116, 240 covered bytes incorrectly satisfy the byte-loss threshold and outrank unsent data. Preserve helper SMSS tests; separate loss-threshold SMSS from output clipping in a future runtime fix."
+quote = '''
+(1.c) IsLost (S2) returns true.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+reason = "Successful first limited-transmit output clears limited_pending instead of repeating SetPipe while credit remains. With flight=cwnd=512, SMSS=128 and SACK [128,384), pipe=256 leaves two SMSS credit but only one sends. Existing test covers one send per fresh-evidence ACK, not this loop. No production fix or waiver."
+quote = '''
+(3.3) If (cwnd - pipe) >= 1 SMSS, there exists previously unsent data, and
+the receiver's advertised window allows, transmit up to 1 SMSS of data
+starting with the octet HighData+1 and update HighData to reflect this
+transmission, then return to (3.2).
+'''

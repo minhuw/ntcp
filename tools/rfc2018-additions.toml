@@ -1,0 +1,143 @@
+# Agent audit: exact RFC wording, whitespace reflow only. RFC 6675 algorithm
+# evidence applies to negotiated non-RACK/non-PRR SACK; RACK is audited separately.
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-2"
+quote = '''
+This two-byte option may be sent in a SYN by a TCP that has been extended to
+receive (and presumably process) the SACK option once the connection has
+opened.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-3"
+quote = '''
+When missing segments are received, the data receiver acknowledges the data
+normally by advancing the left window edge in the Acknowledgement Number
+Field of the TCP header. The SACK option does not change the meaning of the
+Acknowledgement Number field.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-3"
+quote = '''
+This option contains a list of some of the blocks of contiguous sequence
+space occupied by data that has been received and queued within the window.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-3"
+quote = '''
+Each contiguous block of data queued at the data receiver is defined in the
+SACK option by two 32-bit unsigned integers in network byte order:
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-3"
+quote = '''
+This is the first sequence number of this block.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-3"
+quote = '''
+This is the sequence number immediately following the last sequence number
+of this block.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-3"
+quote = '''
+Each block represents received bytes of data that are contiguous and
+isolated; that is, the bytes just below the block, (Left Edge of Block - 1),
+and just above the block, (Right Edge of Block), have not been received.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-3"
+quote = '''
+A SACK option that specifies n blocks will have a length of 8*n+2 bytes, so
+the 40 bytes available for TCP options can specify a maximum of 4 blocks. It
+is expected that SACK will often be used in conjunction with the Timestamp
+option used for RTTM [Jacobson92], which takes an additional 10 bytes (plus
+two bytes of padding); thus a maximum of 3 SACK blocks will be allowed in
+this case.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-5"
+quote = '''
+After the SACKed bit is turned on (as the result of processing a received
+SACK option), the data sender will skip that segment during any later
+retransmission.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-5"
+quote = '''
+A segment will not be dequeued and its buffer freed until the left window
+edge is advanced over it.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-2"
+quote = '''
+Kind: 4
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-3"
+quote = '''
+Kind: 5
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-5"
+quote = '''
+When an acknowledgment segment arrives containing a SACK option, the data
+sender will turn on the SACKed bits for segments that have been selectively
+acknowledged. More specifically, for each block in the SACK option, the data
+sender will turn on the SACKed flags for all segments in the retransmission
+queue that are wholly contained within that block. This requires
+straightforward sequence number comparisons.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-5"
+quote = '''
+Any segment that has the SACKed bit turned off and is less than the highest
+SACKed segment is available for retransmission.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-8"
+reason = "RFC 2018 section 8 qualifies these receiver rules with \"The data receiver MAY elect not to keep data which it has reported in a SACK option. In this case\". ReceiveBuffer retains previously accepted/SACKed bytes; range-cap overflow rejects new bytes transactionally rather than reneging on a prior report (overflow_is_transactional_and_bridging_at_capacity_succeeds). This optional reneging algorithm is not selected. Overflow SACK omission remains a section-4 TODO, not excused here."
+quote = '''
+The data receiver MAY elect not to keep data which it has reported in a SACK
+option.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-8"
+reason = "RFC 2018 section 8 qualifies these receiver rules with \"The data receiver MAY elect not to keep data which it has reported in a SACK option. In this case\". ReceiveBuffer retains previously accepted/SACKed bytes; range-cap overflow rejects new bytes transactionally rather than reneging on a prior report (overflow_is_transactional_and_bridging_at_capacity_succeeds). This optional reneging algorithm is not selected. Overflow SACK omission remains a section-4 TODO, not excused here."
+quote = '''
+* The first SACK block MUST reflect the newest segment.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-8"
+reason = "RFC 2018 section 8 qualifies these receiver rules with \"The data receiver MAY elect not to keep data which it has reported in a SACK option. In this case\". ReceiveBuffer retains previously accepted/SACKed bytes; range-cap overflow rejects new bytes transactionally rather than reneging on a prior report (overflow_is_transactional_and_bridging_at_capacity_succeeds). This optional reneging algorithm is not selected. Overflow SACK omission remains a section-4 TODO, not excused here."
+quote = '''
+Even if the newest segment is going to be discarded and the receiver has
+already discarded adjacent segments, the first SACK block MUST report, at a
+minimum, the left and right edges of the newest segment.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc2018#section-8"
+reason = "RFC 2018 section 8 qualifies these receiver rules with \"The data receiver MAY elect not to keep data which it has reported in a SACK option. In this case\". ReceiveBuffer retains previously accepted/SACKed bytes; range-cap overflow rejects new bytes transactionally rather than reneging on a prior report (overflow_is_transactional_and_bridging_at_capacity_succeeds). This optional reneging algorithm is not selected. Overflow SACK omission remains a section-4 TODO, not excused here."
+quote = '''
+* Except for the newest segment, all SACK blocks MUST NOT report any old
+data which is no longer actually held by the receiver.
+'''
+

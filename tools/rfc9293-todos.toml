@@ -1,3 +1,32 @@
-# No unresolved tracked RFC 9293 TODOs in the current profile.
-# Source/test citations retain scoped evidence and embedding preconditions.
-# Verified erratum corrections remain in rfc9293-additions.toml.
+# Unresolved functional obligations; not implementation waivers.
+# Embedding contracts and verified erratum 8167 remain unchanged.
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4"
+feature = "BASE-013"
+reason = "shutdown only arms work in SYN-RECEIVED; transmit requires Established/CloseWait to create FIN. The no-SEND branch specified here has no corresponding transition. Review protocol/security policy before fixing; do not cite the deferred-close tests as satisfying this branch."
+quote = '''
+If no SENDs have been issued and there is no pending data to send, then form a
+FIN segment and send it, and enter FIN-WAIT-1 state; otherwise, queue for
+processing after entering ESTABLISHED state.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.5.2"
+feature = "BASE-044"
+reason = "No TIME-WAIT reservation is kept for locally generated ABORT/data-loss resets: terminal detaches the tuple and release can reclaim it after reset output. This conflicts with the recommendation here (while 3.10.5 describes immediate CLOSED). Parent must decide/document policy rather than claiming coverage of both."
+quote = '''
+The side of a connection issuing a reset should enter the TIME-WAIT state, as
+this generally helps to reduce the load on busy servers for reasons described
+in [70].
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.2"
+feature = "BASE-056"
+reason = "Endpoint lower_mss applies an embedding-supplied limit; neither a PMTUD ICMP/DF path nor a PLPMTUD discovery/probing engine is implemented here. The TUN example does not consume ICMP. Track the strongly recommended discovery mechanisms honestly; a packet-size-limit test does not demonstrate discovery."
+quote = '''
+Instead, implementation of Path MTU Discovery (PMTUD) and Packetization Layer
+Path MTU Discovery (PLPMTUD) is strongly recommended in order for TCP to
+improve segmentation decisions.
+'''

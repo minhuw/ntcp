@@ -39,6 +39,33 @@ impl Scoreboard {
         self.len = 0;
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5
+    //= reason=Within ordinary capacity (at most 64 disjoint ranges), valid in-flight ranges persist as a union, duplicates count once and cumulative ACK trims them. A 65th disjoint range clears advice; see RFC 2018 section-5 recording TODO.
+    //# When receiving an ACK containing a SACK option, the data sender SHOULD
+    //# record the selective acknowledgment for future reference.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-3
+    //= reason=Each Connection owns a Scoreboard; byte-range union persists across ACKs with exact new-byte count.
+    //# For a TCP sender to implement the algorithm defined in the next section, it
+    //# must keep a data structure to store incoming selective acknowledgment
+    //# information on a per connection basis. Such a data structure is commonly
+    //# called the "scoreboard".
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-3
+    //= reason=Unaligned byte ranges, adjacency, partial ACK trim and duplicates are supported, independent of segment boundaries.
+    //# The algorithms presented here allow this, but require the ability to mark
+    //# arbitrary sequence number ranges as having been selectively acknowledged.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Update trims ACKed bytes and unions SACKed ranges; total is represented by ranges and newly_sacked delta, not a separate stored scalar.
+    //# Given the information provided in an ACK, each octet that is cumulatively
+    //# ACKed or SACKed should be marked accordingly in the scoreboard data
+    //# structure, and the total number of octets SACKed should be recorded.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5
+    //= reason=RFC 2018 calls bit flags one possible implementation. Equivalent range union records every covered octet, including fully covered segments, without literal flag bits or a segment-alignment restriction.
+    //# When an acknowledgment segment arrives containing a SACK option, the data
+    //# sender will turn on the SACKed bits for segments that have been selectively
+    //# acknowledged. More specifically, for each block in the SACK option, the data
+    //# sender will turn on the SACKed flags for all segments in the retransmission
+    //# queue that are wholly contained within that block. This requires
+    //# straightforward sequence number comparisons.
     pub(crate) fn update(
         &mut self,
         ack: Seq,
@@ -142,6 +169,13 @@ impl Scoreboard {
         outcome
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Tests distinguish exactly 2*SMSS from greater, three distinct ranges from merged adjacency, and bytes strictly above SeqNum; reference oracle also covers wrapping edges.
+    //# This routine returns whether the given sequence number is considered to be
+    //# lost. The routine returns true when either DupThresh discontiguous SACKed
+    //# sequences have arrived above 'SeqNum' or more than (DupThresh - 1) * SMSS
+    //# bytes with sequence numbers greater than 'SeqNum' have been SACKed.
+    //# Otherwise, the routine returns false.
     pub(crate) fn is_lost(&self, seq: Seq, mss: u32) -> bool {
         if seq.distance_from(self.ack) >= HALF_SPACE {
             return false;
@@ -202,6 +236,12 @@ impl Scoreboard {
         })
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= reason=For a valid ledger, interval length minus unsacked_bytes gives the covered range union without requiring a stored SACKd scalar. PRR signed-delivery and entry-epoch gaps remain separate TODOs.
+    //# SACKd: The total number of bytes that the scoreboard indicates have
+    //# been delivered to the receiver.  This can be computed by scanning
+    //# the scoreboard and counting the total number of bytes covered by
+    //# all SACK blocks.  If SACK is not in use, SACKd is not defined.
     pub(crate) fn unsacked_bytes(&self, start: Seq, end: Seq) -> u32 {
         self.holes(start, end)
             .map(|(left, right)| right.distance_from(left))
@@ -209,6 +249,26 @@ impl Scoreboard {
     }
 
     // ponytail: bounded 65-by-64 range scans; cache suffix counts if profiling warrants it.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Exclusive edges translate RFC inclusive byte variables. Independent per-octet oracle checks both additive conditions, SACK exclusion, unaligned edges and wrapping sequence space.
+    //# This routine traverses the sequence space from HighACK to HighData and MUST
+    //# set the "pipe" variable to an estimate of the number of octets that are
+    //# currently in transit between the TCP sender and the TCP receiver.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=holes traverses only unsacked data and zero-initialized sum is compared against independent octet reference.
+    //# After initializing pipe to zero, the following steps are taken for each
+    //# octet 'S1' in the sequence space between HighACK and HighData that has not
+    //# been SACKed:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Not-lost original unsacked bytes count once in pipe; oracle asserts each byte contribution.
+    //# (a) If IsLost (S1) returns false: Pipe is incremented by 1 octet.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Exclusive high_rxt counts retransmitted unsacked bytes below it in addition to any original count; oracle includes high_rxt cutting a hole.
+    //# (b) If S1 <= HighRxt: Pipe is incremented by 1 octet.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Explicit 348/199/498 pipe expectations include double counted nonlost retransmitted bytes and exclude SACKed bytes.
+    //# Note that octets retransmitted without being considered lost are counted
+    //# twice by the above mechanism.
     pub(crate) fn pipe(&self, ack: Seq, high_data: Seq, high_rxt: Seq, mss: u32) -> u32 {
         let span = high_data.distance_from(ack);
         let retransmitted = if high_rxt.serial_cmp(ack) == Some(Ordering::Greater) {
@@ -228,6 +288,19 @@ impl Scoreboard {
         pipe
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Lowest-hole selection honors exclusive retransmit frontier, highest SACK edge and lost_only; tests assert partial hole start, bounded length and no candidate above highest SACK.
+    //# (1.a) S2 is greater than HighRxt.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Lowest-hole selection honors exclusive retransmit frontier, highest SACK edge and lost_only; tests assert partial hole start, bounded length and no candidate above highest SACK.
+    //# (1.b) S2 is less than the highest octet covered by any received SACK.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Lowest-hole selection honors exclusive retransmit frontier, highest SACK edge and lost_only; tests assert partial hole start, bounded length and no candidate above highest SACK.
+    //# (1.c) IsLost (S2) returns true.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5
+    //= reason=Equivalent byte-range implementation returns only unsacked holes below highest SACK; test excludes ranges at/above the final SACK edge.
+    //# Any segment that has the SACKed bit turned off and is less than the highest
+    //# SACKed segment is available for retransmission.
     pub(crate) fn lowest_hole(
         &self,
         after: Seq,
@@ -281,20 +354,100 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-8
+    //= type=test
+    //= reason=Owned storage/scoreboard check SACKs even the head, confirms exact retained payload, clears advice on RTO, and releases only explicit cumulative ACK bytes. Connection-level wire assertions remain separate.
+    //# Since the data receiver may later discard data reported in a SACK option,
+    //# the sender MUST NOT discard data before it is acknowledged by the
+    //# Acknowledgment Number field in the TCP header.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Owned storage/scoreboard check SACKs even the head, confirms exact retained payload, clears advice on RTO, and releases only explicit cumulative ACK bytes. Connection-level wire assertions remain separate.
+    //# Note: SACK information is advisory and therefore SACKed data MUST NOT be
+    //# removed from the TCP's retransmission buffer until the data is cumulatively
+    //# acknowledged [RFC2018].
+    fn sack_advice_keeps_send_storage_until_cumulative_ack() {
+        let mut send = crate::buffer::SendBuffer::new(16).unwrap();
+        assert_eq!(send.write(b"abcdefghijklmnop"), 16);
+        let mut s = Scoreboard::new();
+        assert_eq!(update(&mut s, 100, 116, &[(100, 116)]).newly_sacked, 16);
+        assert_eq!(s.pipe(Seq(100), Seq(116), Seq(100), 4), 0);
+        let mut out = [0; 16];
+        assert_eq!(send.copy(0, &mut out), 16);
+        assert_eq!(&out, b"abcdefghijklmnop");
+        s.clear(); // RTO makes even a previously SACKed head eligible again.
+        assert_eq!(s.pipe(Seq(100), Seq(116), Seq(100), 4), 16);
+        assert_eq!(
+            s.tail_hole(Seq(100), Seq(116), 16),
+            Some((Seq(100), Seq(116)))
+        );
+        assert_eq!(send.len(), 16);
+        send.acknowledge(7).unwrap();
+        update(&mut s, 107, 116, &[(110, 116)]);
+        assert_eq!(send.copy(0, &mut out), 9);
+        assert_eq!(&out[..9], b"hijklmnop");
+        send.acknowledge(9).unwrap();
+        assert_eq!(send.len(), 0);
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5
+    //= type=test
+    //= reason=Within ordinary capacity (at most 64 disjoint ranges), valid in-flight ranges persist as a union, duplicates count once and cumulative ACK trims them. A 65th disjoint range clears advice; see RFC 2018 section-5 recording TODO.
+    //# When receiving an ACK containing a SACK option, the data sender SHOULD
+    //# record the selective acknowledgment for future reference.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-3
+    //= type=test
+    //= reason=Each Connection owns a Scoreboard; byte-range union persists across ACKs with exact new-byte count.
+    //# For a TCP sender to implement the algorithm defined in the next section, it
+    //# must keep a data structure to store incoming selective acknowledgment
+    //# information on a per connection basis. Such a data structure is commonly
+    //# called the "scoreboard".
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-3
+    //= type=test
+    //= reason=Unaligned byte ranges, adjacency, partial ACK trim and duplicates are supported, independent of segment boundaries.
+    //# The algorithms presented here allow this, but require the ability to mark
+    //# arbitrary sequence number ranges as having been selectively acknowledged.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Update trims ACKed bytes and unions SACKed ranges; total is represented by ranges and newly_sacked delta, not a separate stored scalar.
+    //# Given the information provided in an ACK, each octet that is cumulatively
+    //# ACKed or SACKed should be marked accordingly in the scoreboard data
+    //# structure, and the total number of octets SACKed should be recorded.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5
+    //= type=test
+    //= reason=RFC 2018 calls bit flags one possible implementation. Equivalent range union records every covered octet, including fully covered segments, without literal flag bits or a segment-alignment restriction.
+    //# When an acknowledgment segment arrives containing a SACK option, the data
+    //# sender will turn on the SACKed bits for segments that have been selectively
+    //# acknowledged. More specifically, for each block in the SACK option, the data
+    //# sender will turn on the SACKed flags for all segments in the retransmission
+    //# queue that are wholly contained within that block. This requires
+    //# straightforward sequence number comparisons.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= type=test
+    //= reason=Asserts total covered bytes from the disjoint union, overlapping blocks, duplicate blocks and cumulative-ACK trimming; this is representation evidence rather than PRR delivery-epoch equivalence.
+    //# SACKd: The total number of bytes that the scoreboard indicates have
+    //# been delivered to the receiver.  This can be computed by scanning
+    //# the scoreboard and counting the total number of bytes covered by
+    //# all SACK blocks.  If SACK is not in use, SACKd is not defined.
     fn unaligned_union_adjacency_duplicates_and_ack_trim() {
         let mut s = Scoreboard::new();
         assert_eq!(
             update(&mut s, 10, 500, &[(111, 153), (33, 79)]).newly_sacked,
             88
         );
+        assert_eq!(490 - s.unsacked_bytes(Seq(10), Seq(500)), 88);
         assert_eq!(update(&mut s, 10, 500, &[(70, 120)]).newly_sacked, 32);
+        assert_eq!(490 - s.unsacked_bytes(Seq(10), Seq(500)), 120);
         assert_eq!(s.ranges[..s.len], [(Seq(33), Seq(153))]);
         assert_eq!(update(&mut s, 10, 500, &[(153, 177)]).newly_sacked, 24);
         assert_eq!(update(&mut s, 10, 500, &[(33, 177)]).newly_sacked, 0);
         assert_eq!(update(&mut s, 100, 500, &[]).newly_sacked, 0);
         assert_eq!(s.ranges[..s.len], [(Seq(100), Seq(177))]);
+        assert_eq!(400 - s.unsacked_bytes(Seq(100), Seq(500)), 77);
         update(&mut s, 177, 500, &[]);
         assert_eq!(s.len, 0);
+        assert_eq!(s.unsacked_bytes(Seq(177), Seq(500)), 323);
     }
 
     #[test]
@@ -370,6 +523,14 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Tests distinguish exactly 2*SMSS from greater, three distinct ranges from merged adjacency, and bytes strictly above SeqNum; reference oracle also covers wrapping edges.
+    //# This routine returns whether the given sequence number is considered to be
+    //# lost. The routine returns true when either DupThresh discontiguous SACKed
+    //# sequences have arrived above 'SeqNum' or more than (DupThresh - 1) * SMSS
+    //# bytes with sequence numbers greater than 'SeqNum' have been SACKed.
+    //# Otherwise, the routine returns false.
     fn loss_strict_two_mss_and_three_discontiguous_ranges() {
         let mut s = Scoreboard::new();
         update(&mut s, 0, 1000, &[(100, 300)]);
@@ -405,6 +566,28 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Explicit 348/199/498 pipe expectations include double counted nonlost retransmitted bytes and exclude SACKed bytes.
+    //# Note that octets retransmitted without being considered lost are counted
+    //# twice by the above mechanism.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Lowest-hole selection honors exclusive retransmit frontier, highest SACK edge and lost_only; tests assert partial hole start, bounded length and no candidate above highest SACK.
+    //# (1.a) S2 is greater than HighRxt.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Lowest-hole selection honors exclusive retransmit frontier, highest SACK edge and lost_only; tests assert partial hole start, bounded length and no candidate above highest SACK.
+    //# (1.b) S2 is less than the highest octet covered by any received SACK.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Lowest-hole selection honors exclusive retransmit frontier, highest SACK edge and lost_only; tests assert partial hole start, bounded length and no candidate above highest SACK.
+    //# (1.c) IsLost (S2) returns true.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5
+    //= type=test
+    //= reason=Equivalent byte-range implementation returns only unsacked holes below highest SACK; test excludes ranges at/above the final SACK edge.
+    //# Any segment that has the SACKed bit turned off and is less than the highest
+    //# SACKed segment is available for retransmission.
     fn pipe_counts_unsacked_only_and_splits_retransmission_at_loss_boundary() {
         let mut s = Scoreboard::new();
         update(&mut s, 0, 600, &[(100, 301), (401, 501)]);
@@ -505,6 +688,26 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Exclusive edges translate RFC inclusive byte variables. Independent per-octet oracle checks both additive conditions, SACK exclusion, unaligned edges and wrapping sequence space.
+    //# This routine traverses the sequence space from HighACK to HighData and MUST
+    //# set the "pipe" variable to an estimate of the number of octets that are
+    //# currently in transit between the TCP sender and the TCP receiver.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=holes traverses only unsacked data and zero-initialized sum is compared against independent octet reference.
+    //# After initializing pipe to zero, the following steps are taken for each
+    //# octet 'S1' in the sequence space between HighACK and HighData that has not
+    //# been SACKed:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Not-lost original unsacked bytes count once in pipe; oracle asserts each byte contribution.
+    //# (a) If IsLost (S1) returns false: Pipe is incremented by 1 octet.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Exclusive high_rxt counts retransmitted unsacked bytes below it in addition to any original count; oracle includes high_rxt cutting a hole.
+    //# (b) If S1 <= HighRxt: Pipe is incremented by 1 octet.
     fn interval_pipe_matches_byte_reference_at_unaligned_and_wrapping_edges() {
         for base in [0u32, u32::MAX - 170] {
             let seq = |offset| Seq(base).wrapping_add(offset);

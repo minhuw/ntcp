@@ -1,0 +1,281 @@
+# Agent audit: exact RFC wording, whitespace reflow only. RFC 6675 algorithm
+# evidence applies to negotiated non-RACK/non-PRR SACK; RACK is audited separately.
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-2"
+quote = '''
+"HighACK" is the sequence number of the highest byte of data that has been
+cumulatively ACKed at a given point.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-2"
+quote = '''
+"HighData" is the highest sequence number transmitted at a given point.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-2"
+quote = '''
+"HighRxt" is the highest sequence number which has been retransmitted during
+the current loss recovery phase.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-2"
+quote = '''
+"RescueRxt" is the highest sequence number which has been optimistically
+retransmitted to prevent stalling of the ACK clock when there is loss at the
+end of the window and no new data is available for transmission.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-2"
+quote = '''
+"Pipe" is a sender's estimate of the number of bytes outstanding in the
+network. This is used during recovery for limiting the sender's sending
+rate. The pipe variable allows TCP to use fundamentally different congestion
+control than the algorithm specified in [RFC5681]. The congestion control
+algorithm using the pipe estimate is often referred to as the "pipe
+algorithm".
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-2"
+quote = '''
+"DupAcks" is the number of duplicate acknowledgments received since the last
+cumulative acknowledgment.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-2"
+quote = '''
+For the purposes of this specification, we define a "duplicate
+acknowledgment" as a segment that arrives carrying a SACK block that
+identifies previously unacknowledged and un-SACKed octets between HighACK
+and HighData. Note that an ACK which carries new SACK data is counted as a
+duplicate acknowledgment under this definition even if it carries new data,
+changes the advertised window, or moves the cumulative acknowledgment point,
+which is different from the definition of duplicate acknowledgment in
+[RFC5681].
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-2"
+quote = '''
+Per [RFC5681], this threshold is defined to be 3 duplicate acknowledgments.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-3"
+quote = '''
+For a TCP sender to implement the algorithm defined in the next section, it
+must keep a data structure to store incoming selective acknowledgment
+information on a per connection basis. Such a data structure is commonly
+called the "scoreboard".
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-3"
+quote = '''
+The algorithms presented here allow this, but require the ability to mark
+arbitrary sequence number ranges as having been selectively acknowledged.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-4"
+quote = '''
+Given the information provided in an ACK, each octet that is cumulatively
+ACKed or SACKed should be marked accordingly in the scoreboard data
+structure, and the total number of octets SACKed should be recorded.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-4"
+quote = '''
+This routine returns whether the given sequence number is considered to be
+lost. The routine returns true when either DupThresh discontiguous SACKed
+sequences have arrived above 'SeqNum' or more than (DupThresh - 1) * SMSS
+bytes with sequence numbers greater than 'SeqNum' have been SACKed.
+Otherwise, the routine returns false.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-4"
+quote = '''
+After initializing pipe to zero, the following steps are taken for each
+octet 'S1' in the sequence space between HighACK and HighData that has not
+been SACKed:
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-4"
+quote = '''
+(a) If IsLost (S1) returns false: Pipe is incremented by 1 octet.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-4"
+quote = '''
+(b) If S1 <= HighRxt: Pipe is incremented by 1 octet.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-4"
+quote = '''
+Note that octets retransmitted without being considered lost are counted
+twice by the above mechanism.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-4"
+quote = '''
+(1.a) S2 is greater than HighRxt.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-4"
+quote = '''
+(1.b) S2 is less than the highest octet covered by any received SACK.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-4"
+quote = '''
+(1.c) IsLost (S2) returns true.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+quote = '''
+(1) If DupAcks >= DupThresh, go to step (4).
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+quote = '''
+(2) If DupAcks < DupThresh but IsLost (HighACK + 1) returns true --
+indicating at least three segments have arrived above the current cumulative
+acknowledgment point, which is taken to indicate loss -- go to step (4).
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+quote = '''
+(3.1) Set HighRxt to HighACK.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+quote = '''
+(3.2) Run SetPipe ().
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+quote = '''
+(3.3) If (cwnd - pipe) >= 1 SMSS, there exists previously unsent data, and
+the receiver's advertised window allows, transmit up to 1 SMSS of data
+starting with the octet HighData+1 and update HighData to reflect this
+transmission, then return to (3.2).
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+quote = '''
+(3.4) Terminate processing of this ACK.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+quote = '''
+(4.1) RecoveryPoint = HighData When the TCP sender receives a cumulative ACK
+for this data octet, the loss recovery phase is terminated.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+quote = '''
+(4.2) ssthresh = cwnd = (FlightSize / 2) The congestion window (cwnd) and
+slow start threshold (ssthresh) are reduced to half of FlightSize per
+[RFC5681]. Additionally, note that [RFC5681] requires that any segments sent
+as part of the Limited Transmit mechanism not be counted in FlightSize for
+the purpose of the above equation.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+quote = '''
+(4.3) Retransmit the first data segment presumed dropped -- the segment
+starting with sequence number HighACK + 1. To prevent repeated
+retransmission of the same data or a premature rescue retransmission, set
+both HighRxt and RescueRxt to the highest sequence number in the
+retransmitted segment.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+quote = '''
+(4.4) Run SetPipe () Set a "pipe" variable to the number of outstanding
+octets currently "in the pipe"; this is the data which has been sent by the
+TCP sender but for which no cumulative or selective acknowledgment has been
+received and the data has not been determined to have been dropped in the
+network. It is assumed that the data is still traversing the network path.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+quote = '''
+(4.5) In order to take advantage of potential additional available cwnd,
+proceed to step (C) below.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+quote = '''
+(B.1) Use Update () to record the new SACK information conveyed by the
+incoming ACK.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+quote = '''
+(B.2) Use SetPipe () to re-calculate the number of octets still in the
+network.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+quote = '''
+If NextSeg () returns failure (no data to send), return without sending
+anything (i.e., terminate steps C.1 -- C.5).
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+quote = '''
+(C.3) If any of the data octets sent in (C.1) are above HighData, HighData
+must be updated to reflect the transmission of previously unsent data.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+quote = '''
+(C.4) The estimate of the amount of data outstanding in the network must be
+updated by incrementing pipe by the number of octets transmitted in (C.1).
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5"
+quote = '''
+(C.5) If cwnd - pipe >= 1 SMSS, return to (C.1)
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6675#section-5.1"
+quote = '''
+The exact algorithm for this selection is not specified in this document
+(specifically NextSeg () is inappropriate during loss recovery after an
+RTO).
+'''
+

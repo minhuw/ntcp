@@ -83,6 +83,10 @@ impl Rack {
         self.fallback.is_none()
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= reason=Takes min of accepted samples; acknowledge contributes eligible non-retransmitted full-transmission samples.
+    //# Use the RTT measurements obtained via [RFC6298] or [RFC7323] to
+    //# update the estimated minimum RTT in RACK.min_RTT.
     pub(crate) fn sample(&mut self, rtt: u64) {
         // ponytail: lifetime minimum; a windowed min filter is needed for path migration.
         self.min_rtt = Some(self.min_rtt.map_or(rtt, |old| old.min(rtt)));
@@ -118,6 +122,16 @@ impl Rack {
 
     // Called only after encoding succeeds. Overflow disables time-based inference
     // until the entire incompletely represented flight is cumulatively ACKed.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-4
+    //= reason=Partial evidence: every represented committed transmission stores the caller microsecond timestamp, including retransmissions.
+    //# For each data segment sent, the sender MUST store its most recent
+    //# transmission time with a timestamp whose granularity is finer
+    //# than 1/4 of the minimum RTT of the connection.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.1
+    //= reason=Original commit stores timestamp and clear pending loss; retransmit changes timestamp, sets retransmitted, clears needs_retransmit. original_lost is historical diagnostic state, not Segment.lost.
+    //# Upon transmitting a new segment or retransmitting an old segment,
+    //# record the time in Segment.xmit_ts and set Segment.lost to FALSE.
+    //# Upon retransmitting a segment, set Segment.retransmitted to TRUE.
     pub(crate) fn transmit(&mut self, start: Seq, end: Seq, now: u64, retransmit: bool) {
         if let Some(boundary) = self.fallback {
             if after(end, boundary) {
@@ -177,6 +191,63 @@ impl Rack {
     // Scoreboard is authoritative. Split at its byte edges, never scan send-buffer bytes.
     // Return newly delivered bytes, counting SACK-to-cumulative transitions only once.
     #[allow(clippy::too_many_arguments)]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-3.3.2
+    //= reason=DSACK grows the multiplier at most once per cumulative flight boundary.
+    //# The RACK reordering window SHOULD adaptively increase (using the
+    //# algorithm in "Step 4: Update RACK reordering window" below) if
+    //# the sender receives a Duplicate Selective Acknowledgment (DSACK)
+    //# option [RFC2883].
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-4
+    //= reason=DSACK adaptation is implemented even though optional in section 4.
+    //# RACK DSACK-based reordering window adaptation is RECOMMENDED but
+    //# is not required.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-5.1
+    //= reason=Full transmission coverage is required for latest timestamp/RTT qualification; byte delivery accounting is separately one-shot.
+    //# Denotes the time when the full sequence range of RACK.segment was
+    //# selectively or cumulatively acknowledged.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= reason=Scoreboard byte coverage marks delivered/SACKed intervals, cumulative transitions do not double count delivery.
+    //# Given the information provided in an ACK, each segment
+    //# cumulatively ACKed or SACKed is marked as delivered in the
+    //# scoreboard.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= reason=Ambiguous original pieces cannot qualify; retransmitted range requires full coverage, RTT >= minimum and matching millisecond TSecr when timestamps negotiated. Equality check is stricter than merely rejecting old echoes.
+    //# To avoid spurious inferences, ignore a segment as invalid if any of
+    //# its sequence range has been retransmitted before and if either of two
+    //# conditions is true:
+    //#
+    //# 1.  The Timestamp Echo Reply field (TSecr) of the ACK's timestamp
+    //# option [RFC7323], if available, indicates the ACK was not
+    //# acknowledging the last retransmission of the segment.
+    //#
+    //# 2.  The segment was last retransmitted less than RACK.min_rtt ago.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= reason=Chooses most recently sent eligible full transmission for current ACK RTT; latest reference advances only by timestamp and serial end-sequence tie break.
+    //# Among all the segments newly ACKed or SACKed by this ACK that pass
+    //# the checks above, update the RACK.rtt to be the RTT sample calculated
+    //# using this ACK.  Furthermore, record the most recent Segment.xmit_ts
+    //# in RACK.xmit_ts if it is ahead of RACK.xmit_ts.  If Segment.xmit_ts
+    //# equals RACK.xmit_ts (e.g., due to clock granularity limits), then
+    //# compare Segment.end_seq and RACK.end_seq to break the tie when
+    //# deciding whether to update the RACK.segment's associated state.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= reason=Original non-retransmitted intervals acknowledged below fack set reordering_seen; retransmitted originals are excluded.
+    //# If a never-retransmitted segment
+    //# that's below RACK.fack is (selectively or cumulatively) acknowledged,
+    //# it has been delivered out of order.  The sender sets
+    //# RACK.reordering_seen to TRUE if such a segment is identified.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= reason=Cumulative ACK covers round boundary before a new DSACK can grow multiplier and reset 16-recovery persistence.
+    //# If RACK.dsack_round is not None AND
+    //# SND.UNA >= RACK.dsack_round:
+    //# RACK.dsack_round = None
+    //# /* Grow the reordering window per round that sees DSACK.
+    //# Reset the window after 16 DSACK-free recoveries */
+    //# If RACK.dsack_round is None AND
+    //# any DSACK option is present on latest received ACK:
+    //# RACK.dsack_round = SND.NXT
+    //# RACK.reo_wnd_mult += 1
+    //# RACK.reo_wnd_persist = 16
     pub(crate) fn acknowledge(
         &mut self,
         ack: Seq,
@@ -278,6 +349,12 @@ impl Rack {
         delivered
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= reason=Helper decrements persistence and resets multiplier on zero. Connection calls this at fast recovery exit only.
+    //# Else if exiting Fast or RTO recovery:
+    //# RACK.reo_wnd_persist -= 1
+    //# If RACK.reo_wnd_persist <= 0:
+    //# RACK.reo_wnd_mult = 1
     pub(crate) fn recovery_exit(&mut self) {
         self.persist = self.persist.saturating_sub(1);
         if self.persist == 0 {
@@ -285,6 +362,34 @@ impl Rack {
         }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-3.3.2
+    //= reason=Zero window without observed reordering in recovery or after three complete SACKed logical segments.
+    //# The reordering window SHOULD be set to zero if no reordering has
+    //# been observed on the connection so far, and either (a) three
+    //# segments have been SACKed since the last recovery or (b) the
+    //# sender is already in fast or RTO recovery.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-3.3.2
+    //= reason=Starts at min_RTT/4 with zero for missing estimates; SRTT bound applies.
+    //# Otherwise, the
+    //# reordering window SHOULD start from a small fraction of the
+    //# round-trip time or zero if no round-trip time estimate is
+    //# available.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-3.3.2
+    //= reason=Saturating multiplier result is capped at SRTT (zero if unavailable).
+    //# The RACK reordering window MUST be bounded, and this bound SHOULD
+    //# be SRTT.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= reason=Observed reordering preserves nonzero settling window regardless of complete SACK count/recovery.
+    //# Otherwise, if some reordering has been observed, then RACK does not
+    //# trigger fast recovery based on DupThresh.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= reason=Implements zeroing after three complete SACKed logical segments or in recovery only without observed reordering; otherwise multiplies integer min_RTT/4 and caps at SRTT. Missing estimates yield zero.
+    //# If RACK.reordering_seen is FALSE:
+    //# If in Fast or RTO recovery:
+    //# Return 0
+    //# Else if RACK.segs_sacked >= DupThresh:
+    //# Return 0
+    //# Return min(RACK.reo_wnd_mult * RACK.min_RTT / 4, SRTT)
     fn reo_window(&self, recovery: bool, srtt: Option<u64>) -> u64 {
         if !self.reordering_seen && (recovery || self.counts().sacked >= 3) {
             return 0;
@@ -296,6 +401,26 @@ impl Rack {
 
     // RFC 8985 §6.2: maximum remaining eligible interval, not minimum.
     // Return whether a retransmission itself was newly lost (new congestion).
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= reason=Computes maximum remaining eligible deadline so all eligible intervals have expired when serviced; loss marking is one-shot until retransmit.
+    //# For timely loss detection, it is RECOMMENDED that the
+    //# sender install a reordering timer.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= reason=Uses serial tie-break, RTT+window deadline and maximum remaining deadline. needs_retransmit excludes lost intervals from pipe/repeated detection, equivalent to invalid in-flight timestamp; stored timestamp retained for diagnostics.
+    //# RACK_detect_loss():
+    //# timeout = 0
+    //# RACK.reo_wnd = RACK_update_reo_wnd()
+    //# For each segment, Segment, not acknowledged yet:
+    //# If RACK_sent_after(RACK.xmit_ts, RACK.end_seq,
+    //# Segment.xmit_ts, Segment.end_seq):
+    //# remaining = Segment.xmit_ts + RACK.rtt +
+    //# RACK.reo_wnd - Now()
+    //# If remaining <= 0:
+    //# Segment.lost = TRUE
+    //# Segment.xmit_ts = INFINITE_TS
+    //# Else:
+    //# timeout = max(remaining, timeout)
+    //# Return timeout
     pub(crate) fn detect(&mut self, now: u64, recovery: bool, srtt: Option<u64>) -> bool {
         self.deadline = None;
         let window = self.reo_window(recovery, srtt);
@@ -319,6 +444,13 @@ impl Rack {
         retransmission_lost
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.3
+    //= reason=First unacknowledged interval is lost regardless of age, others only at recent RTT+window; clears SACK advice for possible reneging.
+    //# Upon RTO timer expiration, RACK marks the first outstanding segment
+    //# as lost (since it was sent an RTO ago); for all the other segments,
+    //# RACK only marks the segment as lost if the time elapsed since the
+    //# segment was transmitted is at least the sum of the recent RTT and the
+    //# reordering window.
     pub(crate) fn rto(&mut self, now: u64, ack: Seq, srtt: Option<u64>) {
         let window = self.reo_window(true, srtt);
         self.deadline = None;
@@ -344,6 +476,11 @@ impl Rack {
 
     // SACK splits are byte accounting, not packet boundaries. Include even the
     // SACKed pieces of the highest original segment (RFC 8985 section 7.3).
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= reason=Finds highest original segment, including its SACKed pieces; MSS may clip a suffix but never select an earlier packet.
+    //# If such an unsent segment is not available, then the sender SHOULD
+    //# retransmit the highest-sequence segment sent so far and set
+    //# TLP.is_retrans to true.
     pub(crate) fn tail_segment(&self, mss: u32) -> Option<(Seq, Seq)> {
         if !self.valid() {
             return None;
@@ -429,6 +566,12 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Checks partial SACK and tail probe credit, repeated SACK no credit, and RTO reneging reset.
+    //# Given the information provided in an ACK, each segment
+    //# cumulatively ACKed or SACKed is marked as delivered in the
+    //# scoreboard.
     fn partial_sack_delivery_is_one_shot_across_tail_probe_and_resets_at_rto() {
         for base in [Seq(0), Seq(u32::MAX - 1999)] {
             let seq = |n: u32| base.wrapping_add(n);
@@ -563,6 +706,18 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Retransmitting suffix marks untouched prefix ambiguous; immediate full SACK cannot create RTT/latest evidence.
+    //# To avoid spurious inferences, ignore a segment as invalid if any of
+    //# its sequence range has been retransmitted before and if either of two
+    //# conditions is true:
+    //#
+    //# 1.  The Timestamp Echo Reply field (TSecr) of the ACK's timestamp
+    //# option [RFC7323], if available, indicates the ACK was not
+    //# acknowledging the last retransmission of the segment.
+    //#
+    //# 2.  The segment was last retransmitted less than RACK.min_rtt ago.
     fn clipped_retransmit_makes_untouched_original_prefix_rtt_ambiguous() {
         for base in [Seq(0), Seq(u32::MAX - 499)] {
             let end = base.wrapping_add(1000);
@@ -594,6 +749,12 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= type=test
+    //= reason=Checks SACK split, partial cumulative ACK, MSS-clipped tail and sequence wrap.
+    //# If such an unsent segment is not available, then the sender SHOULD
+    //# retransmit the highest-sequence segment sent so far and set
+    //# TLP.is_retrans to true.
     fn tail_segment_retains_original_sack_boundaries_partial_ack_and_wrap() {
         for base in [Seq(1), Seq(u32::MAX - 499)] {
             let mut rack = Rack::new().unwrap();
@@ -672,6 +833,16 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Partial bytes cannot update minimum RTT; completing the transmission can.
+    //# Use the RTT measurements obtained via [RFC6298] or [RFC7323] to
+    //# update the estimated minimum RTT in RACK.min_RTT.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-5.1
+    //= type=test
+    //= reason=One-byte tail SACK does not advance RACK; completing the full original or retransmitted range does.
+    //# Denotes the time when the full sequence range of RACK.segment was
+    //# selectively or cumulatively acknowledged.
     fn partial_delivery_waits_for_complete_transmission_across_wrap() {
         for base in [0u32, u32::MAX - 1357] {
             let seq = |offset| base.wrapping_add(offset);
@@ -736,6 +907,44 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Asserts maximum deadline and timeout marking, then lost retransmission detection.
+    //# For timely loss detection, it is RECOMMENDED that the
+    //# sender install a reordering timer.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.2
+    //= type=test
+    //= reason=Detects loss of a retransmission and makes it selectable again.
+    //# Therefore, the algorithm [RFC6675]
+    //# MUST NOT be used with RACK-TLP; instead, a modified recovery
+    //# algorithm that carefully addresses such a case is needed.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Retransmitted eligible packet advances reference used for lost-retransmission detection.
+    //# Among all the segments newly ACKed or SACKed by this ACK that pass
+    //# the checks above, update the RACK.rtt to be the RTT sample calculated
+    //# using this ACK.  Furthermore, record the most recent Segment.xmit_ts
+    //# in RACK.xmit_ts if it is ahead of RACK.xmit_ts.  If Segment.xmit_ts
+    //# equals RACK.xmit_ts (e.g., due to clock granularity limits), then
+    //# compare Segment.end_seq and RACK.end_seq to break the tie when
+    //# deciding whether to update the RACK.segment's associated state.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Checks maximum remaining timer, original loss, retransmit reset and one-shot lost retransmission detection.
+    //# RACK_detect_loss():
+    //# timeout = 0
+    //# RACK.reo_wnd = RACK_update_reo_wnd()
+    //# For each segment, Segment, not acknowledged yet:
+    //# If RACK_sent_after(RACK.xmit_ts, RACK.end_seq,
+    //# Segment.xmit_ts, Segment.end_seq):
+    //# remaining = Segment.xmit_ts + RACK.rtt +
+    //# RACK.reo_wnd - Now()
+    //# If remaining <= 0:
+    //# Segment.lost = TRUE
+    //# Segment.xmit_ts = INFINITE_TS
+    //# Else:
+    //# timeout = max(remaining, timeout)
+    //# Return timeout
     fn maximum_timer_remaining_and_lost_retransmission() {
         let mut rack = Rack::new().unwrap();
         let mut scoreboard = Scoreboard::new();
@@ -800,6 +1009,14 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.3
+    //= type=test
+    //= reason=Asserts only first loss when another segment is recent and rejects early ACK of retransmission.
+    //# Upon RTO timer expiration, RACK marks the first outstanding segment
+    //# as lost (since it was sent an RTO ago); for all the other segments,
+    //# RACK only marks the segment as lost if the time elapsed since the
+    //# segment was transmitted is at least the sum of the recent RTT and the
+    //# reordering window.
     fn rto_marks_first_and_age_eligible_only_and_karn_rejects_early_retx_ack() {
         let mut rack = Rack::new().unwrap();
         let mut scoreboard = Scoreboard::new();
@@ -814,6 +1031,320 @@ mod tests {
         assert_eq!(rack.ack_sample, None);
         assert_eq!(rack.counts().lost, 0);
         assert_eq!(rack.lowest_lost(1000), None);
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-4
+    //= type=test
+    //= reason=Checks original/retransmission timestamp storage and retransmitted state, not physical clock granularity.
+    //# For each data segment sent, the sender MUST store its most recent
+    //# transmission time with a timestamp whose granularity is finer
+    //# than 1/4 of the minimum RTT of the connection.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= type=test
+    //= reason=Checks timestamp/lost flag reset for the shared transmit procedure.
+    //# The sender MUST follow the RACK transmission procedures in the "Upon
+    //# Transmitting a Data Segment" section upon sending either a
+    //# retransmission or a new data loss probe.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.1
+    //= type=test
+    //= reason=Asserts committed timestamps, retransmitted flag, pending-loss reset and pipe restoration.
+    //# Upon transmitting a new segment or retransmitting an old segment,
+    //# record the time in Segment.xmit_ts and set Segment.lost to FALSE.
+    //# Upon retransmitting a segment, set Segment.retransmitted to TRUE.
+    fn transmission_commit_updates_timestamp_and_clears_pending_loss() {
+        let mut rack = Rack::new().unwrap();
+        rack.transmit(Seq(0), Seq(1000), 10, false);
+        assert_eq!(rack.intervals[0].sent, 10);
+        assert!(!rack.intervals[0].retransmitted);
+        assert!(!rack.intervals[0].needs_retransmit);
+        rack.rto(20, Seq(0), None);
+        assert!(rack.intervals[0].needs_retransmit);
+        assert_eq!(rack.pipe(), 0);
+        rack.transmit(Seq(0), Seq(1000), 30, true);
+        assert_eq!(rack.intervals[0].sent, 30);
+        assert!(rack.intervals[0].retransmitted);
+        assert!(!rack.intervals[0].needs_retransmit);
+        assert_eq!(rack.pipe(), 1000);
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Separately rejects too-fast retransmission ACK and nonmatching old echo, accepts matching echo at min RTT without feeding ordinary estimator.
+    //# To avoid spurious inferences, ignore a segment as invalid if any of
+    //# its sequence range has been retransmitted before and if either of two
+    //# conditions is true:
+    //#
+    //# 1.  The Timestamp Echo Reply field (TSecr) of the ACK's timestamp
+    //# option [RFC7323], if available, indicates the ACK was not
+    //# acknowledging the last retransmission of the segment.
+    //#
+    //# 2.  The segment was last retransmitted less than RACK.min_rtt ago.
+    fn retransmitted_ack_requires_min_rtt_and_matching_timestamp() {
+        for (now, echo, valid) in [
+            (399_999, 300, false), // Matching echo, but below minimum RTT.
+            (400_000, 100, false), // Old original transmission echo.
+            (400_000, 300, true),
+        ] {
+            let mut rack = Rack::new().unwrap();
+            let scoreboard = Scoreboard::new();
+            rack.sample(100_000);
+            rack.transmit(Seq(0), Seq(1000), 100_000, false);
+            rack.transmit(Seq(0), Seq(1000), 300_000, true);
+            assert_eq!(
+                rack.acknowledge(
+                    Seq(1000),
+                    Seq(1000),
+                    &scoreboard,
+                    now,
+                    Some(echo),
+                    true,
+                    1000,
+                    false,
+                ),
+                1000
+            );
+            assert_eq!(rack.latest, valid.then_some((300_000, Seq(1000))));
+            assert_eq!(rack.ack_sample, None); // Karn exclusion, even when RACK qualifies.
+            assert_eq!(rack.min_rtt, Some(100_000));
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-3.3.2
+    //= type=test
+    //= reason=Checks unknown RTT, fractional window, three-SACK threshold and recovery zeroing; observed original reordering disables zeroing.
+    //# The reordering window SHOULD be set to zero if no reordering has
+    //# been observed on the connection so far, and either (a) three
+    //# segments have been SACKed since the last recovery or (b) the
+    //# sender is already in fast or RTO recovery.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-3.3.2
+    //= type=test
+    //= reason=Checks initial fractional and unavailable RTT windows.
+    //# Otherwise, the
+    //# reordering window SHOULD start from a small fraction of the
+    //# round-trip time or zero if no round-trip time estimate is
+    //# available.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Checks original reordered delivery versus retransmitted lower segment and its effect on window zeroing.
+    //# If a never-retransmitted segment
+    //# that's below RACK.fack is (selectively or cumulatively) acknowledged,
+    //# it has been delivered out of order.  The sender sets
+    //# RACK.reordering_seen to TRUE if such a segment is identified.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Checks a positive settling window remains after original reordering.
+    //# Otherwise, if some reordering has been observed, then RACK does not
+    //# trigger fast recovery based on DupThresh.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Checks initial and unknown windows, three-SACK zeroing, original reordering and recovery zeroing.
+    //# If RACK.reordering_seen is FALSE:
+    //# If in Fast or RTO recovery:
+    //# Return 0
+    //# Else if RACK.segs_sacked >= DupThresh:
+    //# Return 0
+    //# Return min(RACK.reo_wnd_mult * RACK.min_RTT / 4, SRTT)
+    fn original_reordering_and_zero_window_rules() {
+        let mut unknown = Rack::new().unwrap();
+        assert_eq!(unknown.reo_window(false, None), 0);
+        unknown.sample(100);
+        assert_eq!(unknown.reo_window(false, Some(100)), 25);
+        assert_eq!(unknown.reo_window(true, Some(100)), 0);
+        for retransmit in [false, true] {
+            let mut rack = Rack::new().unwrap();
+            let mut scoreboard = Scoreboard::new();
+            rack.sample(100);
+            for i in 0..4 {
+                rack.transmit(Seq(i * 1000), Seq((i + 1) * 1000), 0, false);
+            }
+            sack(&mut rack, &mut scoreboard, 0, 4000, 100, &[(1000, 4000)]);
+            assert_eq!(rack.counts().sacked, 3);
+            assert_eq!(rack.reo_window(false, Some(100)), 0);
+            if retransmit {
+                rack.transmit(Seq(0), Seq(1000), 110, true);
+            }
+            sack(&mut rack, &mut scoreboard, 1000, 4000, 210, &[]);
+            assert_eq!(rack.reordering_seen, !retransmit);
+            assert_eq!(
+                rack.reo_window(false, Some(100)),
+                if retransmit { 0 } else { 25 }
+            );
+            assert_eq!(
+                rack.reo_window(true, Some(100)),
+                if retransmit { 0 } else { 25 }
+            );
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Checks equal-timestamp tie ordering and wrap, preserving latest while later ACK of older transmission updates RTT.
+    //# Among all the segments newly ACKed or SACKed by this ACK that pass
+    //# the checks above, update the RACK.rtt to be the RTT sample calculated
+    //# using this ACK.  Furthermore, record the most recent Segment.xmit_ts
+    //# in RACK.xmit_ts if it is ahead of RACK.xmit_ts.  If Segment.xmit_ts
+    //# equals RACK.xmit_ts (e.g., due to clock granularity limits), then
+    //# compare Segment.end_seq and RACK.end_seq to break the tie when
+    //# deciding whether to update the RACK.segment's associated state.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Checks equal timestamp end-sequence ordering across wrap.
+    //# RACK_detect_loss():
+    //# timeout = 0
+    //# RACK.reo_wnd = RACK_update_reo_wnd()
+    //# For each segment, Segment, not acknowledged yet:
+    //# If RACK_sent_after(RACK.xmit_ts, RACK.end_seq,
+    //# Segment.xmit_ts, Segment.end_seq):
+    //# remaining = Segment.xmit_ts + RACK.rtt +
+    //# RACK.reo_wnd - Now()
+    //# If remaining <= 0:
+    //# Segment.lost = TRUE
+    //# Segment.xmit_ts = INFINITE_TS
+    //# Else:
+    //# timeout = max(remaining, timeout)
+    //# Return timeout
+    fn equal_timestamp_tie_breaks_in_serial_sequence_space() {
+        for base in [0u32, u32::MAX - 499] {
+            let seq = |n| Seq(base.wrapping_add(n));
+            let mut rack = Rack::new().unwrap();
+            let mut scoreboard = Scoreboard::new();
+            rack.transmit(seq(0), seq(1000), 10, false);
+            rack.transmit(seq(1000), seq(2000), 10, false);
+            sack(
+                &mut rack,
+                &mut scoreboard,
+                base,
+                seq(2000).0,
+                110,
+                &[(seq(1000).0, seq(2000).0)],
+            );
+            assert_eq!(rack.latest, Some((10, seq(2000))));
+            rack.detect(134, false, Some(100));
+            assert_eq!(rack.lowest_lost(1000), None);
+            assert_eq!(rack.deadline, Some(135));
+            rack.detect(135, false, Some(100));
+            assert_eq!(rack.lowest_lost(1000), Some((seq(0), seq(1000))));
+            // The older original can update the RTT but cannot regress the reference.
+            sack(
+                &mut rack,
+                &mut scoreboard,
+                seq(2000).0,
+                seq(2000).0,
+                210,
+                &[],
+            );
+            assert_eq!(rack.latest, Some((10, seq(2000))));
+            assert_eq!(rack.rtt, 200);
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-3.3.2
+    //= type=test
+    //= reason=Checks repeated DSACK in a round, advancement into a new round, SRTT cap and sixteen exits.
+    //# The RACK reordering window SHOULD adaptively increase (using the
+    //# algorithm in "Step 4: Update RACK reordering window" below) if
+    //# the sender receives a Duplicate Selective Acknowledgment (DSACK)
+    //# option [RFC2883].
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-3.3.2
+    //= type=test
+    //= reason=Exercises multiplier growth past the SRTT bound.
+    //# The RACK reordering window MUST be bounded, and this bound SHOULD
+    //# be SRTT.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-4
+    //= type=test
+    //= reason=Checks round-bounded growth, cap and persistence.
+    //# RACK DSACK-based reordering window adaptation is RECOMMENDED but
+    //# is not required.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Covers repeated same-round DSACK, boundary advancement and SRTT cap.
+    //# If RACK.dsack_round is not None AND
+    //# SND.UNA >= RACK.dsack_round:
+    //# RACK.dsack_round = None
+    //# /* Grow the reordering window per round that sees DSACK.
+    //# Reset the window after 16 DSACK-free recoveries */
+    //# If RACK.dsack_round is None AND
+    //# any DSACK option is present on latest received ACK:
+    //# RACK.dsack_round = SND.NXT
+    //# RACK.reo_wnd_mult += 1
+    //# RACK.reo_wnd_persist = 16
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Checks helper persistence through 15 exits and reset at 16; does not cover RTO integration.
+    //# Else if exiting Fast or RTO recovery:
+    //# RACK.reo_wnd_persist -= 1
+    //# If RACK.reo_wnd_persist <= 0:
+    //# RACK.reo_wnd_mult = 1
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Checks DSACK growth, SRTT cap and persistence reset.
+    //# If RACK.reordering_seen is FALSE:
+    //# If in Fast or RTO recovery:
+    //# Return 0
+    //# Else if RACK.segs_sacked >= DupThresh:
+    //# Return 0
+    //# Return min(RACK.reo_wnd_mult * RACK.min_RTT / 4, SRTT)
+    fn dsack_new_round_cap_and_sixteen_recovery_decay() {
+        let mut rack = Rack::new().unwrap();
+        let mut scoreboard = Scoreboard::new();
+        rack.sample(100);
+        rack.transmit(Seq(1000), Seq(2000), 0, false);
+        sack(&mut rack, &mut scoreboard, 1000, 2000, 100, &[(0, 1000)]);
+        assert_eq!(rack.multiplier, 2);
+        sack(&mut rack, &mut scoreboard, 1000, 2000, 101, &[(0, 1000)]);
+        assert_eq!(rack.multiplier, 2);
+        for high in [3000, 4000, 5000] {
+            let ack = high - 1000;
+            rack.transmit(Seq(ack), Seq(high), 102, false);
+            sack(
+                &mut rack,
+                &mut scoreboard,
+                ack,
+                high,
+                202,
+                &[(ack - 1000, ack)],
+            );
+        }
+        assert_eq!(rack.multiplier, 5);
+        assert_eq!(rack.reo_window(false, Some(100)), 100); // Uncapped value is 125.
+        for _ in 0..15 {
+            rack.recovery_exit();
+            assert_eq!(rack.multiplier, 5);
+        }
+        rack.recovery_exit();
+        assert_eq!(rack.multiplier, 1);
+        assert_eq!(rack.reo_window(false, Some(100)), 25);
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.3
+    //= type=test
+    //= reason=Checks nonzero reordering window before/at age deadline and the first-outstanding exception.
+    //# Upon RTO timer expiration, RACK marks the first outstanding segment
+    //# as lost (since it was sent an RTO ago); for all the other segments,
+    //# RACK only marks the segment as lost if the time elapsed since the
+    //# segment was transmitted is at least the sum of the recent RTT and the
+    //# reordering window.
+    fn rto_nonzero_window_age_boundary_and_first_exception() {
+        for now in [124, 125] {
+            let mut rack = Rack::new().unwrap();
+            rack.sample(100);
+            rack.reordering_seen = true;
+            rack.transmit(Seq(0), Seq(1000), 124, false);
+            rack.transmit(Seq(1000), Seq(2000), 0, false);
+            rack.transmit(Seq(2000), Seq(3000), 100, false);
+            assert_eq!(rack.reo_window(true, Some(100)), 25);
+            rack.rto(now, Seq(0), Some(100));
+            assert!(rack.intervals[0].needs_retransmit); // First: no age requirement.
+            assert_eq!(rack.intervals[1].needs_retransmit, now == 125);
+            assert!(!rack.intervals[2].needs_retransmit);
+            assert_eq!(rack.deadline, None);
+        }
     }
 
     #[test]

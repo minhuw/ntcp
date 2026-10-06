@@ -1,0 +1,180 @@
+# Genuine behavior/embedding and focused-test gaps; no conformance waivers.
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-4"
+reason = "Behavior/embedding gap: Instant is caller-supplied integer microseconds; no validation establishes actual clock granularity finer than min_RTT/4 (in particular RTT <= 4 us cannot satisfy this with 1 us units). The 256-interval overflow fallback also discards per-segment timestamps and disables RACK until the flight is cumulatively ACKed; this is safe fallback, not satisfaction of the timestamp MUST for arbitrary flights."
+quote = '''
+For each data segment sent, the sender MUST store its most recent
+transmission time with a timestamp whose granularity is finer
+than 1/4 of the minimum RTT of the connection.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.2"
+reason = "Behavior and test gap: Rack::sample tracks a lifetime global minimum. No windowed min-filter or path-migration adaptation exists; add an aging/windowed minimum and a longer-path regression."
+quote = '''
+The sender SHOULD
+track a windowed min-filtered estimate of recent RTT measurements
+that can adapt when migrating to significantly longer paths rather
+than tracking a simple global minimum of all RTT measurements.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.2"
+reason = "Behavior/profile gap: schedule_tlp additionally requires a fresh RTT and no tracked probe; tlp_eligible excludes FIN/closing and receive-window-shrink states. Thus it does not schedule after every new-data/advancing-ACK event outside the RFC-listed recovery/SACK exclusions. Fresh RTT correctly gates sending in section 7.3, but is applied early here. Add focused scheduling tests for these omitted contexts or document/implement their handling in the supported profile."
+quote = '''
+The sender SHOULD start or
+restart a loss probe PTO timer after transmitting new data (that was
+not itself a loss probe) or upon receiving an ACK that cumulatively
+acknowledges new data unless it is already in fast recovery, RTO
+recovery, or segments have been SACKed (i.e., RACK.segs_sacked is not
+zero).
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.2"
+reason = "Test gap: no direct no-SRTT PTO interval test. Scheduling also requires a fresh RTT, so a truly unsampled connection does not arm this one-second PTO; section 7.3 correctly forbids sending without a sample, but this is not evidence that the scheduling SHOULD is implemented for that context."
+quote = '''
+Second, when there is no SRTT estimate available, the PTO SHOULD be 1
+second.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.2"
+reason = "Test gap: PTO formula is not directly tested with absent SRTT; optional single-segment delay inflation is not implemented. The fresh RTT scheduling restriction is tracked separately."
+quote = '''
+Summarizing these considerations in pseudocode form, a sender SHOULD
+use the following logic to select the duration of a PTO:
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.3"
+reason = "Test gap: existing tests mostly prevent scheduling when freshness/probe gates fail. Add a direct already-armed PTO expiry test invalidating each gate independently and asserting no output and rearmed RTO. Zero-window flight is routed to persist rather than an RTO; do not claim the unconditional rearm wording for that context."
+quote = '''
+If either one of these two conditions is not met, then the sender
+MUST skip sending a loss probe and MUST proceed to re-arm the RTO
+timer, as specified at the end of this section.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.3"
+reason = "Behavior/test qualification: zero-window outstanding flight uses persist, not the literal mandatory RTO rearm. Direct PTO expiry skip-path assertions are missing; ordinary failed-output and successful-output paths are tested."
+quote = '''
+After attempting to send a loss probe, regardless of whether a loss
+probe was sent, the sender MUST re-arm the RTO timer, not the PTO
+timer, if the FlightSize is not zero.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-8"
+reason = "Behavior gap: schedule_tlp retains rto_deadline, detect retains rto_deadline while rack.deadline is armed, and next_deadline independently minimizes all timers. Guards reduce conflicts (PTO/RTO tie favors PTO, due RTO suppresses RACK) but do not cancel other pending loss timers as recommended. Existing tests demonstrate concurrent fallback deadlines, not mutual exclusivity; implement explicit timer ownership/multiplexing and assertions."
+quote = '''
+When arming a RACK reordering timer or TLP
+PTO timer, the sender SHOULD cancel any other pending timers.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-9.2"
+reason = "Integration test gap: helper tests separately verify lost retransmission detection and additional congestion reduction; no focused connection test drives lost retransmission feedback through revised selection and proves its extra congestion response with PRR both on and off."
+quote = '''
+Therefore, the algorithm [RFC6675]
+MUST NOT be used with RACK-TLP; instead, a modified recovery
+algorithm that carefully addresses such a case is needed.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-9.3"
+reason = "Integration test gap: no connection-level lost-retransmission scenario with config.prr=false asserts both the extra threshold response and credit-constrained retransmission. Helper coverage is partial, not the full no-PRR MUST."
+quote = '''
+In the absence of PRR [RFC6937], when RACK-TLP detects a lost
+retransmission, the congestion control MUST trigger an additional
+congestion response per the aforementioned principle in [RFC5681].
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.2"
+reason = "Test gap: no isolated connection test with observed reordering and three newly SACKed complete segments demonstrates that recovery waits for the time window rather than entering immediately on DupThresh."
+quote = '''
+Otherwise, if some reordering has been observed, then RACK does not
+trigger fast recovery based on DupThresh.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.2"
+reason = "Bounded-state behavior gap: reo_wnd_mult is a saturating u8, so DSACK growth stops at 255 even if SRTT remains above 255*(min_RTT/4). The stated linear per-round increment is not supported beyond that ceiling; add a wider/capped-to-SRTT multiplier and a long adaptation regression if that range is part of the supported profile."
+quote = '''
+If RACK.dsack_round is not None AND
+SND.UNA >= RACK.dsack_round:
+RACK.dsack_round = None
+/* Grow the reordering window per round that sees DSACK.
+Reset the window after 16 DSACK-free recoveries */
+If RACK.dsack_round is None AND
+any DSACK option is present on latest received ACK:
+RACK.dsack_round = SND.NXT
+RACK.reo_wnd_mult += 1
+RACK.reo_wnd_persist = 16
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-6.2"
+reason = "Behavior/integration gaps: accept_ack clears sack_post_rto without calling rack.recovery_exit, so persistence does not decay on RTO recovery exit. Conversely, a qualifying DSACK on the fast-recovery-ending ACK resets persistence to 16 in acknowledge and the unconditional recovery_exit immediately decrements it to 15. The RFC's else-if requires growth/reset instead of decrement on that ACK. Add both connection-level regressions before claiming this conditional algorithm."
+quote = '''
+If RACK.dsack_round is not None AND
+SND.UNA >= RACK.dsack_round:
+RACK.dsack_round = None
+/* Grow the reordering window per round that sees DSACK.
+Reset the window after 16 DSACK-free recoveries */
+If RACK.dsack_round is None AND
+any DSACK option is present on latest received ACK:
+RACK.dsack_round = SND.NXT
+RACK.reo_wnd_mult += 1
+RACK.reo_wnd_persist = 16
+Else if exiting Fast or RTO recovery:
+RACK.reo_wnd_persist -= 1
+If RACK.reo_wnd_persist <= 0:
+RACK.reo_wnd_mult = 1
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.2"
+reason = "Test/profile gap: no direct absent-SRTT formula test and scheduling normally requires a fresh sample. No TLP.max_ack_delay inflation is selected (permitted by MAY), so do not cite evidence for that branch."
+quote = '''
+TLP_calc_PTO():
+If SRTT is available:
+PTO = 2 * SRTT
+If FlightSize is one segment:
+PTO += TLP.max_ack_delay
+Else:
+PTO = 1 sec
+
+If Now() + PTO > TCP_RTO_expiration():
+PTO = TCP_RTO_expiration() - Now()
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-8"
+reason = "Behavior gap: separate rack.deadline/tlp_deadline/rto_deadline coexist, with next_deadline selecting minimum. PTO and RACK eligibility guards and persist routing do not establish the specified mutual exclusivity. Track genuine gap rather than cite fallback deadline tests as conformance."
+quote = '''
+The RACK reordering timer, the TLP PTO timer, the RTO, and Zero
+Window Probe (ZWP) timer [RFC793] are mutually exclusive and are used
+in different scenarios.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-9.4"
+reason = "Behavior/test gap: PTO uses 2*SRTT without an explicit peer delayed-ACK budget (TLP.max_ack_delay optional inflation is omitted). No focused test establishes sufficient waiting for a delayed/stretched ACK receiver before retransmitted probe or DSACK-based delayed-ACK recovery disambiguation."
+quote = '''
+To mitigate this
+complication, before sending a TLP loss probe retransmission, the
+sender should attempt to wait long enough that the receiver has sent
+any delayed ACKs that it is withholding.
+'''
+
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-9.3"
+reason = "Behavior verification/test gap: retransmission_lost reduces on each detect call that newly loses a retransmission, without an explicit retransmission-window epoch. Multiple lost retransmissions discovered in one call are aggregated, but multiple ACKs detecting losses from the same retransmission window may reduce repeatedly. Add a packet-level same-window/multiple-ACK scenario and define the window guard before claiming once-per-window conformance."
+quote = '''
+If multiple original transmissions or retransmissions were lost in a
+window, the congestion control specified in [RFC5681] only reacts
+once per window.
+'''

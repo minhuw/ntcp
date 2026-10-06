@@ -199,6 +199,12 @@ impl ReceiveBuffer {
     //# The acknowledgment mechanism employed is cumulative so that an acknowledgment of
     //# sequence number X indicates that all octets up to but not including X have been
     //# received.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-3
+    //= reason=Gap filling advances cumulative frontier and removes consumed ordinary SACK ranges; test follows section-7 examples.
+    //# When missing segments are received, the data receiver acknowledges the data
+    //# normally by advancing the left window edge in the Acknowledgement Number
+    //# Field of the TCP header. The SACK option does not change the meaning of the
+    //# Acknowledgement Number field.
     pub(crate) fn next(&self) -> Seq {
         self.read_base
             .wrapping_add(self.contiguous_len as u32)
@@ -263,6 +269,34 @@ impl ReceiveBuffer {
         self.dsack = None;
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= reason=Ordinary SACK selects newest contiguous retained union first, except arrivals advancing the cumulative frontier. RFC 2883 DSACK is a separate first-block extension, not asserted as ordinary RFC 2018 behavior.
+    //# * The first SACK block (i.e., the one immediately following the kind and
+    //# length fields in the option) MUST specify the contiguous block of data
+    //# containing the segment which triggered this ACK, unless that segment
+    //# advanced the Acknowledgment Number field in the header.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= reason=Retained distinct ranges have dense arrival-recency ranks; focused RFC examples check repeated blocks and subset-eliminating merge.
+    //# * The SACK option SHOULD be filled out by repeating the most recently
+    //# reported SACK blocks (based on first SACK blocks in previous SACK options)
+    //# that are not subsets of a SACK block already included in the SACK option
+    //# being constructed.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-3
+    //= reason=Ordinary emitted ranges represent queued contiguous non-frontier data, not holes or FIN; focused examples assert full edges and coalescing.
+    //# This option contains a list of some of the blocks of contiguous sequence
+    //# space occupied by data that has been received and queued within the window.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-3
+    //= reason=Receive ranges begin at first retained byte, as asserted by RFC example edges.
+    //# This is the first sequence number of this block.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-3
+    //= reason=Ranges use exclusive right edges; example tests assert last+1 and merges.
+    //# This is the sequence number immediately following the last sequence number
+    //# of this block.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-3
+    //= reason=Ordinary ranges coalesce adjacent retained bytes and exclude contiguous frontier. DSACK extension is not an ordinary isolated block.
+    //# Each block represents received bytes of data that are contiguous and
+    //# isolated; that is, the bytes just below the block, (Left Edge of Block - 1),
+    //# and just above the block, (Right Edge of Block), have not been received.
     pub(crate) fn sack_blocks(&self, max_blocks: usize) -> [Option<(u32, u32)>; 4] {
         let mut blocks = [None; 4];
         let limit = max_blocks.min(blocks.len());
@@ -598,6 +632,94 @@ mod tests {
             assert_eq!(&out[..3], b"new");
             assert_eq!(&out[3..], &[0xaa; 14]);
         }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= type=test
+    //= reason=Ordinary SACK selects newest contiguous retained union first, except arrivals advancing the cumulative frontier. RFC 2883 DSACK is a separate first-block extension, not asserted as ordinary RFC 2018 behavior.
+    //# * The first SACK block (i.e., the one immediately following the kind and
+    //# length fields in the option) MUST specify the contiguous block of data
+    //# containing the segment which triggered this ACK, unless that segment
+    //# advanced the Acknowledgment Number field in the header.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= type=test
+    //= reason=Retained distinct ranges have dense arrival-recency ranks; focused RFC examples check repeated blocks and subset-eliminating merge.
+    //# * The SACK option SHOULD be filled out by repeating the most recently
+    //# reported SACK blocks (based on first SACK blocks in previous SACK options)
+    //# that are not subsets of a SACK block already included in the SACK option
+    //# being constructed.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-3
+    //= type=test
+    //= reason=Gap filling advances cumulative frontier and removes consumed ordinary SACK ranges; test follows section-7 examples.
+    //# When missing segments are received, the data receiver acknowledges the data
+    //# normally by advancing the left window edge in the Acknowledgement Number
+    //# Field of the TCP header. The SACK option does not change the meaning of the
+    //# Acknowledgement Number field.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-3
+    //= type=test
+    //= reason=Ordinary emitted ranges represent queued contiguous non-frontier data, not holes or FIN; focused examples assert full edges and coalescing.
+    //# This option contains a list of some of the blocks of contiguous sequence
+    //# space occupied by data that has been received and queued within the window.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-3
+    //= type=test
+    //= reason=Receive ranges begin at first retained byte, as asserted by RFC example edges.
+    //# This is the first sequence number of this block.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-3
+    //= type=test
+    //= reason=Ranges use exclusive right edges; example tests assert last+1 and merges.
+    //# This is the sequence number immediately following the last sequence number
+    //# of this block.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-3
+    //= type=test
+    //= reason=Ordinary ranges coalesce adjacent retained bytes and exclude contiguous frontier. DSACK extension is not an ordinary isolated block.
+    //# Each block represents received bytes of data that are contiguous and
+    //# isolated; that is, the bytes just below the block, (Left Edge of Block - 1),
+    //# and just above the block, (Right Edge of Block), have not been received.
+    fn sack_rfc2018_examples_repeat_recent_blocks_and_merge() {
+        // RFC 2018 section 7 cases 2 and 3; ordinary SACK, without DSACK.
+        let mut recv = ReceiveBuffer::new(Seq(5000), 4000).unwrap();
+        for sequence in (5500..9000).step_by(500) {
+            recv.insert(Seq(sequence), &[1; 500], false);
+            assert_eq!(recv.next(), Seq(5000));
+            assert_eq!(
+                recv.sack_blocks(3),
+                [Some((5500, sequence + 500)), None, None, None]
+            );
+            assert_ranges(&recv);
+        }
+        recv.insert(Seq(5000), &[2; 500], false);
+        assert_eq!(recv.next(), Seq(9000));
+        assert_eq!(recv.sack_blocks(4), [None; 4]);
+
+        let mut recv = ReceiveBuffer::new(Seq(5000), 4000).unwrap();
+        recv.insert(Seq(5000), &[1; 500], false);
+        let expected = [
+            [Some((6000, 6500)), None, None, None],
+            [Some((7000, 7500)), Some((6000, 6500)), None, None],
+            [
+                Some((8000, 8500)),
+                Some((7000, 7500)),
+                Some((6000, 6500)),
+                None,
+            ],
+        ];
+        for (sequence, blocks) in [6000, 7000, 8000].into_iter().zip(expected) {
+            recv.insert(Seq(sequence), &[1; 500], false);
+            assert_eq!(recv.next(), Seq(5500));
+            assert_eq!(recv.sack_blocks(3), blocks);
+            assert_eq!(recv.sack_blocks(1), [blocks[0], None, None, None]);
+            assert_ranges(&recv);
+        }
+        recv.insert(Seq(6500), &[2; 500], false);
+        assert_eq!(
+            recv.sack_blocks(3),
+            [Some((6000, 7500)), Some((8000, 8500)), None, None]
+        );
+        recv.insert(Seq(5500), &[2; 500], false);
+        assert_eq!(recv.next(), Seq(7500));
+        assert_eq!(recv.sack_blocks(3), [Some((8000, 8500)), None, None, None]);
+        assert_ranges(&recv);
     }
 
     #[test]

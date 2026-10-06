@@ -366,6 +366,9 @@ impl Connection {
         Self::active_with_receive(tuple, config, iss, now, &mut None)
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-4
+    //= reason=Constructor rejects TLP unless both RACK and SACK are configured; runtime additionally requires negotiated SACK.
+    //# TLP requires RACK.
     pub(crate) fn active_with_receive(
         tuple: Tuple,
         mut config: ConnectionConfig,
@@ -551,6 +554,10 @@ impl Connection {
         Self::passive_with_receive(tuple, config, iss, now, syn, &mut None)
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
+    //= reason=Passive state is SYN-RECEIVED; transmit commits ISS+1 only after SYN-ACK encoding succeeds.
+    //# SND.NXT is set to ISS+1 and SND.UNA to ISS. The connection state should be changed to
+    //# SYN-RECEIVED.
     pub(crate) fn passive_with_receive(
         tuple: Tuple,
         config: ConnectionConfig,
@@ -638,6 +645,18 @@ impl Connection {
         }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-1
+    //= reason=Opt-in alternative to DupAck inference only with bidirectional negotiated SACK and a valid ledger.
+    //# This document presents RACK-TLP, a TCP loss detection algorithm that
+    //# improves upon the widely implemented duplicate acknowledgment
+    //# (DupAck) counting approach described in [RFC5681] and [RFC6675]; it
+    //# is RECOMMENDED as an alternative to that earlier approach.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-4
+    //= reason=Requires negotiated SACK in both directions; connection owns its scoreboard.
+    //# The connection MUST use selective acknowledgment (SACK) options
+    //# [RFC2018], and the sender MUST keep SACK scoreboard information
+    //# on a per-connection basis ("SACK scoreboard" has the same meaning
+    //# here as in [RFC6675], Section 3).
     fn rack_enabled(&self) -> bool {
         self.config.rack && self.sack_receive && self.sack_send && self.rack.valid()
     }
@@ -657,6 +676,39 @@ impl Connection {
             && self.rack.deadline.is_none()
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
+    //= reason=Conditional evidence: new-data and advancing-ACK callers schedule only outside recovery, complete SACK, zero/shrunken window, FIN and invalid-ledger states, with a fresh RTT and no outstanding probe.
+    //# The sender SHOULD start or
+    //# restart a loss probe PTO timer after transmitting new data (that was
+    //# not itself a loss probe) or upon receiving an ACK that cumulatively
+    //# acknowledges new data unless it is already in fast recovery, RTO
+    //# recovery, or segments have been SACKed (i.e., RACK.segs_sacked is not
+    //# zero).
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
+    //= reason=Partial arithmetic evidence: missing SRTT uses 500000*2 = one second before the RTO cap. Fresh-sample eligibility normally makes this fallback unreachable.
+    //# Second, when there is no SRTT estimate available, the PTO SHOULD be 1
+    //# second.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
+    //= reason=Optional inflation is not selected: PTO remains 2*SRTT even for a single segment; no TLP.max_ack_delay budget is modeled. This is evidence of the permitted non-inflating choice, not delayed-ACK mitigation.
+    //# Third, when the FlightSize is one segment, the sender MAY inflate the
+    //# PTO by TLP.max_ack_delay to accommodate a potentially delayed
+    //# acknowledgment and reduce the risk of spurious retransmissions.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
+    //= reason=2*SRTT or one second, capped by current RTO; optional single-segment delay inflation omitted.
+    //# Summarizing these considerations in pseudocode form, a sender SHOULD
+    //# use the following logic to select the duration of a PTO:
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
+    //= reason=2*SRTT or one second capped by RTO; permitted single-segment inflation not implemented.
+    //# TLP_calc_PTO():
+    //# If SRTT is available:
+    //# PTO = 2 * SRTT
+    //# If FlightSize is one segment:
+    //# PTO += TLP.max_ack_delay
+    //# Else:
+    //# PTO = 1 sec
+    //#
+    //# If Now() + PTO > TCP_RTO_expiration():
+    //# PTO = TCP_RTO_expiration() - Now()
     fn schedule_tlp(&mut self) {
         if self.tlp_eligible()
             && self.tlp_fresh_rtt
@@ -672,6 +724,10 @@ impl Connection {
         }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.1
+    //= reason=Constructor starts unset; fast/RTO recovery call reset_tlp to clear probe history/pending timers without inventing freshness.
+    //# Reset TLP.is_retrans and TLP.end_seq when initiating a connection,
+    //# fast recovery, or RTO recovery.
     fn reset_tlp(&mut self) {
         self.tlp_deadline = None;
         self.tlp_pending = false;
@@ -681,6 +737,26 @@ impl Connection {
     }
 
     // Called only for validated ACKs, before advancing SND.UNA.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.4.2
+    //= reason=Without matching DSACK or bare duplicate ACK, ACK strictly beyond probe end reports repaired loss; equality keeps ambiguity pending.
+    //# If the TLP
+    //# sender does not receive such an indication, then it MUST assume that
+    //# the original data segment, the TLP retransmission, or a corresponding
+    //# ACK was lost for congestion control purposes.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.4.2
+    //= reason=New-data, matching DSACK, ACK beyond and bare DupACK branches clear episode; only retransmitted beyond-end loss reports congestion.
+    //# TLP_process_ack(ACK):
+    //# If TLP.end_seq is not None AND ACK's ack. number >= TLP.end_seq:
+    //# If not TLP.is_retrans:
+    //# TLP.end_seq = None    /* TLP of new data delivered */
+    //# Else if ACK has a DSACK option matching TLP.end_seq:
+    //# TLP.end_seq = None    /* Case 1, above */
+    //# Else If ACK's ack. number > TLP.end_seq:
+    //# TLP.end_seq = None    /* Repaired the single loss */
+    //# (Invoke congestion control to react to
+    //# the loss event the probe has repaired)
+    //# Else If ACK is a DupAck without any SACK option:
+    //# TLP.end_seq = None     /* Case 2, above */
     fn tlp_ack(
         &mut self,
         ack: Seq,
@@ -716,6 +792,9 @@ impl Connection {
         self.sack_receive && (!(self.config.rack || self.config.prr) || self.sack_send)
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= reason=Uses Scoreboard::pipe without RACK, Rack::pipe with RACK. The latter is not proof of the literal RFC 6675 estimator; TODO remains.
+    //# pipe = (RFC 6675 pipe algorithm)
     fn recovery_pipe(&self, high_rxt: Seq) -> u32 {
         if self.rack_enabled() {
             self.rack.pipe()
@@ -725,6 +804,10 @@ impl Connection {
         }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= reason=Uses byte PRR credit rather than inflated cwnd when PRR is active. Does not prove all output-path or entry behavior.
+    //# We introduce a local variable "sndcnt", which indicates exactly how
+    //# many bytes should be sent in response to each ACK.
     fn recovery_credit(&self, recovery: SackRecovery) -> u32 {
         self.prr.map_or_else(
             || self.congestion.cwnd().saturating_sub(recovery.pipe),
@@ -732,6 +815,43 @@ impl Connection {
         )
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5.1
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Congestion controller halves eligible flight, excludes limited bytes and avoids duplicate ECN reductions. This cites integration, not all congestion-control recommendations.
+    //# However, the congestion control algorithms present in the de facto standard
+    //# TCP implementations MUST be preserved [Stevens94].
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Entry records fixed data_high boundary; cumulative ACK at exclusive boundary ends recovery.
+    //# (4.1) RecoveryPoint = HighData When the TCP sender receives a cumulative ACK
+    //# for this data octet, the loss recovery phase is terminated.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Congestion on_sack_recovery sets cwnd=ssthresh=half eligible flight with RFC5681 minimum; outstanding limited bytes excluded even after partial ACK. ECN epoch guards prevent second reduction.
+    //# (4.2) ssthresh = cwnd = (FlightSize / 2) The congestion window (cwnd) and
+    //# slow start threshold (ssthresh) are reduced to half of FlightSize per
+    //# [RFC5681]. Additionally, note that [RFC5681] requires that any segments sent
+    //# as part of the Limited Transmit mechanism not be counted in FlightSize for
+    //# the purpose of the above equation.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Entry initializes pipe from scoreboard and output increments for successful retransmission.
+    //# (4.4) Run SetPipe () Set a "pipe" variable to the number of outstanding
+    //# octets currently "in the pipe"; this is the data which has been sent by the
+    //# TCP sender but for which no cumulative or selective acknowledgment has been
+    //# received and the data has not been determined to have been dropped in the
+    //# network. It is assumed that the data is still traversing the network path.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+    //= reason=Configurable PRR initialized on valid SACK recovery; default PRR is off.
+    //# The Proportional Rate
+    //# Reduction (PRR) algorithm [RFC6937] is RECOMMENDED for the specific
+    //# congestion control actions taken upon the losses detected by RACK-
+    //# TLP.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= reason=Scoped entry evidence: threshold selected by Congestion and flight passed to Prr::new. Does not justify the initial-MSS override or delayed-entry delivery policy; tracked TODOs remain.
+    //# At the beginning of recovery, initialize PRR state.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= reason=Scoped entry evidence: threshold selected by Congestion and flight passed to Prr::new. Does not justify the initial-MSS override or delayed-entry delivery policy; tracked TODOs remain.
+    //# ssthresh = CongCtrlAlg()  // Target cwnd after recovery
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= reason=Scoped entry evidence: threshold selected by Congestion and flight passed to Prr::new. Does not justify the initial-MSS override or delayed-entry delivery policy; tracked TODOs remain.
+    //# RecoverFS = snd.nxt-snd.una // FlightSize at the start of recovery
     fn start_sack_recovery(&mut self) -> bool {
         if self.sack_guard.is_some()
             || self.sack_recovery.is_some()
@@ -762,6 +882,35 @@ impl Connection {
         true
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.2
+    //= reason=Lost retransmissions trigger additional congestion response, then revised RACK recovery selection.
+    //# Therefore, the algorithm [RFC6675]
+    //# MUST NOT be used with RACK-TLP; instead, a modified recovery
+    //# algorithm that carefully addresses such a case is needed.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+    //= reason=Every newly detected lost retransmission calls Congestion::retransmission_lost, independently of the PRR option.
+    //# In the absence of PRR [RFC6937], when RACK-TLP detects a lost
+    //# retransmission, the congestion control MUST trigger an additional
+    //# congestion response per the aforementioned principle in [RFC5681].
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= reason=RACK recovery entry depends on time-based losses; ACK path gates DupAck/scoreboard loss entry behind !rack_enabled().
+    //# Otherwise, if some reordering has been observed, then RACK does not
+    //# trigger fast recovery based on DupThresh.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= reason=ACK and timer paths call shared detector and update recovery pipe; zero-window/invalid-ledger profile suppresses detection.
+    //# When an ACK
+    //# is received or the RACK reordering timer expires, call
+    //# RACK_detect_loss_and_arm_timer().
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.4.1
+    //= reason=All validated ACK feedback, including tail-probe ACK, goes through RACK detector and loss-triggered recovery.
+    //# More specifically, RACK_detect_loss() (Step 5) would mark those
+    //# earlier segments as lost.  Then the sender would trigger a fast
+    //# recovery to recover those losses.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+    //= reason=Original losses share recovery entry; lost retransmissions within one detect call aggregate into one additional response. This does not establish grouping across multiple ACKs in one retransmission window.
+    //# If multiple original transmissions or retransmissions were lost in a
+    //# window, the congestion control specified in [RFC5681] only reacts
+    //# once per window.
     fn detect_rack(&mut self) {
         if !self.rack_enabled() || self.snd_wnd == 0 {
             self.rack.deadline = None;
@@ -974,6 +1123,11 @@ impl Connection {
         self.last_output_ecn
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
+    //= reason=Passive constructor consumes SYN sequence, learns peer, and schedules SYN-ACK. SYN text buffering/delivery scope separately cited.
+    //# Set RCV.NXT to SEG.SEQ+1, IRS is set to SEG.SEQ, and any other control or text should be
+    //# queued for processing later. ISS should be selected and a SYN segment sent of the form:
+    //# <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>
     fn learn_syn(&mut self, syn: &Segment<'_>) {
         self.learn_ecn(syn.header.flags);
         self.sack_send |= self.config.sack && syn.options.sack_permitted;
@@ -1095,6 +1249,12 @@ impl Connection {
     //# If the local TCP connection is closed by the remote side due to a FIN or RST
     //# received from the remote side, then the local application MUST be informed
     //# whether it closed normally or was aborted (MUST-12).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= reason=Exact-sequence inbound reset terminates, cancels all protocol output/deadlines, reports Reset; explicit release governs terminal handle storage.
+    //# If the RST bit is set, then any outstanding RECEIVEs and SEND should receive "reset"
+    //# responses. All segment queues should be flushed. Users should also receive an
+    //# unsolicited general "connection reset" signal. Enter the CLOSED state, delete the TCB,
+    //# and return.
     fn terminal(&mut self, reason: CloseReason) {
         self.state = State::Closed;
         self.reset_tlp();
@@ -1295,6 +1455,19 @@ impl Connection {
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
     //# A TCP endpoint MAY implement PUSH flags on SEND calls (MAY-15).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
+    //= reason=Explicit PUSH marks survive packetization and partial acknowledgment; Nagle still applies.
+    //# If the PUSH flag is set, the application intends the data to be transmitted promptly to
+    //# the receiver, and the PSH bit will be set in the last TCP segment created from the
+    //# buffer.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
+    //= reason=FIFO byte queue across successive writes, not per-write completion records.
+    //# Multiple SENDs are served in first come, first served order, so the TCP endpoint will
+    //# queue those it cannot service immediately.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.2
+    //= reason=Handshake SEND queue; focused send_state_matrix_preserves_queue_on_rejection additionally tests exhaustion.
+    //# Queue the data for transmission after entering ESTABLISHED state. If no space to queue,
+    //# respond with "error: insufficient resources".
     pub(crate) fn write_with_push(&mut self, data: &[u8], push: bool) -> Result<usize, Error> {
         if self.shutdown
             || !matches!(
@@ -1429,6 +1602,18 @@ impl Connection {
         }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.3
+    //= reason=CLOSE-WAIT drains accepted bytes then returns EOF (0), the nonblocking API equivalent of closing notification.
+    //# Since the remote side has already sent FIN, RECEIVEs must be satisfied by data already
+    //# on hand, but not yet delivered to the user. If no text is awaiting delivery, the RECEIVE
+    //# will get an "error: connection closing" response. Otherwise, any remaining data can be
+    //# used to satisfy the RECEIVE.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.5
+    //= reason=SYN data is buffered internally, not readable nor notified to application before handshake completes.
+    //# so long as the receiving TCP endpoint doesn't deliver the data to the user until it is
+    //# clear the data is valid (e.g., the data is buffered at the receiver until the connection
+    //# reaches the ESTABLISHED state, given that the three-way handshake reduces the
+    //# possibility of false connections).
     pub(crate) fn read(&mut self, out: &mut [u8]) -> Result<usize, Error> {
         if self.read_closed {
             return Err(Error::InvalidState);
@@ -1470,6 +1655,17 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.6
     //# The user who CLOSEs may continue to RECEIVE until the TCP receiver is told that
     //# the remote peer has CLOSED also.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.4
+    //= reason=Unpushed writes flush before FIN; read half remains available.
+    //# Close also implies push function.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
+    //= reason=Repeated shutdown is idempotent and never creates a second FIN.
+    //# An "ok" response would be acceptable, too, as long as a second FIN is not emitted (the
+    //# first FIN may be retransmitted, though).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
+    //= reason=CLOSE-WAIT sends final reply data with FIN and enters LAST-ACK only on committed output.
+    //# Queue this request until all preceding SENDs have been segmentized; then send a FIN
+    //# segment, enter LAST-ACK state.
     pub(crate) fn shutdown(&mut self) -> Result<(), Error> {
         if self.shutdown
             && (self.state != State::Closed || self.reason == Some(CloseReason::Normal))
@@ -1549,6 +1745,146 @@ impl Connection {
     //= reason=Core separates input and transmit; driver-owned batches must be fed before polling output.
     //# For example, if the TCP endpoint is processing a series of queued segments, it
     //# MUST process them all before sending any ACK segments (MUST-59).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
+    //= reason=SYN-SENT validates ACK before RST; no response to unacceptable RST. Erratum 8167 remains separate.
+    //# If SEG.ACK =< ISS or SEG.ACK > SND.NXT, send a reset (unless the RST bit is set, if so
+    //# drop the segment and return) <SEQ=SEG.ACK><CTL=RST>
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
+    //= reason=SYN-SENT reset acceptance uses ACK of SYN, not RCV.NXT; terminal reason distinguishes reset.
+    //# If the ACK was acceptable, then signal to the user "error: connection reset", drop the
+    //# segment, enter CLOSED state, delete TCB, and return. Otherwise (no ACK), drop the
+    //# segment and return.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
+    //= reason=ACK-only/text without SYN cannot establish a SYN-SENT connection.
+    //# Fifth, if neither of the SYN or RST bits is set, then drop the segment and return.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= reason=Rejected input leaves receive state unchanged and replies with current ACK; invalid RST is silent.
+    //# If an incoming segment is not acceptable, an acknowledgment should be sent in reply
+    //# (unless the RST bit is set, if so drop the segment and return):
+    //# <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK> o After sending the acknowledgment, drop the
+    //# unacceptable segment and return.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
+    //= reason=Receiver replies to persist probes with current next sequence/window; responsive sender survives.
+    //# When the receiving TCP peer has a zero window and a segment arrives, it must still send
+    //# an acknowledgment showing its next expected sequence number and current window (zero).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
+    //= reason=SYN-ACK establishes active side and schedules ACK, which may carry queued data; no inline output.
+    //# If SND.UNA > ISS (our SYN has been ACKed), change the connection state to ESTABLISHED,
+    //# form an ACK segment <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= reason=RST in passive child silently releases it while listener survives; active simultaneous opener terminates and reports Reset (refusal equivalent).
+    //# If this connection was initiated with a passive OPEN (i.e., came from the LISTEN state),
+    //# then return this connection to LISTEN state and return. The user need not be informed.
+    //# If this connection was initiated with an active OPEN (i.e., came from SYN-SENT state),
+    //# then the connection was refused; signal the user "connection refused". In either case,
+    //# the retransmission queue should be flushed. And in the active OPEN case, enter the
+    //# CLOSED state and delete the TCB, and return.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Fresh post-RTO SACKs update scoreboard and select missing offset 256 without fast-recovery reentry.
+    //# Further, a SACK TCP sender SHOULD utilize all SACK information made
+    //# available during the loss recovery following an RTO.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Fresh post-RTO SACKs update scoreboard and select missing offset 256 without fast-recovery reentry.
+    //# As described in Sections 4 and 5, Update () SHOULD continue to be used
+    //# appropriately upon receipt of ACKs.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Fresh post-RTO SACKs update scoreboard and select missing offset 256 without fast-recovery reentry.
+    //# In this case, a TCP sender SHOULD use this SACK information when determining
+    //# what data should be sent in each segment following an RTO.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Validated negotiated ACKs update in-flight ranges; stale/future/DSACK-only blocks cannot count as fresh delivery.
+    //# Upon the receipt of any ACK containing SACK information, the scoreboard MUST
+    //# be updated via the Update () routine.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. New SACK evidence increments once even on duplex/window-changing ACK; repeated blocks do not earn new credit.
+    //# If the incoming ACK is a duplicate acknowledgment per the definition in
+    //# Section 2 (regardless of its status as a cumulative acknowledgment), and the
+    //# TCP is not currently in loss recovery, the TCP MUST increase DupAcks by one
+    //# and take the following steps:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Recovery ACK processing updates scoreboard/pipe and exits on boundary; partial cumulative ACK keeps recovery active without cwnd growth.
+    //# Once a TCP is in the loss recovery phase, the following procedure MUST be
+    //# used for each arriving ACK:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Exclusive recovery boundary is cumulatively ACKed; recovery terminates, send storage releases and cwnd is deflated.
+    //# (A) An incoming cumulative ACK for a sequence number greater than
+    //# RecoveryPoint signals the end of loss recovery, and the loss recovery phase
+    //# MUST be terminated.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Exit does not clear scoreboard; Update trims only cumulatively ACKed ranges.
+    //# Any information contained in the scoreboard for sequence numbers greater
+    //# than the new value of HighACK SHOULD NOT be cleared when leaving the loss
+    //# recovery phase.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. ACK below recovery boundary updates scoreboard and recomputes recovery.pipe; partial ACK remains in recovery.
+    //# (B) Upon receipt of an ACK that does not cover RecoveryPoint, the following
+    //# actions MUST be taken:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-2
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. snd_una is the exclusive cumulative edge, equivalent to HighACK+1.
+    //# "HighACK" is the sequence number of the highest byte of data that has been
+    //# cumulatively ACKed at a given point.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-2
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. duplicate_acks resets on cumulative ACK and increments on new delivery evidence.
+    //# "DupAcks" is the number of duplicate acknowledgments received since the last
+    //# cumulative acknowledgment.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-2
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. New in-flight SACK bytes qualify even when ACK carries duplex data or changes window; advancing-ACK test separately checks reset then increment.
+    //# For the purposes of this specification, we define a "duplicate
+    //# acknowledgment" as a segment that arrives carrying a SACK block that
+    //# identifies previously unacknowledged and un-SACKed octets between HighACK
+    //# and HighData. Note that an ACK which carries new SACK data is counted as a
+    //# duplicate acknowledgment under this definition even if it carries new data,
+    //# changes the advertised window, or moves the cumulative acknowledgment point,
+    //# which is different from the definition of duplicate acknowledgment in
+    //# [RFC5681].
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-2
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Threshold is three fresh-evidence ACKs; recovery starts on third, not repeated SACK blocks.
+    //# Per [RFC5681], this threshold is defined to be 3 duplicate acknowledgments.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Three fresh evidence ACKs start recovery; repeated evidence is not counted.
+    //# (1) If DupAcks >= DupThresh, go to step (4).
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. A single ACK carrying three one-byte discontiguous SACK ranges starts recovery immediately and emits a 17-byte first hole.
+    //# (2) If DupAcks < DupThresh but IsLost (HighACK + 1) returns true --
+    //# indicating at least three segments have arrived above the current cumulative
+    //# acknowledgment point, which is taken to indicate loss -- go to step (4).
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Event input returns; output is poll-driven and repeated evidence gives no extra credit.
+    //# (3.4) Terminate processing of this ACK.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Every valid recovery ACK records SACK union before cumulative ACK and recovery state processing.
+    //# (B.1) Use Update () to record the new SACK information conveyed by the
+    //# incoming ACK.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. ACK below recovery boundary recomputes pipe; test gains credit after partial ACK then sends new data.
+    //# (B.2) Use SetPipe () to re-calculate the number of octets still in the
+    //# network.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= reason=Partial byte-ledger evidence: acknowledge counts new covered bytes once; feeds PRR on ACKs while active and disables PRR on invalid ledger. Signed-delta equivalence and retained pre-entry interval accounting remain TODOs.
+    //# SACKd: The total number of bytes that the scoreboard indicates have
+    //# been delivered to the receiver.  This can be computed by scanning
+    //# the scoreboard and counting the total number of bytes covered by
+    //# all SACK blocks.  If SACK is not in use, SACKd is not defined.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= reason=Partial byte-ledger evidence: acknowledge counts new covered bytes once; feeds PRR on ACKs while active and disables PRR on invalid ledger. Signed-delta equivalence and retained pre-entry interval accounting remain TODOs.
+    //# With SACK,
+    //# DeliveredData can be computed precisely as the change in snd.una,
+    //# plus the (signed) change in SACKd.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= reason=Partial byte-ledger evidence: acknowledge counts new covered bytes once; feeds PRR on ACKs while active and disables PRR on invalid ledger. Signed-delta equivalence and retained pre-entry interval accounting remain TODOs.
+    //# On every ACK during recovery compute:
+    //#
+    //#    DeliveredData = change_in(snd.una) + change_in(SACKd)
+    //#    prr_delivered += DeliveredData
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= reason=Partial byte-ledger evidence: acknowledge counts new covered bytes once; feeds PRR on ACKs while active and disables PRR on invalid ledger. Signed-delta equivalence and retained pre-entry interval accounting remain TODOs.
+    //# Furthermore, for any TCP
+    //# (with or without SACK), the sum of DeliveredData must agree with the
+    //# forward progress over the same time interval.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= reason=Delayed timer entry reuses retained pre-entry ACK delivery (capped at MSS) instead of a current ACK; audit interval/epoch semantics rather than treating one-shot evidence as compliance. ACK path ledger counts unique covered bytes; this is partial evidence, not a deferred-entry waiver.
+    //# DeliveredData: The total number of bytes that the current ACK
+    //# indicates have been delivered to the receiver.
     pub(crate) fn input_with_traffic_class(
         &mut self,
         now: Instant,
@@ -2082,6 +2418,36 @@ impl Connection {
         self.limited_end = None;
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= reason=Partial cumulative ACK removes only covered bytes and reports progress; future ACK rejection additionally in rfc5961_ack_bounds_are_inclusive_and_reject_all_incoming_side_effects.
+    //# If SND.UNA < SEG.ACK =< SND.NXT, then set SND.UNA <- SEG.ACK. Any segments on the
+    //# retransmission queue that are thereby entirely acknowledged are removed. Users should
+    //# receive positive acknowledgments for buffers that have been SENT and fully acknowledged
+    //# (i.e., SEND buffer should be returned with "ok" response). If the ACK is a duplicate
+    //# (SEG.ACK =< SND.UNA), it can be ignored. If the ACK acks something not yet sent (SEG.ACK
+    //# > SND.NXT), then send an ACK, drop the segment, and return.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-8
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Only validated cumulative ACK calls SendBuffer::acknowledge; test asserts 1024 bytes retained across selective recovery and zero only after full ACK.
+    //# Since the data receiver may later discard data reported in a SACK option,
+    //# the sender MUST NOT discard data before it is acknowledged by the
+    //# Acknowledgment Number field in the TCP header.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. SACK updates never release send bytes; cumulative ACK is the release path and is asserted separately.
+    //# Note: SACK information is advisory and therefore SACKed data MUST NOT be
+    //# removed from the TCP's retransmission buffer until the data is cumulatively
+    //# acknowledged [RFC2018].
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Cumulative ACK resets duplicate counter before new SACK evidence increments it; test explicitly observes count one after advancing ACK.
+    //# If the incoming ACK is a cumulative acknowledgment, the TCP MUST reset
+    //# DupAcks to zero.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Byte buffer is retained across SACKs and released only by cumulative ACK.
+    //# A segment will not be dequeued and its buffer freed until the left window
+    //# edge is advanced over it.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= reason=Validated advancing ACK sample from ordinary estimator also updates Rack::sample.
+    //# Use the RTT measurements obtained via [RFC6298] or [RFC7323] to
+    //# update the estimated minimum RTT in RACK.min_RTT.
     fn accept_ack(&mut self, ack: Seq, ece: bool, echo: Option<u32>) {
         if !self.sack_receive {
             self.rack.acknowledge(
@@ -2203,6 +2569,41 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
     //# This should not occur since a FIN has been received from the remote side. Ignore
     //# the segment text.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= reason=Focused edge test covers duplicate-prefix and out-of-window suffix trimming, wrap and zero-window rejection.
+    //# If a segment's contents straddle the boundary between old and new, only the new parts
+    //# are processed.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= reason=Closing-state test additionally checks URG after FIN cannot advance the urgent endpoint.
+    //# This should not occur since a FIN has been received from the remote side. Ignore the
+    //# URG.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= reason=RCV.NXT reflects accepted contiguous bytes and advertised credit; scaled rounding exception scoped in existing SHLD-14 evidence.
+    //# Once the TCP endpoint takes responsibility for the data, it advances RCV.NXT over the
+    //# data accepted, and adjusts RCV.WND as appropriate to the current buffer availability.
+    //# The total of RCV.NXT and RCV.WND should not be reduced.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= reason=FIN advances receive sequence and half_closed event, sends ACK, preserves buffered bytes for subsequent read.
+    //# If the FIN bit is set, signal the user "connection closing" and return any pending
+    //# RECEIVEs with same message, advance RCV.NXT over the FIN, and send an acknowledgment for
+    //# the FIN. Note that FIN implies PUSH for any segment text not yet delivered to the user.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= reason=Unacknowledged local FIN enters CLOSING; fin_half_close_time_wait_and_duplicate_fin_restart covers acknowledged branch and timer cancellation.
+    //# If our FIN has been ACKed (perhaps in this segment), then enter TIME-WAIT, start the
+    //# time-wait timer, turn off the other timers; otherwise, enter the CLOSING state.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Ordinary reordered arrivals schedule immediate ACKs, output includes retained ranges; tests parse emitted ACKs.
+    //# If the data receiver generates SACK options under any circumstance, it
+    //# SHOULD generate them under all permitted circumstances.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Ordinary reordered arrivals schedule immediate ACKs, output includes retained ranges; tests parse emitted ACKs.
+    //# If sent at all, SACK options SHOULD be included in all ACKs which do not ACK
+    //# the highest sequence number in the data receiver's queue.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Ordinary reordered arrivals schedule immediate ACKs, output includes retained ranges; tests parse emitted ACKs.
+    //# The receiver SHOULD send an ACK for every valid segment that arrives
+    //# containing new data, and each of these "duplicate" ACKs SHOULD bear a SACK
+    //# option.
     fn receive_text(&mut self, seq: Seq, payload: &[u8], flags: u8, urgent: u16) {
         if !matches!(
             self.state,
@@ -2410,6 +2811,232 @@ impl Connection {
         retransmitted + self.scoreboard.unsacked_bytes(new_start, self.data_high())
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
+    //= reason=Output ACK field is the receive frontier; established reply flags and sequence are explicitly checked.
+    //# If the ACK control bit is set, this field contains the value of the next sequence number
+    //# the sender of the segment is expecting to receive. Once a connection is established,
+    //# this is always sent.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4
+    //= reason=SYN precedes queued data, FIN follows it; sequence numbers checked across wrap, handshake_queues_sends_until_established checks SYN consumes one.
+    //# For sequence number purposes, the SYN is considered to occur before the first actual
+    //# data octet of the segment in which it occurs, while the FIN is considered to occur after
+    //# the last actual data octet in a segment in which it occurs.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.1
+    //= reason=ISS/ISS+1 are checked on committed SYN output; active API enqueues SYN and driver polls, rather than emitting inline.
+    //# A SYN segment of the form <SEQ=ISS><CTL=SYN> is sent. Set SND.UNA to ISS, SND.NXT to
+    //# ISS+1, enter SYN-SENT state, and return.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Enabled receiver emits kind 5 after SYN permission; reordered data yields SACK and gap fill removes it.
+    //# If the data receiver has received a SACK-Permitted option on the SYN for
+    //# this connection, the data receiver MAY elect to generate SACK options as
+    //# described below.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Output gates kind 5 on sack_send, set only from SYN permission and local config.
+    //# If the data receiver has not received a SACK-Permitted option for a given
+    //# connection, it MUST NOT send SACK options on that connection.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Output uses available TCP/path option budget; tests assert 4 ordinary slots or 3 with timestamps, payload clipping and failed-output rollback.
+    //# * The data receiver SHOULD include as many distinct SACK blocks as possible
+    //# in the SACK option.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Update/IsLost/SetPipe are byte-range scoreboard functions; NextSeg is in poll-driven output selection, not a literal function. Focused scoreboard reference and priority tests provide behavioral evidence.
+    //# For the purposes of the algorithm defined in this document, the scoreboard
+    //# SHOULD implement the following functions:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Ordinary full-SMSS-budget tests show lost/new/speculative/rescue priorities. Reduced packet budgets also lower the IsLost threshold incorrectly; see section-4 NextSeg/rule (1.c) TODOs.
+    //# NextSeg () MUST return the sequence number range of the next segment that is
+    //# to be transmitted, per the following rules:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. With packet budget equal to SMSS, the next lost hole at offset 256 skips SACKed offset 128 and output is <= SMSS. This does not establish correct loss classification with piggybacked SACK; see rule (1.c) TODO.
+    //# (1) If there exists a smallest unSACKed sequence number 'S2' that meets the
+    //# following three criteria for determining loss, the sequence range of one
+    //# segment of up to SMSS octets starting with S2 MUST be returned.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Full-SMSS-budget test sends queued data before a speculative hole; snd_nxt advances and RecoveryPoint stays fixed. Reduced packet budgets can incorrectly promote a nonlost hole over new data; see rule (1.c) TODO.
+    //# (2) If no sequence number 'S2' per rule (1) exists but there exists
+    //# available unsent data and the receiver's advertised window allows, the
+    //# sequence range of one segment of up to SMSS octets of previously unsent data
+    //# starting with sequence number HighData+1 MUST be returned.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. With no new/lost segment, speculative offset 768 is sent before tail rescue, then high_rxt advances.
+    //# (3) If the conditions for rules (1) and (2) fail, but there exists an
+    //# unSACKed sequence number 'S3' that meets the criteria for detecting loss
+    //# given in steps (1.a) and (1.b) above (specifically excluding step (1.c)),
+    //# then one segment of up to SMSS octets starting with S3 SHOULD be returned.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Rescue contains the highest outstanding unsacked byte; success sets RescueRxt to fixed recovery boundary, retry does not consume it and a second rescue is denied.
+    //# If HighACK is greater than RescueRxt (or RescueRxt is undefined), then one
+    //# segment of up to SMSS octets that MUST include the highest outstanding
+    //# unSACKed sequence number SHOULD be returned, and RescueRxt set to
+    //# RecoveryPoint.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Rescue leaves high_rxt unchanged, explicitly asserted.
+    //# HighRxt MUST NOT be updated.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. No remaining permitted candidate yields Ok(None); rescue test separately denies repeated rescue.
+    //# (5) If the conditions for each of (1), (2), (3), and (4) are not met, then
+    //# NextSeg () MUST indicate failure, and no segment is returned.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Limited-transmit test checks one new transmission per fresh-evidence ACK and exclusion from reduction, not exhaustion of multi-SMSS credit from one ACK; see (3.3) TODO.
+    //# (3) The TCP MAY transmit previously unsent data segments as per Limited
+    //# Transmit [RFC5681], except that the number of octets which may be sent is
+    //# governed by pipe and cwnd as follows:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. During active recovery, repeated output polls consume pipe/cwnd credit and stop below SMSS. This is not evidence for the pre-recovery limited-transmit loop; see (3.3) TODO.
+    //# (C) If cwnd - pipe >= 1 SMSS, the sender SHOULD transmit one or more
+    //# segments as follows:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Output uses scoreboard lowest/tail-hole selection and fails without a candidate; test checks multiple output ranges then Ok(None).
+    //# (C.1) The scoreboard MUST be queried via NextSeg () for the sequence number
+    //# range of the next segment to transmit (if any), and the given segment sent.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Successful nonrescue output advances high_rxt; rescue explicitly leaves it unchanged; failed encode does not commit either.
+    //# (C.2) If any of the data octets sent in (C.1) are below HighData, HighRxt
+    //# MUST be set to the highest sequence number of the retransmitted segment
+    //# unless NextSeg () rule (4) was invoked for this retransmission.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-6
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Optional timer variant uses the shared successful-retransmission commit path. sack_multiloss_selective_recovery_and_transactional_entry asserts exact send_time+rto after both retransmissions, failed-output stability and nonadvancing-SACK nonrestart; sack_rto_discards_advice_retransmits_head_and_guards_epoch checks entry and expiry.
+    //# Therefore, we give implementers the latitude to use the standard
+    //# [RFC6298]-style RTO management or, optionally, a more careful variant that
+    //# re-arms the RTO timer on each retransmission that is sent during recovery
+    //# MAY be used.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-9
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Section 9 restates rule (3), not a new algorithm; speculative retransmission is selected and asserted before rescue.
+    //# Rule (3) of NextSeg() has been changed from MAY to SHOULD, to appropriately
+    //# reflect the opinion of the authors and working group that it should be left
+    //# in, rather than out, if an implementor does not have a compelling reason to
+    //# do otherwise.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-3
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Wire ACK remains cumulative across SACK reports and advances to end only after gap fill.
+    //# When missing segments are received, the data receiver acknowledges the data
+    //# normally by advancing the left window edge in the Acknowledgement Number
+    //# Field of the TCP header. The SACK option does not change the meaning of the
+    //# Acknowledgement Number field.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Equivalent byte-range strategy skips SACKed intervals in retransmission selection; test sends only missing offsets 0 and 256. RTO intentionally clears advice.
+    //# After the SACKed bit is turned on (as the result of processing a received
+    //# SACK option), the data sender will skip that segment during any later
+    //# retransmission.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-2
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. data_high is the exclusive transmitted data edge; new output advances snd_nxt but excludes FIN.
+    //# "HighData" is the highest sequence number transmitted at a given point.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-2
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. high_rxt is exclusive; only successful nonrescue retransmissions advance it.
+    //# "HighRxt" is the highest sequence number which has been retransmitted during
+    //# the current loss recovery phase.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-2
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. rescue_rxt grants a single tail retransmission and tracks recovery boundary after success.
+    //# "RescueRxt" is the highest sequence number which has been optimistically
+    //# retransmitted to prevent stalling of the ACK clock when there is loss at the
+    //# end of the window and no new data is available for transmission.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-2
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Recovery pipe bounds output; independent scoreboard per-byte oracle checks computation.
+    //# "Pipe" is a sender's estimate of the number of bytes outstanding in the
+    //# network. This is used during recovery for limiting the sender's sending
+    //# rate. The pipe variable allows TCP to use fundamentally different congestion
+    //# control than the algorithm specified in [RFC5681]. The congestion control
+    //# algorithm using the pipe estimate is often referred to as the "pipe
+    //# algorithm".
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Full-SMSS-budget test selects offset 256 after entry, skipping SACKed bytes. Connection passes packet_mss to IsLost via lowest_hole; a reduced budget can falsely classify loss. Helper tests using SMSS remain valid; see rule (1.c) TODO.
+    //# (1.a) S2 is greater than HighRxt.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Full-SMSS-budget test selects offset 256 after entry, skipping SACKed bytes. Connection passes packet_mss to IsLost via lowest_hole; a reduced budget can falsely classify loss. Helper tests using SMSS remain valid; see rule (1.c) TODO.
+    //# (1.b) S2 is less than the highest octet covered by any received SACK.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Full-SMSS-budget test selects offset 256 after entry, skipping SACKed bytes. Connection passes packet_mss to IsLost via lowest_hole; a reduced budget can falsely classify loss. Helper tests using SMSS remain valid; see rule (1.c) TODO.
+    //# (1.c) IsLost (S2) returns true.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Limited-transmit pipe passes snd_una (exclusive HighACK) as high_rxt.
+    //# (3.1) Set HighRxt to HighACK.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. First limited-transmit output computes pipe for credit; limited_pending clearing prevents the required return to SetPipe when more credit remains (3.3 TODO).
+    //# (3.2) Run SetPipe ().
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. First limited-transmit output checks pipe/cwnd and peer window, sends <=SMSS and advances snd_nxt. It clears limited_pending even if credit remains; repeated SetPipe/transmit for one ACK is not established (3.3 TODO).
+    //# (3.3) If (cwnd - pipe) >= 1 SMSS, there exists previously unsent data, and
+    //# the receiver's advertised window allows, transmit up to 1 SMSS of data
+    //# starting with the octet HighData+1 and update HighData to reflect this
+    //# transmission, then return to (3.2).
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. entry_pending selects first unsacked head and commits high_rxt/rescue_rxt on successful encode, not failure.
+    //# (4.3) Retransmit the first data segment presumed dropped -- the segment
+    //# starting with sequence number HighACK + 1. To prevent repeated
+    //# retransmission of the same data or a premature rescue retransmission, set
+    //# both HighRxt and RescueRxt to the highest sequence number in the
+    //# retransmitted segment.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Poll-driven output continues recovery candidates until cwnd credit exhausted.
+    //# (4.5) In order to take advantage of potential additional available cwnd,
+    //# proceed to step (C) below.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. No candidate returns no segment; multiloss and rescue tests assert Ok(None).
+    //# If NextSeg () returns failure (no data to send), return without sending
+    //# anything (i.e., terminate steps C.1 -- C.5).
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Successful new data advances exclusive snd_nxt; test checks one-SMSS advance while recovery point remains fixed.
+    //# (C.3) If any of the data octets sent in (C.1) are above HighData, HighData
+    //# must be updated to reflect the transmission of previously unsent data.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Non-RACK pipe increments by actual successfully encoded bytes; test fills pipe exactly to cwnd and denies next poll.
+    //# (C.4) The estimate of the amount of data outstanding in the network must be
+    //# updated by incrementing pipe by the number of octets transmitted in (C.1).
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. One segment per output poll; successive polls select ranges until credit less than SMSS, equivalent to loop.
+    //# (C.5) If cwnd - pipe >= 1 SMSS, return to (C.1)
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Post-RTO selection fills fresh holes without the normal fast-recovery NextSeg priorities/rescue and stays guarded until old flight is cumulatively covered.
+    //# The exact algorithm for this selection is not specified in this document
+    //# (specifically NextSeg () is inappropriate during loss recovery after an
+    //# RTO).
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= reason=TLP branch prefers lowest unsent data fitting the receive window, even beyond cwnd; commit advances SND.NXT and charges FlightSize.
+    //# If both conditions are met, then the sender SHOULD transmit a
+    //# previously unsent data segment, if one exists and the receive window
+    //# allows, and increment the FlightSize accordingly.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= reason=Output falls back to the tail segment and commits retransmitted probe state only on successful encode.
+    //# If such an unsent segment is not available, then the sender SHOULD
+    //# retransmit the highest-sequence segment sent so far and set
+    //# TLP.is_retrans to true.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= reason=All successfully encoded non-persist/non-keepalive data, including new/retransmitted TLP, calls Rack::transmit with committed boundaries and now.
+    //# The sender MUST follow the RACK transmission procedures in the "Upon
+    //# Transmitting a Data Segment" section upon sending either a
+    //# retransmission or a new data loss probe.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= reason=Probe commit clears PTO and arms now+RTO; failed encode leaves the expiry-armed fallback intact.
+    //# After attempting to send a loss probe, regardless of whether a loss
+    //# probe was sent, the sender MUST re-arm the RTO timer, not the PTO
+    //# timer, if the FlightSize is not zero.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.2
+    //= reason=When RACK is enabled, selection uses Rack::lowest_lost and time-based pipe instead of unchanged RFC6675 NextSeg; the disabled/fallback profile retains RFC6675.
+    //# Therefore, the algorithm [RFC6675]
+    //# MUST NOT be used with RACK-TLP; instead, a modified recovery
+    //# algorithm that carefully addresses such a case is needed.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+    //= reason=RACK loss selection is clipped by recovery credit/PRR, then receive-window limits; timer marking alone does not emit bytes.
+    //# A segment marked
+    //# as lost by RACK-TLP MUST NOT be retransmitted until congestion
+    //# control deems this appropriate.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= reason=Requires fresh RTT at selection and clears it only when nonempty probe commits.
+    //# Second, the sender has obtained an RTT measurement since the last
+    //# loss probe transmission or the start of the connection, whichever
+    //# was later.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+    //= reason=TLP may send one packet past cwnd but within receive window; committed new bytes advance SND.NXT, so flight includes overcommit (not limited-transmit credit).
+    //# The only exception -- the only way in which RACK-TLP modulates the
+    //# congestion control algorithm -- is that one outstanding loss probe
+    //# can be sent even if the congestion window is fully used.  However,
+    //# this temporary overcommit is accounted for and credited in the in-
+    //# flight data tracked for congestion control, so that congestion
+    //# control will erase the overcommit upon the next ACK.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= reason=Partial output evidence: retransmission payload clipped to PRR credit, new recovery data bounded by recovery_credit, and actual payload counted only after wire::encode succeeds. No universal bound claim for initial override or special output paths.
+    //# On any data transmission or retransmission:
+    //#
+    //#    prr_out += (data sent) // strictly less than or equal to sndcnt
     pub(crate) fn transmit(
         &mut self,
         now: Instant,
@@ -2566,7 +3193,7 @@ impl Connection {
                 || self.prr.is_none() && self.recovery_credit(recovery) >= self.mss as u32
             {
                 //= https://www.rfc-editor.org/rfc/rfc6675#section-4
-                //= reason=Connection output selection applies the four NextSeg priorities to scoreboard ranges; markers commit only after encoding.
+                //= reason=Full-SMSS-budget tests exercise NextSeg priorities; reduced packet budgets incorrectly lower the IsLost threshold (section-4 TODO). Markers commit only after encoding.
                 //# NextSeg () MUST return the sequence number range of the next segment that is to be transmitted, per the following rules:
                 // RFC 6675 NextSeg: lost hole, new data, speculative hole,
                 // then one tail rescue. New data is selected by the live branch.
@@ -3173,6 +3800,73 @@ impl Connection {
         .min()
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.8
+    //= reason=Default SYN/data R2 terminal behavior; storage reclaimed by release, timer servicing belongs to driver; explicit application stall timeout is separate.
+    //# For any state if the user timeout expires, flush all queues, signal the user "error:
+    //# connection aborted due to user timeout" in general and for any outstanding calls, delete
+    //# the TCB, enter the CLOSED state, and return.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5.1
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Timeout clears scoreboard and RTO sends left edge before acting on fresh SACKs. Implementation satisfies even the original stronger wording; verified erratum 1610 changes MUST to SHOULD, rejected erratum 6602 is not applied.
+    //# Because the data receiver is allowed to discard SACKed data, when a
+    //# retransmit timeout occurs the data sender MUST ignore prior SACK information
+    //# in determining which data to retransmit.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Timeout clears advisory ranges; test observes full pipe after timeout.
+    //# After a retransmit timeout the data sender SHOULD turn off all of the SACKed
+    //# bits, since the timeout might indicate that the data receiver has reneged.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Timeout output retransmits snd_una; test verifies head sequence and guard.
+    //# The data sender MUST retransmit the segment at the left edge of the window
+    //# after a retransmit timeout, whether or not the SACKed bit is on for that
+    //# segment.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Clears prior advice and sends the head. Erratum 1610 permits a weaker SHOULD but implementation takes conservative clearing path.
+    //# As a result, [RFC2018] suggests that a TCP sender SHOULD expunge the SACK
+    //# information gathered from a receiver upon a retransmission timeout (RTO)
+    //# "since the timeout might indicate that the data receiver has reneged."
+    //# Additionally, a TCP sender MUST "ignore prior SACK information in
+    //# determining which data to retransmit." However, since the publication of
+    //# [RFC2018], this has come to be viewed by some as too strong.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Timeout replaces recovery with sack_guard=data_high; fresh SACKs cannot reenter until cumulative boundary is covered. Exclusive boundary equals RFC highest byte plus one.
+    //# If an RTO occurs during loss recovery as specified in this document,
+    //# RecoveryPoint MUST be set to HighData.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Timeout replaces recovery with sack_guard=data_high; fresh SACKs cannot reenter until cumulative boundary is covered. Exclusive boundary equals RFC highest byte plus one.
+    //# Further, the new value of RecoveryPoint MUST be preserved and the loss
+    //# recovery algorithm outlined in this document MUST be terminated.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Timeout replaces recovery with sack_guard=data_high; fresh SACKs cannot reenter until cumulative boundary is covered. Exclusive boundary equals RFC highest byte plus one.
+    //# In addition, a new recovery phase (as described in Section 5) MUST NOT be
+    //# initiated until HighACK is greater than or equal to the new value of
+    //# RecoveryPoint.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= reason=Services the RACK deadline by re-running detect_rack; RTO takes priority if already due.
+    //# For timely loss detection, it is RECOMMENDED that the
+    //# sender install a reordering timer.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= reason=Checks no tlp_end, no tlp_flight, and fresh RTT before making a probe pending; output repeats these checks.
+    //# When the PTO timer expires, the sender MUST check whether both of the
+    //# following conditions are met before sending a loss probe:
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= reason=At PTO expiration failed send eligibility leaves no pending probe and rearms RTO for nonzero/nonzero-window flight.
+    //# If either one of these two conditions is not met, then the sender
+    //# MUST skip sending a loss probe and MUST proceed to re-arm the RTO
+    //# timer, as specified at the end of this section.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= reason=PTO expiry rearms RTO before attempting output when flight and window are nonzero; successful probe commit rearms again.
+    //# After attempting to send a loss probe, regardless of whether a loss
+    //# probe was sent, the sender MUST re-arm the RTO timer, not the PTO
+    //# timer, if the FlightSize is not zero.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= reason=Tracks both unresolved TLP recovery episode and original-flight boundary; at most one committed probe until ACK/recovery reset.
+    //# First, there is no other previous loss probe still in flight.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= reason=Consumes matching retained timer evidence once, then acknowledges PRR with real but capped pre-entry delivery. This is not a new ACK or proof of RFC entry-epoch semantics; TODO remains.
+    //# On every ACK during recovery compute:
+    //#
+    //#    DeliveredData = change_in(snd.una) + change_in(SACKd)
+    //#    prr_delivered += DeliveredData
     pub(crate) fn timeout(&mut self, now: Instant) -> Result<(), Error> {
         self.check_time(now)?;
         self.now = now;
@@ -3373,6 +4067,169 @@ mod tests {
         assert!(a.take_events().connected);
         assert!(b.take_events().connected);
         (a, b)
+    }
+
+    #[test]
+    fn send_state_matrix_preserves_queue_on_rejection() {
+        for state in [
+            State::Closed,
+            State::SynSent,
+            State::SynReceived,
+            State::Established,
+            State::FinWait1,
+            State::FinWait2,
+            State::CloseWait,
+            State::Closing,
+            State::LastAck,
+            State::TimeWait,
+        ] {
+            let (mut a, _) = pair(config(4, 4), 100);
+            a.state = state;
+            let allowed = matches!(
+                state,
+                State::SynSent | State::SynReceived | State::Established | State::CloseWait
+            );
+            let before = (a.send.len(), a.snd_una, a.snd_nxt, a.acknowledged());
+            if allowed {
+                assert_eq!(a.write(b"abc"), Ok(3));
+                assert_eq!(a.write(b"de"), Ok(1));
+                assert_eq!(a.write(b"f"), Err(Error::WouldBlock));
+                let mut queued = [0; 4];
+                assert_eq!(a.send.copy(0, &mut queued), 4);
+                assert_eq!(&queued, b"abcd");
+                assert_eq!(
+                    (a.snd_una, a.snd_nxt, a.acknowledged()),
+                    (before.1, before.2, before.3)
+                );
+            } else {
+                assert_eq!(a.write(b"late"), Err(Error::InvalidState));
+                assert_eq!(
+                    (a.send.len(), a.snd_una, a.snd_nxt, a.acknowledged()),
+                    before
+                );
+            }
+            assert_eq!(a.state(), state);
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.4
+    //= type=test
+    //= reason=Unpushed writes flush before FIN; read half remains available.
+    //# Close also implies push function.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.3
+    //= type=test
+    //= reason=CLOSE-WAIT drains accepted bytes then returns EOF (0), the nonblocking API equivalent of closing notification.
+    //# Since the remote side has already sent FIN, RECEIVEs must be satisfied by data already
+    //# on hand, but not yet delivered to the user. If no text is awaiting delivery, the RECEIVE
+    //# will get an "error: connection closing" response. Otherwise, any remaining data can be
+    //# used to satisfy the RECEIVE.
+    fn shutdown_pushes_unpushed_fifo_and_close_wait_drains_before_eof() {
+        let (mut a, mut b) = pair(config(64, 4), u32::MAX - 2);
+        a.set_nagle(false);
+        a.write_with_push(b"abc", false).unwrap();
+        a.write_with_push(b"def", false).unwrap();
+        a.shutdown().unwrap();
+        let first = deliver(&mut a, &mut b, 40);
+        let first = wire::parse(ip(tuple()), &first).unwrap();
+        assert_eq!(first.payload, b"abcd");
+        assert_eq!(first.header.flags & FIN, 0);
+        let last = deliver(&mut a, &mut b, 50);
+        let last = wire::parse(ip(tuple()), &last).unwrap();
+        assert_eq!(last.payload, b"ef");
+        assert_ne!(last.header.flags & FIN, 0);
+        assert_eq!(b.state(), State::CloseWait);
+        assert!(b.take_events().half_closed);
+        for expected in [b"ab", b"cd", b"ef"] {
+            let mut out = [0; 2];
+            assert_eq!(b.read(&mut out), Ok(2));
+            assert_eq!(&out, expected);
+        }
+        assert_eq!(b.read(&mut [0; 2]), Ok(0));
+        assert_eq!(b.write(b"reply"), Ok(5));
+        deliver(&mut b, &mut a, 60);
+        let mut out = [0; 8];
+        assert_eq!(a.read(&mut out), Ok(4));
+        assert_eq!(&out[..4], b"repl");
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //= reason=Focused edge test covers duplicate-prefix and out-of-window suffix trimming, wrap and zero-window rejection.
+    //# If a segment's contents straddle the boundary between old and new, only the new parts
+    //# are processed.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //= reason=Rejected input leaves receive state unchanged and replies with current ACK; invalid RST is silent.
+    //# If an incoming segment is not acceptable, an acknowledgment should be sent in reply
+    //# (unless the RST bit is set, if so drop the segment and return):
+    //# <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK> o After sending the acknowledgment, drop the
+    //# unacceptable segment and return.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
+    //= type=test
+    //= reason=Output ACK field is the receive frontier; established reply flags and sequence are explicitly checked.
+    //# If the ACK control bit is set, this field contains the value of the next sequence number
+    //# the sender of the segment is expecting to receive. Once a connection is established,
+    //# this is always sent.
+    fn receive_acceptability_edges_trim_duplicates_and_wrap() {
+        for next in [Seq(901), Seq(u32::MAX - 1)] {
+            for (offset, payload, flags, used, readable, reply) in [
+                (u32::MAX - 1, b"xxAB".as_slice(), ACK, 2, 2, true),
+                (30, b"WXYZ".as_slice(), ACK, 2, 0, true),
+                (32, b"bad".as_slice(), ACK, 0, 0, true),
+                (u32::MAX - 3, b"old".as_slice(), ACK, 0, 0, true),
+                (32, b"bad".as_slice(), RST | ACK, 0, 0, false),
+            ] {
+                let (mut a, _) = pair(config(32, 8), 100);
+                a.receive.reset_start(next).unwrap();
+                a.advertised_edge = next.wrapping_add(32);
+                let ack = a.snd_una;
+                inject(
+                    &mut a,
+                    40,
+                    next.wrapping_add(offset),
+                    ack,
+                    flags,
+                    32,
+                    payload,
+                );
+                assert_eq!(a.state(), State::Established);
+                assert_eq!(a.receive_used, used);
+                assert_eq!(a.readable_bytes(), readable);
+                assert_eq!(a.receive.next(), next.wrapping_add(readable as u32));
+                let mut out = [0; 64];
+                let packet = a.transmit(40, &mut out).unwrap();
+                assert_eq!(packet.is_some(), reply);
+                if let Some(len) = packet {
+                    let segment = wire::parse(ip(tuple()), &out[..len]).unwrap();
+                    assert_eq!(segment.header.flags, ACK);
+                    assert_eq!(segment.header.sequence, a.snd_nxt.0);
+                    assert_eq!(segment.header.acknowledgment, a.receive.next().0);
+                    assert!(segment.payload.is_empty());
+                }
+                if readable != 0 {
+                    let mut out = [0; 8];
+                    assert_eq!(a.read(&mut out), Ok(2));
+                    assert_eq!(&out[..2], b"AB");
+                }
+            }
+            for (offset, payload, reply) in [
+                (0, b"".as_slice(), false),
+                (1, b"".as_slice(), true),
+                (0, b"bad".as_slice(), true),
+            ] {
+                let (mut a, _) = pair(config(32, 8), 100);
+                a.receive.reset_start(next).unwrap();
+                a.advertised_edge = next;
+                let ack = a.snd_una;
+                inject(&mut a, 40, next.wrapping_add(offset), ack, ACK, 32, payload);
+                assert_eq!(a.receive.next(), next);
+                assert_eq!(a.receive_used, 0);
+                assert_eq!(a.ack_pending, reply);
+                assert_eq!(a.state(), State::Established);
+            }
+        }
     }
 
     #[test]
@@ -3658,6 +4515,18 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+    //= type=test
+    //= reason=Partial/repeated SACK does not mint retransmission credit after initial entry output.
+    //# A segment marked
+    //# as lost by RACK-TLP MUST NOT be retransmitted until congestion
+    //# control deems this appropriate.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= type=test
+    //= reason=Asserts partial SACK then full tail and later head coverage cannot double-count delivery; checks credit=0 and no output. Entry guarantee explicitly not evidence for strict CRB.
+    //# With SACK,
+    //# DeliveredData can be computed precisely as the change in snd.una,
+    //# plus the (signed) change in SACKd.
     fn tlp_partial_sack_then_full_tail_delivery_cannot_inflate_prr_credit() {
         for iss in [0, u32::MAX - 1999] {
             let (mut a, _) = tlp_pair(iss);
@@ -3687,6 +4556,18 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.4.2
+    //= type=test
+    //= reason=Asserts TLP reduction and recovery of later original loss without a second same-flight reduction.
+    //# The sender then
+    //# SHOULD invoke a congestion control response equivalent to a fast
+    //# recovery.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+    //= type=test
+    //= reason=Later original loss in the already-reduced TLP flight starts recovery without a second reduction.
+    //# If multiple original transmissions or retransmissions were lost in a
+    //# window, the congestion control specified in [RFC5681] only reacts
+    //# once per window.
     fn tlp_repaired_loss_epoch_never_bars_recovery_of_later_original_loss() {
         for iss in [0, u32::MAX - 4999] {
             let cfg = ConnectionConfig {
@@ -3735,6 +4616,12 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= type=test
+    //= reason=Immediate SACK of partly retransmitted original cannot replenish freshness.
+    //# Second, the sender has obtained an RTT measurement since the last
+    //# loss probe transmission or the start of the connection, whichever
+    //# was later.
     fn tlp_options_clipped_suffix_full_sack_cannot_grant_fresh_rtt() {
         for iss in [0, u32::MAX - 1999] {
             let (mut a, _) = tlp_pair(iss);
@@ -3777,6 +4664,23 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= type=test
+    //= reason=Checks tail retransmission, output retry state, RTO fallback and no repeated probe.
+    //# If such an unsent segment is not available, then the sender SHOULD
+    //# retransmit the highest-sequence segment sent so far and set
+    //# TLP.is_retrans to true.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= type=test
+    //= reason=Output-too-small does not change RACK retransmitted counts or probe state; successful output does.
+    //# The sender MUST follow the RACK transmission procedures in the "Upon
+    //# Transmitting a Data Segment" section upon sending either a
+    //# retransmission or a new data loss probe.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.1
+    //= type=test
+    //= reason=RTO after pending/committed probe clears episode and preserves last-resort recovery.
+    //# Reset TLP.is_retrans and TLP.end_seq when initiating a connection,
+    //# fast recovery, or RTO recovery.
     fn tlp_four_packets_partial_byte_sack_output_retry_and_rto_sequence() {
         for iss in [0, u32::MAX - 1999] {
             let (mut a, _) = tlp_pair(iss);
@@ -3869,6 +4773,45 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= type=test
+    //= reason=At full cwnd one new segment probe increases flight by one MSS and a second output is blocked.
+    //# When the PTO timer expires, the sender MUST check whether both of the
+    //# following conditions are met before sending a loss probe:
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= type=test
+    //= reason=Asserts new-data choice, one MSS cwnd overcommit, flight charge and no loss response for its ACK.
+    //# If both conditions are met, then the sender SHOULD transmit a
+    //# previously unsent data segment, if one exists and the receive window
+    //# allows, and increment the FlightSize accordingly.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= type=test
+    //= reason=Blocks a second output while probe is outstanding despite additional unsent data.
+    //# First, there is no other previous loss probe still in flight.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.4.2
+    //= type=test
+    //= reason=New-data probe ACK clears episode without threshold reduction.
+    //# TLP_process_ack(ACK):
+    //# If TLP.end_seq is not None AND ACK's ack. number >= TLP.end_seq:
+    //# If not TLP.is_retrans:
+    //# TLP.end_seq = None    /* TLP of new data delivered */
+    //# Else if ACK has a DSACK option matching TLP.end_seq:
+    //# TLP.end_seq = None    /* Case 1, above */
+    //# Else If ACK's ack. number > TLP.end_seq:
+    //# TLP.end_seq = None    /* Repaired the single loss */
+    //# (Invoke congestion control to react to
+    //# the loss event the probe has repaired)
+    //# Else If ACK is a DupAck without any SACK option:
+    //# TLP.end_seq = None     /* Case 2, above */
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+    //= type=test
+    //= reason=Checks full-window overcommit, flight=5000 for cwnd=4000, no second output and cumulative ACK exit.
+    //# The only exception -- the only way in which RACK-TLP modulates the
+    //# congestion control algorithm -- is that one outstanding loss probe
+    //# can be sent even if the congestion window is fully used.  However,
+    //# this temporary overcommit is accounted for and credited in the in-
+    //# flight data tracked for congestion control, so that congestion
+    //# control will erase the overcommit upon the next ACK.
     fn tlp_prefers_new_data_beyond_cwnd_and_ack_is_not_loss() {
         for iss in [0, u32::MAX - 1999] {
             let (mut a, _) = tlp_pair(iss);
@@ -3899,6 +4842,39 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= type=test
+    //= reason=No fresh RTT after retransmitted probe, no second PTO; a new sampled flight permits another.
+    //# When the PTO timer expires, the sender MUST check whether both of the
+    //# following conditions are met before sending a loss probe:
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.4.2
+    //= type=test
+    //= reason=Checks equality, matching and unrelated DSACK, bare DupACK, later ACK loss reduction and fresh-sample gate.
+    //# If the TLP
+    //# sender does not receive such an indication, then it MUST assume that
+    //# the original data segment, the TLP retransmission, or a corresponding
+    //# ACK was lost for congestion control purposes.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= type=test
+    //= reason=Retransmitted probe does not yield a new ordinary RTT sample; new unambiguous data ACK restores freshness.
+    //# Second, the sender has obtained an RTT measurement since the last
+    //# loss probe transmission or the start of the connection, whichever
+    //# was later.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.4.2
+    //= type=test
+    //= reason=Checks retransmission equality, DSACK match/unrelated, DupACK and beyond-end loss.
+    //# TLP_process_ack(ACK):
+    //# If TLP.end_seq is not None AND ACK's ack. number >= TLP.end_seq:
+    //# If not TLP.is_retrans:
+    //# TLP.end_seq = None    /* TLP of new data delivered */
+    //# Else if ACK has a DSACK option matching TLP.end_seq:
+    //# TLP.end_seq = None    /* Case 1, above */
+    //# Else If ACK's ack. number > TLP.end_seq:
+    //# TLP.end_seq = None    /* Repaired the single loss */
+    //# (Invoke congestion control to react to
+    //# the loss event the probe has repaired)
+    //# Else If ACK is a DupAck without any SACK option:
+    //# TLP.end_seq = None     /* Case 2, above */
     fn tlp_retransmit_ack_equality_dsack_dupack_and_single_loss_response() {
         for iss in [0, u32::MAX - 1999] {
             // 0: ACK beyond probe = loss; 1: matching DSACK; 2: bare DupACK;
@@ -3953,6 +4929,24 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-1
+    //= type=test
+    //= reason=Opt-in packet-level feedback enters RACK recovery and retransmits earlier losses.
+    //# This document presents RACK-TLP, a TCP loss detection algorithm that
+    //# improves upon the widely implemented duplicate acknowledgment
+    //# (DupAck) counting approach described in [RFC5681] and [RFC6675]; it
+    //# is RECOMMENDED as an alternative to that earlier approach.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.1
+    //= type=test
+    //= reason=Feedback-triggered fast recovery clears probe episode.
+    //# Reset TLP.is_retrans and TLP.end_seq when initiating a connection,
+    //# fast recovery, or RTO recovery.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.4.1
+    //= type=test
+    //= reason=Actual packet delivery of tail probe solicits SACK and causes earlier losses, threshold reduction and retransmission.
+    //# More specifically, RACK_detect_loss() (Step 5) would mark those
+    //# earlier segments as lost.  Then the sender would trigger a fast
+    //# recovery to recover those losses.
     fn tlp_packet_feedback_detects_earlier_losses_and_enters_rack_recovery() {
         for iss in [0, u32::MAX - 1999] {
             let (mut a, mut b) = tlp_pair(iss);
@@ -3985,6 +4979,15 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
+    //= type=test
+    //= reason=Checks advancing ACK reschedule and cancellation for full SACK, zero window and invalid ledger.
+    //# The sender SHOULD start or
+    //# restart a loss probe PTO timer after transmitting new data (that was
+    //# not itself a loss probe) or upon receiving an ACK that cumulatively
+    //# acknowledges new data unless it is already in fast recovery, RTO
+    //# recovery, or segments have been SACKed (i.e., RACK.segs_sacked is not
+    //# zero).
     fn tlp_zero_window_complete_sack_and_recovery_cancel_probe() {
         for mode in 0..4 {
             let (mut a, _) = tlp_pair(0);
@@ -4050,6 +5053,12 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.3
+    //= type=test
+    //= reason=Failed output preserves sample/probe state and subsequent RTO emits the first outstanding packet.
+    //# After attempting to send a loss probe, regardless of whether a loss
+    //# probe was sent, the sender MUST re-arm the RTO timer, not the PTO
+    //# timer, if the FlightSize is not zero.
     fn tlp_failed_output_falls_back_to_rto_without_consuming_a_probe() {
         let (mut a, _) = tlp_pair(0);
         a.write(&[0x55; 5000]).unwrap();
@@ -4080,6 +5089,28 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
+    //= type=test
+    //= reason=Asserts capped tie, no RTO backoff and successful probe RTO rearm, not the unestimated RTT branch.
+    //# Summarizing these considerations in pseudocode form, a sender SHOULD
+    //# use the following logic to select the duration of a PTO:
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-4
+    //= type=test
+    //= reason=Asserts default-off TLP and rejects all TLP/RACK/SACK invalid combinations.
+    //# TLP requires RACK.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
+    //= type=test
+    //= reason=Directly asserts cap tie and RTO rearm after successful probe.
+    //# TLP_calc_PTO():
+    //# If SRTT is available:
+    //# PTO = 2 * SRTT
+    //# If FlightSize is one segment:
+    //# PTO += TLP.max_ack_delay
+    //# Else:
+    //# PTO = 1 sec
+    //#
+    //# If Now() + PTO > TCP_RTO_expiration():
+    //# PTO = TCP_RTO_expiration() - Now()
     fn tlp_opt_in_rto_floor_validation_fresh_rtt_and_capped_pto() {
         assert!(!ConnectionConfig::default().tlp);
         assert_eq!(ConnectionConfig::default().rto_min_us, 1_000_000);
@@ -4124,6 +5155,30 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Checks next_deadline, deferred entry and emitted retransmission after timer expiry.
+    //# For timely loss detection, it is RECOMMENDED that the
+    //# sender install a reordering timer.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+    //= type=test
+    //= reason=Exercises RACK timer recovery, unique delivery credit and PRR output gating.
+    //# The Proportional Rate
+    //# Reduction (PRR) algorithm [RFC6937] is RECOMMENDED for the specific
+    //# congestion control actions taken upon the losses detected by RACK-
+    //# TLP.
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
+    //= type=test
+    //= reason=Services deadline and confirms deferred recovery and output selection.
+    //# When an ACK
+    //# is received or the RACK reordering timer expires, call
+    //# RACK_detect_loss_and_arm_timer().
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Failed output preserves TransportInfo, successful packets increase retransmission count, repeated SACK cannot restore spent credit. No direct prr_out assertion for all output kinds.
+    //# On any data transmission or retransmission:
+    //#
+    //#    prr_out += (data sent) // strictly less than or equal to sndcnt
     fn rack_shift_timer_loss_and_reordered_sack_counts() {
         for iss in [0, u32::MAX - 4999] {
             for low in [3000, 5000] {
@@ -4179,6 +5234,12 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= type=test
+    //= reason=Retained causative evidence survives duplicate SACK, clears on advancing ACK, reset and scoreboard exhaustion; asserts PRR disabled after exhaustion. Not interval-sum equivalence.
+    //# Furthermore, for any TCP
+    //# (with or without SACK), the sum of DeliveredData must agree with the
+    //# forward progress over the same time interval.
     fn rack_timer_entry_credit_is_unique_and_cleared_on_ack_and_reset() {
         let mut a = rack_flight(0);
         rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
@@ -4249,6 +5310,12 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-3
+    //= type=test
+    //= reason=Exercises recovery burst across wrap, one/two holes and unsent suffix; failed small output precedes each successful MSS packet. Validates transactional recovery output, not all PRR accounting paths.
+    //# On any data transmission or retransmission:
+    //#
+    //#    prr_out += (data sent) // strictly less than or equal to sndcnt
     fn recovery_burst_push_preserves_explicit_control_and_unsent_suffix() {
         for (iss, holes) in [
             (0, 1),
@@ -4292,6 +5359,12 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= type=test
+    //= reason=Repeated same SACK after output leaves credit zero; cumulative delivery and recovery exit leave no outstanding ledger counts. Not signed reneging proof.
+    //# With SACK,
+    //# DeliveredData can be computed precisely as the change in snd.una,
+    //# plus the (signed) change in SACKd.
     fn rack_shift_three_sacks_nofack_and_cumulative_delivery() {
         for iss in [0, u32::MAX - 4999] {
             let mut a = rack_flight(iss);
@@ -4352,6 +5425,18 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+    //= type=test
+    //= reason=After initial MSS consumes PRR credit, further timer-marked loss cannot emit without new delivery credit.
+    //# A segment marked
+    //# as lost by RACK-TLP MUST NOT be retransmitted until congestion
+    //# control deems this appropriate.
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= type=test
+    //= reason=Immediate entry consumes its MSS; later deferred timer marks another loss without minting delivery credit; asserts zero credit and no transmission. Does not prove pre-entry policy.
+    //# Furthermore, for any TCP
+    //# (with or without SACK), the sum of DeliveredData must agree with the
+    //# forward progress over the same time interval.
     fn rack_mixed_immediate_deferred_loss_timer_cannot_mint_prr_entry_credit() {
         for iss in [0, u32::MAX - 1999] {
             let (mut a, _) = tlp_pair(iss);
@@ -4413,6 +5498,13 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= type=test
+    //= reason=Partial SACK retains byte advice; completing original packet retains only 502 new bytes. Asserts later cumulative credit, RTO removal and no-SACK fallback; no universal entry accounting claim.
+    //# SACKd: The total number of bytes that the scoreboard indicates have
+    //# been delivered to the receiver.  This can be computed by scanning
+    //# the scoreboard and counting the total number of bytes covered by
+    //# all SACK blocks.  If SACK is not in use, SACKd is not defined.
     fn rack_partial_sack_credit_rto_ecn_and_peer_fallback() {
         let mut a = rack_flight(0);
         rack_sack(&mut a, 200_000, 0, &[(7501, 7999)]);
@@ -4461,6 +5553,21 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc8985#section-4
+    //= type=test
+    //= reason=Peer without negotiated SACK uses ordinary fast retransmit, not RACK/PRR.
+    //# The connection MUST use selective acknowledgment (SACK) options
+    //# [RFC2018], and the sender MUST keep SACK scoreboard information
+    //# on a per-connection basis ("SACK scoreboard" has the same meaning
+    //# here as in [RFC6675], Section 3).
+    //= https://www.rfc-editor.org/rfc/rfc6937#section-2
+    //= type=test
+    //= reason=Peer lacking SACK negotiates ordinary duplicate-ACK retransmission; asserts prr remains None. Applicability evidence only, not implementation of PRR without SACK.
+    //# In recovery without SACK,
+    //# DeliveredData is estimated to be 1 SMSS on duplicate
+    //# acknowledgements, and on a subsequent partial or full ACK,
+    //# DeliveredData is estimated to be the change in snd.una, minus 1
+    //# SMSS for each preceding duplicate ACK.
     fn rack_prr_peer_without_sack_uses_ordinary_fast_retransmit() {
         let cfg = ConnectionConfig {
             sack: true,
@@ -4774,6 +5881,35 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Enabled receiver emits kind 5 after SYN permission; reordered data yields SACK and gap fill removes it.
+    //# If the data receiver has received a SACK-Permitted option on the SYN for
+    //# this connection, the data receiver MAY elect to generate SACK options as
+    //# described below.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Ordinary reordered arrivals schedule immediate ACKs, output includes retained ranges; tests parse emitted ACKs.
+    //# If the data receiver generates SACK options under any circumstance, it
+    //# SHOULD generate them under all permitted circumstances.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Ordinary reordered arrivals schedule immediate ACKs, output includes retained ranges; tests parse emitted ACKs.
+    //# If sent at all, SACK options SHOULD be included in all ACKs which do not ACK
+    //# the highest sequence number in the data receiver's queue.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Ordinary reordered arrivals schedule immediate ACKs, output includes retained ranges; tests parse emitted ACKs.
+    //# The receiver SHOULD send an ACK for every valid segment that arrives
+    //# containing new data, and each of these "duplicate" ACKs SHOULD bear a SACK
+    //# option.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-3
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Wire ACK remains cumulative across SACK reports and advances to end only after gap fill.
+    //# When missing segments are received, the data receiver acknowledges the data
+    //# normally by advancing the left window edge in the Acknowledgement Number
+    //# Field of the TCP header. The SACK option does not change the meaning of the
+    //# Acknowledgement Number field.
     fn sack_receiver_reorder_gap_fill_and_dsack_transaction() {
         for iss in [100, u32::MAX - 20] {
             let (mut a, mut b) = pair(sack_config(128), iss);
@@ -4837,6 +5973,11 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-4
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Output uses available TCP/path option budget; tests assert 4 ordinary slots or 3 with timestamps, payload clipping and failed-output rollback.
+    //# * The data receiver SHOULD include as many distinct SACK blocks as possible
+    //# in the SACK option.
     fn sack_options_budget_ts_payload_fin_and_failed_output() {
         for timestamps in [false, true] {
             let cfg = ConnectionConfig {
@@ -4915,6 +6056,11 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Validated negotiated ACKs update in-flight ranges; stale/future/DSACK-only blocks cannot count as fresh delivery.
+    //# Upon the receipt of any ACK containing SACK information, the scoreboard MUST
+    //# be updated via the Update () routine.
     fn sack_invalid_future_stale_ack_and_dsack_are_not_delivery() {
         let mut a = sack_flight(128, 100, 6);
         let una = a.snd_una;
@@ -4971,9 +6117,105 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc6675#section-4
     //= type=test
+    //= reason=Full-SMSS-budget priority evidence only; reduced packet budgets can falsely promote loss (section-4 NextSeg/rule (1.c) TODOs).
     //# NextSeg () MUST return the
     //# sequence number range of the next segment that is to be
     //# transmitted, per the following rules:
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-8
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Only validated cumulative ACK calls SendBuffer::acknowledge; test asserts 1024 bytes retained across selective recovery and zero only after full ACK.
+    //# Since the data receiver may later discard data reported in a SACK option,
+    //# the sender MUST NOT discard data before it is acknowledged by the
+    //# Acknowledgment Number field in the TCP header.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Update/IsLost/SetPipe are byte-range scoreboard functions; NextSeg is in poll-driven output selection, not a literal function. Focused scoreboard reference and priority tests provide behavioral evidence.
+    //# For the purposes of the algorithm defined in this document, the scoreboard
+    //# SHOULD implement the following functions:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. SACK updates never release send bytes; cumulative ACK is the release path and is asserted separately.
+    //# Note: SACK information is advisory and therefore SACKed data MUST NOT be
+    //# removed from the TCP's retransmission buffer until the data is cumulatively
+    //# acknowledged [RFC2018].
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. With packet budget equal to SMSS, the next lost hole at offset 256 skips SACKed offset 128 and output is <= SMSS. This does not establish correct loss classification with piggybacked SACK; see rule (1.c) TODO.
+    //# (1) If there exists a smallest unSACKed sequence number 'S2' that meets the
+    //# following three criteria for determining loss, the sequence range of one
+    //# segment of up to SMSS octets starting with S2 MUST be returned.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. No remaining permitted candidate yields Ok(None); rescue test separately denies repeated rescue.
+    //# (5) If the conditions for each of (1), (2), (3), and (4) are not met, then
+    //# NextSeg () MUST indicate failure, and no segment is returned.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Exclusive recovery boundary is cumulatively ACKed; recovery terminates, send storage releases and cwnd is deflated.
+    //# (A) An incoming cumulative ACK for a sequence number greater than
+    //# RecoveryPoint signals the end of loss recovery, and the loss recovery phase
+    //# MUST be terminated.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Output uses scoreboard lowest/tail-hole selection and fails without a candidate; test checks multiple output ranges then Ok(None).
+    //# (C.1) The scoreboard MUST be queried via NextSeg () for the sequence number
+    //# range of the next segment to transmit (if any), and the given segment sent.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Equivalent byte-range strategy skips SACKed intervals in retransmission selection; test sends only missing offsets 0 and 256. RTO intentionally clears advice.
+    //# After the SACKed bit is turned on (as the result of processing a received
+    //# SACK option), the data sender will skip that segment during any later
+    //# retransmission.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Byte buffer is retained across SACKs and released only by cumulative ACK.
+    //# A segment will not be dequeued and its buffer freed until the left window
+    //# edge is advanced over it.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Full-SMSS-budget test selects offset 256 after entry, skipping SACKed bytes. Connection passes packet_mss to IsLost via lowest_hole; a reduced budget can falsely classify loss. Helper tests using SMSS remain valid; see rule (1.c) TODO.
+    //# (1.a) S2 is greater than HighRxt.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Full-SMSS-budget test selects offset 256 after entry, skipping SACKed bytes. Connection passes packet_mss to IsLost via lowest_hole; a reduced budget can falsely classify loss. Helper tests using SMSS remain valid; see rule (1.c) TODO.
+    //# (1.b) S2 is less than the highest octet covered by any received SACK.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Full-SMSS-budget test selects offset 256 after entry, skipping SACKed bytes. Connection passes packet_mss to IsLost via lowest_hole; a reduced budget can falsely classify loss. Helper tests using SMSS remain valid; see rule (1.c) TODO.
+    //# (1.c) IsLost (S2) returns true.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Entry records fixed data_high boundary; cumulative ACK at exclusive boundary ends recovery.
+    //# (4.1) RecoveryPoint = HighData When the TCP sender receives a cumulative ACK
+    //# for this data octet, the loss recovery phase is terminated.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. entry_pending selects first unsacked head and commits high_rxt/rescue_rxt on successful encode, not failure.
+    //# (4.3) Retransmit the first data segment presumed dropped -- the segment
+    //# starting with sequence number HighACK + 1. To prevent repeated
+    //# retransmission of the same data or a premature rescue retransmission, set
+    //# both HighRxt and RescueRxt to the highest sequence number in the
+    //# retransmitted segment.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Entry initializes pipe from scoreboard and output increments for successful retransmission.
+    //# (4.4) Run SetPipe () Set a "pipe" variable to the number of outstanding
+    //# octets currently "in the pipe"; this is the data which has been sent by the
+    //# TCP sender but for which no cumulative or selective acknowledgment has been
+    //# received and the data has not been determined to have been dropped in the
+    //# network. It is assumed that the data is still traversing the network path.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. No candidate returns no segment; multiloss and rescue tests assert Ok(None).
+    //# If NextSeg () returns failure (no data to send), return without sending
+    //# anything (i.e., terminate steps C.1 -- C.5).
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-6
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Optional timer variant uses the shared successful-retransmission commit path. sack_multiloss_selective_recovery_and_transactional_entry asserts exact send_time+rto after both retransmissions, failed-output stability and nonadvancing-SACK nonrestart; sack_rto_discards_advice_retransmits_head_and_guards_epoch checks entry and expiry.
+    //# Therefore, we give implementers the latitude to use the standard
+    //# [RFC6298]-style RTO management or, optionally, a more careful variant that
+    //# re-arms the RTO timer on each retransmission that is sent during recovery
+    //# MAY be used.
     fn sack_multiloss_selective_recovery_and_transactional_entry() {
         for iss in [100, u32::MAX - 1000] {
             let mut a = sack_flight(128, iss, 8);
@@ -4992,18 +6234,37 @@ mod tests {
             let recovery = a.sack_recovery.unwrap();
             assert!(recovery.entry_pending);
             assert_eq!(recovery.high_rxt, una);
+            let original_deadline = a.rto_deadline;
             assert_eq!(a.transmit(201, &mut [0; 8]), Err(Error::OutputTooSmall));
+            assert_eq!(a.rto_deadline, original_deadline);
             assert!(a.sack_recovery.unwrap().entry_pending);
             assert_eq!(a.sack_recovery.unwrap().rescue_rxt, None);
             let bytes = packet(&mut a, 201);
             let first = wire::parse(ip(tuple()), &bytes).unwrap();
             assert_eq!(first.header.sequence, una.0);
             assert_eq!(first.payload.len(), 128);
+            assert_eq!(a.rto_deadline, Some(201 + a.rto()));
             assert_eq!(a.sack_recovery.unwrap().high_rxt, una.wrapping_add(128));
+            let first_deadline = a.rto_deadline;
+            assert_eq!(a.transmit(202, &mut [0; 8]), Err(Error::OutputTooSmall));
+            assert_eq!(a.rto_deadline, first_deadline);
             let bytes = packet(&mut a, 202);
             let second = wire::parse(ip(tuple()), &bytes).unwrap();
             assert_eq!(second.header.sequence, una.wrapping_add(256).0);
             assert_eq!(second.payload.len(), 128);
+            assert_eq!(a.rto_deadline, Some(202 + a.rto()));
+            let second_deadline = a.rto_deadline;
+            sack_ack(
+                &mut a,
+                203,
+                una,
+                &[
+                    (una.wrapping_add(128).0, una.wrapping_add(256).0),
+                    (una.wrapping_add(384).0, point.0),
+                ],
+            );
+            assert_eq!(a.snd_una, una);
+            assert_eq!(a.rto_deadline, second_deadline);
             assert_eq!(a.transmit(203, &mut [0; 1024]), Ok(None));
             assert_eq!(a.send.len(), 1024); // SACK never frees send bytes.
             assert_eq!(a.acknowledged, 1024); // Only the warmup was ACKed.
@@ -5015,6 +6276,12 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. A single ACK carrying three one-byte discontiguous SACK ranges starts recovery immediately and emits a 17-byte first hole.
+    //# (2) If DupAcks < DupThresh but IsLost (HighACK + 1) returns true --
+    //# indicating at least three segments have arrived above the current cumulative
+    //# acknowledgment point, which is taken to indicate loss -- go to step (4).
     fn sack_discontiguous_evidence_and_unaligned_retransmit() {
         let mut a = sack_flight(128, 100, 8);
         let una = a.snd_una;
@@ -5044,6 +6311,57 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. New SACK evidence increments once even on duplex/window-changing ACK; repeated blocks do not earn new credit.
+    //# If the incoming ACK is a duplicate acknowledgment per the definition in
+    //# Section 2 (regardless of its status as a cumulative acknowledgment), and the
+    //# TCP is not currently in loss recovery, the TCP MUST increase DupAcks by one
+    //# and take the following steps:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Limited-transmit test checks one new transmission per fresh-evidence ACK and exclusion from reduction, not exhaustion of multi-SMSS credit from one ACK; see (3.3) TODO.
+    //# (3) The TCP MAY transmit previously unsent data segments as per Limited
+    //# Transmit [RFC5681], except that the number of octets which may be sent is
+    //# governed by pipe and cwnd as follows:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-2
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. New in-flight SACK bytes qualify even when ACK carries duplex data or changes window; advancing-ACK test separately checks reset then increment.
+    //# For the purposes of this specification, we define a "duplicate
+    //# acknowledgment" as a segment that arrives carrying a SACK block that
+    //# identifies previously unacknowledged and un-SACKed octets between HighACK
+    //# and HighData. Note that an ACK which carries new SACK data is counted as a
+    //# duplicate acknowledgment under this definition even if it carries new data,
+    //# changes the advertised window, or moves the cumulative acknowledgment point,
+    //# which is different from the definition of duplicate acknowledgment in
+    //# [RFC5681].
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-2
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Threshold is three fresh-evidence ACKs; recovery starts on third, not repeated SACK blocks.
+    //# Per [RFC5681], this threshold is defined to be 3 duplicate acknowledgments.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Three fresh evidence ACKs start recovery; repeated evidence is not counted.
+    //# (1) If DupAcks >= DupThresh, go to step (4).
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Limited-transmit pipe passes snd_una (exclusive HighACK) as high_rxt.
+    //# (3.1) Set HighRxt to HighACK.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. First limited-transmit output computes pipe for credit; limited_pending clearing prevents the required return to SetPipe when more credit remains (3.3 TODO).
+    //# (3.2) Run SetPipe ().
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. First limited-transmit output checks pipe/cwnd and peer window, sends <=SMSS and advances snd_nxt. It clears limited_pending even if credit remains; repeated SetPipe/transmit for one ACK is not established (3.3 TODO).
+    //# (3.3) If (cwnd - pipe) >= 1 SMSS, there exists previously unsent data, and
+    //# the receiver's advertised window allows, transmit up to 1 SMSS of data
+    //# starting with the octet HighData+1 and update HighData to reflect this
+    //# transmission, then return to (3.2).
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Event input returns; output is poll-driven and repeated evidence gives no extra credit.
+    //# (3.4) Terminate processing of this ACK.
     fn sack_limited_transmit_requires_new_evidence_including_duplex_ack() {
         let (mut a, _) = pair(sack_config(128), 100);
         a.write(&[1; 1024]).unwrap();
@@ -5093,6 +6411,19 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5.1
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Congestion controller halves eligible flight, excludes limited bytes and avoids duplicate ECN reductions. This cites integration, not all congestion-control recommendations.
+    //# However, the congestion control algorithms present in the de facto standard
+    //# TCP implementations MUST be preserved [Stevens94].
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Congestion on_sack_recovery sets cwnd=ssthresh=half eligible flight with RFC5681 minimum; outstanding limited bytes excluded even after partial ACK. ECN epoch guards prevent second reduction.
+    //# (4.2) ssthresh = cwnd = (FlightSize / 2) The congestion window (cwnd) and
+    //# slow start threshold (ssthresh) are reduced to half of FlightSize per
+    //# [RFC5681]. Additionally, note that [RFC5681] requires that any segments sent
+    //# as part of the Limited Transmit mechanism not be counted in FlightSize for
+    //# the purpose of the above equation.
     fn sack_advancing_ack_keeps_unacked_limited_bytes_out_of_reduction() {
         let (mut a, _) = pair(sack_config(128), 100);
         a.write(&[1; 1024]).unwrap();
@@ -5131,13 +6462,69 @@ mod tests {
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
     //= type=test
     //# RecoveryPoint MUST be set to HighData.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5.1
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Timeout clears scoreboard and RTO sends left edge before acting on fresh SACKs. Implementation satisfies even the original stronger wording; verified erratum 1610 changes MUST to SHOULD, rejected erratum 6602 is not applied.
+    //# Because the data receiver is allowed to discard SACKed data, when a
+    //# retransmit timeout occurs the data sender MUST ignore prior SACK information
+    //# in determining which data to retransmit.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Timeout clears advisory ranges; test observes full pipe after timeout.
+    //# After a retransmit timeout the data sender SHOULD turn off all of the SACKed
+    //# bits, since the timeout might indicate that the data receiver has reneged.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Timeout output retransmits snd_una; test verifies head sequence and guard.
+    //# The data sender MUST retransmit the segment at the left edge of the window
+    //# after a retransmit timeout, whether or not the SACKed bit is on for that
+    //# segment.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Clears prior advice and sends the head. Erratum 1610 permits a weaker SHOULD but implementation takes conservative clearing path.
+    //# As a result, [RFC2018] suggests that a TCP sender SHOULD expunge the SACK
+    //# information gathered from a receiver upon a retransmission timeout (RTO)
+    //# "since the timeout might indicate that the data receiver has reneged."
+    //# Additionally, a TCP sender MUST "ignore prior SACK information in
+    //# determining which data to retransmit." However, since the publication of
+    //# [RFC2018], this has come to be viewed by some as too strong.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Timeout replaces recovery with sack_guard=data_high; fresh SACKs cannot reenter until cumulative boundary is covered. Exclusive boundary equals RFC highest byte plus one.
+    //# If an RTO occurs during loss recovery as specified in this document,
+    //# RecoveryPoint MUST be set to HighData.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Timeout replaces recovery with sack_guard=data_high; fresh SACKs cannot reenter until cumulative boundary is covered. Exclusive boundary equals RFC highest byte plus one.
+    //# Further, the new value of RecoveryPoint MUST be preserved and the loss
+    //# recovery algorithm outlined in this document MUST be terminated.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Timeout replaces recovery with sack_guard=data_high; fresh SACKs cannot reenter until cumulative boundary is covered. Exclusive boundary equals RFC highest byte plus one.
+    //# In addition, a new recovery phase (as described in Section 5) MUST NOT be
+    //# initiated until HighACK is greater than or equal to the new value of
+    //# RecoveryPoint.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-6
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Optional timer variant uses the shared successful-retransmission commit path. sack_multiloss_selective_recovery_and_transactional_entry asserts exact send_time+rto after both retransmissions, failed-output stability and nonadvancing-SACK nonrestart; sack_rto_discards_advice_retransmits_head_and_guards_epoch checks entry and expiry.
+    //# Therefore, we give implementers the latitude to use the standard
+    //# [RFC6298]-style RTO management or, optionally, a more careful variant that
+    //# re-arms the RTO timer on each retransmission that is sent during recovery
+    //# MAY be used.
     fn sack_rto_discards_advice_retransmits_head_and_guards_epoch() {
         let mut a = sack_flight(128, 100, 8);
         let una = a.snd_una;
         let point = a.data_high();
         sack_ack(&mut a, 200, una, &[(una.wrapping_add(128).0, point.0)]);
+        let original_deadline = a.rto_deadline;
+        assert_eq!(a.transmit(201, &mut [0; 8]), Err(Error::OutputTooSmall));
+        assert_eq!(a.rto_deadline, original_deadline);
         packet(&mut a, 201);
+        assert_eq!(a.rto_deadline, Some(201 + a.rto()));
         let deadline = a.rto_deadline.unwrap();
+        sack_ack(&mut a, 202, una, &[(una.wrapping_add(128).0, point.0)]);
+        assert_eq!(a.snd_una, una);
+        assert_eq!(a.rto_deadline, Some(deadline));
         a.timeout(deadline).unwrap();
         assert!(a.sack_recovery.is_none());
         assert_eq!(a.sack_guard, Some(point));
@@ -5162,6 +6549,27 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Fresh post-RTO SACKs update scoreboard and select missing offset 256 without fast-recovery reentry.
+    //# Further, a SACK TCP sender SHOULD utilize all SACK information made
+    //# available during the loss recovery following an RTO.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Fresh post-RTO SACKs update scoreboard and select missing offset 256 without fast-recovery reentry.
+    //# As described in Sections 4 and 5, Update () SHOULD continue to be used
+    //# appropriately upon receipt of ACKs.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Fresh post-RTO SACKs update scoreboard and select missing offset 256 without fast-recovery reentry.
+    //# In this case, a TCP sender SHOULD use this SACK information when determining
+    //# what data should be sent in each segment following an RTO.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Post-RTO selection fills fresh holes without the normal fast-recovery NextSeg priorities/rescue and stays guarded until old flight is cumulatively covered.
+    //# The exact algorithm for this selection is not specified in this document
+    //# (specifically NextSeg () is inappropriate during loss recovery after an
+    //# RTO).
     fn sack_after_rto_uses_fresh_holes_without_reentering_recovery() {
         let mut a = sack_flight(128, 100, 8);
         let una = a.snd_una;
@@ -5271,6 +6679,60 @@ mod tests {
     //# NextSeg () MUST return the
     //# sequence number range of the next segment that is to be
     //# transmitted, per the following rules:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Ordinary full-SMSS-budget tests show lost/new/speculative/rescue priorities. Reduced packet budgets also lower the IsLost threshold incorrectly; see section-4 NextSeg/rule (1.c) TODOs.
+    //# NextSeg () MUST return the sequence number range of the next segment that is
+    //# to be transmitted, per the following rules:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Full-SMSS-budget test sends queued data before a speculative hole; snd_nxt advances and RecoveryPoint stays fixed. Reduced packet budgets can incorrectly promote a nonlost hole over new data; see rule (1.c) TODO.
+    //# (2) If no sequence number 'S2' per rule (1) exists but there exists
+    //# available unsent data and the receiver's advertised window allows, the
+    //# sequence range of one segment of up to SMSS octets of previously unsent data
+    //# starting with sequence number HighData+1 MUST be returned.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. During active recovery, repeated output polls consume pipe/cwnd credit and stop below SMSS. This is not evidence for the pre-recovery limited-transmit loop; see (3.3) TODO.
+    //# (C) If cwnd - pipe >= 1 SMSS, the sender SHOULD transmit one or more
+    //# segments as follows:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-2
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. data_high is the exclusive transmitted data edge; new output advances snd_nxt but excludes FIN.
+    //# "HighData" is the highest sequence number transmitted at a given point.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-2
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Recovery pipe bounds output; independent scoreboard per-byte oracle checks computation.
+    //# "Pipe" is a sender's estimate of the number of bytes outstanding in the
+    //# network. This is used during recovery for limiting the sender's sending
+    //# rate. The pipe variable allows TCP to use fundamentally different congestion
+    //# control than the algorithm specified in [RFC5681]. The congestion control
+    //# algorithm using the pipe estimate is often referred to as the "pipe
+    //# algorithm".
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Poll-driven output continues recovery candidates until cwnd credit exhausted.
+    //# (4.5) In order to take advantage of potential additional available cwnd,
+    //# proceed to step (C) below.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. ACK below recovery boundary recomputes pipe; test gains credit after partial ACK then sends new data.
+    //# (B.2) Use SetPipe () to re-calculate the number of octets still in the
+    //# network.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Successful new data advances exclusive snd_nxt; test checks one-SMSS advance while recovery point remains fixed.
+    //# (C.3) If any of the data octets sent in (C.1) are above HighData, HighData
+    //# must be updated to reflect the transmission of previously unsent data.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Non-RACK pipe increments by actual successfully encoded bytes; test fills pipe exactly to cwnd and denies next poll.
+    //# (C.4) The estimate of the amount of data outstanding in the network must be
+    //# updated by incrementing pipe by the number of octets transmitted in (C.1).
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. One segment per output poll; successive polls select ranges until credit less than SMSS, equivalent to loop.
+    //# (C.5) If cwnd - pipe >= 1 SMSS, return to (C.1)
     fn sack_nextseg_new_data_precedes_speculative_holes_and_bounds_pipe() {
         let mut a = sack_flight(128, 100, 12);
         let una = a.snd_una;
@@ -5303,9 +6765,52 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc6675#section-4
     //= type=test
+    //= reason=Full-SMSS-budget priority evidence only; reduced packet budgets can falsely promote loss (section-4 NextSeg/rule (1.c) TODOs).
     //# NextSeg () MUST return the
     //# sequence number range of the next segment that is to be
     //# transmitted, per the following rules:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. With no new/lost segment, speculative offset 768 is sent before tail rescue, then high_rxt advances.
+    //# (3) If the conditions for rules (1) and (2) fail, but there exists an
+    //# unSACKed sequence number 'S3' that meets the criteria for detecting loss
+    //# given in steps (1.a) and (1.b) above (specifically excluding step (1.c)),
+    //# then one segment of up to SMSS octets starting with S3 SHOULD be returned.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Rescue contains the highest outstanding unsacked byte; success sets RescueRxt to fixed recovery boundary, retry does not consume it and a second rescue is denied.
+    //# If HighACK is greater than RescueRxt (or RescueRxt is undefined), then one
+    //# segment of up to SMSS octets that MUST include the highest outstanding
+    //# unSACKed sequence number SHOULD be returned, and RescueRxt set to
+    //# RecoveryPoint.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Rescue leaves high_rxt unchanged, explicitly asserted.
+    //# HighRxt MUST NOT be updated.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Successful nonrescue output advances high_rxt; rescue explicitly leaves it unchanged; failed encode does not commit either.
+    //# (C.2) If any of the data octets sent in (C.1) are below HighData, HighRxt
+    //# MUST be set to the highest sequence number of the retransmitted segment
+    //# unless NextSeg () rule (4) was invoked for this retransmission.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-9
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Section 9 restates rule (3), not a new algorithm; speculative retransmission is selected and asserted before rescue.
+    //# Rule (3) of NextSeg() has been changed from MAY to SHOULD, to appropriately
+    //# reflect the opinion of the authors and working group that it should be left
+    //# in, rather than out, if an implementor does not have a compelling reason to
+    //# do otherwise.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-2
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. high_rxt is exclusive; only successful nonrescue retransmissions advance it.
+    //# "HighRxt" is the highest sequence number which has been retransmitted during
+    //# the current loss recovery phase.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-2
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. rescue_rxt grants a single tail retransmission and tracks recovery boundary after success.
+    //# "RescueRxt" is the highest sequence number which has been optimistically
+    //# retransmitted to prevent stalling of the ACK clock when there is loss at the
+    //# end of the window and no new data is available for transmission.
     fn sack_nextseg_speculative_then_single_transactional_tail_rescue() {
         for speculative in [false, true] {
             let mut a = sack_flight(128, 100, 8);
@@ -5441,6 +6946,47 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Cumulative ACK resets duplicate counter before new SACK evidence increments it; test explicitly observes count one after advancing ACK.
+    //# If the incoming ACK is a cumulative acknowledgment, the TCP MUST reset
+    //# DupAcks to zero.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Recovery ACK processing updates scoreboard/pipe and exits on boundary; partial cumulative ACK keeps recovery active without cwnd growth.
+    //# Once a TCP is in the loss recovery phase, the following procedure MUST be
+    //# used for each arriving ACK:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. ACK below recovery boundary updates scoreboard and recomputes recovery.pipe; partial ACK remains in recovery.
+    //# (B) Upon receipt of an ACK that does not cover RecoveryPoint, the following
+    //# actions MUST be taken:
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-2
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. snd_una is the exclusive cumulative edge, equivalent to HighACK+1.
+    //# "HighACK" is the sequence number of the highest byte of data that has been
+    //# cumulatively ACKed at a given point.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-2
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. duplicate_acks resets on cumulative ACK and increments on new delivery evidence.
+    //# "DupAcks" is the number of duplicate acknowledgments received since the last
+    //# cumulative acknowledgment.
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-2
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Advancing ACK with new SACK evidence remains counted as one duplicate after reset.
+    //# For the purposes of this specification, we define a "duplicate
+    //# acknowledgment" as a segment that arrives carrying a SACK block that
+    //# identifies previously unacknowledged and un-SACKed octets between HighACK
+    //# and HighData. Note that an ACK which carries new SACK data is counted as a
+    //# duplicate acknowledgment under this definition even if it carries new data,
+    //# changes the advertised window, or moves the cumulative acknowledgment point,
+    //# which is different from the definition of duplicate acknowledgment in
+    //# [RFC5681].
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5
+    //= type=test
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Every valid recovery ACK records SACK union before cumulative ACK and recovery state processing.
+    //# (B.1) Use Update () to record the new SACK information conveyed by the
+    //# incoming ACK.
     fn sack_advancing_ack_resets_count_before_new_evidence_and_partial_cwnd() {
         let mut a = sack_flight(128, 100, 8);
         let una = a.snd_una;
@@ -5919,6 +7465,32 @@ mod tests {
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.2
     //= type=test
     //# Queue the data for transmission after entering ESTABLISHED state.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.2
+    //= type=test
+    //= reason=Handshake SEND queue; focused send_state_matrix_preserves_queue_on_rejection additionally tests exhaustion.
+    //# Queue the data for transmission after entering ESTABLISHED state. If no space to queue,
+    //# respond with "error: insufficient resources".
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.1
+    //= type=test
+    //= reason=ISS/ISS+1 are checked on committed SYN output; active API enqueues SYN and driver polls, rather than emitting inline.
+    //# A SYN segment of the form <SEQ=ISS><CTL=SYN> is sent. Set SND.UNA to ISS, SND.NXT to
+    //# ISS+1, enter SYN-SENT state, and return.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
+    //= type=test
+    //= reason=Passive constructor consumes SYN sequence, learns peer, and schedules SYN-ACK. SYN text buffering/delivery scope separately cited.
+    //# Set RCV.NXT to SEG.SEQ+1, IRS is set to SEG.SEQ, and any other control or text should be
+    //# queued for processing later. ISS should be selected and a SYN segment sent of the form:
+    //# <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
+    //= type=test
+    //= reason=Passive state is SYN-RECEIVED; transmit commits ISS+1 only after SYN-ACK encoding succeeds.
+    //# SND.NXT is set to ISS+1 and SND.UNA to ISS. The connection state should be changed to
+    //# SYN-RECEIVED.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
+    //= type=test
+    //= reason=SYN-ACK establishes active side and schedules ACK, which may carry queued data; no inline output.
+    //# If SND.UNA > ISS (our SYN has been ACKed), change the connection state to ESTABLISHED,
+    //# form an ACK segment <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
     fn handshake_queues_sends_until_established() {
         let cfg = config(64, 8);
         let mut a = Connection::active(tuple(), cfg.clone(), 100, 0).unwrap();
@@ -5928,10 +7500,20 @@ mod tests {
         assert!(syn.payload.is_empty());
         assert_eq!(a.state(), State::SynSent);
         assert_eq!(a.snd_nxt, Seq(101));
+        assert_eq!(a.snd_una, Seq(100));
+        assert_eq!(syn.header.flags & (SYN | ACK), SYN);
+        assert_eq!(syn.header.sequence, 100);
         assert_eq!(a.transmit(1, &mut [0; 64]), Ok(None));
         let mut b = Connection::passive(reverse(tuple()), cfg, 900, 10, &syn).unwrap();
         assert_eq!(b.write(b"passive"), Ok(7));
+        assert_eq!(b.irs, Some(Seq(100)));
+        assert_eq!(b.receive.next(), Seq(101));
+        assert_eq!(b.snd_una, Seq(900));
         let bytes = deliver(&mut b, &mut a, 20);
+        let synack = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+        assert_eq!(synack.header.flags & (SYN | ACK), SYN | ACK);
+        assert_eq!(synack.header.sequence, 900);
+        assert_eq!(synack.header.acknowledgment, 101);
         assert!(
             wire::parse(ip(reverse(tuple())), &bytes)
                 .unwrap()
@@ -5942,8 +7524,13 @@ mod tests {
         assert_eq!(b.snd_nxt, Seq(901));
         assert_eq!(b.transmit(21, &mut [0; 64]), Ok(None));
         assert_eq!(a.state(), State::Established);
+        assert_eq!(a.snd_una, Seq(101));
         let bytes = deliver(&mut a, &mut b, 30);
-        assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, b"active");
+        let final_ack = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(final_ack.header.flags & (SYN | ACK), ACK);
+        assert_eq!(final_ack.header.sequence, 101);
+        assert_eq!(final_ack.header.acknowledgment, 901);
+        assert_eq!(final_ack.payload, b"active");
         assert_eq!(b.state(), State::Established);
         let bytes = deliver(&mut b, &mut a, 40);
         assert_eq!(
@@ -5988,6 +7575,12 @@ mod tests {
     //= type=test
     //# Queue this until all preceding SENDs have been segmentized, then form a
     //# FIN segment and send it.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4
+    //= type=test
+    //= reason=SYN precedes queued data, FIN follows it; sequence numbers checked across wrap, handshake_queues_sends_until_established checks SYN consumes one.
+    //# For sequence number purposes, the SYN is considered to occur before the first actual
+    //# data octet of the segment in which it occurs, while the FIN is considered to occur after
+    //# the last actual data octet in a segment in which it occurs.
     fn fin_follows_all_queued_sends_across_segments() {
         let (mut a, mut b) = pair(config(64, 4), u32::MAX - 2);
         a.set_nagle(false);
@@ -6062,6 +7655,11 @@ mod tests {
     //= type=test
     //# This should not occur since a FIN has been received from the remote side. Ignore
     //# the segment text.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //= reason=Closing-state test additionally checks URG after FIN cannot advance the urgent endpoint.
+    //# This should not occur since a FIN has been received from the remote side. Ignore the
+    //# URG.
     fn text_after_fin_is_ignored_in_closing_states() {
         for closing in [false, true] {
             let (mut a, mut b) = pair(config(64, 8), 100);
@@ -6087,7 +7685,17 @@ mod tests {
                 let ack = a.snd_una;
                 let state = a.state();
                 let total = a.received_total;
-                inject(&mut a, 60 + step * 20, next, ack, ACK | PSH, 64, b"bad");
+                let urgent_before = (a.rcv_up, a.urgent_remaining());
+                inject(
+                    &mut a,
+                    60 + step * 20,
+                    next,
+                    ack,
+                    ACK | PSH | URG,
+                    64,
+                    b"bad",
+                );
+                assert_eq!((a.rcv_up, a.urgent_remaining()), urgent_before);
                 assert_eq!(a.state(), state);
                 assert_eq!(a.receive.next(), next);
                 assert_eq!(a.received_total, total);
@@ -6118,6 +7726,12 @@ mod tests {
     //= type=test
     //# A TCP implementation MUST include a SWS avoidance algorithm in the receiver
     //# (MUST-39).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //= reason=RCV.NXT reflects accepted contiguous bytes and advertised credit; scaled rounding exception scoped in existing SHLD-14 evidence.
+    //# Once the TCP endpoint takes responsibility for the data, it advances RCV.NXT over the
+    //# data accepted, and adjusts RCV.WND as appropriate to the current buffer availability.
+    //# The total of RCV.NXT and RCV.WND should not be reduced.
     fn handshake_data_backpressure_partial_reads_and_sequence_wrap() {
         let (mut a, mut b) = pair(config(8, 4), u32::MAX - 2);
         assert_eq!(a.write(b"abcdefghij"), Ok(8));
@@ -6246,6 +7860,12 @@ mod tests {
     //= type=test
     //# The value of R2 SHOULD correspond to at least 100 seconds (SHLD-11).
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.8
+    //= type=test
+    //= reason=Default SYN/data R2 terminal behavior; storage reclaimed by release, timer servicing belongs to driver; explicit application stall timeout is separate.
+    //# For any state if the user timeout expires, flush all queues, signal the user "error:
+    //# connection aborted due to user timeout" in general and for any outstanding calls, delete
+    //# the TCB, enter the CLOSED state, and return.
     fn syn_and_data_failures_warn_before_default_r2_expires() {
         for handshake in [true, false] {
             let cfg = config(64, 8);
@@ -6290,6 +7910,11 @@ mod tests {
     //# However, a TCP implementation SHOULD send a maximum-sized segment whenever
     //# possible (SHLD-28) to improve performance (see Section 3.8.6.2.1).
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
+    //= type=test
+    //= reason=FIFO byte queue across successive writes, not per-write completion records.
+    //# Multiple SENDs are served in first come, first served order, so the TCP endpoint will
+    //# queue those it cannot service immediately.
     fn successive_writes_coalesce_to_mss_and_push_the_final_segment() {
         let (mut a, _) = pair(config(64, 8), 100);
         a.set_nagle(false);
@@ -6482,6 +8107,15 @@ mod tests {
     //# For any state if the retransmission timeout expires on a segment in the
     //# retransmission queue, send the segment at the front of the retransmission
     //# queue again, reinitialize the retransmission timer, and return.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //= reason=Partial cumulative ACK removes only covered bytes and reports progress; future ACK rejection additionally in rfc5961_ack_bounds_are_inclusive_and_reject_all_incoming_side_effects.
+    //# If SND.UNA < SEG.ACK =< SND.NXT, then set SND.UNA <- SEG.ACK. Any segments on the
+    //# retransmission queue that are thereby entirely acknowledged are removed. Users should
+    //# receive positive acknowledgments for buffers that have been SENT and fully acknowledged
+    //# (i.e., SEND buffer should be returned with "ok" response). If the ACK is a duplicate
+    //# (SEG.ACK =< SND.UNA), it can be ignored. If the ACK acks something not yet sent (SEG.ACK
+    //# > SND.NXT), then send an ACK, drop the segment, and return.
     fn retransmission_uses_partial_ack_base_and_never_sends_unsent_tail() {
         let (mut a, mut b) = pair(config(64, 8), u32::MAX - 4);
         a.set_nagle(false);
@@ -6548,6 +8182,17 @@ mod tests {
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.2
     //= type=test
     //# Return "error: connection closing" and do not service request.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
+    //= type=test
+    //= reason=CLOSE-WAIT sends final reply data with FIN and enters LAST-ACK only on committed output.
+    //# Queue this request until all preceding SENDs have been segmentized; then send a FIN
+    //# segment, enter LAST-ACK state.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //= reason=FIN advances receive sequence and half_closed event, sends ACK, preserves buffered bytes for subsequent read.
+    //# If the FIN bit is set, signal the user "connection closing" and return any pending
+    //# RECEIVEs with same message, advance RCV.NXT over the FIN, and send an acknowledgment for
+    //# the FIN. Note that FIN implies PUSH for any segment text not yet delivered to the user.
     fn fin_half_close_time_wait_and_duplicate_fin_restart() {
         let (mut a, mut b) = pair(config(64, 8), 100);
         a.write(b"last").unwrap();
@@ -6599,6 +8244,11 @@ mod tests {
     //= type=test
     //# if the ACK acknowledges our FIN, then enter the TIME-WAIT state;
     //# otherwise, ignore the segment.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //= reason=Unacknowledged local FIN enters CLOSING; fin_half_close_time_wait_and_duplicate_fin_restart covers acknowledged branch and timer cancellation.
+    //# If our FIN has been ACKed (perhaps in this segment), then enter TIME-WAIT, start the
+    //# time-wait timer, turn off the other timers; otherwise, enter the CLOSING state.
     fn simultaneous_close_and_fin_retransmission() {
         let (mut a, mut b) = pair(config(64, 8), 100);
         a.shutdown().unwrap();
@@ -6645,6 +8295,10 @@ mod tests {
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
     //= type=test
     //# if the ACK bit is off, drop the segment and return
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
+    //= type=test
+    //= reason=ACK-only/text without SYN cannot establish a SYN-SENT connection.
+    //# Fifth, if neither of the SYN or RST bits is set, then drop the segment and return.
     fn invalid_ack_reset_and_unsynchronized_text_are_not_processed() {
         let (mut a, _) = pair(config(64, 8), 100);
         a.write(b"retained").unwrap();
@@ -6705,6 +8359,17 @@ mod tests {
     //= type=test
     //# If SEG.ACK =< ISS or SEG.ACK > SND.NXT, send a reset (unless the RST bit
     //# is set, if so drop the segment and return)
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
+    //= type=test
+    //= reason=SYN-SENT validates ACK before RST; no response to unacceptable RST. Erratum 8167 remains separate.
+    //# If SEG.ACK =< ISS or SEG.ACK > SND.NXT, send a reset (unless the RST bit is set, if so
+    //# drop the segment and return) <SEQ=SEG.ACK><CTL=RST>
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
+    //= type=test
+    //= reason=SYN-SENT reset acceptance uses ACK of SYN, not RCV.NXT; terminal reason distinguishes reset.
+    //# If the ACK was acceptable, then signal to the user "error: connection reset", drop the
+    //# segment, enter CLOSED state, delete TCB, and return. Otherwise (no ACK), drop the
+    //# segment and return.
     fn syn_sent_resets_require_ack_and_abort_outputs_once() {
         // Verified erratum 8167 removes the SYN-SENT RCV.NXT check:
         // https://www.rfc-editor.org/errata/eid8167
@@ -6770,6 +8435,11 @@ mod tests {
     //# As long as the receiving TCP peer continues to send acknowledgments in response
     //# to the probe segments, the sending TCP peer MUST allow the connection to stay
     //# open (MUST-37).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
+    //= type=test
+    //= reason=Receiver replies to persist probes with current next sequence/window; responsive sender survives.
+    //# When the receiving TCP peer has a zero window and a segment arrives, it must still send
+    //# an acknowledgment showing its next expected sequence number and current window (zero).
     fn zero_window_probe_recovers_lost_update_and_responsive_peer_survives() {
         let mut cfg = config(4, 4);
         cfg.user_timeout_us = 5_000_000;
@@ -7003,6 +8673,13 @@ mod tests {
     //# The TCP implementation MUST (MUST-33) provide a way for the application to learn
     //# how much urgent data remains to be read from the connection, or at least to
     //# determine whether more urgent data remains to be read [19].
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.5
+    //= type=test
+    //= reason=SYN data is buffered internally, not readable nor notified to application before handshake completes.
+    //# so long as the receiving TCP endpoint doesn't deliver the data to the user until it is
+    //# clear the data is valid (e.g., the data is buffered at the receiver until the connection
+    //# reaches the ESTABLISHED state, given that the three-way handshake reduces the
+    //# possibility of false connections).
     fn syn_text_is_retained_but_not_readable_before_establishment() {
         let metadata = ip(tuple());
         let header = Header {
@@ -7148,6 +8825,11 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
+    //= type=test
+    //= reason=Repeated shutdown is idempotent and never creates a second FIN.
+    //# An "ok" response would be acceptable, too, as long as a second FIN is not emitted (the
+    //# first FIN may be retransmitted, though).
     fn fast_retransmit_uses_three_duplicate_acks_and_fin_shutdown_is_idempotent() {
         let (mut a, mut b) = pair(config(64, 4), 100);
         a.write(b"abcdefghijklmnop").unwrap();
@@ -8187,6 +9869,13 @@ mod tests {
     //= type=test
     //# o  After sending the acknowledgment, TCP implementations MUST
     //# drop the unacceptable segment and stop processing further.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //= type=test
+    //= reason=Exact-sequence inbound reset terminates, cancels all protocol output/deadlines, reports Reset; explicit release governs terminal handle storage.
+    //# If the RST bit is set, then any outstanding RECEIVEs and SEND should receive "reset"
+    //# responses. All segment queues should be flushed. Users should also receive an
+    //# unsolicited general "connection reset" signal. Enter the CLOSED state, delete the TCB,
+    //# and return.
     fn rfc5961_reset_and_syn_state_matrix_drops_text_urgent_fin_and_ack() {
         for state in [
             State::SynReceived,
@@ -8974,6 +10663,12 @@ mod tests {
     //# When an application issues a series of SEND calls without setting the PUSH
     //# flag, the TCP implementation MAY aggregate the data internally without
     //# sending it (MAY-16).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
+    //= type=test
+    //= reason=Explicit PUSH marks survive packetization and partial acknowledgment; Nagle still applies.
+    //# If the PUSH flag is set, the application intends the data to be transmitted promptly to
+    //# the receiver, and the PSH bit will be set in the last TCP segment created from the
+    //# buffer.
     fn explicit_push_aggregates_crosses_marks_and_retransmits_after_partial_ack() {
         let (mut a, _) = pair(config(16, 8), u32::MAX - 3);
         a.set_nagle(false);

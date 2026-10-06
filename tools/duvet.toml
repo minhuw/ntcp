@@ -8,16 +8,44 @@ pattern = "examples/**/*.rs"
 
 # Section 2.1 defines keywords; Appendix B repeats the functional requirements.
 [[requirement]]
-pattern = "workbench/duvet/requirements/**/section-3*.toml"
+pattern = "workbench/duvet/requirements/**/rfc9293/section-3*.toml"
 
 [[requirement]]
-pattern = "tools/rfc9293-additions.toml"
+pattern = "workbench/duvet/requirements/**/rfc2018/*.toml"
 
 [[requirement]]
-pattern = "tools/rfc9293-todos.toml"
+pattern = "workbench/duvet/requirements/**/rfc6675/*.toml"
+
+[[requirement]]
+pattern = "workbench/duvet/requirements/**/rfc8985/*.toml"
+
+[[requirement]]
+pattern = "workbench/duvet/requirements/**/rfc6937/*.toml"
+
+[[requirement]]
+pattern = "tools/rfc*-additions.toml"
+
+[[requirement]]
+pattern = "tools/rfc*-todos.toml"
 
 [[specification]]
 source = "https://www.rfc-editor.org/rfc/rfc9293"
+format = "ietf"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc2018"
+format = "ietf"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc6675"
+format = "ietf"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc8985"
+format = "ietf"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc6937"
 format = "ietf"
 
 [report.html]

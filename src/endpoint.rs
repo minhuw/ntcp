@@ -613,6 +613,9 @@ impl Endpoint {
         self.resource_admission(tuple)
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.1
+    //= reason=Duplicate tuple admission fails without replacing the existing record; independent listener remains legal.
+    //# Return "error: connection already exists".
     fn resource_admission(&self, tuple: Tuple) -> Result<(), EndpointError> {
         if tuple.local.port() == 0 || tuple.remote.port() == 0 {
             return Err(EndpointError::InvalidAddress);
@@ -1044,6 +1047,14 @@ impl Endpoint {
     //# containing a RST causes a RST to be sent in response.
 
     // Traceability limitation: Control replies are capacity- and rate-limited.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.1
+    //= reason=Unknown tuple reset suppression and data discarded; control output subject to explicit capacity/rate bounds.
+    //# all data in the incoming segment is discarded. An incoming segment containing a RST is
+    //# discarded. An incoming segment not containing a RST causes a RST to be sent in response.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.1
+    //= reason=Checks ACK-derived reset sequence and non-ACK sequence-space length including SYN/FIN across wrap.
+    //# If the ACK bit is off, sequence number zero is used,
+    //# <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK> If the ACK bit is on, <SEQ=SEG.ACK><CTL=RST>
     fn reset_for(
         &mut self,
         ip: IpMetadata,
@@ -1125,6 +1136,14 @@ impl Endpoint {
         self.input_with_ipv4_options(now, ip, traffic_class, Ipv4Options::default(), bytes)
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
+    //= reason=LISTEN ACK/SYN-ACK/FIN-ACK reset sequence is checked; bounded reset_for output.
+    //# Any acknowledgment is bad if it arrives on a connection still in the LISTEN state. An
+    //# acceptable reset segment should be formed for any arriving ACK-bearing segment. The RST
+    //# should be formatted as follows: <SEQ=SEG.ACK><CTL=RST>
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
+    //= reason=Drops no-SYN, no-ACK non-RST input before allocating a child.
+    //# This should not be reached. Drop the segment and return.
     pub fn input_with_ipv4_options(
         &mut self,
         now: Instant,
@@ -1915,6 +1934,11 @@ mod recovery_observation_tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.8
+    //= type=test
+    //= reason=TIME-WAIT expiry removes mapping and reclaims released storage; unreleased terminal handle intentionally survives for status.
+    //# If the time-wait timeout expires on a connection, delete the TCB, enter the CLOSED
+    //# state, and return.
     fn connection_existence_retains_released_timewait_and_rejects_reused_generation() {
         let config = EndpointConfig {
             max_connections: 2,

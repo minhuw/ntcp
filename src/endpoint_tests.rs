@@ -644,6 +644,16 @@ fn lower_layer_errors_require_a_matching_outstanding_quote() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.1
+//= type=test
+//= reason=Unknown tuple reset suppression and data discarded; control output subject to explicit capacity/rate bounds.
+//# all data in the incoming segment is discarded. An incoming segment containing a RST is
+//# discarded. An incoming segment not containing a RST causes a RST to be sent in response.
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.1
+//= type=test
+//= reason=Checks ACK-derived reset sequence and non-ACK sequence-space length including SYN/FIN across wrap.
+//# If the ACK bit is off, sequence number zero is used,
+//# <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK> If the ACK bit is on, <SEQ=SEG.ACK><CTL=RST>
 fn unknown_connection_reset_has_correct_sequence_and_never_answers_reset() {
     let mut b = Endpoint::new(config(), [4; 32], 0, test_policy).unwrap();
     let (local, remote) = addresses();
@@ -1180,6 +1190,16 @@ fn isn_depends_on_secret_and_each_tuple_component() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
+//= type=test
+//= reason=LISTEN ACK/SYN-ACK/FIN-ACK reset sequence is checked; bounded reset_for output.
+//# Any acknowledgment is bad if it arrives on a connection still in the LISTEN state. An
+//# acceptable reset segment should be formed for any arriving ACK-bearing segment. The RST
+//# should be formatted as follows: <SEQ=SEG.ACK><CTL=RST>
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
+//= type=test
+//= reason=Drops no-SYN, no-ACK non-RST input before allocating a child.
+//# This should not be reached. Drop the segment and return.
 fn listen_ignores_resets_resets_acks_and_drops_segments_without_syn() {
     let (local, remote) = addresses();
     let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
@@ -1314,6 +1334,15 @@ fn input_header(endpoint: &mut Endpoint, ip: IpMetadata, header: wire::Header) -
 //# in SYN-RECEIVED state and had previously been in the LISTEN state,
 //# then the receiver returns to the LISTEN state; otherwise, the
 //# receiver aborts the connection and goes to the CLOSED state.
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+//= type=test
+//= reason=RST in passive child silently releases it while listener survives; active simultaneous opener terminates and reports Reset (refusal equivalent).
+//# If this connection was initiated with a passive OPEN (i.e., came from the LISTEN state),
+//# then return this connection to LISTEN state and return. The user need not be informed.
+//# If this connection was initiated with an active OPEN (i.e., came from SYN-SENT state),
+//# then the connection was refused; signal the user "connection refused". In either case,
+//# the retransmission queue should be flushed. And in the active OPEN case, enter the
+//# CLOSED state and delete the TCB, and return.
 fn syn_received_reset_preserves_passive_listener_but_closes_active_open() {
     let (mut a, mut b, listener, client) = endpoints();
     let syns = packets(&mut a, 0);
@@ -1367,6 +1396,10 @@ fn syn_received_reset_preserves_passive_listener_but_closes_active_open() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.1
+//= type=test
+//= reason=Duplicate tuple admission fails without replacing the existing record; independent listener remains legal.
+//# Return "error: connection already exists".
 fn duplicate_listen_and_pending_open_port_sharing_preserve_existing_records() {
     let (mut a, mut b, listener, client) = endpoints();
     let (local, remote) = addresses();

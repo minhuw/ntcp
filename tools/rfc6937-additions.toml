@@ -1,0 +1,281 @@
+# RFC 6937 operative prose and pseudocode: automatic extraction finds zero requirements.
+# Quotes retain RFC text (whitespace only); no invented BCP 14 levels.
+
+# variants
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-1"
+quote = '''
+We describe two slightly different Reduction Bound algorithms:
+Conservative Reduction Bound (CRB), which is strictly packet
+conserving; and a Slow Start Reduction Bound (SSRB), which is more
+aggressive than CRB by, at most, 1 segment per ACK.
+'''
+
+# sackd
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-2"
+quote = '''
+SACKd: The total number of bytes that the scoreboard indicates have
+been delivered to the receiver.  This can be computed by scanning
+the scoreboard and counting the total number of bytes covered by
+all SACK blocks.  If SACK is not in use, SACKd is not defined.
+'''
+
+# outside-delivery
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-2"
+quote = '''
+When not in
+recovery, DeliveredData is the change in snd.una.
+'''
+
+# sack-delivery
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-2"
+quote = '''
+With SACK,
+DeliveredData can be computed precisely as the change in snd.una,
+plus the (signed) change in SACKd.
+'''
+
+# non-sack-delivery
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-2"
+quote = '''
+In recovery without SACK,
+DeliveredData is estimated to be 1 SMSS on duplicate
+acknowledgements, and on a subsequent partial or full ACK,
+DeliveredData is estimated to be the change in snd.una, minus 1
+SMSS for each preceding duplicate ACK.
+'''
+
+# delivery-sum
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-2"
+quote = '''
+Furthermore, for any TCP
+(with or without SACK), the sum of DeliveredData must agree with the
+forward progress over the same time interval.
+'''
+
+# sndcnt
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-2"
+quote = '''
+We introduce a local variable "sndcnt", which indicates exactly how
+many bytes should be sent in response to each ACK.
+'''
+
+# entry
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
+quote = '''
+At the beginning of recovery, initialize PRR state.
+'''
+
+# threshold
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
+quote = '''
+ssthresh = CongCtrlAlg()  // Target cwnd after recovery
+'''
+
+# delivered-init
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
+quote = '''
+prr_delivered = 0         // Total bytes delivered during recovery
+'''
+
+# out-init
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
+quote = '''
+prr_out = 0               // Total bytes sent during recovery
+'''
+
+# flight-init
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
+quote = '''
+RecoverFS = snd.nxt-snd.una // FlightSize at the start of recovery
+'''
+
+# ack-delivery
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
+quote = '''
+On every ACK during recovery compute:
+
+   DeliveredData = change_in(snd.una) + change_in(SACKd)
+   prr_delivered += DeliveredData
+'''
+
+# pipe
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
+quote = '''
+pipe = (RFC 6675 pipe algorithm)
+'''
+
+# proportional
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
+quote = '''
+if (pipe > ssthresh) {
+   // Proportional Rate Reduction
+   sndcnt = CEIL(prr_delivered * ssthresh / RecoverFS) - prr_out
+'''
+
+# crb
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
+quote = '''
+if (conservative) {    // PRR-CRB
+  limit = prr_delivered - prr_out
+'''
+
+# ssrb
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
+quote = '''
+} else {               // PRR-SSRB
+  limit = MAX(prr_delivered - prr_out, DeliveredData) + MSS
+'''
+
+# headroom
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
+quote = '''
+// Attempt to catch up, as permitted by limit
+sndcnt = MIN(ssthresh - pipe, limit)
+'''
+
+# output
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
+quote = '''
+On any data transmission or retransmission:
+
+   prr_out += (data sent) // strictly less than or equal to sndcnt
+'''
+
+# crb-explanation
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-3.1"
+quote = '''
+Transmission is controlled
+by the sending limit, which is set to prr_delivered - prr_out.
+'''
+
+# convergence
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-4"
+quote = '''
+If there are minimal losses, PRR will converge to exactly the target
+window chosen by the congestion control algorithm.
+'''
+
+# banking
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-4"
+quote = '''
+The missed opportunities to send
+due to stalls are treated like banked voluntary window reductions;
+specifically, they cause prr_delivered - prr_out to be significantly
+positive.
+'''
+
+# conservation
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-4"
+quote = '''
+Under all conditions and sequences of events during recovery, PRR-CRB
+strictly bounds the data transmitted to be equal to or less than the
+amount of data delivered to the receiver.
+'''
+
+# appendix-conservation
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#appendix-A"
+quote = '''
+Under all conditions and sequences of
+ events during recovery, PRR-CRB strictly bounds the data transmitted
+ to be equal to or less than the amount of data delivered to the
+ receiver.
+'''
+
+# byte-security
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-8"
+quote = '''
+Implementers that change PRR from counting bytes to segments have to
+be cautious about the effects of ACK splitting attacks [Savage99],
+where the receiver acknowledges partial segments for the purpose of
+confusing the sender's congestion accounting.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-3"
+reason = "RFC 6937 section 1 defines two different Reduction Bound algorithms and section 3 explicitly selects with if (conservative). src/recovery.rs:Prr::acknowledge implements the prr_delivered - prr_out CRB branch, without SSRB MAX or additional MSS. CRB selection is valid; shared entry, delivery, output and conservation TODOs remain, so this is not a claim of complete CRB conformance."
+quote = '''
+} else {               // PRR-SSRB
+  limit = MAX(prr_delivered - prr_out, DeliveredData) + MSS
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-2"
+reason = "RFC 6937 section 2 makes this estimate conditional on recovery without SACK. This profile does not run PRR without negotiated SACK: src/connection.rs:sack_recovery_enabled and start_sack_recovery gate PRR on negotiated SACK and a valid byte ledger; rack_prr_peer_without_sack_uses_ordinary_fast_retransmit asserts fallback without PRR. Ordinary non-SACK Reno/NewReno recovery is not audited as PRR."
+quote = '''
+In recovery without SACK,
+DeliveredData is estimated to be 1 SMSS on duplicate
+acknowledgements, and on a subsequent partial or full ACK,
+DeliveredData is estimated to be the change in snd.una, minus 1
+SMSS for each preceding duplicate ACK.
+'''
+
+# current-delivery
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-2"
+quote = '''
+DeliveredData: The total number of bytes that the current ACK
+indicates have been delivered to the receiver.
+'''
+
+# implicit-reductions
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-4"
+quote = '''
+Implicit window reductions, due to multiple isolated losses during
+recovery, cause later voluntary reductions to be skipped.  For small
+numbers of losses, the window size ends at exactly the window chosen
+by the congestion control algorithm.
+'''
+
+# burst-reductions
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-4"
+quote = '''
+For burst losses, earlier voluntary window reductions can be undone
+by sending extra segments in response to ACKs arriving later during
+recovery.  Note that as long as some voluntary window reductions are
+not undone, the final value for pipe will be the same as ssthresh,
+the target cwnd value chosen by the congestion control algorithm.
+'''
+
+# stall-catchup
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-4"
+quote = '''
+If the application catches up while TCP is still in
+recovery, TCP will send a partial window burst to catch up to exactly
+where it would have been had the application never stalled.
+'''
+
+# pipe-role
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc6937#section-4"
+quote = '''
+For PRR, pipe merely determines which algorithm, PRR or the
+Reduction Bound, is used to compute sndcnt from DeliveredData.
+'''

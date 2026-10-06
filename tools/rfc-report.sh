@@ -11,4 +11,13 @@ fi
 
 mkdir -p workbench/duvet
 cp tools/duvet.toml workbench/duvet/config.toml
-exec "$root/bin/duvet" report --config-path workbench/duvet/config.toml --require-tests true "$@"
+# Duvet 0.4.3 ignores CI when snapshots are disabled; select its gate explicitly.
+has_ci=0
+for argument do
+    case "$argument" in --ci|--ci=*) has_ci=1 ;; esac
+done
+if [ "$has_ci" -eq 0 ]; then
+    set -- --ci true "$@"
+fi
+"$root/bin/duvet" report --config-path workbench/duvet/config.toml --require-tests true "$@"
+exec python3 tools/check_rfc_coverage.py

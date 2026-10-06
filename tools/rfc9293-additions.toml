@@ -58,3 +58,544 @@ quote = '''
 Respond with "ok" and delete the TCB, enter CLOSED state, and
 return.
 '''
+
+# Supplemental functional instructions omitted by keyword-only extraction.
+
+# BASE-001: Reserved input bits ignored; output zeroing also asserted by output_padding_capacity_and_max_options.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.1"
+level = "MUST"
+quote = '''
+Must be zero in generated segments and must be ignored in received segments if
+the corresponding future features are not implemented by the sending or
+receiving host.
+'''
+
+# BASE-002: Nonzero output storage is cleared before checksum generation.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.1"
+level = "MUST"
+quote = '''
+While computing the checksum, the checksum field itself is replaced with
+zeros.
+'''
+
+# BASE-003: Wrapping addition/subtraction; callers keep live spans below the serial half-space.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.4"
+level = "MUST"
+quote = '''
+Since the space is finite, all arithmetic dealing with sequence numbers must
+be performed modulo 2^32.
+'''
+
+# BASE-004: shutdown is the simplex CLOSE primitive; close separately selects the permitted half-duplex profile.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.6"
+level = "MUST"
+quote = '''
+The user who CLOSEs may continue to RECEIVE until the TCP receiver is told
+that the remote peer has CLOSED also.
+'''
+
+# BASE-005: Explicit PUSH marks survive packetization and partial acknowledgment; Nagle still applies.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2"
+level = "MUST"
+quote = '''
+If the PUSH flag is set, the application intends the data to be transmitted
+promptly to the receiver, and the PSH bit will be set in the last TCP segment
+created from the buffer.
+'''
+
+# BASE-006: FIFO byte queue across successive writes, not per-write completion records.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2"
+level = "MUST"
+quote = '''
+Multiple SENDs are served in first come, first served order, so the TCP
+endpoint will queue those it cannot service immediately.
+'''
+
+# BASE-007: Unpushed writes flush before FIN; read half remains available.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.4"
+level = "MUST"
+quote = '''
+Close also implies push function.
+'''
+
+# BASE-008: LimitReached/NoMemory, pooled allocations and insertion rollback; not OS process authorization.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.1"
+level = "MUST"
+quote = '''
+If there is no room to create a new connection, return "error: insufficient
+resources".
+'''
+
+# BASE-009: Duplicate tuple admission fails without replacing the existing record; independent listener remains legal.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.1"
+level = "MUST"
+quote = '''
+Return "error: connection already exists".
+'''
+
+# BASE-010: Handshake SEND queue; focused send_state_matrix_preserves_queue_on_rejection additionally tests exhaustion.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.2"
+level = "MUST"
+quote = '''
+Queue the data for transmission after entering ESTABLISHED state. If no space
+to queue, respond with "error: insufficient resources".
+'''
+
+# BASE-011: Every closing state rejects a SEND without changing queued bytes.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.2"
+level = "MUST"
+quote = '''
+Return "error: connection closing" and do not service request.
+'''
+
+# BASE-012: CLOSE-WAIT drains accepted bytes then returns EOF (0), the nonblocking API equivalent of closing notification.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.3"
+level = "MUST"
+quote = '''
+Since the remote side has already sent FIN, RECEIVEs must be satisfied by data
+already on hand, but not yet delivered to the user. If no text is awaiting
+delivery, the RECEIVE will get an "error: connection closing" response.
+Otherwise, any remaining data can be used to satisfy the RECEIVE.
+'''
+
+# BASE-013: SYN-RECEIVED shutdown currently always defers FIN to ESTABLISHED.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4"
+level = "MUST"
+quote = '''
+If no SENDs have been issued and there is no pending data to send, then form a
+FIN segment and send it, and enter FIN-WAIT-1 state; otherwise, queue for
+processing after entering ESTABLISHED state.
+'''
+
+# BASE-014: FIN follows all queued bytes, including sequence wrap. FIN-WAIT-1 is committed when output succeeds, not on API enqueue.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4"
+level = "MUST"
+quote = '''
+Queue this until all preceding SENDs have been segmentized, then form a FIN
+segment and send it.
+'''
+
+# BASE-015: Repeated shutdown is idempotent and never creates a second FIN.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4"
+level = "MUST"
+quote = '''
+An "ok" response would be acceptable, too, as long as a second FIN is not
+emitted (the first FIN may be retransmitted, though).
+'''
+
+# BASE-016: CLOSE-WAIT sends final reply data with FIN and enters LAST-ACK only on committed output.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4"
+level = "MUST"
+quote = '''
+Queue this request until all preceding SENDs have been segmentized; then send
+a FIN segment, enter LAST-ACK state.
+'''
+
+# BASE-017: State-specific local ABORT reset sequence; failed output retains pending reset.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5"
+level = "MUST"
+quote = '''
+Send a reset segment: <SEQ=SND.NXT><CTL=RST>
+'''
+
+# BASE-018: Unknown tuple reset suppression and data discarded; control output subject to explicit capacity/rate bounds.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.1"
+level = "MUST"
+quote = '''
+all data in the incoming segment is discarded. An incoming segment containing
+a RST is discarded. An incoming segment not containing a RST causes a RST to
+be sent in response.
+'''
+
+# BASE-019: Checks ACK-derived reset sequence and non-ACK sequence-space length including SYN/FIN across wrap.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.1"
+level = "MUST"
+quote = '''
+If the ACK bit is off, sequence number zero is used,
+<SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK> If the ACK bit is on,
+<SEQ=SEG.ACK><CTL=RST>
+'''
+
+# BASE-020: LISTEN checks RST before ACK and sends no reply.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2"
+level = "MUST"
+quote = '''
+An incoming RST should be ignored. Return.
+'''
+
+# BASE-021: LISTEN ACK/SYN-ACK/FIN-ACK reset sequence is checked; bounded reset_for output.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2"
+level = "MUST"
+quote = '''
+Any acknowledgment is bad if it arrives on a connection still in the LISTEN
+state. An acceptable reset segment should be formed for any arriving
+ACK-bearing segment. The RST should be formatted as follows:
+<SEQ=SEG.ACK><CTL=RST>
+'''
+
+# BASE-022: Drops no-SYN, no-ACK non-RST input before allocating a child.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2"
+level = "MUST"
+quote = '''
+This should not be reached. Drop the segment and return.
+'''
+
+# BASE-023: SYN-SENT validates ACK before RST; no response to unacceptable RST. Erratum 8167 remains separate.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3"
+level = "MUST"
+quote = '''
+If SEG.ACK =< ISS or SEG.ACK > SND.NXT, send a reset (unless the RST bit is
+set, if so drop the segment and return) <SEQ=SEG.ACK><CTL=RST>
+'''
+
+# BASE-024: SYN-SENT reset acceptance uses ACK of SYN, not RCV.NXT; terminal reason distinguishes reset.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3"
+level = "MUST"
+quote = '''
+If the ACK was acceptable, then signal to the user "error: connection reset",
+drop the segment, enter CLOSED state, delete TCB, and return. Otherwise (no
+ACK), drop the segment and return.
+'''
+
+# BASE-025: Queues SYN text in receive storage; defers application reads/events, not internal buffer acceptance or ACK advancement.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3"
+level = "MUST"
+quote = '''
+If there are other controls or text in the segment, queue them for processing
+after the ESTABLISHED state has been reached, return.
+'''
+
+# BASE-026: ACK-only/text without SYN cannot establish a SYN-SENT connection.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3"
+level = "MUST"
+quote = '''
+Fifth, if neither of the SYN or RST bits is set, then drop the segment and
+return.
+'''
+
+# BASE-027: Focused edge test covers duplicate-prefix and out-of-window suffix trimming, wrap and zero-window rejection.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+level = "MUST"
+quote = '''
+If a segment's contents straddle the boundary between old and new, only the
+new parts are processed.
+'''
+
+# BASE-028: Rejected input leaves receive state unchanged and replies with current ACK; invalid RST is silent.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+level = "MUST"
+quote = '''
+If an incoming segment is not acceptable, an acknowledgment should be sent in
+reply (unless the RST bit is set, if so drop the segment and return):
+<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK> o After sending the acknowledgment, drop
+the unacceptable segment and return.
+'''
+
+# BASE-029: No-ACK synchronized text is not delivered.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+level = "MUST"
+quote = '''
+if the ACK bit is off, drop the segment and return
+'''
+
+# BASE-030: Partial cumulative ACK removes only covered bytes and reports progress; future ACK rejection additionally in rfc5961_ack_bounds_are_inclusive_and_reject_all_incoming_side_effects.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+level = "MUST"
+quote = '''
+If SND.UNA < SEG.ACK =< SND.NXT, then set SND.UNA <- SEG.ACK. Any segments on
+the retransmission queue that are thereby entirely acknowledged are removed.
+Users should receive positive acknowledgments for buffers that have been SENT
+and fully acknowledged (i.e., SEND buffer should be returned with "ok"
+response). If the ACK is a duplicate (SEG.ACK =< SND.UNA), it can be ignored.
+If the ACK acks something not yet sent (SEG.ACK > SND.NXT), then send an ACK,
+drop the segment, and return.
+'''
+
+# BASE-031: Tests older/newer/equal SEQ and ACK combinations at ordinary and wrapping ISNs.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+level = "MUST"
+quote = '''
+If (SND.WL1 < SEG.SEQ or (SND.WL1 = SEG.SEQ and SND.WL2 =< SEG.ACK)), set
+SND.WND <- SEG.WND, set SND.WL1 <- SEG.SEQ, and set SND.WL2 <- SEG.ACK.
+'''
+
+# BASE-032: FIN-WAIT-1 ACK advances to FIN-WAIT-2 and receive half stays available.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+level = "MUST"
+quote = '''
+if the FIN segment is now acknowledged, then enter FIN- WAIT-2 and continue
+processing in that state.
+'''
+
+# BASE-033: CLOSING remains until own FIN acknowledgment; then TIME-WAIT.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+level = "MUST"
+quote = '''
+if the ACK acknowledges our FIN, then enter the TIME-WAIT state; otherwise,
+ignore the segment.
+'''
+
+# BASE-034: LAST-ACK logically terminates and cancels timers; Endpoint handle storage is retained until explicit release.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+level = "MUST"
+quote = '''
+If our FIN is now acknowledged, delete the TCB, enter the CLOSED state, and
+return.
+'''
+
+# BASE-035: Duplicate FIN ACK and exact restarted deadline; other TIME-WAIT input does not resume data processing.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+level = "MUST"
+quote = '''
+The only thing that can arrive in this state is a retransmission of the remote
+FIN. Acknowledge it, and restart the 2 MSL timeout.
+'''
+
+# BASE-036: Closing-state test additionally checks URG after FIN cannot advance the urgent endpoint.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+level = "MUST"
+quote = '''
+This should not occur since a FIN has been received from the remote side.
+Ignore the URG.
+'''
+
+# BASE-037: RCV.NXT reflects accepted contiguous bytes and advertised credit; scaled rounding exception scoped in existing SHLD-14 evidence.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+level = "MUST"
+quote = '''
+Once the TCP endpoint takes responsibility for the data, it advances RCV.NXT
+over the data accepted, and adjusts RCV.WND as appropriate to the current
+buffer availability. The total of RCV.NXT and RCV.WND should not be reduced.
+'''
+
+# BASE-038: CLOSE-WAIT/CLOSING/LAST-ACK/TIME-WAIT ignore further text and do not notify readability/push.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+level = "MUST"
+quote = '''
+This should not occur since a FIN has been received from the remote side.
+Ignore the segment text.
+'''
+
+# BASE-039: FIN advances receive sequence and half_closed event, sends ACK, preserves buffered bytes for subsequent read.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+level = "MUST"
+quote = '''
+If the FIN bit is set, signal the user "connection closing" and return any
+pending RECEIVEs with same message, advance RCV.NXT over the FIN, and send an
+acknowledgment for the FIN. Note that FIN implies PUSH for any segment text
+not yet delivered to the user.
+'''
+
+# BASE-040: Unacknowledged local FIN enters CLOSING; fin_half_close_time_wait_and_duplicate_fin_restart covers acknowledged branch and timer cancellation.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+level = "MUST"
+quote = '''
+If our FIN has been ACKed (perhaps in this segment), then enter TIME-WAIT,
+start the time-wait timer, turn off the other timers; otherwise, enter the
+CLOSING state.
+'''
+
+# BASE-041: Default SYN/data R2 terminal behavior; storage reclaimed by release, timer servicing belongs to driver; explicit application stall timeout is separate.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.8"
+level = "MUST"
+quote = '''
+For any state if the user timeout expires, flush all queues, signal the user
+"error: connection aborted due to user timeout" in general and for any
+outstanding calls, delete the TCB, enter the CLOSED state, and return.
+'''
+
+# BASE-042: Retransmits current unacknowledged head (partial ACK base), never unsent tail; timer committed by successful output.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.8"
+level = "MUST"
+quote = '''
+For any state if the retransmission timeout expires on a segment in the
+retransmission queue, send the segment at the front of the retransmission
+queue again, reinitialize the retransmission timer, and return.
+'''
+
+# BASE-043: TIME-WAIT expiry removes mapping and reclaims released storage; unreleased terminal handle intentionally survives for status.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.8"
+level = "MUST"
+quote = '''
+If the time-wait timeout expires on a connection, delete the TCB, enter the
+CLOSED state, and return.
+'''
+
+# BASE-044: Local ABORT resets currently transition directly to CLOSED, per the example in 3.10.5.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.5.2"
+level = "SHOULD"
+quote = '''
+The side of a connection issuing a reset should enter the TIME-WAIT state, as
+this generally helps to reduce the load on busy servers for reasons described
+in [70].
+'''
+
+# BASE-045: Output ACK field is the receive frontier; established reply flags and sequence are explicitly checked.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.1"
+level = "MUST"
+quote = '''
+If the ACK control bit is set, this field contains the value of the next
+sequence number the sender of the segment is expecting to receive. Once a
+connection is established, this is always sent.
+'''
+
+# BASE-046: SYN precedes queued data, FIN follows it; sequence numbers checked across wrap, handshake_queues_sends_until_established checks SYN consumes one.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.4"
+level = "MUST"
+quote = '''
+For sequence number purposes, the SYN is considered to occur before the first
+actual data octet of the segment in which it occurs, while the FIN is
+considered to occur after the last actual data octet in a segment in which it
+occurs.
+'''
+
+# BASE-047: SYN data is buffered internally, not readable nor notified to application before handshake completes.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.5"
+level = "MUST"
+quote = '''
+so long as the receiving TCP endpoint doesn't deliver the data to the user
+until it is clear the data is valid (e.g., the data is buffered at the
+receiver until the connection reaches the ESTABLISHED state, given that the
+three-way handshake reduces the possibility of false connections).
+'''
+
+# BASE-048: Receiver replies to persist probes with current next sequence/window; responsive sender survives.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1"
+level = "MUST"
+quote = '''
+When the receiving TCP peer has a zero window and a segment arrives, it must
+still send an acknowledgment showing its next expected sequence number and
+current window (zero).
+'''
+
+# BASE-049: Concrete and wildcard bind selection, with per-connection tuple pinned to destination of SYN.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1"
+level = "MUST"
+quote = '''
+A passive OPEN call with a specified "local IP address" parameter will await
+an incoming connection request to that address. If the parameter is
+unspecified, a passive OPEN will await an incoming connection request to any
+local IP address and then bind the local IP address of the connection to the
+particular address that is used.
+'''
+
+# BASE-050: ISS/ISS+1 are checked on committed SYN output; active API enqueues SYN and driver polls, rather than emitting inline.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.1"
+level = "MUST"
+quote = '''
+A SYN segment of the form <SEQ=ISS><CTL=SYN> is sent. Set SND.UNA to ISS,
+SND.NXT to ISS+1, enter SYN-SENT state, and return.
+'''
+
+# BASE-051: Passive constructor consumes SYN sequence, learns peer, and schedules SYN-ACK. SYN text buffering/delivery scope separately cited.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2"
+level = "MUST"
+quote = '''
+Set RCV.NXT to SEG.SEQ+1, IRS is set to SEG.SEQ, and any other control or text
+should be queued for processing later. ISS should be selected and a SYN
+segment sent of the form: <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>
+'''
+
+# BASE-052: Passive state is SYN-RECEIVED; transmit commits ISS+1 only after SYN-ACK encoding succeeds.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2"
+level = "MUST"
+quote = '''
+SND.NXT is set to ISS+1 and SND.UNA to ISS. The connection state should be
+changed to SYN-RECEIVED.
+'''
+
+# BASE-053: SYN-ACK establishes active side and schedules ACK, which may carry queued data; no inline output.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3"
+level = "MUST"
+quote = '''
+If SND.UNA > ISS (our SYN has been ACKed), change the connection state to
+ESTABLISHED, form an ACK segment <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+'''
+
+# BASE-054: RST in passive child silently releases it while listener survives; active simultaneous opener terminates and reports Reset (refusal equivalent).
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+level = "MUST"
+quote = '''
+If this connection was initiated with a passive OPEN (i.e., came from the
+LISTEN state), then return this connection to LISTEN state and return. The
+user need not be informed. If this connection was initiated with an active
+OPEN (i.e., came from SYN-SENT state), then the connection was refused; signal
+the user "connection refused". In either case, the retransmission queue should
+be flushed. And in the active OPEN case, enter the CLOSED state and delete the
+TCB, and return.
+'''
+
+# BASE-055: Exact-sequence inbound reset terminates, cancels all protocol output/deadlines, reports Reset; explicit release governs terminal handle storage.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+level = "MUST"
+quote = '''
+If the RST bit is set, then any outstanding RECEIVEs and SEND should receive
+"reset" responses. All segment queues should be flushed. Users should also
+receive an unsolicited general "connection reset" signal. Enter the CLOSED
+state, delete the TCB, and return.
+'''
+
+# BASE-056: lower_mss exposes a reduction hook, not autonomous PMTUD/PLPMTUD.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.2"
+level = "SHOULD"
+quote = '''
+Instead, implementation of Path MTU Discovery (PMTUD) and Packetization Layer
+Path MTU Discovery (PLPMTUD) is strongly recommended in order for TCP to
+improve segmentation decisions.
+'''
