@@ -27,7 +27,8 @@ pub struct ConnectionConfig {
     //# (SHLD-6).
     pub receive_ip_payload_limit: u16,
     // Maximum TCP segment bytes after IP headers/extensions are subtracted from
-    // the transmission bound; must fit SYN with MSS/WS (28 bytes, or 40 with TS).
+    // the transmission bound; must fit SYN with MSS/WS: 28 bytes, 32 with
+    // SACK alone, or 40 with timestamps (with or without SACK).
     pub send_ip_payload_limit: u16,
     pub nagle: bool,
     pub ecn: bool,
@@ -305,7 +306,13 @@ impl Connection {
             || config.receive_capacity > (65535usize << 14)
             || config.receive_ip_payload_limit < 21
             || config.send_ip_payload_limit
-                < 28 + if config.timestamps { 12 } else { 0 } + if config.sack { 4 } else { 0 }
+                < if config.timestamps {
+                    40
+                } else if config.sack {
+                    32
+                } else {
+                    28
+                }
             || config.mss == 0
             || config.mss > if tuple.local.is_ipv4() { 65495 } else { 65515 }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.3
@@ -2050,28 +2057,16 @@ impl Connection {
             .min(self.config.receive_ip_payload_limit - 20)
             .to_be_bytes();
         let mut options = [0; 40];
-        options[..8].copy_from_slice(&[2, 4, mss[0], mss[1], 1, 3, 3, self.local_scale]);
+        options[..4].copy_from_slice(&[2, 4, mss[0], mss[1]]);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
         //# TCP implementations SHOULD send an MSS Option in every SYN segment when its
         //# receive MSS differs from the default 536 for IPv4 or 1220 for IPv6 (SHLD-5),
         //# and MAY send it always (MAY-3).
-        let mut option_len = if syn {
-            if self.state == State::SynSent || self.scaling {
-                8
-            } else {
-                4
-            }
-        } else {
-            0
-        };
+        let mut option_len = if syn { 4 } else { 0 };
         //= https://www.rfc-editor.org/rfc/rfc2018#section-2
         //# It MUST NOT be sent on non-SYN segments.
         let sack_offer =
             syn && self.config.sack && (self.state == State::SynSent || self.sack_send);
-        if sack_offer {
-            options[option_len..option_len + 4].copy_from_slice(&[1, 1, 4, 2]);
-            option_len += 4;
-        }
         let timestamp = if reset.is_some() && self.reset_echo.is_some() {
             self.reset_echo.map(|echo| (0, echo))
         } else if self.timestamps || syn && self.state == State::SynSent && self.config.timestamps {
@@ -2089,10 +2084,23 @@ impl Connection {
         if let Some((value, echo)) =
             timestamp.filter(|_| reset.is_none() || self.config.send_ip_payload_limit >= 32)
         {
-            options[option_len..option_len + 4].copy_from_slice(&[1, 1, 8, 10]);
+            // SACK-permitted replaces timestamp padding on SYN, as in Linux.
+            options[option_len..option_len + 4].copy_from_slice(if sack_offer {
+                &[4, 2, 8, 10]
+            } else {
+                &[1, 1, 8, 10]
+            });
             options[option_len + 4..option_len + 8].copy_from_slice(&value.to_be_bytes());
             options[option_len + 8..option_len + 12].copy_from_slice(&echo.to_be_bytes());
             option_len += 12;
+        }
+        if sack_offer && timestamp.is_none() {
+            options[option_len..option_len + 4].copy_from_slice(&[1, 1, 4, 2]);
+            option_len += 4;
+        }
+        if syn && (self.state == State::SynSent || self.scaling) {
+            options[option_len..option_len + 4].copy_from_slice(&[1, 3, 3, self.local_scale]);
+            option_len += 4;
         }
         let mut sack_option_len = 0;
         if reset.is_none() && !syn && live && self.sack_send && !self.sack_omit {
@@ -2951,15 +2959,27 @@ mod tests {
                     assert_eq!(a.transmit(0, &mut [0; 8]), Err(Error::OutputTooSmall));
                     assert!(!a.sack_receive);
                     let bytes = packet(&mut a, 0);
-                    assert_eq!(&bytes[20..28], &[2, 4, 0, 128, 1, 3, 3, 0]);
+                    assert_eq!(&bytes[20..24], &[2, 4, 0, 128]);
+                    assert_eq!(&bytes[bytes.len() - 4..], &[1, 3, 3, 0]);
                     if active {
-                        assert_eq!(&bytes[28..32], &[1, 1, 4, 2]);
+                        assert_eq!(
+                            &bytes[24..28],
+                            if timestamps {
+                                &[4, 2, 8, 10]
+                            } else {
+                                &[1, 1, 4, 2]
+                            }
+                        );
                     }
                     let syn = wire::parse(ip(tuple()), &bytes).unwrap();
                     assert_eq!(syn.options.sack_permitted, active);
                     assert_eq!(
                         bytes.len(),
-                        28 + 4 * usize::from(active) + 12 * usize::from(timestamps)
+                        28 + if timestamps {
+                            12
+                        } else {
+                            4 * usize::from(active)
+                        }
                     );
                     let mut b = Connection::passive(
                         reverse(tuple()),
@@ -3021,21 +3041,49 @@ mod tests {
 
     #[test]
     fn sack_syn_path_budget_validated() {
-        for timestamps in [false, true] {
-            let bound = 32 + 12 * u16::from(timestamps);
-            let mut cfg = ConnectionConfig {
-                sack: true,
-                timestamps,
-                send_ip_payload_limit: bound - 1,
-                ..config(1024, 128)
-            };
-            assert!(matches!(
-                Connection::active(tuple(), cfg.clone(), 100, 0),
-                Err(Error::InvalidArgument)
-            ));
-            cfg.send_ip_payload_limit = bound;
-            let mut a = Connection::active(tuple(), cfg, 100, 0).unwrap();
-            assert_eq!(packet(&mut a, 0).len(), bound as usize);
+        for sack in [false, true] {
+            for timestamps in [false, true] {
+                let bound = if timestamps {
+                    40
+                } else if sack {
+                    32
+                } else {
+                    28
+                };
+                let mut cfg = ConnectionConfig {
+                    sack,
+                    timestamps,
+                    nagle: false,
+                    send_ip_payload_limit: bound - 1,
+                    ..config(1024, 128)
+                };
+                assert!(matches!(
+                    Connection::active(tuple(), cfg.clone(), 100, 0),
+                    Err(Error::InvalidArgument)
+                ));
+                cfg.send_ip_payload_limit = bound;
+                let mut a = Connection::active(tuple(), cfg.clone(), 100, 0).unwrap();
+                let syn = packet(&mut a, 0);
+                assert_eq!(syn.len(), bound as usize);
+                let syn = wire::parse(ip(tuple()), &syn).unwrap();
+                let mut b = Connection::passive(reverse(tuple()), cfg, 900, 10, &syn).unwrap();
+                assert_eq!(deliver(&mut b, &mut a, 20).len(), bound as usize);
+                deliver(&mut a, &mut b, 30);
+                let payload = usize::from(bound) - 20 - if timestamps { 12 } else { 0 };
+                assert_eq!(a.mss, payload);
+                a.write(&[7; 32]).unwrap();
+                let data = deliver(&mut a, &mut b, 40);
+                assert_eq!(data.len(), bound as usize);
+                let data = wire::parse(ip(tuple()), &data).unwrap();
+                assert_eq!(data.payload, vec![7; payload]);
+                assert_eq!(data.raw_options.len(), if timestamps { 12 } else { 0 });
+                a.lower_mss(if timestamps { 16 } else { 4 }).unwrap();
+                assert_eq!(a.mss, 4);
+                assert_eq!(
+                    packet(&mut a, 50).len(),
+                    24 + if timestamps { 12 } else { 0 }
+                );
+            }
         }
     }
 
@@ -3063,39 +3111,70 @@ mod tests {
 
     #[test]
     fn sack_simultaneous_open_and_syn_retransmit() {
-        let cfg = ConnectionConfig {
-            sack: true,
-            ..config(1024, 128)
-        };
-        let mut a = Connection::active(tuple(), cfg.clone(), 100, 0).unwrap();
-        let mut b = Connection::active(reverse(tuple()), cfg, 900, 0).unwrap();
-        let a_syn = packet(&mut a, 0);
-        let b_syn = packet(&mut b, 0);
-        a.input(10, &wire::parse(ip(reverse(tuple())), &b_syn).unwrap())
+        for timestamps in [false, true] {
+            let cfg = ConnectionConfig {
+                sack: true,
+                timestamps,
+                ..config(1024, 128)
+            };
+            let mut a = Connection::active(tuple(), cfg.clone(), 100, 0).unwrap();
+            let mut b = Connection::active(reverse(tuple()), cfg, 900, 0).unwrap();
+            let a_syn = packet(&mut a, 0);
+            let b_syn = packet(&mut b, 0);
+            let mut expected = vec![2, 4, 0, 128];
+            if timestamps {
+                expected.extend_from_slice(&[4, 2, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0]);
+            } else {
+                expected.extend_from_slice(&[1, 1, 4, 2]);
+            }
+            expected.extend_from_slice(&[1, 3, 3, 0]);
+            assert_eq!(&a_syn[20..], expected);
+            assert_eq!(&b_syn[20..], expected);
+            let deadline = a.rto_deadline.unwrap();
+            a.timeout(deadline).unwrap();
+            let retry = packet(&mut a, deadline);
+            let mut retry_options = expected.clone();
+            if timestamps {
+                retry_options[8..12].copy_from_slice(&((deadline / 1_000) as u32).to_be_bytes());
+            }
+            assert_eq!(&retry[20..], retry_options);
+            a.input(
+                deadline + 10,
+                &wire::parse(ip(reverse(tuple())), &b_syn).unwrap(),
+            )
             .unwrap();
-        b.input(10, &wire::parse(ip(tuple()), &a_syn).unwrap())
+            b.input(deadline + 10, &wire::parse(ip(tuple()), &a_syn).unwrap())
+                .unwrap();
+            let a_reply = packet(&mut a, deadline + 20);
+            let b_reply = packet(&mut b, deadline + 20);
+            if timestamps {
+                expected[8..12].copy_from_slice(&(((deadline + 20) / 1_000) as u32).to_be_bytes());
+            }
+            assert_eq!(&a_reply[20..], expected);
+            assert_eq!(&b_reply[20..], expected);
+            assert!(
+                wire::parse(ip(tuple()), &a_reply)
+                    .unwrap()
+                    .options
+                    .sack_permitted
+            );
+            a.input(
+                deadline + 30,
+                &wire::parse(ip(reverse(tuple())), &b_reply).unwrap(),
+            )
             .unwrap();
-        let a_reply = packet(&mut a, 20);
-        let b_reply = packet(&mut b, 20);
-        assert!(
-            wire::parse(ip(tuple()), &a_reply)
-                .unwrap()
-                .options
-                .sack_permitted
-        );
-        a.input(30, &wire::parse(ip(reverse(tuple())), &b_reply).unwrap())
-            .unwrap();
-        b.input(30, &wire::parse(ip(tuple()), &a_reply).unwrap())
-            .unwrap();
-        assert_eq!((a.state, b.state), (State::Established, State::Established));
-        assert!(a.sack_send && a.sack_receive && b.sack_send && b.sack_receive);
-        let bytes = deliver(&mut a, &mut b, 40);
-        assert!(
-            !wire::parse(ip(tuple()), &bytes)
-                .unwrap()
-                .options
-                .sack_permitted
-        );
+            b.input(deadline + 30, &wire::parse(ip(tuple()), &a_reply).unwrap())
+                .unwrap();
+            assert_eq!((a.state, b.state), (State::Established, State::Established));
+            assert!(a.sack_send && a.sack_receive && b.sack_send && b.sack_receive);
+            let bytes = deliver(&mut a, &mut b, deadline + 40);
+            assert!(
+                !wire::parse(ip(tuple()), &bytes)
+                    .unwrap()
+                    .options
+                    .sack_permitted
+            );
+        }
     }
 
     fn sack_config(mss: u16) -> ConnectionConfig {
@@ -3808,6 +3887,56 @@ mod tests {
     }
 
     #[test]
+    fn sack_three_blocks_with_timestamps_fit_data_mss_and_path() {
+        let cfg = ConnectionConfig {
+            timestamps: true,
+            send_ip_payload_limit: 148,
+            ..sack_config(128)
+        };
+        let (mut a, _) = pair(cfg, 100);
+        let next = a.receive.next();
+        let una = a.snd_una;
+        for offset in [10, 30, 50] {
+            inject_sack(
+                &mut a,
+                40,
+                next.wrapping_add(offset),
+                una,
+                ACK,
+                8192,
+                &[2; 5],
+                &[],
+            );
+        }
+        a.write(&[7; 128]).unwrap();
+        let before = (a.now, a.snd_nxt, a.last_timestamp_sent_at, a.ack_pending);
+        assert_eq!(a.transmit(1_000, &mut [0; 147]), Err(Error::OutputTooSmall));
+        assert_eq!(
+            (a.now, a.snd_nxt, a.last_timestamp_sent_at, a.ack_pending),
+            before
+        );
+        let bytes = packet(&mut a, 1_000);
+        let data = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(bytes.len(), 148);
+        assert_eq!(data.raw_options.len(), 40);
+        assert_eq!(
+            &data.raw_options[..12],
+            &[1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 0]
+        );
+        assert_eq!(&data.raw_options[12..16], &[1, 1, 5, 26]);
+        assert_eq!(
+            data.options.sack_blocks[..3],
+            [
+                Some((next.wrapping_add(50).0, next.wrapping_add(55).0)),
+                Some((next.wrapping_add(30).0, next.wrapping_add(35).0)),
+                Some((next.wrapping_add(10).0, next.wrapping_add(15).0)),
+            ]
+        );
+        assert_eq!(data.payload, &[7; 88]);
+        assert_eq!(data.payload.len() + data.raw_options.len(), 128);
+    }
+
+    #[test]
     fn sack_small_mss_ack_report_does_not_starve_data() {
         for (mss, timestamps) in [(8, false), (24, true)] {
             let cfg = ConnectionConfig {
@@ -3891,7 +4020,7 @@ mod tests {
     fn sack_options_leave_path_space_for_probe_and_keepalive_octets() {
         for timestamps in [false, true] {
             for probing in [false, true] {
-                let limit = if timestamps { 44 } else { 32 };
+                let limit = if timestamps { 40 } else { 32 };
                 let cfg = ConnectionConfig {
                     timestamps,
                     send_ip_payload_limit: limit,
@@ -4598,99 +4727,137 @@ mod tests {
                     if !synack && peer_ts {
                         continue;
                     }
-                    let mut cfg = config(131072, 300);
-                    cfg.ecn = false;
-                    cfg.receive_ip_payload_limit = 200;
-                    cfg.send_ip_payload_limit = if local_ts { 40 } else { 28 };
-                    cfg.timestamps = local_ts;
-                    let mut c = if synack {
-                        let mut options = vec![2, 4, 1, 44];
+                    for (local_sack, peer_sack) in
+                        [(false, false), (false, true), (true, false), (true, true)]
+                    {
+                        let mut cfg = config(131072, 300);
+                        cfg.ecn = false;
+                        cfg.receive_ip_payload_limit = 200;
+                        cfg.send_ip_payload_limit = if local_ts {
+                            40
+                        } else if local_sack {
+                            32
+                        } else {
+                            28
+                        };
+                        cfg.sack = local_sack;
+                        cfg.timestamps = local_ts;
+                        let mut c = if synack {
+                            let mut options = vec![2, 4, 1, 44];
+                            if peer_sack {
+                                options.extend_from_slice(&[1, 1, 4, 2]);
+                            }
+                            if scaling {
+                                options.extend_from_slice(&[1, 3, 3, 7]);
+                            }
+                            if peer_ts {
+                                options.extend_from_slice(&[1, 1, 8, 10, 0, 0, 0, 2, 0, 0, 0, 0]);
+                            }
+                            let mut input = [0; 60];
+                            let size = wire::encode(
+                                ip(reverse(tuple())),
+                                Header {
+                                    source_port: tuple().remote.port(),
+                                    destination_port: tuple().local.port(),
+                                    sequence: 900,
+                                    acknowledgment: 0,
+                                    flags: SYN,
+                                    window: 65535,
+                                    urgent_pointer: 0,
+                                },
+                                &options,
+                                &[],
+                                &mut input,
+                            )
+                            .unwrap();
+                            let syn = wire::parse(ip(reverse(tuple())), &input[..size]).unwrap();
+                            Connection::passive(tuple(), cfg, 100, 3_000, &syn).unwrap()
+                        } else {
+                            Connection::active(tuple(), cfg, 100, 3_000).unwrap()
+                        };
+                        let timestamps = local_ts && (!synack || peer_ts);
+                        let mut expected = vec![2, 4, 0, 180];
+                        let sack_offer = local_sack && (!synack || peer_sack);
+                        if timestamps {
+                            let echo = if synack { 2 } else { 0 };
+                            expected.extend_from_slice(if sack_offer {
+                                &[4, 2, 8, 10]
+                            } else {
+                                &[1, 1, 8, 10]
+                            });
+                            expected.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, echo]);
+                        } else if sack_offer {
+                            expected.extend_from_slice(&[1, 1, 4, 2]);
+                        }
                         if scaling {
-                            options.extend_from_slice(&[1, 3, 3, 7]);
+                            expected.extend_from_slice(&[1, 3, 3, 2]);
                         }
-                        if peer_ts {
-                            options.extend_from_slice(&[1, 1, 8, 10, 0, 0, 0, 2, 0, 0, 0, 0]);
-                        }
-                        let mut input = [0; 40];
-                        let size = wire::encode(
-                            ip(reverse(tuple())),
-                            Header {
-                                source_port: tuple().remote.port(),
-                                destination_port: tuple().local.port(),
-                                sequence: 900,
-                                acknowledgment: 0,
-                                flags: SYN,
-                                window: 65535,
-                                urgent_pointer: 0,
-                            },
-                            &options,
-                            &[],
-                            &mut input,
-                        )
-                        .unwrap();
-                        let syn = wire::parse(ip(reverse(tuple())), &input[..size]).unwrap();
-                        Connection::passive(tuple(), cfg, 100, 3_000, &syn).unwrap()
-                    } else {
-                        Connection::active(tuple(), cfg, 100, 3_000).unwrap()
-                    };
-                    let timestamps = local_ts && (!synack || peer_ts);
-                    let mut expected = vec![2, 4, 0, 180];
-                    if scaling {
-                        expected.extend_from_slice(&[1, 3, 3, 2]);
-                    }
-                    if timestamps {
-                        let echo = if synack { 2 } else { 0 };
-                        expected.extend_from_slice(&[1, 1, 8, 10, 0, 0, 0, 4, 0, 0, 0, echo]);
-                    }
-                    let size = 20 + expected.len();
-                    let before = (
-                        c.now,
-                        c.snd_nxt,
-                        c.last_sent,
-                        c.last_ack_sent,
-                        c.advertised_edge,
-                        c.ts_recent,
-                        c.last_timestamp_sent_at,
-                        c.sample,
-                        c.next_deadline(),
-                        c.syn_pending,
-                        c.ack_pending,
-                    );
-                    for len in 0..size {
-                        let mut short = vec![0xa5; len];
-                        assert_eq!(c.transmit(4_000, &mut short), Err(Error::OutputTooSmall));
-                        assert_eq!(short, vec![0xa5; len]);
-                        assert_eq!(
+                        let size = 20 + expected.len();
+                        let before = (
+                            c.now,
+                            c.snd_nxt,
+                            c.last_sent,
+                            c.last_ack_sent,
+                            c.advertised_edge,
+                            c.ts_recent,
+                            c.last_timestamp_sent_at,
+                            c.sample,
+                            c.next_deadline(),
+                            c.syn_pending,
                             (
-                                c.now,
-                                c.snd_nxt,
-                                c.last_sent,
-                                c.last_ack_sent,
-                                c.advertised_edge,
-                                c.ts_recent,
-                                c.last_timestamp_sent_at,
-                                c.sample,
-                                c.next_deadline(),
-                                c.syn_pending,
                                 c.ack_pending,
+                                c.sack_receive,
+                                c.sack_send,
+                                c.timestamps,
+                                c.scaling,
+                                c.state,
                             ),
-                            before
                         );
+                        for len in 0..size {
+                            let mut short = vec![0xa5; len];
+                            assert_eq!(c.transmit(4_000, &mut short), Err(Error::OutputTooSmall));
+                            assert_eq!(short, vec![0xa5; len]);
+                            assert_eq!(
+                                (
+                                    c.now,
+                                    c.snd_nxt,
+                                    c.last_sent,
+                                    c.last_ack_sent,
+                                    c.advertised_edge,
+                                    c.ts_recent,
+                                    c.last_timestamp_sent_at,
+                                    c.sample,
+                                    c.next_deadline(),
+                                    c.syn_pending,
+                                    (
+                                        c.ack_pending,
+                                        c.sack_receive,
+                                        c.sack_send,
+                                        c.timestamps,
+                                        c.scaling,
+                                        c.state
+                                    ),
+                                ),
+                                before
+                            );
+                        }
+                        let mut out = vec![0; size];
+                        assert_eq!(c.transmit(4_000, &mut out), Ok(Some(size)));
+                        let segment = wire::parse(ip(tuple()), &out).unwrap();
+                        assert_eq!(segment.raw_options, expected);
+                        assert_eq!(segment.header.flags, SYN | if synack { ACK } else { 0 });
+                        assert_eq!(segment.header.window, 65535);
+                        assert_eq!(segment.options.mss, Some(180));
+                        assert_eq!(segment.options.window_scale, scaling.then_some(2));
+                        assert_eq!(
+                            segment.options.timestamps,
+                            timestamps.then_some((4, if synack { 2 } else { 0 }))
+                        );
+                        assert_eq!(segment.options.sack_permitted, sack_offer);
+                        assert_eq!(c.sack_receive, sack_offer);
+                        assert!(segment.payload.is_empty());
+                        assert!(!c.syn_pending);
                     }
-                    let mut out = vec![0; size];
-                    assert_eq!(c.transmit(4_000, &mut out), Ok(Some(size)));
-                    let segment = wire::parse(ip(tuple()), &out).unwrap();
-                    assert_eq!(segment.raw_options, expected);
-                    assert_eq!(segment.header.flags, SYN | if synack { ACK } else { 0 });
-                    assert_eq!(segment.header.window, 65535);
-                    assert_eq!(segment.options.mss, Some(180));
-                    assert_eq!(segment.options.window_scale, scaling.then_some(2));
-                    assert_eq!(
-                        segment.options.timestamps,
-                        timestamps.then_some((4, if synack { 2 } else { 0 }))
-                    );
-                    assert!(segment.payload.is_empty());
-                    assert!(!c.syn_pending);
                 }
             }
         }
