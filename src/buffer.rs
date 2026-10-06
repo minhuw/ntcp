@@ -420,13 +420,19 @@ impl ReceiveBuffer {
 
     // Called only after a SACK-bearing packet has been successfully encoded.
     pub(crate) fn commit_sack(&mut self, first: (u32, u32)) {
-        let anchor = Seq(first.0);
         let mut history = [None; 4];
-        history[0] = Some(anchor);
-        let mut count = 1;
-        for &old in &self.reported {
-            if old != Some(anchor) && old.is_some() && count < history.len() {
-                history[count] = old;
+        let mut count = 0;
+        // A bridge can merge several historical anchors into one block. Resolve
+        // and deduplicate before truncation so distinct recent blocks survive.
+        for anchor in core::iter::once(Some(Seq(first.0)))
+            .chain(self.reported)
+            .flatten()
+        {
+            if let Some((left, _)) = self.block_at(anchor)
+                && count < history.len()
+                && !history[..count].contains(&Some(left))
+            {
+                history[count] = Some(left);
                 count += 1;
             }
         }
@@ -744,6 +750,37 @@ impl ReceiveBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merged_report_history_preserves_distinct_recent_blocks() {
+        for start in [Seq(0), Seq(u32::MAX - 63)] {
+            for limit in [3, 4] {
+                let mut recv = ReceiveBuffer::new(start, 128).unwrap();
+                for offset in [10, 30, 50, 70, 90] {
+                    recv.insert(start.wrapping_add(offset), b"x", false);
+                    let first = recv.sack_blocks(limit)[0].unwrap();
+                    recv.commit_sack(first);
+                    recv.commit_report();
+                }
+                recv.insert(start.wrapping_add(49), &[1; 42], false);
+                let bridge = recv.sack_blocks(limit);
+                let history = recv.reported;
+                assert_eq!(recv.sack_blocks(limit), bridge);
+                assert_eq!(recv.reported, history); // Failed encoding has no commit.
+                recv.commit_sack(bridge[0].unwrap());
+                recv.commit_report();
+                recv.insert(start.wrapping_add(110), b"x", false);
+                let block =
+                    |left, right| Some((start.wrapping_add(left).0, start.wrapping_add(right).0));
+                let report = recv.sack_blocks(limit);
+                assert_eq!(
+                    &report[..3],
+                    &[block(110, 111), block(49, 91), block(30, 31)]
+                );
+                assert_eq!(report[3], if limit == 4 { block(10, 11) } else { None });
+            }
+        }
+    }
 
     #[test]
     fn empty_and_contiguous_presence_search_preserves_fin_and_wrap() {
