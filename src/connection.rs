@@ -305,6 +305,8 @@ pub(crate) struct Connection {
     snd_up: Option<Seq>,
     advertised_snd_up: Option<Seq>,
     rcv_up: Option<u64>,
+    handshake_complete: bool,
+    send_issued: bool,
     shutdown: bool,
     read_closed: bool,
     fin_sequence: Option<Seq>,
@@ -492,6 +494,8 @@ impl Connection {
             snd_up: None,
             advertised_snd_up: None,
             rcv_up: None,
+            handshake_complete: false,
+            send_issued: false,
             shutdown: false,
             read_closed: false,
             fin_sequence: None,
@@ -586,6 +590,23 @@ impl Connection {
     pub(crate) fn state(&self) -> State {
         self.state
     }
+    // Set only by validated handshake ACK processing, never inferred from state.
+    pub(crate) fn handshake_complete(&self) -> bool {
+        self.handshake_complete
+    }
+
+    pub(crate) fn reset_pending(&self) -> bool {
+        self.state == State::Closed && self.pending_rst.is_some()
+    }
+
+    fn handshake_pending(&self) -> bool {
+        !self.handshake_complete
+            && matches!(
+                self.state,
+                State::SynSent | State::SynReceived | State::FinWait1
+            )
+    }
+
     pub(crate) fn time_wait_valid(&self, now: Instant) -> bool {
         self.state == State::TimeWait && self.time_wait_deadline.is_some_and(|end| now < end)
     }
@@ -962,7 +983,7 @@ impl Connection {
     //# how much urgent data remains to be read from the connection, or at least to
     //# determine whether more urgent data remains to be read [19].
     pub(crate) fn urgent_remaining(&self) -> u64 {
-        if matches!(self.state, State::SynSent | State::SynReceived)
+        if self.handshake_pending()
             || self.state == State::Closed && self.reason != Some(CloseReason::Normal)
         {
             return 0;
@@ -972,7 +993,7 @@ impl Connection {
 
     pub(crate) fn readable_bytes(&self) -> usize {
         if self.read_closed
-            || matches!(self.state, State::SynSent | State::SynReceived)
+            || self.handshake_pending()
             || self.state == State::Closed
                 && (self.reason != Some(CloseReason::Normal) || !self.receive.eof())
         {
@@ -1087,7 +1108,7 @@ impl Connection {
             self.sack_recovery = Some(recovery);
         }
         if self.flight() != 0 {
-            if matches!(self.state, State::SynSent | State::SynReceived) {
+            if self.handshake_pending() {
                 self.syn_pending = true;
             } else if self.synchronized() && self.snd_wnd != 0 && self.sack_recovery.is_none() {
                 self.retx_pending = true;
@@ -1224,10 +1245,11 @@ impl Connection {
     }
 
     fn synchronized(&self) -> bool {
-        !matches!(
-            self.state,
-            State::Closed | State::SynSent | State::SynReceived | State::TimeWait
-        )
+        !self.handshake_pending()
+            && !matches!(
+                self.state,
+                State::Closed | State::SynSent | State::SynReceived | State::TimeWait
+            )
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
@@ -1240,7 +1262,10 @@ impl Connection {
     }
 
     fn establish(&mut self) {
-        self.state = State::Established;
+        self.handshake_complete = true;
+        if self.state == State::SynSent || self.state == State::SynReceived {
+            self.state = State::Established;
+        }
         self.syn_pending = false;
         self.events.connected = true;
         self.events.writable = !self.shutdown && self.send.remaining() != 0;
@@ -1250,7 +1275,13 @@ impl Connection {
         self.events.urgent = if self.read_closed { None } else { self.rcv_up };
         if self.receive.eof() {
             self.events.half_closed = true;
-            self.state = State::CloseWait;
+            if self.state == State::Established {
+                self.state = State::CloseWait;
+            } else if self.state == State::FinWait1 {
+                self.state = State::Closing;
+            } else if self.state == State::FinWait2 {
+                self.time_wait();
+            }
         }
         self.arm_work();
     }
@@ -1315,7 +1346,7 @@ impl Connection {
     //# In particular, R2 for a SYN segment MUST be set large enough to provide
     //# retransmission of the segment for at least 3 minutes (MUST-23).
     fn user_timeout(&self) -> u64 {
-        if matches!(self.state, State::SynSent | State::SynReceived) {
+        if self.handshake_pending() {
             self.config.user_timeout_us.max(180_000_000)
         } else {
             self.config.user_timeout_us
@@ -1323,13 +1354,12 @@ impl Connection {
     }
 
     fn user_timer_needed(&self) -> bool {
-        matches!(
-            self.state,
-            State::SynSent | State::SynReceived | State::FinWait2
-        ) || (self.synchronized()
-            && (self.send.len() != 0
-                || self.flight() != 0
-                || self.shutdown && self.fin_sequence.is_none()))
+        self.handshake_pending()
+            || self.state == State::FinWait2
+            || (self.synchronized()
+                && (self.send.len() != 0
+                    || self.flight() != 0
+                    || self.shutdown && self.fin_sequence.is_none()))
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
@@ -1371,7 +1401,7 @@ impl Connection {
     // Explicit application resource policy is separate from transport R2 liveness
     // (RFC 6429 section 4). Responsive probes do not constitute output progress.
     fn application_timer_needed(&self) -> bool {
-        matches!(self.state, State::SynSent | State::SynReceived)
+        self.handshake_pending()
             || (self.synchronized()
                 && (self.send.len() != 0
                     || self.flight() != 0
@@ -1489,6 +1519,7 @@ impl Connection {
             return Err(Error::InvalidState);
         }
         if data.is_empty() {
+            self.send_issued = true;
             if push {
                 self.send.mark_push();
             }
@@ -1500,6 +1531,7 @@ impl Connection {
         if count == 0 {
             return Err(Error::WouldBlock);
         }
+        self.send_issued = true;
         if push {
             self.send.mark_push();
         }
@@ -1539,7 +1571,7 @@ impl Connection {
         {
             return Err(Error::InvalidState);
         }
-        let sent = if matches!(self.state, State::SynSent | State::SynReceived) {
+        let sent = if self.handshake_pending() {
             0
         } else {
             (self.snd_nxt.distance_from(self.send_base) as usize).min(self.send.len())
@@ -1640,7 +1672,7 @@ impl Connection {
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
         //# If there are other controls or text in the segment, queue them for
         //# processing after the ESTABLISHED state has been reached, return.
-        if matches!(self.state, State::SynSent | State::SynReceived) {
+        if self.handshake_pending() {
             return Err(Error::WouldBlock);
         }
         let count = self.receive.read(out);
@@ -1976,12 +2008,12 @@ impl Connection {
         //# A TCP implementation MUST support simultaneous open attempts (MUST- 10).
         // Simultaneous open: the SYN has already consumed receive sequence
         // space. Only the identical SYN+ACK can finish this handshake here.
-        if self.state == State::SynReceived
+        if self.handshake_pending()
             && !self.passive_open
             && self.irs == Some(seq)
             && h.flags & (SYN | ACK | RST | FIN) == (SYN | ACK)
             && ack == self.iss.wrapping_add(1)
-            && ack == self.snd_nxt
+            && at_or_after(self.snd_nxt, ack)
         {
             self.accepted_metadata = true;
             self.learn_ecn(h.flags);
@@ -2071,7 +2103,7 @@ impl Connection {
                 self.sack_omit = false;
             }
             if h.flags & RST == 0 {
-                if self.state == State::SynReceived && h.flags & SYN != 0 && self.irs == Some(seq) {
+                if self.handshake_pending() && h.flags & SYN != 0 && self.irs == Some(seq) {
                     if h.flags & (ACK | FIN) == 0 {
                         self.learn_ecn(h.flags);
                         self.sack_send |= self.config.sack && segment.options.sack_permitted;
@@ -2100,7 +2132,7 @@ impl Connection {
         //# prescribed below according to the connection state.
         if h.flags & RST != 0 {
             if seq == next {
-                let passive = self.state == State::SynReceived && self.passive_open;
+                let passive = self.handshake_pending() && self.passive_open;
                 self.terminal(CloseReason::Reset);
                 if passive {
                     self.events = ConnectionEvents::default();
@@ -2133,7 +2165,7 @@ impl Connection {
         //# o  After sending the acknowledgment, TCP implementations MUST
         //# drop the unacceptable segment and stop processing further.
         if h.flags & SYN != 0 {
-            if self.state == State::SynReceived && self.passive_open {
+            if self.handshake_pending() && self.passive_open {
                 // Endpoint owns LISTEN independently; closing this unaccepted
                 // child releases its slot without notifying the application.
                 self.terminal(CloseReason::Reset);
@@ -2166,7 +2198,7 @@ impl Connection {
             self.immediate_ack();
             return Ok(());
         }
-        if self.state == State::SynReceived {
+        if self.handshake_pending() {
             if !after(ack, self.snd_una) {
                 self.pending_rst = Some((ack, false));
                 self.reset_echo = segment
@@ -2488,8 +2520,7 @@ impl Connection {
             self.limited_end = Some(end);
             self.limited_sent = bytes;
         }
-        let syn_ack =
-            self.snd_una == self.iss && matches!(self.state, State::SynSent | State::SynReceived);
+        let syn_ack = self.snd_una == self.iss && self.handshake_pending();
         let bytes = ack
             .distance_from(self.send_base)
             .min(self.send.len() as u32);
@@ -3278,12 +3309,7 @@ impl Connection {
             flags = RST | if with_ack { ACK } else { 0 };
         } else if syn {
             seq = self.iss;
-            flags = SYN
-                | if self.state == State::SynReceived {
-                    ACK
-                } else {
-                    0
-                };
+            flags = SYN | if self.irs.is_some() { ACK } else { 0 };
             retransmitted = self.snd_nxt != self.iss;
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
         //# Probing of zero (offered) windows MUST be supported (MUST-36).
@@ -3373,6 +3399,21 @@ impl Connection {
                 self.scratch[0] = 0;
                 count = 1;
             }
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
+        //= reason=SYN-ACK has output priority; FIN and FIN-WAIT-1 commit only after successful encoding.
+        //# If no SENDs have been issued and there is no pending data to send, then form a
+        //# FIN segment and send it, and enter FIN-WAIT-1 state; otherwise, queue for
+        //# processing after entering ESTABLISHED state.
+        } else if self.state == State::SynReceived
+            && self.shutdown
+            && !self.send_issued
+            && self.send.len() == 0
+            && self.fin_sequence.is_none()
+            && self.snd_wnd.min(self.congestion.cwnd()) > self.flight()
+        {
+            seq = self.iss.wrapping_add(1);
+            flags |= FIN;
+            new_fin = true;
         } else if live {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
             //= reason=SendBuffer coalesces writes; packetization is independent of application write boundaries.
@@ -3995,7 +4036,7 @@ impl Connection {
             //# SYN retransmissions MUST be handled in the general way just described
             //# for data retransmissions, including notification of the application
             //# layer.
-            if matches!(self.state, State::SynSent | State::SynReceived) {
+            if self.handshake_pending() {
                 self.syn_timed_out = true;
                 self.syn_pending = true;
             } else {
@@ -4096,6 +4137,506 @@ mod tests {
         assert!(a.take_events().connected);
         assert!(b.take_events().connected);
         (a, b)
+    }
+
+    fn opening_for_close(
+        cfg: ConnectionConfig,
+        iss: u32,
+        simultaneous: bool,
+    ) -> (Connection, Vec<u8>) {
+        let mut peer = Connection::active(reverse(tuple()), cfg.clone(), 900, 0).unwrap();
+        let bytes = packet(&mut peer, 0);
+        let syn = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+        let connection = if simultaneous {
+            let mut connection = Connection::active(tuple(), cfg, iss, 0).unwrap();
+            packet(&mut connection, 0);
+            connection.input(10, &syn).unwrap();
+            connection
+        } else {
+            Connection::passive(tuple(), cfg, iss, 10, &syn).unwrap()
+        };
+        (connection, bytes)
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
+    //= type=test
+    //= reason=Passive and simultaneous CLOSE before/after SYN-ACK, transactional output, wrap, and separate SYN/FIN ACK boundaries.
+    //# If no SENDs have been issued and there is no pending data to send, then form a
+    //# FIN segment and send it, and enter FIN-WAIT-1 state; otherwise, queue for
+    //# processing after entering ESTABLISHED state.
+    fn syn_received_close_commits_early_fin_without_completing_handshake() {
+        for simultaneous in [false, true] {
+            for synack_sent in [false, true] {
+                for iss in [100, u32::MAX - 1, u32::MAX] {
+                    for both in [false, true] {
+                        let (mut a, _) = opening_for_close(config(64, 8), iss, simultaneous);
+                        if synack_sent {
+                            packet(&mut a, 20);
+                        }
+                        a.shutdown().unwrap();
+                        assert!(!a.handshake_complete());
+                        assert_eq!(a.state(), State::SynReceived);
+                        if !synack_sent {
+                            let before = (a.now, a.snd_nxt, a.syn_pending, a.rto_deadline);
+                            assert_eq!(a.transmit(20, &mut [0; 19]), Err(Error::OutputTooSmall));
+                            assert_eq!((a.now, a.snd_nxt, a.syn_pending, a.rto_deadline), before);
+                            let bytes = packet(&mut a, 20);
+                            let synack = wire::parse(ip(tuple()), &bytes).unwrap();
+                            assert_eq!(synack.header.flags & (SYN | ACK | FIN), SYN | ACK);
+                            assert_eq!(synack.header.sequence, iss);
+                            assert!(synack.payload.is_empty());
+                        }
+                        let before = (
+                            a.now,
+                            a.snd_nxt,
+                            a.state,
+                            a.fin_sequence,
+                            a.rto_deadline,
+                            a.sample,
+                        );
+                        assert_eq!(a.transmit(30, &mut [0; 19]), Err(Error::OutputTooSmall));
+                        assert_eq!(
+                            (
+                                a.now,
+                                a.snd_nxt,
+                                a.state,
+                                a.fin_sequence,
+                                a.rto_deadline,
+                                a.sample
+                            ),
+                            before
+                        );
+                        let bytes = packet(&mut a, 30);
+                        let fin = wire::parse(ip(tuple()), &bytes).unwrap();
+                        assert_eq!(fin.header.flags & (SYN | ACK | FIN), ACK | FIN);
+                        assert_eq!(fin.header.sequence, iss.wrapping_add(1));
+                        assert!(fin.payload.is_empty());
+                        assert_eq!(a.state(), State::FinWait1);
+                        assert_eq!(a.snd_nxt, Seq(iss.wrapping_add(2)));
+                        assert!(!a.handshake_complete());
+                        assert!(!a.synchronized());
+                        assert!(!a.events_pending());
+                        assert_eq!(a.read(&mut [0; 1]), Err(Error::WouldBlock));
+                        assert_eq!(a.transmit(31, &mut [0; 64]), Ok(None));
+                        // Old and future ACKs cannot complete the handshake.
+                        inject(&mut a, 32, Seq(901), Seq(iss), ACK, 64, b"bad");
+                        assert!(!a.handshake_complete());
+                        packet(&mut a, 32); // Reset for unacceptable handshake ACK.
+                        inject(
+                            &mut a,
+                            33,
+                            Seq(901),
+                            Seq(iss.wrapping_add(3)),
+                            ACK,
+                            64,
+                            b"bad",
+                        );
+                        assert!(!a.handshake_complete());
+                        packet(&mut a, 33); // Challenge ACK for unsent sequence space.
+                        let ack = Seq(iss.wrapping_add(if both { 2 } else { 1 }));
+                        inject(&mut a, 40, Seq(901), ack, ACK, 64, b"");
+                        assert!(a.handshake_complete());
+                        assert!(a.synchronized());
+                        assert_eq!(
+                            a.state(),
+                            if both {
+                                State::FinWait2
+                            } else {
+                                State::FinWait1
+                            }
+                        );
+                        assert_eq!(a.acknowledged(), 0);
+                        let events = a.take_events();
+                        assert!(events.connected);
+                        assert!(!events.writable);
+                        assert_eq!(events.acknowledged, None);
+                        if !both {
+                            inject(&mut a, 50, Seq(901), Seq(iss.wrapping_add(2)), ACK, 64, b"");
+                            assert_eq!(a.state(), State::FinWait2);
+                            assert!(!a.take_events().connected);
+                        }
+                        assert!(a.handshake_complete());
+                        a.abort();
+                        assert!(a.reset_pending());
+                        assert!(a.handshake_complete());
+                        packet(&mut a, 60);
+                        assert!(!a.reset_pending());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn syn_received_close_peer_fin_completes_handshake_and_read_half() {
+        for iss in [100, u32::MAX] {
+            for simultaneous in [false, true] {
+                for acknowledges_fin in [false, true] {
+                    let (mut a, _) = opening_for_close(config(64, 8), iss, simultaneous);
+                    a.shutdown().unwrap();
+                    packet(&mut a, 20); // SYN-ACK.
+                    packet(&mut a, 30); // Our FIN, handshake still pending.
+                    assert!(!a.handshake_complete());
+                    inject(
+                        &mut a,
+                        40,
+                        Seq(901),
+                        Seq(iss.wrapping_add(if acknowledges_fin { 2 } else { 1 })),
+                        ACK | FIN,
+                        64,
+                        b"reply",
+                    );
+                    assert!(a.handshake_complete());
+                    assert_eq!(
+                        a.state(),
+                        if acknowledges_fin {
+                            State::TimeWait
+                        } else {
+                            State::Closing
+                        }
+                    );
+                    assert_eq!(a.acknowledged(), 0);
+                    let events = a.take_events();
+                    assert!(events.connected && events.half_closed);
+                    let mut reply = [0; 8];
+                    assert_eq!(a.read(&mut reply), Ok(5));
+                    assert_eq!(&reply[..5], b"reply");
+                    assert_eq!(a.read(&mut reply), Ok(0));
+                    let bytes = packet(&mut a, 41);
+                    let ack = wire::parse(ip(tuple()), &bytes).unwrap();
+                    assert_eq!(ack.header.flags & (ACK | SYN | FIN), ACK);
+                    assert_eq!(ack.header.sequence, iss.wrapping_add(2));
+                    assert_eq!(ack.header.acknowledgment, 907);
+                    if !acknowledges_fin {
+                        inject(&mut a, 50, Seq(907), Seq(iss.wrapping_add(2)), ACK, 64, b"");
+                        assert_eq!(a.state(), State::TimeWait);
+                        assert!(!a.take_events().connected);
+                    }
+                    assert!(a.time_wait_valid(50));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn syn_received_close_send_history_survives_flush_and_empty_send() {
+        for simultaneous in [false, true] {
+            for mode in 0..3 {
+                let (mut a, _) = opening_for_close(config(64, 8), 100, simultaneous);
+                match mode {
+                    0 => assert_eq!(a.write(b"queued"), Ok(6)),
+                    1 => {
+                        assert_eq!(a.write(b"discard"), Ok(7));
+                        a.snd_wnd = 0;
+                        assert_eq!(a.flush(), Ok(7));
+                    }
+                    _ => assert_eq!(a.write(b""), Ok(0)),
+                }
+                assert!(a.send_issued);
+                a.shutdown().unwrap();
+                let bytes = packet(&mut a, 20);
+                assert!(wire::parse(ip(tuple()), &bytes).unwrap().payload.is_empty());
+                assert_eq!(a.transmit(30, &mut [0; 64]), Ok(None));
+                assert_eq!(a.state(), State::SynReceived);
+                inject(&mut a, 40, Seq(901), Seq(101), ACK, 64, b"");
+                let bytes = packet(&mut a, 50);
+                let fin = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(
+                    fin.payload,
+                    if mode == 0 { b"queued".as_slice() } else { b"" }
+                );
+                assert_eq!(fin.header.flags & FIN, FIN);
+                assert_eq!(fin.header.sequence, 101);
+                assert_eq!(a.fin_sequence, Some(Seq(if mode == 0 { 107 } else { 101 })));
+            }
+        }
+        // A SEND issued in SYN-SENT also rules out the no-SEND branch after
+        // simultaneous open, even if FLUSH leaves no queued bytes.
+        let (_, syn_bytes) = opening_for_close(config(64, 8), 100, false);
+        let mut a = Connection::active(tuple(), config(64, 8), 100, 0).unwrap();
+        a.write(b"prior").unwrap();
+        packet(&mut a, 0);
+        a.input(10, &wire::parse(ip(reverse(tuple())), &syn_bytes).unwrap())
+            .unwrap();
+        a.snd_wnd = 0;
+        assert_eq!(a.flush(), Ok(5));
+        a.snd_wnd = 64;
+        a.shutdown().unwrap();
+        packet(&mut a, 20);
+        assert_eq!(a.transmit(30, &mut [0; 64]), Ok(None));
+        assert_eq!(a.state(), State::SynReceived);
+        inject(&mut a, 40, Seq(901), Seq(101), ACK, 64, b"");
+        packet(&mut a, 50);
+        assert_eq!(a.state(), State::FinWait1);
+
+        let (mut a, _) = opening_for_close(config(64, 8), 100, false);
+        a.send.write(&[0; 64]); // Exhaust storage without a successful application SEND.
+        assert_eq!(a.write(b"failed"), Err(Error::WouldBlock));
+        assert!(!a.send_issued);
+        a.snd_wnd = 0;
+        a.flush().unwrap();
+        a.snd_wnd = 64;
+        a.shutdown().unwrap();
+        assert_eq!(a.write(b"late"), Err(Error::InvalidState));
+        assert!(!a.send_issued);
+        packet(&mut a, 20);
+        packet(&mut a, 30);
+        assert_eq!(a.state(), State::FinWait1);
+    }
+
+    #[test]
+    fn early_fin_retransmits_syn_until_ack_then_retransmits_fin() {
+        for simultaneous in [false, true] {
+            let mut cfg = config(64, 8);
+            cfg.user_timeout_us = 1_000_000;
+            let (mut a, syn_bytes) = opening_for_close(cfg, u32::MAX, simultaneous);
+            a.set_application_timeout(Some(200_000_000)).unwrap();
+            a.shutdown().unwrap();
+            packet(&mut a, 20); // Lost SYN-ACK.
+            packet(&mut a, 30); // FIN also lost.
+            assert_eq!(a.user_deadline(), Some(a.progress_at + 180_000_000));
+            assert_eq!(
+                a.application_deadline(),
+                Some(a.application_progress_at + 200_000_000)
+            );
+            for duplicate in [true, false] {
+                let now = if duplicate {
+                    a.input(40, &wire::parse(ip(reverse(tuple())), &syn_bytes).unwrap())
+                        .unwrap();
+                    40
+                } else {
+                    let end = a.rto_deadline.unwrap();
+                    a.timeout(end).unwrap();
+                    end
+                };
+                assert!(a.syn_pending);
+                assert!(!a.handshake_complete());
+                let before = (a.now, a.snd_nxt, a.syn_pending, a.rto_deadline);
+                assert_eq!(a.transmit(now, &mut [0; 19]), Err(Error::OutputTooSmall));
+                assert_eq!((a.now, a.snd_nxt, a.syn_pending, a.rto_deadline), before);
+                let bytes = packet(&mut a, now);
+                let synack = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(synack.header.flags & (SYN | ACK | FIN), SYN | ACK);
+                assert_eq!(synack.header.sequence, u32::MAX);
+                assert!(synack.payload.is_empty());
+                assert_eq!(a.snd_nxt, Seq(1));
+                assert_eq!(a.state(), State::FinWait1);
+                assert!(a.rto_deadline.is_some());
+            }
+            let now = a.now + 10;
+            inject(&mut a, now, Seq(901), Seq(0), ACK, 64, b"");
+            assert!(a.handshake_complete());
+            assert_eq!(a.state(), State::FinWait1);
+            assert_eq!(a.acknowledged(), 0);
+            assert_eq!(a.user_deadline(), Some(now + 1_000_000));
+            // Lengthen post-handshake R2 so this test can service the backed-off RTO.
+            a.config.user_timeout_us = 300_000_000;
+            let end = a.rto_deadline.unwrap();
+            a.timeout(end).unwrap();
+            assert!(!a.syn_pending);
+            let bytes = packet(&mut a, end);
+            let fin = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(fin.header.flags & (SYN | ACK | FIN), ACK | FIN);
+            assert_eq!(fin.header.sequence, 0);
+            assert!(fin.payload.is_empty());
+            inject(&mut a, end + 10, Seq(901), Seq(1), ACK, 64, b"");
+            assert_eq!(a.state(), State::FinWait2);
+        }
+        let (mut a, _) = opening_for_close(config(64, 8), 100, false);
+        a.shutdown().unwrap();
+        packet(&mut a, 20);
+        packet(&mut a, 30);
+        a.timeout(a.user_deadline().unwrap()).unwrap();
+        assert_eq!(a.close_reason(), Some(CloseReason::TimedOut));
+        assert!(!a.handshake_complete());
+        assert_eq!(a.next_deadline(), None);
+        assert!(!a.reset_pending());
+    }
+
+    #[test]
+    fn early_fin_timestamp_validation_and_simultaneous_synack_preserve_negotiation() {
+        for simultaneous in [false, true] {
+            let mut cfg = config(131072, 1460);
+            cfg.timestamps = true;
+            cfg.sack = true;
+            let mut peer = Connection::active(reverse(tuple()), cfg.clone(), 900, 0).unwrap();
+            let syn_bytes = packet(&mut peer, 0);
+            let syn = wire::parse(ip(reverse(tuple())), &syn_bytes).unwrap();
+            let mut a = if simultaneous {
+                let mut a = Connection::active(tuple(), cfg, 100, 0).unwrap();
+                deliver(&mut a, &mut peer, 0);
+                a.input(10, &syn).unwrap();
+                a
+            } else {
+                Connection::passive(tuple(), cfg, 100, 10, &syn).unwrap()
+            };
+            a.shutdown().unwrap();
+            let synack_bytes = packet(&mut a, 20);
+            let synack = wire::parse(ip(tuple()), &synack_bytes).unwrap();
+            let bytes = packet(&mut a, 30);
+            let fin = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert!(fin.options.timestamps.is_some());
+            assert_eq!(fin.options.window_scale, None);
+            assert!(!fin.options.sack_permitted);
+            assert_eq!(a.snd_wnd, 65535); // The SYN window is unscaled.
+            assert_eq!(a.peer_scale, 2);
+            assert!(a.scaling && a.timestamps && a.sack_receive && a.sack_send);
+            // A duplicate SYN must still retransmit a fully negotiated SYN-ACK.
+            a.input(40, &syn).unwrap();
+            let bytes = packet(&mut a, 40);
+            let retry = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(retry.header.flags & (SYN | ACK | FIN), SYN | ACK);
+            assert_eq!(retry.options.window_scale, synack.options.window_scale);
+            assert_eq!(retry.options.timestamps, synack.options.timestamps);
+            assert!(retry.options.sack_permitted);
+            assert_eq!(retry.header.window, synack.header.window);
+            inject(&mut a, 50, Seq(901), Seq(101), ACK, 1, b"bad");
+            assert!(!a.handshake_complete()); // Negotiated timestamp missing.
+            let metadata = ip(reverse(tuple()));
+            let header = Header {
+                source_port: 2000,
+                destination_port: 1000,
+                sequence: 901,
+                acknowledgment: 101,
+                flags: ACK,
+                window: 1,
+                urgent_pointer: 0,
+            };
+            let mut bytes = [0; 64];
+            let options = [1, 1, 8, 10, 255, 255, 255, 255, 0, 0, 0, 0];
+            let size = wire::encode(metadata, header, &options, b"bad", &mut bytes).unwrap();
+            a.input(60, &wire::parse(metadata, &bytes[..size]).unwrap())
+                .unwrap();
+            assert!(!a.handshake_complete()); // PAWS rejects stale timestamp.
+            assert_eq!(a.snd_wnd, 65535);
+            assert_eq!(a.readable_bytes(), 0);
+            packet(&mut a, 60); // PAWS ACK does not consume SYN retransmission state.
+            if !simultaneous {
+                peer.input(10_000, &synack).unwrap();
+            }
+            let bytes = deliver(&mut peer, &mut a, 10_010);
+            let completion = wire::parse(metadata, &bytes).unwrap();
+            assert_eq!(completion.header.flags & SYN != 0, simultaneous);
+            assert!(a.handshake_complete());
+            assert_eq!(a.state(), State::FinWait1);
+            assert_eq!(a.snd_una, Seq(101)); // SYN-ACK/ACK did not acknowledge FIN.
+            assert_eq!(a.acknowledged(), 0);
+            assert!(a.take_events().connected);
+            assert_eq!(a.snd_wnd, if simultaneous { 65535 } else { 131072 });
+            assert_eq!(a.peer_scale, 2);
+            let options = [1, 1, 8, 10, 0, 0, 0, 11, 0, 0, 0, 0];
+            let header = Header {
+                acknowledgment: 102,
+                window: 10,
+                ..header
+            };
+            let mut buffer = [0; 64];
+            let size = wire::encode(metadata, header, &options, b"x", &mut buffer).unwrap();
+            a.input(11_000, &wire::parse(metadata, &buffer[..size]).unwrap())
+                .unwrap();
+            assert_eq!(a.state(), State::FinWait2);
+            assert_eq!(a.snd_wnd, 10 << 2); // Non-SYN windows use negotiated scale.
+            assert_eq!(a.read(&mut [0; 1]), Ok(1));
+            assert!(!a.take_events().connected);
+        }
+    }
+
+    #[test]
+    fn early_fin_retains_handshake_receive_and_reset_rules() {
+        for simultaneous in [false, true] {
+            let cfg = config(64, 8);
+            let metadata = ip(reverse(tuple()));
+            let mut bytes = [0; 64];
+            let header = Header {
+                source_port: 2000,
+                destination_port: 1000,
+                sequence: 900,
+                acknowledgment: 0,
+                flags: SYN | PSH | URG,
+                window: 64,
+                urgent_pointer: 4,
+            };
+            let size = wire::encode(metadata, header, &[], b"abc", &mut bytes).unwrap();
+            let syn = wire::parse(metadata, &bytes[..size]).unwrap();
+            let mut a = if simultaneous {
+                let mut a = Connection::active(tuple(), cfg, 100, 0).unwrap();
+                packet(&mut a, 0);
+                a.input(10, &syn).unwrap();
+                a
+            } else {
+                Connection::passive(tuple(), cfg, 100, 10, &syn).unwrap()
+            };
+            a.shutdown().unwrap();
+            packet(&mut a, 20);
+            packet(&mut a, 30);
+            assert_eq!(a.state(), State::FinWait1);
+            assert_eq!(a.readable_bytes(), 0);
+            assert_eq!(a.urgent_remaining(), 0);
+            assert_eq!(a.read(&mut [0; 3]), Err(Error::WouldBlock));
+            assert!(!a.events_pending());
+            inject(&mut a, 40, Seq(904), Seq(101), ACK, 64, b"");
+            assert!(a.handshake_complete());
+            assert_eq!(a.state(), State::FinWait1);
+            let events = a.take_events();
+            assert!(events.connected && events.readable && events.pushed);
+            assert_eq!(events.urgent, Some(3));
+            assert_eq!(a.urgent_remaining(), 3);
+            assert_eq!(a.read(&mut [0; 3]), Ok(3));
+
+            let (mut a, _) = opening_for_close(config(64, 8), 100, simultaneous);
+            a.shutdown().unwrap();
+            packet(&mut a, 20);
+            packet(&mut a, 30);
+            inject(&mut a, 40, Seq(902), Seq(102), RST | ACK, 64, b"bad");
+            assert_eq!(a.state(), State::FinWait1);
+            assert!(!a.handshake_complete());
+            let bytes = packet(&mut a, 40);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().header.flags & (RST | SYN | FIN | ACK),
+                ACK
+            );
+            inject(&mut a, 50, Seq(901), Seq(102), RST | ACK, 64, b"bad");
+            assert_eq!(a.close_reason(), Some(CloseReason::Reset));
+            assert!(!a.handshake_complete());
+            assert!(!a.reset_pending());
+            assert_eq!(a.next_deadline(), None);
+            assert_eq!(
+                a.take_events().closed,
+                if simultaneous {
+                    Some(CloseReason::Reset)
+                } else {
+                    None
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn syn_received_close_zero_window_defers_fin_but_not_synack() {
+        for simultaneous in [false, true] {
+            let (mut a, _) = opening_for_close(config(64, 8), 100, simultaneous);
+            a.snd_wnd = 0;
+            a.shutdown().unwrap();
+            let bytes = packet(&mut a, 20);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().header.flags & (SYN | ACK | FIN),
+                SYN | ACK
+            );
+            assert_eq!(a.transmit(30, &mut [0; 64]), Ok(None));
+            assert_eq!(a.state(), State::SynReceived);
+            inject(&mut a, 40, Seq(901), Seq(101), ACK, 0, b"");
+            assert!(a.handshake_complete());
+            assert_eq!(a.state(), State::Established);
+            assert_eq!(a.transmit(50, &mut [0; 64]), Ok(None));
+            assert!(a.persist_deadline.is_some());
+            inject(&mut a, 60, Seq(901), Seq(101), ACK, 64, b"");
+            let bytes = packet(&mut a, 70);
+            let fin = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(fin.header.flags & (SYN | ACK | FIN), ACK | FIN);
+            assert_eq!(fin.header.sequence, 101);
+            assert_eq!(a.state(), State::FinWait1);
+        }
     }
 
     #[test]

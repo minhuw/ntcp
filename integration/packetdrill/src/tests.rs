@@ -1382,26 +1382,30 @@ fn ip_options_passive_expiry_gc_final_reset_and_unmatched_control() {
     execute_value(&mut owner, 11, listener, 6, 120).unwrap();
     execute_value(&mut owner, 11, listener, 7, IP_PMTUDISC_DO).unwrap();
     owner.execute(&mut incoming).unwrap();
-    let replacement = owner.endpoint.connection_id(tuple).unwrap();
-    assert_ne!(replacement, child);
-    let mut reset_seen = false;
-    let mut synack_seen = false;
-    for _ in 0..2 {
-        let (tx, bytes) = poll_frame(&mut owner).unwrap();
-        if tx.connection == Some(child) {
-            assert_ne!(packet_header(&bytes).flags & ntcp::wire::RST, 0);
-            check_ip(&bytes, 80, false);
-            reset_seen = true;
-        } else {
-            assert_eq!(tx.connection, Some(replacement));
-            assert_ne!(packet_header(&bytes).flags & ntcp::wire::SYN, 0);
-            check_ip(&bytes, 120, true);
-            synack_seen = true;
-        }
-    }
-    assert!(reset_seen && synack_seen);
+    assert_eq!(owner.endpoint.connection_id(tuple), Some(child));
+    let (tx, bytes) = poll_frame(&mut owner).unwrap();
+    assert_eq!(tx.connection, Some(child));
+    assert_ne!(packet_header(&bytes).flags & ntcp::wire::RST, 0);
+    check_ip(&bytes, 80, false);
+    // The terminal reset retains its original policy and tuple through 2MSL.
+    owner.execute(&mut incoming).unwrap();
+    assert!(poll_frame(&mut owner).is_none());
+    assert_eq!(owner.endpoint.connection_id(tuple), Some(child));
     owner.gc_ip_options();
     assert_eq!(owner.connection_ip.len(), 1);
+    let expiry = owner.endpoint.next_deadline().unwrap().max(owner.now());
+    owner.endpoint.on_timeout(expiry, BUDGET).unwrap();
+    owner.epoch = Instant::now() - Duration::from_micros(expiry);
+    assert!(!owner.endpoint.connection_exists(child));
+    owner.gc_ip_options();
+    assert!(owner.connection_ip.is_empty());
+    owner.execute(&mut incoming).unwrap();
+    let replacement = owner.endpoint.connection_id(tuple).unwrap();
+    assert_ne!(replacement, child);
+    let (tx, bytes) = poll_frame(&mut owner).unwrap();
+    assert_eq!(tx.connection, Some(replacement));
+    assert_ne!(packet_header(&bytes).flags & ntcp::wire::SYN, 0);
+    check_ip(&bytes, 120, true);
     let child = replacement;
     execute_value(&mut owner, 8, listener, 0, 0).unwrap();
     owner.endpoint.on_timeout(owner.now(), BUDGET).unwrap();
@@ -1411,6 +1415,12 @@ fn ip_options_passive_expiry_gc_final_reset_and_unmatched_control() {
     assert_eq!(tx.connection, Some(child));
     assert_ne!(packet_header(&bytes).flags & ntcp::wire::RST, 0);
     check_ip(&bytes, 120, true);
+    assert!(owner.endpoint.connection_exists(child));
+    owner.gc_ip_options();
+    assert_eq!(owner.connection_ip.len(), 1);
+    let expiry = owner.endpoint.next_deadline().unwrap().max(owner.now());
+    owner.endpoint.on_timeout(expiry, BUDGET).unwrap();
+    owner.epoch = Instant::now() - Duration::from_micros(expiry);
     assert!(!owner.endpoint.connection_exists(child));
     owner.gc_ip_options();
     assert!(owner.connection_ip.is_empty());

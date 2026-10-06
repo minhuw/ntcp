@@ -195,11 +195,14 @@ impl TupleTable {
         false
     }
 
-    fn remove(&mut self, hash: usize, tuple: Tuple) {
+    fn remove(&mut self, hash: usize, tuple: Tuple, owner: usize) {
         for probe in 0..self.entries.len().min(64) {
             let position = hash.wrapping_add(probe) & (self.entries.len() - 1);
             match self.entries[position] {
-                Entry::Occupied(key, _) if key == tuple => {
+                Entry::Occupied(key, slot) if key == tuple => {
+                    if slot != owner {
+                        return;
+                    }
                     self.entries[position] = Entry::Deleted;
                     return;
                 }
@@ -221,6 +224,9 @@ struct Slot {
     released: bool,
     closed_output_drained: bool,
     mapped: bool,
+    // ponytail: quarantine retains slot/buffers within existing connection/byte bounds;
+    // compact tombstones can reclaim buffer slack if reset churn matters.
+    reset_deadline: Option<Instant>,
     fallback: Option<ConnectionId>,
     hop_limit: u8,
     dscp: u8,
@@ -697,6 +703,15 @@ impl Endpoint {
         let admission = (|| {
             let index = *self.free.last().ok_or(EndpointError::LimitReached)?;
             if let Some(old) = fallback {
+                if self.generations.get(old.slot) != Some(&old.generation)
+                    || !self.slots[old.slot].as_ref().is_some_and(|slot| {
+                        slot.mapped
+                            && slot.connection.tuple() == tuple
+                            && slot.connection.time_wait_valid(self.now)
+                    })
+                {
+                    return Err(EndpointError::AddressInUse);
+                }
                 if !self
                     .tuples
                     .replace(self.hash(tuple), tuple, old.slot, index)
@@ -704,6 +719,9 @@ impl Endpoint {
                     return Err(EndpointError::AddressInUse);
                 }
             } else {
+                if self.tuples.find(self.hash(tuple), tuple).is_some() {
+                    return Err(EndpointError::AddressInUse);
+                }
                 self.tuples.insert(self.hash(tuple), tuple, index)?;
             }
             Ok(index)
@@ -727,6 +745,7 @@ impl Endpoint {
             released: false,
             closed_output_drained: false,
             mapped: true,
+            reset_deadline: None,
             fallback,
             hop_limit: self.config.hop_limit,
             dscp: self.config.dscp,
@@ -890,7 +909,7 @@ impl Endpoint {
         let slot = self.slots[index].take().unwrap();
         let tuple = slot.connection.tuple();
         if slot.mapped {
-            self.tuples.remove(self.hash(tuple), tuple);
+            self.tuples.remove(self.hash(tuple), tuple, index);
         }
         if let Some(parent) = slot.listener {
             self.unlink_child(parent, id);
@@ -908,7 +927,10 @@ impl Endpoint {
 
     fn refresh(&mut self, index: usize) {
         if let Some(slot) = self.slots[index].as_ref()
-            && slot.connection.state() != State::SynReceived
+            && (slot.connection.handshake_complete()
+                || (slot.connection.state() == State::Closed
+                    && !slot.connection.reset_pending()
+                    && slot.reset_deadline.is_none()))
             && let Some(old) = slot.fallback
         {
             let failed = slot.connection.state() == State::Closed;
@@ -943,9 +965,10 @@ impl Endpoint {
         };
         let state = slot.connection.state();
         let parent = slot.listener;
-        let newly_established = !slot.accepted_ready
-            && !matches!(state, State::SynSent | State::SynReceived | State::Closed);
-        let failed_half_open = parent.is_some() && !slot.accepted_ready && state == State::Closed;
+        let newly_established =
+            !slot.accepted_ready && slot.connection.handshake_complete() && state != State::Closed;
+        let failed_child = parent.is_some() && state == State::Closed;
+        let reset_reserved = slot.connection.reset_pending() || slot.reset_deadline.is_some();
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.5.3
         //# If the receiver was
         //# in SYN-RECEIVED state and had previously been in the LISTEN state,
@@ -955,18 +978,23 @@ impl Endpoint {
         // A Closed connection may still owe a reset. Only reclaim after a
         // successful output attempt (including one that finds no packet).
         if state == State::Closed
-            && (failed_half_open || slot.released)
+            && (failed_child || slot.released)
             && slot.closed_output_drained
+            && !reset_reserved
         {
             self.reclaim(index);
             return;
         }
-        if failed_half_open {
-            self.slots[index].as_mut().unwrap().released = true;
+        if failed_child {
+            self.unlink_child(parent.unwrap(), self.id(index));
+            let slot = self.slots[index].as_mut().unwrap();
+            slot.listener = None;
+            slot.released = true;
+            self.events.remove(index);
         }
-        if state == State::Closed && self.slots[index].as_ref().unwrap().mapped {
+        if state == State::Closed && !reset_reserved && self.slots[index].as_ref().unwrap().mapped {
             let tuple = self.slots[index].as_ref().unwrap().connection.tuple();
-            self.tuples.remove(self.hash(tuple), tuple);
+            self.tuples.remove(self.hash(tuple), tuple, index);
             self.slots[index].as_mut().unwrap().mapped = false;
         }
         if let Some(parent) = parent
@@ -985,11 +1013,16 @@ impl Endpoint {
             }
         }
         let slot = self.slots[index].as_ref().unwrap();
-        self.deadlines.set(index, slot.connection.next_deadline());
+        self.deadlines.set(
+            index,
+            slot.reset_deadline.or(slot.connection.next_deadline()),
+        );
         if slot.listener.is_none() && !slot.released && slot.connection.events_pending() {
             self.events.push(index);
         }
-        if slot.mapped || state == State::Closed {
+        if (slot.mapped && state != State::Closed)
+            || (state == State::Closed && !slot.closed_output_drained)
+        {
             self.output.push(index);
         }
     }
@@ -1211,6 +1244,10 @@ impl Endpoint {
             remote: SocketAddr::new(ip.source, segment.header.source_port),
         };
         if let Some(index) = self.tuples.find(self.hash(tuple), tuple) {
+            let slot = self.slots[index].as_ref().unwrap();
+            if slot.connection.reset_pending() || slot.reset_deadline.is_some() {
+                return Ok(InputDisposition::Dropped);
+            }
             if self.config.reuse_time_wait
                 && self.slots[index].as_ref().unwrap().connection.state() == State::TimeWait
                 && segment.header.flags & !(wire::ECE | wire::CWR) == SYN
@@ -1667,11 +1704,12 @@ impl Endpoint {
                 break;
             }
             self.deadlines.set(index, None);
-            self.slots[index]
-                .as_mut()
-                .unwrap()
-                .connection
-                .timeout(now)?;
+            let slot = self.slots[index].as_mut().unwrap();
+            if slot.reset_deadline.is_some_and(|deadline| deadline <= now) {
+                slot.reset_deadline = None;
+            } else {
+                slot.connection.timeout(now)?;
+            }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.8
             //# If the time-wait timeout expires on a connection, delete the TCB,
             //# enter the CLOSED state, and return.
@@ -1726,8 +1764,23 @@ impl Endpoint {
             let connection = self.id(index);
             let slot = self.slots[index].as_mut().unwrap();
             let tuple = slot.connection.tuple();
+            let terminal_reset = slot.connection.reset_pending();
             match slot.connection.transmit(now, out) {
                 Ok(Some(len)) => {
+                    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.5.2
+                    //= reason=Terminal local reset reserves the tuple for 2MSL independently of immediate application CLOSED; only successful RST generation starts the timer.
+                    //# The side of a connection issuing a reset should enter the TIME-WAIT state, as
+                    //# this generally helps to reduce the load on busy servers for reasons described
+                    //# in [70].
+                    if terminal_reset
+                        && out
+                            .get(..len)
+                            .and_then(|bytes| bytes.get(13))
+                            .is_some_and(|flags| flags & RST != 0)
+                    {
+                        slot.reset_deadline =
+                            Some(now.saturating_add(self.config.connection.time_wait_us));
+                    }
                     slot.closed_output_drained = slot.connection.state() == State::Closed;
                     let hop_limit = slot.hop_limit;
                     let dscp = slot.dscp;
@@ -1762,10 +1815,16 @@ impl Endpoint {
                     });
                 }
                 Ok(None) => {
-                    self.deadlines.set(index, slot.connection.next_deadline());
+                    self.deadlines.set(
+                        index,
+                        slot.reset_deadline.or(slot.connection.next_deadline()),
+                    );
                     if slot.connection.state() == State::Closed {
                         slot.closed_output_drained = true;
-                        if slot.released {
+                        if slot.released
+                            && !slot.connection.reset_pending()
+                            && slot.reset_deadline.is_none()
+                        {
                             self.reclaim(index);
                         }
                     }
@@ -1823,7 +1882,9 @@ mod recovery_observation_tests {
             let charge = endpoint.per_connection_bytes;
             let pool_capacity = endpoint.receive_pool.capacity();
             // A full bounded probe table can fail insertion after construction.
-            endpoint.tuples.entries.fill(Entry::Occupied(tuple, 0));
+            let mut occupied = tuple;
+            occupied.remote.set_port(occupied.remote.port() + 1);
+            endpoint.tuples.entries.fill(Entry::Occupied(occupied, 0));
             let connection = endpoint.new_connection(tuple, 100, None).unwrap();
             assert!(endpoint.receive_pool.is_empty());
             assert_eq!(endpoint.buffer_bytes(), charge);
@@ -1854,6 +1915,51 @@ mod recovery_observation_tests {
                 (endpoint.slots.iter().flatten().count() + endpoint.receive_pool.len()) * charge
             );
         }
+    }
+
+    #[test]
+    fn reserved_tuple_insert_rejects_duplicates_and_invalid_fallback_owners() {
+        let config = EndpointConfig {
+            max_connections: 3,
+            ..EndpointConfig::default()
+        };
+        let tuple = Tuple {
+            local: "192.0.2.1:40000".parse().unwrap(),
+            remote: "192.0.2.2:8080".parse().unwrap(),
+        };
+        let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+        b.listen(tuple.remote, 1).unwrap();
+        a.connect(0, tuple.local, tuple.remote).unwrap();
+        let (tx, bytes) = packet(&mut a, 0);
+        b.input(0, tx.ip, &bytes).unwrap();
+        let tuple = Tuple {
+            local: tuple.remote,
+            remote: tuple.local,
+        };
+        let owner = b.connection_id(tuple).unwrap();
+        b.abort(owner).unwrap(); // Terminal pending reset, automatically unlinked/released.
+        let charge = b.buffer_bytes();
+        for fallback in [
+            None,
+            Some(owner),
+            Some(ConnectionId {
+                generation: owner.generation + 1,
+                ..owner
+            }),
+        ] {
+            let connection = b.new_connection(tuple, 100, None).unwrap();
+            assert_eq!(
+                b.insert(connection, None, fallback),
+                Err(EndpointError::AddressInUse)
+            );
+            assert_eq!(b.connection_id(tuple), Some(owner));
+            assert_eq!(b.buffer_bytes(), charge);
+        }
+        let (tx, _) = packet(&mut b, 0);
+        assert_eq!(tx.connection, Some(owner));
+        assert_eq!(b.next_deadline(), Some(b.config.connection.time_wait_us));
+        assert!(b.connection_exists(owner));
     }
 
     #[test]
@@ -1928,6 +2034,10 @@ mod recovery_observation_tests {
         let (tx, bytes) = packet(&mut a, 225_000);
         assert_eq!(tx.connection, Some(client));
         assert_ne!(wire::parse(tx.ip, &bytes).unwrap().header.flags & RST, 0);
+        assert_eq!(a.connection_id(tuple), Some(client));
+        assert!(a.connection_exists(client));
+        let expiry = a.next_deadline().unwrap();
+        a.on_timeout(expiry, 1).unwrap();
         assert_eq!(a.connection_id(tuple), None);
         assert!(!a.connection_exists(client));
         assert_eq!(a.transport_info(client), Err(EndpointError::InvalidHandle));

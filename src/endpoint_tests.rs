@@ -225,9 +225,12 @@ fn output_failure_stale_handles_and_memory_limits_are_explicit() {
     //# Delete the
     //# TCB, enter CLOSED state, and return.
 
+    assert!(a.buffer_bytes() > 0);
+    let expiry = a.next_deadline().unwrap();
+    a.on_timeout(expiry, 1).unwrap();
     assert_eq!(a.buffer_bytes(), 0);
     let (local, remote) = addresses();
-    let replacement = a.connect(0, local, remote).unwrap();
+    let replacement = a.connect(expiry, local, remote).unwrap();
     assert_ne!(replacement, client);
     assert_eq!(a.write(client, b"bad"), Err(EndpointError::InvalidHandle));
     let mut limited = config();
@@ -244,7 +247,7 @@ fn output_failure_stale_handles_and_memory_limits_are_explicit() {
     );
     assert_eq!(
         a.input(
-            0,
+            expiry,
             IpMetadata {
                 source: remote.ip(),
                 destination: local.ip()
@@ -254,7 +257,7 @@ fn output_failure_stale_handles_and_memory_limits_are_explicit() {
         .unwrap(),
         InputDisposition::Dropped
     );
-    a.on_timeout(1, 0).unwrap();
+    a.on_timeout(expiry + 1, 0).unwrap();
     assert_eq!(
         a.poll_transmit(0, &mut [0; 100], 1),
         Err(EndpointError::Connection(Error::TimeWentBackwards))
@@ -269,6 +272,9 @@ fn listener_backlog_and_cleanup_are_bounded() {
     assert!(b.buffer_bytes() > 0);
     b.close_listener(listener).unwrap();
     packets(&mut b, 0);
+    assert!(b.buffer_bytes() > 0);
+    let expiry = b.next_deadline().unwrap();
+    b.on_timeout(expiry, 1).unwrap();
     assert_eq!(b.buffer_bytes(), 0);
     assert_eq!(b.accept(listener), Err(EndpointError::InvalidHandle));
     let (_, remote) = addresses();
@@ -420,15 +426,22 @@ fn closed_status_does_not_keep_owning_the_tuple_or_remove_its_replacement() {
     pump(&mut a, &mut b, 0);
     assert_eq!(b.state(peer).unwrap(), State::Closed);
     let (local, remote) = addresses();
-    let replacement = a.connect(1, local, remote).unwrap();
+    assert_eq!(
+        a.connect(1, local, remote),
+        Err(EndpointError::AddressInUse)
+    );
+    let expiry = a.next_deadline().unwrap();
+    a.on_timeout(expiry, 1).unwrap();
+    assert_eq!(a.state(old), Ok(State::Closed));
+    let replacement = a.connect(expiry, local, remote).unwrap();
     assert_ne!(old, replacement);
     a.release(old).unwrap();
-    pump(&mut a, &mut b, 1);
+    pump(&mut a, &mut b, expiry);
     let accepted = b.accept(listener).unwrap();
     assert_eq!(a.state(replacement).unwrap(), State::Established);
     b.release(peer).unwrap();
     a.write(replacement, b"new incarnation").unwrap();
-    pump(&mut a, &mut b, 1);
+    pump(&mut a, &mut b, expiry);
     let mut data = [0; 32];
     assert_eq!(b.read(accepted, &mut data).unwrap(), 15);
     assert_eq!(&data[..15], b"new incarnation");
@@ -725,7 +738,7 @@ fn unknown_connection_reset_has_correct_sequence_and_never_answers_reset() {
 
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5
 //= type=test
-//= reason=Terminal notification cancels stream operations; explicit release reclaims storage after the pending reset is generated.
+//= reason=Terminal notification cancels stream operations immediately; explicit release invalidates the handle while bounded reset quarantine retains storage until expiry.
 //# All queued SENDs and RECEIVEs should be given "connection reset"
 //# notification; all segments queued for transmission (except for the
 //# RST formed above) or retransmission should be flushed. Delete the
@@ -768,12 +781,15 @@ fn abort_release_retries_reset_before_reclaiming_storage() {
     let segment = wire::parse(reset[0].0, &reset[0].1).unwrap();
     assert_eq!(segment.header.flags, wire::RST);
     assert!(segment.payload.is_empty());
-    assert_eq!(a.buffer_bytes(), 0);
-    assert!(a.next_deadline().is_none());
+    assert_eq!(a.buffer_bytes(), retained);
+    assert_eq!(a.next_deadline(), Some(config().connection.time_wait_us));
     assert!(packets(&mut a, 0).is_empty());
     deliver(&mut b, 0, reset);
     assert_eq!(b.state(server).unwrap(), State::Closed);
     assert_eq!(b.close_reason(server).unwrap(), Some(CloseReason::Reset));
+    a.on_timeout(config().connection.time_wait_us, 1).unwrap();
+    assert_eq!(a.buffer_bytes(), 0);
+    assert!(a.next_deadline().is_none());
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8
@@ -1533,6 +1549,9 @@ fn listener_cleanup_retries_unaccepted_child_reset() {
             & wire::RST,
         0
     );
+    assert!(b.buffer_bytes() > 0);
+    let expiry = b.next_deadline().unwrap();
+    b.on_timeout(expiry, 1).unwrap();
     assert_eq!(b.buffer_bytes(), 0);
     assert_eq!(b.accept(listener), Err(EndpointError::InvalidHandle));
 }
@@ -3314,34 +3333,41 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
         assert!(a.connection_exists(id));
         assert!(a.poll_transmit(0, &mut [0; 1], 1).is_err());
         packets(&mut a, 0);
-        assert!(!a.connection_exists(id));
+        assert!(a.connection_exists(id));
     }
+    assert_eq!(a.buffer_bytes(), 2 * charge);
+    a.on_timeout(240_000_000, 2).unwrap();
+    assert!(!a.connection_exists(first));
+    assert!(!a.connection_exists(second));
     assert_eq!(a.buffer_bytes(), charge);
     for id in servers {
         b.abort(id).unwrap();
         b.release(id).unwrap();
         packets(&mut b, 0);
     }
+    assert_eq!(b.buffer_bytes(), 2 * charge);
+    b.on_timeout(240_000_000, 2).unwrap();
     assert_eq!(b.buffer_bytes(), charge);
     // At the reserved budget, active and passive opens must still be admitted.
-    let fresh = a.connect(0, local, remote).unwrap();
-    pump(&mut a, &mut b, 0);
+    let fresh = a.connect(240_000_000, local, remote).unwrap();
+    pump(&mut a, &mut b, 240_000_000);
     let server = b.accept(listener).unwrap();
     assert_ne!(fresh, first);
     assert_eq!((a.buffer_bytes(), b.buffer_bytes()), (charge, charge));
     a.write(fresh, b"old bytes").unwrap();
     a.shutdown(fresh).unwrap();
-    pump(&mut a, &mut b, 0);
+    pump(&mut a, &mut b, 240_000_000);
     assert_eq!(b.state(server), Ok(State::CloseWait));
     // Keep old unread payload and EOF in the receive buffer through abort/reclaim.
     b.abort(server).unwrap();
     b.release(server).unwrap();
-    pump(&mut a, &mut b, 0);
+    pump(&mut a, &mut b, 240_000_000);
     a.release(fresh).unwrap();
-    packets(&mut a, 0);
+    packets(&mut a, 240_000_000);
+    b.on_timeout(480_000_000, 1).unwrap();
     assert_eq!((a.buffer_bytes(), b.buffer_bytes()), (charge, charge));
-    let replacement = a.connect(1, local, remote).unwrap();
-    pump(&mut a, &mut b, 1);
+    let replacement = a.connect(480_000_001, local, remote).unwrap();
+    pump(&mut a, &mut b, 480_000_001);
     let server = b.accept(listener).unwrap();
     assert_eq!(b.readable_bytes(server), Ok(0));
     assert_eq!(
@@ -3355,7 +3381,7 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
         }
     }
     a.write(replacement, b"new").unwrap();
-    pump(&mut a, &mut b, 1);
+    pump(&mut a, &mut b, 480_000_001);
     let mut out = [0xaa; 16];
     assert_eq!(b.read(server, &mut out), Ok(3));
     assert_eq!(&out[..3], b"new");
@@ -3396,4 +3422,387 @@ fn receive_preallocation_time_wait_fallback_keeps_ownership_and_charges() {
     assert_eq!(b.buffer_bytes(), 2 * charge);
     assert!(b.connect(240_003_000, tuple.local, tuple.remote).is_ok());
     assert_eq!(b.buffer_bytes(), 2 * charge);
+}
+
+// Exact BASE-044 recommendation, reconciled with application-visible ABORT CLOSED.
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.5.2
+//= type=test
+//= reason=IPv4/IPv6 terminal resets reserve bounded tuple ownership before output and for exactly configured 2MSL after successful generation; released and retained handles expire safely.
+//# The side of a connection issuing a reset should enter the TIME-WAIT state, as
+//# this generally helps to reduce the load on busy servers for reasons described
+//# in [70].
+#[test]
+fn reset_quarantine_output_commit_exact_boundary_and_replacement_ownership() {
+    for ipv6 in [false, true] {
+        for released in [false, true] {
+            let (local, remote) = if ipv6 {
+                (
+                    "[2001:db8::1]:40000".parse().unwrap(),
+                    "[2001:db8::2]:8080".parse().unwrap(),
+                )
+            } else {
+                addresses()
+            };
+            let mut cfg = config();
+            cfg.connection.time_wait_us = 240_000_123;
+            let duration = cfg.connection.time_wait_us;
+            let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+            let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+            let listener = b.listen(remote, 1).unwrap();
+            let id = a.connect(0, local, remote).unwrap();
+            pump(&mut a, &mut b, 0);
+            b.accept(listener).unwrap();
+            a.listen(local, 1).unwrap(); // Stale SYN must not reach even a matching listener.
+            let tuple = Tuple { local, remote };
+            let charge = a.buffer_bytes();
+            a.abort(id).unwrap();
+            assert_eq!(a.state(id), Ok(State::Closed));
+            assert_eq!(a.next_deadline(), None);
+            if released {
+                a.release(id).unwrap();
+            }
+            let incoming = IpMetadata {
+                source: remote.ip(),
+                destination: local.ip(),
+            };
+            let header = wire::Header {
+                source_port: remote.port(),
+                destination_port: local.port(),
+                sequence: 123,
+                acknowledgment: 456,
+                flags: 0,
+                window: 1024,
+                urgent_pointer: 0,
+            };
+            // Neither failed generation nor stale traffic starts/extends the timer.
+            for now in [1, 500] {
+                assert_eq!(
+                    a.poll_transmit(now, &mut [0; 1], 1),
+                    Err(EndpointError::Connection(Error::OutputTooSmall))
+                );
+                for flags in [wire::SYN, wire::ACK, wire::RST] {
+                    let mut bytes = [0; 64];
+                    let len = wire::encode(
+                        incoming,
+                        wire::Header { flags, ..header },
+                        &[],
+                        b"stale",
+                        &mut bytes,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        a.input(now, incoming, &bytes[..len]),
+                        Ok(InputDisposition::Dropped)
+                    );
+                }
+                assert_eq!(a.next_deadline(), None);
+                assert_eq!(
+                    a.connect(now, local, remote),
+                    Err(EndpointError::AddressInUse)
+                );
+                assert_eq!(a.buffer_bytes(), charge);
+            }
+            assert!(
+                a.poll_transmit(1_000, &mut [0; 64], 0)
+                    .unwrap()
+                    .packet
+                    .is_none()
+            );
+            let (tx, bytes) = ecn_packet(&mut a, 1_000);
+            assert_eq!(tx.connection, Some(id));
+            assert_ne!(
+                wire::parse(tx.ip, &bytes).unwrap().header.flags & wire::RST,
+                0
+            );
+            let expiry = 1_000 + duration;
+            assert_eq!(a.next_deadline(), Some(expiry));
+            assert!(!a.has_pending_output());
+            for flags in [wire::SYN, wire::ACK, wire::RST] {
+                let mut bytes = [0; 64];
+                let len = wire::encode(
+                    incoming,
+                    wire::Header { flags, ..header },
+                    &[],
+                    b"old",
+                    &mut bytes,
+                )
+                .unwrap();
+                assert_eq!(
+                    a.input(expiry - 1, incoming, &bytes[..len]),
+                    Ok(InputDisposition::Dropped)
+                );
+            }
+            assert!(packets(&mut a, expiry - 1).is_empty());
+            assert_eq!(a.next_deadline(), Some(expiry));
+            assert!(!a.on_timeout(expiry - 1, 1).unwrap());
+            assert!(a.on_timeout(expiry, 0).unwrap());
+            assert_eq!(
+                a.connect(expiry, local, remote),
+                Err(EndpointError::AddressInUse)
+            );
+            assert!(!a.on_timeout(expiry, 1).unwrap());
+            assert_eq!(a.connection_id(tuple), None);
+            assert_eq!(a.connection_exists(id), !released);
+            assert_eq!(a.buffer_bytes(), if released { 0 } else { charge });
+            let replacement = a.connect(expiry, local, remote).unwrap();
+            assert_ne!(id, replacement);
+            if !released {
+                assert_eq!(a.state(id), Ok(State::Closed));
+                a.release(id).unwrap();
+            }
+            assert_eq!(a.state(id), Err(EndpointError::InvalidHandle));
+            assert_eq!(a.connection_id(tuple), Some(replacement));
+            assert!(a.connection_exists(replacement));
+        }
+    }
+}
+
+#[test]
+fn reset_quarantine_connection_and_byte_capacity_and_timeout_budgets() {
+    for slots in [1, 2] {
+        for byte_slots in [0, 1, 2] {
+            let mut cfg = config();
+            cfg.max_connections = slots;
+            let charge = connection_charge(&cfg);
+            cfg.max_buffer_bytes = byte_slots * charge;
+            let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+            let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+            let (local, remote) = addresses();
+            let listener = b.listen(remote, 2).unwrap();
+            if byte_slots == 0 {
+                assert_eq!(
+                    a.connect(0, local, remote),
+                    Err(EndpointError::LimitReached)
+                );
+                continue;
+            }
+            let id = a.connect(0, local, remote).unwrap();
+            pump(&mut a, &mut b, 0);
+            b.accept(listener).unwrap();
+            a.abort(id).unwrap();
+            a.release(id).unwrap();
+            packets(&mut a, 0);
+            assert_eq!(a.buffer_bytes(), charge);
+            let mut other = local;
+            other.set_port(local.port() + 1);
+            if slots == 2 && byte_slots == 2 {
+                let second = a.connect(0, other, remote).unwrap();
+                pump(&mut a, &mut b, 0);
+                b.accept(listener).unwrap();
+                a.abort(second).unwrap();
+                a.release(second).unwrap();
+                packets(&mut a, 0);
+                assert_eq!(a.buffer_bytes(), 2 * charge);
+                assert!(a.on_timeout(cfg.connection.time_wait_us, 0).unwrap());
+                assert!(a.on_timeout(cfg.connection.time_wait_us, 1).unwrap());
+                assert_eq!(a.buffer_bytes(), charge);
+            } else {
+                assert_eq!(
+                    a.connect(0, other, remote),
+                    Err(EndpointError::LimitReached)
+                );
+            }
+            assert!(!a.on_timeout(cfg.connection.time_wait_us, 1).unwrap());
+            assert_eq!(a.buffer_bytes(), 0);
+            assert!(!a.connection_exists(id));
+            assert!(
+                a.connect(cfg.connection.time_wait_us, local, remote)
+                    .is_ok()
+            );
+        }
+    }
+    let mut cfg = config();
+    cfg.max_connections = 0;
+    assert!(matches!(
+        Endpoint::new(cfg, [1; 32], 0, test_policy),
+        Err(EndpointError::Connection(Error::InvalidArgument))
+    ));
+}
+
+#[test]
+fn reset_quarantine_excludes_received_stateless_nonterminal_and_no_reset_abort() {
+    // An inbound reset closes and frees the tuple without a reset-origin timer.
+    let (mut a, mut b, listener, client) = endpoints();
+    pump(&mut a, &mut b, 0);
+    let server = b.accept(listener).unwrap();
+    b.abort(server).unwrap();
+    deliver(&mut a, 0, packets(&mut b, 0));
+    assert_eq!(a.close_reason(client), Ok(Some(CloseReason::Reset)));
+    assert_eq!(a.next_deadline(), None);
+    a.release(client).unwrap();
+    packets(&mut a, 0);
+    let (local, remote) = addresses();
+    assert!(a.connect(0, local, remote).is_ok());
+
+    // Bad handshake ACK resets are nonterminal and must not reserve the tuple.
+    let (mut a, mut b, _, id) = endpoints();
+    let syn = packets(&mut a, 0);
+    let h = wire::parse(syn[0].0, &syn[0].1).unwrap().header;
+    let ip = IpMetadata {
+        source: remote.ip(),
+        destination: local.ip(),
+    };
+    let bad_ack = tw_segment(ip, h, 123, h.sequence, wire::ACK, None);
+    a.input(0, ip, &bad_ack).unwrap();
+    let rst = packets(&mut a, 0);
+    assert_ne!(
+        wire::parse(rst[0].0, &rst[0].1).unwrap().header.flags & wire::RST,
+        0
+    );
+    assert_eq!(a.state(id), Ok(State::SynSent));
+    a.abort(id).unwrap(); // SYN-SENT owes no reset.
+    a.release(id).unwrap();
+    assert!(packets(&mut a, 0).is_empty());
+    assert_eq!(a.next_deadline(), None);
+    assert_eq!(a.buffer_bytes(), 0);
+    assert!(a.connect(0, local, remote).is_ok());
+
+    // Stateless reset output consumes no connection slot or reservation.
+    let unknown = IpMetadata {
+        source: local.ip(),
+        destination: remote.ip(),
+    };
+    let mut bytes = [0; 64];
+    let len = wire::encode(
+        unknown,
+        wire::Header {
+            flags: wire::ACK,
+            ..h
+        },
+        &[],
+        &[],
+        &mut bytes,
+    )
+    .unwrap();
+    b.input(0, unknown, &bytes[..len]).unwrap();
+    let (tx, _) = ecn_packet(&mut b, 0);
+    assert_eq!(tx.connection, None);
+    assert_eq!(b.buffer_bytes(), 0);
+    assert_eq!(b.next_deadline(), None);
+    assert!(b.connect(0, remote, local).is_ok());
+
+    // ABORT from ordinary TIME-WAIT emits no reset and adds no quarantine.
+    let (mut b, _, old, _, _, _) = time_wait_endpoint(config());
+    b.abort(old).unwrap();
+    b.release(old).unwrap();
+    assert!(packets(&mut b, 3_000).is_empty());
+    assert_eq!(b.next_deadline(), None);
+    assert!(b.connect(3_000, remote, local).is_ok());
+}
+
+#[test]
+fn reset_failed_child_unlinks_backlog_before_output_and_quarantine_expiry() {
+    let (mut a, _, _, _) = endpoints();
+    // Use a one-entry backlog, leaving the independent slot bound larger.
+    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+    let listener = b.listen(addresses().1, 1).unwrap();
+    let (tuple, _) = passive_quote(&mut a, &mut b);
+    let failed = b.connection_id(tuple).unwrap();
+    b.abort(failed).unwrap();
+    assert_eq!(b.state(failed), Err(EndpointError::InvalidHandle));
+    let mut local = addresses().0;
+    local.set_port(local.port() + 1);
+    a.connect(0, local, addresses().1).unwrap();
+    deliver(&mut b, 0, packets(&mut a, 0));
+    assert!(
+        b.connection_id(Tuple {
+            local: addresses().1,
+            remote: local
+        })
+        .is_some()
+    );
+    assert_eq!(b.buffer_bytes(), 2 * connection_charge(&config()));
+    assert_eq!(
+        b.accept(listener),
+        Err(EndpointError::Connection(Error::WouldBlock))
+    );
+    assert!(b.poll_transmit(0, &mut [0; 1], 1).is_err());
+    b.close_listener(listener).unwrap();
+    packets(&mut b, 0); // Must quiesce rather than repeatedly visit quarantined children.
+    assert_eq!(b.buffer_bytes(), 2 * connection_charge(&config()));
+    b.on_timeout(config().connection.time_wait_us, 2).unwrap();
+    assert_eq!(b.buffer_bytes(), 0);
+}
+
+#[test]
+fn time_wait_reuse_local_reset_keeps_candidate_quarantine_and_old_owner() {
+    for release_old in [false, true] {
+        let (mut b, listener, old, ip, h, _) = time_wait_endpoint(config());
+        if release_old {
+            b.release(old).unwrap();
+        }
+        let tuple = Tuple {
+            local: addresses().1,
+            remote: addresses().0,
+        };
+        let syn = tw_segment(ip, h, h.acknowledgment + 100, 0, wire::SYN, None);
+        b.input(4_000, ip, &syn).unwrap();
+        let candidate = b.connection_id(tuple).unwrap();
+        b.abort(candidate).unwrap();
+        assert_eq!(b.connection_id(tuple), Some(candidate));
+        assert!(b.connection_exists(old));
+        assert_eq!(
+            b.accept(listener),
+            Err(EndpointError::Connection(Error::WouldBlock))
+        );
+        assert!(b.poll_transmit(5_000, &mut [0; 1], 1).is_err());
+        assert_eq!(b.connection_id(tuple), Some(candidate));
+        packets(&mut b, 6_000);
+        b.on_timeout(240_003_000, 1).unwrap(); // Old TIME-WAIT expires first.
+        packets(&mut b, 240_003_000);
+        assert_eq!(b.connection_exists(old), !release_old);
+        assert_eq!(b.connection_id(tuple), Some(candidate));
+        b.on_timeout(240_006_000, 1).unwrap();
+        assert!(!b.connection_exists(candidate));
+        assert_eq!(b.connection_id(tuple), None);
+        let replacement = b.connect(240_006_000, tuple.local, tuple.remote).unwrap();
+        if !release_old {
+            b.release(old).unwrap();
+        }
+        assert_eq!(b.connection_id(tuple), Some(replacement));
+    }
+}
+
+#[test]
+fn early_fin_passive_accept_waits_for_handshake_ack_and_reuse_failure_rolls_back() {
+    let (mut a, mut b, listener, _) = endpoints();
+    let (tuple, _) = passive_quote(&mut a, &mut b);
+    let child = b.connection_id(tuple).unwrap();
+    while b.next_event().is_some() {}
+    b.shutdown(child).unwrap();
+    let fin = packets(&mut b, 0);
+    assert_eq!(b.state(child), Ok(State::FinWait1));
+    assert_eq!(
+        b.accept(listener),
+        Err(EndpointError::Connection(Error::WouldBlock))
+    );
+    assert_eq!(b.next_event(), None);
+    let h = wire::parse(fin[0].0, &fin[0].1).unwrap().header;
+    let ip = IpMetadata {
+        source: tuple.remote.ip(),
+        destination: tuple.local.ip(),
+    };
+    let ack = tw_segment(ip, h, h.acknowledgment, h.sequence + 1, wire::ACK, None);
+    b.input(1, ip, &ack).unwrap();
+    assert_eq!(b.next_event(), Some(Event::Acceptable(listener)));
+    assert_eq!(b.accept(listener), Ok(child));
+
+    let (mut b, listener, old, ip, h, _) = time_wait_endpoint(config());
+    let seq = h.acknowledgment + 100;
+    b.input(4_000, ip, &tw_segment(ip, h, seq, 0, wire::SYN, None))
+        .unwrap();
+    let candidate = b.connection_id(tuple).unwrap();
+    packets(&mut b, 4_000);
+    b.shutdown(candidate).unwrap();
+    packets(&mut b, 4_000);
+    assert_eq!(b.state(candidate), Ok(State::FinWait1));
+    assert_eq!(
+        b.accept(listener),
+        Err(EndpointError::Connection(Error::WouldBlock))
+    );
+    b.input(5_000, ip, &tw_segment(ip, h, seq + 1, 0, wire::RST, None))
+        .unwrap();
+    packets(&mut b, 5_000);
+    assert_eq!(b.connection_id(tuple), Some(old));
+    assert!(!b.connection_exists(candidate));
 }
