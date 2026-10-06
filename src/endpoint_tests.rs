@@ -4374,3 +4374,99 @@ fn timestamp_offset_time_wait_reuse_and_rollback_keep_virtual_clock() {
         );
     }
 }
+
+#[test]
+fn pacing_endpoint_budget_and_halfclose() {
+    for scale in [1, 1000] {
+        let mut cfg = config();
+        cfg.connection.prr = true;
+        cfg.connection.timebase.units_per_second = 1_000_000 * scale;
+        assert!(cfg.connection.prr_pacing);
+        let (local, remote) = addresses();
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+        let listener = b.listen(remote, 4).unwrap();
+        let client = a.connect(0, local, remote).unwrap();
+        pump(&mut a, &mut b, 0);
+        let server = b.accept(listener).unwrap();
+        a.write(client, &[0x55; 150]).unwrap();
+        a.shutdown(client).unwrap();
+        let mut out = [0; 2048];
+        let first = a
+            .poll_transmit(100 * scale, &mut out, 1)
+            .unwrap()
+            .packet
+            .unwrap();
+        let segment = wire::parse(first.ip, &out[..first.len]).unwrap();
+        assert_eq!(segment.payload.len(), 64);
+        assert_eq!(segment.header.flags & wire::FIN, 0);
+        b.input(100 * scale, first.ip, &out[..first.len]).unwrap();
+        assert!(
+            a.poll_transmit(100 * scale, &mut out, 1)
+                .unwrap()
+                .packet
+                .is_none()
+        );
+        assert!(!a.has_pending_output()); // Ok(None) removed the queue entry
+        let deadline = a.next_deadline().unwrap();
+        assert!(deadline > 100 * scale);
+        assert!(!a.on_timeout(deadline - 1, 1).unwrap());
+        assert!(
+            a.poll_transmit(deadline - 1, &mut out, 1)
+                .unwrap()
+                .packet
+                .is_none()
+        );
+        assert!(a.on_timeout(deadline, 0).unwrap());
+        assert!(!a.has_pending_output());
+        assert!(
+            !a.on_timeout(deadline, 1).unwrap(),
+            "deadline={deadline} next={:?}",
+            a.next_deadline()
+        );
+        assert!(a.has_pending_output());
+        assert!(a.poll_transmit(deadline, &mut [0; 19], 1).is_err());
+        assert!(a.has_pending_output());
+        let second = a
+            .poll_transmit(deadline, &mut out, 1)
+            .unwrap()
+            .packet
+            .unwrap();
+        assert_eq!(
+            wire::parse(second.ip, &out[..second.len])
+                .unwrap()
+                .payload
+                .len(),
+            64
+        );
+        b.input(deadline, second.ip, &out[..second.len]).unwrap();
+        assert!(
+            a.poll_transmit(deadline, &mut out, 1)
+                .unwrap()
+                .packet
+                .is_none()
+        );
+        let next = a.next_deadline().unwrap();
+        assert!(next > deadline);
+        a.on_timeout(next, 1).unwrap();
+        let last = a.poll_transmit(next, &mut out, 1).unwrap().packet.unwrap();
+        let segment = wire::parse(last.ip, &out[..last.len]).unwrap();
+        assert_eq!(segment.payload.len(), 22);
+        assert_ne!(segment.header.flags & wire::FIN, 0);
+        b.input(next, last.ip, &out[..last.len]).unwrap();
+        pump(&mut a, &mut b, next);
+        assert_eq!(a.state(client).unwrap(), State::FinWait2);
+        assert_eq!(b.state(server).unwrap(), State::CloseWait);
+        let mut received = [0; 150];
+        assert_eq!(b.read(server, &mut received).unwrap(), 150);
+        assert_eq!(received, [0x55; 150]);
+        // Opposite-direction half-close remains writable. FIN-only bypasses
+        // pacing, and cleanup must not retain a pacing timer in TIME-WAIT.
+        b.write(server, b"x").unwrap();
+        pump(&mut a, &mut b, next);
+        b.shutdown(server).unwrap();
+        pump(&mut a, &mut b, next);
+        assert_eq!(a.state(client).unwrap(), State::TimeWait);
+        assert_eq!(b.state(server).unwrap(), State::Closed);
+    }
+}

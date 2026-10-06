@@ -262,6 +262,17 @@ fn selected_recovery_output_policy_matrix() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc9937#section-3
+//= type=test
+//= reason=rwnd reconciliation is limited to RFC9293 sections3.8.6/3.8.6.1 old-data shrink retries and prescribed zero-window probes, with RFC7323 section2.4 items4/5 stricter scaled limits. This matrix asserts no fresh TLP overcommit of rwnd, unscaled shrink clipping, a single octet persist probe and no additional output; it runs scaled first/sub-scale/subsequent/configuration/ledger/wrap/failed-output checks and strict PRR cancellation before persist. ordinary_output_policy_matrix and selected_recovery_output_policy_matrix separately bound ordinary and recovery output. No blanket recovery waiver.
+//# At any given time, a connection MUST
+//# NOT send data with a sequence number higher than the sum of
+//# SND.UNA and rwnd.
+//= https://www.rfc-editor.org/rfc/rfc9937#section-3
+//= type=test
+//= reason=cwnd reconciliation retains only selected protocol extensions: RFC9937 section5 recommends RACK-TLP, whose RFC8985 sections7.3/9.3 permit one accounted outstanding probe. This wire matrix asserts flight=cwnd before the probe, flight=cwnd+SMSS after, committed probe endpoints, RTO fallback and no second output. ordinary_output_policy_matrix and selected_recovery_output_policy_matrix cover normal cwnd/pipe/strict-PRR bounds and RFC3042 section2 bounded Limited Transmit separately; LegacyInitialCredit is not strict PRR evidence.
+//# At any given time, a connection MUST
+//# NOT send data if inflight (see below) matches or exceeds cwnd.
 fn probe_and_shrink_output_policy_matrix() {
     for iss in [100, u32::MAX - 1999] {
         let (mut a, _) = tlp_pair(iss);
@@ -272,9 +283,18 @@ fn probe_and_shrink_output_policy_matrix() {
             vec![(0, 1000), (1000, 1000), (2000, 1000), (3000, 1000)]
         );
         let pto = a.tlp_deadline.unwrap();
+        assert_eq!(a.flight(), a.congestion.cwnd());
+        assert!(a.prr.is_none()); // PTO exception is outside active PRR.
         a.timeout(pto).unwrap();
         assert_eq!(outputs(&mut a, pto, base), vec![(4000, 1000)]);
         assert_eq!(a.flight(), a.congestion.cwnd() + 1000);
+        assert_eq!(
+            a.tlp_end,
+            Some((base.wrapping_add(4000), base.wrapping_add(5000), false))
+        );
+        assert_eq!(a.tlp_flight, Some(base.wrapping_add(5000)));
+        assert!(!a.tlp_pending);
+        assert_eq!(a.loss_timer.unwrap().0, LossTimer::Rto);
         assert_eq!(outputs(&mut a, pto + 1, base), vec![]);
         let (mut a, _) = tlp_pair(iss);
         let base = a.snd_una;
@@ -537,4 +557,321 @@ fn rfc9937_safe_ack_advancing_rescue_denies_extra_smss() {
             }
         }
     }
+}
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc9937#section-6.4
+//= type=test
+//# It is RECOMMENDED that implementations use pacing to reduce the
+//# burstiness of data traffic.
+fn pacing_wire_spacing_units_idle_and_failed_output() {
+    assert!(ConnectionConfig::default().prr_pacing);
+    for scale in [1, 1000] {
+        for mss in [1, 64, 1000] {
+            let cfg = ConnectionConfig {
+                prr: true,
+                nagle: false,
+                timebase: CallerTimebase {
+                    units_per_second: 1_000_000 * scale,
+                    ..CallerTimebase::default()
+                },
+                mss,
+                send_capacity: 65_536,
+                receive_capacity: 65_536,
+                ..ConnectionConfig::default()
+            };
+            let (mut a, _) = pair(cfg, 0);
+            a.rtt = RttEstimator::with_timebase(1_000_000, a.config.timebase);
+            a.rtt.sample(100_003 * scale);
+            let start = 100_000 * scale;
+            let bytes = mss as usize;
+            let cwnd = a.congestion.cwnd() as u64;
+            a.write(&vec![0x55; bytes * 2 + 1]).unwrap();
+            let state = (a.snd_nxt, a.now, a.rack.pipe(), a.pacing_deadline);
+            assert_eq!(a.transmit(start, &mut [0; 19]), Err(Error::OutputTooSmall));
+            assert_eq!((a.snd_nxt, a.now, a.rack.pipe(), a.pacing_deadline), state);
+            let first = packet(&mut a, start);
+            assert_eq!(
+                wire::parse(ip(tuple()), &first).unwrap().payload.len(),
+                bytes
+            );
+            let spacing = (bytes as u64 * 100_003 * scale).div_ceil(cwnd).max(1);
+            let deadline = start + spacing;
+            assert_eq!(a.next_deadline(), Some(deadline));
+            assert!(a.transmit(start, &mut [0; 1500]).unwrap().is_none());
+            assert!(a.transmit(deadline - 1, &mut [0; 1500]).unwrap().is_none());
+            assert_eq!(
+                a.transmit(deadline, &mut [0; 19]),
+                Err(Error::OutputTooSmall)
+            );
+            assert_eq!(a.pacing_deadline, Some(deadline));
+            let second = packet(&mut a, deadline);
+            assert_eq!(
+                wire::parse(ip(tuple()), &second).unwrap().payload.len(),
+                bytes
+            );
+            assert!(a.transmit(deadline, &mut [0; 1500]).unwrap().is_none());
+            // Delayed polling must not accumulate credit; ACK the old flight,
+            // then restart after an idle interval with a short first segment.
+            let idle = deadline + 2_000_000 * scale;
+            let seq = a.receive.next();
+            let high = a.snd_nxt;
+            inject(&mut a, idle, seq, high, ACK, 65_535, &[]);
+            let short = packet(&mut a, idle);
+            assert_eq!(wire::parse(ip(tuple()), &short).unwrap().payload.len(), 1);
+            let rtt = a.rtt.srtt().unwrap();
+            let short_spacing = rtt.div_ceil(a.congestion.cwnd() as u64).max(1);
+            assert_eq!(a.pacing_deadline, Some(idle + short_spacing));
+            a.write(&vec![0x55; bytes * 2]).unwrap();
+            assert!(a.transmit(idle, &mut [0; 1500]).unwrap().is_none());
+            packet(&mut a, idle + short_spacing);
+            assert!(
+                a.transmit(idle + short_spacing, &mut [0; 1500])
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+    // No SRTT uses the initial estimator's one-second RTO. Sub-tick byte
+    // spacing rounds up to one caller tick rather than allowing same-time data.
+    let (mut a, _) = pair(
+        ConnectionConfig {
+            prr: true,
+            nagle: false,
+            mss: 1,
+            ..ConnectionConfig::default()
+        },
+        0,
+    );
+    a.rtt = RttEstimator::new(1_000_000);
+    a.write(b"abc").unwrap();
+    packet(&mut a, 40);
+    assert_eq!(
+        a.pacing_deadline,
+        Some(40 + 1_000_000u64.div_ceil(a.congestion.cwnd() as u64))
+    );
+    let due = a.pacing_deadline.unwrap();
+    a.rtt.sample(1);
+    packet(&mut a, due);
+    assert_eq!(a.pacing_deadline, Some(due + 1));
+    assert!(a.transmit(due, &mut [0; 1500]).unwrap().is_none());
+}
+
+#[test]
+fn pacing_recovery_budget_exit_and_control() {
+    for rack in [false, true] {
+        let mut a = strict_flight(0);
+        // Flight helper is an equation oracle; enable pacing for every repair
+        // and all output after the actual recovery completion below.
+        a.config.prr_pacing = true;
+        a.config.rack = rack;
+        strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
+        let before = a.prr.unwrap();
+        assert!(before.credit() >= 1000);
+        let first = prr_packet(&mut a, 200_000);
+        assert_eq!(first.1, 1000);
+        assert_eq!(a.prr.unwrap().counters().2, before.counters().2 + 1000);
+        let deadline = a.pacing_deadline.unwrap();
+        let snapshot = a.prr.unwrap().counters();
+        assert!(a.transmit(200_000, &mut [0; 1500]).unwrap().is_none());
+        assert_eq!(a.prr.unwrap().counters(), snapshot);
+        // A pending head retry and ACK must survive a blocked data poll.
+        a.retx_pending = true;
+        a.immediate_ack();
+        let ack = packet(&mut a, 200_000);
+        let ack = wire::parse(ip(tuple()), &ack).unwrap();
+        assert!(ack.payload.is_empty());
+        assert_eq!(ack.header.flags & (FIN | RST), 0);
+        assert!(a.retx_pending);
+        assert_eq!(a.prr.unwrap().counters(), snapshot);
+        a.challenge_ack_pending = true;
+        let challenge = packet(&mut a, 200_000);
+        assert!(
+            wire::parse(ip(tuple()), &challenge)
+                .unwrap()
+                .payload
+                .is_empty()
+        );
+        assert!(a.retx_pending);
+        assert_eq!(a.pacing_deadline, Some(deadline));
+        assert!(a.transmit(deadline - 1, &mut [0; 1500]).unwrap().is_none());
+        assert_eq!(
+            a.transmit(deadline, &mut [0; 19]),
+            Err(Error::OutputTooSmall)
+        );
+        assert!(a.retx_pending);
+        assert_eq!(a.prr.unwrap().counters(), snapshot);
+        let sent = prr_packet(&mut a, deadline).1;
+        assert!(sent as u32 <= before.credit() - 1000);
+        assert!(!a.retx_pending);
+        let exit_deadline = a.pacing_deadline.unwrap();
+        a.write(&[0x55; 6000]).unwrap();
+        strict_ack(&mut a, deadline, 10_000, &[]);
+        assert!(a.prr.is_none());
+        assert_eq!(a.congestion.cwnd(), a.congestion.ssthresh());
+        assert_eq!(a.pacing_deadline, Some(exit_deadline));
+        // This is a real full boundary ACK, with enough cwnd/queued data for
+        // several packets, not a synthetic call to complete_prr.
+        assert!(a.transmit(deadline, &mut [0; 1500]).unwrap().is_none());
+        let base = a.snd_una;
+        assert_eq!(outputs(&mut a, exit_deadline, base).len(), 1);
+        a.abort();
+        assert_eq!(a.pacing_deadline, None);
+        let reset = packet(&mut a, exit_deadline);
+        assert_ne!(
+            wire::parse(ip(tuple()), &reset).unwrap().header.flags & RST,
+            0
+        );
+        assert_eq!(a.pacing_deadline, None);
+    }
+}
+
+#[test]
+fn pacing_selection_gates_protocol_probes_and_widened_rate() {
+    for (prr, algorithm, pacing) in [
+        (false, PrrAlgorithm::Rfc9937, true),
+        (true, PrrAlgorithm::LegacyInitialCredit, true),
+        (true, PrrAlgorithm::Rfc9937, false),
+    ] {
+        let (mut a, _) = pair(
+            ConnectionConfig {
+                prr,
+                prr_algorithm: algorithm,
+                prr_pacing: pacing,
+                nagle: false,
+                ..config(65_536, 1000)
+            },
+            0,
+        );
+        a.write(&[0x55; 2000]).unwrap();
+        assert_eq!(outputs(&mut a, 40, Seq(1)).len(), 2);
+        assert_eq!(a.pacing_deadline, None);
+    }
+    let (mut a, _) = pair(
+        ConnectionConfig {
+            prr: true,
+            prr_pacing: true,
+            nagle: false,
+            ..config(65_536, 1000)
+        },
+        0,
+    );
+    a.rtt = RttEstimator::new(1_000_000);
+    a.rtt.sample(u64::MAX / 8);
+    a.write(&[0x55; 1000]).unwrap();
+    let cwnd = a.congestion.cwnd();
+    packet(&mut a, 40);
+    let spacing = (1000u128 * (u64::MAX / 8) as u128).div_ceil(cwnd as u128) as u64;
+    assert_eq!(a.pacing_deadline, Some(40 + spacing));
+    // A due RTO must honor its protocol deadline even if eligibility is far
+    // later. Failed encoding leaves both obligations intact.
+    let expiry = a.loss_timer.unwrap().1;
+    a.timeout(expiry).unwrap();
+    assert!(a.retx_pending);
+    assert!(a.pacing_deadline.unwrap() > expiry);
+    assert_eq!(a.transmit(expiry, &mut [0; 19]), Err(Error::OutputTooSmall));
+    assert!(a.retx_pending);
+    let bytes = packet(&mut a, expiry);
+    assert_eq!(
+        wire::parse(ip(tuple()), &bytes).unwrap().payload.len(),
+        1000
+    );
+    assert!(!a.retx_pending);
+
+    for probe in [false, true] {
+        let (mut a, _) = tlp_pair(0);
+        a.config.prr_algorithm = PrrAlgorithm::Rfc9937;
+        a.config.prr_pacing = true;
+        a.write(&[0x55; 2000]).unwrap();
+        packet(&mut a, 100_000);
+        // Keep eligibility beyond the actual protocol expiration to exercise
+        // the scoped bypass, independently of the normal RTO>SRTT relation.
+        if probe {
+            let seq = a.receive.next();
+            let una = a.snd_una;
+            inject(&mut a, 100_001, seq, una, ACK, 0, &[]);
+        }
+        let expiry = a.loss_timer.unwrap().1;
+        a.pacing_deadline = Some(expiry + 1_000_000);
+        a.timeout(expiry).unwrap();
+        assert!(if probe {
+            a.probe_pending
+        } else {
+            a.tlp_pending
+        });
+        let old_nxt = a.snd_nxt;
+        let bytes = packet(&mut a, expiry);
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(segment.payload.len(), if probe { 1 } else { 1000 });
+        if probe {
+            assert_eq!(a.snd_nxt, old_nxt);
+        }
+        let spacing = (segment.payload.len() as u128 * a.rtt.srtt().unwrap() as u128)
+            .div_ceil(a.congestion.cwnd() as u128)
+            .max(1) as u64;
+        assert_eq!(a.pacing_deadline, Some(expiry + spacing));
+    }
+    // A due pacer never supplies PRR credit of its own.
+    let mut a = strict_flight(0);
+    a.config.prr_pacing = true;
+    strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
+    while a.prr.unwrap().credit() != 0 {
+        let now = a.pacing_deadline.unwrap_or(200_000);
+        prr_packet(&mut a, now);
+    }
+    let deadline = a.pacing_deadline.unwrap();
+    let before = a.prr.unwrap().counters();
+    a.timeout(deadline).unwrap();
+    assert!(a.transmit(deadline, &mut [0; 1500]).unwrap().is_none());
+    assert_eq!(a.prr.unwrap().counters(), before);
+    assert!(a.next_deadline().is_none_or(|next| next > deadline));
+}
+
+#[test]
+fn pacing_no_sack_retries_with_default_policy() {
+    let (mut a, _) = primed_pair(
+        ConnectionConfig {
+            prr: true,
+            nagle: false,
+            initial_window: InitialWindow::Iw10,
+            mss: 1000,
+            send_capacity: 65_536,
+            receive_capacity: 65_536,
+            ..ConnectionConfig::default()
+        },
+        0,
+    );
+    assert!(!a.sack_send && a.config.prr_pacing);
+    a.rtt = RttEstimator::new(1_000_000);
+    a.rtt.sample(100_000);
+    a.write(&[0x55; 10_000]).unwrap();
+    let mut now = 100_000;
+    for _ in 0..10 {
+        let bytes = packet(&mut a, now);
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes).unwrap().payload.len(),
+            1000
+        );
+        assert!(a.transmit(now, &mut [0; 1500]).unwrap().is_none());
+        now = a.pacing_deadline.unwrap();
+    }
+    let seq = a.receive.next();
+    let una = a.snd_una;
+    let window = (a.snd_wnd >> a.peer_scale) as u16;
+    for _ in 0..3 {
+        inject(&mut a, now, seq, una, ACK, window, &[]);
+    }
+    assert_eq!(a.prr.unwrap().counters(), (10_000, 1000, 0));
+    assert_eq!(a.prr.unwrap().credit(), 500);
+    assert_eq!(prr_packet(&mut a, now).1, 500);
+    let deadline = a.pacing_deadline.unwrap();
+    // Further delivered-byte estimates grant credit, but not elapsed time.
+    inject(&mut a, now, seq, una, ACK, window, &[]);
+    let counters = a.prr.unwrap().counters();
+    let credit = a.prr.unwrap().credit();
+    assert!(credit != 0);
+    assert!(a.transmit(now, &mut [0; 1500]).unwrap().is_none());
+    assert!(a.transmit(deadline - 1, &mut [0; 1500]).unwrap().is_none());
+    assert_eq!(a.prr.unwrap().counters(), counters);
+    assert!(prr_packet(&mut a, deadline).1 as u32 <= credit);
 }

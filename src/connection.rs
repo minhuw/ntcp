@@ -121,9 +121,13 @@ pub struct ConnectionConfig {
     // Opt-in RFC 8985 time-based loss detection (requires negotiated SACK).
     // Physical clock precision is a caller precondition, not a runtime gate.
     pub rack: bool,
-    // Opt-in PRR byte-credit control for SACK or non-SACK loss recovery; no time pacer.
+    // Opt-in PRR byte-credit control for SACK or non-SACK loss recovery.
     pub prr: bool,
     pub prr_algorithm: PrrAlgorithm,
+    // RFC9937 data pacing, effective only with prr=true and Rfc9937.
+    // false is a nonpaced override for equation tests or caller-managed pacing;
+    // it does not implement the RFC9937 section 6.4 pacing recommendation.
+    pub prr_pacing: bool,
     // Opt-in RFC 8985 tail loss probes; requires rack and sack configuration
     // and negotiated SACK. At most one probe per outstanding flight.
     pub tlp: bool,
@@ -208,6 +212,7 @@ impl Default for ConnectionConfig {
             rack: false,
             prr: false,
             prr_algorithm: PrrAlgorithm::default(),
+            prr_pacing: true,
             tlp: false,
             peer_max_ack_delay_us: 499_999,
             rto_min_us: 1_000_000,
@@ -433,6 +438,8 @@ pub(crate) struct Connection {
     tlp_flight: Option<Seq>,
     tlp_fresh_rtt: bool,
     prr: Option<Prr>,
+    // One caller-unit eligibility time; never accumulated burst credit.
+    pacing_deadline: Option<Instant>,
     #[cfg(test)]
     prr_exit_trace: Option<Prr>,
     // LegacyInitialCredit only: prior ACK delivery, capped and bound to its timer.
@@ -659,6 +666,7 @@ impl Connection {
             tlp_flight: None,
             tlp_fresh_rtt: false,
             prr: None,
+            pacing_deadline: None,
             #[cfg(test)]
             prr_exit_trace: None,
             rack_entry_delivery: None,
@@ -1101,6 +1109,10 @@ impl Connection {
         }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9937#section-3
+    //= reason=Normal output subtracts flight from cwnd; recovery_credit bounds selected recovery by pipe or strict PRR byte credit, with PRR setting cwnd=inflight+SndCnt. RFC9937 section5 recommends RACK-TLP composition: its sole congestion-control exception is one accounted outstanding probe (RFC8985 sections7.3/9.3), not unrestricted recovery. RFC3042 section2 Limited Transmit is separately bounded to two SMSS without changing cwnd. ordinary_output_policy_matrix, selected_recovery_output_policy_matrix and probe_and_shrink_output_policy_matrix assert these distinct policies; LegacyInitialCredit is not strict PRR evidence.
+    //# At any given time, a connection MUST
+    //# NOT send data if inflight (see below) matches or exceeds cwnd.
     fn recovery_credit(&self, recovery: SackRecovery) -> u32 {
         self.prr.map_or_else(
             || self.congestion.cwnd().saturating_sub(recovery.pipe),
@@ -1837,6 +1849,7 @@ impl Connection {
     //# When a TCP host enters TIME-WAIT or CLOSED state, it should ignore any previous state about the negotiation of ECN for that connection.
     fn terminal(&mut self, reason: CloseReason) {
         self.state = State::Closed;
+        self.pacing_deadline = None;
         self.reset_tlp();
         self.rack.deadline = None;
         self.prr = None;
@@ -4188,6 +4201,11 @@ impl Connection {
 
     // Pure planning shared by cumulative RTO/Reno, SACK/RACK and TLP data.
     // Persist deliberately bypasses this rule and never consumes retry credit.
+    //= https://www.rfc-editor.org/rfc/rfc9937#section-3
+    //= reason=Fresh ordinary/PRR/TLP output is bounded by the latest rwnd. Reconcile this inherited definition only with RFC9293 section3.8.6 MAY-7 old-data shrink retries and section3.8.6.1 mandatory zero-window probes; scaled retries additionally obey RFC7323 section2.4 items4/5 (originally in-window, first/sub-scale permission, otherwise current window). retry_limit is shared by RTO/Reno/SACK/RACK/TLP; missing scaled metadata cannot authorize beyond-window retries. Persist is separate and active strict PRR is cancelled before probing. Wire/shrink matrices and scaled retry regressions assert these limits, not a general recovery exemption.
+    //# At any given time, a connection MUST
+    //# NOT send data with a sequence number higher than the sum of
+    //# SND.UNA and rwnd.
     fn retry_limit(&self, seq: Seq, proposed: u32) -> u32 {
         let proposed = proposed.min(self.data_high().distance_from(seq));
         let window = self.snd_wnd.saturating_sub(seq.distance_from(self.snd_una));
@@ -4200,9 +4218,6 @@ impl Connection {
                 .original_retry_span(seq, seq.wrapping_add(proposed))
         {
             let limit = span.retry_end.distance_from(seq);
-            if self.config.retransmit_beyond_window {
-                return limit;
-            }
             let edge = self.snd_una.wrapping_add(self.snd_wnd);
             // RFC7323 tests the segment's sequence number (SEG.SEQ), not
             // its last byte; permitted retries still stop at original/coverage edges.
@@ -4213,7 +4228,9 @@ impl Connection {
             }
             return limit.min(window);
         }
-        if self.config.retransmit_beyond_window {
+        // RFC9293 MAY-7 opt-in cannot override RFC7323 scaled retry rules,
+        // including when the original-validity/retry ledger is unavailable.
+        if !self.scaling && self.config.retransmit_beyond_window {
             proposed
         } else {
             proposed.min(window)
@@ -4540,7 +4557,20 @@ impl Connection {
         let challenge = reset.is_none() && self.challenge_ack_pending;
         let syn = reset.is_none() && !challenge && self.syn_pending;
         let live = self.synchronized() && !challenge;
-        let retransmit = reset.is_none() && !syn && live && self.retx_pending && self.flight() != 0;
+        // Control and due protocol probes bypass pacing: SYN/RST/challenge,
+        // pure ACK/FIN, RTO head retry outside PRR, TLP, persist and keepalive.
+        // Actual stream data on bypasses still schedules spacing (keepalive's
+        // garbage octet is not stream data). Fast recovery retries do not
+        // bypass. Selection/admission below remains the sole authority to send.
+        let pacing_blocked =
+            self.pacing_enabled() && self.pacing_deadline.is_some_and(|deadline| now < deadline);
+        let data_live = live && !pacing_blocked;
+        let retransmit = reset.is_none()
+            && !syn
+            && live
+            && (!pacing_blocked || self.consecutive_timeouts != 0 && self.prr.is_none())
+            && self.retx_pending
+            && self.flight() != 0;
         let probe = reset.is_none() && !syn && live && self.probe_pending;
         let tlp = reset.is_none()
             && !syn
@@ -4816,7 +4846,7 @@ impl Connection {
         let mut sack_segment = None;
         if reset.is_none()
             && !syn
-            && live
+            && data_live
             && !retransmit
             && !probe
             && !keepalive
@@ -4898,7 +4928,7 @@ impl Connection {
         // without enabling SACK's speculative/rescue selection.
         if reset.is_none()
             && !syn
-            && live
+            && data_live
             && !retransmit
             && !probe
             && !keepalive
@@ -4916,7 +4946,7 @@ impl Connection {
         // is covered. The initial RTO retransmission still ignores all SACKs.
         let post_rto_segment = if reset.is_none()
             && !syn
-            && live
+            && data_live
             && !retransmit
             && !probe
             && !keepalive
@@ -5007,9 +5037,9 @@ impl Connection {
                 //# retransmit old data beyond SND.UNA+SND.WND (MAY-7), but SHOULD NOT
                 //# time out the connection if data beyond the right window edge is not
                 //# acknowledged (SHLD-17).
-                // Scope: Subsequent retries clip to the current window unless original-valid sub-scale permission applies. Explicit retransmit_beyond_window opt-in remains a separate policy.
+                // Scope: Scaled retry limits cannot be overridden by configuration.
                 //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
-                //= reason=Subsequent retries clip to the current window unless original-valid sub-scale permission applies. Explicit retransmit_beyond_window opt-in remains a separate policy.
+                //= reason=Subsequent scaled retries clip to the current window unless original-valid sub-scale permission applies. retransmit_beyond_window applies only without scaling; missing scaled metadata falls back to the current window.
                 //# 5)  Subsequent retransmissions MAY only be sent if they are within
                 //# the window announced by the most recent <ACK>.
                 // Scope: Capacity-backed original identity and per-coverage successful retries implement first/sub-scale permission; normal retries share pure planning and post-encode commit, with persist separate.
@@ -5084,7 +5114,11 @@ impl Connection {
             seq = self.iss.wrapping_add(1);
             flags |= FIN;
             new_fin = true;
-        } else if live {
+        } else if live
+            && (!pacing_blocked
+                || self.send.len() <= self.snd_nxt.distance_from(self.send_base) as usize)
+            && !(pacing_blocked && self.retx_pending)
+        {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
             //= reason=SendBuffer coalesces writes; packetization is independent of application write boundaries.
             //# The transmitter SHOULD collapse successive bits when it packetizes data,
@@ -5805,7 +5839,26 @@ impl Connection {
         if fresh_data && !tlp {
             self.schedule_tlp();
         }
+        if count != 0 && !syn && !keepalive && self.pacing_enabled() {
+            // Commit after encode and congestion/idle accounting. Schedule from
+            // this output, never from an expired deadline (no catch-up bursts).
+            let rtt = self.rtt.srtt().unwrap_or(self.rtt.rto());
+            let spacing = (count as u128 * rtt as u128)
+                .div_ceil(self.congestion.cwnd().max(1) as u128)
+                .clamp(1, u64::MAX as u128) as u64;
+            self.pacing_deadline = Some(now.saturating_add(spacing));
+        }
         Ok(Some(size))
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc9937#section-6.4
+    //= reason=Connection::transmit gates ordinary/startup and recovery selection on one caller-clock deadline, commits ceil(data*SRTT/cwnd) after encoding (initial RTO fallback), and preserves spacing through recovery exit/idle. Connection::next_deadline/timeout expose budgeted Endpoint::on_timeout wakeups. src/connection_output_tests.rs pacing_wire_spacing_units_idle_and_failed_output, pacing_recovery_budget_exit_and_control, pacing_selection_gates_protocol_probes_and_widened_rate, pacing_no_sack_retries_with_default_policy and src/endpoint_tests.rs pacing_endpoint_budget_and_halfclose verify wire behavior. Explicit nonpaced override and LegacyInitialCredit excluded; protocol-control/probe bypasses scoped at transmit.
+    //# It is RECOMMENDED that implementations use pacing to reduce the
+    //# burstiness of data traffic.
+    fn pacing_enabled(&self) -> bool {
+        self.config.prr
+            && self.config.prr_algorithm == PrrAlgorithm::Rfc9937
+            && self.config.prr_pacing
     }
 
     pub(crate) fn iw_setup_loss(&self) -> bool {
@@ -5867,7 +5920,10 @@ impl Connection {
                     .ticks_from_us(self.config.timestamp_granularity.tick_us()),
             )
         });
+        // At most one extra wakeup even if no data remains: timeout consumes
+        // eligibility and refresh rechecks admission, so idle cannot busy-loop.
         [
+            self.pacing_deadline,
             timestamp_wakeup,
             self.loss_timer.map(|(_, deadline)| deadline),
             self.ecn_pause,
@@ -5998,6 +6054,9 @@ impl Connection {
     //# recorded in the variable recover.
     pub(crate) fn timeout(&mut self, now: Instant) -> Result<(), Error> {
         self.update_time(now)?;
+        if due(self.pacing_deadline, now) {
+            self.pacing_deadline = None;
+        }
         self.retransmit_burst = None;
         let expired_loss = self
             .loss_timer
@@ -6009,6 +6068,7 @@ impl Connection {
         //# CLOSED state, and return.
         if due(self.time_wait_deadline, now) {
             self.state = State::Closed;
+            self.pacing_deadline = None;
             self.time_wait_deadline = None;
             self.ack_pending = false;
             return Ok(());
@@ -6715,14 +6775,18 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
     //= type=test
-    //= reason=Successful original validity, failure rollback, persist/challenge exclusion, partial ACK coverage and original packet caps are asserted at the wire boundary, including wrap.
+    //= reason=Successful original validity, failure rollback, persist/challenge exclusion, partial ACK coverage and original packet caps are asserted at the wire boundary, including wrap and retransmit_beyond_window both false and true.
     //# 4)  On first retransmission, or if the sequence number is out of
     //# window by less than 2^Rcv.Wind.Shift, then do normal
     //# retransmission(s) without regard to the receiver window as long
     //# as the original segment was in window when it was sent.
     fn scaled_retry_wire_commit_partial_ack_and_persist_are_independent() {
-        for iss in [100, u32::MAX - 4] {
+        for (iss, beyond_window) in [100, u32::MAX - 4]
+            .into_iter()
+            .flat_map(|iss| [false, true].map(|enabled| (iss, enabled)))
+        {
             let (mut a, _) = pair(config(65_536, 8), iss);
+            a.config.retransmit_beyond_window = beyond_window;
             assert!(a.scaling && a.peer_scale == 1);
             a.write(b"abcdefghijklmnop").unwrap();
             packet(&mut a, 40);
@@ -6809,8 +6873,16 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
+    //= type=test
+    //= reason=With retransmit_beyond_window both false and true, first/original-valid retries and strict sub-scale SEG.SEQ distance are asserted through wrap at scales0/1/14. Subsequent far retries, originally invalid spans and missing ledger are clipped to the latest window. Only unscaled opt-in can bypass it; zero window still requires separate persist.
+    //# 5)  Subsequent retransmissions MAY only be sent if they are within
+    //# the window announced by the most recent <ACK>.
     fn scaled_retry_strict_sequence_distance_and_conservative_fallbacks() {
-        for iss in [100, u32::MAX - 20000] {
+        for (iss, beyond_window) in [100, u32::MAX - 20000]
+            .into_iter()
+            .flat_map(|iss| [false, true].map(|enabled| (iss, enabled)))
+        {
             for scale in [0, 1, 14] {
                 let (mut a, _) = pair(config(131_072, 32_768), iss);
                 // Negotiation extremes without allocating a 1GiB receive buffer.
@@ -6820,8 +6892,16 @@ mod tests {
                 packet(&mut a, 40);
                 let una = a.snd_una;
                 let high = a.snd_nxt;
+                a.config.retransmit_beyond_window = beyond_window;
                 a.snd_wnd = 1;
+                // Even a first retry needs evidence the original was in-window.
+                a.rack.commit_original_window(una, high, false);
+                assert_eq!(a.retry_limit(una, 32_768), 1);
+                assert_eq!(a.retry_limit(una.wrapping_add(20_000), 16), 0);
+                a.rack.commit_original_window(una, high, true);
                 assert_eq!(a.retry_limit(una, 32_768), 32_768);
+                // First retry is allowed even far outside the shrunken window.
+                assert_eq!(a.retry_limit(una.wrapping_add(20_000), 16), 16);
                 a.rack.commit_retry_span(una, high);
                 let edge = una.wrapping_add(1);
                 let unit = 1u32 << scale;
@@ -6832,13 +6912,21 @@ mod tests {
                 // Serially inside the latest window is normal retransmission.
                 assert_eq!(a.retry_limit(una, 32_768), 32_768);
                 a.scaling = false;
-                assert_eq!(a.retry_limit(una, 32_768), 1);
+                assert_eq!(
+                    a.retry_limit(una, 32_768),
+                    if beyond_window { 32_768 } else { 1 }
+                );
                 a.scaling = true;
                 a.rack.commit_original_window(una, high, false);
                 assert_eq!(a.retry_limit(una, 32_768), 1);
+                assert_eq!(a.retry_limit(una.wrapping_add(20_000), 16), 0);
                 a.rack.abandon(high);
+                assert!(a.rack.original_retry_span(una, high).is_none());
                 assert_eq!(a.retry_limit(una, 32_768), 1);
                 a.config.retransmit_beyond_window = true;
+                assert_eq!(a.retry_limit(una, 32_768), 1);
+                assert_eq!(a.retry_limit(una.wrapping_add(20_000), 16), 0);
+                a.scaling = false;
                 assert_eq!(a.retry_limit(una, 32_768), 32_768);
                 a.snd_wnd = 0;
                 assert_eq!(a.retry_limit(una, 32_768), 0);
@@ -7084,6 +7172,8 @@ mod tests {
     }
     fn config(capacity: usize, mss: u16) -> ConnectionConfig {
         ConnectionConfig {
+            // Fixed-time equation/admission oracles intentionally bypass pacing.
+            prr_pacing: false,
             send_capacity: capacity,
             receive_capacity: capacity,
             mss,
@@ -10136,6 +10226,8 @@ mod tests {
 
     #[test]
     fn strict_prr_full_minimal_isolated_and_burst_loss_traces() {
+        // Nonpaced equation oracle (config helper): burst here describes loss,
+        // not the default paced output policy tested by pacing_recovery_budget_exit_and_control.
         // Bulk queued data, no rwnd/application stall, losses below half the
         // flight. RACK's RFC 8985 modified pipe, not literal RFC 6675 NextSeg.
         // Measure the boundary-ACK handoff separately: output after exit is
@@ -18447,12 +18539,6 @@ mod tests {
     //# time out the connection if data beyond the right window edge is not
     //# acknowledged (SHLD-17).
     #[test]
-    // Scope: Subsequent retries clip to the current window unless original-valid sub-scale permission applies. Explicit retransmit_beyond_window opt-in remains a separate policy.
-    //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
-    //= type=test
-    //= reason=Subsequent retries clip to the current window unless original-valid sub-scale permission applies. Explicit retransmit_beyond_window opt-in remains a separate policy.
-    //# 5)  Subsequent retransmissions MAY only be sent if they are within
-    //# the window announced by the most recent <ACK>.
     fn optional_beyond_window_retransmission_never_sends_new_bytes() {
         for iss in [100, u32::MAX - 3] {
             for enabled in [false, true] {
