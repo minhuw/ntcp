@@ -4501,6 +4501,9 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-2
+    //= type=test
+    //# It MUST NOT be sent on non-SYN segments.
     fn sack_negotiation_directional_and_disabled_layout() {
         assert!(!ConnectionConfig::default().sack);
         for active in [false, true] {
@@ -4551,7 +4554,15 @@ mod tests {
                     let bytes = deliver(&mut b, &mut a, 20);
                     let reply = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
                     assert_eq!(reply.options.sack_permitted, active && passive);
-                    deliver(&mut a, &mut b, 30);
+                    let ack = deliver(&mut a, &mut b, 30);
+                    let ack = wire::parse(ip(tuple()), &ack).unwrap();
+                    assert_eq!(ack.header.flags & SYN, 0);
+                    assert!(!ack.options.sack_permitted);
+                    a.write(b"data").unwrap();
+                    let data = packet(&mut a, 31);
+                    let data = wire::parse(ip(tuple()), &data).unwrap();
+                    assert_eq!(data.payload, b"data");
+                    assert!(!data.options.sack_permitted);
                     assert_eq!((a.sack_receive, a.sack_send), (active, active && passive));
                     assert_eq!(
                         (b.sack_receive, b.sack_send),
@@ -4958,6 +4969,11 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //# NextSeg () MUST return the
+    //# sequence number range of the next segment that is to be
+    //# transmitted, per the following rules:
     fn sack_multiloss_selective_recovery_and_transactional_entry() {
         for iss in [100, u32::MAX - 1000] {
             let mut a = sack_flight(128, iss, 8);
@@ -5112,6 +5128,9 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
+    //= type=test
+    //# RecoveryPoint MUST be set to HighData.
     fn sack_rto_discards_advice_retransmits_head_and_guards_epoch() {
         let mut a = sack_flight(128, 100, 8);
         let una = a.snd_una;
@@ -5246,6 +5265,12 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //= reason=Together with multiloss and speculative/rescue tests, checks the selected sequence ranges and NextSeg priorities.
+    //# NextSeg () MUST return the
+    //# sequence number range of the next segment that is to be
+    //# transmitted, per the following rules:
     fn sack_nextseg_new_data_precedes_speculative_holes_and_bounds_pipe() {
         let mut a = sack_flight(128, 100, 12);
         let una = a.snd_una;
@@ -5276,6 +5301,11 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc6675#section-4
+    //= type=test
+    //# NextSeg () MUST return the
+    //# sequence number range of the next segment that is to be
+    //# transmitted, per the following rules:
     fn sack_nextseg_speculative_then_single_transactional_tail_rescue() {
         for speculative in [false, true] {
             let mut a = sack_flight(128, 100, 8);
