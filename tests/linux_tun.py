@@ -17,31 +17,56 @@ def assert_timestamp_negotiation(sock):
     assert bool(info[5] & 2) == (os.environ.get('NTCP_SACK') == '1'), info
 
 
-def isolated_test(parent_namespace):
+def isolated_test(parent_namespace, ipv6=False):
     if str(os.stat('/proc/self/ns/net').st_ino) == parent_namespace:
         raise RuntimeError('refusing to change the parent network namespace')
     subprocess.run(['sysctl', '-qw', 'net.ipv4.tcp_timestamps=1',
                     'net.ipv4.tcp_sack=1', 'net.ipv4.tcp_dsack=1'], check=True)
     subprocess.run(['ip', 'link', 'set', 'lo', 'up'], check=True)
-    subprocess.run(['ip', 'tuntap', 'add', 'dev', 'ntcp-test', 'mode', 'tun'], check=True)
-    subprocess.run(['ip', 'addr', 'add', '10.73.0.1/24', 'dev', 'ntcp-test'], check=True)
-    subprocess.run(['ip', 'link', 'set', 'ntcp-test', 'up'], check=True)
+    tun = 'ntcp-test6' if ipv6 else 'ntcp-test'
+    kernel = '2001:db8:73::1' if ipv6 else '10.73.0.1'
+    local = '2001:db8:73::2' if ipv6 else '10.73.0.2'
+    family = socket.AF_INET6 if ipv6 else socket.AF_INET
+    env = os.environ.copy()
+    if ipv6:
+        env.pop('NTCP_IPV4_OPTIONS', None)
+        subprocess.run(['sysctl', '-qw', 'net.ipv6.conf.all.disable_ipv6=0',
+                        'net.ipv6.conf.default.disable_ipv6=0'], check=True)
+    subprocess.run(['ip', 'tuntap', 'add', 'dev', tun, 'mode', 'tun'], check=True)
+    subprocess.run(['ip', 'addr', 'add', f'{kernel}/{64 if ipv6 else 24}', 'dev', tun]
+                   + (['nodad'] if ipv6 else []), check=True)
+    subprocess.run(['ip', 'link', 'set', tun, 'mtu', '1500', 'up'], check=True)
     executable = ROOT / 'target/debug/examples/tun_echo'
     mismatch = subprocess.run(
-        [str(executable), 'ntcp-test', '192.0.2.2', '8080'],
-        capture_output=True, timeout=5,
+        [str(executable), tun, '2001:db8:74::2' if ipv6 else '192.0.2.2', '8080'],
+        capture_output=True, timeout=5, env=env,
     )
     assert mismatch.returncode != 0
-    assert b'local IPv4 address must lie in the TUN interface subnet' in mismatch.stderr
-    invalid_open = subprocess.run(
-        [str(executable), 'ntcp-test', '10.73.0.2', '8080', '10.73.0.255:9090'],
-        capture_output=True, timeout=5,
-    )
-    assert invalid_open.returncode != 0
-    assert b'TCP engine: InvalidAddress' in invalid_open.stderr
-    assert b'echo listening' not in invalid_open.stderr
+    assert (b'in the TUN interface subnet' if ipv6 else
+            b'local IPv4 address must lie in the TUN interface subnet') in mismatch.stderr
+    if ipv6:
+        # Reject duplicates on both the TUN and an unrelated interface.
+        subprocess.run(['ip', '-6', 'addr', 'add', f'{local}/128', 'dev', 'lo',
+                        'nodad'], check=True)
+        for duplicate in [kernel, local]:
+            rejected = subprocess.run([str(executable), tun, duplicate, '8080'],
+                                      capture_output=True, timeout=5, env=env)
+            assert rejected.returncode != 0
+            assert b'already owned by the kernel' in rejected.stderr
+            assert b'echo listening' not in rejected.stderr
+        subprocess.run(['ip', '-6', 'addr', 'del', f'{local}/128', 'dev', 'lo'], check=True)
+        route = subprocess.check_output(['ip', '-6', 'route', 'get', local])
+        assert f'dev {tun}'.encode() in route and not route.startswith(b'local '), route
+    else:
+        invalid_open = subprocess.run(
+            [str(executable), tun, local, '8080', '10.73.0.255:9090'],
+            capture_output=True, timeout=5,
+        )
+        assert invalid_open.returncode != 0
+        assert b'TCP engine: InvalidAddress' in invalid_open.stderr
+        assert b'echo listening' not in invalid_open.stderr
     with tempfile.TemporaryFile(mode='w+b') as log:
-        process = subprocess.Popen([str(executable), 'ntcp-test', '10.73.0.2', '8080'], stderr=log)
+        process = subprocess.Popen([str(executable), tun, local, '8080'], stderr=log, env=env)
         try:
             for attempt in range(100):
                 if process.poll() is not None:
@@ -54,12 +79,12 @@ def isolated_test(parent_namespace):
                 raise RuntimeError('TUN adapter did not start')
             if os.environ.get('NTCP_NETEM') == '1':
                 # Impair Linux-to-ntcp packets; never silently skip a requested gate.
-                subprocess.run(['tc', 'qdisc', 'add', 'dev', 'ntcp-test', 'root', 'netem',
+                subprocess.run(['tc', 'qdisc', 'add', 'dev', tun, 'root', 'netem',
                                 'delay', '5ms', '2ms', 'loss', '1%', 'duplicate', '1%',
                                 'reorder', '25%', '50%'], check=True)
             for size in [1, 31, 1460, 65536, 1048576]:
                 payload = bytes(i % 251 for i in range(size))
-                with socket.create_connection(('10.73.0.2', 8080), timeout=10) as client:
+                with socket.create_connection((local, 8080), timeout=10) as client:
                     client.settimeout(30)
                     assert_timestamp_negotiation(client)
                     errors = []
@@ -82,14 +107,14 @@ def isolated_test(parent_namespace):
                     if sender.is_alive() or errors:
                         raise AssertionError(f'sender failed: {errors}')
                     assert received == payload, (size, len(received))
-            if os.environ.get('NTCP_IPV4_OPTIONS') == '1':
+            if not ipv6 and os.environ.get('NTCP_IPV4_OPTIONS') == '1':
                 # Exercise Linux-generated RR and IP Timestamp headers, not TCP timestamps.
                 for options in [bytes([7, 7, 4]) + bytes(5),
                                 bytes([68, 12, 5, 1]) + bytes(8)]:
                     with socket.socket() as client:
                         client.settimeout(10)
                         client.setsockopt(socket.IPPROTO_IP, socket.IP_OPTIONS, options)
-                        client.connect(('10.73.0.2', 8080))
+                        client.connect((local, 8080))
                         assert_timestamp_negotiation(client)
                         client.sendall(b'ipv4-options')
                         client.shutdown(socket.SHUT_WR)
@@ -98,7 +123,7 @@ def isolated_test(parent_namespace):
                             received.extend(chunk)
                         assert received == b'ipv4-options', received
             # Linux sends one urgent byte; ntcp must retain it inline.
-            with socket.create_connection(('10.73.0.2', 8080), timeout=10) as client:
+            with socket.create_connection((local, 8080), timeout=10) as client:
                 client.settimeout(10)
                 client.sendall(b'before')
                 assert client.send(b'!', socket.MSG_OOB) == 1
@@ -111,12 +136,13 @@ def isolated_test(parent_namespace):
             assert process.poll() is None
             process.terminate()
             process.wait(timeout=5)
-            with socket.socket() as listener:
+            with socket.socket(family) as listener:
                 listener.settimeout(10)
-                listener.bind(('10.73.0.1', 9090))
+                listener.bind((kernel, 9090))
                 listener.listen(1)
-                process = subprocess.Popen([str(executable), 'ntcp-test', '10.73.0.2',
-                                            '8080', '10.73.0.1:9090'], stderr=log)
+                process = subprocess.Popen([str(executable), tun, local, '8080',
+                                            f'[{kernel}]:9090' if ipv6 else f'{kernel}:9090'],
+                                           stderr=log, env=env)
                 peer, _ = listener.accept()
                 with peer:
                     peer.settimeout(10)
@@ -129,7 +155,8 @@ def isolated_test(parent_namespace):
                         received.extend(chunk)
                     assert received == payload
             assert process.poll() is None
-            print('Linux TUN: active/passive open, 5 transfer sizes, half-close and urgent data passed')
+            print(f'Linux TUN IPv{6 if ipv6 else 4}: active/passive open, '
+                  '5 transfer sizes, half-close and urgent data passed')
         except BaseException:
             log.seek(0)
             sys.stderr.write(log.read().decode(errors='replace'))
@@ -146,6 +173,7 @@ def isolated_test(parent_namespace):
 if __name__ == '__main__':
     if len(sys.argv) == 3 and sys.argv[1] == '--isolated':
         isolated_test(sys.argv[2])
+        isolated_test(sys.argv[2], ipv6=True)
     elif len(sys.argv) == 1:
         subprocess.run(['cargo', 'build', '--example', 'tun_echo'], cwd=ROOT, check=True)
         namespace = str(os.stat('/proc/self/ns/net').st_ino)

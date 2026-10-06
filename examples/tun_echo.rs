@@ -414,6 +414,31 @@ mod linux {
         }
     }
 
+    fn checked_interface_ipv6(
+        local: Ipv6Addr,
+        address: Ipv6Addr,
+        mask: u128,
+        scope_id: u32,
+    ) -> io::Result<()> {
+        let prefix = mask.leading_ones();
+        if mask != u128::MAX.checked_shl(128 - prefix).unwrap_or(0) {
+            return Err(invalid("noncontiguous IPv6 interface netmask"));
+        }
+        if !unicast_v6(local)
+            || local.segments()[0] & 0xe000 != 0x2000
+            || !unicast_v6(address)
+            || address.segments()[0] & 0xe000 != 0x2000
+            || scope_id != 0
+            || local == address
+            || u128::from(local) & mask != u128::from(address) & mask
+        {
+            return Err(invalid(
+                "local IPv6 address must be a distinct global-unicast address in the TUN interface subnet",
+            ));
+        }
+        Ok(())
+    }
+
     fn interface_ipv6(tun: &File, local: Ipv6Addr) -> io::Result<()> {
         // SAFETY: zero initializes ifreq; the live TUN fd writes its actual name.
         let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
@@ -426,29 +451,45 @@ mod linux {
             return Err(io::Error::last_os_error());
         }
         let mut found = false;
+        let mut kernel_owned = false;
         let mut cursor = addresses;
         // SAFETY: traverse the live getifaddrs list, checking nullable addresses
         // and family before casting; names are NUL-terminated by the kernel.
         unsafe {
             let name = std::ffi::CStr::from_ptr(request.ifr_name.as_ptr());
             while let Some(entry) = cursor.as_ref() {
-                if !entry.ifa_addr.is_null()
-                    && (*entry.ifa_addr).sa_family as i32 == libc::AF_INET6
-                    && std::ffi::CStr::from_ptr(entry.ifa_name) == name
+                if !entry.ifa_addr.is_null() && (*entry.ifa_addr).sa_family as i32 == libc::AF_INET6
                 {
                     let address = &*entry.ifa_addr.cast::<libc::sockaddr_in6>();
-                    found |= Ipv6Addr::from(address.sin6_addr.s6_addr) == local
-                        && address.sin6_scope_id == 0;
+                    let ip = Ipv6Addr::from(address.sin6_addr.s6_addr);
+                    // Any kernel-owned duplicate has a local route that bypasses TUN,
+                    // including addresses assigned to another interface.
+                    kernel_owned |= ip == local;
+                    if std::ffi::CStr::from_ptr(entry.ifa_name) == name
+                        && !entry.ifa_netmask.is_null()
+                        && (*entry.ifa_netmask).sa_family as i32 == libc::AF_INET6
+                    {
+                        let mask = &*entry.ifa_netmask.cast::<libc::sockaddr_in6>();
+                        found |= checked_interface_ipv6(
+                            local,
+                            ip,
+                            u128::from_be_bytes(mask.sin6_addr.s6_addr),
+                            address.sin6_scope_id,
+                        )
+                        .is_ok();
+                    }
                 }
                 cursor = entry.ifa_next;
             }
             libc::freeifaddrs(addresses);
         }
-        if found && unicast_v6(local) {
+        if kernel_owned {
+            Err(invalid("local IPv6 address is already owned by the kernel"))
+        } else if found {
             Ok(())
         } else {
             Err(invalid(
-                "local IPv6 address must be an unscoped address assigned to this TUN",
+                "local IPv6 address must be a distinct global-unicast address in the TUN interface subnet",
             ))
         }
     }
@@ -1415,6 +1456,42 @@ mod linux {
             assert!(
                 checked_interface_subnet(Ipv4Addr::new(192, 0, 2, 3), interface, u32::MAX).is_err()
             );
+        }
+
+        #[test]
+        fn ipv6_interface_prefix_requires_distinct_unscoped_global_address() {
+            let interface: Ipv6Addr = "2001:db8::2".parse().unwrap();
+            let local: Ipv6Addr = "2001:db8::3".parse().unwrap();
+            for prefix in 0..=127 {
+                let mask = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
+                assert!(checked_interface_ipv6(local, interface, mask, 0).is_ok());
+                assert!(checked_interface_ipv6(interface, interface, mask, 0).is_err());
+                if prefix != 0 {
+                    let outside = Ipv6Addr::from(u128::from(local) ^ (1 << (128 - prefix)));
+                    assert!(checked_interface_ipv6(outside, interface, mask, 0).is_err());
+                }
+            }
+            assert!(checked_interface_ipv6(local, interface, u128::MAX, 0).is_err());
+            let mask = u128::MAX << 64;
+            assert!(checked_interface_ipv6(local, interface, mask, 1).is_err());
+            for ip in [
+                "2001:db8:1::3",
+                "::",
+                "::1",
+                "ff02::1",
+                "fe80::3",
+                "fec0::3",
+                "fc00::3",
+                "::ffff:192.0.2.3",
+            ] {
+                assert!(checked_interface_ipv6(ip.parse().unwrap(), interface, mask, 0).is_err());
+            }
+            for ip in ["fe80::2", "fec0::2", "fc00::2", "::1", "ff02::2"] {
+                assert!(checked_interface_ipv6(local, ip.parse().unwrap(), 0, 0).is_err());
+            }
+            for mask in [1, u128::MAX - 2, (u128::MAX << 64) | 1] {
+                assert!(checked_interface_ipv6(local, interface, mask, 0).is_err());
+            }
         }
 
         #[test]
