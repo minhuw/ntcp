@@ -4308,6 +4308,18 @@ impl Connection {
     //# of previously unsent data per [RFC3042] provided that the receiver's advertised window
     //# allows, the total FlightSize would remain less than or equal to cwnd plus 2*SMSS, and
     //# that new data is available for transmission.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-2
+    //= reason=Ordinary new data uses min(rwnd,cwnd)-flight; section3.2 Limited Transmit extends cwnd by at most two MSS. Negotiated SACK selects RFC6675 pipe, strict CRB selects RFC6937 exact byte credit (LegacyInitialCredit excluded), RACK selects RFC8985 modified pipe, and TLP permits one accounted probe. retry_limit restricts old-data receive-window exceptions; zero-window output is only the prescribed probe. output_policy wire matrix tests these choices, not section4.3 half-flight packet counts.
+    //# At any given time, a TCP MUST NOT send data with a sequence number higher than the sum of the highest acknowledged sequence number and the minimum of cwnd and rwnd.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
+    //= reason=Shared congestion ACK/timeout processing selects slow start or byte-counting avoidance; ordinary output uses their computed cwnd, including reduced-cwnd recovery exit. Selected advanced recovery/probe budgets are tested separately in output_policy; LegacyInitialCredit is not strict RFC6937 evidence.
+    //# The slow start and congestion avoidance algorithms MUST be used by a TCP sender to control the amount of outstanding data being injected into the network.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3
+    //= reason=Selected algorithm evidence, not a blanket exception: ordinary min windows, controlled Limited Transmit, non-RACK/non-PRR RFC6675 pipe, strict RFC6937 CRB byte credit, RFC8985 modified RACK recovery and one accounted TLP probe; retry_limit allows only prescribed old-data retry exceptions. output_policy asserts exact output and exhaustion. Section4.3 literal segment-count TODO remains independent; LegacyInitialCredit compatibility is excluded from strict equations.
+    //# In some situations, it may be beneficial for a TCP sender to be more conservative than the algorithms allow; however, a TCP MUST NOT be more aggressive than the following algorithms allow (that is, MUST NOT send data when the value of cwnd computed by the following algorithms would not allow the data to be sent).
+    //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
+    //= reason=ACK/eligible duplicate ACK/RTO output follows the selected ordinary congestion algorithm or negotiated advanced-recovery budget, with RFC8985 one-probe extension; output_policy and ECN wire traces test those paths. Not whole RFC2581/5681 compliance or a section4.3 half-flight claim, and LegacyInitialCredit is not strict RFC6937 evidence.
+    //# TCP follows existing algorithms for sending data packets in response to incoming ACKs, multiple duplicate acknowledgments, or retransmit timeouts [RFC2581].
     pub(crate) fn transmit(
         &mut self,
         now: Instant,
@@ -21553,5 +21565,8 @@ mod tests {
             assert_eq!(reset.header.flags, RST);
             assert_eq!(reset.options.timestamps, (budget >= 32).then_some((0, 77)));
         }
+    }
+    mod output_policy {
+        include!("connection_output_tests.rs");
     }
 }

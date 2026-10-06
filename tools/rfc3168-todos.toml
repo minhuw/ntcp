@@ -7,11 +7,3 @@ reason = "ECN-off CE/ECT receive tests now prove no implicit enablement or echo;
 quote = '''
 If the TCP connection does not wish to use ECN notification for a particular packet, the sending TCP sets the ECN codepoint to not-ECT, and the TCP receiver ignores the CE codepoint in the received packet.
 '''
-
-# 3168-A043 | TCP endpoint | normal ACK/duplicate ACK/timeout output
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2"
-reason = "Integrated ECN traces preserve retransmission, Limited Transmit and non-ECE Reno/NewReno behavior; SACK/RACK/PRR/TLP tests exercise selectable paths. Full inherited RFC2581/5681 algorithm compliance is a separate umbrella audit, including its still-open congestion TODOs. Outside this bounded ECN fix; no inferred compliance or waiver."
-quote = '''
-TCP follows existing algorithms for sending data packets in response to incoming ACKs, multiple duplicate acknowledgments, or retransmit timeouts [RFC2581].
-'''

@@ -1,21 +1,5 @@
 # Open semantic/test gaps and explicitly scoped optional/actor exceptions.
 
-# 5681-001
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc5681#section-2"
-reason = "Ordinary transmit uses min(rwnd,cwnd), and Limited Transmit is the section 3.2 controlled exception. Negotiated SACK uses pipe; RACK/TLP/PRR require their modified-recovery scope (RFC8985/6937), not literal Reno inflation. No universal output assertion covers all paths; audit persist and recovery budgets before claiming this global limit. Post-recovery avoidance is now explicitly tested. TLP intentionally sends one probe beyond cwnd under RFC8985, which is not evidence for literal RFC5681."
-quote = '''
-At any given time, a TCP MUST NOT send data with a sequence number higher than the sum of the highest acknowledged sequence number and the minimum of cwnd and rwnd.
-'''
-
-# 5681-002
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.1"
-reason = "Ordinary transmit uses min(rwnd,cwnd), and Limited Transmit is the section 3.2 controlled exception. Negotiated SACK uses pipe; RACK/TLP/PRR require their modified-recovery scope (RFC8985/6937), not literal Reno inflation. No universal output assertion covers all paths; audit persist and recovery budgets before claiming this global limit. Post-recovery avoidance is now explicitly tested. TLP intentionally sends one probe beyond cwnd under RFC8985, which is not evidence for literal RFC5681. Shared helper arithmetic is covered by initial_slow_start_and_byte_counting."
-quote = '''
-The slow start and congestion avoidance algorithms MUST be used by a TCP sender to control the amount of outstanding data being injected into the network.
-'''
-
 # 5681-015
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.1"
@@ -38,14 +22,6 @@ target = "https://www.rfc-editor.org/rfc/rfc5681#section-3.2"
 reason = "Optional outstanding-segment cap on artificial inflation is not selected: on_duplicate_ack adds SMSS with MAX_WINDOW saturation. Mandatory inflation is tested in newreno_partial_and_full_ack. The permission does not require this defense, and it does not waive ACK eligibility or global sending limits."
 quote = '''
 A TCP MAY therefore limit the number of times cwnd is artificially inflated during loss recovery to the number of outstanding segments (or, an approximation thereof).
-'''
-
-# 5681-032
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc5681#section-3"
-reason = "Ordinary transmit uses min(rwnd,cwnd), and Limited Transmit is the section 3.2 controlled exception. Negotiated SACK uses pipe; RACK/TLP/PRR require their modified-recovery scope (RFC8985/6937), not literal Reno inflation. No universal output assertion covers all paths; audit persist and recovery budgets before claiming this global limit. Post-recovery avoidance is now explicitly tested. TLP intentionally sends one probe beyond cwnd under RFC8985, which is not evidence for literal RFC5681."
-quote = '''
-In some situations, it may be beneficial for a TCP sender to be more conservative than the algorithms allow; however, a TCP MUST NOT be more aggressive than the following algorithms allow (that is, MUST NOT send data when the value of cwnd computed by the following algorithms would not allow the data to be sent).
 '''
 
 # 5681-037
@@ -75,7 +51,7 @@ We also emphasize that this is a SHOULD, meaning that an implementor should inde
 # 5681-046
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc5681#section-4.3"
-reason = "Enhanced NewReno/SACK/RACK/PRR: no existing actual per-RTT segment-output bound assertion. Byte pipe/headroom and PRR arithmetic tests do not establish this universal half-flight bound; PRR initial MSS floor and uncounted persist are additional known gaps (rfc6937 TODOs). Specify RFC8985/6937 modified recovery applicability and test actual recovery outputs over RTTs, including small flights and lost retransmissions."
+reason = "Exact receiver-driven wire observations in half_flight_segment_output_observations: ten originals at SMSS1/13/128; NewReno emits one full-SMSS retry in each of the first two recovery RTTs; non-RACK/non-PRR SACK without duplex SACK output emits five full-SMSS retries. With an out-of-order duplex byte requiring a 12-byte outgoing SACK option, fixed path budget33/SMSS13 emits 53 one-byte retries in one poll burst before any retry RTT completes; budget148/SMSS128 emits nine packets (116-byte prefixes and 12-byte suffixes), while holes remain. RFC6675 section5(C) byte gating (cwnd-pipe>=SMSS) and actual-byte pipe increments prescribe these admissions but do not prove RFC5681 section4.3 literal half-flight packet count. Retain the concrete packetization/algorithm applicability gap: no compliant packet-count limiter is specified by the selected RFC6675 algorithm, and RFC8985 section9.3 does not waive congestion control. Do not infer a strict PRR defect: zero-entry credit and zero-window epoch cancellation are already fixed; initial-floor/uncounted-persist reasons apply only to excluded LegacyInitialCredit compatibility. General small-flight/lost-copy multi-RTT packet-count proof remains unestablished."
 quote = '''
 Second, until all lost segments in the window of data in question are repaired, the number of segments transmitted in each RTT MUST be no more than half the number of outstanding segments when the loss was detected.
 '''
