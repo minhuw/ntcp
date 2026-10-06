@@ -196,6 +196,24 @@ impl Rack {
         }
     }
 
+    // Reclaim cumulative bytes without consulting SACK advice or creating
+    // delivery/RTT evidence. Trim in place: a full ledger needs no split slot.
+    pub(crate) fn trim_cumulative(&mut self, ack: Seq) {
+        self.intervals.retain_mut(|r| {
+            if !after(r.end, ack) {
+                return false;
+            }
+            if after(ack, r.start) {
+                r.start = ack;
+            }
+            true
+        });
+        if self.fallback.is_some_and(|boundary| !after(boundary, ack)) {
+            self.fallback = None;
+            self.fack = Some(ack);
+        }
+    }
+
     pub(crate) fn abandon(&mut self, boundary: Seq) {
         self.intervals.clear();
         self.fallback = Some(boundary);
@@ -389,11 +407,8 @@ impl Rack {
     ) -> u32 {
         self.ack_sample = None;
         self.reo_grew = false;
-        if let Some(boundary) = self.fallback {
-            if !after(boundary, ack) {
-                self.fallback = None;
-                self.fack = Some(ack);
-            }
+        if self.fallback.is_some() {
+            self.trim_cumulative(ack);
             return 0;
         }
         if !self.split(ack) {
@@ -1110,6 +1125,61 @@ mod tests {
             rack.abandon(end);
             assert_eq!(rack.tail_segment(1000), None);
         }
+    }
+
+    #[test]
+    fn cumulative_reclamation_needs_no_split_capacity_or_advice() {
+        for base in [Seq(10), Seq(u32::MAX - 5)] {
+            let mut rack = Rack::with_capacity(3).unwrap();
+            for i in 0..3 {
+                rack.transmit(
+                    base.wrapping_add(4 * i),
+                    base.wrapping_add(4 * i + 4),
+                    100 + u64::from(i),
+                    false,
+                );
+            }
+            rack.trim_cumulative(base.wrapping_add(2));
+            assert!(rack.valid());
+            assert_eq!(rack.intervals.len(), 3);
+            assert_eq!(rack.intervals[0].start, base.wrapping_add(2));
+            assert_eq!(
+                rack.original_transmission(base.wrapping_add(2)),
+                Some((base, base.wrapping_add(4), 100, false))
+            );
+            assert_eq!(rack.latest, None);
+            assert_eq!(rack.ack_sample, None);
+            rack.trim_cumulative(base.wrapping_add(4));
+            rack.transmit(base.wrapping_add(12), base.wrapping_add(13), 200, false);
+            assert!(rack.valid());
+            assert_eq!(rack.intervals.len(), 3);
+            assert_eq!(
+                rack.head_transmission(base.wrapping_add(12)),
+                Some((base.wrapping_add(13), 200))
+            );
+        }
+    }
+
+    #[test]
+    fn abandoned_ledger_cumulative_reclamation_waits_for_extended_boundary() {
+        let base = Seq(u32::MAX - 3);
+        let mut rack = Rack::with_capacity(1).unwrap();
+        rack.transmit(base, base.wrapping_add(2), 100, false);
+        rack.transmit(base.wrapping_add(2), base.wrapping_add(4), 200, false);
+        assert!(!rack.valid()); // Explicit defensive capacity exhaustion.
+        rack.trim_cumulative(base.wrapping_add(2));
+        assert!(!rack.valid());
+        rack.transmit(base.wrapping_add(4), base.wrapping_add(5), 300, false);
+        rack.trim_cumulative(base.wrapping_add(4));
+        assert!(!rack.valid());
+        rack.trim_cumulative(base.wrapping_add(5));
+        assert!(rack.valid());
+        rack.transmit(base.wrapping_add(5), base.wrapping_add(6), 400, false);
+        assert_eq!(
+            rack.head_transmission(base.wrapping_add(5)),
+            Some((base.wrapping_add(6), 400))
+        );
+        assert_eq!(rack.latest, None);
     }
 
     #[test]

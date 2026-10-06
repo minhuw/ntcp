@@ -805,9 +805,8 @@ impl Connection {
             && self.sack_send
             && self.rack.valid()
             && self.sack_fallback.is_none()
-            // Enforce what the 1us representation can prove; the embedding
-            // must still certify its physical resolution (options clock contract).
-            && self.rack.clock_compatible(1)
+            // The embedding must still certify its declared physical resolution.
+            && self.rack.clock_compatible(self.config.timebase.resolution_us)
     }
 
     fn tlp_arm_eligible(&self) -> bool {
@@ -3376,6 +3375,9 @@ impl Connection {
                 false,
             );
         }
+        // Timestamp storage follows cumulative send-buffer reclamation even
+        // while SACK inference is suspended below its fallback boundary.
+        self.rack.trim_cumulative(ack);
         let limited = self
             .limited_end
             .filter(|&end| self.sack_recovery_enabled() && after(end, ack))
@@ -5940,6 +5942,138 @@ mod tests {
     }
 
     #[test]
+    fn sack_fallback_partial_ack_refill_preserves_fresh_tail_timer_ledger() {
+        for iss in [100, u32::MAX - 255] {
+            for exercise_overflow in [false, true] {
+                let cfg = ConnectionConfig {
+                    sack: true,
+                    rack: true,
+                    prr: true,
+                    initial_window: InitialWindow::Iw10,
+                    ..config(512, 128)
+                };
+                let (mut a, _) = pair(cfg, iss);
+                a.set_nagle(false);
+                let base = a.snd_una;
+                a.write(b"abcd").unwrap();
+                packet(&mut a, 100);
+                for _ in 4..a.config.send_capacity {
+                    a.write(b"x").unwrap();
+                    packet(&mut a, 100);
+                }
+                let end = a.data_high();
+                let congestion = a.congestion.clone();
+                if exercise_overflow {
+                    // Discover exhaustion, rather than assuming a fixed number
+                    // of ranges. Capacity-backed scoreboards need not overflow.
+                    for offset in (5..a.config.send_capacity as u32).step_by(2) {
+                        sack_ack(
+                            &mut a,
+                            200,
+                            base,
+                            &[(base.wrapping_add(offset).0, base.wrapping_add(offset + 1).0)],
+                        );
+                        if a.sack_fallback.is_some() {
+                            break;
+                        }
+                    }
+                }
+                if a.sack_fallback.is_none() {
+                    // Keep the explicit fallback path covered independently of
+                    // whether the scoreboard can exhaust its advice storage.
+                    a.scoreboard.clear();
+                    a.sack_fallback = Some(end);
+                    a.sack_guard = Some(end);
+                    a.sack_recovery = None;
+                    a.sack_post_rto = None;
+                    a.prr = None;
+                    a.rack_entry_delivery = None;
+                    a.rack.deadline = None;
+                    a.congestion.cancel_sack_recovery();
+                }
+                // Isolate storage refill from reductions caused by the advice
+                // used to reach overflow; keep real packet admission checks.
+                a.congestion = congestion;
+                assert!(a.rack.valid());
+                let partial = base.wrapping_add(2);
+                sack_ack(&mut a, 300, partial, &[(partial.0, end.0)]);
+                assert_eq!(
+                    a.rack.head_transmission(partial),
+                    Some((base.wrapping_add(4), 100))
+                );
+                assert_eq!(
+                    a.rack.original_transmission(partial),
+                    Some((base, base.wrapping_add(4), 100, false))
+                );
+                let head = base.wrapping_add(257);
+                sack_ack(&mut a, 301, head, &[(head.0, end.0)]);
+                assert_eq!(a.send.len(), 255);
+                assert!(a.scoreboard.ranges().is_empty());
+                assert_eq!(a.sack_fallback, Some(end));
+                assert!(a.prr.is_none());
+                assert!(a.sack_recovery.is_none());
+                assert!(!a.rack_enabled());
+                let expiry = a.rto_deadline.unwrap();
+                for i in 0..257 {
+                    let sent = expiry - 257 + i;
+                    a.write(b"y").unwrap();
+                    let bytes = packet(&mut a, sent);
+                    let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+                    let start = end.wrapping_add(i as u32);
+                    assert_eq!(seg.header.sequence, start.0);
+                    assert_eq!(seg.payload, b"y");
+                    assert!(a.rack.valid());
+                    assert_eq!(
+                        a.rack.head_transmission(start),
+                        Some((start.wrapping_add(1), sent))
+                    );
+                }
+                assert_eq!(a.send.len(), a.config.send_capacity);
+                assert_eq!(a.rto_deadline, Some(expiry));
+                let tail = a.data_high().wrapping_add(u32::MAX);
+                a.timeout(expiry).unwrap();
+                let bytes = packet(&mut a, expiry);
+                let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(seg.header.sequence, head.0);
+                assert_eq!(seg.payload, b"x");
+                assert_eq!(
+                    a.rack.head_transmission(head),
+                    Some((head.wrapping_add(1), expiry))
+                );
+                assert_eq!(
+                    a.rack.head_transmission(tail),
+                    Some((tail.wrapping_add(1), expiry - 1))
+                );
+                assert!(a.rack.valid());
+                assert!(a.prr.is_none());
+                sack_ack(&mut a, expiry + 1, end, &[]);
+                assert!(a.sack_fallback.is_none());
+                assert!(a.rack_enabled());
+                assert!(a.prr.is_none());
+                assert_eq!(
+                    a.rack.head_transmission(end),
+                    Some((end.wrapping_add(1), expiry - 257))
+                );
+                let next_expiry = a.rto_deadline.unwrap();
+                let interval = a.rto();
+                a.timeout(next_expiry - 1).unwrap();
+                assert!(!a.retx_pending);
+                a.timeout(next_expiry).unwrap();
+                let bytes = packet(&mut a, next_expiry);
+                let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(seg.header.sequence, end.0);
+                assert_eq!(seg.payload, b"y");
+                assert!(next_expiry - (expiry - 257) >= interval);
+                assert_eq!(
+                    a.rack.head_transmission(tail),
+                    Some((tail.wrapping_add(1), expiry - 1))
+                );
+                assert!(a.rack.valid());
+            }
+        }
+    }
+
+    #[test]
     fn pto_new_data_fin_and_closing_ack_keep_loss_timer() {
         for close_wait in [false, true] {
             let (mut a, _) = tlp_pair(0);
@@ -6052,6 +6186,87 @@ mod tests {
                     1001
                 );
                 assert!(a.rack.valid());
+            }
+        }
+    }
+
+    #[test]
+    fn rack_clock_gate_uses_declared_resolution_at_strict_boundary() {
+        for resolution_us in [1, 10, 1_000] {
+            for minimum in [4 * resolution_us, 4 * resolution_us + 1] {
+                let cfg = ConnectionConfig {
+                    sack: true,
+                    rack: true,
+                    tlp: true,
+                    timebase: CallerTimebase {
+                        resolution_us,
+                        ..CallerTimebase::default()
+                    },
+                    ..config(64, 20)
+                };
+                let (mut a, _) = pair(cfg, 100);
+                // Isolate the data-path minimum from the fixture's 20us SYN RTT.
+                a.rack = Rack::with_capacity(a.config.send_capacity + 2).unwrap();
+                assert!(a.rack_enabled()); // Unknown minimum permits initialization.
+                a.rack.sample(minimum, 30);
+                let compatible = minimum > 4 * resolution_us;
+                assert_eq!(a.rack_enabled(), compatible);
+                a.write(b"clock").unwrap();
+                packet(&mut a, 100);
+                assert_eq!(a.tlp_arm_eligible(), compatible);
+                assert!(a.rack.valid());
+            }
+        }
+    }
+
+    #[test]
+    fn rack_retransmission_echo_normalizes_secret_timestamp_offset() {
+        for sack in [false, true] {
+            for offset in [42, u32::MAX - 250] {
+                for echo_tick in [200u32, 300, 301] {
+                    let cfg = ConnectionConfig {
+                        timestamps: true,
+                        sack,
+                        rack: sack,
+                        ..config(64, 20)
+                    };
+                    let (mut a, _) = pair(cfg, 100);
+                    a.set_timestamp_offset(offset);
+                    a.set_nagle(false);
+                    a.rack = Rack::with_capacity(a.config.send_capacity + 2).unwrap();
+                    a.rack.sample(100_000, 30);
+                    let base = a.snd_una;
+                    a.write(b"a").unwrap();
+                    packet(&mut a, 200_000);
+                    a.write(b"b").unwrap();
+                    packet(&mut a, 210_000);
+                    a.snd_wnd = 1; // Clip retry to the head, leaving an older tail.
+                    a.retx_pending = true;
+                    let bytes = packet(&mut a, 300_000);
+                    let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+                    assert_eq!(seg.payload, b"a");
+                    assert_eq!(
+                        seg.options.timestamps.unwrap().0,
+                        300u32.wrapping_add(offset)
+                    );
+                    let next = a.receive.next();
+                    timestamp_input(
+                        &mut a,
+                        400_000,
+                        next,
+                        base.wrapping_add(1),
+                        ACK,
+                        Some((400, echo_tick.wrapping_add(offset))),
+                        b"",
+                    );
+                    assert_eq!(a.snd_una, base.wrapping_add(1));
+                    assert_eq!(a.rack.ack_sample, None); // Karn, even on matching echo.
+                    a.rack.detect(400_000, true, Some(100_000));
+                    assert_eq!(
+                        a.rack.lowest_lost(a.mss as u32),
+                        (echo_tick == 300).then_some((base.wrapping_add(1), base.wrapping_add(2))),
+                    );
+                }
             }
         }
     }
