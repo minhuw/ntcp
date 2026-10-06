@@ -1,6 +1,6 @@
 // Bounded transmission intervals shared by RACK selection and diagnostics.
 // Sequence ranges are exclusive and always smaller than half the sequence space.
-use crate::{sack::Scoreboard, seq::Seq};
+use crate::{connection::TimestampGranularity, sack::Scoreboard, seq::Seq};
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
@@ -410,7 +410,7 @@ impl Rack {
     //# cumulatively ACKed or SACKed is marked as delivered in the
     //# scoreboard.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
-    //= reason=Ambiguous original pieces cannot qualify; retransmitted range requires full coverage, RTT >= minimum and matching millisecond TSecr when timestamps negotiated. Equality check is stricter than merely rejecting old echoes.
+    //= reason=Ambiguous original pieces cannot qualify; retransmitted range requires full coverage, RTT >= minimum and matching normalized local-tick TSecr when timestamps negotiated. Equality check is stricter than merely rejecting old echoes.
     //# To avoid spurious inferences, ignore a segment as invalid if any of
     //# its sequence range has been retransmitted before and if either of two
     //# conditions is true:
@@ -476,7 +476,7 @@ impl Rack {
         scoreboard: &Scoreboard,
         now: u64,
         echo: Option<u32>,
-        timestamps: bool,
+        timestamps: Option<TimestampGranularity>,
         mss: u32,
         dsack: bool,
     ) -> u32 {
@@ -532,7 +532,9 @@ impl Rack {
                     && (r.retransmitted || !r.original_retransmitted)
                     && (!r.retransmitted
                         || (rtt >= self.min_rtt.unwrap_or(u64::MAX)
-                            && (!timestamps || echo == Some((r.sent / 1000) as u32))));
+                            && timestamps.is_none_or(|granularity| {
+                                echo == Some(granularity.tick(r.sent) as u32)
+                            })));
                 if eligible
                     && newest
                         .is_none_or(|old| sent_after((r.sent, r.transmission_end), (old.0, old.1)))
@@ -803,7 +805,7 @@ mod tests {
             scoreboard,
             now,
             None,
-            false,
+            None,
             1000,
             update.dsack,
         )
@@ -925,7 +927,7 @@ mod tests {
             &Scoreboard::new(),
             1000,
             None,
-            false,
+            None,
             512,
             false,
         );
@@ -1084,13 +1086,13 @@ mod tests {
         for round in 1..=400 {
             let ack = Seq(round * 1000);
             let high = ack.wrapping_add(1000);
-            rack.acknowledge(ack, high, &scoreboard, 0, None, false, 1000, true);
+            rack.acknowledge(ack, high, &scoreboard, 0, None, None, 1000, true);
             assert_eq!(rack.multiplier, u128::from(round) + 1);
             assert_eq!(
                 rack.reo_window(false, Some(400)),
                 u64::from(round + 1).min(400)
             );
-            rack.acknowledge(ack, high, &scoreboard, 0, None, false, 1000, true);
+            rack.acknowledge(ack, high, &scoreboard, 0, None, None, 1000, true);
             assert_eq!(rack.multiplier, u128::from(round) + 1);
         }
         for minimum in [1, 2, 3, 4, u64::MAX] {
@@ -1111,7 +1113,7 @@ mod tests {
             &scoreboard,
             0,
             None,
-            false,
+            None,
             1000,
             true,
         );
@@ -1723,7 +1725,7 @@ mod tests {
                     &scoreboard,
                     now,
                     Some(echo),
-                    true,
+                    Some(TimestampGranularity::Milliseconds),
                     1000,
                     false,
                 ),

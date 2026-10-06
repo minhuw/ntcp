@@ -39,6 +39,29 @@ impl CallerTimebase {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TimestampGranularity {
+    #[default]
+    Milliseconds,
+    // Opt-in fast clock requires a peer-aware idle policy or peer-received traffic
+    // refreshing TS.Recent before half-range (~35.8min); ordinary 24-day PAWS
+    // can reject data after 40min idle, even with continuously serviced local clocks.
+    Microseconds,
+}
+
+impl TimestampGranularity {
+    pub(crate) const fn tick_us(self) -> u64 {
+        match self {
+            Self::Milliseconds => 1_000,
+            Self::Microseconds => 1,
+        }
+    }
+
+    pub(crate) fn tick(self, now: Instant) -> u64 {
+        now / self.tick_us()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ConnectionConfig {
     pub send_capacity: usize,
@@ -64,8 +87,9 @@ pub struct ConnectionConfig {
     //# We recommend that all TCP implementations have a settable TCP IW parameter, as long as there is a reasonable effort to monitor for possible interactions with other Internet applications and services as described in Section 12. Furthermore, Section 10 details why 10 segments may be an appropriate value, and while that value may continue to rise in the future, this document does not include any supporting evidence for values of IW larger than 10.
     pub initial_window: InitialWindow,
     pub timestamps: bool,
+    pub timestamp_granularity: TimestampGranularity,
     pub timebase: CallerTimebase,
-    // Successful sequence-space bytes (including copies and SYN/FIN) per ms; <2^31.
+    // Successful sequence-space bytes (including copies and SYN/FIN) per local timestamp tick; <2^31.
     pub timestamp_bytes_per_tick: u32,
     pub sack: bool,
     // Opt-in RFC 8985 time-based loss detection (requires negotiated SACK
@@ -121,6 +145,12 @@ impl Default for KeepaliveConfig {
 }
 
 impl ConnectionConfig {
+    pub(crate) fn valid_timestamp_timebase(&self) -> bool {
+        self.timebase.valid()
+            && (!self.timestamps
+                || self.timebase.resolution_us <= self.timestamp_granularity.tick_us())
+    }
+
     pub(crate) fn minimum_send_budget(&self) -> u16 {
         if self.timestamps && self.sack {
             44
@@ -147,6 +177,7 @@ impl Default for ConnectionConfig {
             recovery_algorithm: RecoveryAlgorithm::default(),
             initial_window: InitialWindow::default(),
             timestamps: false,
+            timestamp_granularity: TimestampGranularity::default(),
             timebase: CallerTimebase::default(),
             timestamp_bytes_per_tick: (1 << 30) - 1,
             sack: false,
@@ -481,7 +512,7 @@ impl Connection {
         now: Instant,
         receive: &mut Option<ReceiveBuffer>,
     ) -> Result<Self, Error> {
-        if !config.timebase.valid()
+        if !config.valid_timestamp_timebase()
             || config.timestamp_bytes_per_tick == 0
             || config.timestamp_bytes_per_tick >= 1 << 31
             || (config.tlp && (!config.rack || !config.sack))
@@ -554,6 +585,7 @@ impl Connection {
                 ReceiveBuffer::new(Seq(0), config.receive_capacity).map_err(|_| Error::NoMemory)?
             }
         };
+        let timestamp_tick = config.timestamp_granularity.tick(now);
         Ok(Self {
             tuple,
             config,
@@ -579,7 +611,7 @@ impl Connection {
             scaling: false,
             timestamps: false,
             timestamp_offset: 0,
-            timestamp_tick: now / 1_000,
+            timestamp_tick,
             timestamp_bytes: 0,
             invalid_scale_reported: false,
             iw_epoch: None,
@@ -1325,7 +1357,13 @@ impl Connection {
         self.check_time(now)?;
         // Endpoint validates caller clock gaps. A dormant connection may lag
         // that serviced clock by more than the timestamp serial half-range.
-        let stale = |sent: Instant| (now / 1_000).saturating_sub(sent / 1_000) >= 1 << 31;
+        let granularity = if self.config.timestamps {
+            self.config.timestamp_granularity
+        } else {
+            TimestampGranularity::Milliseconds
+        };
+        let stale =
+            |sent: Instant| granularity.tick(now).saturating_sub(granularity.tick(sent)) >= 1 << 31;
         if self.sample.is_some_and(|(_, sent)| stale(sent))
             || self.last_timestamp_sent_at.is_some_and(stale)
         {
@@ -1344,15 +1382,15 @@ impl Connection {
         Ok(())
     }
 
-    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
-    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //# Values of this
     //# clock MUST be at least approximately proportional to real time, in
     //# order to measure actual RTT.
-    // Scope: Every input/transmit checks nondecreasing Instant, TSval derived by fixed millisecond scaling modulo2^32; repeated Instant intentionally repeats TSval. Physical rate and forward-jump safety separately TODO.
+    // Scope: Every input/transmit checks nondecreasing Instant, TSval derived by fixed selected local tick scaling (default milliseconds) modulo2^32; repeated Instant intentionally repeats TSval. Physical rate and forward-jump safety separately TODO.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
-    //= reason=Every input/transmit checks nondecreasing Instant, TSval derived by fixed millisecond scaling modulo2^32; repeated Instant intentionally repeats TSval. Physical rate and forward-jump safety separately TODO.
+    //= reason=Every input/transmit checks nondecreasing Instant, TSval derived by fixed selected local tick scaling (default milliseconds) modulo2^32; repeated Instant intentionally repeats TSval. Physical rate and forward-jump safety separately TODO.
     //# The PAWS mechanism also puts a strong monotonicity requirement on the
     //# sender's timestamp clock.
     fn check_time(&self, now: Instant) -> Result<(), Error> {
@@ -1375,7 +1413,7 @@ impl Connection {
     //= reason=Successful TS-bearing sequence-space bytes (including retransmitted copies and SYN/FIN) are transactionally limited by configured nonzero timestamp_bytes_per_tick <2^31. Exhaustion returns TimestampBudgetExceeded with caller time and protocol state unchanged; next tick resets credit. Boundary/wrap/output rollback tests verify the gate. Physical clock truth remains separately external.
     //# It MUST tick at least once for each 2^31 bytes sent.
     fn timestamp_value(&self, now: Instant) -> u32 {
-        ((now / 1_000) as u32).wrapping_add(self.timestamp_offset)
+        (self.config.timestamp_granularity.tick(now) as u32).wrapping_add(self.timestamp_offset)
     }
 
     // Classic RFC 3168 only: setup offers remain binding for receive feedback even
@@ -3068,7 +3106,7 @@ impl Connection {
                     .options
                     .timestamps
                     .map(|ts| ts.1.wrapping_sub(self.timestamp_offset)),
-                self.timestamps,
+                self.timestamps.then_some(self.config.timestamp_granularity),
                 self.mss as u32,
                 update.dsack,
             );
@@ -3500,7 +3538,7 @@ impl Connection {
                 &self.scoreboard,
                 self.now,
                 echo.map(|value| value.wrapping_sub(self.timestamp_offset)),
-                self.timestamps,
+                self.timestamps.then_some(self.config.timestamp_granularity),
                 self.mss as u32,
                 false,
             );
@@ -4413,9 +4451,9 @@ impl Connection {
         //# clock SHOULD tick at least once per window's worth of data, and
         //# even with the window extension defined in Section 2.2, 2^31
         //# bytes must be at least two windows.
-        // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+        // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
-        //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+        //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
         //# The recycling time of the timestamp clock MUST be greater than
         //# MSL seconds.
         // Scope: Endpoint derives offset using HMAC-SHA256 secret, tuple and ISS nonce in the separate ntcp timestamp offset domain before first output; ISS is an input, never the offset. Modular addition/subtraction covers wire TS and ordinary/RACK RTT validation. TIME-WAIT reuse inherits the old local offset so peer PAWS sees no random jump; failed output/candidate rollback retain the old clock. Unrelated tuple/secret, echo/RTT/wrap and reuse rollback tests cover the policy.
@@ -4431,9 +4469,9 @@ impl Connection {
         //# RECOMMENDED to generate a random, per-connection offset to be used
         //# with the clock source when generating the Timestamps option value
         //# (see Section 5.4).
-        // Scope: Wire TS fields u32 network-order; TSval uses caller millisecond clock modulo 32 bits. Physical rate guarantees separately TODO.
+        // Scope: Wire TS fields u32 network-order; TSval uses selected local ticks (default milliseconds) modulo 32 bits. Physical rate guarantees separately TODO.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
-        //= reason=Wire TS fields u32 network-order; TSval uses caller millisecond clock modulo 32 bits. Physical rate guarantees separately TODO.
+        //= reason=Wire TS fields u32 network-order; TSval uses selected local ticks (default milliseconds) modulo 32 bits. Physical rate guarantees separately TODO.
         //# The Timestamps option carries two four-byte timestamp fields.  The
         //# TSval field contains the current value of the timestamp clock of the
         //# TCP sending the option.
@@ -4442,9 +4480,9 @@ impl Connection {
         //= reason=Negotiated ordinary ACK output echoes single retained TS.Recent; reactive RST overrides follow section 5.2.
         //# (3)  When a TSopt is sent, its TSecr field is set to the current
         //# TS.Recent value.
-        // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+        // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
-        //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+        //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
         //# Based upon these considerations, we choose a timestamp clock
         //# frequency in the range 1 ms to 1 sec per tick.
         let timestamp = if reset.is_some() && self.reset_echo.is_some() {
@@ -4582,7 +4620,7 @@ impl Connection {
                 option_len += sack_option_len;
             }
         }
-        let tick_bytes = if now / 1_000 == self.timestamp_tick {
+        let tick_bytes = if self.config.timestamp_granularity.tick(now) == self.timestamp_tick {
             self.timestamp_bytes
         } else {
             0
@@ -5288,7 +5326,7 @@ impl Connection {
             }
         }
         if timestamp.is_some() {
-            self.timestamp_tick = now / 1_000;
+            self.timestamp_tick = self.config.timestamp_granularity.tick(now);
             self.timestamp_bytes = tick_bytes + timestamp_cost;
         }
         if !challenge {
@@ -5613,7 +5651,8 @@ impl Connection {
         // A successfully filled tick can leave stream/control output queued.
         // Derive its wakeup from committed credit: failed encodes do not arm a
         // timer, and timeout advancing to the next tick removes this deadline.
-        let timestamp_wakeup = (self.timestamp_tick == self.now / 1_000
+        let timestamp_wakeup = (self.timestamp_tick
+            == self.config.timestamp_granularity.tick(self.now)
             && self.timestamp_bytes >= self.config.timestamp_bytes_per_tick
             && (self.syn_pending
                 || self.retx_pending
@@ -5622,7 +5661,11 @@ impl Connection {
                 || self.synchronized()
                     && (self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize
                         || self.shutdown && self.fin_sequence.is_none())))
-        .then(|| self.timestamp_tick.saturating_add(1).saturating_mul(1_000));
+        .then(|| {
+            self.timestamp_tick
+                .saturating_add(1)
+                .saturating_mul(self.config.timestamp_granularity.tick_us())
+        });
         [
             timestamp_wakeup,
             self.loss_timer.map(|(_, deadline)| deadline),
@@ -6658,51 +6701,62 @@ mod tests {
 
     #[test]
     fn rack_retransmission_echo_normalizes_secret_timestamp_offset() {
-        for sack in [false, true] {
-            for offset in [42, u32::MAX - 250] {
-                for echo_tick in [200u32, 300, 301] {
-                    let cfg = ConnectionConfig {
-                        timestamps: true,
-                        sack,
-                        rack: sack,
-                        ..config(64, 20)
-                    };
-                    let (mut a, _) = pair(cfg, 100);
-                    a.set_timestamp_offset(offset);
-                    a.set_nagle(false);
-                    a.rack = Rack::with_capacity(a.config.send_capacity + 2).unwrap();
-                    a.rack.sample(100_000, 30);
-                    let base = a.snd_una;
-                    a.write(b"a").unwrap();
-                    packet(&mut a, 200_000);
-                    a.write(b"b").unwrap();
-                    packet(&mut a, 210_000);
-                    a.snd_wnd = 1; // Clip retry to the head, leaving an older tail.
-                    a.retx_pending = true;
-                    let bytes = packet(&mut a, 300_000);
-                    let seg = wire::parse(ip(tuple()), &bytes).unwrap();
-                    assert_eq!(seg.payload, b"a");
-                    assert_eq!(
-                        seg.options.timestamps.unwrap().0,
-                        300u32.wrapping_add(offset)
-                    );
-                    let next = a.receive.next();
-                    timestamp_input(
-                        &mut a,
-                        400_000,
-                        next,
-                        base.wrapping_add(1),
-                        ACK,
-                        Some((400, echo_tick.wrapping_add(offset))),
-                        b"",
-                    );
-                    assert_eq!(a.snd_una, base.wrapping_add(1));
-                    assert_eq!(a.rack.ack_sample, None); // Karn, even on matching echo.
-                    a.rack.detect(400_000, true, Some(100_000));
-                    assert_eq!(
-                        a.rack.lowest_lost(a.mss as u32),
-                        (echo_tick == 300).then_some((base.wrapping_add(1), base.wrapping_add(2))),
-                    );
+        for granularity in [
+            TimestampGranularity::Milliseconds,
+            TimestampGranularity::Microseconds,
+        ] {
+            for sack in [false, true] {
+                for offset in [42, u32::MAX - 250] {
+                    for echo_tick in [
+                        granularity.tick(200_000) as u32,
+                        granularity.tick(300_000) as u32,
+                        granularity.tick(300_000) as u32 + 1,
+                    ] {
+                        let cfg = ConnectionConfig {
+                            timestamps: true,
+                            timestamp_granularity: granularity,
+                            sack,
+                            rack: sack,
+                            ..config(64, 20)
+                        };
+                        let (mut a, _) = pair(cfg, 100);
+                        a.set_timestamp_offset(offset);
+                        a.set_nagle(false);
+                        a.rack = Rack::with_capacity(a.config.send_capacity + 2).unwrap();
+                        a.rack.sample(100_000, 30);
+                        let base = a.snd_una;
+                        a.write(b"a").unwrap();
+                        packet(&mut a, 200_000);
+                        a.write(b"b").unwrap();
+                        packet(&mut a, 210_000);
+                        a.snd_wnd = 1; // Clip retry to the head, leaving an older tail.
+                        a.retx_pending = true;
+                        let bytes = packet(&mut a, 300_000);
+                        let seg = wire::parse(ip(tuple()), &bytes).unwrap();
+                        assert_eq!(seg.payload, b"a");
+                        assert_eq!(
+                            seg.options.timestamps.unwrap().0,
+                            (granularity.tick(300_000) as u32).wrapping_add(offset)
+                        );
+                        let next = a.receive.next();
+                        timestamp_input(
+                            &mut a,
+                            400_000,
+                            next,
+                            base.wrapping_add(1),
+                            ACK,
+                            Some((400, echo_tick.wrapping_add(offset))),
+                            b"",
+                        );
+                        assert_eq!(a.snd_una, base.wrapping_add(1));
+                        assert_eq!(a.rack.ack_sample, None); // Karn, even on matching echo.
+                        a.rack.detect(400_000, true, Some(100_000));
+                        assert_eq!(
+                            a.rack.lowest_lost(a.mss as u32),
+                            (echo_tick == granularity.tick(300_000) as u32)
+                                .then_some((base.wrapping_add(1), base.wrapping_add(2))),
+                        );
+                    }
                 }
             }
         }
@@ -14678,10 +14732,10 @@ mod tests {
         let before = (a.snd_nxt, a.next_deadline(), a.now);
         assert_eq!(a.transmit(200, &mut [0; 128]), Ok(None));
         assert_eq!((a.snd_nxt, a.next_deadline(), a.now), before);
-        // Scope: Every input/transmit checks nondecreasing Instant, TSval derived by fixed millisecond scaling modulo2^32; repeated Instant intentionally repeats TSval. Physical rate and forward-jump safety separately TODO.
+        // Scope: Every input/transmit checks nondecreasing Instant, TSval derived by fixed selected local tick scaling (default milliseconds) modulo2^32; repeated Instant intentionally repeats TSval. Physical rate and forward-jump safety separately TODO.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
         //= type=test
-        //= reason=Every input/transmit checks nondecreasing Instant, TSval derived by fixed millisecond scaling modulo2^32; repeated Instant intentionally repeats TSval. Physical rate and forward-jump safety separately TODO.
+        //= reason=Every input/transmit checks nondecreasing Instant, TSval derived by fixed selected local tick scaling (default milliseconds) modulo2^32; repeated Instant intentionally repeats TSval. Physical rate and forward-jump safety separately TODO.
         //# The PAWS mechanism also puts a strong monotonicity requirement on the
         //# sender's timestamp clock.
         assert_eq!(a.transmit(99, &mut [0; 128]), Err(Error::TimeWentBackwards));
@@ -20560,98 +20614,117 @@ mod tests {
     //# regardless of the failure of the timestamp check, and rule R3 updates
     //# TS.Recent with the TSval from the new segment.
     fn timestamps_paws_echo_order_wrap_idle_and_rst_exemption() {
-        let mut cfg = config(1024, 128);
-        cfg.timestamps = true;
-        let (mut a, _) = pair(cfg.clone(), 10);
-        a.ts_recent = u32::MAX - 2;
-        a.ts_latest = a.ts_recent;
-        let next = a.receive.next();
-        let ack = a.snd_nxt;
-        timestamp_input(&mut a, 1_000, next, ack, ACK, None, b"missing");
-        assert_eq!(a.receive.next(), next);
-        assert!(!a.ack_pending);
-        timestamp_input(
-            &mut a,
-            2_000,
-            next,
-            ack,
-            ACK,
-            Some((u32::MAX - 3, 0)),
-            b"stale",
-        );
-        assert_eq!(a.receive.next(), next);
-        assert!(a.ack_pending);
-        packet(&mut a, 2_000);
-        timestamp_input(&mut a, 3_000, next, ack, ACK, Some((u32::MAX - 1, 0)), b"a");
-        timestamp_input(
-            &mut a,
-            4_000,
-            next.wrapping_add(1),
-            ack,
-            ACK,
-            Some((1, 0)),
-            b"b",
-        );
-        assert_eq!(a.ts_recent, u32::MAX - 1); // Earliest unacknowledged segment.
-        a.immediate_ack();
-        let bytes = packet(&mut a, 4_000);
-        assert_eq!(
-            wire::parse(ip(tuple()), &bytes).unwrap().options.timestamps,
-            Some((4, u32::MAX - 1))
-        );
-        assert_eq!(a.last_ack_sent, next.wrapping_add(2));
-        timestamp_input(
-            &mut a,
-            5_000,
-            next.wrapping_add(3),
-            ack,
-            ACK,
-            Some((4, 0)),
-            b"d",
-        );
-        assert_eq!(a.ts_recent, u32::MAX - 1); // Hole must not advance echo.
-        packet(&mut a, 5_000);
-        timestamp_input(
-            &mut a,
-            6_000,
-            next.wrapping_add(2),
-            ack,
-            ACK,
-            Some((3, 0)),
-            b"c",
-        );
-        assert_eq!(a.ts_recent, 3); // Filling the hole replaces the echo.
-        assert_eq!(a.receive.next(), next.wrapping_add(4));
-        packet(&mut a, 6_000);
-        let idle = 6_000 + 24 * 86_400_000_000 + 1;
-        timestamp_input(
-            &mut a,
-            idle,
-            next.wrapping_add(4),
-            ack,
-            ACK,
-            Some((0x8000_0003, 0)),
-            b"e",
-        );
-        assert_eq!(a.ts_recent, 0x8000_0003);
-        assert_eq!(a.receive.next(), next.wrapping_add(5));
-        let recent = a.ts_recent;
-        timestamp_input(
-            &mut a,
-            idle + 1,
-            next.wrapping_add(5),
-            ack,
-            RST,
-            Some((0, 0)),
-            b"",
-        );
-        assert_eq!(a.state, State::Closed);
-        assert_eq!(a.ts_recent, recent);
-        let (mut a, _) = pair(cfg, 10);
-        let next = a.receive.next();
-        let ack = a.snd_nxt;
-        timestamp_input(&mut a, 40, next, ack, RST, None, b"");
-        assert_eq!(a.state, State::Closed);
+        for granularity in [
+            TimestampGranularity::Milliseconds,
+            TimestampGranularity::Microseconds,
+        ] {
+            let mut cfg = config(1024, 128);
+            cfg.timestamps = true;
+            cfg.timestamp_granularity = granularity;
+            let (mut a, _) = pair(cfg.clone(), 10);
+            a.ts_recent = u32::MAX - 2;
+            a.ts_latest = a.ts_recent;
+            let next = a.receive.next();
+            let ack = a.snd_nxt;
+            timestamp_input(&mut a, 1_000, next, ack, ACK, None, b"missing");
+            assert_eq!(a.receive.next(), next);
+            assert!(!a.ack_pending);
+            timestamp_input(
+                &mut a,
+                2_000,
+                next,
+                ack,
+                ACK,
+                Some((u32::MAX - 3, 0)),
+                b"stale",
+            );
+            assert_eq!(a.receive.next(), next);
+            assert!(a.ack_pending);
+            packet(&mut a, 2_000);
+            timestamp_input(&mut a, 3_000, next, ack, ACK, Some((u32::MAX - 1, 0)), b"a");
+            timestamp_input(
+                &mut a,
+                4_000,
+                next.wrapping_add(1),
+                ack,
+                ACK,
+                Some((1, 0)),
+                b"b",
+            );
+            assert_eq!(a.ts_recent, u32::MAX - 1); // Earliest unacknowledged segment.
+            a.immediate_ack();
+            let bytes = packet(&mut a, 4_000);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().options.timestamps,
+                Some((granularity.tick(4_000) as u32, u32::MAX - 1))
+            );
+            assert_eq!(a.last_ack_sent, next.wrapping_add(2));
+            timestamp_input(
+                &mut a,
+                5_000,
+                next.wrapping_add(3),
+                ack,
+                ACK,
+                Some((4, 0)),
+                b"d",
+            );
+            assert_eq!(a.ts_recent, u32::MAX - 1); // Hole must not advance echo.
+            packet(&mut a, 5_000);
+            timestamp_input(
+                &mut a,
+                6_000,
+                next.wrapping_add(2),
+                ack,
+                ACK,
+                Some((3, 0)),
+                b"c",
+            );
+            assert_eq!(a.ts_recent, 3); // Filling the hole replaces the echo.
+            assert_eq!(a.receive.next(), next.wrapping_add(4));
+            packet(&mut a, 6_000);
+            // Beyond the microsecond local half-range, but far short of the
+            // independent physical 24-day peer PAWS expiry: stale peer TS drops.
+            timestamp_input(
+                &mut a,
+                6_000 + 3_000_000_000,
+                next.wrapping_add(4),
+                ack,
+                ACK,
+                Some((2, 0)),
+                b"stale",
+            );
+            assert_eq!(a.receive.next(), next.wrapping_add(4));
+            assert_eq!(a.ts_recent, 3);
+            let idle = 6_000 + 24 * 86_400_000_000 + 1;
+            timestamp_input(
+                &mut a,
+                idle,
+                next.wrapping_add(4),
+                ack,
+                ACK,
+                Some((0x8000_0003, 0)),
+                b"e",
+            );
+            assert_eq!(a.ts_recent, 0x8000_0003);
+            assert_eq!(a.receive.next(), next.wrapping_add(5));
+            let recent = a.ts_recent;
+            timestamp_input(
+                &mut a,
+                idle + 1,
+                next.wrapping_add(5),
+                ack,
+                RST,
+                Some((0, 0)),
+                b"",
+            );
+            assert_eq!(a.state, State::Closed);
+            assert_eq!(a.ts_recent, recent);
+            let (mut a, _) = pair(cfg, 10);
+            let next = a.receive.next();
+            let ack = a.snd_nxt;
+            timestamp_input(&mut a, 40, next, ack, RST, None, b"");
+            assert_eq!(a.state, State::Closed);
+        }
     }
 
     #[test]
@@ -20739,30 +20812,30 @@ mod tests {
     //# <SYN,ACK> contain TSopt, the TSopt MUST be sent in every non-<RST>
     //# segment for the duration of the connection, and SHOULD be sent in an
     //# <RST> segment (see Section 5.2 for details).
-    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-4.1
     //= type=test
-    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //# Values of this
     //# clock MUST be at least approximately proportional to real time, in
     //# order to measure actual RTT.
-    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
     //= type=test
-    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //# The recycling time of the timestamp clock MUST be greater than
     //# MSL seconds.
-    // Scope: Wire TS fields u32 network-order; TSval uses caller millisecond clock modulo 32 bits. Physical rate guarantees separately TODO.
+    // Scope: Wire TS fields u32 network-order; TSval uses selected local ticks (default milliseconds) modulo 32 bits. Physical rate guarantees separately TODO.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
     //= type=test
-    //= reason=Wire TS fields u32 network-order; TSval uses caller millisecond clock modulo 32 bits. Physical rate guarantees separately TODO.
+    //= reason=Wire TS fields u32 network-order; TSval uses selected local ticks (default milliseconds) modulo 32 bits. Physical rate guarantees separately TODO.
     //# The Timestamps option carries two four-byte timestamp fields.  The
     //# TSval field contains the current value of the timestamp clock of the
     //# TCP sending the option.
-    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    // Scope: External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-5.4
     //= type=test
-    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31-ms are rejected independently of connection inactivity. TSval uses a secret-derived offset plus 1ms ticks; recycle is 2^32ms. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
+    //= reason=External clock precondition remains TODO: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s; nondecreasing caller input is checked here; endpoint caller-clock gaps >=2^31 selected local ticks are rejected independently of connection inactivity. TSval uses a secret-derived offset plus fixed local ticks (default 1ms, opt-in 1us); recycle is 2^32 ticks. Enabled timestamps require declared resolution no coarser than the selected tick. Peer PAWS expiry is independent; opt-in microseconds does not close the frequency or per-window policy audit. These enforceable checks cannot establish physical rate/drift, truthful declarations or actual network MSL. Embedding integrator must provide a real monotonic microsecond clock and measured rate/drift/MSL evidence; no system clock is sampled.
     //# Based upon these considerations, we choose a timestamp clock
     //# frequency in the range 1 ms to 1 sec per tick.
     fn timestamps_ip_budget_data_fin_keepalive_and_clock_wrap() {
@@ -20909,38 +20982,49 @@ mod tests {
     }
     #[test]
     fn time_wait_timestamp_freshness_uses_latest_not_echo_and_handles_wrap() {
-        let (mut a, _) = pair(config(1024, 128), 10);
-        a.time_wait();
-        a.timestamps = true;
-        a.ts_recent = 1;
-        a.ts_latest = 9;
-        let mut syn = Segment {
-            header: Header {
-                source_port: 2000,
-                destination_port: 1000,
-                sequence: 1,
-                acknowledgment: 0,
-                flags: SYN,
-                window: 1024,
-                urgent_pointer: 0,
-            },
-            options: wire::Options {
-                timestamps: Some((8, 0)),
-                ..wire::Options::default()
-            },
-            raw_options: &[],
-            payload: &[],
-        };
-        assert!(!a.reuse_syn(40, &syn, true));
-        a.ts_latest = u32::MAX;
-        syn.options.timestamps = Some((0, 0));
-        assert!(a.reuse_syn(40, &syn, true));
-        syn.options.timestamps = Some((0x7fff_ffff, 0));
-        assert!(!a.reuse_syn(40, &syn, true));
-        a.timestamps = false;
-        assert!(a.reuse_syn(40, &syn, true));
-        assert!(!a.reuse_syn(40, &syn, false));
-        assert!(!a.reuse_syn(240_000_030, &syn, true));
+        for granularity in [
+            TimestampGranularity::Milliseconds,
+            TimestampGranularity::Microseconds,
+        ] {
+            let (mut a, _) = pair(
+                ConnectionConfig {
+                    timestamp_granularity: granularity,
+                    ..config(1024, 128)
+                },
+                10,
+            );
+            a.time_wait();
+            a.timestamps = true;
+            a.ts_recent = 1;
+            a.ts_latest = 9;
+            let mut syn = Segment {
+                header: Header {
+                    source_port: 2000,
+                    destination_port: 1000,
+                    sequence: 1,
+                    acknowledgment: 0,
+                    flags: SYN,
+                    window: 1024,
+                    urgent_pointer: 0,
+                },
+                options: wire::Options {
+                    timestamps: Some((8, 0)),
+                    ..wire::Options::default()
+                },
+                raw_options: &[],
+                payload: &[],
+            };
+            assert!(!a.reuse_syn(40, &syn, true));
+            a.ts_latest = u32::MAX;
+            syn.options.timestamps = Some((0, 0));
+            assert!(a.reuse_syn(40, &syn, true));
+            syn.options.timestamps = Some((0x7fff_ffff, 0));
+            assert!(!a.reuse_syn(40, &syn, true));
+            a.timestamps = false;
+            assert!(a.reuse_syn(40, &syn, true));
+            assert!(!a.reuse_syn(40, &syn, false));
+            assert!(!a.reuse_syn(240_000_030, &syn, true));
+        }
     }
     #[test]
     fn application_stall_bounds_responsive_persist_and_window_shrink() {
@@ -21123,189 +21207,384 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_credit_clips_below_mss_and_defers_full_packet_fin() {
-        for budget in [1, 8, 52] {
+    fn timestamp_units_mixed_peer_echo_wrap_and_resolution() {
+        use crate::{Endpoint, EndpointConfig};
+        assert_eq!(
+            ConnectionConfig::default().timestamp_granularity,
+            TimestampGranularity::Milliseconds
+        );
+        for granularity in [
+            TimestampGranularity::Milliseconds,
+            TimestampGranularity::Microseconds,
+        ] {
+            for peer_granularity in [
+                TimestampGranularity::Milliseconds,
+                TimestampGranularity::Microseconds,
+            ] {
+                let cfg = ConnectionConfig {
+                    timestamps: true,
+                    timestamp_granularity: granularity,
+                    nagle: false,
+                    ..config(256, 64)
+                };
+                let mut peer_cfg = cfg.clone();
+                peer_cfg.timestamp_granularity = peer_granularity;
+                let now = u32::MAX as u64 * granularity.tick_us();
+                let mut a = Connection::active(tuple(), cfg.clone(), 100, now).unwrap();
+                a.set_timestamp_offset(42);
+                let syn = packet(&mut a, now);
+                let syn = wire::parse(ip(tuple()), &syn).unwrap();
+                assert_eq!(syn.options.timestamps, Some((41, 0)));
+                let mut b =
+                    Connection::passive(reverse(tuple()), peer_cfg, 900, now, &syn).unwrap();
+                b.set_timestamp_offset(u32::MAX);
+                let synack = deliver(&mut b, &mut a, now + 1);
+                let synack = wire::parse(ip(reverse(tuple())), &synack).unwrap();
+                let peer_value = (peer_granularity.tick(now + 1) as u32).wrapping_add(u32::MAX);
+                assert_eq!(synack.options.timestamps, Some((peer_value, 41)));
+                let ack = deliver(&mut a, &mut b, now + 2);
+                assert_eq!(
+                    wire::parse(ip(tuple()), &ack).unwrap().options.timestamps,
+                    Some((a.timestamp_value(now + 2), peer_value))
+                );
+                for connection in [&mut a, &mut b] {
+                    let old = connection.timestamp_value(now + 2);
+                    connection.immediate_ack();
+                    let bytes = packet(connection, now + 3);
+                    let ts = wire::parse(ip(connection.tuple), &bytes)
+                        .unwrap()
+                        .options
+                        .timestamps
+                        .unwrap();
+                    assert_eq!(
+                        ts.0.wrapping_sub(old),
+                        if connection.config.timestamp_granularity
+                            == TimestampGranularity::Microseconds
+                        {
+                            1
+                        } else {
+                            0
+                        }
+                    );
+                    assert_eq!(
+                        connection.timestamp_value(u64::MAX),
+                        (connection.config.timestamp_granularity.tick(u64::MAX) as u32)
+                            .wrapping_add(connection.timestamp_offset)
+                    );
+                }
+                a.sample = Some((a.snd_nxt, now));
+                a.last_timestamp_sent_at = Some(now);
+                let half = (1u64 << 31) * granularity.tick_us();
+                a.update_time(now + half - granularity.tick_us()).unwrap();
+                assert!(a.sample.is_some());
+                a.update_time(now + half).unwrap();
+                assert_eq!(a.sample, None);
+                assert_eq!(a.last_timestamp_sent_at, None);
+                let mut endpoint = Endpoint::new(
+                    EndpointConfig {
+                        connection: cfg.clone(),
+                        ..EndpointConfig::default()
+                    },
+                    [1; 32],
+                    0,
+                    |_| true,
+                )
+                .unwrap();
+                assert_eq!(
+                    endpoint.on_timeout(half, 64),
+                    Err(crate::EndpointError::Connection(Error::AmbiguousTimeJump))
+                );
+                endpoint.on_timeout(half - 1, 64).unwrap();
+                endpoint.on_timeout(half, 64).unwrap();
+                for resolution in [1, 2, 1_000] {
+                    for enabled in [false, true] {
+                        let mut invalid = cfg.clone();
+                        invalid.timestamps = enabled;
+                        invalid.timebase.resolution_us = resolution;
+                        let valid = !enabled || resolution <= granularity.tick_us();
+                        assert_eq!(
+                            Connection::active(tuple(), invalid.clone(), 0, 0).is_ok(),
+                            valid
+                        );
+                        assert_eq!(
+                            Endpoint::new(
+                                EndpointConfig {
+                                    connection: invalid,
+                                    ..EndpointConfig::default()
+                                },
+                                [1; 32],
+                                0,
+                                |_| true
+                            )
+                            .is_ok(),
+                            valid
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn timestamp_boundary_saturates_and_disabled_units_are_inert() {
+        for granularity in [
+            TimestampGranularity::Milliseconds,
+            TimestampGranularity::Microseconds,
+        ] {
             let cfg = ConnectionConfig {
                 timestamps: true,
-                nagle: false,
-                timestamp_bytes_per_tick: budget,
-                ..config(256, 64)
+                timestamp_granularity: granularity,
+                timestamp_bytes_per_tick: 1,
+                ..config(64, 20)
             };
-            let (mut a, mut b) = pair(cfg, 100);
-            assert_eq!(a.mss, 52);
-            let data = [b'x'; 104];
-            a.write(&data).unwrap();
-            a.shutdown().unwrap();
-            let start = a.snd_nxt;
-            let mut received = Vec::new();
-            let mut now = 1_000;
-            while a.fin_sequence.is_none() {
-                let before = (
-                    a.now,
-                    a.snd_nxt,
-                    a.timestamp_bytes,
-                    a.sample,
-                    a.rto_deadline,
-                );
-                assert_eq!(a.transmit(now, &mut [0; 31]), Err(Error::OutputTooSmall));
-                assert_eq!(
-                    (
+            let mut a = Connection::active(tuple(), cfg.clone(), 100, u64::MAX).unwrap();
+            packet(&mut a, u64::MAX);
+            a.syn_pending = true;
+            assert_eq!(a.next_deadline(), Some(u64::MAX));
+            let mut cfg = cfg;
+            cfg.timestamps = false;
+            let (mut a, _) = pair(cfg.clone(), 100);
+            a.sample = Some((a.snd_nxt, 30));
+            a.update_time(30 + (1u64 << 31)).unwrap();
+            assert_eq!(a.sample, Some((a.snd_nxt, 30)));
+            let mut endpoint = crate::Endpoint::new(
+                crate::EndpointConfig {
+                    connection: cfg,
+                    ..crate::EndpointConfig::default()
+                },
+                [1; 32],
+                0,
+                |_| true,
+            )
+            .unwrap();
+            endpoint.on_timeout(1u64 << 40, 64).unwrap();
+        }
+    }
+
+    #[test]
+    fn timestamp_credit_clips_below_mss_and_defers_full_packet_fin() {
+        for granularity in [
+            TimestampGranularity::Milliseconds,
+            TimestampGranularity::Microseconds,
+        ] {
+            for budget in [1, 8, 52] {
+                let cfg = ConnectionConfig {
+                    timestamps: true,
+                    timestamp_granularity: granularity,
+                    nagle: false,
+                    timestamp_bytes_per_tick: budget,
+                    ..config(256, 64)
+                };
+                let (mut a, mut b) = pair(cfg, 100);
+                assert_eq!(a.mss, 52);
+                let data = [b'x'; 104];
+                a.write(&data).unwrap();
+                a.shutdown().unwrap();
+                let start = a.snd_nxt;
+                let mut received = Vec::new();
+                let mut now = 1_000;
+                while a.fin_sequence.is_none() {
+                    let before = (
                         a.now,
                         a.snd_nxt,
                         a.timestamp_bytes,
                         a.sample,
-                        a.rto_deadline
-                    ),
-                    before
-                );
-                let bytes = deliver(&mut a, &mut b, now);
-                let segment = wire::parse(ip(tuple()), &bytes).unwrap();
-                let fin = segment.header.flags & FIN != 0;
-                assert!(segment.payload.len() as u32 + u32::from(fin) <= budget);
-                assert_eq!(
-                    segment.header.sequence,
-                    start.wrapping_add(received.len() as u32).0
-                );
-                received.extend_from_slice(segment.payload);
-                if segment.payload.len() as u32 == budget {
-                    assert!(!fin);
-                }
-                if !fin {
-                    assert_eq!(a.next_deadline(), Some(now + 1_000));
-                    let before = (a.now, a.snd_nxt, a.sample, a.rto_deadline);
-                    assert_eq!(
-                        a.transmit(now, &mut [0; 256]),
-                        Err(Error::TimestampBudgetExceeded)
+                        a.rto_deadline,
                     );
-                    assert_eq!((a.now, a.snd_nxt, a.sample, a.rto_deadline), before);
+                    assert_eq!(a.transmit(now, &mut [0; 31]), Err(Error::OutputTooSmall));
+                    assert_eq!(
+                        (
+                            a.now,
+                            a.snd_nxt,
+                            a.timestamp_bytes,
+                            a.sample,
+                            a.rto_deadline
+                        ),
+                        before
+                    );
+                    let bytes = deliver(&mut a, &mut b, now);
+                    let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+                    let fin = segment.header.flags & FIN != 0;
+                    assert!(segment.payload.len() as u32 + u32::from(fin) <= budget);
+                    assert_eq!(
+                        segment.header.sequence,
+                        start.wrapping_add(received.len() as u32).0
+                    );
+                    received.extend_from_slice(segment.payload);
+                    if segment.payload.len() as u32 == budget {
+                        assert!(!fin);
+                    }
+                    if !fin {
+                        assert_eq!(a.next_deadline(), Some(now + granularity.tick_us()));
+                        let before = (a.now, a.snd_nxt, a.sample, a.rto_deadline);
+                        assert_eq!(
+                            a.transmit(now, &mut [0; 256]),
+                            Err(Error::TimestampBudgetExceeded)
+                        );
+                        assert_eq!((a.now, a.snd_nxt, a.sample, a.rto_deadline), before);
+                    }
+                    b.immediate_ack();
+                    deliver(&mut b, &mut a, now + granularity.tick_us() / 10);
+                    now += granularity.tick_us();
+                    a.timeout(now).unwrap();
+                    assert!(a.next_deadline().is_none_or(|deadline| deadline > now));
+                    assert!(now <= 106_000);
                 }
-                b.immediate_ack();
-                deliver(&mut b, &mut a, now + 100);
-                now += 1_000;
-                a.timeout(now).unwrap();
-                assert!(a.next_deadline().is_none_or(|deadline| deadline > now));
-                assert!(now <= 106_000);
+                assert_eq!(received, data);
+                assert_eq!(a.fin_sequence, Some(start.wrapping_add(data.len() as u32)));
+                assert_eq!(a.state, State::FinWait2);
+                assert_eq!(a.rto_deadline, None);
+                let mut read = [0; 104];
+                assert_eq!(b.read(&mut read).unwrap(), data.len());
+                assert_eq!(read, data);
             }
-            assert_eq!(received, data);
-            assert_eq!(a.fin_sequence, Some(start.wrapping_add(data.len() as u32)));
-            assert_eq!(a.state, State::FinWait2);
-            assert_eq!(a.rto_deadline, None);
-            let mut read = [0; 104];
-            assert_eq!(b.read(&mut read).unwrap(), data.len());
-            assert_eq!(read, data);
         }
     }
 
     #[test]
     fn timestamp_partial_credit_syn_fin_retransmit_and_zero_window_wakeup() {
-        let cfg = ConnectionConfig {
-            timestamps: true,
-            timestamp_bytes_per_tick: 8,
-            nagle: false,
-            ..config(256, 64)
-        };
-        let (mut a, mut b) = pair(cfg, 100);
-        a.write(b"seven!!").unwrap();
-        deliver(&mut a, &mut b, 1_000);
-        a.write(b"tail").unwrap();
-        let bytes = packet(&mut a, 1_000);
-        assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, b"t");
-        assert_eq!(a.timestamp_bytes, 8);
-        assert_eq!(a.next_deadline(), Some(2_000));
-        let before = (a.now, a.snd_nxt, a.rto_deadline);
-        assert_eq!(
-            a.transmit(1_000, &mut [0; 256]),
-            Err(Error::TimestampBudgetExceeded)
-        );
-        assert_eq!((a.now, a.snd_nxt, a.rto_deadline), before);
-        // Closing the window must leave persist/loss timers intact; the credit
-        // wake fires once, not repeatedly at the same timestamp.
-        a.snd_wnd = 0;
-        a.arm_work();
-        let loss = a.loss_timer;
-        a.timeout(2_000).unwrap();
-        assert_eq!(a.loss_timer, loss);
-        assert!(a.next_deadline().is_some_and(|deadline| deadline > 2_000));
-        assert_eq!(a.transmit(2_000, &mut [0; 256]), Ok(None));
-        a.snd_wnd = 256;
-        a.arm_work();
-        a.retx_pending = true;
-        let bytes = packet(&mut a, 2_000);
-        let retry = wire::parse(ip(tuple()), &bytes).unwrap();
-        // Retry credit also respects the original seven-byte packet boundary.
-        assert_eq!(retry.payload, b"seven!!");
-        assert_eq!(a.timestamp_bytes, 7);
-        assert_eq!(retry.header.sequence, 101);
-
-        // SYN spends one byte even before negotiation; pure ACK spends none.
-        let cfg = ConnectionConfig {
-            timestamps: true,
-            timestamp_bytes_per_tick: 1,
-            ..config(64, 20)
-        };
-        let mut c = Connection::active(tuple(), cfg, 100, 0).unwrap();
-        packet(&mut c, 0);
-        assert_eq!(c.timestamp_bytes, 1);
-        c.syn_pending = true;
-        assert_eq!(
-            c.transmit(0, &mut [0; 256]),
-            Err(Error::TimestampBudgetExceeded)
-        );
-        assert_eq!(c.next_deadline(), Some(1_000));
-        c.timeout(1_000).unwrap();
-        let retry = packet(&mut c, 1_000);
-        assert_eq!(
-            wire::parse(ip(tuple()), &retry).unwrap().header.flags & SYN,
-            SYN
-        );
-    }
-
-    #[test]
-    fn timestamp_stale_rtt_echo_cannot_alias_after_clock_recycle() {
-        for timestamps in [false, true] {
+        for granularity in [
+            TimestampGranularity::Milliseconds,
+            TimestampGranularity::Microseconds,
+        ] {
             let cfg = ConnectionConfig {
-                timestamps,
-                sack: true,
-                rack: true,
+                timestamps: true,
+                timestamp_granularity: granularity,
+                timestamp_bytes_per_tick: 8,
+                nagle: false,
                 ..config(256, 64)
             };
-            let (mut a, _) = pair(cfg, 100);
-            a.write(b"old").unwrap();
-            packet(&mut a, 1_000);
-            let sample = a.sample;
-            let srtt = a.rtt.srtt();
-            let deadline = a.rto_deadline;
-            let end = a.snd_nxt;
-            let after_recycle = 1_000 + (1u64 << 32) * 1_000;
-            // An ACK encode failure may not invalidate state before commit.
-            a.immediate_ack();
+            let (mut a, mut b) = pair(cfg, 100);
+            a.write(b"seven!!").unwrap();
+            deliver(&mut a, &mut b, 1_000);
+            a.write(b"tail").unwrap();
+            let bytes = packet(&mut a, 1_000);
+            assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, b"t");
+            assert_eq!(a.timestamp_bytes, 8);
+            assert_eq!(a.next_deadline(), Some(1_000 + granularity.tick_us()));
+            let before = (a.now, a.snd_nxt, a.rto_deadline);
             assert_eq!(
-                a.transmit(after_recycle, &mut [0; 19]),
-                Err(Error::OutputTooSmall)
+                a.transmit(1_000, &mut [0; 256]),
+                Err(Error::TimestampBudgetExceeded)
             );
-            assert_eq!(a.now, 1_000);
-            assert_eq!(a.sample, sample);
-            assert_eq!(a.rto_deadline, deadline);
-            a.update_time(after_recycle).unwrap();
-            assert_eq!(a.sample, None);
-            assert_eq!(a.last_timestamp_sent_at, None);
-            assert!(!a.rack.valid());
-            assert_eq!(a.rto_deadline, deadline);
-            assert_eq!(a.send.len(), 3);
-            let next = a.receive.next();
-            timestamp_input(&mut a, after_recycle, next, end, ACK, Some((0, 1)), b"");
-            assert_eq!(a.snd_una, end);
-            assert_eq!(a.rtt.srtt(), srtt);
-            assert_eq!(a.send.len(), 0);
-            assert_eq!(a.rto_deadline, None);
+            assert_eq!((a.now, a.snd_nxt, a.rto_deadline), before);
+            // Closing the window must leave persist/loss timers intact; the credit
+            // wake fires once, not repeatedly at the same timestamp.
+            a.snd_wnd = 0;
+            a.arm_work();
+            let loss = a.loss_timer;
+            a.timeout(2_000).unwrap();
+            assert_eq!(a.loss_timer, loss);
+            assert!(a.next_deadline().is_some_and(|deadline| deadline > 2_000));
+            assert_eq!(a.transmit(2_000, &mut [0; 256]), Ok(None));
+            a.snd_wnd = 256;
+            a.arm_work();
+            a.retx_pending = true;
+            let bytes = packet(&mut a, 2_000);
+            let retry = wire::parse(ip(tuple()), &bytes).unwrap();
+            // Retry credit also respects the original seven-byte packet boundary.
+            assert_eq!(retry.payload, b"seven!!");
+            assert_eq!(a.timestamp_bytes, 7);
+            assert_eq!(retry.header.sequence, 101);
+
+            // SYN spends one byte even before negotiation; pure ACK spends none.
+            let cfg = ConnectionConfig {
+                timestamps: true,
+                timestamp_granularity: granularity,
+                timestamp_bytes_per_tick: 1,
+                ..config(64, 20)
+            };
+            let mut c = Connection::active(tuple(), cfg, 100, 0).unwrap();
+            packet(&mut c, 0);
+            assert_eq!(c.timestamp_bytes, 1);
+            c.syn_pending = true;
+            assert_eq!(
+                c.transmit(0, &mut [0; 256]),
+                Err(Error::TimestampBudgetExceeded)
+            );
+            assert_eq!(c.next_deadline(), Some(granularity.tick_us()));
+            c.timeout(1_000).unwrap();
+            let retry = packet(&mut c, 1_000);
+            assert_eq!(
+                wire::parse(ip(tuple()), &retry).unwrap().header.flags & SYN,
+                SYN
+            );
         }
     }
 
     #[test]
-    fn timestamp_long_idle_connections_resume_on_serviced_endpoint_clock() {
+    fn timestamp_stale_rtt_echo_cannot_alias_after_clock_recycle() {
+        for granularity in [
+            TimestampGranularity::Milliseconds,
+            TimestampGranularity::Microseconds,
+        ] {
+            for timestamps in [false, true] {
+                let cfg = ConnectionConfig {
+                    timestamps,
+                    timestamp_granularity: granularity,
+                    sack: true,
+                    rack: true,
+                    ..config(256, 64)
+                };
+                let (mut a, _) = pair(cfg, 100);
+                a.write(b"old").unwrap();
+                packet(&mut a, 1_000);
+                let sample = a.sample;
+                let srtt = a.rtt.srtt();
+                let deadline = a.rto_deadline;
+                let end = a.snd_nxt;
+                let after_recycle = 1_000
+                    + (1u64 << 32)
+                        * if timestamps {
+                            granularity.tick_us()
+                        } else {
+                            1_000
+                        };
+                // An ACK encode failure may not invalidate state before commit.
+                a.immediate_ack();
+                assert_eq!(
+                    a.transmit(after_recycle, &mut [0; 19]),
+                    Err(Error::OutputTooSmall)
+                );
+                assert_eq!(a.now, 1_000);
+                assert_eq!(a.sample, sample);
+                assert_eq!(a.rto_deadline, deadline);
+                a.update_time(after_recycle).unwrap();
+                assert_eq!(a.sample, None);
+                assert_eq!(a.last_timestamp_sent_at, None);
+                assert!(!a.rack.valid());
+                assert_eq!(a.rto_deadline, deadline);
+                assert_eq!(a.send.len(), 3);
+                let next = a.receive.next();
+                // Local recycle is not permission to expire the peer's PAWS clock.
+                let peer_value = a.ts_recent;
+                let echo = granularity.tick(1_000) as u32;
+                timestamp_input(
+                    &mut a,
+                    after_recycle,
+                    next,
+                    end,
+                    ACK,
+                    Some((peer_value, echo)),
+                    b"",
+                );
+                assert_eq!(a.snd_una, end);
+                assert_eq!(a.rtt.srtt(), srtt);
+                assert_eq!(a.send.len(), 0);
+                assert_eq!(a.rto_deadline, None);
+            }
+        }
+    }
+
+    fn assert_timestamp_interop_on_serviced_clocks(
+        granularity: TimestampGranularity,
+        interval: Instant,
+        exchanges: u32,
+        accepted: bool,
+    ) {
         use crate::{Endpoint, EndpointConfig};
 
-        fn transfer(from: &mut Endpoint, to: &mut Endpoint, now: Instant) {
+        fn transfer(from: &mut Endpoint, to: &mut Endpoint, now: Instant) -> Vec<u8> {
             let mut out = [0; 256];
             let tx = from
                 .poll_transmit(now, &mut out, 64)
@@ -21313,54 +21592,190 @@ mod tests {
                 .packet
                 .unwrap();
             to.input(now, tx.ip, &out[..tx.len]).unwrap();
+            out[..tx.len].to_vec()
         }
 
-        for negotiated in [false, true] {
-            let cfg = EndpointConfig {
-                max_connections: 2,
-                connection: ConnectionConfig {
-                    timestamps: true,
-                    ..config(256, 64)
-                },
-                ..EndpointConfig::default()
-            };
-            let mut peer_cfg = cfg.clone();
-            peer_cfg.connection.timestamps = negotiated;
-            let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
-            let mut b = Endpoint::new(peer_cfg, [2; 32], 0, |_| true).unwrap();
-            let listener = b.listen(tuple().remote, 1).unwrap();
-            let id = a.connect(0, tuple().local, tuple().remote).unwrap();
-            transfer(&mut a, &mut b, 0);
-            transfer(&mut b, &mut a, 10);
-            transfer(&mut a, &mut b, 20);
-            let peer = b.accept(listener).unwrap();
-            assert_eq!(a.next_deadline(), None);
-            let day = 86_400_000_000;
-            for d in 1..=26 {
-                assert!(!a.on_timeout(d * day, 64).unwrap());
-                assert!(!b.on_timeout(d * day, 64).unwrap());
+        let cfg = EndpointConfig {
+            max_connections: 2,
+            connection: ConnectionConfig {
+                timestamps: true,
+                timestamp_granularity: granularity,
+                nagle: false,
+                ..config(256, 64)
+            },
+            ..EndpointConfig::default()
+        };
+        let mut peer_cfg = cfg.clone();
+        peer_cfg.connection.timestamp_granularity = TimestampGranularity::Milliseconds;
+        let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(peer_cfg, [2; 32], 0, |_| true).unwrap();
+        let listener = b.listen(tuple().remote, 1).unwrap();
+        let id = a.connect(0, tuple().local, tuple().remote).unwrap();
+        transfer(&mut a, &mut b, 0);
+        transfer(&mut b, &mut a, 10);
+        let handshake_ack = transfer(&mut a, &mut b, 20);
+        let peer = b.accept(listener).unwrap();
+        let mut previous_ts = wire::parse(ip(tuple()), &handshake_ack)
+            .unwrap()
+            .options
+            .timestamps
+            .unwrap()
+            .0;
+        let mut clock = 20;
+        for exchange in 1..=exchanges {
+            let now = 20 + interval * u64::from(exchange);
+            // Service both endpoint clocks every <=10min without sending packets.
+            // This satisfies the local clock contract, not the peer's idle policy.
+            while clock < now {
+                clock = (clock + 600_000_000).min(now);
+                assert!(!a.on_timeout(clock, 64).unwrap());
+                assert!(!b.on_timeout(clock, 64).unwrap());
             }
-            // Endpoint time advances, while this idle connection has no work.
-            assert_eq!(a.write(id, b"resumed").unwrap(), 7);
-            transfer(&mut a, &mut b, 26 * day);
-            let mut read = [0; 7];
-            assert_eq!(b.read(peer, &mut read).unwrap(), 7);
-            assert_eq!(&read, b"resumed");
-            b.on_timeout(26 * day + 500_000, 64).unwrap();
-            transfer(&mut b, &mut a, 26 * day + 500_000);
-            assert_eq!(a.acknowledged(id).unwrap(), 7);
-            for d in 27..=52 {
-                a.on_timeout(d * day, 64).unwrap();
-                b.on_timeout(d * day, 64).unwrap();
+            assert_eq!(a.write(id, b"x").unwrap(), 1);
+            let bytes = transfer(&mut a, &mut b, now);
+            let data = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(data.payload, b"x");
+            let ts = data.options.timestamps.unwrap().0;
+            assert_eq!(
+                ts.wrapping_sub(previous_ts),
+                (interval / granularity.tick_us()) as u32
+            );
+            previous_ts = ts;
+            assert_eq!(b.readable_bytes(peer).unwrap(), usize::from(accepted));
+            if accepted {
+                assert_eq!(b.read(peer, &mut [0; 1]).unwrap(), 1);
             }
-            a.abort(id).unwrap();
-            a.release(id).unwrap();
-            transfer(&mut a, &mut b, 52 * day);
-            assert_eq!(b.state(peer).unwrap(), State::Closed);
-            a.on_timeout(52 * day + 240_000_000, 64).unwrap();
-            a.poll_transmit(52 * day + 240_000_000, &mut [0; 256], 64)
-                .unwrap();
-            assert!(!a.connection_exists(id));
+            let ack_time = now + 500_000;
+            b.on_timeout(ack_time, 64).unwrap();
+            let bytes = transfer(&mut b, &mut a, ack_time);
+            let ack = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+            assert!(ack.payload.is_empty());
+            assert_eq!(ack.header.flags & ACK, ACK);
+            assert_eq!(
+                ack.header.acknowledgment,
+                data.header.sequence.wrapping_add(u32::from(accepted))
+            );
+            assert_eq!(
+                a.acknowledged(id).unwrap(),
+                if accepted { u64::from(exchange) } else { 0 }
+            );
+            clock = ack_time;
+        }
+    }
+
+    #[test]
+    fn timestamp_mixed_units_idle_half_range_is_known_paws_limitation() {
+        let minute = 60_000_000;
+        assert_timestamp_interop_on_serviced_clocks(
+            TimestampGranularity::Microseconds,
+            30 * minute,
+            1,
+            true,
+        );
+        // 2.4e9 microsecond ticks compare stale against the peer's still-valid
+        // TS.Recent. Servicing clocks does not fix ordinary 24-day PAWS.
+        assert_timestamp_interop_on_serviced_clocks(
+            TimestampGranularity::Microseconds,
+            40 * minute,
+            1,
+            false,
+        );
+        assert_timestamp_interop_on_serviced_clocks(
+            ConnectionConfig::default().timestamp_granularity,
+            40 * minute,
+            1,
+            true,
+        );
+    }
+
+    #[test]
+    fn timestamp_mixed_units_real_data_refreshes_recent_over_sixty_minutes() {
+        // Three actual data/ACK exchanges refresh the peer baseline every 20min,
+        // below half-range over a total duration exceeding half-range. Pure
+        // keepalives need not refresh TS.Recent and are not sufficient evidence.
+        assert_timestamp_interop_on_serviced_clocks(
+            TimestampGranularity::Microseconds,
+            20 * 60_000_000,
+            3,
+            true,
+        );
+    }
+
+    #[test]
+    // At 26 days the peer's PAWS baseline has expired; this is not evidence
+    // that microsecond timestamps resume safely after an ordinary 40min idle.
+    fn timestamp_long_idle_connections_resume_on_serviced_endpoint_clock() {
+        for granularity in [
+            TimestampGranularity::Milliseconds,
+            TimestampGranularity::Microseconds,
+        ] {
+            use crate::{Endpoint, EndpointConfig};
+
+            fn transfer(from: &mut Endpoint, to: &mut Endpoint, now: Instant) {
+                let mut out = [0; 256];
+                let tx = from
+                    .poll_transmit(now, &mut out, 64)
+                    .unwrap()
+                    .packet
+                    .unwrap();
+                to.input(now, tx.ip, &out[..tx.len]).unwrap();
+            }
+
+            for negotiated in [false, true] {
+                let cfg = EndpointConfig {
+                    max_connections: 2,
+                    connection: ConnectionConfig {
+                        timestamps: true,
+                        timestamp_granularity: granularity,
+                        ..config(256, 64)
+                    },
+                    ..EndpointConfig::default()
+                };
+                let mut peer_cfg = cfg.clone();
+                peer_cfg.connection.timestamps = negotiated;
+                // Mixed units remain opaque to the peer, including after physical PAWS expiry.
+                peer_cfg.connection.timestamp_granularity = TimestampGranularity::Milliseconds;
+                let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+                let mut b = Endpoint::new(peer_cfg, [2; 32], 0, |_| true).unwrap();
+                let listener = b.listen(tuple().remote, 1).unwrap();
+                let id = a.connect(0, tuple().local, tuple().remote).unwrap();
+                transfer(&mut a, &mut b, 0);
+                transfer(&mut b, &mut a, 10);
+                transfer(&mut a, &mut b, 20);
+                let peer = b.accept(listener).unwrap();
+                assert_eq!(a.next_deadline(), None);
+                let day = 86_400_000_000;
+                let step = (1u64 << 30) * granularity.tick_us();
+                let mut clock: Instant = 20;
+                while clock < 26 * day {
+                    clock = clock.saturating_add(step).min(26 * day);
+                    assert!(!a.on_timeout(clock, 64).unwrap());
+                    assert!(!b.on_timeout(clock, 64).unwrap());
+                }
+                // Endpoint time advances, while this idle connection has no work.
+                assert_eq!(a.write(id, b"resumed").unwrap(), 7);
+                transfer(&mut a, &mut b, 26 * day);
+                let mut read = [0; 7];
+                assert_eq!(b.read(peer, &mut read).unwrap(), 7);
+                assert_eq!(&read, b"resumed");
+                b.on_timeout(26 * day + 500_000, 64).unwrap();
+                transfer(&mut b, &mut a, 26 * day + 500_000);
+                assert_eq!(a.acknowledged(id).unwrap(), 7);
+                clock = 26 * day + 500_000;
+                while clock < 52 * day {
+                    clock = clock.saturating_add(step).min(52 * day);
+                    a.on_timeout(clock, 64).unwrap();
+                    b.on_timeout(clock, 64).unwrap();
+                }
+                a.abort(id).unwrap();
+                a.release(id).unwrap();
+                transfer(&mut a, &mut b, 52 * day);
+                assert_eq!(b.state(peer).unwrap(), State::Closed);
+                a.on_timeout(52 * day + 240_000_000, 64).unwrap();
+                a.poll_transmit(52 * day + 240_000_000, &mut [0; 256], 64)
+                    .unwrap();
+                assert!(!a.connection_exists(id));
+            }
         }
     }
 

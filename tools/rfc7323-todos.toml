@@ -2,7 +2,7 @@
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7323#section-4.1"
-reason = "External clock evidence: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s. Backward time is rejected; long inactivity invalidates stale RTT history while preserving lifecycle progress. Secret-offset TSval advances in 1ms ticks with a 2^32ms period. Physical rate, drift and real network MSL require the embedding runtime's clock guarantees and measurements."
+reason = "External clock evidence: CallerTimebase validates 1000000 units/sec, resolution 1..1000us and MSL <=255s. Backward time is rejected; long inactivity invalidates stale RTT history while preserving lifecycle progress. Secret-offset TSval advances in fixed local ticks (default 1ms, opt-in 1us), with a 2^32-tick period; enabled timestamps require declared resolution no coarser than the tick. Peer PAWS expiry is independent. Physical rate, drift and real network MSL require the embedding runtime's clock guarantees and measurements."
 quote = '''
 Values of this
 clock MUST be at least approximately proportional to real time, in
@@ -11,7 +11,7 @@ order to measure actual RTT.
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.4"
-reason = "Explicit fixed-1ms clock tradeoff: byte-per-tick credit enforces the <2^31 sequence-space bound, but a submillisecond path can turn a small peer window several times per tick. Pacing to window/1ms would reduce a one-byte/10us path from100000 to1000bytes/s; synthetic ticks would lose real-time correspondence. Local Karn-safe RTT sampling preserves estimator cadence independently of TSecr. Dynamic per-window pacing is implementable and remains a separate SHOULD policy decision; this is distinct from external clock evidence."
+reason = "Default fixed-1ms clock tradeoff (opt-in 1us ticks reduce quantization but do not enforce per-window ticking): byte-per-tick credit enforces the <2^31 sequence-space bound, but a submillisecond path can turn a small peer window several times per tick. Pacing to window/1ms would reduce a one-byte/10us path from100000 to1000bytes/s; synthetic ticks would lose real-time correspondence. Local Karn-safe RTT sampling preserves estimator cadence independently of TSecr. Dynamic per-window pacing is implementable and remains a separate SHOULD policy decision; this is distinct from external clock evidence."
 quote = '''
 In fact,
 in order to be useful to the sender for round-trip timing, the
@@ -22,7 +22,7 @@ bytes must be at least two windows.
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.4"
-reason = "Configured timestamp period is 2^32ms and validated MSL is at most255s. Long inactivity safely expires stale timing history. Establishing the relationship to physical packet lifetime requires the embedding runtime's clock and network-MSL guarantees."
+reason = "Configured timestamp period is 2^32 selected ticks (default milliseconds, opt-in microseconds) and validated MSL is at most255s. Long inactivity safely expires stale timing history. Establishing the relationship to physical packet lifetime requires the embedding runtime's clock and network-MSL guarantees."
 quote = '''
 The recycling time of the timestamp clock MUST be greater than
 MSL seconds.
@@ -39,7 +39,7 @@ that implements PAWS MUST also implement Path MTU Discovery.
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.4"
-reason = "TSval advances every1000 declared microseconds, with declared caller resolution validated at1..1000us. Actual elapsed-time frequency and drift require trustworthy embedding-clock evidence. Long idle periods remain serviceable and expire stale RTT state."
+reason = "Default TSval advances every1000 declared microseconds; opt-in microseconds uses1us and is outside the quoted frequency range. Declared caller resolution is validated at1..1000us and no coarser than the selected tick when enabled. Neither mode closes this frequency audit. Actual elapsed-time frequency and drift require trustworthy embedding-clock evidence. Long idle periods remain serviceable and expire stale RTT state."
 quote = '''
 Based upon these considerations, we choose a timestamp clock
 frequency in the range 1 ms to 1 sec per tick.

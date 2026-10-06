@@ -4314,57 +4314,63 @@ fn timestamp_privacy_echo_rtt_and_reactive_reset_without_local_enable() {
 
 #[test]
 fn timestamp_offset_time_wait_reuse_and_rollback_keep_virtual_clock() {
-    let mut cfg = config();
-    cfg.connection.timestamps = true;
-    let (mut b, _, old, ip, h, ts) = time_wait_endpoint(cfg);
-    let duplicate_fin = tw_segment(
-        ip,
-        h,
-        h.acknowledgment.wrapping_sub(1),
-        h.sequence,
-        wire::FIN | wire::ACK,
-        Some((ts, 0)),
-    );
-    b.input(4_000, ip, &duplicate_fin).unwrap();
-    let output = packets(&mut b, 4_000).pop().unwrap();
-    let old_value = wire::parse(output.0, &output.1)
-        .unwrap()
-        .options
-        .timestamps
-        .unwrap()
-        .0;
-    let seq = h.acknowledgment.wrapping_add(100);
-    let syn = tw_segment(ip, h, seq, 0, wire::SYN, Some((ts.wrapping_add(1), 0)));
-    b.input(5_000, ip, &syn).unwrap();
-    assert_eq!(
-        b.poll_transmit(5_000, &mut [0; 19], 16),
-        Err(EndpointError::Connection(Error::OutputTooSmall))
-    );
-    let output = packets(&mut b, 5_000).pop().unwrap();
-    let synack = wire::parse(output.0, &output.1).unwrap();
-    assert_eq!(
-        synack.options.timestamps.unwrap().0,
-        old_value.wrapping_add(1)
-    );
-    let reset = tw_segment(
-        ip,
-        h,
-        seq.wrapping_add(1),
-        synack.header.sequence.wrapping_add(1),
-        wire::RST | wire::ACK,
-        None,
-    );
-    b.input(5_100, ip, &reset).unwrap();
-    assert_eq!(b.state(old), Ok(State::TimeWait));
-    b.input(6_000, ip, &duplicate_fin).unwrap();
-    let output = packets(&mut b, 6_000).pop().unwrap();
-    assert_eq!(
-        wire::parse(output.0, &output.1)
+    for granularity in [
+        crate::TimestampGranularity::Milliseconds,
+        crate::TimestampGranularity::Microseconds,
+    ] {
+        let mut cfg = config();
+        cfg.connection.timestamps = true;
+        cfg.connection.timestamp_granularity = granularity;
+        let (mut b, _, old, ip, h, ts) = time_wait_endpoint(cfg);
+        let duplicate_fin = tw_segment(
+            ip,
+            h,
+            h.acknowledgment.wrapping_sub(1),
+            h.sequence,
+            wire::FIN | wire::ACK,
+            Some((ts, 0)),
+        );
+        b.input(4_000, ip, &duplicate_fin).unwrap();
+        let output = packets(&mut b, 4_000).pop().unwrap();
+        let old_value = wire::parse(output.0, &output.1)
             .unwrap()
             .options
             .timestamps
             .unwrap()
-            .0,
-        old_value.wrapping_add(2)
-    );
+            .0;
+        let seq = h.acknowledgment.wrapping_add(100);
+        let syn = tw_segment(ip, h, seq, 0, wire::SYN, Some((ts.wrapping_add(1), 0)));
+        b.input(5_000, ip, &syn).unwrap();
+        assert_eq!(
+            b.poll_transmit(5_000, &mut [0; 19], 16),
+            Err(EndpointError::Connection(Error::OutputTooSmall))
+        );
+        let output = packets(&mut b, 5_000).pop().unwrap();
+        let synack = wire::parse(output.0, &output.1).unwrap();
+        assert_eq!(
+            synack.options.timestamps.unwrap().0,
+            old_value.wrapping_add((1_000 / granularity.tick_us()) as u32)
+        );
+        let reset = tw_segment(
+            ip,
+            h,
+            seq.wrapping_add(1),
+            synack.header.sequence.wrapping_add(1),
+            wire::RST | wire::ACK,
+            None,
+        );
+        b.input(5_100, ip, &reset).unwrap();
+        assert_eq!(b.state(old), Ok(State::TimeWait));
+        b.input(6_000, ip, &duplicate_fin).unwrap();
+        let output = packets(&mut b, 6_000).pop().unwrap();
+        assert_eq!(
+            wire::parse(output.0, &output.1)
+                .unwrap()
+                .options
+                .timestamps
+                .unwrap()
+                .0,
+            old_value.wrapping_add((2_000 / granularity.tick_us()) as u32)
+        );
+    }
 }

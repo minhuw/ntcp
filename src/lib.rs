@@ -24,7 +24,7 @@ pub mod wire;
 
 pub use connection::{
     CallerTimebase, CloseReason, ConnectionConfig, ConnectionEvents, Error, Instant,
-    KeepaliveConfig, NetworkError, State, TransportInfo, Tuple,
+    KeepaliveConfig, NetworkError, State, TimestampGranularity, TransportInfo, Tuple,
 };
 pub use endpoint::{
     AddressValidation, ConnectionId, Endpoint, EndpointConfig, EndpointError, Event,

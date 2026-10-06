@@ -311,7 +311,7 @@ impl Endpoint {
         address_policy: F,
     ) -> Result<Self, EndpointError> {
         if !(1..=1_024).contains(&config.max_setup_cache_entries)
-            || !config.connection.timebase.valid()
+            || !config.connection.valid_timestamp_timebase()
             || config.connection.time_wait_us < 240_000_000
             || config.connection.time_wait_us
                 < 2 * config.connection.timebase.max_segment_lifetime_us
@@ -449,7 +449,10 @@ impl Endpoint {
         if now < self.now {
             return Err(Error::TimeWentBackwards.into());
         }
-        if self.config.connection.timestamps && now / 1_000 - self.now / 1_000 >= 1 << 31 {
+        let granularity = self.config.connection.timestamp_granularity;
+        if self.config.connection.timestamps
+            && granularity.tick(now) - granularity.tick(self.now) >= 1 << 31
+        {
             return Err(Error::AmbiguousTimeJump.into());
         }
         self.now = now;
