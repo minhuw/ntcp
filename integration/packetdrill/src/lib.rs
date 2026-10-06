@@ -305,6 +305,11 @@ impl Owner {
             Profile::UpstreamWindow8 | Profile::UpstreamSack => 8 * 1024 * 1024,
         };
         config.connection.mss = 1460;
+        config.connection.initial_window = if profile == Profile::UpstreamSack {
+            ntcp::InitialWindow::Iw10
+        } else {
+            ntcp::InitialWindow::Rfc5681
+        };
         config.connection.timestamps = profile == Profile::UpstreamSack;
         config.connection.sack = matches!(profile, Profile::Sack | Profile::UpstreamSack);
         config.connection.recovery_algorithm = ntcp::RecoveryAlgorithm::NewReno;

@@ -786,3 +786,62 @@ fn explicit_close_cancels_pending_accept_before_descriptor_reuse() {
     );
     call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap();
 }
+
+#[test]
+fn only_upstream_sack_uses_iw10() {
+    for (profile, expected) in [
+        (Profile::Baseline, 4380),
+        (Profile::UpstreamWindow8, 4380),
+        (Profile::Sack, 4380),
+        (Profile::UpstreamSack, 14600),
+    ] {
+        let mut owner = Owner::new((local(), profile)).unwrap();
+        let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
+        let (mut connect, _) = request(
+            5,
+            fd,
+            0,
+            encode_addr(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080)),
+            0,
+        );
+        assert_eq!(owner.execute(&mut connect).err(), Some(EINPROGRESS));
+        let mut tcp = vec![0; BYTES];
+        let tx = owner
+            .endpoint
+            .poll_transmit(owner.now(), &mut tcp, BUDGET)
+            .unwrap()
+            .packet
+            .unwrap();
+        let syn = ntcp::wire::parse(tx.ip, &tcp[..tx.len]).unwrap().header;
+        let ip = IpMetadata {
+            source: tx.ip.destination,
+            destination: tx.ip.source,
+        };
+        let header = ntcp::wire::Header {
+            source_port: syn.destination_port,
+            destination_port: syn.source_port,
+            sequence: 100,
+            acknowledgment: syn.sequence.wrapping_add(1),
+            flags: ntcp::wire::SYN | ntcp::wire::ACK,
+            window: 65535,
+            urgent_pointer: 0,
+        };
+        let n = ntcp::wire::encode(ip, header, &[2, 4, 5, 180], &[], &mut tcp).unwrap();
+        owner.endpoint.input(owner.now(), ip, &tcp[..n]).unwrap();
+        let id = owner.connection(fd).unwrap();
+        owner.endpoint.write(id, &vec![0; 20000]).unwrap();
+        let mut flight = 0;
+        while let Some(tx) = owner
+            .endpoint
+            .poll_transmit(owner.now(), &mut tcp, BUDGET)
+            .unwrap()
+            .packet
+        {
+            flight += ntcp::wire::parse(tx.ip, &tcp[..tx.len])
+                .unwrap()
+                .payload
+                .len();
+        }
+        assert_eq!(flight, expected, "{profile:?}");
+    }
+}
