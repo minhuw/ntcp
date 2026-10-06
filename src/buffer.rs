@@ -1,6 +1,10 @@
 extern crate alloc;
 
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::{
+    alloc::{Layout, alloc_zeroed},
+    collections::VecDeque,
+    vec::Vec,
+};
 
 use crate::seq::Seq;
 
@@ -133,12 +137,24 @@ impl ReceiveBuffer {
         if capacity == 0 || capacity >= 1usize << 31 {
             return Err(());
         }
-        let mut data = Vec::new();
-        data.try_reserve_exact(capacity).map_err(|_| ())?;
-        data.resize(capacity, (0, false));
-        let mut present = Vec::new();
-        present.try_reserve_exact(capacity).map_err(|_| ())?;
-        present.resize(capacity, false);
+        let data_layout = Layout::array::<(u8, bool)>(capacity).map_err(|_| ())?;
+        // Zero is a valid u8 and bool representation. Allocate with the exact
+        // Vec layout, preserving fallible allocation and allocator-owned zero pages.
+        let data = unsafe {
+            let pointer = alloc_zeroed(data_layout).cast::<(u8, bool)>();
+            if pointer.is_null() {
+                return Err(());
+            }
+            Vec::from_raw_parts(pointer, capacity, capacity)
+        };
+        let present_layout = Layout::array::<bool>(capacity).map_err(|_| ())?;
+        let present = unsafe {
+            let pointer = alloc_zeroed(present_layout).cast::<bool>();
+            if pointer.is_null() {
+                return Err(());
+            }
+            Vec::from_raw_parts(pointer, capacity, capacity)
+        };
         Ok(Self {
             data,
             pushed: false,
@@ -155,7 +171,7 @@ impl ReceiveBuffer {
     }
 
     pub(crate) fn reset_start(&mut self, start: Seq) -> Result<(), ()> {
-        if self.fin_sequence.is_some() || self.present.iter().any(|&present| present) {
+        if self.fin_sequence.is_some() || self.has_data() {
             return Err(());
         }
         self.read_base = start;
@@ -184,7 +200,7 @@ impl ReceiveBuffer {
     }
 
     pub(crate) fn has_data(&self) -> bool {
-        self.present.iter().any(|&present| present)
+        self.contiguous_len != 0 || self.range_count != 0
     }
 
     pub(crate) fn take_push(&mut self) -> bool {
@@ -904,6 +920,24 @@ mod tests {
             (recv.present.as_ptr(), recv.present.capacity()),
             presence_storage
         );
+    }
+
+    #[test]
+    fn zeroed_storage_and_constant_time_data_presence_agree() {
+        let mut recv = ReceiveBuffer::new(Seq(u32::MAX - 8), 8192).unwrap();
+        assert!(recv.data.iter().all(|&value| value == (0, false)));
+        assert!(recv.present.iter().all(|&value| !value));
+        assert!(!recv.has_data());
+        assert_eq!(recv.reset_start(Seq(10)), Ok(()));
+        recv.insert(Seq(12), b"cd", false);
+        assert!(recv.has_data());
+        assert_eq!(recv.reset_start(Seq(20)), Err(()));
+        recv.insert(Seq(10), b"ab", false);
+        assert!(recv.has_data());
+        assert_eq!(recv.read(&mut [0; 4]), 4);
+        assert!(!recv.has_data());
+        assert!(recv.present.iter().all(|&value| !value));
+        assert_eq!(recv.reset_start(Seq(20)), Ok(()));
     }
 
     #[test]
