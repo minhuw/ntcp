@@ -215,7 +215,13 @@ class AdaptationChecks(unittest.TestCase):
                        b'0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3\n'
                        b'+0 > S 0:0(0) <...>\n+0 close(3) = 0\n')
         self.setup = b'#!/bin/sh\nsysctl -q net.ipv4.tcp_ecn=0\n'
+        # Synthetic sources exercise runner behavior, independent of real scripts'
+        # blocked capabilities and alternate defaults spellings.
         for name, entry in self.manifest['scripts'].items():
+            entry.pop('blocked_reasons', None)
+            entry.pop('additional_setup_files', None)
+            entry['command_line'] = '`../common/defaults.sh`\n'
+            entry['expected_command_count'] = 1
             path = self.directory / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(self.source)
@@ -240,6 +246,100 @@ class AdaptationChecks(unittest.TestCase):
             self.assertFalse(audit['mapping']['linux_defaults_reproduced'])
             self.assertTrue(preflight(self.source.decode()))  # upstream still refuses it
             self.assertEqual(preflight(generated.decode()), [])
+
+    def test_alternate_defaults_spellings_preserve_every_other_byte(self):
+        entry = self.manifest['scripts'][self.name]
+        for command in ('`../common/defaults.sh\n`\n', '`../../common/defaults.sh`\n'):
+            original = self.source.replace(entry['command_line'].encode(), command.encode())
+            (self.directory / self.name).write_bytes(original)
+            entry['command_line'] = command
+            entry['source_sha256'] = hashlib.sha256(original).hexdigest()
+            generated, _ = adapt_source(self.directory, self.name, self.manifest, self.flags)
+            self.assertEqual(generated, original.replace(command.encode(),
+                                                       entry['replacement_line'].encode()))
+            entry['command_line'] = '`../common/defaults.sh`\n'
+
+    def test_inline_ecn_enablement_requires_exact_hash_and_profile(self):
+        entry = self.manifest['scripts'][self.name]
+        command = ('`../common/defaults.sh\n'
+                   'sysctl -q net.ipv4.tcp_ecn=1  # fully enabled\n`\n')
+        original = self.source.replace(entry['command_line'].encode(), command.encode())
+        (self.directory / self.name).write_bytes(original)
+        entry.update(command_line=command,
+                     source_sha256=hashlib.sha256(original).hexdigest(),
+                     command_sha256=hashlib.sha256(command.encode()).hexdigest(),
+                     adapter_flags='upstream-ecn,local=192.168.0.1')
+        entry['mapping']['ntcp_settings']['ecn'] = True
+        flags = entry['adapter_flags']
+        generated, _ = adapt_source(self.directory, self.name, self.manifest, flags)
+        self.assertEqual(generated, original.replace(command.encode(),
+                                                   entry['replacement_line'].encode()))
+        for field, value in (('command_sha256', '0' * 64),
+                             ('adapter_flags', 'upstream-sack,local=192.168.0.1')):
+            manifest = copy.deepcopy(self.manifest)
+            manifest['scripts'][self.name][field] = value
+            with self.assertRaises(ValueError):
+                adapt_source(self.directory, self.name, manifest,
+                             manifest['scripts'][self.name]['adapter_flags'])
+        entry['mapping']['ntcp_settings']['ecn'] = False
+        with self.assertRaises(ValueError):
+            adapt_source(self.directory, self.name, self.manifest, flags)
+        entry['mapping']['ntcp_settings']['ecn'] = True
+        original = original.replace(b'tcp_ecn=1', b'tcp_ecn=2')
+        (self.directory / self.name).write_bytes(original)
+        entry['source_sha256'] = hashlib.sha256(original).hexdigest()
+        entry['command_line'] = command.replace('tcp_ecn=1', 'tcp_ecn=2')
+        entry['command_sha256'] = hashlib.sha256(entry['command_line'].encode()).hexdigest()
+        with self.assertRaises(ValueError):
+            adapt_source(self.directory, self.name, self.manifest, flags)
+
+    def test_blocked_setup_and_embedded_assertions_are_never_executed(self):
+        entry = self.manifest['scripts'][self.name]
+        original = self.source + b'+0 `tc qdisc add dev tun0 root pfifo limit 0`\n' \
+                   + b'+0 %{ assert tcpi_probes == 6 }%\n'
+        (self.directory / self.name).write_bytes(original)
+        entry['source_sha256'] = hashlib.sha256(original).hexdigest()
+        entry['blocked_reasons'] = ['No ntcp resource-probe mapping']
+        extra = self.directory / 'common/set_sysctls.py'
+        extra.write_bytes(b'unavailable setup')
+        entry['additional_setup_files'] = [{'path': 'common/set_sysctls.py',
+                                           'sha256': hashlib.sha256(extra.read_bytes()).hexdigest()}]
+        generated, audit = adapt_source(self.directory, self.name, self.manifest, self.flags)
+        self.assertEqual(generated, original)
+        self.assertNotIn('generated_sha256', audit)
+        checkout = Path(self.temporary.name)
+        runner = checkout / PIN['runner']
+        runner.parent.mkdir(parents=True)
+        runner.write_text('unused')
+        runner.chmod(0o700)
+        plugin = checkout / 'plugin.so'
+        plugin.write_text('unused')
+        manifest_dir = checkout / 'manifest'
+        manifest_dir.mkdir()
+        (manifest_dir / 'adaptations.json').write_text(json.dumps(self.manifest))
+        report = checkout / 'report.json'
+        tracked = '\0'.join(str(Path(PIN['tcp_tests']) / name)
+                            for name in self.manifest['scripts'])
+        with patch('run.HERE', manifest_dir), \
+                patch('run.check_checkout', return_value=PIN['revision']), \
+                patch('run.subprocess.check_output', return_value=tracked), \
+                patch('run.invoke') as execute, patch.object(sys, 'argv',
+                    ['run.py', '--checkout', str(checkout), '--plugin', str(plugin),
+                     '--suite', 'adapted', '--variant', 'ipv4', '--script', self.name,
+                     '--report', str(report)]):
+            self.assertEqual(main(), 1)
+            execute.assert_not_called()
+        row = json.loads(report.read_text())['results'][0]
+        self.assertEqual(row['status'], 'unsupported')
+        self.assertEqual(row['reasons'], entry['blocked_reasons'])
+        self.assertFalse(row['behavior_executed'])
+        self.assertFalse(row['adapted'])
+        extra.write_bytes(b'changed')
+        with self.assertRaisesRegex(ValueError, 'setup common/set_sysctls.py hash differs'):
+            adapt_source(self.directory, self.name, self.manifest, self.flags)
+        extra.unlink()
+        with self.assertRaises(OSError):
+            adapt_source(self.directory, self.name, self.manifest, self.flags)
 
     def test_embedded_assertions_preserved_and_hash_bound(self):
         entry = self.manifest['scripts'][self.name]
@@ -276,6 +376,9 @@ class AdaptationChecks(unittest.TestCase):
             self.source + b'`echo surprise`\n',
             self.source + b'`../common/defaults.sh`\n',
             self.source.replace(b'`../common/defaults.sh`', b'`true`'),
+            self.source.replace(b'`../common/defaults.sh`', b'// `../common/defaults.sh`'),
+            self.source.replace(b'`../common/defaults.sh`',
+                                b'`../common/defaults.sh\nsysctl -q net.ipv4.tcp_ecn=1\n`'),
             self.source.replace(b'`../common/defaults.sh`\n', b''),
             self.source + b'0 %{ assert 1 }%\n',
         ):
@@ -396,6 +499,8 @@ class AdaptationChecks(unittest.TestCase):
                              hashlib.sha256((manifest_dir / 'adaptations.json').read_bytes()).hexdigest())
             self.assertEqual(data['runner_sha256'], hashlib.sha256(runner.read_bytes()).hexdigest())
             self.assertEqual(data['plugin_sha256'], hashlib.sha256(plugin.read_bytes()).hexdigest())
+            self.assertEqual(data['plugin_path'], str(plugin.resolve()))
+            self.assertEqual(data['runner_path'], str(runner.resolve()))
             for row in data['results']:
                 self.assertEqual(row['adaptation']['source_sha256'],
                                  self.manifest['scripts'][row['script']]['source_sha256'])

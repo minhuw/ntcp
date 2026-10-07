@@ -46,7 +46,7 @@ def preflight(text, embedded_tcp_info=False):
 
 
 def adapt_source(directory, relative, manifest, so_flags):
-    """Replace only the audited setup line; never rewrite packet/syscall text."""
+    """Replace only an audited defaults invocation; never rewrite assertions."""
     if manifest['upstream_revision'] != PIN['revision']:
         raise ValueError('adaptation revision differs from upstream pin')
     if relative not in manifest['scripts']:
@@ -62,14 +62,31 @@ def adapt_source(directory, relative, manifest, so_flags):
     ):
         if hashlib.sha256(data).hexdigest() != expected:
             raise ValueError(f'{label} hash differs from audited adaptation')
+    for extra in entry.get('additional_setup_files', []):
+        data = (directory / extra['path']).read_bytes()
+        if hashlib.sha256(data).hexdigest() != extra['sha256']:
+            raise ValueError(f"setup {extra['path']} hash differs from audited adaptation")
+    if entry.get('blocked_reasons'):
+        # Keep unavailable shell/configuration and embedded assertions untouched.
+        # The caller reports the audit but must never execute this source.
+        return source, dict(entry)
     command = entry['command_line'].encode()
     replacement = entry['replacement_line'].encode()
-    # This is deliberately a single known setup mapping, not a shell scrubber.
+    ecn_command = (b'`../common/defaults.sh\n'
+                   b'sysctl -q net.ipv4.tcp_ecn=1  # fully enabled\n`\n')
+    ecn_mapped = (command == ecn_command
+                  and so_flags == 'upstream-ecn,local=192.168.0.1'
+                  and entry['mapping']['ntcp_settings'].get('ecn') is True
+                  and entry.get('command_sha256') == hashlib.sha256(command).hexdigest())
+    # Only exact defaults spellings or hashed ECN enablement, not a shell scrubber.
     if (entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
-            or command != b'`../common/defaults.sh`\n'
+            or not (command in (b'`../common/defaults.sh`\n',
+                                b'`../common/defaults.sh\n`\n',
+                                b'`../../common/defaults.sh`\n') or ecn_mapped)
             or replacement != b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n'
             or entry['expected_command_count'] != 1
-            or source.splitlines(keepends=True).count(command) != 1
+            or source.count(command) != 1
+            or not (source.startswith(command) or b'\n' + command in source)
             or source.count(b'`') != 2):
         raise ValueError('expected exactly one audited setup command and replacement')
     generated = source.replace(command, replacement, 1)
@@ -248,7 +265,9 @@ def main():
                     generated, audit = adapt_source(directory, row['script'], manifest,
                                                     so_flags)
                     row['adaptation'] = audit
-                    if variant != 'ipv4':
+                    if audit.get('blocked_reasons'):
+                        row.update(status='unsupported', reasons=audit['blocked_reasons'])
+                    elif variant != 'ipv4':
                         row.update(status='unsupported', reasons=['adaptation supports IPv4 only'])
                     else:
                         execution_script = Path(temporary) / script.name
@@ -295,7 +314,9 @@ def main():
               'excluded_cases': excluded,
               'syntax_valid': sum(row['syntax_returncode'] == 0 for row in results),
               'behavior_executed': sum(row['behavior_executed'] for row in results),
+              'runner_path': str(runner),
               'runner_sha256': hashlib.sha256(runner.read_bytes()).hexdigest(),
+              'plugin_path': str(plugin),
               'plugin_sha256': hashlib.sha256(plugin.read_bytes()).hexdigest(),
               'counts': counts, 'total': len(results), 'results': results,
               'all_passed': bool(results) and len(results) == len(cases) and all(
