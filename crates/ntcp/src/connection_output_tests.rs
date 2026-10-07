@@ -1375,3 +1375,131 @@ fn output_push_batch_endpoint_poll_budgets() {
         }
     }
 }
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
+//= type=test
+//= reason=ACK-driven CUBIC lost-copy detection preserves active PRR target 7000; the additional response applies only in the absence of PRR, covered separately by rack_lost_retransmissions_select_again_and_reduce_once_per_window.
+//# In the absence of PRR [RFC6937], when RACK-TLP detects a lost
+//# retransmission, the congestion control MUST trigger an additional
+//# congestion response per the aforementioned principle in [RFC5681].
+//= https://www.rfc-editor.org/rfc/rfc9937#section-6.1
+//= type=test
+//= reason=Lost retransmission leaves RecoverFS at 10000, accumulated delivery at 9000 and output at 8000 before committing more bytes, including wrapped sequence space.
+//# Upon entering fast
+//# recovery, PRR initializes RecoverFS, and RecoverFS remains constant
+//# during a given fast recovery episode.
+//= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
+//= type=test
+//= reason=SACK-only lost-copy ACK uses CRB without a SafeACK bonus; credit is exactly 2000, not 900 after an erroneous second reduction. Parsed wire emits a 1000-byte retry and 1000 fresh bytes; failed output preserves state. Advancing fresh-loss denial is covered separately by rfc9937_safe_ack_advancing_new_loss_denies_extra_smss.
+//# SafeACK = (SND.UNA advances and no further loss indicated)
+fn rfc9937_cubic_lost_retransmission_preserves_target_credit_and_wire() {
+    for iss in [0, u32::MAX - 4999] {
+        let cfg = ConnectionConfig {
+            sack: true,
+            rack: true,
+            prr: true,
+            prr_algorithm: PrrAlgorithm::Rfc9937,
+            congestion_algorithm: CongestionAlgorithm::Cubic,
+            initial_window: InitialWindow::Iw10,
+            output_push_batch_segments: 2,
+            ..config(65_536, 1000)
+        };
+        let mut b = Connection::active(reverse(tuple()), cfg.clone(), 900, 0).unwrap();
+        let syn = packet(&mut b, 0);
+        let syn = wire::parse(ip(reverse(tuple())), &syn).unwrap();
+        let mut a = Connection::passive(tuple(), cfg, iss, 0, &syn).unwrap();
+        let syn_ack = packet(&mut a, 0);
+        let syn_ack = wire::parse(ip(tuple()), &syn_ack).unwrap();
+        b.input(10_000, &syn_ack).unwrap();
+        deliver(&mut b, &mut a, 10_000);
+        let base = a.snd_una;
+        a.write(&[0x55; 20_000]).unwrap();
+        assert_eq!(
+            outputs(&mut a, 10_000, base),
+            (0..10).map(|i| (i * 1000, 1000)).collect::<Vec<_>>()
+        );
+        for (now, ack, lo, hi, expected) in [
+            (20_000, 0, 4000, 5000, vec![(10_000, 1000)]),
+            (22_000, 0, 4000, 6000, vec![(11_000, 1000)]),
+            (24_000, 0, 4000, 7000, vec![(0, 1000)]),
+            (26_000, 0, 4000, 8000, vec![(1000, 1000)]),
+            (28_000, 0, 4000, 9000, vec![(2000, 1000)]),
+            (30_000, 0, 4000, 10_000, vec![(3000, 1000)]),
+            (32_000, 0, 4000, 11_000, vec![(12_000, 1000)]),
+            (34_000, 0, 4000, 12_000, vec![(13_000, 1000)]),
+            (
+                44_000,
+                1000,
+                4000,
+                12_000,
+                vec![(14_000, 1000), (15_000, 1000)],
+            ),
+            (
+                46_000,
+                1000,
+                2000,
+                12_000,
+                vec![(1000, 1000), (16_000, 1000)],
+            ),
+        ] {
+            rack_sack(&mut a, now, ack, &[(lo, hi)]);
+            if now == 44_000 {
+                assert_eq!(a.prr.unwrap().counters(), (10_000, 7000, 6000));
+                assert_eq!(
+                    (
+                        a.congestion.cwnd(),
+                        a.congestion.ssthresh(),
+                        a.rack.pipe(),
+                        a.prr.unwrap().credit()
+                    ),
+                    (7000, 7000, 5000, 2000)
+                );
+            }
+            if now == 46_000 {
+                assert_eq!(a.prr.unwrap().counters(), (10_000, 9000, 8000));
+                assert_eq!(
+                    (
+                        a.congestion.cwnd(),
+                        a.congestion.ssthresh(),
+                        a.rack.pipe(),
+                        a.prr.unwrap().credit()
+                    ),
+                    (6000, 7000, 4000, 2000)
+                );
+                assert_eq!(
+                    a.rack.lowest_lost(1000),
+                    Some((base.wrapping_add(1000), base.wrapping_add(2000)))
+                );
+                let counts = a.rack.counts();
+                assert_eq!(
+                    (
+                        counts.unacked,
+                        counts.sacked,
+                        counts.lost,
+                        counts.retransmitted
+                    ),
+                    (15, 10, 1, 0)
+                );
+                // CRB: min(7000 - 4000, max(9000 - 8000, 2000)) = 2000;
+                // this loss-indicating ACK receives no SafeACK bonus.
+                let before = (
+                    a.transport_info(),
+                    a.prr.unwrap(),
+                    alloc::format!("{:?}", a.rack),
+                );
+                assert_eq!(a.transmit(now, &mut [0; 20]), Err(Error::OutputTooSmall));
+                assert_eq!(a.transport_info(), before.0);
+                assert_eq!(a.prr.unwrap().counters(), before.1.counters());
+                assert_eq!(a.prr.unwrap().credit(), before.1.credit());
+                assert_eq!(alloc::format!("{:?}", a.rack), before.2);
+            }
+            assert_eq!(outputs(&mut a, now, base), expected);
+            if now == 46_000 {
+                assert_eq!(a.prr.unwrap().counters(), (10_000, 9000, 10_000));
+                assert_eq!((a.rack.pipe(), a.prr.unwrap().credit()), (6000, 0));
+                assert_eq!(a.congestion.ssthresh(), 7000);
+            }
+        }
+    }
+}

@@ -1254,12 +1254,12 @@ impl Connection {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8985#section-9.2
-    //= reason=Lost retransmissions trigger additional congestion response, then revised RACK recovery selection.
+    //= reason=Lost retransmissions remain eligible for revised RACK recovery selection; an additional congestion response is required only without active PRR.
     //# Therefore, the algorithm [RFC6675]
     //# MUST NOT be used with RACK-TLP; instead, a modified recovery
     //# algorithm that carefully addresses such a case is needed.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
-    //= reason=Lost retransmissions receive one extra congestion response per committed-copy window, independently of the PRR option.
+    //= reason=Without active PRR, lost retransmissions receive one extra congestion response per committed-copy window; configured PRR alone does not imply an active episode.
     //# In the absence of PRR [RFC6937], when RACK-TLP detects a lost
     //# retransmission, the congestion control MUST trigger an additional
     //# congestion response per the aforementioned principle in [RFC5681].
@@ -1283,16 +1283,21 @@ impl Connection {
     //# window, the congestion control specified in [RFC5681] only reacts
     //# once per window.
     //= https://www.rfc-editor.org/rfc/rfc9937#section-5
-    //= reason=Opt-in prr=true/rack=true composes PRR with modified RACK loss recovery; lost-copy ACK and timer responses reset the episode once per committed-copy window. Default prr=false is not evidence of enabling PRR by default.
+    //= reason=Opt-in prr=true/rack=true composes PRR with modified RACK loss recovery; lost-copy ACK and timer detection preserve the active episode and target. Default prr=false is not evidence of enabling PRR by default.
     //# Because of the
     //# performance properties of RACK-TLP, including resilience to tail
     //# loss, reordering, and lost retransmissions, it is RECOMMENDED that
     //# PRR is implemented together with RACK-TLP loss recovery [RFC8985].
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.4
-    //= reason=Lost-copy ACK/timer responses complete then replace old PRR state; boundary ACK traces separately assert removal and unchanged ending counters.
+    //= reason=Lost-copy ACK/timer detection alone does not initiate a congestion response or end active PRR; boundary ACK traces separately assert completion and unchanged ending counters.
     //# A PRR episode ends upon either completing fast recovery or before
     //# initiating a new PRR episode due to a new congestion control response
     //# episode.
+    //= https://www.rfc-editor.org/rfc/rfc9937#section-6.1
+    //= reason=Active PRR keeps its flight snapshot and counters on retransmission loss; RACK still updates pipe and the ACK path accounts only current delivery without reinitialization.
+    //# Upon entering fast
+    //# recovery, PRR initializes RecoverFS, and RecoverFS remains constant
+    //# during a given fast recovery episode.
     fn detect_rack(&mut self) -> (bool, bool) {
         if !self.rack_enabled() || self.snd_wnd == 0 {
             self.rack.deadline = None;
@@ -1304,20 +1309,12 @@ impl Connection {
             self.sack_recovery.is_some() || self.sack_post_rto.is_some(),
             self.rtt.srtt(),
         );
-        if retransmission_lost {
-            // Each new congestion response completes the previous PRR episode.
-            if self.prr.is_some() && self.config.prr_algorithm == PrrAlgorithm::Rfc9937 {
-                self.congestion.complete_prr();
-            }
+        // RFC 8985 section 9.3 requires an additional response in the absence
+        // of PRR, not merely when PRR is disabled in configuration. Active PRR
+        // handles fresh loss through pipe and SafeACK (RFC 9937 section 6.2).
+        let new_response = retransmission_lost && self.prr.is_none();
+        if new_response {
             self.congestion.retransmission_lost(self.data_flight());
-            if self.prr.is_some() && self.config.prr_algorithm == PrrAlgorithm::Rfc9937 {
-                self.prr = Some(Prr::new(
-                    self.scoreboard
-                        .unsacked_bytes(self.snd_una, self.data_high()),
-                    self.mss as u32,
-                    PrrAlgorithm::Rfc9937,
-                ));
-            }
         }
         let further_loss = self.rack.pipe() < old_pipe;
         if let Some((start, _)) = self.rack.lowest_lost(self.mss as u32) {
@@ -1328,7 +1325,7 @@ impl Connection {
             recovery.pipe = self.rack.pipe();
             self.sack_recovery = Some(recovery);
         }
-        (retransmission_lost, further_loss)
+        (new_response, further_loss)
     }
 
     pub(crate) fn acknowledged(&self) -> u64 {
@@ -10556,24 +10553,24 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc9937#section-5
     //= type=test
-    //= reason=Opt-in prr=true/rack=true composes PRR with modified RACK loss recovery; lost-copy ACK and timer responses reset the episode once per committed-copy window. Default prr=false is not evidence of enabling PRR by default.
+    //= reason=Opt-in prr=true/rack=true composes PRR with modified RACK loss recovery; lost-copy ACK and timer detection preserve the active episode and target. Default prr=false is not evidence of enabling PRR by default.
     //# Because of the
     //# performance properties of RACK-TLP, including resilience to tail
     //# loss, reordering, and lost retransmissions, it is RECOMMENDED that
     //# PRR is implemented together with RACK-TLP loss recovery [RFC8985].
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.1
     //= type=test
-    //= reason=Rfc9937 only: zero counters on each initial or additional response, including timer response without replay; entry and no-SACK traces independently assert initial episodes.
+    //= reason=Rfc9937 only: lost retransmission detection preserves initial episode counters; entry and no-SACK traces independently assert initialization on actual congestion responses.
     //# At the beginning of a congestion control response episode initiated
     //# by the congestion control algorithm, a data sender using PRR MUST
     //# initialize the PRR state.
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.4
     //= type=test
-    //= reason=Lost-copy ACK/timer responses complete then replace old PRR state; boundary ACK traces separately assert removal and unchanged ending counters.
+    //= reason=Lost-copy ACK/timer detection alone does not initiate a congestion response or end active PRR; boundary ACK traces separately assert completion and unchanged ending counters.
     //# A PRR episode ends upon either completing fast recovery or before
     //# initiating a new PRR episode due to a new congestion control response
     //# episode.
-    fn rfc9937_lost_retransmission_responses_reset_once_per_copy_window() {
+    fn rfc9937_lost_retransmission_ack_and_timer_preserve_episode() {
         for iss in [0, u32::MAX - 4999] {
             let mut a = strict_flight(iss);
             strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
@@ -10581,12 +10578,12 @@ mod tests {
                 prr_packet(&mut a, 200_000);
             }
             strict_ack(&mut a, 300_000, 0, &[(1000, 2000), (7000, 10_000)]);
-            assert_eq!(a.prr.unwrap().counters(), (7000, 1000, 0));
-            assert_eq!(a.congestion.ssthresh(), 2500);
+            assert_eq!(a.prr.unwrap().counters(), (10_000, 4000, 3000));
+            assert_eq!(a.congestion.ssthresh(), 5000);
             let before = a.prr.unwrap();
             strict_ack(&mut a, 300_001, 0, &[(1000, 2000), (7000, 10_000)]);
             assert_eq!(a.prr.unwrap().counters(), before.counters());
-            assert_eq!(a.congestion.ssthresh(), 2500);
+            assert_eq!(a.congestion.ssthresh(), 5000);
             prr_packet(&mut a, 300_001);
             // A later retransmission's ACK makes the replacement head eligible
             // for loss detection; the reordering timer completes that detection.
@@ -10598,12 +10595,15 @@ mod tests {
                 0,
                 &[(1000, 2000), (3000, 4000), (6000, 10_000)],
             );
-            assert_eq!(a.congestion.ssthresh(), 2500);
+            assert_eq!(a.congestion.ssthresh(), 5000);
             let deadline = a.rack.deadline.unwrap();
+            let before_timer = a.prr.unwrap();
+            assert_eq!(a.rack.pipe(), 1000);
+            assert!(a.rack.counts().retransmitted > 0);
             a.timeout(deadline).unwrap();
-            assert_eq!(a.congestion.ssthresh(), 2000);
-            assert_eq!(a.prr.unwrap().counters(), (4000, 0, 0));
-            assert_eq!(a.prr.unwrap().credit(), 0); // Timer responses replay no ACK.
+            assert_eq!(a.congestion.ssthresh(), 5000);
+            assert_eq!(a.prr.unwrap().counters(), before_timer.counters());
+            assert_eq!(a.prr.unwrap().credit(), before_timer.credit()); // No ACK replay.
             assert_eq!(a.rack.pipe(), 0);
         }
     }
@@ -10970,21 +10970,21 @@ mod tests {
             }
             assert_eq!(a.rack.pipe(), 3000);
             strict_ack(&mut a, 300_000, 0, &[(1000, 2000), (7000, 10_000)]);
-            assert_eq!(a.congestion.ssthresh(), 2500);
+            assert_eq!(a.congestion.ssthresh(), 5000);
             assert_eq!(a.rack.pipe(), 1000); // SACKed copy + lost copy excluded.
             let (seq, _) = prr_packet(&mut a, 300_000);
             assert_eq!(seq, a.iss.wrapping_add(1).0); // Below HighRxt, not NextSeg.
             assert_eq!(a.rack.pipe(), 2000);
             strict_ack(&mut a, 400_000, 2000, &[(7000, 10_000)]);
-            assert_eq!(a.congestion.ssthresh(), 2500); // Same copy-loss window.
+            assert_eq!(a.congestion.ssthresh(), 5000); // Same copy-loss window.
             assert_eq!(a.rack.pipe(), 0);
             let (seq, _) = prr_packet(&mut a, 400_000);
             assert_eq!(seq, a.iss.wrapping_add(2001).0);
             assert_eq!(a.rack.pipe(), 1000);
 
-            // With bulk new data, the same lost-copy event leaves pipe ABOVE
-            // the newly reduced target. A fresh PRR response resets its counters
-            // and applies the proportional equation to this ACK alone.
+            // With bulk new data, the same lost-copy event preserves the target
+            // and accumulated delivery/output. CRB uses the current ACK's bytes
+            // without a SafeACK bonus, even though pipe is below the target.
             let mut a = strict_flight(iss);
             a.write(&[0x66; 10_000]).unwrap();
             strict_ack(&mut a, 200_000, 0, &[(3000, 10_000)]);
@@ -10993,11 +10993,11 @@ mod tests {
             }
             assert_eq!(a.rack.pipe(), 5000);
             strict_ack(&mut a, 300_000, 0, &[(1000, 2000), (3000, 10_000)]);
-            assert_eq!(a.congestion.ssthresh(), 2500);
+            assert_eq!(a.congestion.ssthresh(), 5000);
             assert_eq!(a.rack.pipe(), 3000);
-            assert_eq!(a.prr.unwrap().counters(), (5000, 1000, 0));
-            assert_eq!(a.prr.unwrap().credit(), 500);
-            assert_eq!(prr_packet(&mut a, 300_000).1, 500);
+            assert_eq!(a.prr.unwrap().counters(), (10_000, 8000, 5000));
+            assert_eq!(a.prr.unwrap().credit(), 2000);
+            assert_eq!(prr_packet(&mut a, 300_000).1, 1000);
             let rto = a.rto_deadline.unwrap();
             a.timeout(rto).unwrap();
             assert!(a.prr.is_none());
@@ -12568,7 +12568,7 @@ mod tests {
     //# algorithm that carefully addresses such a case is needed.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
     //= type=test
-    //= reason=Both PRR profiles reduce additionally for the first lost retransmission, not again for another committed copy in the same transmission window; output failure commits no transmission or credit.
+    //= reason=Without active PRR, reduce once per committed-copy window; active PRR preserves its target. Output failure commits no transmission or credit.
     //# In the absence of PRR [RFC6937], when RACK-TLP detects a lost
     //# retransmission, the congestion control MUST trigger an additional
     //# congestion response per the aforementioned principle in [RFC5681].
@@ -12579,7 +12579,7 @@ mod tests {
     //# once per window.
     fn rack_lost_retransmissions_select_again_and_reduce_once_per_window() {
         for iss in [0, u32::MAX - 4999] {
-            for prr in [false, true] {
+            for (configured, prr) in [(false, false), (true, false), (true, true)] {
                 let mut a = rack_flight(iss);
                 a.config.prr = prr;
                 rack_sack(&mut a, 200_000, 0, &[(7000, 8000)]);
@@ -12596,9 +12596,14 @@ mod tests {
                 }
                 assert_eq!(a.congestion.ssthresh(), 5000);
                 assert_eq!(a.prr.is_some(), prr);
+                // Configuration is not an active episode (e.g. fallback).
+                a.config.prr = configured;
                 // Deliver the second retransmission: the first is lost again.
                 rack_sack(&mut a, 326_000, 0, &[(1000, 2000), (7000, 10_000)]);
-                assert_eq!((a.congestion.cwnd(), a.congestion.ssthresh()), (2500, 2500));
+                assert_eq!(
+                    (a.congestion.cwnd(), a.congestion.ssthresh()),
+                    if prr { (5000, 5000) } else { (2500, 2500) }
+                );
                 let send_credit = a.recovery_credit(a.sack_recovery.unwrap());
                 assert_eq!(send_credit, if prr { 1000 } else { 1500 });
                 let before = a.transport_info();
@@ -12620,14 +12625,14 @@ mod tests {
                 // Its ACK now loses the third retransmission on another ACK,
                 // still inside the original 10-MSS sequence window.
                 rack_sack(&mut a, 426_000, 2000, &[(7000, 10_000)]);
-                assert_eq!(a.congestion.ssthresh(), 2500);
+                assert_eq!(a.congestion.ssthresh(), if prr { 5000 } else { 2500 });
                 let bytes = packet(&mut a, 426_000);
                 assert_eq!(
                     wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
                     iss.wrapping_add(2001)
                 );
                 rack_sack(&mut a, 427_000, 2000, &[(7000, 10_000)]);
-                assert_eq!(a.congestion.ssthresh(), 2500);
+                assert_eq!(a.congestion.ssthresh(), if prr { 5000 } else { 2500 });
             }
         }
     }
@@ -12635,13 +12640,13 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
     //= type=test
-    //= reason=Loss of a successfully committed replacement triggers another response with unchanged cumulative hole and SND.NXT, for PRR on/off and wrap. Distinct successful commits may share a timestamp; failed encoding changes no copy markers or credit.
+    //= reason=Loss of a committed replacement triggers another response only without active PRR; active PRR keeps its target. Covers unchanged cumulative hole/SND.NXT, wrap, timestamp ties and failed encoding.
     //# In the absence of PRR [RFC6937], when RACK-TLP detects a lost
     //# retransmission, the congestion control MUST trigger an additional
     //# congestion response per the aforementioned principle in [RFC5681].
     fn rack_replacement_loss_renews_response_without_cumulative_progress() {
         for iss in [0, u32::MAX - 4999] {
-            for prr in [false, true] {
+            for (configured, prr) in [(false, false), (true, false), (true, true)] {
                 for same_timestamp in [false, true] {
                     let mut a = rack_flight(iss);
                     a.config.prr = prr;
@@ -12666,9 +12671,12 @@ mod tests {
                             iss.wrapping_add(1 + offset)
                         );
                     }
+                    assert_eq!(a.prr.is_some(), prr);
+                    // Exercise configured PRR without an active episode too.
+                    a.config.prr = configured;
                     let flight = (a.snd_una, a.snd_nxt);
                     rack_sack(&mut a, 326_000, 0, &[(1000, 2000), (7000, 10_000)]);
-                    assert_eq!(a.congestion.ssthresh(), 2500);
+                    assert_eq!(a.congestion.ssthresh(), if prr { 5000 } else { 2500 });
                     // Failed output cannot renew the accounted first copy.
                     let copies = alloc::format!("{:?}", a.rack);
                     let credit = a.prr.map(|p| p.credit());
@@ -12679,7 +12687,7 @@ mod tests {
                     assert_eq!(alloc::format!("{:?}", a.rack), copies);
                     assert_eq!(a.prr.map(|p| p.credit()), credit);
                     rack_sack(&mut a, 326_000, 0, &[(1000, 2000), (7000, 10_000)]);
-                    assert_eq!(a.congestion.ssthresh(), 2500);
+                    assert_eq!(a.congestion.ssthresh(), if prr { 5000 } else { 2500 });
                     // This actual commit renews the first copy, not SND.NXT.
                     a.snd_wnd = 2; // replacement SEG.SEQ is still in window
                     let bytes = packet(&mut a, 326_000);
@@ -12705,7 +12713,10 @@ mod tests {
                     // detects the replacement at offset 0 as lost again.
                     rack_sack(&mut a, sent + 100_000, 0, &[(1000, 4000), (7000, 10_000)]);
                     assert_eq!((a.snd_una, a.snd_nxt), flight);
-                    assert_eq!((a.congestion.cwnd(), a.congestion.ssthresh()), (2000, 2000));
+                    assert_eq!(
+                        (a.congestion.cwnd(), a.congestion.ssthresh()),
+                        if prr { (5000, 5000) } else { (2000, 2000) }
+                    );
                     a.snd_wnd = 2;
                     let bytes = packet(&mut a, sent + 100_000);
                     assert_eq!(
