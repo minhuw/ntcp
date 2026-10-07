@@ -11,6 +11,7 @@ extern crate alloc;
 
 mod buffer;
 mod connection;
+mod cubic;
 mod endpoint;
 #[cfg(test)]
 mod endpoint_tests;
@@ -33,5 +34,5 @@ pub use endpoint::{
 pub use ipv4_options::{
     Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options, SourceRoute, TimestampRequest,
 };
-pub use recovery::{InitialWindow, PrrAlgorithm, RecoveryAlgorithm};
+pub use recovery::{CongestionAlgorithm, InitialWindow, PrrAlgorithm, RecoveryAlgorithm};
 pub use wire::{IpMetadata, WireError};

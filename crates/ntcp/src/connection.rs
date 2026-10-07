@@ -6,7 +6,10 @@ use core::{cmp::Ordering, net::SocketAddr};
 use crate::{
     buffer::{ReceiveBuffer, SendBuffer},
     rack::Rack,
-    recovery::{Congestion, InitialWindow, Prr, PrrAlgorithm, RecoveryAlgorithm, RttEstimator},
+    recovery::{
+        Congestion, CongestionAlgorithm, InitialWindow, Prr, PrrAlgorithm, RecoveryAlgorithm,
+        RttEstimator,
+    },
     sack::Scoreboard,
     seq::Seq,
     wire::{self, ACK, CWR, ECE, FIN, Header, IpMetadata, PSH, RST, SYN, Segment, URG},
@@ -108,6 +111,8 @@ pub struct ConnectionConfig {
     pub nagle: bool,
     pub ecn: bool,
     pub recovery_algorithm: RecoveryAlgorithm,
+    // Optional growth/backoff policy; does not select loss recovery or PRR.
+    pub congestion_algorithm: CongestionAlgorithm,
     //= https://www.rfc-editor.org/rfc/rfc6928#section-1
     //= reason=Settable Rfc5681/Iw10 selection with default-disabled IW10; deployment monitoring/application interactions remain enabling-actor obligations explicitly excluded from this implementation audit, not satisfied. No evidence for IW>10 is claimed.
     //# We recommend that all TCP implementations have a settable TCP IW parameter, as long as there is a reasonable effort to monitor for possible interactions with other Internet applications and services as described in Section 12. Furthermore, Section 10 details why 10 segments may be an appropriate value, and while that value may continue to rise in the future, this document does not include any supporting evidence for values of IW larger than 10.
@@ -214,6 +219,7 @@ impl Default for ConnectionConfig {
             nagle: true,
             ecn: true,
             recovery_algorithm: RecoveryAlgorithm::default(),
+            congestion_algorithm: CongestionAlgorithm::default(),
             initial_window: InitialWindow::default(),
             abort_with_ack: false,
             timestamps: false,
@@ -617,7 +623,8 @@ impl Connection {
             config.recovery_algorithm,
             config.initial_window,
             Seq(iss),
-        );
+        )
+        .with_congestion(config.congestion_algorithm, config.timebase);
         //= https://www.rfc-editor.org/rfc/rfc6928#section-2
         //= reason=All initial-window choices share RFC6298 estimator and connection timer/sampling implementation. Default/configured >=1s floors retain the recommended floor; explicit subsecond Linux compatibility is a scoped departure, not universal inherited conformance.
         //# Implementations must also follow RFC 6298 [RFC6298] in order to avoid spurious RTO as described in Section 9.
@@ -2643,7 +2650,12 @@ impl Connection {
             self.learn_syn(segment);
             self.last_received = now;
             if valid_ack {
-                self.accept_ack(ack, false, segment.options.timestamps.map(|ts| ts.1));
+                self.accept_ack(
+                    ack,
+                    false,
+                    segment.options.timestamps.map(|ts| ts.1),
+                    self.snd_wnd,
+                );
                 self.establish();
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
                 //# Data or controls that were queued for transmission MAY be included.
@@ -2815,7 +2827,12 @@ impl Connection {
                 self.ts_latest = value;
                 self.ts_recent_at = now;
             }
-            self.accept_ack(ack, false, segment.options.timestamps.map(|ts| ts.1));
+            self.accept_ack(
+                ack,
+                false,
+                segment.options.timestamps.map(|ts| ts.1),
+                self.snd_wnd,
+            );
             self.establish();
             self.last_received = now;
             self.immediate_ack();
@@ -3118,7 +3135,12 @@ impl Connection {
                 self.reset_reply = true;
                 return Ok(());
             }
-            self.accept_ack(ack, false, segment.options.timestamps.map(|ts| ts.1));
+            self.accept_ack(
+                ack,
+                false,
+                segment.options.timestamps.map(|ts| ts.1),
+                self.snd_wnd,
+            );
             self.establish();
         }
         if self.state == State::TimeWait {
@@ -3200,6 +3222,11 @@ impl Connection {
         }
         self.congestion.observe_ack(ack);
         let old_window = self.snd_wnd;
+        // Compute the existing WL1/WL2 admission once. CUBIC needs the
+        // accepted receive window before cumulative ACK growth; commit it
+        // below at the existing transactional window-update boundary.
+        let window_update = at_or_after(ack, self.snd_una)
+            && (after(seq, self.wl1) || seq == self.wl1 && at_or_after(ack, self.wl2));
         let was_blocked = old_window == 0 || self.flight() > old_window;
         let prr_window_before = self.prr.map(|_| self.congestion.cwnd());
         let advancing = after(ack, self.snd_una);
@@ -3339,6 +3366,11 @@ impl Connection {
                 ack,
                 ece || tlp_reduced,
                 segment.options.timestamps.map(|ts| ts.1),
+                if window_update {
+                    u32::from(h.window) << if self.scaling { self.peer_scale } else { 0 }
+                } else {
+                    old_window
+                },
             );
         }
         if let Some(mut recovery) = self.sack_recovery {
@@ -3394,9 +3426,7 @@ impl Connection {
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
         //# If (SND.WL1 < SEG.SEQ or (SND.WL1 = SEG.SEQ and SND.WL2 =< SEG.ACK)), set
         //# SND.WND <- SEG.WND, set SND.WL1 <- SEG.SEQ, and set SND.WL2 <- SEG.ACK.
-        if at_or_after(ack, self.snd_una)
-            && (after(seq, self.wl1) || seq == self.wl1 && at_or_after(ack, self.wl2))
-        {
+        if window_update {
             // Scope: Changed WS on established data and ACK is ignored: negotiated shifts and subsequent effective incoming/outgoing windows remain fixed, including zero, nonzero and absent negotiation.
             //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
             //= reason=Changed WS on established data and ACK is ignored: negotiated shifts and subsequent effective incoming/outgoing windows remain fixed, including zero, nonzero and absent negotiation.
@@ -3415,6 +3445,9 @@ impl Connection {
             //# the TCP header; each TCP using extended windows will maintain the
             //# window values locally as 32-bit numbers.
             self.snd_wnd = (h.window as u32) << if self.scaling { self.peer_scale } else { 0 };
+            // Also freeze CUBIC on accepted non-advancing window updates;
+            // otherwise a zero-window interval could age the cubic curve.
+            self.congestion.on_window_update(now, self.snd_wnd);
             //= https://www.rfc-editor.org/rfc/rfc5961#section-5.2
             //= reason=Initial SYN window is unscaled; accepted updates are scaled and monotonically maxed. Scaled growth/shrink/zero history and ACK lower bounds across wrap are asserted.
             //# A new state variable MAX.SND.WND is defined as the largest window that the local sender has ever received from its peer. This window may be scaled to a value larger than 65,535 bytes ([RFC1323]).
@@ -3786,7 +3819,7 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc6928#section-9
     //= reason=IW10 divided/delayed new ACKs with outstanding flight restart at ACKtime+current RTO after estimator update; duplicate ACK does not restart, last new ACK cancels. RFC6298 universal timing audit remains separate.
     //# To minimize spurious retransmissions, implementations MUST follow RFC 6298 [RFC6298] to restart the retransmission timer with the current value of RTO for each ACK received that acknowledges new data.
-    fn accept_ack(&mut self, ack: Seq, ece: bool, echo: Option<u32>) {
+    fn accept_ack(&mut self, ack: Seq, ece: bool, echo: Option<u32>, send_window: u32) {
         if !self.sack_receive {
             self.rack.acknowledge(
                 ack,
@@ -3892,6 +3925,17 @@ impl Connection {
             && !syn_ack
         {
             self.syn_timed_out = false;
+        }
+        if !syn_ack {
+            // send_base is the cumulative DATA edge (unlike SEG.ACK it excludes
+            // an acknowledged FIN), matching the successful-output data marker.
+            self.congestion.prepare_ack(
+                self.now,
+                self.rtt.srtt(),
+                self.send_base,
+                bytes,
+                send_window,
+            );
         }
         if !syn_ack
             && self
@@ -5997,6 +6041,22 @@ impl Connection {
             }
             self.sws_deadline = None;
             self.sws_override = false;
+        }
+        if count != 0 && !syn && !keepalive && !probe {
+            // Successful encode only: failed polls cannot start/advance CUBIC's
+            // clock or validate an application-limited flight for growth.
+            let flight = self.data_flight();
+            let unsent = self
+                .send
+                .len()
+                .saturating_sub(self.snd_nxt.distance_from(self.send_base) as usize);
+            // Sender SWS may leave <MSS credit in a fractional CUBIC window.
+            // Validate that case only with queued data and rwnd >= cwnd.
+            let cwnd_limited = unsent != 0
+                && self.snd_wnd >= self.congestion.cwnd()
+                && flight.saturating_add(unsent.min(self.mss) as u32) > self.congestion.cwnd();
+            self.congestion
+                .on_data_sent(now, flight, self.data_high(), cwnd_limited);
         }
         self.arm_work();
         if (fresh_data || new_fin) && !tlp {
@@ -24483,6 +24543,354 @@ mod tests {
             assert_eq!(reset.options.timestamps, (budget >= 32).then_some((0, 77)));
         }
     }
+    #[test]
+    fn cubic_ten_mss_loss_threshold_and_existing_prr_wire_exit() {
+        assert_eq!(
+            ConnectionConfig::default().congestion_algorithm,
+            CongestionAlgorithm::Reno
+        );
+        for algorithm in [CongestionAlgorithm::Reno, CongestionAlgorithm::Cubic] {
+            for recovery in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
+                for iss in [100, u32::MAX - 4999] {
+                    let cfg = ConnectionConfig {
+                        congestion_algorithm: algorithm,
+                        recovery_algorithm: recovery,
+                        initial_window: InitialWindow::Iw10,
+                        prr: true,
+                        prr_algorithm: PrrAlgorithm::Rfc9937,
+                        nagle: false,
+                        ..config(32_000, 1000)
+                    };
+                    let (mut a, b) = primed_pair(cfg, iss);
+                    // Both active and passive construction forward the selector.
+                    assert_eq!(
+                        alloc::format!("{:?}", a.congestion).contains("cubic: Some"),
+                        algorithm == CongestionAlgorithm::Cubic
+                    );
+                    assert_eq!(
+                        alloc::format!("{:?}", b.congestion).contains("cubic: Some"),
+                        algorithm == CongestionAlgorithm::Cubic
+                    );
+                    let base = a.snd_una;
+                    a.write(&[0x55; 20_000]).unwrap();
+                    for _ in 0..10 {
+                        let bytes = packet(&mut a, 100_000);
+                        assert_eq!(
+                            wire::parse(ip(tuple()), &bytes).unwrap().payload.len(),
+                            1000
+                        );
+                    }
+                    assert_eq!(a.data_flight(), 10_000);
+                    assert_eq!(a.transmit(100_000, &mut [0; 1500]), Ok(None));
+                    let next = a.receive.next();
+                    let window = (a.snd_wnd >> a.peer_scale) as u16;
+                    for now in 200_000..200_003 {
+                        inject(&mut a, now, next, base, ACK, window, b"");
+                    }
+                    let threshold = if algorithm == CongestionAlgorithm::Cubic {
+                        7000
+                    } else {
+                        5000
+                    };
+                    assert_eq!(a.congestion.ssthresh(), threshold);
+                    assert!(a.prr.is_some());
+                    let state = alloc::format!("{:?}", a.congestion);
+                    let counters = a.prr.unwrap().counters();
+                    let repair_credit = a.prr.unwrap().credit().min(1000);
+                    assert_eq!(
+                        a.transmit(200_003, &mut [0; 20]),
+                        Err(Error::OutputTooSmall)
+                    );
+                    assert_eq!(alloc::format!("{:?}", a.congestion), state);
+                    assert_eq!(a.prr.unwrap().counters(), counters);
+                    let repair = packet(&mut a, 200_003);
+                    let repair = wire::parse(ip(tuple()), &repair).unwrap();
+                    assert_eq!(repair.header.sequence, base.0);
+                    assert_eq!(repair.payload.len(), repair_credit as usize);
+                    assert!(repair.payload.iter().all(|&byte| byte == 0x55));
+                    let counters = a.prr.unwrap().counters();
+                    inject(
+                        &mut a,
+                        300_000,
+                        next,
+                        base.wrapping_add(10_000),
+                        ACK,
+                        window,
+                        b"",
+                    );
+                    assert!(a.prr.is_none());
+                    assert_eq!(a.prr_exit_trace.unwrap().counters(), counters);
+                    // Existing RFC9937 completion sets cwnd=ssthresh for BOTH
+                    // congestion algorithms. No CUBIC-only exit override.
+                    assert_eq!(a.congestion.cwnd(), threshold);
+                    for i in 0..threshold / 1000 {
+                        let bytes = packet(&mut a, 300_000);
+                        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+                        assert_eq!(
+                            segment.header.sequence,
+                            base.wrapping_add(10_000 + i * 1000).0
+                        );
+                        assert_eq!(segment.payload.len(), 1000);
+                    }
+                    assert_eq!(a.transmit(300_000, &mut [0; 1500]), Ok(None));
+                    assert_eq!(a.data_flight(), threshold);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cubic_wire_growth_idle_and_transactional_clocks_in_caller_units() {
+        let trace = |scale: u64| {
+            let cfg = ConnectionConfig {
+                congestion_algorithm: CongestionAlgorithm::Cubic,
+                recovery_algorithm: RecoveryAlgorithm::Reno,
+                initial_window: InitialWindow::Iw10,
+                timebase: CallerTimebase {
+                    units_per_second: 1_000_000 * scale,
+                    ..CallerTimebase::default()
+                },
+                prr: true,
+                nagle: false,
+                ..config(32_000, 1000)
+            };
+            let mut a = Connection::active(tuple(), cfg.clone(), 100, 0).unwrap();
+            let bytes = packet(&mut a, 0);
+            let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+            let mut b =
+                Connection::passive(reverse(tuple()), cfg, 900, 50_000 * scale, &syn).unwrap();
+            deliver(&mut b, &mut a, 100_000 * scale);
+            deliver(&mut a, &mut b, 100_000 * scale);
+            assert_eq!(a.rtt.srtt(), Some(100_000 * scale));
+            // Application/rwnd-limited originals cannot inflate CUBIC slow start.
+            let base = a.snd_una;
+            let next = a.receive.next();
+            a.write(&[0x55; 1000]).unwrap();
+            packet(&mut a, 200_000 * scale);
+            inject(
+                &mut a,
+                300_000 * scale,
+                next,
+                base.wrapping_add(1000),
+                ACK,
+                32_000,
+                b"",
+            );
+            assert_eq!(a.congestion.cwnd(), 10_000);
+            let base = a.snd_una;
+            a.write(&[0x55; 20_000]).unwrap();
+            for _ in 0..10 {
+                packet(&mut a, 400_000 * scale);
+            }
+            for i in 0..3 {
+                inject(&mut a, (500_000 + i) * scale, next, base, ACK, 32_000, b"");
+            }
+            packet(&mut a, 500_003 * scale);
+            inject(
+                &mut a,
+                600_000 * scale,
+                next,
+                base.wrapping_add(10_000),
+                ACK,
+                32_000,
+                b"",
+            );
+            assert_eq!(a.congestion.cwnd(), 7000);
+            for _ in 0..7 {
+                packet(&mut a, 700_000 * scale);
+            }
+            inject(
+                &mut a,
+                800_000 * scale,
+                next,
+                base.wrapping_add(17_000),
+                ACK,
+                32_000,
+                b"",
+            );
+            let grown = a.congestion.cwnd();
+            assert!(grown > 7000 && grown < 8000); // Reno-friendly ACK-counted W_est.
+            // Drain an unfilled suffix, which must not grant growth credit.
+            for _ in 0..3 {
+                packet(&mut a, 800_000 * scale);
+            }
+            inject(
+                &mut a,
+                900_000 * scale,
+                next,
+                base.wrapping_add(20_000),
+                ACK,
+                32_000,
+                b"",
+            );
+            assert_eq!(a.congestion.cwnd(), grown);
+            // Long idle: failed output changes neither epoch nor restart state.
+            a.write(&[0x66; 20_000]).unwrap();
+            let before = alloc::format!("{:?}", a.congestion);
+            assert_eq!(
+                a.transmit(10_000_000 * scale, &mut [0; 20]),
+                Err(Error::OutputTooSmall)
+            );
+            assert_eq!(alloc::format!("{:?}", a.congestion), before);
+            let start = a.snd_una;
+            let restart = grown.min(a.restart_window()); // Existing IW10 loss fallback.
+            while a
+                .transmit(10_000_000 * scale, &mut [0; 1500])
+                .unwrap()
+                .is_some()
+            {}
+            let flight = restart / 1000 * 1000; // SWS leaves fractional-MSS credit.
+            assert_eq!(a.data_flight(), flight);
+            inject(
+                &mut a,
+                10_100_000 * scale,
+                next,
+                start.wrapping_add(flight),
+                ACK,
+                32_000,
+                b"",
+            );
+            let resumed = a.congestion.cwnd();
+            // The idle interval does not yield a huge cubic target.
+            assert!(resumed > restart && resumed < restart + 1000);
+            // RFC6298 integer rounding depends on caller-unit precision;
+            // CUBIC consumes that estimator in ticks, without truncating to us.
+            assert!((100_000..120_000).contains(&(a.rtt.srtt().unwrap() / scale)));
+            (grown, resumed)
+        };
+        assert_eq!(trace(1), trace(1000));
+    }
+
+    #[test]
+    fn cubic_sack_rack_prr_loss_threshold_and_completion() {
+        for algorithm in [CongestionAlgorithm::Reno, CongestionAlgorithm::Cubic] {
+            for iss in [0, u32::MAX - 4999] {
+                let cfg = ConnectionConfig {
+                    congestion_algorithm: algorithm,
+                    initial_window: InitialWindow::Iw10,
+                    sack: true,
+                    rack: true,
+                    prr: true,
+                    nagle: false,
+                    ..config(32_000, 1000)
+                };
+                let (mut a, _) = primed_pair(cfg, iss);
+                let base = a.snd_una;
+                let next = a.receive.next();
+                let window = (a.snd_wnd >> a.peer_scale) as u16;
+                a.write(&[0x55; 20_000]).unwrap();
+                for _ in 0..10 {
+                    packet(&mut a, 100_000);
+                }
+                inject_sack(
+                    &mut a,
+                    200_000,
+                    next,
+                    base,
+                    ACK,
+                    window,
+                    b"",
+                    &[(base.wrapping_add(7000).0, base.wrapping_add(10_000).0)],
+                );
+                let timer_entry = a.prr.is_none();
+                if timer_entry {
+                    let deadline = a.rack.deadline.expect("RACK loss deadline");
+                    a.timeout(deadline).unwrap();
+                }
+                let threshold = if algorithm == CongestionAlgorithm::Cubic {
+                    7000
+                } else {
+                    5000
+                };
+                assert_eq!(a.congestion.ssthresh(), threshold);
+                assert!(a.sack_recovery.is_some());
+                let (recover_fs, _, _) = a.prr.unwrap().counters();
+                // ACK entry includes its delivery; timer entry excludes advice
+                // already received. RFC9937 keeps this denominator fixed.
+                assert_eq!(recover_fs, if timer_entry { 7000 } else { 10_000 });
+                let now = a.now;
+                let bytes = packet(&mut a, now);
+                let repair = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(repair.header.sequence, base.0);
+                assert_eq!(repair.payload.len(), 1000);
+                let ending = a.prr.unwrap().counters();
+                inject_sack(
+                    &mut a,
+                    now + 100_000,
+                    next,
+                    base.wrapping_add(10_000),
+                    ACK,
+                    window,
+                    b"",
+                    &[],
+                );
+                assert!(a.sack_recovery.is_none() && a.prr.is_none());
+                assert_eq!(a.prr_exit_trace.unwrap().counters(), ending);
+                assert_eq!(a.congestion.cwnd(), threshold);
+            }
+        }
+    }
+
+    #[test]
+    fn cubic_receiver_limited_ack_does_not_grow_previous_full_flight() {
+        for algorithm in [CongestionAlgorithm::Reno, CongestionAlgorithm::Cubic] {
+            let cfg = ConnectionConfig {
+                congestion_algorithm: algorithm,
+                initial_window: InitialWindow::Iw10,
+                nagle: false,
+                ..config(32_000, 1000)
+            };
+            let (mut a, _) = pair(cfg, 100);
+            let base = a.snd_una;
+            let next = a.receive.next();
+            a.write(&[0x55; 10_000]).unwrap();
+            for _ in 0..10 {
+                packet(&mut a, 100_000);
+            }
+            inject(
+                &mut a,
+                200_000,
+                next,
+                base.wrapping_add(1000),
+                ACK,
+                2000,
+                b"",
+            );
+            let expected = if algorithm == CongestionAlgorithm::Cubic {
+                10_000
+            } else {
+                11_000
+            };
+            assert_eq!(a.congestion.cwnd(), expected);
+            inject(
+                &mut a,
+                300_000,
+                next,
+                base.wrapping_add(10_000),
+                ACK,
+                2000,
+                b"",
+            );
+            if algorithm == CongestionAlgorithm::Cubic {
+                assert_eq!(a.congestion.cwnd(), 10_000);
+                a.write(&[0x66; 20_000]).unwrap();
+                for _ in 0..2 {
+                    packet(&mut a, 300_000);
+                }
+                inject(
+                    &mut a,
+                    400_000,
+                    next,
+                    base.wrapping_add(12_000),
+                    ACK,
+                    2000,
+                    b"",
+                );
+                assert_eq!(a.congestion.cwnd(), 10_000);
+            }
+        }
+    }
+
     mod output_policy {
         include!("connection_output_tests.rs");
     }

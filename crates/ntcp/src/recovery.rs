@@ -1,6 +1,6 @@
 use core::cmp::Ordering;
 
-use crate::{connection::CallerTimebase, seq::Seq};
+use crate::{connection::CallerTimebase, cubic::Cubic, seq::Seq};
 
 const MIN_RTO: u64 = 1_000_000;
 const MAX_RTO: u64 = 60_000_000;
@@ -200,6 +200,16 @@ pub enum RecoveryAlgorithm {
     NewReno,
 }
 
+// Congestion growth/backoff selection is independent of fast recovery.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum CongestionAlgorithm {
+    // Existing RFC 5681-compatible byte-counted growth and half-flight backoff.
+    #[default]
+    Reno,
+    // RFC 9438 CUBIC, C=0.4, beta=0.7, with fast convergence.
+    Cubic,
+}
+
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum InitialWindow {
     #[default]
@@ -249,6 +259,7 @@ impl InitialWindow {
 #[derive(Clone, Debug)]
 pub(crate) struct Congestion {
     algorithm: RecoveryAlgorithm,
+    cubic: Option<Cubic>,
     initial_window: InitialWindow,
     mss: u32,
     cwnd: u32,
@@ -289,6 +300,7 @@ impl Congestion {
         let mss = mss.min(MAX_WINDOW);
         Self {
             algorithm,
+            cubic: None,
             initial_window,
             mss,
             cwnd: initial_window.bytes(mss),
@@ -306,6 +318,49 @@ impl Congestion {
             tlp_reduction_end: None,
             timeout_retransmitted: false,
             retransmitted_end: None,
+        }
+    }
+
+    pub(crate) fn with_congestion(
+        mut self,
+        algorithm: CongestionAlgorithm,
+        timebase: CallerTimebase,
+    ) -> Self {
+        self.cubic = match algorithm {
+            CongestionAlgorithm::Reno => None,
+            CongestionAlgorithm::Cubic => Some(Cubic::new(timebase)),
+        };
+        self
+    }
+
+    // Caller invokes only after committed data output and SND.NXT accounting.
+    pub(crate) fn on_data_sent(&mut self, now: u64, flight: u32, end: Seq, cwnd_limited: bool) {
+        let recovery = self.in_recovery();
+        if let Some(cubic) = &mut self.cubic {
+            cubic.sent(now, flight, self.cwnd, end, recovery, cwnd_limited);
+        }
+    }
+
+    // Validated cumulative ACK, with the freshly updated smoothed RTT in
+    // caller ticks. Reno deliberately does not consume the timing context.
+    pub(crate) fn prepare_ack(
+        &mut self,
+        now: u64,
+        rtt: Option<u64>,
+        ack: Seq,
+        acked: u32,
+        send_window: u32,
+    ) {
+        if let Some(cubic) = &mut self.cubic {
+            cubic.prepare_ack(now, rtt, ack, acked, send_window >= self.cwnd);
+        }
+    }
+
+    pub(crate) fn on_window_update(&mut self, now: u64, window: u32) {
+        if window < self.cwnd
+            && let Some(cubic) = &mut self.cubic
+        {
+            cubic.receiver_limited(now);
         }
     }
 
@@ -364,6 +419,15 @@ impl Congestion {
         if mss < self.mss {
             // RFC 5681: preserve the segment count when the path MSS falls.
             self.cwnd = ((self.cwnd as u64 * mss as u64) / self.mss as u64) as u32;
+        }
+        if mss != self.mss
+            && let Some(cubic) = &mut self.cubic
+        {
+            if mss < self.mss && self.ssthresh != MAX_WINDOW {
+                self.ssthresh =
+                    (u64::from(self.ssthresh) * u64::from(mss) / u64::from(self.mss)) as u32;
+            }
+            cubic.mss_changed(self.mss, mss);
         }
         self.mss = mss;
         self.cwnd = self.cwnd.max(mss).min(MAX_WINDOW);
@@ -684,6 +748,22 @@ impl Congestion {
             self.ecn_end = None;
         }
         if ece {
+            return false;
+        }
+        if let Some(cubic) = &mut self.cubic {
+            if !cubic.can_grow() {
+                return false;
+            }
+            // Published section 4.10 uses slow start at equality. Recovery's
+            // explicit congestion-avoidance state remains authoritative.
+            if !self.congestion_avoidance && self.cwnd <= self.ssthresh {
+                self.cwnd = self
+                    .cwnd
+                    .saturating_add(acked.min(self.mss))
+                    .min(MAX_WINDOW);
+            } else {
+                self.cwnd = cubic.grow(self.cwnd, self.mss);
+            }
             return false;
         }
         if !self.congestion_avoidance && self.cwnd < self.ssthresh {
@@ -1037,17 +1117,33 @@ impl Congestion {
             return false;
         }
         self.reduce_threshold(flight);
-        self.cwnd = (self.cwnd / 2).max(self.mss).min(self.ssthresh);
+        // RFC 9438 section 4.6 permits CUBIC's beta=0.7 instead of the
+        // RFC 5681/RFC 3168 default Reno half reduction. ECN still reaches one MSS independently
+        // of the two-MSS ssthresh floor and shares the existing epoch guards.
+        let reduced = if self.cubic.is_some() {
+            (u64::from(flight) * 7 / 10).min(u64::from(self.cwnd)) as u32
+        } else {
+            self.cwnd / 2
+        };
+        self.cwnd = reduced.max(self.mss).min(self.ssthresh);
         self.acknowledged = 0;
         self.ecn_end = Some(highest_sent);
         true
     }
 
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
-    //= reason=Threshold helper uses actual eligible flight /2 with two-MSS minimum; timeout vectors assert 10000->5000 and SACK boundary vectors assert floor. Limited Transmit exclusion is caller-owned and separately evidenced.
+    //= reason=Default CongestionAlgorithm::Reno only; optional CUBIC follows RFC9438 sections 4.6/4.8. Threshold helper uses actual eligible flight /2 with two-MSS minimum; timeout vectors assert 10000->5000 and SACK boundary vectors assert floor. Limited Transmit exclusion is caller-owned and separately evidenced.
     //# ssthresh = max (FlightSize / 2, 2*SMSS) (4)
     fn reduce_threshold(&mut self, flight: u32) {
-        self.ssthresh = (flight / 2).max(self.mss.saturating_mul(2)).min(MAX_WINDOW);
+        // Optional RFC 9438 sections 4.6/4.8 are the scoped exception to
+        // RFC 5681's half-flight threshold, not a recovery-algorithm change.
+        let reduced = if let Some(cubic) = &mut self.cubic {
+            cubic.congestion(self.cwnd);
+            (u64::from(flight) * 7 / 10) as u32
+        } else {
+            flight / 2
+        };
+        self.ssthresh = reduced.max(self.mss.saturating_mul(2)).min(MAX_WINDOW);
     }
 
     // Called only after successful output, not when retransmission is scheduled.
@@ -1136,6 +1232,9 @@ impl Congestion {
             };
             self.reduce_threshold(flight);
         }
+        if let Some(cubic) = &mut self.cubic {
+            cubic.timeout();
+        }
         self.ecn_end = None;
         self.tlp_reduction_end = None;
         self.timeout_retransmitted = true;
@@ -1165,6 +1264,9 @@ impl Congestion {
     }
 
     pub(crate) fn restart_after_idle(&mut self) {
+        if let Some(cubic) = &mut self.cubic {
+            cubic.restart();
+        }
         self.cwnd = self.cwnd.min(self.initial_window());
         self.acknowledged = 0;
         self.reset_duplicate_acks();
@@ -2972,3 +3074,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod cubic_tests;
