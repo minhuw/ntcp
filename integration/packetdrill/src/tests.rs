@@ -2481,6 +2481,7 @@ fn native_tcp_shutdown_precedes_inaccessible_send_payload() {
         assert_eq!(send(stream.as_raw_fd(), ptr::null(), 6, MSG_NOSIGNAL), -1);
         assert_eq!(*__errno_location(), EPIPE);
         vector.iov_base = ptr::null_mut();
+        msg.msg_iov = &mut vector;
         assert_eq!(sendmsg(stream.as_raw_fd(), &msg, MSG_NOSIGNAL), -1);
         assert_eq!(*__errno_location(), EPIPE);
         assert_eq!(munmap(payload, 4096), 0);
