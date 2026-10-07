@@ -25,6 +25,56 @@ const LIMIT: usize = 128;
 const BYTES: usize = 65535;
 const BUDGET: usize = 32;
 type Result<T> = std::result::Result<T, i32>;
+// Foreign memory must cross the kernel fault-reporting boundary, never a Rust slice.
+fn memory(local: *mut u8, remote: *mut u8, len: usize, write: bool) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    (remote as usize)
+        .checked_add(len)
+        .filter(|&n| n <= isize::MAX as usize)
+        .ok_or(EFAULT)?;
+    let local = iovec {
+        iov_base: local.cast(),
+        iov_len: len,
+    };
+    let remote = iovec {
+        iov_base: remote.cast(),
+        iov_len: len,
+    };
+    let n = unsafe {
+        syscall(
+            if write {
+                SYS_process_vm_writev
+            } else {
+                SYS_process_vm_readv
+            },
+            syscall(SYS_getpid),
+            &local,
+            1usize,
+            &remote,
+            1usize,
+            0usize,
+        )
+    };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(EFAULT));
+    }
+    if n as usize != len {
+        return Err(EFAULT);
+    }
+    Ok(())
+}
+fn copy_out(remote: usize, bytes: &[u8]) -> Result<()> {
+    memory(
+        bytes.as_ptr().cast_mut(),
+        remote as *mut u8,
+        bytes.len(),
+        true,
+    )
+}
 struct Request {
     op: i32,
     fd: i32,
@@ -32,6 +82,7 @@ struct Request {
     b: i32,
     bytes: Vec<u8>,
     capacity: usize,
+    destinations: Vec<(usize, usize)>,
     deadline: Option<Instant>,
     started: bool,
     reply: SyncSender<Result<Response>>,
@@ -818,7 +869,12 @@ impl Owner {
                 }
                 let result = if r.op == 6 {
                     response.bytes.resize(r.capacity, 0);
-                    self.endpoint.read(id, &mut response.bytes)
+                    if r.destinations.is_empty() {
+                        self.endpoint.read(id, &mut response.bytes)
+                    } else {
+                        // Owner serialization keeps peek/copyout/commit atomic against readers.
+                        self.endpoint.peek(id, &mut response.bytes)
+                    }
                 } else {
                     self.endpoint.write(id, &r.bytes)
                 };
@@ -827,6 +883,30 @@ impl Owner {
                         response.value = n as i64;
                         if r.op == 6 {
                             response.bytes.truncate(n);
+                            if !r.destinations.is_empty() {
+                                let mut at = 0;
+                                for &(address, capacity) in &r.destinations {
+                                    let count = capacity.min(n - at);
+                                    copy_out(address, &response.bytes[at..at + count])?;
+                                    at += count;
+                                    if at == n {
+                                        break;
+                                    }
+                                }
+                                if at != n {
+                                    return Err(EIO);
+                                }
+                                if n != 0 {
+                                    let consumed = self
+                                        .endpoint
+                                        .read(id, &mut response.bytes)
+                                        .map_err(error)?;
+                                    if consumed != n {
+                                        return Err(EIO);
+                                    }
+                                }
+                                response.bytes.clear();
+                            }
                             socket.readable = if n == 0
                                 || socket.read_shutdown
                                 || matches!(
@@ -1485,25 +1565,61 @@ unsafe fn call_inner(
         if userdata.is_null() {
             return Err(EIO);
         }
-        if input_len > BYTES || (op == 6 && output_len > BYTES) {
+        if input_len > BYTES || (matches!(op, 6 | 20) && output_len > BYTES) {
             return Err(unsupported("scalar I/O exceeds 65535-byte adapter bound"));
         }
-        if input_len != 0 && input.is_null() || output_len != 0 && output.is_null() {
+        if input_len != 0 && input.is_null() || op != 20 && output_len != 0 && output.is_null() {
             return Err(EFAULT);
         }
         let bytes = if input_len == 0 {
             Vec::new()
         } else {
-            unsafe { slice::from_raw_parts(input.cast::<u8>(), input_len).to_vec() }
+            let mut bytes = vec![0; input_len];
+            memory(
+                bytes.as_mut_ptr(),
+                input.cast_mut().cast(),
+                input_len,
+                false,
+            )?;
+            bytes
+        };
+        let destinations = if op == 20 {
+            if !input_len.is_multiple_of(std::mem::size_of::<iovec>())
+                || input_len / std::mem::size_of::<iovec>() > 1024
+            {
+                return Err(EINVAL);
+            }
+            let mut total = 0usize;
+            let mut destinations = Vec::new();
+            for chunk in bytes.chunks_exact(std::mem::size_of::<iovec>()) {
+                let v = unsafe { ptr::read_unaligned(chunk.as_ptr().cast::<iovec>()) };
+                total = total
+                    .checked_add(v.iov_len)
+                    .filter(|&n| n <= BYTES)
+                    .ok_or(EMSGSIZE)?;
+                if v.iov_len != 0 && v.iov_base.is_null() {
+                    return Err(EFAULT);
+                }
+                destinations.push((v.iov_base as usize, v.iov_len));
+            }
+            if total != output_len {
+                return Err(EINVAL);
+            }
+            destinations
+        } else if op == 6 {
+            vec![(output as usize, output_len)]
+        } else {
+            Vec::new()
         };
         let (reply, _) = mpsc::sync_channel(1);
         let request = Request {
-            op,
+            op: if op == 20 { 6 } else { op },
             fd,
             a,
             b,
             bytes,
             capacity: output_len.min(BYTES),
+            destinations,
             deadline: if op == 13 && a > 0 {
                 Some(Instant::now() + Duration::from_millis(a as u64))
             } else {
@@ -1518,18 +1634,10 @@ unsafe fn call_inner(
             return Err(EIO);
         }
         if !response.bytes.is_empty() {
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    response.bytes.as_ptr(),
-                    output.cast::<u8>(),
-                    response.bytes.len(),
-                );
-            }
+            copy_out(output as usize, &response.bytes)?;
         }
         if !stamp.is_null() {
-            unsafe {
-                ptr::write_unaligned(stamp, response.stamp);
-            }
+            copy_out(stamp as usize, &response.stamp.to_ne_bytes())?;
         }
         Ok(response.value)
     }));

@@ -22,6 +22,16 @@ static int unsupported(const char *why) {
     errno = ENOSYS; return -1;
 }
 static int bad(int error) { errno = error; return -1; }
+// Bounded self-process copies report inaccessible or partially mapped buffers.
+static int memory(void *local, const void *remote, size_t n, int writing) {
+    if (!n) return 0;
+    if ((uintptr_t)remote > INTPTR_MAX || n > INTPTR_MAX - (uintptr_t)remote) return bad(EFAULT);
+    struct iovec l = {local, n}, r = {(void *)remote, n};
+    long result = syscall(writing ? SYS_process_vm_writev : SYS_process_vm_readv,
+                          syscall(SYS_getpid), &l, 1UL, &r, 1UL, 0UL);
+    if (result < 0) return -1;
+    return (size_t)result == n ? 0 : bad(EFAULT);
+}
 #define CALL(op, fd, a, b, in, n, out, m, aux) ntcp_call(u, op, fd, a, b, in, n, out, m, aux)
 #define SIMPLE(op, fd, a, b) CALL(op, fd, a, b, NULL, 0, NULL, 0, NULL)
 static int sock(void *u, int domain, int type, int protocol) {
@@ -31,7 +41,7 @@ static int sock(void *u, int domain, int type, int protocol) {
 static int address(void *u, int op, int fd, const struct sockaddr *p, socklen_t n) {
     if (!p) return bad(EFAULT);
     if (n < sizeof(struct sockaddr_in)) return bad(EINVAL);
-    struct sockaddr_in addr; memcpy(&addr, p, sizeof(addr));
+    struct sockaddr_in addr; if (memory(&addr, p, sizeof(addr), 0)) return -1;
     if (addr.sin_family != AF_INET) return unsupported("address family");
     return CALL(op, fd, 0, 0, &addr, sizeof(addr), NULL, 0, NULL);
 }
@@ -57,26 +67,27 @@ static ssize_t send_socket(void *u, int fd, const void *p, size_t n, int flags) 
 }
 static ssize_t vector(void *u, int fd, const struct iovec *v, int count, int writing, int flags) {
     if (count < 0 || count > 1024) return bad(EINVAL);
-    if (count && !v) return bad(EFAULT);
+    struct iovec vectors[1024];
+    if (memory(vectors, v, count * sizeof(*v), 0)) return -1;
     size_t total = 0;
     for (int i = 0; i < count; i++) {
-        if (v[i].iov_len && !v[i].iov_base) return bad(EFAULT);
-        if (v[i].iov_len > 65535 - total) return bad(EMSGSIZE);
-        total += v[i].iov_len;
+        if (vectors[i].iov_len && !vectors[i].iov_base) return bad(EFAULT);
+        if (vectors[i].iov_len > 65535 - total) return bad(EMSGSIZE);
+        total += vectors[i].iov_len;
+    }
+    if (!writing) {
+        if (flags & ~MSG_DONTWAIT) return unsupported("recv flags");
+        // Rust owns copyout and commits stream bytes only after all vectors succeed.
+        return CALL(20, fd, flags, 0, vectors, count * sizeof(*v), NULL, total, NULL);
     }
     unsigned char *buf = malloc(total ? total : 1);
     if (!buf) return bad(ENOMEM);
     size_t at = 0;
-    if (writing) for (int i = 0; i < count; i++) { if(v[i].iov_len) memcpy(buf + at, v[i].iov_base, v[i].iov_len); at += v[i].iov_len; }
-    ssize_t result = writing ? send_socket(u, fd, buf, total, flags) : recv_socket(u, fd, buf, total, flags);
-    if (!writing && result > 0) {
-        at = 0;
-        for (int i = 0; i < count && at < (size_t)result; i++) {
-            size_t n = v[i].iov_len < (size_t)result - at ? v[i].iov_len : (size_t)result - at;
-            if(n) memcpy(v[i].iov_base, buf + at, n);
-            at += n;
-        }
+    for (int i = 0; i < count; i++) {
+        if (memory(buf + at, vectors[i].iov_base, vectors[i].iov_len, 0)) { free(buf); return -1; }
+        at += vectors[i].iov_len;
     }
+    ssize_t result = send_socket(u, fd, buf, total, flags);
     free(buf); return result;
 }
 static ssize_t readv_socket(void *u, int fd, const struct iovec *v, int n) { return vector(u, fd, v, n, 0, 0); }
@@ -85,7 +96,7 @@ static int destination(void *u, int fd, const struct sockaddr *addr, socklen_t l
     if (!addr) return len ? bad(EFAULT) : 0;
     if (len < sizeof(struct sockaddr_in)) return bad(EINVAL);
     struct sockaddr_in requested;
-    memcpy(&requested, addr, sizeof(requested));
+    if (memory(&requested, addr, sizeof(requested), 0)) return -1;
     if (requested.sin_family != AF_INET) return unsupported("send destination family");
     // A connection-mode TCP send uses its established peer, not msg_name.
     return 0;
@@ -95,8 +106,12 @@ static int source(void *u, int fd, struct sockaddr *addr, socklen_t *len) {
     if (!len) return bad(EFAULT);
     struct sockaddr_in peer;
     if (CALL(16, fd, 0, 0, NULL, 0, &peer, sizeof(peer), NULL) < 0) return -1;
-    size_t n = *len < sizeof(peer) ? *len : sizeof(peer);
-    memcpy(addr, &peer, n); *len = sizeof(peer); return 0;
+    socklen_t capacity;
+    if (memory(&capacity, len, sizeof(capacity), 0)) return -1;
+    size_t n = capacity < sizeof(peer) ? capacity : sizeof(peer);
+    if (memory(&peer, addr, n, 1)) return -1;
+    capacity = sizeof(peer);
+    return memory(&capacity, len, sizeof(capacity), 1);
 }
 static ssize_t recvfrom_socket(void *u, int fd, void *p, size_t n, int flags, struct sockaddr *addr, socklen_t *len) {
     if (source(u, fd, addr, len)) return -1;
@@ -107,20 +122,23 @@ static ssize_t sendto_socket(void *u, int fd, const void *p, size_t n, int flags
     return send_socket(u, fd, p, n, flags);
 }
 static ssize_t sendmsg_socket(void *u, int fd, const struct msghdr *msg, int flags) {
-    if (!msg) return bad(EFAULT);
-    if (msg->msg_controllen) return unsupported("sendmsg ancillary data");
-    if (destination(u, fd, msg->msg_name, msg->msg_namelen)) return -1;
-    if (msg->msg_iovlen > 1024) return bad(EINVAL);
-    return vector(u, fd, msg->msg_iov, msg->msg_iovlen, 1, flags);
+    struct msghdr header;
+    if (memory(&header, msg, sizeof(header), 0)) return -1;
+    if (header.msg_controllen) return unsupported("sendmsg ancillary data");
+    if (destination(u, fd, header.msg_name, header.msg_namelen)) return -1;
+    if (header.msg_iovlen > 1024) return bad(EINVAL);
+    return vector(u, fd, header.msg_iov, header.msg_iovlen, 1, flags);
 }
 static ssize_t recvmsg_socket(void *u, int fd, struct msghdr *msg, int flags) {
-    if (!msg) return bad(EFAULT);
-    if (msg->msg_controllen) return unsupported("recvmsg ancillary data");
-    if (msg->msg_iovlen > 1024) return bad(EINVAL);
-    if (source(u, fd, msg->msg_name, &msg->msg_namelen)) return -1;
-    ssize_t result = vector(u, fd, msg->msg_iov, msg->msg_iovlen, 0, flags);
-    if (result >= 0) { msg->msg_flags = 0; msg->msg_controllen = 0; }
-    return result;
+    struct msghdr header;
+    if (memory(&header, msg, sizeof(header), 0)) return -1;
+    if (header.msg_controllen) return unsupported("recvmsg ancillary data");
+    if (header.msg_iovlen > 1024) return bad(EINVAL);
+    if (source(u, fd, header.msg_name, &header.msg_namelen)) return -1;
+    header.msg_flags = 0; header.msg_controllen = 0;
+    // Complete metadata copyout before a receive can consume stream bytes.
+    if (memory(&header, msg, sizeof(header), 1)) return -1;
+    return vector(u, fd, header.msg_iov, header.msg_iovlen, 0, flags);
 }
 static int fcntl_socket(void *u, int fd, int cmd, ...) {
     int arg = 0;
@@ -345,4 +363,56 @@ void ntcp_abi_check(void *u) {
     struct timeval tv;
     assert(p.gettimeofday(u, &tv, NULL) == 0 && tv.tv_sec > 1700000000);
     assert(p.usleep(u, 1) == 0);
+}
+
+#include <sys/mman.h>
+// Connected socket has "abcdef" queued by the Rust test, no privileges needed.
+void ntcp_abi_fault_check(void *u, int fd) {
+    struct packetdrill_interface p;
+    ntcp_fill(&p, u);
+    size_t page = sysconf(_SC_PAGESIZE);
+    unsigned char *mapping = mmap(NULL, page * 2, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(mapping != MAP_FAILED);
+    assert(mprotect(mapping + page, page, PROT_NONE) == 0);
+    void *badptr = mapping + page;
+    unsigned char out[8] = {0};
+    struct iovec v[2] = {{out, 3}, {badptr, 3}};
+    struct msghdr msg = {.msg_iov = v, .msg_iovlen = 2};
+    for (int i = 0; i < 3; i++) {
+        void *ptr = i == 0 ? NULL : i == 1 ? badptr : mapping + page - 2;
+        assert(p.write(u, fd, ptr, 6) == -1 && errno == EFAULT);
+        assert(p.send(u, fd, ptr, 6, 0) == -1 && errno == EFAULT);
+        assert(p.sendto(u, fd, ptr, 6, 0, NULL, 0) == -1 && errno == EFAULT);
+        assert(p.read(u, fd, ptr, 6) == -1 && errno == EFAULT);
+        assert(p.recv(u, fd, ptr, 6, 0) == -1 && errno == EFAULT);
+        assert(p.recvfrom(u, fd, ptr, 6, 0, NULL, NULL) == -1 && errno == EFAULT);
+    }
+    assert(p.readv(u, fd, badptr, 1) == -1 && errno == EFAULT);
+    assert(p.writev(u, fd, badptr, 1) == -1 && errno == EFAULT);
+    assert(p.sendmsg(u, fd, badptr, 0) == -1 && errno == EFAULT);
+    assert(p.recvmsg(u, fd, badptr, 0) == -1 && errno == EFAULT);
+    assert(p.readv(u, fd, v, 2) == -1 && errno == EFAULT);
+    assert(p.writev(u, fd, v, 2) == -1 && errno == EFAULT);
+    assert(p.sendmsg(u, fd, &msg, 0) == -1 && errno == EFAULT);
+    assert(p.recvmsg(u, fd, &msg, 0) == -1 && errno == EFAULT);
+    assert(p.readv(u, fd, v, 1025) == -1 && errno == EINVAL);
+    assert(p.read(u, fd, badptr, 0) == 0);
+    assert(p.write(u, fd, badptr, 0) == 0);
+    socklen_t address_len = sizeof(struct sockaddr_in);
+    assert(p.recvfrom(u, fd, out, 6, 0, badptr, &address_len) == -1 && errno == EFAULT);
+    struct sockaddr_in address;
+    assert(p.recvfrom(u, fd, out, 6, 0, (struct sockaddr *)&address, badptr) == -1 && errno == EFAULT);
+    memcpy(mapping, &msg, sizeof(msg));
+    assert(mprotect(mapping, page, PROT_READ) == 0);
+    assert(p.read(u, fd, mapping, 6) == -1 && errno == EFAULT);
+    assert(p.recvmsg(u, fd, (struct msghdr *)mapping, 0) == -1 && errno == EFAULT);
+    int queued = -1;
+    assert(p.ioctl(u, fd, SIOCINQ, &queued) == 0 && queued == 6);
+    v[1].iov_base = out + 3;
+    assert(p.recvmsg(u, fd, &msg, 0) == 6);
+    assert(memcmp(out, "abcdef", 6) == 0);
+    assert(p.ioctl(u, fd, SIOCINQ, &queued) == 0 && queued == 0);
+    assert(p.recv(u, fd, badptr, 1, MSG_DONTWAIT) == -1 && errno == EAGAIN);
+    assert(munmap(mapping, page * 2) == 0);
 }

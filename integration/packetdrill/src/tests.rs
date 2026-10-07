@@ -17,6 +17,7 @@ fn request(
             b: 0,
             bytes,
             capacity,
+            destinations: Vec::new(),
             deadline: None,
             started: false,
             reply,
@@ -93,6 +94,57 @@ fn abi_table_null_counts_vectors_variadics_and_host_clock() {
     let mut adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
     let userdata = (&mut adapter as *mut Adapter).cast();
     *INSTANCE.write().unwrap() = userdata as usize;
+    // Drive a real handshake and queued payload through the owner before ABI faults.
+    let listener = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+        .unwrap()
+        .value as i32;
+    call(
+        &adapter,
+        2,
+        listener,
+        0,
+        encode_addr(SocketAddr::new(local().into(), 8080)),
+        0,
+    )
+    .unwrap();
+    call(&adapter, 3, listener, 1, vec![], 0).unwrap();
+    call(&adapter, 14, 0, 0, syn(100, 8080), 0).unwrap();
+    let packet = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+    let (ip, tcp) = parse_frame(&syn(100, 8080))
+        .map(|(ip, _)| (ip, packet_header(&packet)))
+        .unwrap();
+    let mut bytes = [0; 128];
+    let header = ntcp::wire::Header {
+        source_port: 50000,
+        destination_port: 8080,
+        sequence: 101,
+        acknowledgment: tcp.sequence.wrapping_add(1),
+        flags: ntcp::wire::ACK,
+        window: 65535,
+        urgent_pointer: 0,
+    };
+    let len = ntcp::wire::encode(ip, header, &[], b"abcdef", &mut bytes).unwrap();
+    let packet = frame(
+        ntcp::Transmit {
+            connection: None,
+            ip,
+            len,
+            hop_limit: 64,
+            dscp: 0,
+            ecn: 0,
+            ipv4_options: Default::default(),
+        },
+        &bytes[..len],
+    )
+    .unwrap();
+    call(&adapter, 14, 0, 0, packet, 0).unwrap();
+    let accepted = call(&adapter, 4, listener, 0, vec![], 16).unwrap().value as i32;
+    unsafe extern "C" {
+        fn ntcp_abi_fault_check(userdata: *mut c_void, fd: i32);
+    }
+    unsafe {
+        ntcp_abi_fault_check(userdata, accepted);
+    }
     let fd = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
         .unwrap()
         .value as i32;
@@ -2290,4 +2342,36 @@ fn shutdown_completes_pending_reads_poll_and_blocked_writes() {
         drop(tx);
         join.join().unwrap();
     }
+}
+
+#[test]
+fn receive_retry_fault_preserves_stream_and_short_copyout() {
+    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let (fd, id, tx, sent) = active_ip_connection(&mut owner, 0, IP_PMTUDISC_WANT);
+    execute_value(&mut owner, 10, fd, F_SETFL, O_RDWR).unwrap();
+    let (mut r, rx) = request(6, fd, 0, vec![], 6);
+    r.destinations = vec![(1, 6)];
+    assert!(!owner.retry(&mut r)); // No data: fault checking must survive retries.
+    assert!(rx.try_recv().is_err());
+    let (ip, header) = reverse_ack(tx, sent, sent.sequence.wrapping_add(1));
+    let mut tcp = [0; 128];
+    let len = ntcp::wire::encode(ip, header, &[], b"abcdef", &mut tcp).unwrap();
+    owner.endpoint.input(owner.now(), ip, &tcp[..len]).unwrap();
+    assert!(owner.retry(&mut r));
+    assert_eq!(rx.recv().unwrap().err(), Some(EFAULT));
+    assert_eq!(owner.endpoint.readable_bytes(id), Ok(6));
+    let mut output = [0; 8];
+    r.capacity = 8;
+    // A bad unused tail must not fault a short successful receive.
+    r.destinations = vec![(0, 0), (output.as_mut_ptr() as usize, 6), (1, 2)];
+    assert_eq!(owner.execute(&mut r).unwrap().unwrap().value, 6);
+    assert_eq!(&output[..6], b"abcdef");
+    assert_eq!(owner.endpoint.readable_bytes(id), Ok(0));
+    let mut fin = header;
+    fin.sequence += 6;
+    fin.flags |= ntcp::wire::FIN;
+    let len = ntcp::wire::encode(ip, fin, &[], &[], &mut tcp).unwrap();
+    owner.endpoint.input(owner.now(), ip, &tcp[..len]).unwrap();
+    r.destinations = vec![(1, 8)];
+    assert_eq!(owner.execute(&mut r).unwrap().unwrap().value, 0);
 }
