@@ -79,16 +79,15 @@ impl Runtime {
                 let _ = result;
                 signal(wake);
             });
-        if spawned.is_err() {
-            unsafe {
-                syscall(SYS_close, wake);
+        let worker = match spawned {
+            Ok(worker) => worker,
+            Err(_) => {
+                unsafe { syscall(SYS_close, wake) };
+                return Err(EAGAIN);
             }
-            return Err(EAGAIN);
-        }
+        };
         if let Err(e) = ready_rx.recv().unwrap_or(Err(EIO)) {
-            unsafe {
-                syscall(SYS_close, wake);
-            }
+            close_failed_startup(worker, wake);
             return Err(e);
         }
         Ok(Self {
@@ -114,6 +113,11 @@ impl Runtime {
         rx.recv().unwrap_or(Err(EIO))
     }
 }
+fn close_failed_startup(worker: std::thread::JoinHandle<()>, wake: i32) {
+    // The worker may still signal wake after reporting failure.
+    let _ = worker.join();
+    unsafe { syscall(SYS_close, wake) };
+}
 pub fn signal(fd: i32) {
     let one = 1u64;
     unsafe {
@@ -137,6 +141,7 @@ enum Handle {
     Listener(ListenerId),
     Connection(ConnectionId),
 }
+#[derive(Clone)]
 struct Socket {
     handle: Handle,
     local: Option<SocketAddr>,
@@ -472,6 +477,18 @@ impl Owner {
         }
         Err(EADDRNOTAVAIL)
     }
+    fn apply_options(&mut self, cid: ConnectionId, s: &Socket) -> Result<()> {
+        // Validate the fallible option before changing the infallible one.
+        self.endpoint
+            .set_keepalive(cid, s.keepalive_config())
+            .map_err(engine)?;
+        self.endpoint.set_nagle(cid, !s.nodelay).map_err(engine)
+    }
+    fn rollback_connection(&mut self, cid: ConnectionId) {
+        // release retains storage until any reset output has drained.
+        let _ = self.endpoint.abort(cid);
+        let _ = self.endpoint.release(cid);
+    }
     fn execute(&mut self, id: u64, op: Op) -> Result<Reply> {
         self.endpoint.on_timeout(self.now(), 0).map_err(engine)?;
         let mut out = Reply::default();
@@ -536,17 +553,27 @@ impl Owner {
                     self.sockets.get_mut(&id).unwrap().acceptable = false;
                 }
                 let cid = accepted.map_err(engine)?;
-                let tuple = self.endpoint.tuple(cid).map_err(engine)?;
+                let tuple = match self.endpoint.tuple(cid).map_err(engine) {
+                    Ok(tuple) => tuple,
+                    Err(e) => {
+                        self.rollback_connection(cid);
+                        return Err(e);
+                    }
+                };
                 child.handle = Handle::Connection(cid);
                 child.local = Some(tuple.local);
                 child.connected = true;
-                self.endpoint
-                    .set_nagle(cid, !child.nodelay)
-                    .map_err(engine)?;
-                self.endpoint
-                    .set_keepalive(cid, child.keepalive_config())
-                    .map_err(engine)?;
-                out.value = self.alloc(child)?;
+                if let Err(e) = self.apply_options(cid, &child) {
+                    self.rollback_connection(cid);
+                    return Err(e);
+                }
+                out.value = match self.alloc(child) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        self.rollback_connection(cid);
+                        return Err(e);
+                    }
+                };
                 out.addr = Some(tuple.remote);
                 // Core emits Acceptable on empty->nonempty; stay readable until accept returns EAGAIN.
             }
@@ -570,6 +597,7 @@ impl Owner {
                 if remote.port() == 0 {
                     return Err(EINVAL);
                 }
+                let options = s.clone();
                 let mut local = match s.local {
                     Some(a) => a,
                     None => SocketAddr::new(self.local.into(), self.port()?),
@@ -581,13 +609,13 @@ impl Owner {
                     .endpoint
                     .connect(self.now(), local, remote)
                     .map_err(engine)?;
+                if let Err(e) = self.apply_options(cid, &options) {
+                    self.rollback_connection(cid);
+                    return Err(e);
+                }
                 let s = self.sockets.get_mut(&id).unwrap();
                 s.handle = Handle::Connection(cid);
                 s.local = Some(local);
-                self.endpoint.set_nagle(cid, !s.nodelay).map_err(engine)?;
-                self.endpoint
-                    .set_keepalive(cid, s.keepalive_config())
-                    .map_err(engine)?;
                 return Err(EINPROGRESS);
             }
             Op::Read(capacity) => {
@@ -598,14 +626,26 @@ impl Owner {
                     return Ok(out);
                 }
                 // Deliver buffered data before the terminal error/EOF.
-                if self.endpoint.readable_bytes(cid).map_err(engine)? == 0 && s.error != 0 {
+                let terminal = self.endpoint.state(cid).map_err(engine)? == State::Closed;
+                let available = if terminal {
+                    self.endpoint.terminal_readable_bytes(cid)
+                } else {
+                    self.endpoint.readable_bytes(cid)
+                }
+                .map_err(engine)?;
+                if available == 0 && s.error != 0 {
                     let s = self.sockets.get_mut(&id).unwrap();
                     let e = s.error;
                     s.error = 0;
                     return Err(e);
                 }
                 out.bytes.resize(capacity.min(BYTES), 0);
-                let n = self.endpoint.read(cid, &mut out.bytes).map_err(engine)?;
+                let n = if terminal {
+                    self.endpoint.read_terminal(cid, &mut out.bytes)
+                } else {
+                    self.endpoint.read(cid, &mut out.bytes)
+                }
+                .map_err(engine)?;
                 out.bytes.truncate(n);
                 out.value = n as i32;
             }
@@ -646,9 +686,9 @@ impl Owner {
                         ) {
                             self.endpoint.release(cid).map_err(engine)?;
                         } else {
-                            if self.detached.len() == LIMIT {
-                                return Err(ENOBUFS);
-                            }
+                            // Endpoint has at most LIMIT records; this attached
+                            // record is not yet in detached, so there is room.
+                            debug_assert!(self.detached.len() < LIMIT);
                             self.detached.push(cid);
                         }
                     }
@@ -695,7 +735,8 @@ impl Owner {
                 }
             }
             Op::Set(level, name, value) => {
-                let s = self.sockets.get_mut(&id).unwrap();
+                let mut candidate = s.clone();
+                let s = &mut candidate;
                 match (level, name) {
                     (SOL_SOCKET, SO_REUSEADDR) => s.reuse = value != 0,
                     (SOL_SOCKET, SO_KEEPALIVE) => s.keepalive = value != 0,
@@ -704,18 +745,16 @@ impl Owner {
                     (IPPROTO_TCP, TCP_KEEPINTVL) if value > 0 && value <= 32767 => {
                         s.interval = value
                     }
-                    (IPPROTO_TCP, TCP_KEEPCNT) if value > 0 && value <= 127 => s.probes = value,
+                    (IPPROTO_TCP, TCP_KEEPCNT) if (2..=127).contains(&value) => s.probes = value,
                     (IPPROTO_TCP, TCP_KEEPIDLE | TCP_KEEPINTVL | TCP_KEEPCNT) => {
                         return Err(EINVAL);
                     }
                     _ => return Err(ENOPROTOOPT),
                 }
                 if let Handle::Connection(cid) = s.handle {
-                    self.endpoint.set_nagle(cid, !s.nodelay).map_err(engine)?;
-                    self.endpoint
-                        .set_keepalive(cid, s.keepalive_config())
-                        .map_err(engine)?;
+                    self.apply_options(cid, s)?;
                 }
+                self.sockets.insert(id, candidate);
             }
             Op::Get(level, name) => {
                 let s = self.sockets.get_mut(&id).unwrap();
@@ -758,7 +797,13 @@ impl Owner {
             Op::Available => {
                 out.value = match s.handle {
                     Handle::Connection(cid) => {
-                        self.endpoint.readable_bytes(cid).map_err(engine)? as i32
+                        if s.read_shutdown {
+                            0
+                        } else if self.endpoint.state(cid).map_err(engine)? == State::Closed {
+                            self.endpoint.terminal_readable_bytes(cid).map_err(engine)? as i32
+                        } else {
+                            self.endpoint.readable_bytes(cid).map_err(engine)? as i32
+                        }
                     }
                     Handle::Fresh => 0,
                     Handle::Listener(_) => return Err(EINVAL),
@@ -973,6 +1018,174 @@ mod tests {
         }
         assert_eq!(a.execute(0, Op::New(0)).unwrap_err(), EMFILE);
     }
+    #[test]
+    fn reset_drains_payload_then_reports_error_once_then_eof() {
+        let (mut a, mut b, client, server, _) = pair();
+        a.execute(client, Op::Write(b"abcdef".to_vec())).unwrap();
+        pump(&mut a, &mut b);
+        let Handle::Connection(cid) = a.sockets[&client].handle else {
+            panic!()
+        };
+        a.endpoint.abort(cid).unwrap();
+        pump(&mut a, &mut b);
+        assert_eq!(b.execute(server, Op::Available).unwrap().value, 6);
+        assert_eq!(b.execute(server, Op::Read(2)).unwrap().bytes, b"ab");
+        assert_eq!(b.execute(server, Op::Available).unwrap().value, 4);
+        assert_eq!(b.execute(server, Op::Read(32)).unwrap().bytes, b"cdef");
+        assert_eq!(b.execute(server, Op::Read(32)).unwrap_err(), ECONNRESET);
+        for _ in 0..2 {
+            assert_eq!(b.execute(server, Op::Read(32)).unwrap().value, 0);
+            assert_ne!(b.execute(server, Op::Ready).unwrap().value & EPOLLIN, 0);
+        }
+    }
+
+    #[test]
+    fn keepalive_rejection_is_transactional_in_all_socket_states() {
+        let (mut a, mut b, client, server, listen) = pair();
+        let fresh = new(&mut b, 0);
+        for id in [fresh, listen, server] {
+            b.execute(id, Op::Set(IPPROTO_TCP, TCP_KEEPCNT, 4)).unwrap();
+            b.execute(id, Op::Set(SOL_SOCKET, SO_KEEPALIVE, 1)).unwrap();
+            assert_eq!(
+                b.execute(id, Op::Set(IPPROTO_TCP, TCP_KEEPCNT, 1))
+                    .unwrap_err(),
+                EINVAL
+            );
+            assert_eq!(
+                b.execute(id, Op::Get(IPPROTO_TCP, TCP_KEEPCNT))
+                    .unwrap()
+                    .value,
+                4
+            );
+            assert_eq!(
+                b.execute(id, Op::Get(SOL_SOCKET, SO_KEEPALIVE))
+                    .unwrap()
+                    .value,
+                1
+            );
+        }
+        let second = new(&mut a, 0);
+        assert_eq!(
+            a.execute(second, Op::Connect("10.73.0.3:16379".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        pump(&mut a, &mut b);
+        let accepted = b.execute(listen, Op::Accept(0)).unwrap().value as u64;
+        assert_eq!(
+            b.execute(accepted, Op::Get(IPPROTO_TCP, TCP_KEEPCNT))
+                .unwrap()
+                .value,
+            4
+        );
+        a.execute(client, Op::Close).unwrap();
+    }
+
+    #[test]
+    fn option_application_failure_releases_connect_and_accept_records() {
+        let mut a = owner(2);
+        let mut b = owner(3);
+        let listen = new(&mut b, 0);
+        b.execute(listen, Op::Bind("10.73.0.3:16379".parse().unwrap()))
+            .unwrap();
+        b.execute(listen, Op::Listen(16)).unwrap();
+        let client = new(&mut a, 0);
+        // Inject an invalid internal configuration to exercise otherwise
+        // unreachable failure paths; public sets reject this before mutation.
+        a.sockets.get_mut(&client).unwrap().keepalive = true;
+        a.sockets.get_mut(&client).unwrap().probes = 1;
+        assert_eq!(
+            a.execute(client, Op::Connect("10.73.0.3:16379".parse().unwrap()))
+                .unwrap_err(),
+            EINVAL
+        );
+        assert!(matches!(a.sockets[&client].handle, Handle::Fresh));
+        assert!(a.sockets[&client].local.is_none());
+        pump(&mut a, &mut b);
+        assert_eq!(a.endpoint.buffer_bytes(), 0);
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_KEEPCNT, 2))
+            .unwrap();
+        assert_eq!(
+            a.execute(client, Op::Connect("10.73.0.3:16379".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        pump(&mut a, &mut b);
+        b.sockets.get_mut(&listen).unwrap().keepalive = true;
+        b.sockets.get_mut(&listen).unwrap().probes = 1;
+        assert_eq!(b.execute(listen, Op::Accept(0)).unwrap_err(), EINVAL);
+        assert_eq!(b.sockets.len(), 1);
+        // The failed child owes a reset: release must retain it until output.
+        assert_ne!(b.endpoint.buffer_bytes(), 0);
+        pump(&mut a, &mut b);
+        // Local resets retain the released record for the core's 2MSL
+        // quarantine; expiry must reclaim it rather than leak a slot.
+        assert_ne!(b.endpoint.buffer_bytes(), 0);
+        b.epoch -=
+            std::time::Duration::from_micros(ntcp::ConnectionConfig::default().time_wait_us + 1);
+        b.endpoint.on_timeout(b.now(), BUDGET).unwrap();
+        assert_eq!(b.endpoint.buffer_bytes(), 0);
+        b.execute(listen, Op::Set(IPPROTO_TCP, TCP_KEEPCNT, 2))
+            .unwrap();
+        let second = new(&mut a, 0);
+        assert_eq!(
+            a.execute(second, Op::Connect("10.73.0.3:16379".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        pump(&mut a, &mut b);
+        assert!(b.execute(listen, Op::Accept(0)).is_ok());
+    }
+
+    #[test]
+    fn close_delivery_waits_for_space_in_bounded_queue() {
+        let (tx, rx) = mpsc::sync_channel(LIMIT);
+        for _ in 0..LIMIT {
+            let (reply, _) = mpsc::sync_channel(1);
+            tx.send(Request {
+                id: 1,
+                op: Op::Ready,
+                reply,
+            })
+            .unwrap();
+        }
+        let runtime = Runtime {
+            tx,
+            wake: -1,
+            family: AF_INET,
+        };
+        let caller = std::thread::spawn(move || runtime.call(1, Op::Close));
+        for _ in 0..LIMIT {
+            assert!(matches!(rx.recv().unwrap().op, Op::Ready));
+        }
+        let request = rx.recv().unwrap();
+        assert!(matches!(request.op, Op::Close));
+        request.reply.send(Ok(Reply::default())).unwrap();
+        assert!(caller.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn startup_failure_joins_before_closing_wake() {
+        let wake = unsafe { syscall(SYS_eventfd2, 0, EFD_NONBLOCK | EFD_CLOEXEC) as i32 };
+        assert!(wake >= 0);
+        let (tx, rx) = mpsc::sync_channel(0);
+        let open_at_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = open_at_exit.clone();
+        let worker = std::thread::spawn(move || {
+            rx.recv().unwrap();
+            observed.store(
+                unsafe { syscall(SYS_fcntl, wake, F_GETFD) } >= 0,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            signal(wake);
+        });
+        let closer = std::thread::spawn(move || close_failed_startup(worker, wake));
+        tx.send(()).unwrap();
+        closer.join().unwrap();
+        assert!(open_at_exit.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(unsafe { syscall(SYS_fcntl, wake, F_GETFD) }, -1);
+    }
+
     #[test]
     fn send_buffer_backpressure_and_short_write() {
         let (mut a, mut b, client, _server, _listen) = pair();

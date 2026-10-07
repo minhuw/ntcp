@@ -1540,6 +1540,22 @@ impl Endpoint {
         self.refresh(id.slot);
         Ok(count)
     }
+    /// Drain contiguous, already accepted bytes after CLOSED, without changing
+    /// the normal `read` error contract. Uncompleted handshakes and discarded
+    /// read sides expose no data. Does not schedule network output.
+    pub fn read_terminal(
+        &mut self,
+        id: ConnectionId,
+        out: &mut [u8],
+    ) -> Result<usize, EndpointError> {
+        Ok(self.slot_mut(id)?.connection.read_terminal(out)?)
+    }
+
+    /// Bytes eligible for `read_terminal`; zero unless CLOSED after a handshake.
+    pub fn terminal_readable_bytes(&self, id: ConnectionId) -> Result<usize, EndpointError> {
+        Ok(self.slot(id)?.connection.terminal_readable_bytes())
+    }
+
     pub fn shutdown(&mut self, id: ConnectionId) -> Result<(), EndpointError> {
         self.slot_mut(id)?.connection.shutdown()?;
         self.refresh(id.slot);

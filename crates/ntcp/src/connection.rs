@@ -1326,6 +1326,29 @@ impl Connection {
         self.receive.readable()
     }
 
+    pub(crate) fn terminal_readable_bytes(&self) -> usize {
+        if self.state == State::Closed && self.handshake_complete && !self.read_closed {
+            self.receive.readable()
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn read_terminal(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+        if self.state != State::Closed {
+            return Err(Error::InvalidState);
+        }
+        let count = if self.terminal_readable_bytes() != 0 {
+            self.receive.read(out)
+        } else {
+            0
+        };
+        self.receive_used -= count;
+        self.received_read = self.received_read.saturating_add(count as u64);
+        // Terminal draining never schedules ACKs or window updates.
+        Ok(count)
+    }
+
     pub(crate) fn take_route_advice(&mut self) -> bool {
         core::mem::take(&mut self.route_advice_pending)
     }
@@ -16304,6 +16327,13 @@ mod tests {
         let mut bytes = [0; 64];
         let size = wire::encode(metadata, header, &[], b"abc", &mut bytes).unwrap();
         let syn = wire::parse(metadata, &bytes[..size]).unwrap();
+        let mut uncompleted =
+            Connection::passive(reverse(tuple()), config(64, 8), 900, 0, &syn).unwrap();
+        uncompleted.abort();
+        assert_eq!(uncompleted.receive.readable(), 3);
+        assert_eq!(uncompleted.terminal_readable_bytes(), 0);
+        assert_eq!(uncompleted.read_terminal(&mut [0; 8]), Ok(0));
+        assert_eq!(uncompleted.receive_used, 3);
         let mut b = Connection::passive(reverse(tuple()), config(64, 8), 900, 0, &syn).unwrap();
         assert_eq!(b.receive.next(), Seq(2));
         assert!(!b.events_pending());
@@ -16325,6 +16355,43 @@ mod tests {
         assert_eq!(b.read(&mut out[1..]), Ok(2));
         assert_eq!(&out[..3], b"abc");
         assert_eq!(b.urgent_remaining(), 0);
+    }
+
+    #[test]
+    fn terminal_drain_preserves_read_contract_and_excludes_out_of_order_data() {
+        let (mut a, mut b) = pair(config(64, 8), 100);
+        assert_eq!(b.read_terminal(&mut [0; 8]), Err(Error::InvalidState));
+        a.write(b"abc").unwrap();
+        deliver(&mut a, &mut b, 40);
+        let next = b.receive.next();
+        let ack = b.snd_nxt;
+        inject(&mut b, 50, next.wrapping_add(4), ack, ACK, 64, b"ooo");
+        assert_eq!(b.receive_used, 6);
+        inject(&mut b, 60, next, ack, RST | ACK, 64, b"ignored");
+        assert_eq!(b.state(), State::Closed);
+        assert_eq!(b.readable_bytes(), 0);
+        assert_eq!(b.read(&mut [0; 8]), Err(Error::InvalidState));
+        assert_eq!(b.terminal_readable_bytes(), 3);
+        let read_before = b.received_read;
+        let mut out = [0; 8];
+        assert_eq!(b.read_terminal(&mut out[..1]), Ok(1));
+        assert_eq!(&out[..1], b"a");
+        assert_eq!(b.terminal_readable_bytes(), 2);
+        assert_eq!(b.read_terminal(&mut out), Ok(2));
+        assert_eq!(&out[..2], b"bc");
+        assert_eq!(b.received_read, read_before + 3);
+        assert_eq!(b.receive_used, 3);
+        assert_eq!(b.read_terminal(&mut out), Ok(0));
+        assert!(!b.ack_pending);
+        assert!(b.transmit(70, &mut [0; 128]).unwrap().is_none());
+
+        let (mut a, mut b) = pair(config(64, 8), 100);
+        a.write(b"abc").unwrap();
+        deliver(&mut a, &mut b, 40);
+        b.close().unwrap(); // Explicitly discards the read side and aborts.
+        assert_eq!(b.state(), State::Closed);
+        assert_eq!(b.terminal_readable_bytes(), 0);
+        assert_eq!(b.read_terminal(&mut out), Ok(0));
     }
 
     #[test]
