@@ -82,6 +82,7 @@ struct Request {
     b: i32,
     bytes: Vec<u8>,
     capacity: usize,
+    // Read destinations or write sources, snapshotted before owner submission.
     destinations: Vec<(usize, usize)>,
     deadline: Option<Instant>,
     started: bool,
@@ -863,6 +864,18 @@ impl Owner {
                     if matches!(state, State::SynSent | State::SynReceived) {
                         return self.block(r);
                     }
+                    // Resolve payload faults only after serialized error/state checks.
+                    // Keep the owned copy for retries; never preflight the owner separately.
+                    if !r.destinations.is_empty() {
+                        let mut bytes = vec![0; r.destinations.iter().map(|v| v.1).sum()];
+                        let mut at = 0;
+                        for &(address, len) in &r.destinations {
+                            memory(bytes[at..].as_mut_ptr(), address as *mut u8, len, false)?;
+                            at += len;
+                        }
+                        r.bytes = bytes;
+                        r.destinations.clear();
+                    }
                     if r.bytes.is_empty() {
                         return Ok(Some(response));
                     }
@@ -974,6 +987,12 @@ impl Owner {
             }
             9 => {
                 let id = self.connection(r.fd)?;
+                if matches!(
+                    self.endpoint.state(id).map_err(error)?,
+                    State::Closed | State::TimeWait
+                ) {
+                    return Err(ENOTCONN);
+                }
                 if !(SHUT_RD..=SHUT_RDWR).contains(&r.a) {
                     return Err(EINVAL);
                 }
@@ -1565,13 +1584,15 @@ unsafe fn call_inner(
         if userdata.is_null() {
             return Err(EIO);
         }
-        if input_len > BYTES || (matches!(op, 6 | 20) && output_len > BYTES) {
+        if input_len > BYTES || (matches!(op, 6 | 20 | 21) && output_len > BYTES) {
             return Err(unsupported("scalar I/O exceeds 65535-byte adapter bound"));
         }
-        if input_len != 0 && input.is_null() || op != 20 && output_len != 0 && output.is_null() {
+        if input_len != 0 && input.is_null()
+            || !matches!(op, 20 | 21) && output_len != 0 && output.is_null()
+        {
             return Err(EFAULT);
         }
-        let bytes = if input_len == 0 {
+        let bytes = if input_len == 0 || op == 7 {
             Vec::new()
         } else {
             let mut bytes = vec![0; input_len];
@@ -1583,7 +1604,7 @@ unsafe fn call_inner(
             )?;
             bytes
         };
-        let destinations = if op == 20 {
+        let destinations = if matches!(op, 20 | 21) {
             if !input_len.is_multiple_of(std::mem::size_of::<iovec>())
                 || input_len / std::mem::size_of::<iovec>() > 1024
             {
@@ -1606,6 +1627,8 @@ unsafe fn call_inner(
                 return Err(EINVAL);
             }
             destinations
+        } else if op == 7 {
+            vec![(input as usize, input_len)]
         } else if op == 6 {
             vec![(output as usize, output_len)]
         } else {
@@ -1613,11 +1636,15 @@ unsafe fn call_inner(
         };
         let (reply, _) = mpsc::sync_channel(1);
         let request = Request {
-            op: if op == 20 { 6 } else { op },
+            op: match op {
+                20 => 6,
+                21 => 7,
+                _ => op,
+            },
             fd,
             a,
             b,
-            bytes,
+            bytes: if op == 21 { Vec::new() } else { bytes },
             capacity: output_len.min(BYTES),
             destinations,
             deadline: if op == 13 && a > 0 {

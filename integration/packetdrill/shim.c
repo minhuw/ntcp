@@ -80,15 +80,9 @@ static ssize_t vector(void *u, int fd, const struct iovec *v, int count, int wri
         // Rust owns copyout and commits stream bytes only after all vectors succeed.
         return CALL(20, fd, flags, 0, vectors, count * sizeof(*v), NULL, total, NULL);
     }
-    unsigned char *buf = malloc(total ? total : 1);
-    if (!buf) return bad(ENOMEM);
-    size_t at = 0;
-    for (int i = 0; i < count; i++) {
-        if (memory(buf + at, vectors[i].iov_base, vectors[i].iov_len, 0)) { free(buf); return -1; }
-        at += vectors[i].iov_len;
-    }
-    ssize_t result = send_socket(u, fd, buf, total, flags);
-    free(buf); return result;
+    if (flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) return unsupported("send flags");
+    // Snapshot only bounded descriptors here; the owner checks state before payload copy.
+    return CALL(21, fd, flags, 0, vectors, count * sizeof(*v), NULL, total, NULL);
 }
 static ssize_t readv_socket(void *u, int fd, const struct iovec *v, int n) { return vector(u, fd, v, n, 0, 0); }
 static ssize_t writev_socket(void *u, int fd, const struct iovec *v, int n) { return vector(u, fd, v, n, 1, 0); }
@@ -415,4 +409,21 @@ void ntcp_abi_fault_check(void *u, int fd) {
     assert(p.ioctl(u, fd, SIOCINQ, &queued) == 0 && queued == 0);
     assert(p.recv(u, fd, badptr, 1, MSG_DONTWAIT) == -1 && errno == EAGAIN);
     assert(munmap(mapping, page * 2) == 0);
+}
+
+// Exercise every send entry point with readable descriptors and inaccessible payload.
+void ntcp_abi_send_error_check(void *u, int fd, int first_error) {
+    struct packetdrill_interface p;
+    ntcp_fill(&p, u);
+    size_t page = sysconf(_SC_PAGESIZE);
+    void *payload = mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(payload != MAP_FAILED);
+    struct iovec v = {payload, 6};
+    struct msghdr msg = {.msg_iov = &v, .msg_iovlen = 1};
+    assert(p.write(u, fd, payload, 6) == -1 && errno == first_error);
+    assert(p.send(u, fd, payload, 6, MSG_NOSIGNAL) == -1 && errno == EPIPE);
+    assert(p.sendto(u, fd, payload, 6, 0, NULL, 0) == -1 && errno == EPIPE);
+    assert(p.writev(u, fd, &v, 1) == -1 && errno == EPIPE);
+    assert(p.sendmsg(u, fd, &msg, MSG_NOSIGNAL) == -1 && errno == EPIPE);
+    assert(munmap(payload, page) == 0);
 }
