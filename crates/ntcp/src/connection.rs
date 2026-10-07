@@ -5279,7 +5279,12 @@ impl Connection {
             if self.shutdown
                 && self.fin_sequence.is_none()
                 && count == unsent
-                && usable > count
+                // FIN occupies sequence space, not data space (RFC 9293
+                // section 3.4). RFC 5681 section 2 and RFC 9937 section 3
+                // constrain data: a standalone FIN need not wait for cwnd.
+                // Keep peer-window admission and the existing PRR gate.
+                && self.snd_wnd.saturating_sub(self.flight()) as usize > count
+                && (usable > count || count == 0 && self.prr.is_none())
                 && matches!(self.state, State::Established | State::CloseWait)
             {
                 flags |= FIN;
@@ -15068,6 +15073,64 @@ mod tests {
         assert_eq!(b.read(&mut out), Ok(10));
         assert_eq!(&out[..10], b"abcdefghij");
         assert_eq!(b.read(&mut out), Ok(0));
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
+    //= type=test
+    //= reason=Full IW10 payload flight permits a standalone FIN, but exhausted peer window and zero PRR credit still defer it; failed encoding cannot commit sequence, state or timers.
+    //# Queue this until all preceding SENDs have been segmentized, then form a
+    //# FIN segment and send it.
+    fn standalone_fin_at_full_cwnd_preserves_window_prr_and_output_commit() {
+        let cfg = ConnectionConfig {
+            initial_window: InitialWindow::Iw10,
+            nagle: false,
+            ..config(32_768, 1_000)
+        };
+        for iss in [100, u32::MAX - 5_000] {
+            let (mut a, _) = pair(cfg.clone(), iss);
+            assert_eq!(a.congestion.cwnd(), 10_000);
+            a.write(&[1; 10_000]).unwrap();
+            for _ in 0..10 {
+                let bytes = packet(&mut a, 40);
+                let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(segment.payload.len(), 1_000);
+                assert_eq!(segment.header.flags & FIN, 0);
+            }
+            assert_eq!(a.flight(), a.congestion.cwnd());
+            a.shutdown().unwrap();
+            let next = a.snd_nxt;
+            let window = a.snd_wnd;
+            for closed_window in [0, a.flight()] {
+                a.snd_wnd = closed_window;
+                assert_eq!(a.transmit(50, &mut [0; 64]), Ok(None));
+                assert_eq!(a.fin_sequence, None);
+                assert_eq!(a.snd_nxt, next);
+                assert_eq!(a.state(), State::Established);
+            }
+            a.snd_wnd = window;
+            a.prr = Some(Prr::new(a.flight(), a.mss as u32, PrrAlgorithm::Rfc9937));
+            assert_eq!(a.prr.unwrap().credit(), 0);
+            assert_eq!(a.transmit(50, &mut [0; 64]), Ok(None));
+            assert_eq!(a.prr.unwrap().credit(), 0);
+            a.prr = None;
+            let before = (a.now, a.rto_deadline, a.last_sent, a.fin_sent_at);
+            assert_eq!(a.transmit(50, &mut [0; 19]), Err(Error::OutputTooSmall));
+            assert_eq!((a.now, a.rto_deadline, a.last_sent, a.fin_sent_at), before);
+            assert_eq!(a.fin_sequence, None);
+            assert_eq!(a.snd_nxt, next);
+            assert_eq!(a.state(), State::Established);
+            let bytes = packet(&mut a, 50);
+            let fin = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(fin.header.flags, FIN | ACK);
+            assert!(fin.payload.is_empty());
+            assert_eq!(fin.header.sequence, next.0);
+            assert_eq!(a.fin_sequence, Some(next));
+            assert_eq!(a.snd_nxt, next.wrapping_add(1));
+            assert_eq!(a.state(), State::FinWait1);
+            assert_eq!(a.congestion.cwnd(), 10_000);
+            assert_eq!(a.transmit(50, &mut [0; 64]), Ok(None));
+        }
     }
 
     #[test]
