@@ -11,22 +11,23 @@ fn native() {
     assert_eq!(
         env::var("HOST").unwrap(),
         env::var("TARGET").unwrap(),
-        "ntcp-dpdk native: cross compilation is not supported by this build script"
+        "ntcp-io-dpdk native: cross compilation is not supported by this build script"
     );
     let static_link = env::var_os("CARGO_FEATURE_STATIC").is_some();
     let sdk = pkg_config::Config::new()
         .statik(static_link)
         .cargo_metadata(false)
         .probe("libdpdk")
-        .unwrap_or_else(|e| panic!("ntcp-dpdk native requires the DPDK SDK, pkg-config libdpdk, and a C compiler. Set PKG_CONFIG_PATH for your SDK. No stub backend is built: {e}"));
+        .unwrap_or_else(|e| panic!("ntcp-io-dpdk native requires the DPDK SDK, pkg-config libdpdk, and a C compiler. Set PKG_CONFIG_PATH for your SDK. No stub backend is built: {e}"));
     // Keep SDK-specific flags, including -include rte_config.h and -march.
-    let output = pkg_config_cflags(static_link).expect("ntcp-dpdk native: cannot run pkg-config");
+    let output =
+        pkg_config_cflags(static_link).expect("ntcp-io-dpdk native: cannot run pkg-config");
     assert!(
         output.status.success(),
-        "ntcp-dpdk native: pkg-config --cflags failed"
+        "ntcp-io-dpdk native: pkg-config --cflags failed"
     );
     let flags = shlex::split(std::str::from_utf8(&output.stdout).unwrap())
-        .expect("ntcp-dpdk native: invalid quoted pkg-config flags");
+        .expect("ntcp-io-dpdk native: invalid quoted pkg-config flags");
     cc::Build::new()
         .file("src/shim.c")
         .flags(&flags)

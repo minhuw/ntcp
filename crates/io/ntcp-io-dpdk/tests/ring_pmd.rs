@@ -1,5 +1,5 @@
-use ntcp_dpdk::{Dpdk, MAX_PACKET_LEN};
 use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
+use ntcp_io_dpdk::{Dpdk, MAX_PACKET_LEN};
 use std::ffi::c_void;
 
 unsafe extern "C" {

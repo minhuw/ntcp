@@ -2,7 +2,7 @@
 set -euo pipefail
 trap 'echo "native AF_XDP runner failed at line $LINENO (requires kernel support and CAP_SYS_ADMIN, CAP_NET_ADMIN, CAP_NET_RAW, CAP_BPF)" >&2' ERR
 
-root=$(cd "$(dirname "$0")/../../.." && pwd)
+root=$(cd "$(dirname "$0")/../../../.." && pwd)
 cd "$root"
 for tool in cargo clang python3 unshare mount umount ip bpftool readlink mktemp rm; do
     command -v "$tool" >/dev/null || { echo "missing required tool: $tool" >&2; exit 1; }
@@ -18,7 +18,7 @@ fi
 assets=$(mktemp -d /tmp/ntcpxdpXXXXXX)
 trap 'rm -rf "$assets"' EXIT
 # Build outside the network namespace; all generated assets are disposable.
-CARGO_TARGET_DIR="$assets/target" cargo test -p ntcp-af-xdp --test native --no-run --message-format=json >"$assets/build.json"
+CARGO_TARGET_DIR="$assets/target" cargo test -p ntcp-io-af-xdp --test native --no-run --message-format=json >"$assets/build.json"
 binary=$(python3 - "$assets/build.json" <<'PY'
 import json
 import sys
@@ -31,7 +31,7 @@ print(binaries[0])
 PY
 )
 multiarch=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("MULTIARCH") or "")')
-clang -O2 -g -target bpf -I"/usr/include/$multiarch" -c crates/ntcp-af-xdp/tests/redirect.c -o "$assets/redirect.o"
+clang -O2 -g -target bpf -I"/usr/include/$multiarch" -c crates/io/ntcp-io-af-xdp/tests/redirect.c -o "$assets/redirect.o"
 
 # No setup command can run unless BOTH namespace identities differ from the caller.
 "${privilege[@]}" "$(command -v unshare)" --net --mount --propagation private \

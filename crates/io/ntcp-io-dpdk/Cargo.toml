@@ -1,8 +1,9 @@
 [package]
-name = "ntcp-dpdk"
+name = "ntcp-io-dpdk"
 version = "0.0.1"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/minhuw/ntcp"
 description = "Caller-driven native DPDK packet I/O"
 links = "ntcp_dpdk_shim"
 

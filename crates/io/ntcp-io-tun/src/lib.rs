@@ -1,7 +1,6 @@
-use crate::{
-    PacketIo, PacketLayer, TxOutcome,
-    af_packet::{received, transmitted},
-};
+#![cfg(target_os = "linux")]
+
+use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
 use std::{
     fs::OpenOptions,
     io,
@@ -10,6 +9,42 @@ use std::{
         unix::fs::OpenOptionsExt,
     },
 };
+
+pub(crate) fn received(count: isize, capacity: usize) -> io::Result<Option<usize>> {
+    if count < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::WouldBlock {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    if count as usize > capacity {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "packet exceeds output buffer; packet discarded",
+        ));
+    }
+    Ok(Some(count as usize))
+}
+
+pub(crate) fn transmitted(count: isize, length: usize) -> io::Result<TxOutcome> {
+    if count < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::WouldBlock {
+            Ok(TxOutcome::WouldBlock)
+        } else {
+            Err(error)
+        };
+    }
+    if count as usize != length {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "short packet write",
+        ));
+    }
+    Ok(TxOutcome::Submitted)
+}
 
 pub struct Tun {
     fd: OwnedFd,
@@ -276,7 +311,70 @@ impl AsRawFd for Tun {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::af_packet::tests::{backpressure, flags, pair};
+    pub(crate) fn backpressure(a: &mut impl PacketIo, b: &mut impl PacketIo) {
+        let mut out = [0; 1024];
+        for submitted in 0..10000 {
+            let packet = [submitted as u8; 1024];
+            if b.transmit(&packet).unwrap() == TxOutcome::WouldBlock {
+                for sequence in 0..submitted {
+                    assert_eq!(a.receive(&mut out).unwrap(), Some(1024));
+                    assert_eq!(out, [sequence as u8; 1024]);
+                }
+                // The rejected send did not enqueue another copy.
+                assert_eq!(a.receive(&mut out).unwrap(), None);
+                assert_eq!(b.transmit(&packet).unwrap(), TxOutcome::Submitted);
+                assert_eq!(a.receive(&mut out).unwrap(), Some(packet.len()));
+                assert_eq!(out, packet);
+                assert_eq!(a.receive(&mut out).unwrap(), None);
+                return;
+            }
+        }
+        panic!("queue never filled");
+    }
+
+    pub(crate) fn flags(fd: RawFd) {
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK,
+            0
+        );
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+    }
+
+    pub(crate) fn pair() -> (OwnedFd, OwnedFd) {
+        let mut fds = [-1; 2];
+        // SAFETY: socketpair initializes two distinct owned fds on success.
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let size: libc::c_int = 4096;
+        for fd in fds {
+            // SAFETY: size is a correctly sized socket option integer.
+            assert_eq!(
+                unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        (&size as *const libc::c_int).cast(),
+                        std::mem::size_of_val(&size) as libc::socklen_t,
+                    )
+                },
+                0
+            );
+        }
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
 
     #[test]
     fn malformed_attributes_fail_closed() {

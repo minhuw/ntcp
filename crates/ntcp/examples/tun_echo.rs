@@ -9,7 +9,8 @@ mod linux {
         AddressValidation, ConnectionConfig, ConnectionId, Endpoint, EndpointConfig, EndpointError,
         Error, Event, IpMetadata, Ipv4Options, State,
     };
-    use ntcp_io::{PacketIo, TxOutcome, tun::Tun};
+    use ntcp_io::{PacketIo, TxOutcome};
+    use ntcp_io_tun::Tun;
     use std::{
         io,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},

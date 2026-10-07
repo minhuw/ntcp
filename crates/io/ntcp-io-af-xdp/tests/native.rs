@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
-use ntcp_af_xdp::{AfXdp, Config};
 use ntcp_io::{PacketIo, TxOutcome};
+use ntcp_io_af_xdp::{AfXdp, Config};
 use std::{
     ffi::CString,
     io,

@@ -17,4 +17,5 @@ sha2 = { version = "0.10", default-features = false }
 [dev-dependencies]
 libc = "0.2"
 ntcp-ip = { version = "0.0.1", path = "../ntcp-ip" }
-ntcp-io = { version = "0.0.1", path = "../ntcp-io" }
+ntcp-io = { version = "0.0.1", path = "../io/ntcp-io" }
+ntcp-io-tun = { version = "0.0.1", path = "../io/ntcp-io-tun" }

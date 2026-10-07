@@ -23,8 +23,3 @@ pub trait PacketIo {
     fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>>;
     fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome>;
 }
-
-#[cfg(target_os = "linux")]
-pub mod af_packet;
-#[cfg(target_os = "linux")]
-pub mod tun;

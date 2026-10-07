@@ -95,12 +95,26 @@ dependencies = [
  "hmac",
  "libc",
  "ntcp-io",
+ "ntcp-io-tun",
  "ntcp-ip",
  "sha2",
 ]
 
 [[package]]
-name = "ntcp-af-xdp"
+name = "ntcp-io"
+version = "0.0.1"
+
+[[package]]
+name = "ntcp-io-af-packet"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "ntcp-io",
+ "ntcp-io-tun",
+]
+
+[[package]]
+name = "ntcp-io-af-xdp"
 version = "0.0.1"
 dependencies = [
  "libc",
@@ -108,7 +122,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ntcp-dpdk"
+name = "ntcp-io-dpdk"
 version = "0.0.1"
 dependencies = [
  "cc",
@@ -118,10 +132,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "ntcp-io"
+name = "ntcp-io-tun"
 version = "0.0.1"
 dependencies = [
  "libc",
+ "ntcp-io",
 ]
 
 [[package]]

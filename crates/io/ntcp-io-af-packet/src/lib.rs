@@ -1,4 +1,6 @@
-use crate::{PacketIo, PacketLayer, TxOutcome};
+#![cfg(target_os = "linux")]
+
+use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
 use std::{
     io,
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},

@@ -1,6 +1,8 @@
 #![cfg(target_os = "linux")]
 
-use ntcp_io::{PacketIo, TxOutcome, af_packet::AfPacket, tun::Tun};
+use ntcp_io::{PacketIo, TxOutcome};
+use ntcp_io_af_packet::AfPacket;
+use ntcp_io_tun::Tun;
 use std::{io, net::UdpSocket, os::fd::AsRawFd, process::Command, time::Duration};
 
 fn ip(args: &[&str]) {
