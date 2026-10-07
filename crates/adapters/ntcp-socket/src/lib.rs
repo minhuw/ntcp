@@ -1151,7 +1151,48 @@ mod tests {
             )
         } == -1
             && errno() == EDEADLK;
-        SIGNAL_RESULT.store(if native && recursive { 1 } else { -1 }, Ordering::Relaxed);
+        let mut p = pollfd {
+            fd: SIGNAL_PIPE.load(Ordering::Relaxed),
+            events: POLLOUT,
+            revents: 0,
+        };
+        let zero = timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let native_poll = unsafe { readiness::poll(&mut p, 1, 0) } == 1;
+        let native_ppoll = unsafe { readiness::ppoll(&mut p, 1, &zero, ptr::null()) } == 1;
+        let mut set: fd_set = unsafe { std::mem::zeroed() };
+        unsafe { FD_SET(p.fd, &mut set) };
+        let mut timeout = timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        // The unrelated virtual fd is inside nfds but absent from the set.
+        let n = p.fd.max(SIGNAL_SOCKET.load(Ordering::Relaxed)) + 1;
+        let native_select = unsafe {
+            readiness::select(n, ptr::null_mut(), &mut set, ptr::null_mut(), &mut timeout)
+        } == 1;
+        let native_pselect = unsafe {
+            readiness::pselect(
+                n,
+                ptr::null_mut(),
+                &mut set,
+                ptr::null_mut(),
+                &zero,
+                ptr::null(),
+            )
+        } == 1;
+        p.fd = SIGNAL_SOCKET.load(Ordering::Relaxed);
+        let virtual_poll = unsafe { readiness::poll(&mut p, 1, 0) } == -1 && errno() == EDEADLK;
+        let passed = native
+            && recursive
+            && native_poll
+            && native_ppoll
+            && native_select
+            && native_pselect
+            && virtual_poll;
+        SIGNAL_RESULT.store(if passed { 1 } else { -1 }, Ordering::Relaxed);
     }
     #[test]
     fn signal_native_pipe_bypasses_locked_tokens_and_virtual_recursion_fails_closed() {

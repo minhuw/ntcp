@@ -343,17 +343,13 @@ pub unsafe extern "C" fn poll(p: *mut pollfd, n: nfds_t, timeout: i32) -> i32 {
     ffi(|| unsafe { poll_impl(p, n, timeout, ptr::null()) }) as i32
 }
 unsafe fn poll_impl(p: *mut pollfd, n: nfds_t, timeout: i32, mask: *const sigset_t) -> Result<i64> {
-    if !any_sockets() {
+    // Inspect on bounded stack storage before any allocation or registry lock;
+    // native readiness stays callable from an interrupted interposed operation.
+    if !any_sockets() || !unsafe { large_poll_virtual(p, n)? } {
         return raw(unsafe { syscall(SYS_poll, p, n, timeout) });
-    }
-    if DEPTH.with(Cell::get) > 1 || INTERNAL.with(Cell::get) {
-        return Err(EDEADLK);
     }
     if n > LIMIT as nfds_t {
-        if unsafe { large_poll_virtual(p, n)? } {
-            return Err(EINVAL);
-        }
-        return raw(unsafe { syscall(SYS_poll, p, n, timeout) });
+        return Err(EINVAL);
     }
     let mut original = load_array(p, poll_count(n)?, LIMIT)?;
     let mut owned_fds = Vec::new();
@@ -480,17 +476,11 @@ pub unsafe extern "C" fn select(
     t: *mut timeval,
 ) -> i32 {
     ffi(|| {
-        if !select_maybe_virtual(n) {
+        if !select_maybe_virtual(n) || !large_select_virtual(n, [r, w, e])? {
             return raw(unsafe { syscall(SYS_select, n, r, w, e, t) });
-        }
-        if DEPTH.with(Cell::get) > 1 || INTERNAL.with(Cell::get) {
-            return Err(EDEADLK);
         }
         if n > FD_SETSIZE as i32 {
-            if large_select_virtual(n, [r, w, e])? {
-                return Err(EINVAL);
-            }
-            return raw(unsafe { syscall(SYS_select, n, r, w, e, t) });
+            return Err(EINVAL);
         }
         let mut rs = input_set(r, n)?;
         let mut ws = input_set(w, n)?;
@@ -652,22 +642,7 @@ unsafe fn large_poll_virtual(p: *const pollfd, n: nfds_t) -> Result<bool> {
     Ok(false)
 }
 unsafe fn virtual_poll(p: *const pollfd, n: nfds_t) -> Result<bool> {
-    if !any_sockets() {
-        return Ok(false);
-    }
-    if DEPTH.with(Cell::get) > 1 || INTERNAL.with(Cell::get) {
-        return Err(EDEADLK);
-    }
-    if n > LIMIT as nfds_t {
-        return unsafe { large_poll_virtual(p, n) };
-    }
-    let fds = load_array(p, poll_count(n)?, LIMIT)?;
-    for p in fds {
-        if owned(p.fd)?.is_some() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(any_sockets() && unsafe { large_poll_virtual(p, n)? })
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ppoll(
@@ -715,29 +690,8 @@ pub unsafe extern "C" fn pselect(
     mask: *const sigset_t,
 ) -> i32 {
     ffi(|| {
-        if select_maybe_virtual(n) {
-            if DEPTH.with(Cell::get) > 1 || INTERNAL.with(Cell::get) {
-                return Err(EDEADLK);
-            }
-            if n > FD_SETSIZE as i32 {
-                if large_select_virtual(n, [r, w, e])? {
-                    return Err(EOPNOTSUPP);
-                }
-            } else {
-                let rs = input_set(r, n)?;
-                let ws = input_set(w, n)?;
-                let es = input_set(e, n)?;
-                for fd in 0..n {
-                    let set = unsafe {
-                        (!r.is_null() && FD_ISSET(fd, &rs))
-                            || (!w.is_null() && FD_ISSET(fd, &ws))
-                            || (!e.is_null() && FD_ISSET(fd, &es))
-                    };
-                    if set && owned(fd)?.is_some() {
-                        return Err(EOPNOTSUPP);
-                    }
-                }
-            }
+        if select_maybe_virtual(n) && large_select_virtual(n, [r, w, e])? {
+            return Err(EOPNOTSUPP);
         }
         #[repr(C)]
         struct Mask {
