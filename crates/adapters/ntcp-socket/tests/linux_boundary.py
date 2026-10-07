@@ -70,6 +70,7 @@ def main():
     if len(sys.argv) == 3 and sys.argv[1] == '--isolated':
         isolated(Path(sys.argv[2]))
         return
+    run([sys.executable, str(Path(__file__).with_name('boundary_mask.py'))])
     run(['cargo', 'build', '-p', 'ntcp-socket'], timeout=180)
     with tempfile.TemporaryDirectory(prefix='ntcp-boundary-') as directory:
         directory = Path(directory)

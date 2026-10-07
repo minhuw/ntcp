@@ -85,7 +85,7 @@ fn deadline(timeout: i32) -> Option<Instant> {
     (timeout >= 0).then(|| Instant::now() + Duration::from_millis(timeout as u64))
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn epoll_create(size: i32) -> i32 {
+pub unsafe extern "C" fn ntcp_managed_epoll_create(size: i32) -> i32 {
     ffi(|| {
         if size <= 0 {
             Err(EINVAL)
@@ -95,11 +95,16 @@ pub unsafe extern "C" fn epoll_create(size: i32) -> i32 {
     }) as i32
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn epoll_create1(flags: i32) -> i32 {
+pub unsafe extern "C" fn ntcp_managed_epoll_create1(flags: i32) -> i32 {
     ffi(|| raw(unsafe { syscall(SYS_epoll_create1, flags) })) as i32
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn epoll_ctl(epfd: i32, op: i32, fd: i32, p: *mut epoll_event) -> i32 {
+pub unsafe extern "C" fn ntcp_managed_epoll_ctl(
+    epfd: i32,
+    op: i32,
+    fd: i32,
+    p: *mut epoll_event,
+) -> i32 {
     ffi(|| {
         let Some(id) = owned(fd)? else {
             if is_epoll(fd)? {
@@ -901,3 +906,7 @@ pub unsafe extern "C" fn ntcp_boundary_select(
     }
     ffi(|| Ok(large_select_virtual(n, [r, w, e])? as i64)) as i32
 }
+
+boundary_entry!(epoll_create, "ntcp_c_epoll_create", (size: i32) -> i32);
+boundary_entry!(epoll_create1, "ntcp_c_epoll_create1", (flags: i32) -> i32);
+boundary_entry!(epoll_ctl, "ntcp_c_epoll_ctl", (epfd: i32, op: i32, fd: i32, p: *mut epoll_event) -> i32);

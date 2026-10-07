@@ -1,6 +1,7 @@
 // Native cancellation points live entirely in C: POSIX forced unwind must
 // never cross a Rust frame. Internal runtime operations still use raw syscalls.
 #define _GNU_SOURCE
+#include "boundary.h"
 #include <dlfcn.h>
 #include <errno.h>
 #include <pthread.h>
@@ -129,20 +130,14 @@ static void ensure_boundary(void) {
 }
 
 #define MANAGED(type, name, args) do { \
-    int state; \
-    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &state); \
-    type result = ntcp_managed_##name args; \
-    int saved = errno; \
-    pthread_setcancelstate(state, NULL); \
-    errno = saved; \
-    return result; \
+    return NTCP_RUST_CALL(type, ntcp_managed_##name args); \
 } while (0)
 
 ssize_t ntcp_c_read(int fd, void *p, size_t n) {
     ensure_boundary();
     if (internal) { MANAGED(ssize_t, read, (fd,p,n)); }
     if (!real_read) { return syscall(SYS_read,fd,p,n); }
-    if (!(ntcp_boundary_fd(fd))) return real_read(fd,p,n);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(fd)))) return real_read(fd,p,n);
     MANAGED(ssize_t, read, (fd,p,n));
 }
 
@@ -150,7 +145,7 @@ ssize_t ntcp_c_write(int fd, const void *p, size_t n) {
     ensure_boundary();
     if (internal) { MANAGED(ssize_t, write, (fd,p,n)); }
     if (!real_write) { return syscall(SYS_write,fd,p,n); }
-    if (!(ntcp_boundary_fd(fd))) return real_write(fd,p,n);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(fd)))) return real_write(fd,p,n);
     MANAGED(ssize_t, write, (fd,p,n));
 }
 
@@ -158,7 +153,7 @@ ssize_t ntcp_c_readv(int fd, const struct iovec *v, int n) {
     ensure_boundary();
     if (internal) { MANAGED(ssize_t, readv, (fd,v,n)); }
     if (!real_readv) { return syscall(SYS_readv,fd,v,n); }
-    if (!(ntcp_boundary_fd(fd))) return real_readv(fd,v,n);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(fd)))) return real_readv(fd,v,n);
     MANAGED(ssize_t, readv, (fd,v,n));
 }
 
@@ -166,7 +161,7 @@ ssize_t ntcp_c_writev(int fd, const struct iovec *v, int n) {
     ensure_boundary();
     if (internal) { MANAGED(ssize_t, writev, (fd,v,n)); }
     if (!real_writev) { return syscall(SYS_writev,fd,v,n); }
-    if (!(ntcp_boundary_fd(fd))) return real_writev(fd,v,n);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(fd)))) return real_writev(fd,v,n);
     MANAGED(ssize_t, writev, (fd,v,n));
 }
 
@@ -174,7 +169,7 @@ ssize_t ntcp_c_send(int fd, const void *p, size_t n, int flags) {
     ensure_boundary();
     if (internal) { MANAGED(ssize_t, send, (fd,p,n,flags)); }
     if (!real_send) { return syscall(SYS_sendto,fd,p,n,flags,0,0); }
-    if (!(ntcp_boundary_fd(fd))) return real_send(fd,p,n,flags);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(fd)))) return real_send(fd,p,n,flags);
     MANAGED(ssize_t, send, (fd,p,n,flags));
 }
 
@@ -182,7 +177,7 @@ ssize_t ntcp_c_recv(int fd, void *p, size_t n, int flags) {
     ensure_boundary();
     if (internal) { MANAGED(ssize_t, recv, (fd,p,n,flags)); }
     if (!real_recv) { return syscall(SYS_recvfrom,fd,p,n,flags,0,0); }
-    if (!(ntcp_boundary_fd(fd))) return real_recv(fd,p,n,flags);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(fd)))) return real_recv(fd,p,n,flags);
     MANAGED(ssize_t, recv, (fd,p,n,flags));
 }
 
@@ -190,7 +185,7 @@ ssize_t ntcp_c_sendto(int fd, const void *p, size_t n, int flags, const struct s
     ensure_boundary();
     if (internal) { MANAGED(ssize_t, sendto, (fd,p,n,flags,addr,len)); }
     if (!real_sendto) { return syscall(SYS_sendto,fd,p,n,flags,addr,len); }
-    if (!(ntcp_boundary_fd(fd))) return real_sendto(fd,p,n,flags,addr,len);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(fd)))) return real_sendto(fd,p,n,flags,addr,len);
     MANAGED(ssize_t, sendto, (fd,p,n,flags,addr,len));
 }
 
@@ -198,7 +193,7 @@ ssize_t ntcp_c_recvfrom(int fd, void *p, size_t n, int flags, struct sockaddr *a
     ensure_boundary();
     if (internal) { MANAGED(ssize_t, recvfrom, (fd,p,n,flags,addr,len)); }
     if (!real_recvfrom) { return syscall(SYS_recvfrom,fd,p,n,flags,addr,len); }
-    if (!(ntcp_boundary_fd(fd))) return real_recvfrom(fd,p,n,flags,addr,len);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(fd)))) return real_recvfrom(fd,p,n,flags,addr,len);
     MANAGED(ssize_t, recvfrom, (fd,p,n,flags,addr,len));
 }
 
@@ -206,7 +201,7 @@ ssize_t ntcp_c_sendmsg(int fd, const struct msghdr *p, int flags) {
     ensure_boundary();
     if (internal) { MANAGED(ssize_t, sendmsg, (fd,p,flags)); }
     if (!real_sendmsg) { return syscall(SYS_sendmsg,fd,p,flags); }
-    if (!(ntcp_boundary_fd(fd))) return real_sendmsg(fd,p,flags);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(fd)))) return real_sendmsg(fd,p,flags);
     MANAGED(ssize_t, sendmsg, (fd,p,flags));
 }
 
@@ -214,7 +209,7 @@ ssize_t ntcp_c_recvmsg(int fd, struct msghdr *p, int flags) {
     ensure_boundary();
     if (internal) { MANAGED(ssize_t, recvmsg, (fd,p,flags)); }
     if (!real_recvmsg) { return syscall(SYS_recvmsg,fd,p,flags); }
-    if (!(ntcp_boundary_fd(fd))) return real_recvmsg(fd,p,flags);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(fd)))) return real_recvmsg(fd,p,flags);
     MANAGED(ssize_t, recvmsg, (fd,p,flags));
 }
 
@@ -222,7 +217,7 @@ int ntcp_c_accept(int fd, struct sockaddr *p, socklen_t *len) {
     ensure_boundary();
     if (internal) { MANAGED(int, accept, (fd,p,len)); }
     if (!real_accept) { return syscall(SYS_accept,fd,p,len); }
-    if (!(ntcp_boundary_fd(fd))) return real_accept(fd,p,len);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(fd)))) return real_accept(fd,p,len);
     MANAGED(int, accept, (fd,p,len));
 }
 
@@ -230,7 +225,7 @@ int ntcp_c_accept4(int fd, struct sockaddr *p, socklen_t *len, int flags) {
     ensure_boundary();
     if (internal) { MANAGED(int, accept4, (fd,p,len,flags)); }
     if (!real_accept4) { return syscall(SYS_accept4,fd,p,len,flags); }
-    if (!(ntcp_boundary_fd(fd))) return real_accept4(fd,p,len,flags);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(fd)))) return real_accept4(fd,p,len,flags);
     MANAGED(int, accept4, (fd,p,len,flags));
 }
 
@@ -238,7 +233,7 @@ int ntcp_c_connect(int fd, const struct sockaddr *p, socklen_t len) {
     ensure_boundary();
     if (internal) { MANAGED(int, connect, (fd,p,len)); }
     if (!real_connect) { return syscall(SYS_connect,fd,p,len); }
-    if (!(ntcp_boundary_fd(fd))) return real_connect(fd,p,len);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(fd)))) return real_connect(fd,p,len);
     MANAGED(int, connect, (fd,p,len));
 }
 
@@ -269,7 +264,7 @@ int ntcp_c_poll(struct pollfd *p, nfds_t n, int timeout) {
     ensure_boundary();
     if (internal) { MANAGED(int, poll, (p,n,timeout)); }
     if (!real_poll) { return syscall(SYS_poll,p,n,timeout); }
-    if (!(ntcp_boundary_poll(p,n))) return real_poll(p,n,timeout);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_poll(p,n)))) return real_poll(p,n,timeout);
     MANAGED(int, poll, (p,n,timeout));
 }
 
@@ -277,7 +272,7 @@ int ntcp_c_ppoll(struct pollfd *p, nfds_t n, const struct timespec *t, const sig
     ensure_boundary();
     if (internal) { MANAGED(int, ppoll, (p,n,t,mask)); }
     if (!real_ppoll) { errno = ENOSYS; return -1; }
-    if (!(ntcp_boundary_poll(p,n))) return real_ppoll(p,n,t,mask);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_poll(p,n)))) return real_ppoll(p,n,t,mask);
     MANAGED(int, ppoll, (p,n,t,mask));
 }
 
@@ -285,7 +280,7 @@ int ntcp_c_select(int n, fd_set *r, fd_set *w, fd_set *e, struct timeval *t) {
     ensure_boundary();
     if (internal) { MANAGED(int, select, (n,r,w,e,t)); }
     if (!real_select) { return syscall(SYS_select,n,r,w,e,t); }
-    if (!(ntcp_boundary_select(n,r,w,e))) return real_select(n,r,w,e,t);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_select(n,r,w,e)))) return real_select(n,r,w,e,t);
     MANAGED(int, select, (n,r,w,e,t));
 }
 
@@ -293,7 +288,7 @@ int ntcp_c_pselect(int n, fd_set *r, fd_set *w, fd_set *e, const struct timespec
     ensure_boundary();
     if (internal) { MANAGED(int, pselect, (n,r,w,e,t,mask)); }
     if (!real_pselect) { errno = ENOSYS; return -1; }
-    if (!(ntcp_boundary_select(n,r,w,e))) return real_pselect(n,r,w,e,t,mask);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_select(n,r,w,e)))) return real_pselect(n,r,w,e,t,mask);
     MANAGED(int, pselect, (n,r,w,e,t,mask));
 }
 
@@ -301,7 +296,7 @@ int ntcp_c_epoll_wait(int fd, struct epoll_event *p, int max, int timeout) {
     ensure_boundary();
     if (internal) { MANAGED(int, epoll_wait, (fd,p,max,timeout)); }
     if (!real_epoll_wait) { return syscall(SYS_epoll_wait,fd,p,max,timeout); }
-    if (!(ntcp_boundary_epoll(fd))) return real_epoll_wait(fd,p,max,timeout);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_epoll(fd)))) return real_epoll_wait(fd,p,max,timeout);
     MANAGED(int, epoll_wait, (fd,p,max,timeout));
 }
 
@@ -309,23 +304,41 @@ int ntcp_c_epoll_pwait(int fd, struct epoll_event *p, int max, int timeout, cons
     ensure_boundary();
     if (internal) { MANAGED(int, epoll_pwait, (fd,p,max,timeout,mask)); }
     if (!real_epoll_pwait) { errno = ENOSYS; return -1; }
-    if (!(ntcp_boundary_epoll(fd))) return real_epoll_pwait(fd,p,max,timeout,mask);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_epoll(fd)))) return real_epoll_pwait(fd,p,max,timeout,mask);
     MANAGED(int, epoll_pwait, (fd,p,max,timeout,mask));
 }
 
 int ntcp_c_epoll_pwait2(int fd, struct epoll_event *p, int max, const struct timespec *t, const sigset_t *mask) {
     ensure_boundary();
     if (internal) { MANAGED(int, epoll_pwait2, (fd,p,max,t,mask)); }
-    if (!real_epoll_pwait2) { errno = ENOSYS; return -1; }
-    if (!(ntcp_boundary_epoll(fd))) return real_epoll_pwait2(fd,p,max,t,mask);
-    MANAGED(int, epoll_pwait2, (fd,p,max,t,mask));
+    if (NTCP_RUST_CALL(int, ntcp_boundary_epoll(fd))) {
+        MANAGED(int, epoll_pwait2, (fd,p,max,t,mask));
+    }
+    if (real_epoll_pwait2) return real_epoll_pwait2(fd,p,max,t,mask);
+#ifdef SYS_epoll_pwait2
+    // The kernel expects its sigset size, not libc's padded sigset_t. A raw
+    // syscall is not a libc cancellation point: provide deferred cancellation
+    // in C, including cancellation while blocked in the syscall.
+    int type;
+    pthread_testcancel();
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &type);
+    int result = syscall(SYS_epoll_pwait2,fd,p,max,t,mask,_NSIG / 8);
+    int saved = errno;
+    pthread_setcanceltype(type, NULL);
+    pthread_testcancel();
+    errno = saved;
+    return result;
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
 }
 
 ssize_t ntcp_c___read_chk(int fd, void *p, size_t n, size_t size) {
     ensure_boundary();
     if (internal) { MANAGED(ssize_t, __read_chk, (fd,p,n,size)); }
     if (!real___read_chk) { errno = ENOSYS; return -1; }
-    if (!(ntcp_boundary_fd(fd))) return real___read_chk(fd,p,n,size);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(fd)))) return real___read_chk(fd,p,n,size);
     MANAGED(ssize_t, __read_chk, (fd,p,n,size));
 }
 
@@ -333,7 +346,7 @@ ssize_t ntcp_c___recv_chk(int fd, void *p, size_t n, size_t size, int flags) {
     ensure_boundary();
     if (internal) { MANAGED(ssize_t, __recv_chk, (fd,p,n,size,flags)); }
     if (!real___recv_chk) { errno = ENOSYS; return -1; }
-    if (!(ntcp_boundary_fd(fd))) return real___recv_chk(fd,p,n,size,flags);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(fd)))) return real___recv_chk(fd,p,n,size,flags);
     MANAGED(ssize_t, __recv_chk, (fd,p,n,size,flags));
 }
 
@@ -341,7 +354,7 @@ ssize_t ntcp_c___recvfrom_chk(int fd, void *p, size_t n, size_t size, int flags,
     ensure_boundary();
     if (internal) { MANAGED(ssize_t, __recvfrom_chk, (fd,p,n,size,flags,addr,len)); }
     if (!real___recvfrom_chk) { errno = ENOSYS; return -1; }
-    if (!(ntcp_boundary_fd(fd))) return real___recvfrom_chk(fd,p,n,size,flags,addr,len);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(fd)))) return real___recvfrom_chk(fd,p,n,size,flags,addr,len);
     MANAGED(ssize_t, __recvfrom_chk, (fd,p,n,size,flags,addr,len));
 }
 
@@ -349,7 +362,7 @@ int ntcp_c___poll_chk(struct pollfd *p, nfds_t n, int timeout, size_t size) {
     ensure_boundary();
     if (internal) { MANAGED(int, __poll_chk, (p,n,timeout,size)); }
     if (!real___poll_chk) { errno = ENOSYS; return -1; }
-    if (!(ntcp_boundary_poll(p,n))) return real___poll_chk(p,n,timeout,size);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_poll(p,n)))) return real___poll_chk(p,n,timeout,size);
     MANAGED(int, __poll_chk, (p,n,timeout,size));
 }
 
@@ -357,13 +370,68 @@ int ntcp_c___ppoll_chk(struct pollfd *p, nfds_t n, const struct timespec *t, con
     ensure_boundary();
     if (internal) { MANAGED(int, __ppoll_chk, (p,n,t,mask,size)); }
     if (!real___ppoll_chk) { errno = ENOSYS; return -1; }
-    if (!(ntcp_boundary_poll(p,n))) return real___ppoll_chk(p,n,t,mask,size);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_poll(p,n)))) return real___ppoll_chk(p,n,t,mask,size);
     MANAGED(int, __ppoll_chk, (p,n,t,mask,size));
 }
 
 int ntcp_c_socket(int domain, int kind, int protocol) {
     ensure_boundary();
     if (!real_socket || internal) return syscall(SYS_socket, domain, kind, protocol);
-    if (!ntcp_boundary_socket(domain, kind)) return real_socket(domain, kind, protocol);
+    if (!NTCP_RUST_CALL(int, ntcp_boundary_socket(domain, kind))) return real_socket(domain, kind, protocol);
     MANAGED(int, socket, (domain, kind, protocol));
+}
+
+// Non-cancellation libc APIs also need a C mask: a signal handler can enter
+// a native cancellation point while any of these Rust frames is interrupted.
+extern int ntcp_managed_bind(int fd, const struct sockaddr * p, socklen_t len);
+int ntcp_c_bind(int fd, const struct sockaddr * p, socklen_t len) {
+    MANAGED(int, bind, (fd,p,len));
+}
+extern int ntcp_managed_listen(int fd, int backlog);
+int ntcp_c_listen(int fd, int backlog) {
+    MANAGED(int, listen, (fd,backlog));
+}
+extern int ntcp_managed_shutdown(int fd, int how);
+int ntcp_c_shutdown(int fd, int how) {
+    MANAGED(int, shutdown, (fd,how));
+}
+extern int ntcp_managed_getsockname(int fd, struct sockaddr * p, socklen_t * len);
+int ntcp_c_getsockname(int fd, struct sockaddr * p, socklen_t * len) {
+    MANAGED(int, getsockname, (fd,p,len));
+}
+extern int ntcp_managed_getpeername(int fd, struct sockaddr * p, socklen_t * len);
+int ntcp_c_getpeername(int fd, struct sockaddr * p, socklen_t * len) {
+    MANAGED(int, getpeername, (fd,p,len));
+}
+extern int ntcp_managed_setsockopt(int fd, int level, int name, const void * p, socklen_t len);
+int ntcp_c_setsockopt(int fd, int level, int name, const void * p, socklen_t len) {
+    MANAGED(int, setsockopt, (fd,level,name,p,len));
+}
+extern int ntcp_managed_getsockopt(int fd, int level, int name, void * p, socklen_t * len);
+int ntcp_c_getsockopt(int fd, int level, int name, void * p, socklen_t * len) {
+    MANAGED(int, getsockopt, (fd,level,name,p,len));
+}
+extern int ntcp_managed_dup(int fd);
+int ntcp_c_dup(int fd) {
+    MANAGED(int, dup, (fd));
+}
+extern int ntcp_managed_dup2(int fd, int new);
+int ntcp_c_dup2(int fd, int new) {
+    MANAGED(int, dup2, (fd,new));
+}
+extern int ntcp_managed_dup3(int fd, int new, int flags);
+int ntcp_c_dup3(int fd, int new, int flags) {
+    MANAGED(int, dup3, (fd,new,flags));
+}
+extern int ntcp_managed_epoll_create(int size);
+int ntcp_c_epoll_create(int size) {
+    MANAGED(int, epoll_create, (size));
+}
+extern int ntcp_managed_epoll_create1(int flags);
+int ntcp_c_epoll_create1(int flags) {
+    MANAGED(int, epoll_create1, (flags));
+}
+extern int ntcp_managed_epoll_ctl(int epfd, int op, int fd, struct epoll_event * p);
+int ntcp_c_epoll_ctl(int epfd, int op, int fd, struct epoll_event * p) {
+    MANAGED(int, epoll_ctl, (epfd,op,fd,p));
 }

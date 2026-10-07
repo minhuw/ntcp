@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rerun-if-changed=src/boundary.h");
     println!("cargo:rerun-if-changed=src/variadic.c");
     println!("cargo:rerun-if-changed=src/boundary.c");
     println!("cargo:rerun-if-changed=src/stdio.c");

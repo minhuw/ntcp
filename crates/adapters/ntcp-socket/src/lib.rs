@@ -646,7 +646,7 @@ pub unsafe extern "C" fn ntcp_managed_socket(domain: i32, kind: i32, protocol: i
     }) as i32
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn bind(fd: i32, p: *const sockaddr, len: socklen_t) -> i32 {
+pub unsafe extern "C" fn ntcp_managed_bind(fd: i32, p: *const sockaddr, len: socklen_t) -> i32 {
     ffi(|| match owned(fd)? {
         Some(id) => {
             call(id, Op::Bind(unsafe { address(p, len)? }))?;
@@ -656,7 +656,7 @@ pub unsafe extern "C" fn bind(fd: i32, p: *const sockaddr, len: socklen_t) -> i3
     }) as i32
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn listen(fd: i32, backlog: i32) -> i32 {
+pub unsafe extern "C" fn ntcp_managed_listen(fd: i32, backlog: i32) -> i32 {
     ffi(|| match owned(fd)? {
         Some(id) => {
             call(id, Op::Listen(backlog))?;
@@ -761,7 +761,7 @@ pub unsafe extern "C" fn ntcp_managed_close(fd: i32) -> i32 {
     }) as i32
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn shutdown(fd: i32, how: i32) -> i32 {
+pub unsafe extern "C" fn ntcp_managed_shutdown(fd: i32, how: i32) -> i32 {
     ffi(|| match owned(fd)? {
         Some(id) => {
             call(id, Op::Shutdown(how))?;
@@ -807,11 +807,19 @@ unsafe fn name(fd: i32, p: *mut sockaddr, len: *mut socklen_t, peer: bool) -> i3
     }) as i32
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn getsockname(fd: i32, p: *mut sockaddr, len: *mut socklen_t) -> i32 {
+pub unsafe extern "C" fn ntcp_managed_getsockname(
+    fd: i32,
+    p: *mut sockaddr,
+    len: *mut socklen_t,
+) -> i32 {
     unsafe { name(fd, p, len, false) }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn getpeername(fd: i32, p: *mut sockaddr, len: *mut socklen_t) -> i32 {
+pub unsafe extern "C" fn ntcp_managed_getpeername(
+    fd: i32,
+    p: *mut sockaddr,
+    len: *mut socklen_t,
+) -> i32 {
     unsafe { name(fd, p, len, true) }
 }
 unsafe fn transfer(fd: i32, p: *mut c_void, n: usize, flags: i32, write: bool) -> Result<i64> {
@@ -1167,7 +1175,7 @@ fn timeout_micros(value: [i64; 2]) -> Result<u64> {
         .ok_or(EINVAL)
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn setsockopt(
+pub unsafe extern "C" fn ntcp_managed_setsockopt(
     fd: i32,
     level: i32,
     name: i32,
@@ -1198,7 +1206,7 @@ pub unsafe extern "C" fn setsockopt(
     }) as i32
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn getsockopt(
+pub unsafe extern "C" fn ntcp_managed_getsockopt(
     fd: i32,
     level: i32,
     name: i32,
@@ -1460,15 +1468,15 @@ fn duplicate(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Result<i64> {
     Ok(result)
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dup(fd: i32) -> i32 {
+pub unsafe extern "C" fn ntcp_managed_dup(fd: i32) -> i32 {
     ffi(|| duplicate(fd, None, SYS_dup as i32, 0)) as i32
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dup2(fd: i32, new: i32) -> i32 {
+pub unsafe extern "C" fn ntcp_managed_dup2(fd: i32, new: i32) -> i32 {
     ffi(|| duplicate(fd, Some(new), SYS_dup2 as i32, 0)) as i32
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dup3(fd: i32, new: i32, flags: i32) -> i32 {
+pub unsafe extern "C" fn ntcp_managed_dup3(fd: i32, new: i32, flags: i32) -> i32 {
     ffi(|| duplicate(fd, Some(new), SYS_dup3 as i32, flags as c_ulong)) as i32
 }
 
@@ -1997,3 +2005,24 @@ pub extern "C" fn ntcp_boundary_socket(domain: i32, kind: i32) -> i32 {
     }) as i32
 }
 boundary_entry!(socket, "ntcp_c_socket", (domain: i32, kind: i32, protocol: i32) -> i32);
+
+boundary_entry!(bind, "ntcp_c_bind", (fd: i32, p: *const sockaddr, len: socklen_t) -> i32);
+boundary_entry!(listen, "ntcp_c_listen", (fd: i32, backlog: i32) -> i32);
+boundary_entry!(shutdown, "ntcp_c_shutdown", (fd: i32, how: i32) -> i32);
+boundary_entry!(getsockname, "ntcp_c_getsockname", (fd: i32, p: *mut sockaddr, len: *mut socklen_t) -> i32);
+boundary_entry!(getpeername, "ntcp_c_getpeername", (fd: i32, p: *mut sockaddr, len: *mut socklen_t) -> i32);
+boundary_entry!(setsockopt, "ntcp_c_setsockopt", (
+    fd: i32,
+    level: i32,
+    name: i32,
+    p: *const c_void,
+    len: socklen_t) -> i32);
+boundary_entry!(getsockopt, "ntcp_c_getsockopt", (
+    fd: i32,
+    level: i32,
+    name: i32,
+    p: *mut c_void,
+    len: *mut socklen_t) -> i32);
+boundary_entry!(dup, "ntcp_c_dup", (fd: i32) -> i32);
+boundary_entry!(dup2, "ntcp_c_dup2", (fd: i32, new: i32) -> i32);
+boundary_entry!(dup3, "ntcp_c_dup3", (fd: i32, new: i32, flags: i32) -> i32);

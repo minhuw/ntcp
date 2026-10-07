@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "boundary.h"
 #include <stdarg.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -19,7 +20,7 @@ int ntcp_variadic_fcntl(int fd, int cmd, ...) {
     default: arg = (unsigned long)va_arg(ap, void *); break;
     }
     va_end(ap);
-    return ntcp_fcntl_dispatch(fd, cmd, arg);
+    return NTCP_RUST_CALL(int, ntcp_fcntl_dispatch(fd, cmd, arg));
 }
 int ntcp_variadic_ioctl(int fd, unsigned long cmd, ...) {
     unsigned long arg = 0;
@@ -34,5 +35,5 @@ int ntcp_variadic_ioctl(int fd, unsigned long cmd, ...) {
             arg = (unsigned long)va_arg(ap, void *);
     }
     va_end(ap);
-    return ntcp_ioctl_dispatch(fd, cmd, arg);
+    return NTCP_RUST_CALL(int, ntcp_ioctl_dispatch(fd, cmd, arg));
 }

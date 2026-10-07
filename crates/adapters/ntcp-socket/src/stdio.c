@@ -1,6 +1,7 @@
 // libc owns buffering, formatting, FILE locks and destruction. We only supply
 // socket transport callbacks and the identity libc's cookie streams lack.
 #define _GNU_SOURCE
+#include "boundary.h"
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -90,7 +91,7 @@ static int cookie_close(void *p) {
 FILE *ntcp_c_fdopen(int fd, const char *mode) {
     ensure_stdio();
     if (!real_fdopen) { errno = ENOSYS; return NULL; }
-    if (!ntcp_boundary_fd(fd)) return real_fdopen(fd, mode);
+    if (!NTCP_RUST_CALL(int, ntcp_boundary_fd(fd))) return real_fdopen(fd, mode);
     int state;
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &state);
     FILE *result = NULL;
