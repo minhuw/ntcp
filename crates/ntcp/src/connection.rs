@@ -113,6 +113,11 @@ pub struct ConnectionConfig {
     pub recovery_algorithm: RecoveryAlgorithm,
     // Optional growth/backoff policy; does not select loss recovery or PRR.
     pub congestion_algorithm: CongestionAlgorithm,
+    // RFC 9406 initial startup for CUBIC; false selects standard Reno slow start.
+    // Ignored when congestion_algorithm is Reno.
+    pub cubic_hystart: bool,
+    // Disable for a known single-flow path without competing traffic (RFC 9438).
+    pub cubic_fast_convergence: bool,
     //= https://www.rfc-editor.org/rfc/rfc6928#section-1
     //= reason=Settable Rfc5681/Iw10 selection with default-disabled IW10; deployment monitoring/application interactions remain enabling-actor obligations explicitly excluded from this implementation audit, not satisfied. No evidence for IW>10 is claimed.
     //# We recommend that all TCP implementations have a settable TCP IW parameter, as long as there is a reasonable effort to monitor for possible interactions with other Internet applications and services as described in Section 12. Furthermore, Section 10 details why 10 segments may be an appropriate value, and while that value may continue to rise in the future, this document does not include any supporting evidence for values of IW larger than 10.
@@ -228,6 +233,8 @@ impl Default for ConnectionConfig {
             ecn: true,
             recovery_algorithm: RecoveryAlgorithm::default(),
             congestion_algorithm: CongestionAlgorithm::default(),
+            cubic_hystart: true,
+            cubic_fast_convergence: true,
             initial_window: InitialWindow::default(),
             abort_with_ack: false,
             output_push_batch_segments: 0,
@@ -636,7 +643,9 @@ impl Connection {
             config.initial_window,
             Seq(iss),
         )
-        .with_congestion(config.congestion_algorithm, config.timebase);
+        .with_congestion(config.congestion_algorithm, config.timebase)
+        .with_cubic_hystart(config.cubic_hystart)
+        .with_cubic_fast_convergence(config.cubic_fast_convergence);
         //= https://www.rfc-editor.org/rfc/rfc6928#section-2
         //= reason=All initial-window choices share RFC6298 estimator and connection timer/sampling implementation. Default/configured >=1s floors retain the recommended floor; explicit subsecond Linux compatibility is a scoped departure, not universal inherited conformance.
         //# Implementations must also follow RFC 6298 [RFC6298] in order to avoid spurious RTO as described in Section 9.
@@ -3286,6 +3295,9 @@ impl Connection {
         let live_ack = if advancing { ack } else { self.snd_una };
         let sack_allowed =
             self.sack_receive && self.sack_fallback.is_none_or(|end| at_or_after(ack, end));
+        // Per-input ledger sample: SACK fallback may skip acknowledge entirely.
+        // Never let a prior ACK's candidate leak into startup or RTO sampling.
+        self.rack.ack_sample = None;
         let sack_evidence = if sack_allowed {
             let cumulative_delivery = if advancing {
                 self.scoreboard.unsacked_bytes(self.snd_una, ack)
@@ -3341,11 +3353,18 @@ impl Connection {
                     .rack
                     .mark_scoreboard_losses(&self.scoreboard, self.mss as u32);
             }
-            if self.rack_enabled()
-                && !advancing
-                && let Some(sample) = self.rack.ack_sample
-            {
-                self.update_rtt(sample);
+            if !advancing && let Some(sample) = self.rack.ack_sample {
+                self.congestion.observe_startup_ack(
+                    live_ack,
+                    crate::hystart::StartupAck {
+                        rtt: Some(sample),
+                        snd_nxt: self.snd_nxt,
+                        paced: self.pacing_enabled(),
+                    },
+                );
+                if self.rack_enabled() {
+                    self.update_rtt(sample);
+                }
             }
             update.newly_sacked != 0 && !update.overflow
         } else {
@@ -3836,6 +3855,10 @@ impl Connection {
     //= reason=IW10 divided/delayed new ACKs with outstanding flight restart at ACKtime+current RTO after estimator update; duplicate ACK does not restart, last new ACK cancels. RFC6298 universal timing audit remains separate.
     //# To minimize spurious retransmissions, implementations MUST follow RFC 6298 [RFC6298] to restart the retransmission timer with the current value of RTO for each ACK received that acknowledges new data.
     fn accept_ack(&mut self, ack: Seq, ece: bool, echo: Option<u32>, send_window: u32) {
+        // When the ledger is available, only its newly delivered complete
+        // original qualifies. A scalar RTTM pending across a SACK must not
+        // count that same transmission again on its later cumulative ACK.
+        let startup_scalar_allowed = !self.rack.valid();
         if !self.sack_receive {
             self.rack.acknowledge(
                 ack,
@@ -3905,6 +3928,7 @@ impl Connection {
         self.application_progress_at = self.now;
         self.consecutive_timeouts = 0;
         self.retx_pending = false;
+        let mut startup_rtt = None;
         if let Some((end, sent)) = self.sample
             && at_or_after(ack, end)
         {
@@ -3924,6 +3948,7 @@ impl Connection {
             //# to the spirit of the history specified in [RFC6298].
             if !self.timestamps || echo == Some(self.timestamp_value(sent)) {
                 let sample = self.now.saturating_sub(sent);
+                startup_rtt = Some(sample);
                 let updated = self.update_rtt(sample);
                 self.rack.sample(sample, self.now);
                 if updated && !syn_ack {
@@ -3952,6 +3977,19 @@ impl Connection {
                 bytes,
                 send_window,
             );
+            // Consume at most one fresh raw candidate, independent of the
+            // causal-round gate used by the fixed-weight RTO estimator. RACK's
+            // ledger excludes incomplete/retransmitted/previously delivered
+            // originals even when time-based loss detection is disabled.
+            self.congestion
+                .prepare_startup_ack(crate::hystart::StartupAck {
+                    rtt: self
+                        .rack
+                        .ack_sample
+                        .or(startup_rtt.filter(|_| startup_scalar_allowed)),
+                    snd_nxt: self.snd_nxt,
+                    paced: self.pacing_enabled(),
+                });
         }
         if !syn_ack
             && self
@@ -6105,6 +6143,12 @@ impl Connection {
                 && flight.saturating_add(unsent.min(self.mss) as u32) > self.congestion.cwnd();
             self.congestion
                 .on_data_sent(now, flight, self.data_high(), cwnd_limited);
+        }
+        if count != 0 && !syn && !keepalive {
+            self.congestion.on_startup_sent(
+                self.snd_nxt,
+                self.pacing_enabled() && !probe && !tlp && !retransmit,
+            );
         }
         self.arm_work();
         if (fresh_data || new_fin) && !tlp {

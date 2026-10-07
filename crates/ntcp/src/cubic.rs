@@ -14,6 +14,7 @@ const MAX_WINDOW: u32 = 0x7fff_ffff;
 pub(crate) struct Cubic {
     // Windows are bytes; estimates and fractional growth use Q32 bytes.
     w_max: u32,
+    pub(crate) fast_convergence: bool,
     cwnd_prior: u32,
     w_est: u128,
     fraction: u128,
@@ -35,6 +36,7 @@ impl Cubic {
     pub(crate) fn new(timebase: CallerTimebase) -> Self {
         Self {
             w_max: 0,
+            fast_convergence: true,
             cwnd_prior: 0,
             w_est: 0,
             fraction: 0,
@@ -70,10 +72,12 @@ impl Cubic {
         cwnd_limited: bool,
     ) {
         self.clock(now);
-        if !recovery && (flight >= cwnd || cwnd_limited) && cwnd != 0 {
+        self.active = !recovery && (flight >= cwnd || cwnd_limited) && cwnd != 0;
+        if self.active {
             self.limited_end = Some(end);
-            self.active = true;
         }
+        // A short application suffix stops the curve clock, but does not
+        // discard historical full-flight ACK eligibility.
     }
 
     pub(crate) fn prepare_ack(
@@ -124,6 +128,21 @@ impl Cubic {
         self.acked != 0
     }
 
+    pub(crate) fn slow_start_acked(&self) -> u32 {
+        self.acked
+    }
+
+    pub(crate) fn timebase(&self) -> CallerTimebase {
+        self.timebase
+    }
+
+    pub(crate) fn startup_exit(&mut self, cwnd: u32, mss: u32) {
+        // RFC 9438 section 4.10: no loss, no fast convergence.
+        self.cwnd_prior = cwnd;
+        self.w_max = cwnd;
+        self.start_epoch(cwnd, mss);
+    }
+
     fn reset_epoch(&mut self) {
         self.epoch = false;
         self.elapsed = 0;
@@ -132,7 +151,7 @@ impl Cubic {
 
     pub(crate) fn congestion(&mut self, cwnd: u32) {
         // RFC 9438 section 4.7: fast convergence, beta=0.7.
-        self.w_max = if cwnd < self.w_max {
+        self.w_max = if self.fast_convergence && cwnd < self.w_max {
             (u64::from(cwnd) * 17 / 20) as u32
         } else {
             cwnd

@@ -242,3 +242,78 @@ fn nonadvancing_receive_window_limit_freezes_clock() {
     assert_eq!(c.elapsed, 200_000);
     assert!(c.can_grow());
 }
+
+#[test]
+fn short_application_suffix_pauses_clock_not_historical_ack_credit() {
+    for scale in [1, 1000] {
+        let mut c = Cubic::new(CallerTimebase {
+            units_per_second: 1_000_000 * scale,
+            ..CallerTimebase::default()
+        });
+        c.congestion(10_000);
+        c.sent(0, 7000, 7000, Seq(7000), false, false);
+        c.prepare_ack(
+            100_000 * scale,
+            Some(100_000 * scale),
+            Seq(1000),
+            1000,
+            true,
+        );
+        let cwnd = c.grow(7000, 1000);
+        // Drained original plus a final short application suffix: less than
+        // current cwnd, no queued remainder. This is well before any RTO.
+        c.sent(110_000 * scale, 6500, cwnd, Seq(7500), false, false);
+        assert!(!c.active);
+        assert_eq!(c.limited_end, Some(Seq(7000)));
+        assert_eq!(c.elapsed, 10_000 * scale);
+        c.prepare_ack(
+            200_000 * scale,
+            Some(100_000 * scale),
+            Seq(2000),
+            1000,
+            true,
+        );
+        assert!(c.can_grow());
+        assert_eq!(c.elapsed, 10_000 * scale);
+        let next = c.grow(cwnd, 1000);
+        assert!(next > cwnd);
+        c.prepare_ack(
+            300_000 * scale,
+            Some(100_000 * scale),
+            Seq(7500),
+            5500,
+            true,
+        );
+        assert_eq!(c.slow_start_acked(), 5000); // Suffix itself earns no credit.
+        assert_eq!(c.elapsed, 10_000 * scale);
+    }
+}
+
+#[test]
+fn explicit_single_flow_fast_convergence_opt_out_and_lossless_epoch() {
+    let mut c = Cubic::new(CallerTimebase::default());
+    c.congestion(10_000);
+    let mut single = c.clone();
+    single.fast_convergence = false;
+    c.congestion(8000);
+    single.congestion(8000);
+    assert_eq!((c.w_max, single.w_max), (6800, 8000));
+    assert_eq!((c.cwnd_prior, single.cwnd_prior), (8000, 8000));
+    c.startup_exit(12_345, 500);
+    assert_eq!((c.cwnd_prior, c.w_max, c.k), (12_345, 12_345, 0));
+    assert!(c.epoch);
+    assert_eq!((c.k, c.w_max, c.w_est), (0, 12_345, 12_345 * WINDOW_SCALE));
+}
+
+#[test]
+fn lossless_epoch_starts_at_exit_ack_not_first_ca_ack() {
+    let mut c = Cubic::new(CallerTimebase::default());
+    c.clock(100_000);
+    c.startup_exit(20_000, 1000);
+    assert_eq!((c.w_est, c.k, c.elapsed), (20_000 * WINDOW_SCALE, 0, 0));
+    c.sent(110_000, 20_000, 20_000, Seq(20_000), false, false);
+    c.prepare_ack(210_000, Some(100_000), Seq(1000), 1000, true);
+    assert_eq!(c.elapsed, 100_000);
+    c.grow(20_000, 1000);
+    assert_eq!(c.elapsed, 100_000); // First CA ACK must not reset the exit epoch.
+}

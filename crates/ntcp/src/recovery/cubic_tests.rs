@@ -140,3 +140,62 @@ fn cubic_mss_byte_bounds_and_growth_protection() {
         assert_eq!((c.cwnd, c.ssthresh), (MAX_WINDOW, MAX_WINDOW));
     }
 }
+
+#[test]
+fn hystart_exit_is_authoritative_and_congestion_disables_initial_startup() {
+    let mut c = controller(RecoveryAlgorithm::Reno, 1000);
+    let mut base = Seq(u32::MAX - 4000);
+    for round in 0..6 {
+        let end = base.wrapping_add(10_000);
+        c.on_data_sent(round * 200_000, c.cwnd(), end, false);
+        for n in 1..=10 {
+            let ack = base.wrapping_add(n * 1000);
+            c.prepare_ack(
+                round * 200_000 + 100_000,
+                Some(100_000),
+                ack,
+                1000,
+                MAX_WINDOW,
+            );
+            c.prepare_startup_ack(StartupAck {
+                rtt: Some(if round == 0 { 100_000 } else { 113_000 }),
+                snd_nxt: end,
+                paced: false,
+            });
+            c.on_ack(ack, 1000, (10 - n) * 1000);
+        }
+        base = end;
+    }
+    assert!(c.hystart.is_none());
+    assert!(c.congestion_avoidance);
+    assert_eq!(c.cwnd, c.ssthresh);
+    let before = c.cwnd;
+    c.on_data_sent(1_300_000, before, base.wrapping_add(before), false);
+    c.prepare_ack(
+        1_400_000,
+        Some(100_000),
+        base.wrapping_add(1000),
+        1000,
+        MAX_WINDOW,
+    );
+    c.on_ack(base.wrapping_add(1000), 1000, before - 1000);
+    assert!(c.cwnd < before + 1000); // Equality did not restart SS.
+
+    for ecn in [false, true] {
+        let mut c = controller(RecoveryAlgorithm::Reno, 1000);
+        if ecn {
+            c.on_ecn(Seq(1), 10_000, Seq(10_001));
+            assert_eq!((c.cwnd, c.ssthresh), (7000, 7000));
+            assert!(c.congestion_avoidance);
+        } else {
+            c.on_timeout(10_000, Seq(10_001));
+            assert_eq!((c.cwnd, c.ssthresh), (1000, 7000));
+            assert!(!c.congestion_avoidance); // Standard SS after RTO.
+        }
+        assert!(c.hystart.is_none());
+        c.restart_after_idle();
+        assert!(c.hystart.is_none());
+    }
+    let c = controller(RecoveryAlgorithm::Reno, 1000).with_cubic_hystart(false);
+    assert!(c.hystart.is_none());
+}

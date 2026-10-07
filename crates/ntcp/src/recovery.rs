@@ -1,6 +1,11 @@
 use core::cmp::Ordering;
 
-use crate::{connection::CallerTimebase, cubic::Cubic, seq::Seq};
+use crate::{
+    connection::CallerTimebase,
+    cubic::Cubic,
+    hystart::{HyStart, StartupAck},
+    seq::Seq,
+};
 
 const MIN_RTO: u64 = 1_000_000;
 const MAX_RTO: u64 = 60_000_000;
@@ -260,6 +265,8 @@ impl InitialWindow {
 pub(crate) struct Congestion {
     algorithm: RecoveryAlgorithm,
     cubic: Option<Cubic>,
+    hystart: Option<HyStart>,
+    startup_ack: Option<StartupAck>,
     initial_window: InitialWindow,
     mss: u32,
     cwnd: u32,
@@ -301,6 +308,8 @@ impl Congestion {
         Self {
             algorithm,
             cubic: None,
+            hystart: None,
+            startup_ack: None,
             initial_window,
             mss,
             cwnd: initial_window.bytes(mss),
@@ -330,7 +339,37 @@ impl Congestion {
             CongestionAlgorithm::Reno => None,
             CongestionAlgorithm::Cubic => Some(Cubic::new(timebase)),
         };
+        self.hystart = self.cubic.as_ref().map(|_| HyStart::default());
         self
+    }
+
+    pub(crate) fn with_cubic_hystart(mut self, enabled: bool) -> Self {
+        if !enabled {
+            self.hystart = None;
+        }
+        self
+    }
+
+    pub(crate) fn with_cubic_fast_convergence(mut self, enabled: bool) -> Self {
+        if let Some(cubic) = &mut self.cubic {
+            cubic.fast_convergence = enabled;
+        }
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn startup_state(&self) -> Option<(u8, Option<u64>, u8, Option<Seq>)> {
+        self.hystart.as_ref().map(HyStart::test_state)
+    }
+
+    pub(crate) fn on_startup_sent(&mut self, end: Seq, paced: bool) {
+        if let Some(hystart) = &mut self.hystart {
+            hystart.sent(end, paced);
+        }
+    }
+
+    pub(crate) fn prepare_startup_ack(&mut self, context: StartupAck) {
+        self.startup_ack = self.hystart.as_ref().map(|_| context);
     }
 
     // Caller invokes only after committed data output and SND.NXT accounting.
@@ -353,6 +392,16 @@ impl Congestion {
     ) {
         if let Some(cubic) = &mut self.cubic {
             cubic.prepare_ack(now, rtt, ack, acked, send_window >= self.cwnd);
+        }
+    }
+
+    pub(crate) fn observe_startup_ack(&mut self, ack: Seq, context: StartupAck) {
+        if !self.congestion_avoidance
+            && self.cwnd <= self.ssthresh
+            && let (Some(hystart), Some(cubic)) = (&mut self.hystart, &self.cubic)
+        {
+            // SACK-only delivery has fresh timing but no cumulative growth.
+            hystart.ack(ack, context, 0, self.mss, cubic.timebase());
         }
     }
 
@@ -751,17 +800,33 @@ impl Congestion {
             return false;
         }
         if let Some(cubic) = &mut self.cubic {
-            if !cubic.can_grow() {
-                return false;
-            }
             // Published section 4.10 uses slow start at equality. Recovery's
             // explicit congestion-avoidance state remains authoritative.
             if !self.congestion_avoidance && self.cwnd <= self.ssthresh {
-                self.cwnd = self
-                    .cwnd
-                    .saturating_add(acked.min(self.mss))
-                    .min(MAX_WINDOW);
+                if let (Some(hystart), Some(context)) = (&mut self.hystart, self.startup_ack.take())
+                {
+                    let (increase, exit) = hystart.ack(
+                        ack,
+                        context,
+                        cubic.slow_start_acked(),
+                        self.mss,
+                        cubic.timebase(),
+                    );
+                    self.cwnd = self.cwnd.saturating_add(increase).min(MAX_WINDOW);
+                    if exit {
+                        self.ssthresh = self.cwnd;
+                        self.congestion_avoidance = true;
+                        self.hystart = None;
+                        cubic.startup_exit(self.cwnd, self.mss);
+                    }
+                } else if cubic.can_grow() {
+                    self.cwnd = self
+                        .cwnd
+                        .saturating_add(acked.min(self.mss))
+                        .min(MAX_WINDOW);
+                }
             } else {
+                self.hystart = None;
                 self.cwnd = cubic.grow(self.cwnd, self.mss);
             }
             return false;
@@ -1135,9 +1200,12 @@ impl Congestion {
     //= reason=Default CongestionAlgorithm::Reno only; optional CUBIC follows RFC9438 sections 4.6/4.8. Threshold helper uses actual eligible flight /2 with two-MSS minimum; timeout vectors assert 10000->5000 and SACK boundary vectors assert floor. Limited Transmit exclusion is caller-owned and separately evidenced.
     //# ssthresh = max (FlightSize / 2, 2*SMSS) (4)
     fn reduce_threshold(&mut self, flight: u32) {
+        self.hystart = None;
+        self.startup_ack = None;
         // Optional RFC 9438 sections 4.6/4.8 are the scoped exception to
         // RFC 5681's half-flight threshold, not a recovery-algorithm change.
         let reduced = if let Some(cubic) = &mut self.cubic {
+            self.congestion_avoidance = true;
             cubic.congestion(self.cwnd);
             (u64::from(flight) * 7 / 10) as u32
         } else {
@@ -1216,6 +1284,8 @@ impl Congestion {
     //# indications of congestion and, therefore, cwnd (and ssthresh) MUST be lowered twice in this
     //# case.
     pub(crate) fn on_timeout(&mut self, flight: u32, highest_sent: Seq) {
+        self.hystart = None;
+        self.startup_ack = None;
         // Repeated RTOs for the same unacknowledged segment retain ssthresh.
         // RFC 3168 section 6.1.2: loss of a retransmission is new congestion,
         // even inside the ECN epoch. An original-flight loss shares its reduction.

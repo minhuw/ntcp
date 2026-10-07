@@ -1503,3 +1503,399 @@ fn rfc9937_cubic_lost_retransmission_preserves_target_credit_and_wire() {
         }
     }
 }
+
+// Build actual ACKs with a deliberately mismatched echo: local original-send
+// ledger samples must remain usable independently of RTTM and RTO gating.
+fn hystart_wire_ack(a: &mut Connection, now: u64, ack: Seq, flags: u8) {
+    hystart_wire_ack_echo(a, now, ack, flags, u32::MAX);
+}
+
+fn hystart_wire_ack_echo(a: &mut Connection, now: u64, ack: Seq, flags: u8, echo: u32) {
+    let mut options = [1, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0];
+    options[4..8].copy_from_slice(&(a.ts_recent.wrapping_add(1)).to_be_bytes());
+    options[8..].copy_from_slice(&echo.to_be_bytes());
+    let metadata = ip(reverse(a.tuple()));
+    let mut bytes = [0; 64];
+    let n = wire::encode(
+        metadata,
+        Header {
+            source_port: a.tuple.remote.port(),
+            destination_port: a.tuple.local.port(),
+            sequence: a.receive.next().0,
+            acknowledgment: ack.0,
+            flags,
+            window: (a.snd_wnd >> a.peer_scale) as u16,
+            urgent_pointer: 0,
+        },
+        if a.timestamps { &options } else { &[] },
+        &[],
+        &mut bytes,
+    )
+    .unwrap();
+    a.input(now, &wire::parse(metadata, &bytes[..n]).unwrap())
+        .unwrap();
+}
+
+fn hystart_wire_round(a: &mut Connection, sent: u64, delay: u64) {
+    let base = a.snd_una;
+    let mss = a.mss as u32;
+    a.write(&vec![0x55; 10 * a.mss]).unwrap();
+    let before = alloc::format!("{:?}", a.congestion);
+    let nxt = a.snd_nxt;
+    assert_eq!(a.transmit(sent, &mut [0; 20]), Err(Error::OutputTooSmall));
+    assert_eq!(a.snd_nxt, nxt);
+    assert_eq!(alloc::format!("{:?}", a.congestion), before);
+    let ranges = outputs(a, sent, base);
+    assert_eq!(ranges.len(), 10);
+    assert_eq!(a.snd_nxt, base.wrapping_add(10 * mss));
+    let rto_updates = a.rtt.updates;
+    for n in 1..=10 {
+        // One duplicate cannot supply a cached RTT to HyStart++.
+        let state = a.congestion.startup_state();
+        hystart_wire_ack(a, sent + delay, a.snd_una, ACK);
+        assert_eq!(a.congestion.startup_state(), state);
+        hystart_wire_ack(a, sent + delay, base.wrapping_add(n * mss), ACK);
+        if n < 10 && a.congestion.startup_state().is_some() {
+            assert_eq!(a.congestion.startup_state().unwrap().0, n as u8);
+            assert_eq!(
+                a.congestion.startup_state().unwrap().3,
+                Some(base.wrapping_add(10 * mss))
+            );
+        }
+    }
+    // HyStart got ten fresh samples while the fixed-weight estimator accepted
+    // at most one from this same causal flight.
+    assert!(a.rtt.updates - rto_updates <= 1);
+}
+
+#[test]
+fn hystart_wire_raw_samples_css_fallback_five_rounds_and_wrap() {
+    for timestamps in [false, true] {
+        for (sack, rack) in [(false, false), (true, false), (true, true)] {
+            for iss in [100, u32::MAX - 4000] {
+                for scale in [1, 1000] {
+                    let (mut a, _) = primed_pair(
+                        ConnectionConfig {
+                            congestion_algorithm: CongestionAlgorithm::Cubic,
+                            initial_window: InitialWindow::Iw10,
+                            timestamps,
+                            sack,
+                            rack,
+                            nagle: false,
+                            timebase: CallerTimebase {
+                                units_per_second: 1_000_000 * scale,
+                                ..CallerTimebase::default()
+                            },
+                            ..config(65_536, 1000)
+                        },
+                        iss,
+                    );
+                    let initial = a.congestion.cwnd();
+                    hystart_wire_round(&mut a, 100_000 * scale, 100_000 * scale);
+                    assert_eq!(a.congestion.cwnd(), initial * 2);
+                    hystart_wire_round(&mut a, 400_000 * scale, 113_000 * scale);
+                    let state = a.congestion.startup_state().unwrap();
+                    assert_eq!((state.1, state.2), (Some(113_000 * scale), 1));
+                    assert_eq!(a.congestion.cwnd(), initial * 2); // Application-limited, still detects delay.
+                    hystart_wire_round(&mut a, 700_000 * scale, 112_000 * scale);
+                    assert_eq!(a.congestion.startup_state().unwrap().1, None);
+                    for n in 0..5 {
+                        hystart_wire_round(
+                            &mut a,
+                            (1_000_000 + n * 300_000) * scale,
+                            127_000 * scale,
+                        );
+                        if n < 4 {
+                            assert_eq!(a.congestion.startup_state().unwrap().2, n as u8 + 1);
+                        }
+                    }
+                    assert_eq!(a.congestion.startup_state(), None);
+                    assert_eq!(a.congestion.cwnd(), initial * 2);
+                    assert_eq!(a.congestion.ssthresh(), initial * 2);
+                    // Fill the new CA window and ACK it: equality stays CA,
+                    // not SS, and not another CSS initial episode.
+                    let base = a.snd_una;
+                    a.write(&vec![0x66; initial as usize * 2]).unwrap();
+                    assert_eq!(outputs(&mut a, 2_500_000 * scale, base).len(), 20);
+                    hystart_wire_ack(
+                        &mut a,
+                        2_627_000 * scale,
+                        base.wrapping_add(initial * 2),
+                        ACK,
+                    );
+                    assert!(a.congestion.cwnd() > initial * 2);
+                    assert!(a.congestion.cwnd() < initial * 2 + a.mss as u32 * 2);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn hystart_wire_delayed_ack_runtime_pacing_and_opt_out() {
+    for (prr, algorithm, pacing, expected) in [
+        (false, PrrAlgorithm::Rfc9937, true, 8000),
+        (true, PrrAlgorithm::LegacyInitialCredit, true, 8000),
+        (true, PrrAlgorithm::Rfc9937, false, 8000),
+        (true, PrrAlgorithm::Rfc9937, true, 10_000),
+    ] {
+        let (mut a, _) = primed_pair(
+            ConnectionConfig {
+                congestion_algorithm: CongestionAlgorithm::Cubic,
+                initial_window: InitialWindow::Iw10,
+                prr,
+                prr_algorithm: algorithm,
+                prr_pacing: pacing,
+                nagle: false,
+                ..config(32_000, 1000)
+            },
+            100,
+        );
+        let base = a.snd_una;
+        a.write(&[0x55; 20_000]).unwrap();
+        let mut sent = 100_000;
+        for _ in 0..10 {
+            let bytes = packet(&mut a, sent);
+            assert_eq!(
+                wire::parse(ip(tuple()), &bytes).unwrap().payload.len(),
+                1000
+            );
+            if a.pacing_enabled() {
+                sent = a.pacing_deadline.unwrap();
+            }
+        }
+        hystart_wire_ack(&mut a, sent + 100_000, base.wrapping_add(10_000), ACK);
+        assert_eq!(a.congestion.cwnd(), 10_000 + expected);
+    }
+    let (mut a, _) = primed_pair(
+        ConnectionConfig {
+            congestion_algorithm: CongestionAlgorithm::Cubic,
+            cubic_hystart: false,
+            initial_window: InitialWindow::Iw10,
+            nagle: false,
+            ..config(32_000, 1000)
+        },
+        100,
+    );
+    let base = a.snd_una;
+    a.write(&[0x55; 10_000]).unwrap();
+    outputs(&mut a, 100_000, base);
+    hystart_wire_ack(&mut a, 200_000, base.wrapping_add(10_000), ACK);
+    assert_eq!(a.congestion.cwnd(), 11_000); // Explicit standard-SS legacy oracle.
+    assert_eq!(a.congestion.startup_state(), None);
+}
+
+#[test]
+fn hystart_wire_karn_loss_ecn_and_standard_ss_after_rto() {
+    for timestamps in [false, true] {
+        let (mut a, _) = primed_pair(
+            ConnectionConfig {
+                congestion_algorithm: CongestionAlgorithm::Cubic,
+                initial_window: InitialWindow::Iw10,
+                timestamps,
+                sack: true,
+                nagle: false,
+                ..config(32_000, 1000)
+            },
+            100,
+        );
+        let base = a.snd_una;
+        let mss = a.mss as u32;
+        a.write(&vec![0x55; 10 * a.mss]).unwrap();
+        outputs(&mut a, 100_000, base);
+        // A committed retry, not merely a scheduled retry, invalidates Karn.
+        a.retx_pending = true;
+        packet(&mut a, 110_000);
+        assert_eq!(a.sample, None);
+        hystart_wire_ack(&mut a, 120_000, base.wrapping_add(mss), ACK);
+        assert_eq!(a.rack.ack_sample, None);
+        assert_eq!(a.congestion.startup_state().unwrap().0, 0);
+        let deadline = a.rto_deadline.unwrap();
+        a.timeout(deadline).unwrap();
+        assert_eq!(a.congestion.startup_state(), None);
+        assert_eq!(a.congestion.cwnd(), mss);
+        packet(&mut a, deadline);
+        let next = base.wrapping_add(2 * mss);
+        hystart_wire_ack(&mut a, deadline + 100_000, next, ACK);
+        assert_eq!(a.congestion.cwnd(), 2 * mss);
+        assert_eq!(a.congestion.startup_state(), None);
+    }
+    let (mut a, _) = primed_pair(
+        ConnectionConfig {
+            congestion_algorithm: CongestionAlgorithm::Cubic,
+            initial_window: InitialWindow::Iw10,
+            ecn: true,
+            nagle: false,
+            ..config(32_000, 1000)
+        },
+        100,
+    );
+    let base = a.snd_una;
+    a.write(&[0x55; 10_000]).unwrap();
+    outputs(&mut a, 100_000, base);
+    hystart_wire_ack(&mut a, 200_000, base.wrapping_add(1000), ACK | ECE);
+    assert_eq!(a.congestion.startup_state(), None);
+    assert_eq!((a.congestion.cwnd(), a.congestion.ssthresh()), (7000, 7000));
+}
+
+#[test]
+fn hystart_wire_css_byte_growth_division_and_sack_sample_not_reused() {
+    let (mut a, _) = primed_pair(
+        ConnectionConfig {
+            congestion_algorithm: CongestionAlgorithm::Cubic,
+            initial_window: InitialWindow::Iw10,
+            nagle: false,
+            ..config(65_536, 1000)
+        },
+        100,
+    );
+    hystart_wire_round(&mut a, 100_000, 100_000);
+    let base = a.snd_una;
+    a.write(&[0x55; 20_000]).unwrap();
+    assert_eq!(outputs(&mut a, 400_000, base).len(), 20);
+    for n in 1..=20 {
+        hystart_wire_ack(&mut a, 513_000, base.wrapping_add(n * 1000), ACK);
+    }
+    assert_eq!(a.congestion.cwnd(), 20_000 + 8000 + 12 * 250);
+    assert_eq!(a.congestion.startup_state().unwrap().2, 1);
+
+    for divided in [false, true] {
+        let (mut a, _) = primed_pair(
+            ConnectionConfig {
+                congestion_algorithm: CongestionAlgorithm::Cubic,
+                initial_window: InitialWindow::Iw10,
+                nagle: false,
+                ..config(4096, 100)
+            },
+            100,
+        );
+        let base = a.snd_una;
+        a.write(&[0x55; 1000]).unwrap();
+        assert_eq!(outputs(&mut a, 100_000, base).len(), 10);
+        let step = if divided { 1 } else { 100 };
+        for n in (step..=1000).step_by(step as usize) {
+            hystart_wire_ack(&mut a, 200_000, base.wrapping_add(n), ACK);
+        }
+        assert_eq!(a.congestion.cwnd(), 2000); // No ACK-division inflation.
+    }
+
+    for rack in [false, true] {
+        let (mut a, _) = primed_pair(
+            ConnectionConfig {
+                congestion_algorithm: CongestionAlgorithm::Cubic,
+                initial_window: InitialWindow::Iw10,
+                sack: true,
+                rack,
+                nagle: false,
+                ..config(32_000, 1000)
+            },
+            100,
+        );
+        let base = a.snd_una;
+        let next = a.receive.next();
+        let window = (a.snd_wnd >> a.peer_scale) as u16;
+        a.write(&[0x55; 10_000]).unwrap();
+        outputs(&mut a, 100_000, base);
+        // SACK-only ACK freshly delivers the first original while leaving the
+        // scalar RTTM pending; subsequent cumulative ACK cannot sample it again.
+        inject_sack(
+            &mut a,
+            200_000,
+            next,
+            base,
+            ACK,
+            window,
+            &[],
+            &[(base.0, base.wrapping_add(1000).0)],
+        );
+        assert_eq!(a.congestion.startup_state().unwrap().0, 1);
+        assert_eq!(a.congestion.cwnd(), 10_000);
+        hystart_wire_ack(&mut a, 200_001, base.wrapping_add(1000), ACK);
+        assert_eq!(a.rack.ack_sample, None);
+        assert_eq!(a.congestion.startup_state().unwrap().0, 1);
+        // Scoreboard fallback skips ledger acknowledgment. It must not use
+        // the cached previous ACK sample either.
+        hystart_wire_ack(&mut a, 200_002, base.wrapping_add(2000), ACK);
+        assert_eq!(a.congestion.startup_state().unwrap().0, 2);
+        assert!(a.rack.ack_sample.is_some());
+        a.sack_fallback = Some(a.snd_nxt);
+        hystart_wire_ack(&mut a, 200_003, base.wrapping_add(3000), ACK);
+        assert_eq!(a.rack.ack_sample, None);
+        assert_eq!(a.congestion.startup_state().unwrap().0, 2);
+    }
+}
+
+#[test]
+fn hystart_wire_scalar_fallback_requires_karn_and_valid_timestamp_echo() {
+    for timestamps in [false, true] {
+        for valid_echo in [false, true] {
+            let (mut a, _) = primed_pair(
+                ConnectionConfig {
+                    congestion_algorithm: CongestionAlgorithm::Cubic,
+                    initial_window: InitialWindow::Iw10,
+                    timestamps,
+                    nagle: false,
+                    ..config(32_000, 1000)
+                },
+                100,
+            );
+            let base = a.snd_una;
+            let mss = a.mss as u32;
+            a.write(&vec![0x55; 10 * a.mss]).unwrap();
+            outputs(&mut a, 100_000, base);
+            // Artificially exhaust the ledger; production backing normally
+            // retains every byte edge. The ordinary scalar still proves one
+            // original send time and validates TS echo without cached SRTT.
+            a.rack.abandon(a.snd_nxt);
+            let echo = if valid_echo {
+                a.timestamp_value(100_000)
+            } else {
+                u32::MAX
+            };
+            hystart_wire_ack_echo(&mut a, 200_000, base.wrapping_add(mss), ACK, echo);
+            assert_eq!(
+                a.congestion.startup_state().unwrap().0,
+                u8::from(!timestamps || valid_echo)
+            );
+            hystart_wire_ack_echo(&mut a, 200_001, base.wrapping_add(2 * mss), ACK, echo);
+            assert_eq!(
+                a.congestion.startup_state().unwrap().0,
+                u8::from(!timestamps || valid_echo)
+            ); // Scalar was consumed once.
+        }
+    }
+}
+
+#[test]
+fn hystart_wire_paced_tlp_bypass_retains_unpaced_ack_cap() {
+    let (mut a, _) = primed_pair(
+        ConnectionConfig {
+            congestion_algorithm: CongestionAlgorithm::Cubic,
+            initial_window: InitialWindow::Iw10,
+            prr: true,
+            prr_pacing: true,
+            sack: true,
+            rack: true,
+            tlp: true,
+            nagle: false,
+            ..config(32_000, 1000)
+        },
+        100,
+    );
+    let base = a.snd_una;
+    a.write(&[0x55; 11_000]).unwrap();
+    let mut now = 100_000;
+    for _ in 0..10 {
+        packet(&mut a, now);
+        now = a.pacing_deadline.unwrap();
+    }
+    // Actual protocol probe admission bypasses the data pacing deadline.
+    a.tlp_pending = true;
+    let bytes = packet(&mut a, now - 1);
+    let probe = wire::parse(ip(tuple()), &bytes).unwrap();
+    assert_eq!(probe.header.sequence, base.wrapping_add(10_000).0);
+    assert_eq!(probe.payload.len(), 1000);
+    assert!(a.tlp_end.is_some());
+    hystart_wire_ack(&mut a, now + 100_000, base.wrapping_add(11_000), ACK);
+    assert_eq!(a.congestion.cwnd(), 18_000); // Not 21k despite pacing flag.
+}
