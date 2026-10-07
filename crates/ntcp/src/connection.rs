@@ -464,6 +464,7 @@ pub(crate) struct Connection {
     ts_recent_at: Instant, // Last R3/handshake refresh; pending ACKs do not extend PAWS age.
     last_ack_sent: Seq,
     reset_echo: Option<u32>,
+    reset_reply: bool,
     last_timestamp_sent_at: Option<Instant>,
     mss: usize,
     advertised_edge: Seq,
@@ -692,6 +693,7 @@ impl Connection {
             ts_recent_at: now,
             last_ack_sent: Seq(0),
             reset_echo: None,
+            reset_reply: false,
             last_timestamp_sent_at: None,
             mss,
             advertised_edge: Seq(0),
@@ -2429,6 +2431,7 @@ impl Connection {
             // This replaces any reactive reset; its TSval=0 echo override
             // must not escape on the newly scheduled local-abort reset.
             self.reset_echo = None;
+            self.reset_reply = false;
             self.terminal(CloseReason::Aborted);
         }
     }
@@ -2620,6 +2623,7 @@ impl Connection {
                 if h.flags & RST == 0 {
                     self.pending_rst = Some((ack, false));
                     self.reset_echo = segment.options.timestamps.map(|ts| ts.0);
+                    self.reset_reply = true;
                 }
                 return Ok(());
             }
@@ -2814,12 +2818,7 @@ impl Connection {
             self.establish();
             self.last_received = now;
             self.immediate_ack();
-            self.receive_text(
-                seq.wrapping_add(1),
-                segment.payload,
-                h.flags & !SYN,
-                h.urgent_pointer.saturating_sub(1),
-            );
+            self.receive_text(seq.wrapping_add(1), segment);
             self.arm_work();
             return Ok(());
         }
@@ -3115,6 +3114,7 @@ impl Connection {
             if !after(ack, self.snd_una) {
                 self.pending_rst = Some((ack, false));
                 self.reset_echo = segment.options.timestamps.map(|ts| ts.0);
+                self.reset_reply = true;
                 return Ok(());
             }
             self.accept_ack(ack, false, segment.options.timestamps.map(|ts| ts.1));
@@ -3607,7 +3607,7 @@ impl Connection {
             }
             self.prr = Some(prr);
         }
-        self.receive_text(seq, segment.payload, h.flags, h.urgent_pointer);
+        self.receive_text(seq, segment);
         self.arm_work();
         if advancing {
             self.schedule_tlp();
@@ -4032,7 +4032,13 @@ impl Connection {
     //= reason=Non-SACK and SACK receivers immediately emit cumulative ACKs after only part of an existing gap is filled, and after full fill; each input produces at most one committed ACK.
     //# To provide feedback to senders recovering from losses, the receiver SHOULD send an immediate
     //# ACK when it receives a data segment that fills in all or part of a gap in the sequence space.
-    fn receive_text(&mut self, seq: Seq, payload: &[u8], flags: u8, urgent: u16) {
+    fn receive_text(&mut self, seq: Seq, segment: &Segment<'_>) {
+        let payload = segment.payload;
+        let flags = segment.header.flags & !SYN;
+        let urgent = segment
+            .header
+            .urgent_pointer
+            .saturating_sub(u16::from(segment.header.flags & SYN != 0));
         if !matches!(
             self.state,
             State::Established | State::FinWait1 | State::FinWait2
@@ -4107,7 +4113,23 @@ impl Connection {
             self.events.pushed = false;
             self.events.urgent = None;
             self.events.writable = false;
-            self.abort();
+            // RFC 9293 3.6.1: new text after half-duplex CLOSE loses data.
+            // This is a segment-triggered reset, not the local ABORT of 3.10.5.
+            // PAWS, sequence, controls, handshake and ACK bounds were checked
+            // before receive_text; use SEG.ACK (3.5.2) rather than SND.NXT so
+            // an unacknowledged FIN does not shift the peer's reset sequence.
+            self.pending_rst = Some((Seq(segment.header.acknowledgment), false));
+            // RFC 7323 5.2: reactive RST uses TSval=0, TSecr=SEG.TSval.
+            self.reset_echo = segment.options.timestamps.map(|ts| ts.0);
+            self.reset_reply = true;
+            self.receive.clear();
+            self.receive
+                .reset_start(next)
+                .expect("cleared receive buffer");
+            self.receive_used = 0;
+            // Aborted preserves the pending reset until successful output;
+            // terminal cancels all ordinary output and timers.
+            self.terminal(CloseReason::Aborted);
             return;
         }
         self.events.pushed |= self.receive.take_push();
@@ -5603,12 +5625,23 @@ impl Connection {
                 flags |= CWR;
             }
         }
-        let window = self.advertised_window(syn);
+        // Reactive resets carry no receive credit or unused ACK value;
+        // local ABORT retains its existing default/opt-in wire format.
+        let reset_reply = reset.is_some() && self.reset_reply;
+        let window = if reset_reply {
+            0
+        } else {
+            self.advertised_window(syn)
+        };
         let header = Header {
             source_port: self.tuple.local.port(),
             destination_port: self.tuple.remote.port(),
             sequence: seq.0,
-            acknowledgment: self.receive.next().0,
+            acknowledgment: if reset_reply {
+                0
+            } else {
+                self.receive.next().0
+            },
             flags,
             window,
             urgent_pointer,
@@ -5706,6 +5739,7 @@ impl Connection {
         if reset.is_some() {
             self.pending_rst = None;
             self.reset_echo = None;
+            self.reset_reply = false;
             return Ok(Some(size));
         }
         // Scope: Planning/retry does not consume pending report; successful SACK-bearing ACK consumes it once. Second identical report requires fresh duplicate recording.
@@ -17909,12 +17943,16 @@ mod tests {
             let reset = wire::parse(ip(b.tuple()), &rejected).unwrap();
             assert_eq!(reset.header.flags, RST);
             assert_eq!(reset.header.sequence, una.0);
+            assert_eq!(reset.header.acknowledgment, 0);
+            assert_eq!(reset.header.window, 0);
             assert_eq!(b.state(), State::SynReceived);
             inject(&mut a, 30, Seq(900), Seq(1), SYN | ACK, 64, b"");
             let rejected = packet(&mut a, 30);
             let reset = wire::parse(ip(a.tuple()), &rejected).unwrap();
             assert_eq!(reset.header.flags, RST);
             assert_eq!(reset.header.sequence, 1);
+            assert_eq!(reset.header.acknowledgment, 0);
+            assert_eq!(reset.header.window, 0);
             assert_eq!(a.state(), State::SynSent);
         }
     }
@@ -17957,6 +17995,7 @@ mod tests {
                             c.set_timestamp_offset(u32::MAX);
                             c.ts_recent = u32::MAX;
                             c.reset_echo = Some(123); // Superseded reactive-reset timestamp.
+                            c.reset_reply = true;
                             let seq = c.snd_nxt;
                             let ack = c.receive.next();
                             let window = c.advertised_window(false);
@@ -21127,6 +21166,184 @@ mod tests {
         inject(&mut a, 50, Seq(901), Seq(102), ACK | FIN, 16, b"");
         assert_eq!(a.state(), State::TimeWait);
         assert!(!a.take_events().readable);
+    }
+
+    #[test]
+    fn half_duplex_payload_reset_is_reactive_and_retry_owned() {
+        for enabled in [false, true] {
+            // No TS, negotiated TS, and TS received without negotiation.
+            for timestamps in 0..3 {
+                for iss in [100, u32::MAX - 1, u32::MAX] {
+                    // FIN remains unacked, is acked by the data, or was acked earlier.
+                    for fin_ack in 0..3 {
+                        for offset in [0, 2] {
+                            let cfg = ConnectionConfig {
+                                abort_with_ack: enabled,
+                                timestamps: timestamps == 1,
+                                ..config(64, 8)
+                            };
+                            let (a, b) = pair(cfg, iss);
+                            for mut a in [a, b] {
+                                let next = a.receive.next();
+                                let fin_seq = a.snd_nxt;
+                                a.close().unwrap();
+                                packet(&mut a, 40);
+                                assert_eq!(a.state(), State::FinWait1);
+                                let ack = fin_seq.wrapping_add(u32::from(fin_ack != 0));
+                                let ts = (timestamps != 0).then_some((u32::MAX, 0));
+                                if timestamps != 0 {
+                                    a.ts_recent = u32::MAX - 1;
+                                }
+                                if fin_ack == 2 {
+                                    timestamp_input(&mut a, 50, next, ack, ACK, ts, b"");
+                                    assert_eq!(a.state(), State::FinWait2);
+                                }
+                                timestamp_input(
+                                    &mut a,
+                                    60,
+                                    next.wrapping_add(offset),
+                                    ack,
+                                    ACK | PSH | FIN | URG,
+                                    ts,
+                                    b"lost",
+                                );
+                                assert_eq!(a.state(), State::Closed);
+                                assert_eq!(a.close_reason(), Some(CloseReason::Aborted));
+                                assert_eq!(a.next_deadline(), None);
+                                assert_eq!(a.receive_used, 0);
+                                assert!(!a.receive.has_data());
+                                assert_eq!(a.receive.next(), next);
+                                assert_eq!(a.terminal_readable_bytes(), 0);
+                                let events = a.take_events();
+                                assert_eq!(events.closed, Some(CloseReason::Aborted));
+                                assert!(!events.readable && !events.pushed && !events.writable);
+                                assert!(!events.half_closed && events.urgent.is_none());
+                                let before = (a.pending_rst, a.reset_echo, a.reset_reply, a.now);
+                                let size = if timestamps != 0 { 32 } else { 20 };
+                                assert_eq!(
+                                    a.transmit(70, &mut vec![0; size - 1]),
+                                    Err(Error::OutputTooSmall)
+                                );
+                                assert_eq!(
+                                    (a.pending_rst, a.reset_echo, a.reset_reply, a.now),
+                                    before
+                                );
+                                a.abort(); // Local abort after terminal entry cannot replace the retry.
+                                timestamp_input(&mut a, 70, next, ack, ACK, ts, b"later");
+                                assert_eq!(a.pending_rst, before.0);
+                                let bytes = packet(&mut a, 80);
+                                let reset = wire::parse(ip(a.tuple()), &bytes).unwrap();
+                                assert_eq!(reset.header.flags, RST);
+                                assert_eq!(reset.header.sequence, ack.0);
+                                assert_eq!(reset.header.acknowledgment, 0);
+                                assert_eq!(reset.header.window, 0);
+                                assert!(reset.payload.is_empty());
+                                assert_eq!(
+                                    reset.options.timestamps,
+                                    ts.map(|(value, _)| (0, value))
+                                );
+                                assert!(!a.reset_pending());
+                                assert_eq!(a.reset_echo, None);
+                                assert_eq!(a.transmit(90, &mut []), Ok(None));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn half_duplex_reset_rejects_invalid_segments_before_data_loss() {
+        for enabled in [false, true] {
+            for iss in [100, u32::MAX] {
+                for invalid in 0..7 {
+                    let cfg = ConnectionConfig {
+                        timestamps: true,
+                        abort_with_ack: enabled,
+                        ..config(64, 8)
+                    };
+                    let (mut a, _) = pair(cfg, iss);
+                    let next = a.receive.next();
+                    a.close().unwrap();
+                    packet(&mut a, 40);
+                    a.ts_recent = 100;
+                    let oldest = a.snd_una.wrapping_add(0u32.wrapping_sub(a.max_snd_wnd));
+                    let (seq, ack, flags, ts) = match invalid {
+                        0 => (next, a.snd_nxt, ACK, None),
+                        1 => (next, a.snd_nxt, ACK, Some((99, 0))),
+                        2 => (next.wrapping_add(64), a.snd_nxt, ACK, Some((101, 0))),
+                        3 => (next, a.snd_nxt, PSH, Some((101, 0))),
+                        4 => (next, a.snd_nxt.wrapping_add(1), ACK, Some((101, 0))),
+                        5 => (next, oldest.wrapping_add(u32::MAX), ACK, Some((101, 0))),
+                        _ => (next, a.snd_nxt, SYN | ACK, Some((101, 0))),
+                    };
+                    let before = (a.receive.next(), a.snd_una, a.ts_recent, a.ts_latest);
+                    timestamp_input(&mut a, 50, seq, ack, flags, ts, b"bad");
+                    assert_eq!(a.state(), State::FinWait1);
+                    assert!(!a.reset_pending());
+                    assert_eq!(a.receive_used, 0);
+                    assert_eq!(
+                        (a.receive.next(), a.snd_una, a.ts_recent, a.ts_latest),
+                        before
+                    );
+                    let mut out = [0; 128];
+                    if let Some(n) = a.transmit(60, &mut out).unwrap() {
+                        let reply = wire::parse(ip(tuple()), &out[..n]).unwrap();
+                        assert_eq!(reply.header.flags & (RST | ACK), ACK);
+                    }
+                    let ack = a.snd_nxt;
+                    timestamp_input(&mut a, 70, next, ack, ACK, Some((101, 0)), b"new");
+                    assert_eq!(a.pending_rst, Some((ack, false)));
+                    assert_eq!(a.state(), State::Closed);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn half_duplex_reset_requires_completed_handshake() {
+        for enabled in [false, true] {
+            for iss in [100, u32::MAX] {
+                for simultaneous in [false, true] {
+                    let cfg = ConnectionConfig {
+                        abort_with_ack: enabled,
+                        ..config(64, 8)
+                    };
+                    let (mut a, _) = opening_for_close(cfg, iss, simultaneous);
+                    a.close().unwrap();
+                    packet(&mut a, 20); // SYN-ACK.
+                    packet(&mut a, 30); // FIN before handshake completion.
+                    let next = a.receive.next();
+                    inject(&mut a, 40, next, Seq(iss), ACK, 64, b"bad");
+                    assert!(!a.handshake_complete());
+                    assert_ne!(a.state(), State::Closed);
+                    assert_eq!(a.receive_used, 0);
+                    packet(&mut a, 40); // Existing nonterminal handshake rejection reset.
+                    let ack = Seq(iss.wrapping_add(1));
+                    inject(
+                        &mut a,
+                        50,
+                        if simultaneous {
+                            next.wrapping_add(u32::MAX)
+                        } else {
+                            next
+                        },
+                        ack,
+                        ACK | if simultaneous { SYN } else { 0 },
+                        64,
+                        b"lost",
+                    );
+                    assert!(a.handshake_complete());
+                    assert_eq!(a.state(), State::Closed);
+                    assert_eq!(a.pending_rst, Some((ack, false)));
+                    let bytes = packet(&mut a, 60);
+                    let reset = wire::parse(ip(a.tuple()), &bytes).unwrap();
+                    assert_eq!(reset.header.flags, RST);
+                    assert_eq!(reset.header.sequence, ack.0);
+                }
+            }
+        }
     }
 
     #[test]
