@@ -420,6 +420,8 @@ impl Owner {
         } else {
             ntcp::InitialWindow::Rfc5681
         };
+        // Explicit synchronized local-abort formatting, not a reactive RST policy.
+        config.connection.abort_with_ack = profile == Profile::UpstreamBasic;
         config.connection.timestamps = upstream;
         config.connection.rack = upstream;
         config.connection.prr = upstream;

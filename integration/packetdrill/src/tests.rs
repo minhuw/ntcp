@@ -1534,6 +1534,41 @@ fn upstream_profiles_use_iw10() {
                 .len();
         }
         assert_eq!(flight, expected, "{profile:?}");
+        owner.endpoint.abort(id).unwrap();
+        let tx = owner
+            .endpoint
+            .poll_transmit(owner.now(), &mut tcp, BUDGET)
+            .unwrap()
+            .packet
+            .unwrap();
+        let reset = ntcp::wire::parse(tx.ip, &tcp[..tx.len]).unwrap();
+        assert_eq!(
+            reset.header.flags,
+            ntcp::wire::RST
+                | if profile == Profile::UpstreamBasic {
+                    ntcp::wire::ACK
+                } else {
+                    0
+                },
+            "{profile:?}"
+        );
+        assert_eq!(reset.header.acknowledgment, 101);
+        // A different port is an unmatched tuple, not a local abort.
+        input_packet(
+            &mut owner,
+            ip,
+            ntcp::wire::Header {
+                destination_port: header.destination_port.wrapping_add(1),
+                acknowledgment: 123,
+                flags: ntcp::wire::ACK,
+                ..header
+            },
+            &[],
+        );
+        let (_, bytes) = poll_frame(&mut owner).unwrap();
+        let reset = packet_header(&bytes);
+        assert_eq!(reset.flags, ntcp::wire::RST, "{profile:?}");
+        assert_eq!(reset.sequence, 123);
     }
 }
 

@@ -112,6 +112,11 @@ pub struct ConnectionConfig {
     //= reason=Settable Rfc5681/Iw10 selection with default-disabled IW10; deployment monitoring/application interactions remain enabling-actor obligations explicitly excluded from this implementation audit, not satisfied. No evidence for IW>10 is claimed.
     //# We recommend that all TCP implementations have a settable TCP IW parameter, as long as there is a reasonable effort to monitor for possible interactions with other Internet applications and services as described in Section 12. Furthermore, Section 10 details why 10 segments may be an appropriate value, and while that value may continue to rise in the future, this document does not include any supporting evidence for values of IW larger than 10.
     pub initial_window: InitialWindow,
+    // Opt-in RST|ACK for local abort after a completed, synchronized handshake.
+    // Default retains the bare RST illustrated by RFC 9293 section 3.10.5.
+    // Linux tcp_send_active_reset uses RST|ACK; only the flag policy is matched:
+    // https://github.com/torvalds/linux/blob/22430ae5d90ab288b0ee2ad99ae941f4a666b694/net/ipv4/tcp_output.c
+    pub abort_with_ack: bool,
     pub timestamps: bool,
     pub timestamp_granularity: TimestampGranularity,
     pub timebase: CallerTimebase,
@@ -204,6 +209,7 @@ impl Default for ConnectionConfig {
             ecn: true,
             recovery_algorithm: RecoveryAlgorithm::default(),
             initial_window: InitialWindow::default(),
+            abort_with_ack: false,
             timestamps: false,
             timestamp_granularity: TimestampGranularity::default(),
             timebase: CallerTimebase::default(),
@@ -2377,7 +2383,7 @@ impl Connection {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5
-    //= reason=Only SYN-RECEIVED, ESTABLISHED, FIN-WAIT-1/2 and CLOSE-WAIT emit reset; release is endpoint-owned.
+    //= reason=Only SYN-RECEIVED, ESTABLISHED, FIN-WAIT-1/2 and CLOSE-WAIT emit reset; default is the illustrated bare RST. Explicit abort_with_ack adds ACK=RCV.NXT only after a completed synchronized handshake; section 3.10 permits detail differences and section 3.5.3 validates synchronized resets by SEQ. Release is endpoint-owned.
     //# Send a reset segment:
     //# <SEQ=SND.NXT><CTL=RST>
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5
@@ -2403,7 +2409,13 @@ impl Connection {
                     | State::FinWait2
                     | State::CloseWait
             )
-            .then_some((self.snd_nxt, false));
+            .then_some((
+                self.snd_nxt,
+                self.config.abort_with_ack && self.handshake_complete && self.synchronized(),
+            ));
+            // This replaces any reactive reset; its TSval=0 echo override
+            // must not escape on the newly scheduled local-abort reset.
+            self.reset_echo = None;
             self.terminal(CloseReason::Aborted);
         }
     }
@@ -17390,6 +17402,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5
     //= type=test
+    //= reason=Default abort_with_ack=false retains the illustrated bare reset; enabled formatting has separate byte-exact coverage.
     //# Send a reset segment:
     //# <SEQ=SND.NXT><CTL=RST>
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5
@@ -17439,6 +17452,140 @@ mod tests {
                 assert!(reset.payload.is_empty());
             }
             assert_eq!(a.transmit(50, &mut []), Ok(None));
+        }
+    }
+
+    #[test]
+    fn abort_with_ack_does_not_change_handshake_rejection_resets() {
+        for enabled in [false, true] {
+            let cfg = ConnectionConfig {
+                abort_with_ack: enabled,
+                ..config(64, 8)
+            };
+            let mut a = Connection::active(tuple(), cfg.clone(), u32::MAX, 0).unwrap();
+            let bytes = packet(&mut a, 0);
+            let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+            let mut b = Connection::passive(reverse(tuple()), cfg, 900, 10, &syn).unwrap();
+            packet(&mut b, 20);
+            let next = b.receive.next();
+            let una = b.snd_una;
+            inject(&mut b, 30, next, una, ACK, 64, b"");
+            let rejected = packet(&mut b, 30);
+            let reset = wire::parse(ip(b.tuple()), &rejected).unwrap();
+            assert_eq!(reset.header.flags, RST);
+            assert_eq!(reset.header.sequence, una.0);
+            assert_eq!(b.state(), State::SynReceived);
+            inject(&mut a, 30, Seq(900), Seq(1), SYN | ACK, 64, b"");
+            let rejected = packet(&mut a, 30);
+            let reset = wire::parse(ip(a.tuple()), &rejected).unwrap();
+            assert_eq!(reset.header.flags, RST);
+            assert_eq!(reset.header.sequence, 1);
+            assert_eq!(a.state(), State::SynSent);
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
+    //= type=test
+    //= reason=Byte-exact default/opt-in abort resets, completed/incomplete handshake, state matrix, sequence/timestamp wrap and failed-output retry. Bare RST echoes zero; RST|ACK echoes TS.Recent.
+    //# When the ACK bit is set
+    //# in an outgoing segment, the sender MUST echo a recently received
+    //# TSval sent by the remote TCP in the TSval field of a Timestamps
+    //# option.
+    fn abort_with_ack_is_scoped_and_byte_exact() {
+        assert!(!ConnectionConfig::default().abort_with_ack);
+        for enabled in [false, true] {
+            for timestamps in [false, true] {
+                for complete in [false, true] {
+                    for state in [
+                        State::Closed,
+                        State::SynSent,
+                        State::SynReceived,
+                        State::Established,
+                        State::FinWait1,
+                        State::FinWait2,
+                        State::CloseWait,
+                        State::Closing,
+                        State::LastAck,
+                        State::TimeWait,
+                    ] {
+                        let cfg = ConnectionConfig {
+                            abort_with_ack: enabled,
+                            timestamps,
+                            ..config(64, 8)
+                        };
+                        // Both directions exercise SND.NXT or RCV.NXT wrapping to zero.
+                        let (a, b) = pair(cfg, u32::MAX);
+                        for mut c in [a, b] {
+                            c.state = state;
+                            c.handshake_complete = complete;
+                            c.set_timestamp_offset(u32::MAX);
+                            c.ts_recent = u32::MAX;
+                            c.reset_echo = Some(123); // Superseded reactive-reset timestamp.
+                            let seq = c.snd_nxt;
+                            let ack = c.receive.next();
+                            let window = c.advertised_window(false);
+                            let ip = ip(c.tuple());
+                            let emits = matches!(
+                                state,
+                                State::SynReceived
+                                    | State::Established
+                                    | State::FinWait1
+                                    | State::FinWait2
+                                    | State::CloseWait
+                            );
+                            let with_ack = enabled && complete && state != State::SynReceived;
+                            c.abort();
+                            c.abort(); // Retry/idempotence retains ACK policy and receive state.
+                            if !emits {
+                                assert_eq!(c.transmit(2_000, &mut []), Ok(None));
+                                continue;
+                            }
+                            let before = (c.pending_rst, c.now, c.last_timestamp_sent_at);
+                            let size = if timestamps { 32 } else { 20 };
+                            assert_eq!(
+                                c.transmit(2_000, &mut vec![0; size - 1]),
+                                Err(Error::OutputTooSmall)
+                            );
+                            assert_eq!((c.pending_rst, c.now, c.last_timestamp_sent_at), before);
+                            let bytes = packet(&mut c, 2_000);
+                            let mut options = Vec::new();
+                            if timestamps {
+                                options.extend_from_slice(&[1, 1, 8, 10]);
+                                options.extend_from_slice(&1u32.to_be_bytes()); // MAX + 2 ticks
+                                options.extend_from_slice(
+                                    &(if with_ack { u32::MAX } else { 0 }).to_be_bytes(),
+                                );
+                            }
+                            let mut expected = vec![0; size];
+                            assert_eq!(
+                                wire::encode(
+                                    ip,
+                                    Header {
+                                        source_port: c.tuple.local.port(),
+                                        destination_port: c.tuple.remote.port(),
+                                        sequence: seq.0,
+                                        acknowledgment: ack.0,
+                                        flags: RST | if with_ack { ACK } else { 0 },
+                                        window,
+                                        urgent_pointer: 0,
+                                    },
+                                    &options,
+                                    &[],
+                                    &mut expected
+                                )
+                                .unwrap(),
+                                size
+                            );
+                            assert_eq!(
+                                bytes, expected,
+                                "{state:?} enabled={enabled} complete={complete}"
+                            );
+                            assert_eq!(c.transmit(3_000, &mut []), Ok(None));
+                        }
+                    }
+                }
+            }
         }
     }
 
