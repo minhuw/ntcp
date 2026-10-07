@@ -20,7 +20,9 @@ def main():
             continue
         seen.add(name)
         classification = name.startswith('ntcp_boundary_')
-        stubs.append(f'{result} {name}{args} {{ return probe({int(classification)}); }}')
+        call = f'probe({int(classification)})'
+        body = f'{call};' if result == 'void' else f'return {call};'
+        stubs.append(f'{result} {name}{args} {{ {body} }}')
     harness = r'''
 #define _GNU_SOURCE
 #include <assert.h>
