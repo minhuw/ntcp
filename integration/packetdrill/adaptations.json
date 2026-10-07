@@ -490,7 +490,8 @@
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
-          "abort_with_ack": true
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true
         }
       }
     },
@@ -529,7 +530,8 @@
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
-          "abort_with_ack": true
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true
         }
       },
       "blocked_reasons": [
@@ -627,7 +629,8 @@
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
-          "abort_with_ack": true
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true
         }
       }
     },
@@ -666,7 +669,8 @@
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
-          "abort_with_ack": true
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true
         }
       }
     },
@@ -705,7 +709,8 @@
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
-          "abort_with_ack": true
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true
         }
       }
     },
@@ -744,7 +749,8 @@
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
-          "abort_with_ack": true
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true
         }
       }
     },
@@ -783,7 +789,8 @@
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
-          "abort_with_ack": true
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true
         }
       }
     },
@@ -822,7 +829,8 @@
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
-          "abort_with_ack": true
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true
         }
       }
     },
@@ -861,7 +869,8 @@
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
-          "abort_with_ack": true
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true
         }
       }
     },
@@ -900,7 +909,8 @@
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
-          "abort_with_ack": true
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true
         }
       }
     },
@@ -939,7 +949,8 @@
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
-          "abort_with_ack": true
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true
         }
       }
     },
@@ -979,7 +990,8 @@
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
-          "abort_with_ack": true
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true
         }
       }
     },
@@ -1018,7 +1030,8 @@
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
-          "abort_with_ack": true
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true
         }
       }
     },
@@ -1057,7 +1070,8 @@
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
-          "abort_with_ack": true
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true
         }
       }
     },
@@ -1097,7 +1111,8 @@
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
-          "abort_with_ack": true
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true
         }
       },
       "blocked_reasons": [
@@ -1153,7 +1168,8 @@
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
-          "abort_with_ack": true
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true
         }
       }
     }

@@ -435,6 +435,7 @@ impl Owner {
             config.connection.rto_min_us = 200_000;
         }
         config.connection.sack = upstream || profile == Profile::Sack;
+        config.connection.coalesce_read_window_updates = profile == Profile::UpstreamBasic;
         config.connection.recovery_algorithm = if profile == Profile::UpstreamBasic {
             ntcp::RecoveryAlgorithm::Reno
         } else {

@@ -145,6 +145,11 @@ pub struct ConnectionConfig {
     pub rto_min_us: u64,
     pub retransmit_beyond_window: bool,
     pub delayed_ack_us: u64,
+    // Coalesce standalone read-triggered window updates up to two effective
+    // send MSS (bounded by half receive capacity). Ordinary ACKs still offer
+    // one-MSS SWS credit; zero-window reopening uses that same lower threshold.
+    // Boolean policy has no invalid values; existing capacity/MSS validation applies.
+    pub coalesce_read_window_updates: bool,
     // Per-connection fixed-window challenge budget, in microseconds.
     // ponytail: permits boundary bursts; use sliding windows if a rolling cap is needed.
     pub challenge_ack_limit: u32,
@@ -224,6 +229,7 @@ impl Default for ConnectionConfig {
             rto_min_us: 1_000_000,
             retransmit_beyond_window: false,
             delayed_ack_us: 200_000,
+            coalesce_read_window_updates: false,
             challenge_ack_limit: 100,
             challenge_ack_interval_us: 1_000_000,
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
@@ -2331,7 +2337,7 @@ impl Connection {
         let shift = if self.scaling { self.local_scale } else { 0 };
         let credit = (u32::from(self.advertised_window(false)) << shift)
             .saturating_sub(self.receive_window());
-        if count != 0 && !self.receive.eof() && credit >= self.window_threshold() {
+        if count != 0 && !self.receive.eof() && credit >= self.read_window_threshold() {
             self.immediate_ack();
         }
         Ok(count)
@@ -4171,6 +4177,26 @@ impl Connection {
     fn window_threshold(&self) -> u32 {
         // RFC 9293 section 3.8.6.2.2: min(Fr * RCV.BUFF, Eff.snd.MSS), Fr = 1/2.
         (self.config.receive_capacity / 2).max(1).min(self.mss) as u32
+    }
+
+    fn read_window_threshold(&self) -> u32 {
+        let shift = if self.scaling { self.local_scale } else { 0 };
+        // A retained sub-scale promise can coexist with a zero wire window.
+        // Do not make a stalled sender wait for the coalescing threshold.
+        if !self.config.coalesce_read_window_updates || self.receive_window() < (1u32 << shift) {
+            return self.window_threshold();
+        }
+        // RFC9293 3.8.6.2.2 / RFC1122 4.2.3.3 prescribe receiver SWS
+        // avoidance, but the one-MSS formula is suggested, not mandatory.
+        // This only delays unsolicited read updates; it neither delays data
+        // ACKs nor changes their advertised window or prior acceptance edge.
+        // Linux 22430ae5d90ab288b0ee2ad99ae941f4a666b694 and current tcp.c,
+        // __tcp_cleanup_rbuf, similarly separate ACK scheduling from window
+        // selection (new_window >= 2 * rcv_window_now). Our two-MSS bound
+        // is NOT that doubling algorithm or tcp_rcv_space_adjust autotuning.
+        (self.config.receive_capacity / 2)
+            .max(1)
+            .min(self.mss.saturating_mul(2)) as u32
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.2.2
@@ -17078,10 +17104,155 @@ mod tests {
     }
 
     #[test]
+    fn coalesced_read_credit_is_bounded_and_commits_only_on_output() {
+        assert!(!ConnectionConfig::default().coalesce_read_window_updates);
+        for (capacity, mss) in [
+            (64, 8),
+            (65536, 1460),
+            (8 * 1024 * 1024, 1000),
+            (8 * 1024 * 1024, 1460),
+        ] {
+            for iss in [100, u32::MAX - 32] {
+                let cfg = ConnectionConfig {
+                    delayed_ack_us: 0,
+                    coalesce_read_window_updates: true,
+                    ..config(capacity, mss)
+                };
+                let (_, mut b) = pair(cfg, iss);
+                b.immediate_ack();
+                packet(&mut b, 40);
+                let ack = b.snd_una;
+                let count = usize::from(mss);
+                let next = b.receive.next();
+                inject(&mut b, 41, next, ack, ACK, 20000, &vec![1; 2 * count]);
+                packet(&mut b, 41);
+                let promised = b.advertised_edge;
+                assert_eq!(b.read_window_threshold(), 2 * u32::from(mss));
+                assert_eq!(b.read(&mut vec![0; count]), Ok(count));
+                assert!(!b.ack_pending);
+                assert_eq!(b.transmit(42, &mut [0; 64]), Ok(None));
+                assert_eq!(b.advertised_edge, promised);
+                assert_eq!(b.read(&mut vec![0; count]), Ok(count));
+                assert!(b.ack_pending);
+                assert_eq!(b.transmit(43, &mut [0; 19]), Err(Error::OutputTooSmall));
+                assert!(b.ack_pending);
+                assert_eq!(b.advertised_edge, promised);
+                let bytes = packet(&mut b, 44);
+                let segment = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+                let edge = Seq(segment.header.acknowledgment)
+                    .wrapping_add(u32::from(segment.header.window) << b.local_scale);
+                assert!(edge.distance_from(promised) >= 2 * u32::from(mss));
+                assert_eq!(b.advertised_edge, edge);
+                assert!(at_or_after(b.receive.right_edge(), edge));
+                assert_eq!(b.transmit(45, &mut [0; 64]), Ok(None));
+
+                // Continued incoming traffic carries one-MSS read credit on
+                // its ordinary ACK, without waiting for two-MSS read credit.
+                let next = b.receive.next();
+                inject(&mut b, 46, next, ack, ACK, 20000, &vec![1; count]);
+                packet(&mut b, 46);
+                let promised = b.advertised_edge;
+                assert_eq!(b.read(&mut vec![0; count]), Ok(count));
+                assert!(!b.ack_pending);
+                let next = b.receive.next();
+                inject(&mut b, 47, next, ack, ACK, 20000, &vec![2; count]);
+                assert!(b.ack_pending);
+                packet(&mut b, 47);
+                assert!(after(b.advertised_edge, promised));
+                assert!(at_or_after(b.receive.right_edge(), b.advertised_edge));
+                assert_eq!(b.read(&mut vec![0; count]), Ok(count));
+            }
+        }
+    }
+
+    #[test]
+    fn coalesced_read_credit_reopens_scaled_zero_with_retained_promise() {
+        let cfg = ConnectionConfig {
+            delayed_ack_us: 0,
+            coalesce_read_window_updates: true,
+            ..config(65536, 1460)
+        };
+        let (_, mut b) = pair(cfg, u32::MAX - 32);
+        b.immediate_ack();
+        packet(&mut b, 40);
+        let ack = b.snd_una;
+        for count in [32768, 32767] {
+            let next = b.receive.next();
+            inject(&mut b, 41, next, ack, ACK, 20000, &vec![1; count]);
+            packet(&mut b, 41);
+        }
+        assert_eq!(b.receive_window(), 1); // Retained acceptance promise.
+        assert_eq!(b.advertised_window(false), 0); // Sender is stalled.
+        let promised = b.advertised_edge;
+        let count = usize::from(b.config.mss) + (1 << b.local_scale);
+        assert_eq!(b.read(&mut vec![0; count]), Ok(count));
+        assert_eq!(b.read_window_threshold(), b.window_threshold());
+        assert!(b.ack_pending);
+        assert_eq!(b.transmit(42, &mut [0; 19]), Err(Error::OutputTooSmall));
+        assert_eq!(b.advertised_edge, promised);
+        // The sender may still deliver the last byte promised before the
+        // scaled zero advertisement, even while reopening output has failed.
+        let next = b.receive.next();
+        inject(&mut b, 43, next, ack, ACK, 20000, b"x");
+        assert_eq!(b.receive.next(), next.wrapping_add(1));
+        assert_eq!(b.advertised_edge, promised);
+        let bytes = packet(&mut b, 43);
+        let segment = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+        assert_ne!(segment.header.window, 0);
+        assert!(after(b.advertised_edge, promised));
+        assert!(at_or_after(b.receive.right_edge(), b.advertised_edge));
+    }
+
+    #[test]
+    fn coalesced_read_credit_small_capacity_and_validation() {
+        for capacity in [1, 2, 3, 16, 64] {
+            let cfg = ConnectionConfig {
+                coalesce_read_window_updates: true,
+                ..config(capacity, 32)
+            };
+            let (_, mut b) = pair(cfg, u32::MAX);
+            let threshold = (capacity / 2).max(1);
+            assert_eq!(b.read_window_threshold(), threshold as u32);
+            let next = b.receive.next();
+            let ack = b.snd_una;
+            inject(&mut b, 40, next, ack, ACK, 20000, &vec![1; capacity]);
+            packet(&mut b, 40);
+            assert_eq!(b.receive_window(), 0);
+            assert_eq!(b.read(&mut vec![0; threshold]), Ok(threshold));
+            assert!(b.ack_pending);
+            packet(&mut b, 41);
+            assert_eq!(b.receive_window(), threshold as u32);
+        }
+        for (capacity, mss) in [(0, 8), ((65535usize << 14) + 1, 8), (64, 0), (64, 65496)] {
+            let cfg = ConnectionConfig {
+                coalesce_read_window_updates: true,
+                ..config(capacity, mss)
+            };
+            assert!(matches!(
+                Connection::active(tuple(), cfg, 100, 0),
+                Err(Error::InvalidArgument)
+            ));
+        }
+        // Maximum legal MSS doubles in usize, not overflowing u16; window
+        // scaling arithmetic remains u32 and < 2^31 under validated bounds.
+        let (_, mut b) = pair(config(64, 8), 100);
+        b.config.coalesce_read_window_updates = true;
+        b.config.receive_capacity = 65535usize << 14;
+        b.mss = 65495;
+        assert_eq!(b.read_window_threshold(), 130990);
+    }
+
+    #[test]
     fn read_credit_reopens_zero_window_at_sws_threshold() {
-        for (capacity, mss) in [(64, 32), (65536, 1460)] {
+        for (capacity, mss, coalesce) in [
+            (64, 32, false),
+            (65536, 1460, false),
+            (64, 32, true),
+            (65536, 1460, true),
+        ] {
             let cfg = ConnectionConfig {
                 delayed_ack_us: 0,
+                coalesce_read_window_updates: coalesce,
                 ..config(capacity, mss)
             };
             let (_, mut b) = pair(cfg, u32::MAX - 32);
@@ -17105,6 +17276,10 @@ mod tests {
             assert_eq!(b.advertised_window(false), 0);
             assert_eq!(b.transmit(42, &mut [0; 64]), Ok(None));
             assert_eq!(b.read(&mut [0; 1]), Ok(1));
+            assert!(b.ack_pending);
+            assert_eq!(b.transmit(43, &mut [0; 19]), Err(Error::OutputTooSmall));
+            assert_eq!(b.receive_window(), 0);
+            assert_eq!(b.advertised_edge, promised);
             assert!(b.ack_pending);
             let bytes = packet(&mut b, 43);
             let segment = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
