@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::missing_safety_doc)]
-// Linux preload boundary. Raw syscalls keep libc and the owner thread out of
-// interposition recursion; OS socket tokens never carry application payload.
+// Linux preload boundary. Native cancellation points tail-jump through C to
+// libc; internal runtime syscalls avoid recursion. Tokens carry no payload.
 use libc::*;
 use std::{
     cell::Cell,
@@ -15,13 +15,34 @@ use std::{
         atomic::{AtomicI32, AtomicUsize, Ordering},
     },
 };
+macro_rules! boundary_entry {
+    ($name:ident, $target:literal, ($($arg:ident: $ty:ty),*) -> $ret:ty) => {
+        #[unsafe(no_mangle)]
+        #[unsafe(naked)]
+        pub unsafe extern "C" fn $name($($arg: $ty),*) -> $ret {
+            #[cfg(target_arch = "x86_64")]
+            core::arch::naked_asm!(concat!("jmp ", $target));
+            #[cfg(target_arch = "aarch64")]
+            core::arch::naked_asm!(concat!("b ", $target));
+        }
+    };
+}
+
 mod readiness;
 mod runtime;
+mod stdio;
 use runtime::{Op, Reply, Runtime};
 type Result<T> = std::result::Result<T, i32>;
 thread_local! {
     static INTERNAL: Cell<bool> = const { Cell::new(false) };
     static DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+unsafe extern "C" {
+    fn ntcp_set_internal(value: i32);
+}
+fn set_internal(value: bool) -> bool {
+    unsafe { ntcp_set_internal(value as i32) };
+    INTERNAL.with(|v| v.replace(value))
 }
 static PID: AtomicI32 = AtomicI32::new(0);
 static RUNTIME: OnceLock<Result<Runtime>> = OnceLock::new();
@@ -104,12 +125,10 @@ fn runtime() -> Result<&'static Runtime> {
     .ok();
     RUNTIME
         .get_or_init(|| {
-            INTERNAL.with(|v| {
-                let old = v.replace(true);
-                let result = catch_unwind(Runtime::start).unwrap_or(Err(EIO));
-                v.set(old);
-                result
-            })
+            let old = set_internal(true);
+            let result = catch_unwind(Runtime::start).unwrap_or(Err(EIO));
+            set_internal(old);
+            result
         })
         .as_ref()
         .map_err(|e| *e)
@@ -503,7 +522,7 @@ unsafe fn output_addr(addr: SocketAddr, p: *mut sockaddr, len: *mut socklen_t) -
     Ok(())
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn socket(domain: i32, kind: i32, protocol: i32) -> i32 {
+pub unsafe extern "C" fn ntcp_managed_socket(domain: i32, kind: i32, protocol: i32) -> i32 {
     ffi(|| {
         if INTERNAL.with(Cell::get)
             || !configured()
@@ -558,7 +577,7 @@ pub unsafe extern "C" fn listen(fd: i32, backlog: i32) -> i32 {
     }) as i32
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn accept4(
+pub unsafe extern "C" fn ntcp_managed_accept4(
     fd: i32,
     p: *mut sockaddr,
     len: *mut socklen_t,
@@ -595,11 +614,15 @@ pub unsafe extern "C" fn accept4(
     }) as i32
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn accept(fd: i32, p: *mut sockaddr, len: *mut socklen_t) -> i32 {
-    unsafe { accept4(fd, p, len, 0) }
+pub unsafe extern "C" fn ntcp_managed_accept(
+    fd: i32,
+    p: *mut sockaddr,
+    len: *mut socklen_t,
+) -> i32 {
+    unsafe { ntcp_managed_accept4(fd, p, len, 0) }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn connect(fd: i32, p: *const sockaddr, len: socklen_t) -> i32 {
+pub unsafe extern "C" fn ntcp_managed_connect(fd: i32, p: *const sockaddr, len: socklen_t) -> i32 {
     ffi(|| {
         let Some(id) = owned(fd)? else {
             return raw(unsafe { syscall(SYS_connect, fd, p, len) });
@@ -617,7 +640,7 @@ pub unsafe extern "C" fn connect(fd: i32, p: *const sockaddr, len: socklen_t) ->
     }) as i32
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn close(fd: i32) -> i32 {
+pub unsafe extern "C" fn ntcp_managed_close(fd: i32) -> i32 {
     if !inherited(&SOCKET_FDS, fd) && !readiness::tracked_epoll(fd) {
         return unsafe { syscall(SYS_close, fd) as i32 };
     }
@@ -749,15 +772,25 @@ unsafe fn transfer(fd: i32, p: *mut c_void, n: usize, flags: i32, write: bool) -
     Ok(reply.value as i64)
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn send(fd: i32, p: *const c_void, n: usize, flags: i32) -> ssize_t {
+pub unsafe extern "C" fn ntcp_managed_send(
+    fd: i32,
+    p: *const c_void,
+    n: usize,
+    flags: i32,
+) -> ssize_t {
     ffi(|| unsafe { transfer(fd, p.cast_mut(), n, flags, true) }) as ssize_t
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn recv(fd: i32, p: *mut c_void, n: usize, flags: i32) -> ssize_t {
+pub unsafe extern "C" fn ntcp_managed_recv(
+    fd: i32,
+    p: *mut c_void,
+    n: usize,
+    flags: i32,
+) -> ssize_t {
     ffi(|| unsafe { transfer(fd, p, n, flags, false) }) as ssize_t
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn read(fd: i32, p: *mut c_void, n: usize) -> ssize_t {
+pub unsafe extern "C" fn ntcp_managed_read(fd: i32, p: *mut c_void, n: usize) -> ssize_t {
     if !inherited(&SOCKET_FDS, fd) {
         return unsafe { syscall(SYS_read, fd, p, n) as ssize_t };
     }
@@ -770,19 +803,24 @@ pub unsafe extern "C" fn read(fd: i32, p: *mut c_void, n: usize) -> ssize_t {
     }) as ssize_t
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __read_chk(fd: i32, p: *mut c_void, n: usize, size: usize) -> ssize_t {
+pub unsafe extern "C" fn ntcp_managed___read_chk(
+    fd: i32,
+    p: *mut c_void,
+    n: usize,
+    size: usize,
+) -> ssize_t {
     if n > size {
         unsafe {
             __chk_fail();
         }
     }
-    unsafe { read(fd, p, n) }
+    unsafe { ntcp_managed_read(fd, p, n) }
 }
 unsafe extern "C" {
     fn __chk_fail() -> !;
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __recv_chk(
+pub unsafe extern "C" fn ntcp_managed___recv_chk(
     fd: i32,
     p: *mut c_void,
     n: usize,
@@ -794,10 +832,10 @@ pub unsafe extern "C" fn __recv_chk(
             __chk_fail();
         }
     }
-    unsafe { recv(fd, p, n, flags) }
+    unsafe { ntcp_managed_recv(fd, p, n, flags) }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __recvfrom_chk(
+pub unsafe extern "C" fn ntcp_managed___recvfrom_chk(
     fd: i32,
     p: *mut c_void,
     n: usize,
@@ -811,10 +849,10 @@ pub unsafe extern "C" fn __recvfrom_chk(
             __chk_fail();
         }
     }
-    unsafe { recvfrom(fd, p, n, flags, addr, len) }
+    unsafe { ntcp_managed_recvfrom(fd, p, n, flags, addr, len) }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn write(fd: i32, p: *const c_void, n: usize) -> ssize_t {
+pub unsafe extern "C" fn ntcp_managed_write(fd: i32, p: *const c_void, n: usize) -> ssize_t {
     if !inherited(&SOCKET_FDS, fd) {
         return unsafe { syscall(SYS_write, fd, p, n) as ssize_t };
     }
@@ -889,7 +927,7 @@ unsafe fn vectors_output(
     })
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn readv(fd: i32, v: *const iovec, n: i32) -> ssize_t {
+pub unsafe extern "C" fn ntcp_managed_readv(fd: i32, v: *const iovec, n: i32) -> ssize_t {
     ffi(|| {
         if owned(fd)?.is_none() {
             raw(unsafe { syscall(SYS_readv, fd, v, n) })
@@ -899,7 +937,7 @@ pub unsafe extern "C" fn readv(fd: i32, v: *const iovec, n: i32) -> ssize_t {
     }) as ssize_t
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn writev(fd: i32, v: *const iovec, n: i32) -> ssize_t {
+pub unsafe extern "C" fn ntcp_managed_writev(fd: i32, v: *const iovec, n: i32) -> ssize_t {
     ffi(|| {
         if owned(fd)?.is_none() {
             raw(unsafe { syscall(SYS_writev, fd, v, n) })
@@ -909,7 +947,7 @@ pub unsafe extern "C" fn writev(fd: i32, v: *const iovec, n: i32) -> ssize_t {
     }) as ssize_t
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sendmsg(fd: i32, p: *const msghdr, flags: i32) -> ssize_t {
+pub unsafe extern "C" fn ntcp_managed_sendmsg(fd: i32, p: *const msghdr, flags: i32) -> ssize_t {
     ffi(|| {
         if owned(fd)?.is_none() {
             return raw(unsafe { syscall(SYS_sendmsg, fd, p, flags) });
@@ -926,7 +964,7 @@ pub unsafe extern "C" fn sendmsg(fd: i32, p: *const msghdr, flags: i32) -> ssize
     }) as ssize_t
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn recvmsg(fd: i32, p: *mut msghdr, flags: i32) -> ssize_t {
+pub unsafe extern "C" fn ntcp_managed_recvmsg(fd: i32, p: *mut msghdr, flags: i32) -> ssize_t {
     ffi(|| {
         let Some(id) = owned(fd)? else {
             return raw(unsafe { syscall(SYS_recvmsg, fd, p, flags) });
@@ -953,7 +991,7 @@ pub unsafe extern "C" fn recvmsg(fd: i32, p: *mut msghdr, flags: i32) -> ssize_t
     }) as ssize_t
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sendto(
+pub unsafe extern "C" fn ntcp_managed_sendto(
     fd: i32,
     p: *const c_void,
     n: usize,
@@ -972,7 +1010,7 @@ pub unsafe extern "C" fn sendto(
     }) as ssize_t
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn recvfrom(
+pub unsafe extern "C" fn ntcp_managed_recvfrom(
     fd: i32,
     p: *mut c_void,
     n: usize,
@@ -1618,3 +1656,85 @@ mod tests {
         }
     }
 }
+
+boundary_entry!(read, "ntcp_c_read", (fd: i32, p: *mut c_void, n: usize) -> ssize_t);
+boundary_entry!(write, "ntcp_c_write", (fd: i32, p: *const c_void, n: usize) -> ssize_t);
+boundary_entry!(readv, "ntcp_c_readv", (fd: i32, v: *const iovec, n: i32) -> ssize_t);
+boundary_entry!(writev, "ntcp_c_writev", (fd: i32, v: *const iovec, n: i32) -> ssize_t);
+boundary_entry!(send, "ntcp_c_send", (fd: i32, p: *const c_void, n: usize, flags: i32) -> ssize_t);
+boundary_entry!(recv, "ntcp_c_recv", (fd: i32, p: *mut c_void, n: usize, flags: i32) -> ssize_t);
+boundary_entry!(sendto, "ntcp_c_sendto", (fd: i32,
+    p: *const c_void,
+    n: usize,
+    flags: i32,
+    addr: *const sockaddr,
+    len: socklen_t) -> ssize_t);
+boundary_entry!(recvfrom, "ntcp_c_recvfrom", (fd: i32,
+    p: *mut c_void,
+    n: usize,
+    flags: i32,
+    addr: *mut sockaddr,
+    len: *mut socklen_t) -> ssize_t);
+boundary_entry!(sendmsg, "ntcp_c_sendmsg", (fd: i32, p: *const msghdr, flags: i32) -> ssize_t);
+boundary_entry!(recvmsg, "ntcp_c_recvmsg", (fd: i32, p: *mut msghdr, flags: i32) -> ssize_t);
+boundary_entry!(accept, "ntcp_c_accept", (fd: i32, p: *mut sockaddr, len: *mut socklen_t) -> i32);
+boundary_entry!(accept4, "ntcp_c_accept4", (fd: i32,
+    p: *mut sockaddr,
+    len: *mut socklen_t,
+    flags: i32) -> i32);
+boundary_entry!(connect, "ntcp_c_connect", (fd: i32, p: *const sockaddr, len: socklen_t) -> i32);
+boundary_entry!(close, "ntcp_c_close", (fd: i32) -> i32);
+boundary_entry!(__read_chk, "ntcp_c___read_chk", (fd: i32, p: *mut c_void, n: usize, size: usize) -> ssize_t);
+boundary_entry!(__recv_chk, "ntcp_c___recv_chk", (fd: i32,
+    p: *mut c_void,
+    n: usize,
+    size: usize,
+    flags: i32) -> ssize_t);
+boundary_entry!(__recvfrom_chk, "ntcp_c___recvfrom_chk", (fd: i32,
+    p: *mut c_void,
+    n: usize,
+    size: usize,
+    flags: i32,
+    addr: *mut sockaddr,
+    len: *mut socklen_t) -> ssize_t);
+
+// C classifiers return before libc can enter a cancellation point. Native
+// descriptors only consult atomics; no locks, allocation, or TLS on that path.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntcp_boundary_fd(fd: i32) -> i32 {
+    inherited(&SOCKET_FDS, fd) as i32
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ntcp_boundary_epoll(fd: i32) -> i32 {
+    readiness::tracked_epoll(fd) as i32
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ntcp_stdio_id(fd: i32) -> u64 {
+    let mut id = 0;
+    ffi(|| {
+        id = owned(fd)?.unwrap_or(0);
+        Ok(0)
+    });
+    id
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ntcp_stdio_valid(fd: i32, id: u64) -> i32 {
+    ffi(|| {
+        if owned(fd)? == Some(id) {
+            Ok(0)
+        } else {
+            Err(EBADF)
+        }
+    }) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ntcp_boundary_socket(domain: i32, kind: i32) -> i32 {
+    ffi(|| {
+        Ok(
+            (configured() && [AF_INET, AF_INET6].contains(&domain) && kind & 0xf == SOCK_STREAM)
+                as i64,
+        )
+    }) as i32
+}
+boundary_entry!(socket, "ntcp_c_socket", (domain: i32, kind: i32, protocol: i32) -> i32);

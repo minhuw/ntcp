@@ -69,7 +69,7 @@ impl Runtime {
         let spawned = std::thread::Builder::new()
             .name("ntcp-socket".into())
             .spawn(move || {
-                INTERNAL.with(|v| v.set(true));
+                set_internal(true);
                 let result = std::panic::catch_unwind(|| match Owner::new(&name, local) {
                     Ok(mut owner) => {
                         let _ = ready_tx.send(Ok(()));

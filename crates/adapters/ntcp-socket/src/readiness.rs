@@ -363,11 +363,16 @@ unsafe fn epwait(
     }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn epoll_wait(epfd: i32, p: *mut epoll_event, max: i32, timeout: i32) -> i32 {
+pub unsafe extern "C" fn ntcp_managed_epoll_wait(
+    epfd: i32,
+    p: *mut epoll_event,
+    max: i32,
+    timeout: i32,
+) -> i32 {
     ffi(|| unsafe { epwait(epfd, p, max, timeout, ptr::null()) }) as i32
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn epoll_pwait(
+pub unsafe extern "C" fn ntcp_managed_epoll_pwait(
     epfd: i32,
     p: *mut epoll_event,
     max: i32,
@@ -377,7 +382,7 @@ pub unsafe extern "C" fn epoll_pwait(
     ffi(|| unsafe { epwait(epfd, p, max, timeout, mask) }) as i32
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn poll(p: *mut pollfd, n: nfds_t, timeout: i32) -> i32 {
+pub unsafe extern "C" fn ntcp_managed_poll(p: *mut pollfd, n: nfds_t, timeout: i32) -> i32 {
     ffi(|| unsafe { poll_impl(p, n, timeout, ptr::null()) }) as i32
 }
 unsafe fn poll_impl(p: *mut pollfd, n: nfds_t, timeout: i32, mask: *const sigset_t) -> Result<i64> {
@@ -506,7 +511,7 @@ fn output_set(p: *mut fd_set, set: &fd_set, n: i32) -> Result<()> {
     Ok(())
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn select(
+pub unsafe extern "C" fn ntcp_managed_select(
     n: i32,
     r: *mut fd_set,
     w: *mut fd_set,
@@ -683,7 +688,7 @@ unsafe fn virtual_poll(p: *const pollfd, n: nfds_t) -> Result<bool> {
     Ok(any_sockets() && unsafe { large_poll_virtual(p, n)? })
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ppoll(
+pub unsafe extern "C" fn ntcp_managed_ppoll(
     p: *mut pollfd,
     n: nfds_t,
     t: *const timespec,
@@ -719,7 +724,7 @@ pub unsafe extern "C" fn ppoll(
     }) as i32
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pselect(
+pub unsafe extern "C" fn ntcp_managed_pselect(
     n: i32,
     r: *mut fd_set,
     w: *mut fd_set,
@@ -763,7 +768,7 @@ pub unsafe extern "C" fn pselect(
     }) as i32
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn epoll_pwait2(
+pub unsafe extern "C" fn ntcp_managed_epoll_pwait2(
     epfd: i32,
     p: *mut epoll_event,
     max: i32,
@@ -779,16 +784,21 @@ pub unsafe extern "C" fn epoll_pwait2(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __poll_chk(p: *mut pollfd, n: nfds_t, timeout: i32, size: usize) -> i32 {
+pub unsafe extern "C" fn ntcp_managed___poll_chk(
+    p: *mut pollfd,
+    n: nfds_t,
+    timeout: i32,
+    size: usize,
+) -> i32 {
     if n > (size / std::mem::size_of::<pollfd>()) as nfds_t {
         unsafe {
             __chk_fail();
         }
     }
-    unsafe { poll(p, n, timeout) }
+    unsafe { ntcp_managed_poll(p, n, timeout) }
 }
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __ppoll_chk(
+pub unsafe extern "C" fn ntcp_managed___ppoll_chk(
     p: *mut pollfd,
     n: nfds_t,
     t: *const timespec,
@@ -800,7 +810,7 @@ pub unsafe extern "C" fn __ppoll_chk(
             __chk_fail();
         }
     }
-    unsafe { ppoll(p, n, t, mask) }
+    unsafe { ntcp_managed_ppoll(p, n, t, mask) }
 }
 
 #[cfg(test)]
@@ -824,4 +834,58 @@ mod tests {
         );
         assert_eq!(poll_events(EPOLLERR | EPOLLHUP, 0), POLLERR | POLLHUP);
     }
+}
+
+boundary_entry!(poll, "ntcp_c_poll", (p: *mut pollfd, n: nfds_t, timeout: i32) -> i32);
+boundary_entry!(ppoll, "ntcp_c_ppoll", (p: *mut pollfd,
+    n: nfds_t,
+    t: *const timespec,
+    mask: *const sigset_t) -> i32);
+boundary_entry!(select, "ntcp_c_select", (n: i32,
+    r: *mut fd_set,
+    w: *mut fd_set,
+    e: *mut fd_set,
+    t: *mut timeval) -> i32);
+boundary_entry!(pselect, "ntcp_c_pselect", (n: i32,
+    r: *mut fd_set,
+    w: *mut fd_set,
+    e: *mut fd_set,
+    t: *const timespec,
+    mask: *const sigset_t) -> i32);
+boundary_entry!(epoll_wait, "ntcp_c_epoll_wait", (epfd: i32, p: *mut epoll_event, max: i32, timeout: i32) -> i32);
+boundary_entry!(epoll_pwait, "ntcp_c_epoll_pwait", (epfd: i32,
+    p: *mut epoll_event,
+    max: i32,
+    timeout: i32,
+    mask: *const sigset_t) -> i32);
+boundary_entry!(epoll_pwait2, "ntcp_c_epoll_pwait2", (epfd: i32,
+    p: *mut epoll_event,
+    max: i32,
+    t: *const timespec,
+    mask: *const sigset_t) -> i32);
+boundary_entry!(__poll_chk, "ntcp_c___poll_chk", (p: *mut pollfd, n: nfds_t, timeout: i32, size: usize) -> i32);
+boundary_entry!(__ppoll_chk, "ntcp_c___ppoll_chk", (p: *mut pollfd,
+    n: nfds_t,
+    t: *const timespec,
+    mask: *const sigset_t,
+    size: usize) -> i32);
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ntcp_boundary_poll(p: *const pollfd, n: nfds_t) -> i32 {
+    if !any_sockets() {
+        return 0;
+    }
+    ffi(|| Ok(unsafe { large_poll_virtual(p, n)? } as i64)) as i32
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ntcp_boundary_select(
+    n: i32,
+    r: *const fd_set,
+    w: *const fd_set,
+    e: *const fd_set,
+) -> i32 {
+    if !select_maybe_virtual(n) {
+        return 0;
+    }
+    ffi(|| Ok(large_select_virtual(n, [r, w, e])? as i64)) as i32
 }
