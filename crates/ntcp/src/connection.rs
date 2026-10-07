@@ -529,6 +529,8 @@ pub(crate) struct Connection {
     ecn_ce_end: Option<Seq>,
     ecn_cwr_pending: bool,
     ecn_pause: Option<Instant>,
+    // Independent of RTT sampling and loss RTO backoff: (flight end, interval).
+    ecn_backoff: Option<(Seq, u64)>,
     last_output_ecn: u8,
     pub(crate) accepted_metadata: bool,
     sample: Option<(Seq, Instant)>,
@@ -763,6 +765,7 @@ impl Connection {
             ecn_ce_end: None,
             ecn_cwr_pending: false,
             ecn_pause: None,
+            ecn_backoff: None,
             last_output_ecn: 0,
             accepted_metadata: false,
             sample: None,
@@ -946,6 +949,7 @@ impl Connection {
             && self.sack_post_rto.is_none()
             && self.consecutive_timeouts == 0
             && !self.retx_pending
+            && self.ecn_pause.is_none_or(|deadline| self.now >= deadline)
             && self.rack.counts().sacked == 0
             && self.rack.deadline.is_none()
     }
@@ -1945,6 +1949,7 @@ impl Connection {
         self.ecn_echo = false;
         self.ecn_cwr_pending = false;
         self.ecn_pause = None;
+        self.ecn_backoff = None;
         self.ecn_sent_setup = false;
         self.reason = Some(reason);
         self.events.closed = Some(reason);
@@ -3259,7 +3264,19 @@ impl Connection {
             self.rack_entry_delivery = None;
             self.tlp_pending = false;
         }
-        let ecn_one = ece && self.flight() != 0 && self.congestion.cwnd() <= self.mss as u32;
+        let ecn_one = ece
+            && self.flight() != 0
+            && self.congestion.cwnd() <= self.mss as u32
+            && self.ecn_backoff.is_none_or(|(end, _)| after(ack, end));
+        // A duplicate or reordered no-ECE ACK does not prove congestion ended.
+        // Require new cumulative data delivery beyond the last marked flight.
+        if advancing
+            && !ece
+            && self.data_flight() != 0
+            && self.ecn_backoff.is_some_and(|(end, _)| after(ack, end))
+        {
+            self.ecn_backoff = None;
+        }
         let ecn_reduced = ece
             && self.flight() != 0
             && self
@@ -3448,12 +3465,35 @@ impl Connection {
         //= reason=Existing assertion blocks fresh output until RTO-length pause deadline and permits fresh ECT/CWR output at expiry.
         //# The sending TCP will then be able to send a new packet only when the retransmit timer expires.
         // Actor/condition: TCP endpoint; ECE at one-MSS cwnd.
+        //= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
+        //= reason=Shared ECN rate control retains an independent interval across RTT samples and pause expiry; serial flight boundaries prevent repeated feedback from doubling or postponing the same pause.
+        //# If congestion events indicated by ECN-Echo ACKs persist,
+        //# a sender with a _cwnd_ of 1 SMSS MUST reduce its sending rate even
+        //# further.
+        //= https://www.rfc-editor.org/rfc/rfc9438#section-5.5
+        //= reason=Successive distinct marked one-MSS flights double the send interval up to the existing 60-second timer cap in caller units. Only advancing no-ECE delivery beyond the marked flight resets persistence; loss backoff remains independent.
+        //# After reducing the sending rate to one packet per RTT in
+        //# response to congestion events detected by ECN-Echo ACKs, CUBIC then
+        //# exponentially increases the transmission timer for each packet
+        //# retransmission while congestion persists.
         if ecn_one {
-            let deadline = now.saturating_add(self.rto());
-            self.ecn_pause = Some(deadline);
-            if self.flight() != 0 {
-                self.rto_deadline = Some(deadline);
-            }
+            let interval = self
+                .ecn_backoff
+                .map_or(self.rto(), |(_, interval)| {
+                    interval.saturating_mul(2).max(self.rto())
+                })
+                .min(self.config.timebase.ticks_from_us(60_000_000));
+            self.ecn_backoff = Some((self.snd_nxt, interval));
+            self.ecn_pause = Some(now.saturating_add(interval));
+            // PTO must not clock out another packet during the ECN pause.
+            self.reset_tlp();
+        }
+        // Partial advancing ACKs may restart the ordinary RTO earlier, but
+        // cannot shorten the current ECN pause or postpone it on duplicates.
+        if let Some(deadline) = self.ecn_pause
+            && self.flight() != 0
+        {
+            self.rto_deadline = Some(self.rto_deadline.map_or(deadline, |rto| rto.max(deadline)));
         }
         if self.state == State::Closed || self.state == State::TimeWait {
             return Ok(());
@@ -20889,6 +20929,198 @@ mod tests {
             0
         );
         assert!(a.ecn_cwr_pending);
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
+    //= type=test
+    //= reason=Accepted duplicate ECE starts one pause but repetitions, partial progress within that flight and replay after expiry cannot double or prolong it. PTO cannot bypass the pause, pure ACK remains live, and genuine loss RTO remains independent.
+    //# If congestion events indicated by ECN-Echo ACKs persist,
+    //# a sender with a _cwnd_ of 1 SMSS MUST reduce its sending rate even
+    //# further.
+    fn persistent_ecn_duplicate_flight_timer_and_control_liveness() {
+        for algorithm in [CongestionAlgorithm::Cubic, CongestionAlgorithm::Reno] {
+            let mut cfg = config(4096, 64);
+            cfg.congestion_algorithm = algorithm;
+            cfg.sack = true;
+            cfg.rack = true;
+            cfg.tlp = true;
+            let (mut a, mut b) = pair(cfg, u32::MAX - 32);
+            a.congestion
+                .on_timeout(64, a.snd_una.wrapping_add(u32::MAX));
+            a.write(&[1; 128]).unwrap();
+            let data = packet(&mut a, 40);
+            b.input_with_traffic_class(50, 3, &wire::parse(ip(tuple()), &data).unwrap())
+                .unwrap();
+            let feedback_bytes = packet(&mut b, 50);
+            let mut feedback = wire::parse(ip(reverse(tuple())), &feedback_bytes).unwrap();
+            let end = feedback.header.acknowledgment;
+            feedback.header.acknowledgment = a.snd_una.0;
+            a.input(50, &feedback).unwrap();
+            let pause = a.ecn_pause.unwrap();
+            let backoff = a.ecn_backoff;
+            assert_eq!(a.loss_timer, Some((LossTimer::Rto, pause)));
+            assert_eq!(a.tlp_deadline, None);
+            for now in [51, 52] {
+                a.input(now, &feedback).unwrap();
+                assert_eq!(a.ecn_pause, Some(pause));
+                assert_eq!(a.ecn_backoff, backoff);
+                assert_eq!(a.loss_timer, Some((LossTimer::Rto, pause)));
+            }
+            feedback.header.flags &= !ECE;
+            a.input(52, &feedback).unwrap();
+            assert_eq!(a.ecn_backoff, backoff);
+            assert_eq!(a.ecn_pause, Some(pause));
+            feedback.header.flags |= ECE;
+            // Advance within (not beyond) the marked flight; RTT sampling and
+            // ACK timer restart must not shorten the reset retransmit timer.
+            feedback.header.acknowledgment = a.snd_una.wrapping_add(1).0;
+            a.input(53, &feedback).unwrap();
+            assert_eq!(a.ecn_pause, Some(pause));
+            assert_eq!(a.ecn_backoff, backoff);
+            let (timer, loss_deadline) = a.loss_timer.unwrap();
+            assert_eq!(timer, LossTimer::Rto);
+            assert!(loss_deadline >= pause);
+            let pause = loss_deadline;
+            a.immediate_ack();
+            let ack = packet(&mut a, 54);
+            assert!(wire::parse(ip(tuple()), &ack).unwrap().payload.is_empty());
+            assert_eq!(a.transmit(pause - 1, &mut [0; 2048]), Ok(None));
+            a.timeout(pause).unwrap();
+            assert!(a.retx_pending);
+            assert_eq!(a.consecutive_timeouts, 1);
+            let retry = packet(&mut a, pause);
+            assert!(!wire::parse(ip(tuple()), &retry).unwrap().payload.is_empty());
+            assert_eq!(a.last_output_ecn(), 0);
+            assert_eq!(a.ecn_backoff, backoff);
+            feedback.header.acknowledgment = end;
+            a.input(pause + 1, &feedback).unwrap();
+            assert_eq!(a.ecn_pause, None);
+            assert_eq!(a.ecn_backoff, backoff);
+            // Replayed feedback while the next original flight is outstanding
+            // is not a new persistent-congestion event.
+            packet(&mut a, pause + 2);
+            a.input(pause + 3, &feedback).unwrap();
+            assert_eq!(a.ecn_pause, None);
+            assert_eq!(a.ecn_backoff, backoff);
+        }
+    }
+
+    #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
+    //= type=test
+    //= reason=Real CE/ECE/CWR wire flights at one MSS demonstrate increasing silence despite fresh low RTT samples, duplicate/reordered feedback immunity, congestion-free progress reset, sequence wrap, caller-unit cap and transactional output for CUBIC and Reno.
+    //# If congestion events indicated by ECN-Echo ACKs persist,
+    //# a sender with a _cwnd_ of 1 SMSS MUST reduce its sending rate even
+    //# further.
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-5.5
+    //= type=test
+    //= reason=Eighteen independently delivered marked flights double the independent timer to the existing 60-second cap without loss timeouts; expiry and successful fresh output remain live.
+    //# After reducing the sending rate to one packet per RTT in
+    //# response to congestion events detected by ECN-Echo ACKs, CUBIC then
+    //# exponentially increases the transmission timer for each packet
+    //# retransmission while congestion persists.
+    fn persistent_ecn_wire_flights_backoff_reset_and_cap() {
+        for algorithm in [CongestionAlgorithm::Cubic, CongestionAlgorithm::Reno] {
+            for scale in [1, 1000] {
+                let mut cfg = config(4096, 64);
+                cfg.congestion_algorithm = algorithm;
+                cfg.rto_min_us = 1000;
+                cfg.timebase.units_per_second = 1_000_000 * scale;
+                let (mut a, mut b) = pair(cfg, u32::MAX - 100);
+                a.congestion
+                    .on_timeout(64, a.snd_una.wrapping_add(u32::MAX));
+                a.write(&[1; 64]).unwrap();
+                let mut now = 40 * scale;
+                let mut interval = 0;
+                let mut previous: Option<Vec<u8>> = None;
+                for _ in 0..18 {
+                    let data = packet(&mut a, now);
+                    let data = wire::parse(ip(tuple()), &data).unwrap();
+                    assert_eq!(data.payload.len(), 64);
+                    assert_eq!(a.last_output_ecn(), 2);
+                    // Old feedback replayed with a new flight outstanding is
+                    // neither a new ECE episode nor congestion-free progress.
+                    if let Some(old) = &previous {
+                        let before = (a.ecn_backoff, a.ecn_pause);
+                        let mut old = wire::parse(ip(reverse(tuple())), old).unwrap();
+                        a.input(now, &old).unwrap();
+                        old.header.flags &= !ECE;
+                        a.input(now, &old).unwrap();
+                        assert_eq!((a.ecn_backoff, a.ecn_pause), before);
+                    }
+                    b.input_with_traffic_class(now, 3, &data).unwrap();
+                    now += 10 * scale;
+                    let feedback_bytes = packet(&mut b, now);
+                    let feedback = wire::parse(ip(reverse(tuple())), &feedback_bytes).unwrap();
+                    assert_ne!(feedback.header.flags & ECE, 0);
+                    a.input(now, &feedback).unwrap();
+                    interval = if interval == 0 {
+                        a.rto()
+                    } else {
+                        (interval * 2).min(60_000_000 * scale)
+                    };
+                    assert_eq!(a.ecn_backoff, Some((a.snd_nxt, interval)));
+                    assert_eq!(a.ecn_pause, Some(now + interval));
+                    assert_eq!(a.congestion.cwnd(), 64);
+                    assert_eq!(a.consecutive_timeouts, 0);
+                    assert_eq!(a.loss_timer, None);
+                    assert!(a.rto() <= 2000 * scale);
+                    a.write(&[2; 64]).unwrap();
+                    let snapshot = (a.ecn_backoff, a.ecn_pause, a.rto_deadline);
+                    a.input(now + scale, &feedback).unwrap();
+                    let mut clear_duplicate =
+                        wire::parse(ip(reverse(tuple())), &feedback_bytes).unwrap();
+                    clear_duplicate.header.flags &= !ECE;
+                    a.input(now + scale, &clear_duplicate).unwrap();
+                    if let Some(old) = &previous {
+                        let mut old = wire::parse(ip(reverse(tuple())), old).unwrap();
+                        a.input(now + scale, &old).unwrap();
+                        old.header.flags &= !ECE;
+                        a.input(now + scale, &old).unwrap();
+                    }
+                    assert_eq!((a.ecn_backoff, a.ecn_pause, a.rto_deadline), snapshot);
+                    previous = Some(feedback_bytes);
+                    let deadline = now + interval;
+                    assert_eq!(a.transmit(deadline - 1, &mut [0; 2048]), Ok(None));
+                    a.timeout(deadline).unwrap();
+                    assert_eq!(a.ecn_pause, None);
+                    assert_eq!(a.ecn_backoff, snapshot.0);
+                    let before = (a.snd_nxt, a.ecn_backoff, a.ecn_cwr_pending, a.now);
+                    assert_eq!(
+                        a.transmit(deadline, &mut [0; 20]),
+                        Err(Error::OutputTooSmall)
+                    );
+                    assert_eq!((a.snd_nxt, a.ecn_backoff, a.ecn_cwr_pending, a.now), before);
+                    now = deadline;
+                }
+                assert_eq!(interval, 60_000_000 * scale);
+                // Unmarked CWR data clears the receiver latch and delivers fresh,
+                // validated congestion-free progress beyond the marked epoch.
+                let data = packet(&mut a, now);
+                let data = wire::parse(ip(tuple()), &data).unwrap();
+                assert_ne!(data.header.flags & CWR, 0);
+                b.input(now, &data).unwrap();
+                assert!(!b.ecn_echo);
+                now += 10 * scale;
+                b.immediate_ack();
+                deliver(&mut b, &mut a, now);
+                assert_eq!(a.ecn_backoff, None);
+                assert_eq!(a.ecn_pause, None);
+                // A subsequent marked flight starts from the RTT-derived RTO,
+                // not the prior capped interval.
+                a.congestion
+                    .on_timeout(64, a.snd_una.wrapping_add(u32::MAX));
+                a.write(&[3; 64]).unwrap();
+                let data = packet(&mut a, now);
+                b.input_with_traffic_class(now, 3, &wire::parse(ip(tuple()), &data).unwrap())
+                    .unwrap();
+                now += 10 * scale;
+                deliver(&mut b, &mut a, now);
+                assert_eq!(a.ecn_backoff, Some((a.snd_nxt, a.rto())));
+                assert_eq!(a.ecn_pause, Some(now + a.rto()));
+            }
+        }
     }
 
     #[test]
