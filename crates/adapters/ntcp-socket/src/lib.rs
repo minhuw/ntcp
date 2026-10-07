@@ -9,17 +9,20 @@ use std::{
     ffi::CStr,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     panic::{AssertUnwindSafe, catch_unwind},
-    ptr, slice,
+    ptr,
     sync::{
-        Mutex, OnceLock,
-        atomic::{AtomicI32, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicI32, AtomicUsize, Ordering},
     },
 };
 mod readiness;
 mod runtime;
 use runtime::{Op, Reply, Runtime};
 type Result<T> = std::result::Result<T, i32>;
-thread_local! { static INTERNAL: Cell<bool> = const { Cell::new(false) }; }
+thread_local! {
+    static INTERNAL: Cell<bool> = const { Cell::new(false) };
+    static DEPTH: Cell<usize> = const { Cell::new(0) };
+}
 static PID: AtomicI32 = AtomicI32::new(0);
 static RUNTIME: OnceLock<Result<Runtime>> = OnceLock::new();
 static SOCKET_FDS: [AtomicI32; runtime::LIMIT] = [const { AtomicI32::new(-1) }; runtime::LIMIT];
@@ -41,6 +44,12 @@ struct Token {
     retained: i32,
     dev: dev_t,
     ino: ino_t,
+    input: Arc<Input>,
+}
+#[derive(Default)]
+struct Input {
+    bytes: Mutex<Vec<u8>>,
+    ready: AtomicUsize,
 }
 impl Token {
     fn matches(&self, fd: i32) -> bool {
@@ -101,8 +110,12 @@ fn runtime() -> Result<&'static Runtime> {
         .map_err(|e| *e)
 }
 fn owned(fd: i32) -> Result<Option<u64>> {
-    if INTERNAL.with(Cell::get) || PID.load(Ordering::Acquire) == 0 {
+    // Native signal-handler I/O must not touch TLS, allocate, or acquire a lock.
+    if !inherited(&SOCKET_FDS, fd) {
         return Ok(None);
+    }
+    if DEPTH.with(Cell::get) > 1 || INTERNAL.with(Cell::get) {
+        return Err(EDEADLK);
     }
     // Check before touching a lock inherited from a vanished fork thread.
     if child() {
@@ -122,9 +135,36 @@ fn owned(fd: i32) -> Result<Option<u64>> {
     Ok(None)
 }
 fn call(id: u64, op: Op) -> Result<Reply> {
-    runtime()?.call(id, op)
+    let buffered = if matches!(op, Op::Ready | Op::Available) {
+        TOKENS
+            .lock()
+            .map_err(|_| EIO)?
+            .values()
+            .find(|t| t.id == id)
+            .map_or(0, |t| t.input.ready.load(Ordering::Acquire))
+    } else {
+        0
+    };
+    let available = matches!(op, Op::Available);
+    let ready = matches!(op, Op::Ready);
+    let mut reply = runtime()?.call(id, op)?;
+    if available {
+        reply.value += buffered as i32;
+    }
+    if ready && buffered != 0 {
+        reply.value |= EPOLLIN;
+    }
+    Ok(reply)
 }
 fn ffi(f: impl FnOnce() -> Result<i64>) -> i64 {
+    struct Depth;
+    impl Drop for Depth {
+        fn drop(&mut self) {
+            DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+    DEPTH.with(|d| d.set(d.get() + 1));
+    let _depth = Depth;
     match catch_unwind(AssertUnwindSafe(f)).unwrap_or(Err(EIO)) {
         Ok(n) => n,
         Err(e) => {
@@ -137,6 +177,144 @@ fn ffi(f: impl FnOnce() -> Result<i64>) -> i64 {
 }
 fn raw(n: c_long) -> Result<i64> {
     if n < 0 { Err(errno()) } else { Ok(n) }
+}
+// All application memory crosses the kernel's fault-reporting boundary. Never
+// form a Rust reference/slice from a foreign pointer (even when non-null).
+fn memory(local: *mut u8, remote: *mut u8, len: usize, write: bool) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    (remote as usize)
+        .checked_add(len)
+        .filter(|&n| n <= isize::MAX as usize)
+        .ok_or(EFAULT)?;
+    let local = iovec {
+        iov_base: local.cast(),
+        iov_len: len,
+    };
+    let remote = iovec {
+        iov_base: remote.cast(),
+        iov_len: len,
+    };
+    let n = unsafe {
+        syscall(
+            if write {
+                SYS_process_vm_writev
+            } else {
+                SYS_process_vm_readv
+            },
+            syscall(SYS_getpid),
+            &local,
+            1usize,
+            &remote,
+            1usize,
+            0usize,
+        )
+    };
+    if n < 0 {
+        return Err(errno());
+    }
+    if n as usize != len {
+        return Err(EFAULT);
+    }
+    Ok(())
+}
+fn copy_in(p: *const u8, out: &mut [u8]) -> Result<()> {
+    memory(out.as_mut_ptr(), p.cast_mut(), out.len(), false)
+}
+fn copy_out(p: *mut u8, bytes: &[u8]) -> Result<()> {
+    memory(bytes.as_ptr().cast_mut(), p, bytes.len(), true)
+}
+// T is a C ABI POD type at each call site below, with no invalid bit patterns.
+fn load<T: Copy>(p: *const T) -> Result<T> {
+    let mut value = std::mem::MaybeUninit::<T>::uninit();
+    memory(
+        value.as_mut_ptr().cast(),
+        p.cast_mut().cast(),
+        std::mem::size_of::<T>(),
+        false,
+    )?;
+    Ok(unsafe { value.assume_init() })
+}
+fn store<T: Copy>(p: *mut T, value: &T) -> Result<()> {
+    memory(
+        (value as *const T).cast_mut().cast(),
+        p.cast(),
+        std::mem::size_of::<T>(),
+        true,
+    )
+}
+fn load_array<T: Copy>(p: *const T, n: usize, cap: usize) -> Result<Vec<T>> {
+    if n > cap {
+        return Err(EINVAL);
+    }
+    let len = n.checked_mul(std::mem::size_of::<T>()).ok_or(EINVAL)?;
+    let mut out = Vec::<T>::with_capacity(n);
+    memory(out.as_mut_ptr().cast(), p.cast_mut().cast(), len, false)?;
+    unsafe {
+        out.set_len(n);
+    }
+    Ok(out)
+}
+fn store_array<T: Copy>(p: *mut T, values: &[T]) -> Result<()> {
+    memory(
+        values.as_ptr().cast_mut().cast(),
+        p.cast(),
+        std::mem::size_of_val(values),
+        true,
+    )
+}
+// Keep at most BYTES staged bytes per socket until every requested copyout
+// succeeds. Partial foreign-memory writes may occur, but a failed read consumes
+// no staged stream bytes. Serialize concurrent readers without holding TOKENS.
+fn read_into(
+    fd: i32,
+    id: u64,
+    n: usize,
+    flags: i32,
+    output: impl FnOnce(&[u8]) -> Result<()>,
+) -> Result<i64> {
+    let input = TOKENS
+        .lock()
+        .map_err(|_| EIO)?
+        .get(&fd)
+        .filter(|t| t.id == id)
+        .ok_or(EBADF)?
+        .input
+        .clone();
+    let mut bytes = loop {
+        match input.bytes.try_lock() {
+            Ok(bytes) => break bytes,
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(EIO),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if flags & MSG_DONTWAIT != 0 || !blocking(id)? {
+                    return Err(EAGAIN);
+                }
+                wait(id, EPOLLIN)?;
+                std::thread::yield_now();
+            }
+        }
+    };
+    if n == 0 {
+        call(id, Op::Read(0))?;
+        output(&[])?;
+        return Ok(0);
+    }
+    if bytes.is_empty() {
+        *bytes = retry(
+            id,
+            Op::Read(n.min(runtime::BYTES)),
+            flags & MSG_DONTWAIT != 0,
+            EPOLLIN,
+        )?
+        .bytes;
+        input.ready.store(bytes.len(), Ordering::Release);
+    }
+    let n = n.min(bytes.len());
+    output(&bytes[..n])?;
+    bytes.drain(..n);
+    input.ready.store(bytes.len(), Ordering::Release);
+    Ok(n as i64)
 }
 fn token(flags: i32) -> Result<(i32, Token)> {
     let fd = unsafe {
@@ -170,6 +348,7 @@ fn token(flags: i32) -> Result<(i32, Token)> {
             retained,
             dev: st.st_dev,
             ino: st.st_ino,
+            input: Arc::new(Input::default()),
         },
     ))
 }
@@ -228,7 +407,7 @@ unsafe fn address(p: *const sockaddr, len: socklen_t) -> Result<SocketAddr> {
     if len < std::mem::size_of::<sockaddr_in>() as u32 {
         return Err(EINVAL);
     }
-    let p = unsafe { ptr::read_unaligned(p.cast::<sockaddr_in>()) };
+    let p = load(p.cast::<sockaddr_in>())?;
     if p.sin_family as i32 != AF_INET {
         return Err(EAFNOSUPPORT);
     }
@@ -256,14 +435,14 @@ unsafe fn output_addr(addr: SocketAddr, p: *mut sockaddr, len: *mut socklen_t) -
         sin_zero: [0; 8],
     };
     let size = std::mem::size_of::<sockaddr_in>();
-    unsafe {
-        ptr::copy_nonoverlapping(
-            (&addr as *const sockaddr_in).cast::<u8>(),
-            p.cast(),
-            (*len as usize).min(size),
-        );
-        *len = size as u32;
-    }
+    let n = (load(len)? as usize).min(size);
+    memory(
+        (&addr as *const sockaddr_in).cast_mut().cast(),
+        p.cast(),
+        n,
+        true,
+    )?;
+    store(len, &(size as u32))?;
     Ok(())
 }
 #[unsafe(no_mangle)]
@@ -275,6 +454,9 @@ pub unsafe extern "C" fn socket(domain: i32, kind: i32, protocol: i32) -> i32 {
             || kind & 0xf != SOCK_STREAM
         {
             return raw(unsafe { syscall(SYS_socket, domain, kind, protocol) });
+        }
+        if DEPTH.with(Cell::get) > 1 {
+            return Err(EDEADLK);
         }
         if kind & !(SOCK_NONBLOCK | SOCK_CLOEXEC | 0xf) != 0 {
             return Err(EINVAL);
@@ -345,8 +527,12 @@ pub unsafe extern "C" fn accept4(
                 return Err(e);
             }
         };
-        unsafe {
-            output_addr(reply.addr.unwrap(), p, len)?;
+        if let Err(e) = unsafe { output_addr(reply.addr.unwrap(), p, len) } {
+            unsafe {
+                syscall(SYS_close, newfd);
+            }
+            let _ = call(reply.value as u64, Op::Close);
+            return Err(e);
         }
         install(newfd, t, reply.value as u64)
     }) as i32
@@ -373,6 +559,9 @@ pub unsafe extern "C" fn connect(fd: i32, p: *const sockaddr, len: socklen_t) ->
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn close(fd: i32) -> i32 {
+    if !inherited(&SOCKET_FDS, fd) && !readiness::tracked_epoll(fd) {
+        return unsafe { syscall(SYS_close, fd) as i32 };
+    }
     ffi(|| {
         if let Some(id) = owned(fd)? {
             let t = TOKENS.lock().map_err(|_| EIO)?.remove(&fd);
@@ -385,7 +574,7 @@ pub unsafe extern "C" fn close(fd: i32) -> i32 {
             engine?;
             Ok(0)
         } else {
-            readiness::close_epoll(fd);
+            readiness::close_epoll(fd)?;
             raw(unsafe { syscall(SYS_close, fd) })
         }
     }) as i32
@@ -395,6 +584,17 @@ pub unsafe extern "C" fn shutdown(fd: i32, how: i32) -> i32 {
     ffi(|| match owned(fd)? {
         Some(id) => {
             call(id, Op::Shutdown(how))?;
+            if how != SHUT_WR {
+                let input = TOKENS
+                    .lock()
+                    .map_err(|_| EIO)?
+                    .get(&fd)
+                    .ok_or(EBADF)?
+                    .input
+                    .clone();
+                input.bytes.lock().map_err(|_| EIO)?.clear();
+                input.ready.store(0, Ordering::Release);
+            }
             Ok(0)
         }
         None => raw(unsafe { syscall(SYS_shutdown, fd, how) }),
@@ -460,15 +660,12 @@ unsafe fn transfer(fd: i32, p: *mut c_void, n: usize, flags: i32, write: bool) -
     if n > isize::MAX as usize {
         return Err(EINVAL);
     }
-    let op = if write {
-        Op::Write(if n == 0 {
-            Vec::new()
-        } else {
-            unsafe { slice::from_raw_parts(p.cast::<u8>(), n.min(runtime::BYTES)).to_vec() }
-        })
-    } else {
-        Op::Read(n.min(runtime::BYTES))
-    };
+    if !write {
+        return read_into(fd, id, n, flags, |bytes| copy_out(p.cast(), bytes));
+    }
+    let mut bytes = vec![0; n.min(runtime::BYTES)];
+    copy_in(p.cast(), &mut bytes)?;
+    let op = Op::Write(bytes);
     let result = retry(
         id,
         op,
@@ -489,11 +686,6 @@ unsafe fn transfer(fd: i32, p: *mut c_void, n: usize, flags: i32, write: bool) -
         }
     }
     let reply = result?;
-    if !write && !reply.bytes.is_empty() {
-        unsafe {
-            ptr::copy_nonoverlapping(reply.bytes.as_ptr(), p.cast(), reply.bytes.len());
-        }
-    }
     Ok(reply.value as i64)
 }
 #[unsafe(no_mangle)]
@@ -506,6 +698,9 @@ pub unsafe extern "C" fn recv(fd: i32, p: *mut c_void, n: usize, flags: i32) -> 
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn read(fd: i32, p: *mut c_void, n: usize) -> ssize_t {
+    if !inherited(&SOCKET_FDS, fd) {
+        return unsafe { syscall(SYS_read, fd, p, n) as ssize_t };
+    }
     ffi(|| {
         if owned(fd)?.is_none() {
             raw(unsafe { syscall(SYS_read, fd, p, n) })
@@ -518,13 +713,51 @@ pub unsafe extern "C" fn read(fd: i32, p: *mut c_void, n: usize) -> ssize_t {
 pub unsafe extern "C" fn __read_chk(fd: i32, p: *mut c_void, n: usize, size: usize) -> ssize_t {
     if n > size {
         unsafe {
-            libc::abort();
+            __chk_fail();
         }
     }
     unsafe { read(fd, p, n) }
 }
+unsafe extern "C" {
+    fn __chk_fail() -> !;
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __recv_chk(
+    fd: i32,
+    p: *mut c_void,
+    n: usize,
+    size: usize,
+    flags: i32,
+) -> ssize_t {
+    if n > size {
+        unsafe {
+            __chk_fail();
+        }
+    }
+    unsafe { recv(fd, p, n, flags) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __recvfrom_chk(
+    fd: i32,
+    p: *mut c_void,
+    n: usize,
+    size: usize,
+    flags: i32,
+    addr: *mut sockaddr,
+    len: *mut socklen_t,
+) -> ssize_t {
+    if n > size {
+        unsafe {
+            __chk_fail();
+        }
+    }
+    unsafe { recvfrom(fd, p, n, flags, addr, len) }
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn write(fd: i32, p: *const c_void, n: usize) -> ssize_t {
+    if !inherited(&SOCKET_FDS, fd) {
+        return unsafe { syscall(SYS_write, fd, p, n) as ssize_t };
+    }
     ffi(|| {
         if owned(fd)?.is_none() {
             raw(unsafe { syscall(SYS_write, fd, p, n) })
@@ -534,19 +767,25 @@ pub unsafe extern "C" fn write(fd: i32, p: *const c_void, n: usize) -> ssize_t {
     }) as ssize_t
 }
 unsafe fn vectors(fd: i32, v: *const iovec, count: i32, flags: i32, write: bool) -> Result<i64> {
+    unsafe { vectors_output(fd, v, count, flags, write, || Ok(())) }
+}
+unsafe fn vectors_output(
+    fd: i32,
+    v: *const iovec,
+    count: i32,
+    flags: i32,
+    write: bool,
+    done: impl FnOnce() -> Result<()>,
+) -> Result<i64> {
     if !(0..=1024).contains(&count) {
         return Err(EINVAL);
     }
     if count != 0 && v.is_null() {
         return Err(EFAULT);
     }
-    let vectors = if count == 0 {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(v, count as usize) }
-    };
+    let vectors = load_array(v, count as usize, 1024)?;
     let mut total = 0usize;
-    for v in vectors {
+    for v in &vectors {
         if v.iov_len != 0 && v.iov_base.is_null() {
             return Err(EFAULT);
         }
@@ -558,16 +797,10 @@ unsafe fn vectors(fd: i32, v: *const iovec, count: i32, flags: i32, write: bool)
     let mut bytes = vec![0u8; total.min(runtime::BYTES)];
     if write {
         let mut offset = 0;
-        for v in vectors {
+        for v in &vectors {
             let n = v.iov_len.min(bytes.len() - offset);
             if n != 0 {
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        v.iov_base.cast::<u8>(),
-                        bytes[offset..].as_mut_ptr(),
-                        n,
-                    );
-                }
+                copy_in(v.iov_base.cast(), &mut bytes[offset..offset + n])?;
             }
             offset += n;
             if offset == bytes.len() {
@@ -575,27 +808,25 @@ unsafe fn vectors(fd: i32, v: *const iovec, count: i32, flags: i32, write: bool)
             }
         }
     }
-    let n = unsafe { transfer(fd, bytes.as_mut_ptr().cast(), bytes.len(), flags, write) }?;
-    if !write {
+    if write {
+        return unsafe { transfer(fd, bytes.as_mut_ptr().cast(), bytes.len(), flags, true) };
+    }
+    if flags & !MSG_DONTWAIT != 0 {
+        return Err(EOPNOTSUPP);
+    }
+    let id = owned(fd)?.ok_or(EBADF)?;
+    read_into(fd, id, bytes.len(), flags, |bytes| {
         let mut offset = 0;
-        for v in vectors {
-            let len = v.iov_len.min(n as usize - offset);
-            if len != 0 {
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        bytes[offset..].as_ptr(),
-                        v.iov_base.cast::<u8>(),
-                        len,
-                    );
-                }
-            }
+        for v in &vectors {
+            let len = v.iov_len.min(bytes.len() - offset);
+            copy_out(v.iov_base.cast(), &bytes[offset..offset + len])?;
             offset += len;
-            if offset == n as usize {
+            if offset == bytes.len() {
                 break;
             }
         }
-    }
-    Ok(n)
+        done()
+    })
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn readv(fd: i32, v: *const iovec, n: i32) -> ssize_t {
@@ -626,7 +857,7 @@ pub unsafe extern "C" fn sendmsg(fd: i32, p: *const msghdr, flags: i32) -> ssize
         if p.is_null() {
             return Err(EFAULT);
         }
-        let m = unsafe { &*p };
+        let m = load(p)?;
         if m.msg_controllen != 0 || !m.msg_name.is_null() {
             return Err(EOPNOTSUPP);
         }
@@ -643,21 +874,22 @@ pub unsafe extern "C" fn recvmsg(fd: i32, p: *mut msghdr, flags: i32) -> ssize_t
         if p.is_null() {
             return Err(EFAULT);
         }
-        let m = unsafe { &mut *p };
+        let mut m = load(p)?;
         let n = i32::try_from(m.msg_iovlen).map_err(|_| EINVAL)?;
-        let result = unsafe { vectors(fd, m.msg_iov, n, flags, false) }?;
-        if !m.msg_name.is_null() {
-            unsafe {
-                output_addr(
-                    call(id, Op::Name(true))?.addr.unwrap(),
-                    m.msg_name.cast(),
-                    &mut m.msg_namelen,
-                )?;
-            }
+        unsafe {
+            vectors_output(fd, m.msg_iov, n, flags, false, || {
+                if !m.msg_name.is_null() {
+                    output_addr(
+                        call(id, Op::Name(true))?.addr.unwrap(),
+                        m.msg_name.cast(),
+                        &mut m.msg_namelen,
+                    )?;
+                }
+                m.msg_controllen = 0;
+                m.msg_flags = 0;
+                store(p, &m)
+            })
         }
-        m.msg_controllen = 0;
-        m.msg_flags = 0;
-        Ok(result)
     }) as ssize_t
 }
 #[unsafe(no_mangle)]
@@ -695,13 +927,21 @@ pub unsafe extern "C" fn recvfrom(
         if !addr.is_null() && len.is_null() {
             return Err(EFAULT);
         }
-        let result = unsafe { transfer(fd, p, n, flags, false) }?;
-        if !addr.is_null() {
-            unsafe {
-                output_addr(call(id, Op::Name(true))?.addr.unwrap(), addr, len)?;
-            }
+        if flags & !MSG_DONTWAIT != 0 {
+            return Err(EOPNOTSUPP);
         }
-        Ok(result)
+        if n > isize::MAX as usize {
+            return Err(EINVAL);
+        }
+        read_into(fd, id, n, flags, |bytes| {
+            copy_out(p.cast(), bytes)?;
+            if !addr.is_null() {
+                unsafe {
+                    output_addr(call(id, Op::Name(true))?.addr.unwrap(), addr, len)?;
+                }
+            }
+            Ok(())
+        })
     }) as ssize_t
 }
 #[unsafe(no_mangle)]
@@ -722,7 +962,7 @@ pub unsafe extern "C" fn setsockopt(
         if len < 4 {
             return Err(EINVAL);
         }
-        let value = unsafe { ptr::read_unaligned(p.cast::<i32>()) };
+        let value = load(p.cast::<i32>())?;
         call(id, Op::Set(level, name, value))?;
         Ok(0)
     }) as i32
@@ -743,11 +983,9 @@ pub unsafe extern "C" fn getsockopt(
             return Err(EFAULT);
         }
         let value = call(id, Op::Get(level, name))?.value.to_ne_bytes();
-        unsafe {
-            let n = (*len as usize).min(4);
-            ptr::copy_nonoverlapping(value.as_ptr(), p.cast(), n);
-            *len = n as u32;
-        }
+        let n = (load(len)? as usize).min(4);
+        copy_out(p.cast(), &value[..n])?;
+        store(len, &(n as u32))?;
         Ok(0)
     }) as i32
 }
@@ -757,6 +995,23 @@ pub extern "C" fn ntcp_fcntl_dispatch(fd: i32, cmd: i32, arg: c_ulong) -> i32 {
         let Some(id) = owned(fd)? else {
             if [F_DUPFD, F_DUPFD_CLOEXEC].contains(&cmd) && readiness::is_epoll(fd)? {
                 return Err(EOPNOTSUPP);
+            }
+            if cmd == F_GETOWN {
+                // Linux UAPI constants not exposed by libc on every target.
+                const F_GETOWN_EX: i32 = 16;
+                const F_OWNER_PGRP: i32 = 2;
+                #[repr(C)]
+                struct Owner {
+                    kind: i32,
+                    pid: i32,
+                }
+                let mut owner = Owner { kind: 0, pid: 0 };
+                raw(unsafe { syscall(SYS_fcntl, fd, F_GETOWN_EX, &mut owner) })?;
+                return Ok(if owner.kind == F_OWNER_PGRP {
+                    -owner.pid
+                } else {
+                    owner.pid
+                } as i64);
             }
             return raw(unsafe { syscall(SYS_fcntl, fd, cmd, arg) });
         };
@@ -778,7 +1033,7 @@ pub extern "C" fn ntcp_ioctl_dispatch(fd: i32, cmd: c_ulong, arg: c_ulong) -> i3
                 if arg == 0 {
                     return Err(EFAULT);
                 }
-                let n = unsafe { ptr::read_unaligned(arg as *const i32) };
+                let n = load(arg as *const i32)?;
                 call(id, Op::Flags(F_SETFL, if n != 0 { O_NONBLOCK } else { 0 }))?;
                 Ok(0)
             }
@@ -786,9 +1041,7 @@ pub extern "C" fn ntcp_ioctl_dispatch(fd: i32, cmd: c_ulong, arg: c_ulong) -> i3
                 if arg == 0 {
                     return Err(EFAULT);
                 }
-                unsafe {
-                    ptr::write_unaligned(arg as *mut i32, call(id, Op::Available)?.value);
-                }
+                store(arg as *mut i32, &call(id, Op::Available)?.value)?;
                 Ok(0)
             }
             FIOCLEX | FIONCLEX => raw(unsafe { syscall(SYS_ioctl, fd, cmd) }),
@@ -846,6 +1099,8 @@ pub unsafe extern "C" fn dup(fd: i32) -> i32 {
 pub unsafe extern "C" fn dup2(fd: i32, new: i32) -> i32 {
     ffi(|| {
         if fd == new {
+            owned(fd)?;
+            readiness::is_epoll(fd)?;
             return raw(unsafe { syscall(SYS_dup2, fd, new) });
         }
         if owned(fd)?.is_some()
@@ -875,6 +1130,97 @@ pub unsafe extern "C" fn dup3(fd: i32, new: i32, flags: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
+    static SIGNAL_SOCKET: AtomicI32 = AtomicI32::new(-1);
+    static SIGNAL_RESULT: AtomicI32 = AtomicI32::new(0);
+    extern "C" fn signal_io(_: i32) {
+        let byte = 1u8;
+        let native = unsafe {
+            write(
+                SIGNAL_PIPE.load(Ordering::Relaxed),
+                (&byte as *const u8).cast(),
+                1,
+            )
+        } == 1;
+        let mut out = 0u8;
+        let recursive = unsafe {
+            read(
+                SIGNAL_SOCKET.load(Ordering::Relaxed),
+                (&mut out as *mut u8).cast(),
+                1,
+            )
+        } == -1
+            && errno() == EDEADLK;
+        SIGNAL_RESULT.store(if native && recursive { 1 } else { -1 }, Ordering::Relaxed);
+    }
+    #[test]
+    fn signal_native_pipe_bypasses_locked_tokens_and_virtual_recursion_fails_closed() {
+        let mut pipes = [-1; 2];
+        assert_eq!(
+            unsafe { syscall(SYS_pipe2, pipes.as_mut_ptr(), O_CLOEXEC) },
+            0
+        );
+        let (fd, t) = token(SOCK_CLOEXEC).unwrap();
+        install(fd, t, 993).unwrap();
+        PID.store(unsafe { syscall(SYS_getpid) as i32 }, Ordering::Release);
+        SIGNAL_PIPE.store(pipes[1], Ordering::Relaxed);
+        SIGNAL_SOCKET.store(fd, Ordering::Relaxed);
+        let mut action: sigaction = unsafe { std::mem::zeroed() };
+        let mut old: sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = signal_io as *const () as usize;
+        assert_eq!(unsafe { libc::sigaction(SIGUSR1, &action, &mut old) }, 0);
+        unsafe {
+            libc::alarm(5);
+        }
+        assert_eq!(
+            ffi(|| {
+                let _tokens = TOKENS.lock().unwrap();
+                raw(unsafe {
+                    syscall(
+                        SYS_tgkill,
+                        syscall(SYS_getpid),
+                        syscall(SYS_gettid),
+                        SIGUSR1,
+                    )
+                })
+            }),
+            0
+        );
+        unsafe {
+            libc::alarm(0);
+            libc::sigaction(SIGUSR1, &old, ptr::null_mut());
+        }
+        assert_eq!(SIGNAL_RESULT.load(Ordering::Relaxed), 1);
+        let mut byte = 0u8;
+        assert_eq!(
+            unsafe { read(pipes[0], (&mut byte as *mut u8).cast(), 1) },
+            1
+        );
+        TOKENS.lock().unwrap().remove(&fd);
+        unsafe {
+            syscall(SYS_close, fd);
+            close(pipes[0]);
+            close(pipes[1]);
+        }
+    }
+    #[test]
+    fn nonblocking_read_does_not_wait_for_another_reader() {
+        let (fd, t) = token(SOCK_CLOEXEC).unwrap();
+        let input = t.input.clone();
+        install(fd, t, 994).unwrap();
+        let reader = input.bytes.lock().unwrap();
+        let mut byte = 0u8;
+        assert_eq!(
+            unsafe { recv(fd, (&mut byte as *mut u8).cast(), 1, MSG_DONTWAIT) },
+            -1
+        );
+        assert_eq!(errno(), EAGAIN);
+        drop(reader);
+        TOKENS.lock().unwrap().remove(&fd);
+        unsafe {
+            syscall(SYS_close, fd);
+        }
+    }
     #[test]
     fn token_identity_rejects_closed_and_reused_descriptor() {
         let (fd, t) = token(SOCK_CLOEXEC | SOCK_NONBLOCK).unwrap();

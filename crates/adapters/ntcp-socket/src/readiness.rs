@@ -39,8 +39,11 @@ impl Drop for Epoll {
 static EPOLL_FDS: [AtomicI32; runtime::LIMIT] = [const { AtomicI32::new(-1) }; runtime::LIMIT];
 static EPOLLS: Mutex<BTreeMap<i32, Epoll>> = Mutex::new(BTreeMap::new());
 pub fn is_epoll(fd: i32) -> Result<bool> {
-    if INTERNAL.with(Cell::get) || PID.load(Ordering::Acquire) == 0 {
+    if !inherited(&EPOLL_FDS, fd) {
         return Ok(false);
+    }
+    if DEPTH.with(Cell::get) > 1 || INTERNAL.with(Cell::get) {
+        return Err(EDEADLK);
     }
     if child() {
         return if inherited(&EPOLL_FDS, fd) {
@@ -51,13 +54,16 @@ pub fn is_epoll(fd: i32) -> Result<bool> {
     }
     Ok(EPOLLS.lock().map_err(|_| EIO)?.contains_key(&fd))
 }
-pub fn close_epoll(fd: i32) {
-    if INTERNAL.with(Cell::get) || child() || PID.load(Ordering::Acquire) == 0 {
-        return;
+pub fn tracked_epoll(fd: i32) -> bool {
+    inherited(&EPOLL_FDS, fd)
+}
+pub fn close_epoll(fd: i32) -> Result<()> {
+    if !inherited(&EPOLL_FDS, fd) {
+        return Ok(());
     }
-    if let Ok(mut map) = EPOLLS.lock() {
-        map.remove(&fd);
-    }
+    is_epoll(fd)?;
+    EPOLLS.lock().map_err(|_| EIO)?.remove(&fd);
+    Ok(())
 }
 pub fn closed(fd: i32, id: u64) {
     if let Ok(mut map) = EPOLLS.lock() {
@@ -108,7 +114,7 @@ pub unsafe extern "C" fn epoll_ctl(epfd: i32, op: i32, fd: i32, p: *mut epoll_ev
             return Err(EFAULT);
         }
         let event = if op != EPOLL_CTL_DEL {
-            unsafe { ptr::read_unaligned(p) }
+            load(p)?
         } else {
             epoll_event { events: 0, u64: 0 }
         };
@@ -215,24 +221,14 @@ unsafe fn epwait(
     timeout: i32,
     mask: *const sigset_t,
 ) -> Result<i64> {
-    if INTERNAL.with(Cell::get) {
+    if !is_epoll(epfd)? {
         return raw(unsafe { syscall(SYS_epoll_pwait, epfd, p, max, timeout, mask, 8) });
-    }
-    if child() {
-        return if inherited(&EPOLL_FDS, epfd) {
-            Err(EOWNERDEAD)
-        } else {
-            raw(unsafe { syscall(SYS_epoll_pwait, epfd, p, max, timeout, mask, 8) })
-        };
-    }
-    if p.is_null() {
-        return Err(EFAULT);
     }
     if max <= 0 {
         return Err(EINVAL);
     }
-    if !is_epoll(epfd)? {
-        return raw(unsafe { syscall(SYS_epoll_pwait, epfd, p, max, timeout, mask, 8) });
+    if p.is_null() {
+        return Err(EFAULT);
     }
     if !mask.is_null() {
         return Err(EOPNOTSUPP);
@@ -276,15 +272,13 @@ unsafe fn epwait(
             let ready = call(r.id, Op::Ready)?.value as u32
                 & (r.events | EPOLLERR as u32 | EPOLLHUP as u32);
             if ready != 0 {
-                unsafe {
-                    ptr::write_unaligned(
-                        p.add(count),
-                        epoll_event {
-                            events: ready,
-                            u64: r.data,
-                        },
-                    );
-                }
+                store(
+                    p.wrapping_add(count),
+                    &epoll_event {
+                        events: ready,
+                        u64: r.data,
+                    },
+                )?;
                 count += 1;
                 if count == cap {
                     break;
@@ -318,9 +312,7 @@ unsafe fn epwait(
         };
         for e in &native[..n] {
             if count < cap {
-                unsafe {
-                    ptr::write_unaligned(p.add(count), *e);
-                }
+                store(p.wrapping_add(count), e)?;
                 count += 1;
             }
         }
@@ -351,41 +343,29 @@ pub unsafe extern "C" fn poll(p: *mut pollfd, n: nfds_t, timeout: i32) -> i32 {
     ffi(|| unsafe { poll_impl(p, n, timeout, ptr::null()) }) as i32
 }
 unsafe fn poll_impl(p: *mut pollfd, n: nfds_t, timeout: i32, mask: *const sigset_t) -> Result<i64> {
-    if INTERNAL.with(Cell::get) {
+    if !any_sockets() {
         return raw(unsafe { syscall(SYS_poll, p, n, timeout) });
     }
-    if !configured() {
+    if DEPTH.with(Cell::get) > 1 || INTERNAL.with(Cell::get) {
+        return Err(EDEADLK);
+    }
+    if n > LIMIT as nfds_t {
+        if unsafe { large_poll_virtual(p, n)? } {
+            return Err(EINVAL);
+        }
         return raw(unsafe { syscall(SYS_poll, p, n, timeout) });
     }
-    let mut limit: rlimit = unsafe { std::mem::zeroed() };
-    raw(unsafe { syscall(SYS_getrlimit, RLIMIT_NOFILE, &mut limit) })?;
-    if n > limit.rlim_cur || n as usize > isize::MAX as usize / std::mem::size_of::<pollfd>() {
-        return Err(EINVAL);
-    }
-    if n != 0 && p.is_null() {
-        return Err(EFAULT);
-    }
-    let original = if n == 0 {
-        &mut []
-    } else {
-        unsafe { slice::from_raw_parts_mut(p, n as usize) }
-    };
+    let mut original = load_array(p, poll_count(n)?, LIMIT)?;
     let mut owned_fds = Vec::new();
     for (i, fd) in original.iter().enumerate() {
         if let Some(id) = owned(fd.fd)? {
-            if owned_fds.len() == LIMIT {
-                return Err(EINVAL);
-            }
             owned_fds.push((i, id));
         }
     }
     if owned_fds.is_empty() {
         return raw(unsafe { syscall(SYS_poll, p, n, timeout) });
     }
-    if original.len() > LIMIT {
-        return Err(EINVAL);
-    }
-    let mut native = original.to_vec();
+    let mut native = original.clone();
     for &(i, _) in &owned_fds {
         native[i].fd = -1;
     }
@@ -434,13 +414,62 @@ unsafe fn poll_impl(p: *mut pollfd, n: nfds_t, timeout: i32, mask: *const sigset
             original[i].revents |= fd.revents;
         }
         let count = original.iter().filter(|p| p.revents != 0).count();
-        if count != 0 {
+        if count != 0 || timeout == 0 || deadline.is_some_and(|d| Instant::now() >= d) {
+            store_array(p, &original)?;
             return Ok(count as i64);
         }
-        if timeout == 0 || deadline.is_some_and(|d| Instant::now() >= d) {
-            return Ok(0);
+    }
+}
+fn any_sockets() -> bool {
+    SOCKET_FDS.iter().any(|fd| fd.load(Ordering::Acquire) >= 0)
+}
+fn select_maybe_virtual(n: i32) -> bool {
+    SOCKET_FDS.iter().any(|fd| {
+        let fd = fd.load(Ordering::Acquire);
+        fd >= 0 && fd < n
+    })
+}
+fn large_select_virtual(n: i32, sets: [*const fd_set; 3]) -> Result<bool> {
+    for slot in &SOCKET_FDS {
+        let fd = slot.load(Ordering::Acquire);
+        if fd < 0 || fd >= n {
+            continue;
+        }
+        for set in sets {
+            if set.is_null() {
+                continue;
+            }
+            let word = load(set.cast::<u64>().wrapping_add(fd as usize / 64))?;
+            if word & (1u64 << (fd % 64)) != 0 && owned(fd)?.is_some() {
+                return Ok(true);
+            }
         }
     }
+    Ok(false)
+}
+fn input_set(p: *const fd_set, n: i32) -> Result<fd_set> {
+    let mut set: fd_set = unsafe { std::mem::zeroed() };
+    if !p.is_null() {
+        let size = (n as usize).div_ceil(64) * 8;
+        memory(
+            (&mut set as *mut fd_set).cast(),
+            p.cast_mut().cast(),
+            size,
+            false,
+        )?;
+    }
+    Ok(set)
+}
+fn output_set(p: *mut fd_set, set: &fd_set, n: i32) -> Result<()> {
+    if !p.is_null() {
+        memory(
+            (set as *const fd_set).cast_mut().cast(),
+            p.cast(),
+            (n as usize).div_ceil(64) * 8,
+            true,
+        )?;
+    }
+    Ok(())
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn select(
@@ -451,20 +480,32 @@ pub unsafe extern "C" fn select(
     t: *mut timeval,
 ) -> i32 {
     ffi(|| {
-        if n < 0 || n > FD_SETSIZE as i32 {
-            return Err(EINVAL);
+        if !select_maybe_virtual(n) {
+            return raw(unsafe { syscall(SYS_select, n, r, w, e, t) });
         }
+        if DEPTH.with(Cell::get) > 1 || INTERNAL.with(Cell::get) {
+            return Err(EDEADLK);
+        }
+        if n > FD_SETSIZE as i32 {
+            if large_select_virtual(n, [r, w, e])? {
+                return Err(EINVAL);
+            }
+            return raw(unsafe { syscall(SYS_select, n, r, w, e, t) });
+        }
+        let mut rs = input_set(r, n)?;
+        let mut ws = input_set(w, n)?;
+        let mut es = input_set(e, n)?;
         let mut polls = Vec::new();
         for fd in 0..n {
             let mut events = 0;
             unsafe {
-                if !r.is_null() && FD_ISSET(fd, r) {
+                if !r.is_null() && FD_ISSET(fd, &rs) {
                     events |= POLLIN;
                 }
-                if !w.is_null() && FD_ISSET(fd, w) {
+                if !w.is_null() && FD_ISSET(fd, &ws) {
                     events |= POLLOUT;
                 }
-                if !e.is_null() && FD_ISSET(fd, e) {
+                if !e.is_null() && FD_ISSET(fd, &es) {
                     events |= POLLPRI;
                 }
             }
@@ -486,7 +527,7 @@ pub unsafe extern "C" fn select(
         let timeout = if t.is_null() {
             -1
         } else {
-            let t = unsafe { &*t };
+            let t = load(t)?;
             if t.tv_sec < 0 || t.tv_usec < 0 || t.tv_usec >= 1_000_000 {
                 return Err(EINVAL);
             }
@@ -503,10 +544,13 @@ pub unsafe extern "C" fn select(
         };
         if !t.is_null() {
             let left = Duration::from_millis(timeout as u64).saturating_sub(started.elapsed());
-            unsafe {
-                (*t).tv_sec = left.as_secs() as time_t;
-                (*t).tv_usec = left.subsec_micros() as suseconds_t;
-            }
+            store(
+                t,
+                &timeval {
+                    tv_sec: left.as_secs() as time_t,
+                    tv_usec: left.subsec_micros() as suseconds_t,
+                },
+            )?;
         }
         result?;
         if polls.iter().any(|p| p.revents & POLLNVAL != 0) {
@@ -514,13 +558,13 @@ pub unsafe extern "C" fn select(
         }
         unsafe {
             if !r.is_null() {
-                FD_ZERO(r);
+                FD_ZERO(&mut rs);
             }
             if !w.is_null() {
-                FD_ZERO(w);
+                FD_ZERO(&mut ws);
             }
             if !e.is_null() {
-                FD_ZERO(e);
+                FD_ZERO(&mut es);
             }
         }
         let mut count = 0;
@@ -530,19 +574,22 @@ pub unsafe extern "C" fn select(
                     && p.events & POLLIN != 0
                     && p.revents & (POLLIN | POLLHUP | POLLERR) != 0
                 {
-                    FD_SET(p.fd, r);
+                    FD_SET(p.fd, &mut rs);
                     count += 1;
                 }
                 if !w.is_null() && p.events & POLLOUT != 0 && p.revents & (POLLOUT | POLLERR) != 0 {
-                    FD_SET(p.fd, w);
+                    FD_SET(p.fd, &mut ws);
                     count += 1;
                 }
                 if !e.is_null() && p.events & POLLPRI != 0 && p.revents & POLLPRI != 0 {
-                    FD_SET(p.fd, e);
+                    FD_SET(p.fd, &mut es);
                     count += 1;
                 }
             }
         }
+        output_set(r, &rs, n)?;
+        output_set(w, &ws, n)?;
+        output_set(e, &es, n)?;
         Ok(count)
     }) as i32
 }
@@ -569,21 +616,54 @@ fn poll_events(bits: i32, requested: i16) -> i16 {
 // These adjacent readiness APIs must not accidentally consult the OS token's
 // AF_UNIX state. Signal-mask/time-nanosecond variants are deliberately unsupported
 // for virtual sockets; native calls retain their kernel ABI.
-unsafe fn virtual_poll(p: *const pollfd, n: nfds_t) -> Result<bool> {
-    if INTERNAL.with(Cell::get) {
-        return Ok(false);
-    }
-    if n != 0 && p.is_null() {
-        return Err(EFAULT);
-    }
-    if n as usize > isize::MAX as usize / std::mem::size_of::<pollfd>() {
+fn poll_count(n: nfds_t) -> Result<usize> {
+    let mut limit: rlimit = unsafe { std::mem::zeroed() };
+    raw(unsafe { syscall(SYS_getrlimit, RLIMIT_NOFILE, &mut limit) })?;
+    if n > limit.rlim_cur {
         return Err(EINVAL);
     }
-    if !configured() {
+    let n = usize::try_from(n).map_err(|_| EINVAL)?;
+    n.checked_mul(std::mem::size_of::<pollfd>())
+        .filter(|&n| n <= isize::MAX as usize)
+        .ok_or(EINVAL)?;
+    Ok(n)
+}
+unsafe fn large_poll_virtual(p: *const pollfd, n: nfds_t) -> Result<bool> {
+    let n = poll_count(n)?;
+    let mut chunk = [pollfd {
+        fd: -1,
+        events: 0,
+        revents: 0,
+    }; runtime::LIMIT];
+    for offset in (0..n).step_by(chunk.len()) {
+        let len = (n - offset).min(chunk.len());
+        memory(
+            chunk.as_mut_ptr().cast(),
+            p.wrapping_add(offset).cast_mut().cast(),
+            len * std::mem::size_of::<pollfd>(),
+            false,
+        )?;
+        for fd in &chunk[..len] {
+            if owned(fd.fd)?.is_some() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+unsafe fn virtual_poll(p: *const pollfd, n: nfds_t) -> Result<bool> {
+    if !any_sockets() {
         return Ok(false);
     }
-    for i in 0..n as usize {
-        if owned(unsafe { (*p.add(i)).fd })?.is_some() {
+    if DEPTH.with(Cell::get) > 1 || INTERNAL.with(Cell::get) {
+        return Err(EDEADLK);
+    }
+    if n > LIMIT as nfds_t {
+        return unsafe { large_poll_virtual(p, n) };
+    }
+    let fds = load_array(p, poll_count(n)?, LIMIT)?;
+    for p in fds {
+        if owned(p.fd)?.is_some() {
             return Ok(true);
         }
     }
@@ -607,7 +687,7 @@ pub unsafe extern "C" fn ppoll(
                 tv_nsec: 0,
             }
         } else {
-            unsafe { *t }
+            load(t)?
         };
         raw(unsafe {
             syscall(
@@ -635,18 +715,27 @@ pub unsafe extern "C" fn pselect(
     mask: *const sigset_t,
 ) -> i32 {
     ffi(|| {
-        if configured() && !INTERNAL.with(Cell::get) {
-            if n < 0 || n > FD_SETSIZE as i32 {
-                return Err(EINVAL);
+        if select_maybe_virtual(n) {
+            if DEPTH.with(Cell::get) > 1 || INTERNAL.with(Cell::get) {
+                return Err(EDEADLK);
             }
-            for fd in 0..n {
-                let set = unsafe {
-                    (!r.is_null() && FD_ISSET(fd, r))
-                        || (!w.is_null() && FD_ISSET(fd, w))
-                        || (!e.is_null() && FD_ISSET(fd, e))
-                };
-                if set && owned(fd)?.is_some() {
+            if n > FD_SETSIZE as i32 {
+                if large_select_virtual(n, [r, w, e])? {
                     return Err(EOPNOTSUPP);
+                }
+            } else {
+                let rs = input_set(r, n)?;
+                let ws = input_set(w, n)?;
+                let es = input_set(e, n)?;
+                for fd in 0..n {
+                    let set = unsafe {
+                        (!r.is_null() && FD_ISSET(fd, &rs))
+                            || (!w.is_null() && FD_ISSET(fd, &ws))
+                            || (!e.is_null() && FD_ISSET(fd, &es))
+                    };
+                    if set && owned(fd)?.is_some() {
+                        return Err(EOPNOTSUPP);
+                    }
                 }
             }
         }
@@ -662,7 +751,7 @@ pub unsafe extern "C" fn pselect(
                 tv_nsec: 0,
             }
         } else {
-            unsafe { *t }
+            load(t)?
         };
         raw(unsafe {
             syscall(
@@ -697,9 +786,41 @@ pub unsafe extern "C" fn epoll_pwait2(
     }) as i32
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __poll_chk(p: *mut pollfd, n: nfds_t, timeout: i32, size: usize) -> i32 {
+    if n > (size / std::mem::size_of::<pollfd>()) as nfds_t {
+        unsafe {
+            __chk_fail();
+        }
+    }
+    unsafe { poll(p, n, timeout) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __ppoll_chk(
+    p: *mut pollfd,
+    n: nfds_t,
+    t: *const timespec,
+    mask: *const sigset_t,
+    size: usize,
+) -> i32 {
+    if n > (size / std::mem::size_of::<pollfd>()) as nfds_t {
+        unsafe {
+            __chk_fail();
+        }
+    }
+    unsafe { ppoll(p, n, t, mask) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_close_bypasses_locked_epoll_registry() {
+        let fd = unsafe { syscall(SYS_eventfd2, 0, EFD_CLOEXEC) as i32 };
+        assert!(fd >= 0);
+        let _epolls = EPOLLS.lock().unwrap();
+        assert_eq!(unsafe { crate::close(fd) }, 0);
+    }
     #[test]
     fn requested_readiness_and_unconditional_terminal_events() {
         assert_eq!(poll_events(EPOLLIN | EPOLLOUT, POLLIN), POLLIN);
