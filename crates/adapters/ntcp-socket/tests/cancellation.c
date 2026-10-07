@@ -129,6 +129,14 @@ int main(int argc, char **argv) {
         void *result;
         assert(!pthread_join(thread, &result));
         assert(result == PTHREAD_CANCELED && cleaned == 1);
+        // A canceled native C close must release the mutation reader, or a
+        // subsequent managed replacement spins forever (suite timeout).
+        if (managed >= 0 && !strcmp(operation, "close")) {
+            int target = dup(pair[1]);
+            assert(target >= 0);
+            assert(dup2(managed, target) == target);
+            assert(close(target) == 0);
+        }
         close(fd); close(pair[1]); close(epfd);
         printf("PASS cancel %s\n", operation);
     }

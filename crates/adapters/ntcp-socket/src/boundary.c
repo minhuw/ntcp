@@ -53,6 +53,14 @@ static int (*_Atomic real_accept4)(int fd, struct sockaddr *p, socklen_t *len, i
 extern int ntcp_managed_connect(int fd, const struct sockaddr *p, socklen_t len);
 static int (*_Atomic real_connect)(int fd, const struct sockaddr *p, socklen_t len);
 extern int ntcp_managed_close(int fd);
+extern int ntcp_boundary_native_enter(void);
+extern void ntcp_boundary_native_exit(void);
+static void native_close_cleanup(void *unused) {
+    (void)unused;
+    // Cancellation cleanup cannot unwind through the Rust exit hook either.
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    ntcp_boundary_native_exit();
+}
 static int (*_Atomic real_close)(int fd);
 extern int ntcp_managed_poll(struct pollfd *p, nfds_t n, int timeout);
 static int (*_Atomic real_poll)(struct pollfd *p, nfds_t n, int timeout);
@@ -237,9 +245,24 @@ int ntcp_c_connect(int fd, const struct sockaddr *p, socklen_t len) {
 int ntcp_c_close(int fd) {
     ensure_boundary();
     if (internal) { MANAGED(int, close, (fd)); }
-    if (!real_close) { return syscall(SYS_close,fd); }
-    if (!(ntcp_boundary_fd(fd) || ntcp_boundary_epoll(fd))) return real_close(fd);
-    MANAGED(int, close, (fd));
+    int state;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &state);
+    int native = ntcp_boundary_native_enter();
+    if (!native || ntcp_boundary_fd(fd) || ntcp_boundary_epoll(fd)) {
+        if (native) ntcp_boundary_native_exit();
+        pthread_setcancelstate(state, NULL);
+        MANAGED(int, close, (fd));
+    }
+    int result, saved;
+    pthread_cleanup_push(native_close_cleanup, NULL);
+    pthread_setcancelstate(state, NULL);
+    result = real_close ? real_close(fd) : syscall(SYS_close, fd);
+    saved = errno;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    pthread_cleanup_pop(1);
+    pthread_setcancelstate(state, NULL);
+    errno = saved;
+    return result;
 }
 
 int ntcp_c_poll(struct pollfd *p, nfds_t n, int timeout) {

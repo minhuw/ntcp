@@ -87,6 +87,29 @@ impl Drop for NativeMutation {
         NATIVE_MUTATION.with(|depth| depth.set(depth.get() - 1));
     }
 }
+// C owns this guard across libc close: cancellation must release it without
+// unwinding through Rust. Both hooks run with cancellation disabled.
+#[unsafe(no_mangle)]
+pub extern "C" fn ntcp_boundary_native_enter() -> i32 {
+    match NativeMutation::enter() {
+        Some(guard) => {
+            std::mem::forget(guard);
+            #[cfg(test)]
+            NATIVE_CLOSE_ENTERED.with(|hook| {
+                let callback = hook.borrow_mut().take();
+                if let Some(callback) = callback {
+                    callback();
+                }
+            });
+            1
+        }
+        None => 0,
+    }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ntcp_boundary_native_exit() {
+    drop(NativeMutation);
+}
 struct Mutation;
 impl Mutation {
     // Caller holds TOKENS; readers never acquire it while holding their guard.
@@ -117,8 +140,10 @@ fn mutation_context() -> Result<()> {
 }
 #[cfg(test)]
 thread_local! {
+    static NATIVE_CLOSE_ENTERED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static CLOSE_BEFORE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static DUP_BEFORE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static DUP_AFTER_MUTATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static DUP_AFTER_KERNEL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 struct Token {
@@ -1349,6 +1374,12 @@ fn duplicate(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Result<i64> {
     let (result, last) = {
         let mut tokens = TOKENS.lock().map_err(|_| EIO)?;
         let _mutation = Mutation::enter();
+        #[cfg(test)]
+        DUP_AFTER_MUTATION.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         if readiness::is_epoll(fd)? {
             return Err(EOPNOTSUPP);
         }
@@ -1511,6 +1542,13 @@ mod tests {
             && virtual_poll;
         SIGNAL_RESULT.store(if passed { 1 } else { -1 }, Ordering::Relaxed);
     }
+    unsafe extern "C" fn signal_close(_: i32) {
+        let managed =
+            unsafe { close(SIGNAL_SOCKET.load(Ordering::Relaxed)) } == -1 && errno() == EDEADLK;
+        let alias = unsafe { dup(SIGNAL_PIPE.load(Ordering::Relaxed)) };
+        let native = alias >= 0 && unsafe { close(alias) } == 0;
+        SIGNAL_RESULT.store(if managed && native { 1 } else { -1 }, Ordering::Relaxed);
+    }
     #[test]
     fn signal_native_pipe_bypasses_locked_tokens_and_virtual_recursion_fails_closed() {
         let mut pipes = [-1; 2];
@@ -1544,6 +1582,35 @@ mod tests {
             }),
             0
         );
+        assert_eq!(SIGNAL_RESULT.load(Ordering::Relaxed), 1);
+        // Interrupt the exported C native close while its reader is held.
+        // Managed mutation fails closed; nested native dup/close stays lockfree.
+        action.sa_sigaction = signal_close as *const () as usize;
+        assert_eq!(
+            unsafe { libc::sigaction(SIGUSR1, &action, ptr::null_mut()) },
+            0
+        );
+        let native = unsafe { syscall(SYS_eventfd2, 0, EFD_CLOEXEC) as i32 };
+        assert!(native >= 0);
+        NATIVE_CLOSE_ENTERED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                assert_eq!(
+                    unsafe {
+                        syscall(
+                            SYS_tgkill,
+                            syscall(SYS_getpid),
+                            syscall(SYS_gettid),
+                            SIGUSR1,
+                        )
+                    },
+                    0
+                );
+            }));
+        });
+        {
+            let _tokens = TOKENS.lock().unwrap();
+            assert_eq!(unsafe { close(native) }, 0);
+        }
         unsafe {
             libc::alarm(0);
             libc::sigaction(SIGUSR1, &old, ptr::null_mut());
@@ -1605,58 +1672,63 @@ mod tests {
     }
     #[test]
     fn close_waits_for_managed_over_native_publication() {
-        let (source, t) = token(SOCK_CLOEXEC).unwrap();
-        install(source, t, 982).unwrap();
-        let target = unsafe { syscall(SYS_eventfd2, 0, EFD_CLOEXEC) as i32 };
-        assert!(target >= 0);
-        let replaced = Arc::new(std::sync::Barrier::new(2));
-        let resume = Arc::new(std::sync::Barrier::new(2));
-        let worker = {
-            let replaced = replaced.clone();
-            let resume = resume.clone();
-            std::thread::spawn(move || {
-                DUP_AFTER_KERNEL.with(|hook| {
-                    *hook.borrow_mut() = Some(Box::new(move || {
+        for before_publication in [true, false] {
+            let (source, t) = token(SOCK_CLOEXEC).unwrap();
+            install(source, t, 982).unwrap();
+            let target = unsafe { syscall(SYS_eventfd2, 0, EFD_CLOEXEC) as i32 };
+            assert!(target >= 0);
+            let replaced = Arc::new(std::sync::Barrier::new(2));
+            let resume = Arc::new(std::sync::Barrier::new(2));
+            let worker = {
+                let replaced = replaced.clone();
+                let resume = resume.clone();
+                std::thread::spawn(move || {
+                    let pause: Box<dyn FnOnce()> = Box::new(move || {
                         replaced.wait();
                         resume.wait();
+                    });
+                    if before_publication {
+                        DUP_AFTER_MUTATION.with(|hook| *hook.borrow_mut() = Some(pause));
+                    } else {
+                        DUP_AFTER_KERNEL.with(|hook| *hook.borrow_mut() = Some(pause));
+                    }
+                    duplicate(source, Some(target), SYS_dup2 as i32, 0)
+                })
+            };
+            replaced.wait();
+            // Exercise both the unclassified native target and the replaced
+            // target before alias publication, through exported close -> C.
+            assert_eq!(inherited(&SOCKET_FDS, target), !before_publication);
+            assert!(NativeMutation::enter().is_none());
+            let (entered, waiting) = std::sync::mpsc::channel();
+            let closer = std::thread::spawn(move || {
+                CLOSE_BEFORE_LOCK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        entered.send(()).unwrap();
                     }))
                 });
-                duplicate(source, Some(target), SYS_dup2 as i32, 0)
-            })
-        };
-        replaced.wait();
-        // The target is visible before alias publication and the native fast
-        // path cannot enter while the kernel/registry transaction is open.
-        assert!(inherited(&SOCKET_FDS, target));
-        assert!(NativeMutation::enter().is_none());
-        let (entered, waiting) = std::sync::mpsc::channel();
-        let closer = std::thread::spawn(move || {
-            CLOSE_BEFORE_LOCK.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(move || {
-                    entered.send(()).unwrap();
-                }))
+                unsafe { close(target) }
             });
-            unsafe { close(target) }
-        });
-        waiting
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        resume.wait();
-        assert_eq!(worker.join().unwrap(), Ok(target as i64));
-        assert_eq!(closer.join().unwrap(), 0);
-        // Other tests may immediately allocate this fd number. Assert the
-        // original OFD has no ghost alias, not that the number stays unused.
-        assert!(
-            !TOKENS
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(&fd, t)| fd != source && t.id == 982)
-        );
-        assert_eq!(owned(source), Ok(Some(982)));
-        TOKENS.lock().unwrap().remove(&source);
-        unsafe {
-            syscall(SYS_close, source);
+            waiting
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            resume.wait();
+            assert_eq!(worker.join().unwrap(), Ok(target as i64));
+            assert_eq!(closer.join().unwrap(), 0);
+            // Other tests may immediately allocate this fd number. Assert the
+            // original OFD has no ghost alias, not that the number stays unused.
+            assert!(
+                !TOKENS
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(&fd, t)| fd != source && t.id == 982)
+            );
+            assert_eq!(owned(source), Ok(Some(982)));
+            TOKENS.lock().unwrap().remove(&source);
+            unsafe {
+                syscall(SYS_close, source);
+            }
         }
     }
     #[test]
