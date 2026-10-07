@@ -148,6 +148,10 @@ fn abi_table_null_counts_vectors_variadics_and_host_clock() {
     unsafe extern "C" {
         fn ntcp_abi_send_error_check(userdata: *mut c_void, fd: i32, first_error: i32);
     }
+    unsafe extern "C" {
+        fn ntcp_abi_zerocopy_check(userdata: *mut c_void, fd: i32);
+    }
+    unsafe { ntcp_abi_zerocopy_check(userdata, accepted) };
     call(&adapter, 9, accepted, SHUT_WR, vec![], 0).unwrap();
     unsafe { ntcp_abi_send_error_check(userdata, accepted, EPIPE) };
     let mut reset = header;
@@ -1333,7 +1337,21 @@ fn listener_timeout_inheritance_and_queued_payload_gap_urgent_fin() {
             urgent_pointer: urgent,
         };
         let n = ntcp::wire::encode(ip, header, &[], payload, &mut out).unwrap();
-        owner.endpoint.input(owner.now(), ip, &out[..n]).unwrap();
+        let packet = frame(
+            ntcp::Transmit {
+                connection: None,
+                ip,
+                len: n,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+                ipv4_options: Default::default(),
+            },
+            &out[..n],
+        )
+        .unwrap();
+        let (mut incoming, _) = request(14, 0, 0, packet, 0);
+        owner.execute(&mut incoming).unwrap();
     };
     inject(&mut owner, 101, ntcp::wire::ACK, 0, &[]);
     execute_value(&mut owner, 11, listener, 5, 3456).unwrap();
@@ -1784,9 +1802,43 @@ fn ip_options_pending_connect_updates_and_engine_owned_ecn() {
 }
 
 #[test]
+fn passive_ack_fin_snapshots_zerocopy_before_accept_and_returns_eof() {
+    for enabled in [0, 1] {
+        let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+        let listener = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
+        execute_value(&mut owner, 11, listener, 8, enabled).unwrap();
+        let (mut bind, _) = request(
+            2,
+            listener,
+            0,
+            encode_addr(SocketAddr::new(local().into(), 8080)),
+            0,
+        );
+        owner.execute(&mut bind).unwrap();
+        execute_value(&mut owner, 3, listener, 1, 0).unwrap();
+        let (mut incoming, _) = request(14, 0, 0, syn(100, 8080), 0);
+        owner.execute(&mut incoming).unwrap();
+        let (tx, bytes) = poll_frame(&mut owner).unwrap();
+        let sent = packet_header(&bytes);
+        let (ip, mut reply) = reverse_ack(tx, sent, sent.sequence.wrapping_add(1));
+        reply.flags |= ntcp::wire::FIN;
+        input_packet(&mut owner, ip, reply, &[]);
+        execute_value(&mut owner, 11, listener, 8, 1 - enabled).unwrap();
+        let fd = execute_value(&mut owner, 4, listener, 0, 0).unwrap() as i32;
+        let id = owner.connection(fd).unwrap();
+        assert_eq!(owner.endpoint.state(id), Ok(State::CloseWait));
+        assert_eq!(execute_value(&mut owner, 12, fd, 8, 0), Ok(enabled as i64));
+        let (mut read, _) = request(6, fd, MSG_DONTWAIT, vec![], 1);
+        assert_eq!(owner.execute(&mut read).unwrap().unwrap().value, 0);
+        assert_eq!(execute_value(&mut owner, 4, listener, 0, 0), Err(EAGAIN));
+    }
+}
+
+#[test]
 fn ip_options_listener_snapshot_accept_detached_fin_and_fd_reuse() {
     let mut owner = Owner::new((local(), Profile::Sack)).unwrap();
     let listener = owner.alloc(Socket::new(0)).unwrap();
+    execute_value(&mut owner, 11, listener, 8, 1).unwrap();
     execute_value(&mut owner, 11, listener, 6, 187).unwrap();
     execute_value(&mut owner, 11, listener, 7, IP_PMTUDISC_DONT).unwrap();
     let (mut bind, _) = request(
@@ -1816,6 +1868,7 @@ fn ip_options_listener_snapshot_accept_detached_fin_and_fd_reuse() {
     let sent = packet_header(&bytes);
     let (ip, reply) = reverse_ack(tx, sent, sent.sequence.wrapping_add(1));
     input_packet(&mut owner, ip, reply, &[]);
+    execute_value(&mut owner, 11, listener, 8, 0).unwrap();
     let fd = execute_value(&mut owner, 4, listener, 0, 0).unwrap() as i32;
     assert_eq!(execute_value(&mut owner, 12, fd, 6, 0), Ok(184));
     assert_eq!(
@@ -1823,6 +1876,9 @@ fn ip_options_listener_snapshot_accept_detached_fin_and_fd_reuse() {
         Ok(IP_PMTUDISC_DONT as i64)
     );
     assert_eq!(owner.connection(fd), Ok(id));
+    assert!(owner.sockets[&fd].zerocopy);
+    assert_eq!(owner.sockets[&fd].zc_next, 0);
+    assert!(owner.sockets[&fd].completions.is_empty());
     // Pin the old exposed fd until dup2: no parallel test can allocate it.
     let old_token = owner.sockets.get_mut(&fd).unwrap().token.take().unwrap();
     execute_value(&mut owner, 8, fd, 0, 0).unwrap();
@@ -1835,6 +1891,7 @@ fn ip_options_listener_snapshot_accept_detached_fin_and_fd_reuse() {
     drop(old_token);
     drop(replacement);
     owner.alloc_token(Socket::new(0), token).unwrap();
+    assert!(!owner.sockets[&fd].zerocopy);
     execute_value(&mut owner, 11, fd, 6, 4).unwrap();
     execute_value(&mut owner, 11, fd, 7, IP_PMTUDISC_DO).unwrap();
     let (fin_tx, bytes) = poll_frame(&mut owner).unwrap();
@@ -2763,4 +2820,78 @@ fn cubic_real_loss_snapshot_and_upstream_reno_independence() {
             );
         }
     }
+}
+
+#[test]
+fn copied_completions_wrap_coalesce_and_reserve_before_accepting_bytes() {
+    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let (fd, id, _, _) = active_ip_connection(&mut owner, 0, IP_PMTUDISC_WANT);
+    execute_value(&mut owner, 11, fd, 8, 1).unwrap();
+    owner.sockets.get_mut(&fd).unwrap().zc_next = u32::MAX - 1;
+    for _ in 0..3 {
+        let (mut send, _) = request(7, fd, MSG_ZEROCOPY, b"x".to_vec(), 0);
+        assert_eq!(owner.execute(&mut send).unwrap().unwrap().value, 1);
+    }
+    assert_eq!(owner.sockets[&fd].zc_next, 1);
+    assert_eq!(owner.sockets[&fd].completions, [(u32::MAX - 1, 0)]);
+    let mut control = [0u8; 64];
+    let mut header: msghdr = unsafe { std::mem::zeroed() };
+    header.msg_control = control.as_mut_ptr().cast();
+    header.msg_controllen = control.len();
+    let bytes = unsafe {
+        slice::from_raw_parts(
+            (&header as *const msghdr).cast(),
+            std::mem::size_of::<msghdr>(),
+        )
+        .to_vec()
+    };
+    let (mut receive, _) = request(22, fd, MSG_ERRQUEUE, bytes, std::mem::size_of::<msghdr>());
+    receive.destinations = vec![(
+        (&mut header as *mut msghdr) as usize,
+        std::mem::size_of::<msghdr>(),
+    )];
+    assert_eq!(owner.execute(&mut receive).unwrap().unwrap().value, 0);
+    let offset = std::mem::size_of::<cmsghdr>();
+    assert_eq!(
+        u32::from_ne_bytes(control[offset + 8..offset + 12].try_into().unwrap()),
+        u32::MAX - 1
+    );
+    assert_eq!(
+        u32::from_ne_bytes(control[offset + 12..offset + 16].try_into().unwrap()),
+        0
+    );
+    assert_eq!(header.msg_flags, MSG_ERRQUEUE);
+    assert_eq!(owner.execute(&mut receive).err(), Some(EAGAIN));
+    // Seed unreachable-in-a-short-test ranges to exercise the real capacity gate.
+    owner.sockets.get_mut(&fd).unwrap().completions =
+        (0..LIMIT as u32).map(|n| (n + 10, n + 10)).collect();
+    let written = owner.sockets[&fd].written;
+    let used = owner.endpoint.transport_info(id).unwrap().send_used;
+    let (mut send, _) = request(7, fd, MSG_ZEROCOPY, vec![], 0);
+    send.destinations = vec![(1, 1)];
+    assert_eq!(owner.execute(&mut send).err(), Some(ENOBUFS));
+    assert_eq!(owner.sockets[&fd].written, written);
+    assert_eq!(owner.endpoint.transport_info(id).unwrap().send_used, used);
+    assert_eq!(owner.sockets[&fd].zc_next, 1);
+    assert_eq!(send.destinations, [(1, 1)]); // Capacity failure precedes payload faults.
+    send.destinations.clear();
+    assert_eq!(owner.execute(&mut send).unwrap().unwrap().value, 0);
+    let next = owner.sockets[&fd].completions.back().unwrap().1 + 1;
+    owner.sockets.get_mut(&fd).unwrap().zc_next = next;
+    send.bytes = b"x".to_vec();
+    assert_eq!(owner.execute(&mut send).unwrap().unwrap().value, 1);
+    assert_eq!(owner.sockets[&fd].completions.len(), LIMIT);
+    assert_eq!(owner.sockets[&fd].completions.back().unwrap().1, next);
+    // A range covering almost a full counter turn cannot grow to 2^32 IDs.
+    let socket = owner.sockets.get_mut(&fd).unwrap();
+    socket.completions = [(1, u32::MAX)].into();
+    socket.zc_next = 0;
+    assert_eq!(owner.execute(&mut send).unwrap().unwrap().value, 1);
+    assert_eq!(owner.sockets[&fd].completions, [(1, u32::MAX), (0, 0)]);
+    execute_value(&mut owner, 11, fd, 8, 0).unwrap();
+    assert_eq!(owner.execute(&mut send).unwrap().unwrap().value, 1);
+    assert_eq!(owner.sockets[&fd].zc_next, 1);
+    execute_value(&mut owner, 11, fd, 8, 1).unwrap();
+    assert_eq!(owner.execute(&mut send).unwrap().unwrap().value, 1);
+    assert_eq!(owner.sockets[&fd].completions, [(1, u32::MAX), (0, 1)]);
 }

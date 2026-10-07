@@ -179,6 +179,9 @@ struct Socket {
     nodelay: bool,
     user_timeout_ms: i32,
     ip_options: IpOptions,
+    zerocopy: bool,
+    zc_next: u32,
+    completions: VecDeque<(u32, u32)>,
     readable: Option<bool>,
     acceptable: Option<bool>,
     error: i32,
@@ -199,6 +202,9 @@ impl Socket {
             nodelay: false,
             user_timeout_ms: 0,
             ip_options: IpOptions::default(),
+            zerocopy: false,
+            zc_next: 0,
+            completions: VecDeque::new(),
             readable: Some(false),
             acceptable: Some(false),
             error: 0,
@@ -208,6 +214,11 @@ impl Socket {
             connected: false,
         }
     }
+}
+// Copied fallback completes synchronously, in send order. Never merge a full
+// 2^32-ID range: that would make wrap indistinguishable from a single ID.
+fn extends_completion(range: (u32, u32), next: u32) -> bool {
+    range.1.wrapping_add(1) == next && u64::from(range.1.wrapping_sub(range.0)) + 2 < (1u64 << 32)
 }
 // Fixed synthetic IPv4 route, MTU 65535: no route lookup or ICMP PMTU updates.
 // WANT/DO set DF; DONT clears it. Every generated packet fits this route.
@@ -227,6 +238,8 @@ impl Default for IpOptions {
 struct ConnectionIp {
     id: ConnectionId,
     options: IpOptions,
+    // Linux clones listener flags when the handshake creates the child, not accept.
+    zerocopy: Option<bool>,
 }
 fn user_timeout_us(milliseconds: i32) -> Result<Option<u64>> {
     let ms = u64::try_from(milliseconds).map_err(|_| EINVAL)?;
@@ -782,6 +795,12 @@ impl Owner {
                         socket.local = Some(tuple.local);
                         socket.nodelay = nodelay;
                         socket.reuse = reuse;
+                        socket.zerocopy = self
+                            .connection_ip
+                            .iter()
+                            .find(|p| p.id == id)
+                            .and_then(|p| p.zerocopy)
+                            .ok_or(EIO)?;
                         socket.ip_options = self
                             .connection_ip
                             .iter()
@@ -858,6 +877,7 @@ impl Owner {
                     self.connection_ip.push(ConnectionIp {
                         id,
                         options: socket.ip_options,
+                        zerocopy: Some(socket.zerocopy),
                     });
                     socket.local = Some(local);
                     socket.handle = Handle::Connection(id);
@@ -887,6 +907,46 @@ impl Owner {
                     _ => return Ok(None),
                 }
             }
+            22 => {
+                let socket = self.sockets.get_mut(&r.fd).ok_or(EBADF)?;
+                let &(lo, hi) = socket.completions.front().ok_or(EAGAIN)?;
+                let header = unsafe { ptr::read_unaligned(r.bytes.as_ptr().cast::<msghdr>()) };
+                let cmsg_size = std::mem::size_of::<cmsghdr>();
+                // IPv4 IP_RECVERR: extended error plus a zero AF_UNSPEC offender.
+                let full = cmsg_size + 16 + std::mem::size_of::<sockaddr_in>();
+                let mut flags = MSG_ERRQUEUE;
+                let mut used = 0usize;
+                if header.msg_control.is_null() || header.msg_controllen < cmsg_size {
+                    flags |= MSG_CTRUNC;
+                } else {
+                    used = header.msg_controllen.min(full);
+                    if used < full {
+                        flags |= MSG_CTRUNC;
+                    }
+                    let mut control = vec![0u8; used];
+                    control[..std::mem::size_of::<usize>()].copy_from_slice(&used.to_ne_bytes());
+                    let level = std::mem::offset_of!(cmsghdr, cmsg_level);
+                    let kind = std::mem::offset_of!(cmsghdr, cmsg_type);
+                    control[level..level + 4].copy_from_slice(&SOL_IP.to_ne_bytes());
+                    control[kind..kind + 4].copy_from_slice(&IP_RECVERR.to_ne_bytes());
+                    let mut extended = [0u8; 32];
+                    extended[4] = 5; // SO_EE_ORIGIN_ZEROCOPY
+                    extended[6] = 1; // SO_EE_CODE_ZEROCOPY_COPIED
+                    extended[8..12].copy_from_slice(&lo.to_ne_bytes());
+                    extended[12..16].copy_from_slice(&hi.to_ne_bytes());
+                    control[cmsg_size..].copy_from_slice(&extended[..used - cmsg_size]);
+                    copy_out(header.msg_control as usize, &control)?;
+                }
+                let name = std::mem::offset_of!(msghdr, msg_namelen);
+                let control = std::mem::offset_of!(msghdr, msg_controllen);
+                let flag = std::mem::offset_of!(msghdr, msg_flags);
+                r.bytes[name..name + 4].copy_from_slice(&0u32.to_ne_bytes());
+                r.bytes[control..control + std::mem::size_of::<usize>()]
+                    .copy_from_slice(&used.to_ne_bytes());
+                r.bytes[flag..flag + 4].copy_from_slice(&flags.to_ne_bytes());
+                copy_out(r.destinations[0].0, &r.bytes)?;
+                socket.completions.pop_front();
+            }
             6 | 7 => {
                 let id = self.connection(r.fd)?;
                 if r.op == 6 && r.capacity == 0 {
@@ -906,6 +966,21 @@ impl Owner {
                     // Core allows pre-handshake buffering; socket sends must wait instead.
                     if matches!(state, State::SynSent | State::SynReceived) {
                         return self.block(r);
+                    }
+                    // Reserve notification capacity BEFORE accepting stream bytes.
+                    let nonempty = !r.bytes.is_empty() || r.destinations.iter().any(|v| v.1 != 0);
+                    if nonempty
+                        && socket.zerocopy
+                        && r.a & MSG_ZEROCOPY != 0
+                        && !socket
+                            .completions
+                            .back()
+                            .is_some_and(|&range| extends_completion(range, socket.zc_next))
+                    {
+                        if socket.completions.len() == LIMIT {
+                            return Err(ENOBUFS);
+                        }
+                        socket.completions.try_reserve(1).map_err(|_| ENOBUFS)?;
                     }
                     // Resolve payload faults only after serialized error/state checks.
                     // Keep the owned copy for retries; never preflight the owner separately.
@@ -981,6 +1056,17 @@ impl Owner {
                             };
                         } else {
                             socket.written += n as u64;
+                            if n != 0 && socket.zerocopy && r.a & MSG_ZEROCOPY != 0 {
+                                let next = socket.zc_next;
+                                if let Some(tail) = socket.completions.back_mut()
+                                    && extends_completion(*tail, next)
+                                {
+                                    tail.1 = next;
+                                } else {
+                                    socket.completions.push_back((next, next));
+                                }
+                                socket.zc_next = next.wrapping_add(1);
+                            }
                         }
                     }
                     Err(EndpointError::Connection(Error::WouldBlock)) => {
@@ -1076,6 +1162,12 @@ impl Owner {
                 let socket = self.sockets.get_mut(&r.fd).ok_or(EBADF)?;
                 if r.op == 11 {
                     match r.a {
+                        8 => {
+                            if !(0..=1).contains(&r.b) {
+                                return Err(EINVAL);
+                            }
+                            socket.zerocopy = r.b != 0;
+                        }
                         1 => socket.reuse = r.b != 0,
                         2 => {
                             if let Handle::Connection(id) = socket.handle {
@@ -1145,6 +1237,7 @@ impl Owner {
                         5 => socket.user_timeout_ms as i64,
                         6 => socket.ip_options.tos as i64,
                         7 => socket.ip_options.discover as i64,
+                        8 => socket.zerocopy as i64,
                         _ => return Err(ENOSYS),
                     };
                 }
@@ -1210,7 +1303,7 @@ impl Owner {
                                 {
                                     p.revents |= POLLOUT;
                                 }
-                                if s.error != 0 {
+                                if s.error != 0 || !s.completions.is_empty() {
                                     p.revents |= POLLERR;
                                 }
                                 if let Handle::Connection(id) = s.handle {
@@ -1282,7 +1375,25 @@ impl Owner {
                     self.endpoint
                         .set_dscp(id, options.tos >> 2)
                         .map_err(error)?;
-                    self.connection_ip.push(ConnectionIp { id, options });
+                    self.connection_ip.push(ConnectionIp {
+                        id,
+                        options,
+                        zerocopy: None,
+                    });
+                }
+                if let Some(id) = self.endpoint.connection_id(tuple)
+                    && matches!(
+                        self.endpoint.state(id),
+                        Ok(State::Established | State::CloseWait)
+                    )
+                    && let Some(metadata) = self.connection_ip.iter_mut().find(|p| p.id == id)
+                    && metadata.zerocopy.is_none()
+                {
+                    metadata.zerocopy = self.sockets.values().find_map(|s| {
+                        (matches!(s.handle, Handle::Listener(_))
+                            && s.local.is_some_and(|a| a.port() == tuple.local.port()))
+                        .then_some(s.zerocopy)
+                    });
                 }
             }
             15 => {
@@ -1647,7 +1758,12 @@ unsafe fn call_inner(
             )?;
             bytes
         };
-        let destinations = if matches!(op, 20 | 21) {
+        let destinations = if op == 22 {
+            if input_len != std::mem::size_of::<msghdr>() || output_len != input_len {
+                return Err(EINVAL);
+            }
+            vec![(output as usize, output_len)]
+        } else if matches!(op, 20 | 21) {
             if !input_len.is_multiple_of(std::mem::size_of::<iovec>())
                 || input_len / std::mem::size_of::<iovec>() > 1024
             {
