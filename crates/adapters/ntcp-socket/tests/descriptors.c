@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 static int connected(void) {
@@ -143,6 +144,49 @@ int main(int argc, char **argv) {
     assert(seen == ((1u << 6) | (1u << 7)));
     assert(read(native, &value, sizeof(value)) == sizeof(value));
 
+    if (managed) {
+        // First successful wait selects native-first. The next fault is
+        // virtual-first and must not consume a staged native ONESHOT event.
+        int mixed = epoll_create1(EPOLL_CLOEXEC);
+        assert(mixed >= 0);
+        control(mixed, EPOLL_CTL_ADD, fd, EPOLLOUT | EPOLLONESHOT, 11);
+        assert(epoll_wait(mixed, out, 2, 0) == 1);
+        control(mixed, EPOLL_CTL_MOD, fd, EPOLLOUT | EPOLLONESHOT, 11);
+        control(mixed, EPOLL_CTL_ADD, native, EPOLLIN | EPOLLONESHOT, 12);
+        assert(write(native, &value, sizeof(value)) == sizeof(value));
+        bad = mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        assert(bad != MAP_FAILED);
+        assert(epoll_wait(mixed, bad, 2, 0) == -1 && errno == EFAULT);
+        assert(epoll_wait(mixed, out, 2, 0) == 2);
+        unsigned mixed_seen = 0;
+        for (int i = 0; i < 2; ++i) mixed_seen |= 1u << out[i].data.u64;
+        assert(mixed_seen == ((1u << 11) | (1u << 12)));
+        assert(epoll_wait(mixed, out, 2, 0) == 0);
+
+        // A delivered native prefix survives failure of virtual copyout.
+        control(mixed, EPOLL_CTL_MOD, fd, EPOLLOUT | EPOLLONESHOT, 11);
+        control(mixed, EPOLL_CTL_MOD, native, EPOLLIN | EPOLLONESHOT, 12);
+        void *partial = mmap(NULL, page * 2, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        assert(partial != MAP_FAILED);
+        assert(mprotect((char *)partial + page, page, PROT_NONE) == 0);
+        struct epoll_event *end = (void *)((char *)partial + page - sizeof(*end));
+        assert(epoll_wait(mixed, end, 2, 0) == 1);
+        assert(end->data.u64 == 12);
+        assert(epoll_wait(mixed, out, 2, 0) == 1 && out[0].data.u64 == 11);
+        // Likewise retain a virtual prefix when the native suffix faults;
+        // direct kernel copyout leaves that native ONESHOT ready for retry.
+        assert(epoll_wait(mixed, out, 2, 0) == 0); // Select virtual-first next.
+        control(mixed, EPOLL_CTL_MOD, fd, EPOLLOUT | EPOLLONESHOT, 11);
+        control(mixed, EPOLL_CTL_MOD, native, EPOLLIN | EPOLLONESHOT, 12);
+        assert(epoll_wait(mixed, end, 2, 0) == 1 && end->data.u64 == 11);
+        assert(epoll_wait(mixed, out, 2, 0) == 1 && out[0].data.u64 == 12);
+        assert(munmap(partial, page * 2) == 0);
+        assert(munmap(bad, page) == 0);
+        assert(read(native, &value, sizeof(value)) == sizeof(value));
+        assert(close(mixed) == 0);
+    }
+
     int target = connected();
     assert(dup2(-1, target) == -1 && errno == EBADF);
     exchange(target);
@@ -201,6 +245,11 @@ int main(int argc, char **argv) {
     }
     assert(close(target) == 0);
     exchange(fd);
+    if (managed) {
+        // Raw mutation is outside the adapter contract, but cleanup of an
+        // observed stale alias must still release the owner's final stream.
+        assert(syscall(SYS_dup2, native, fd) == fd);
+    }
     assert(close(fd) == 0);
     assert(epoll_wait(ep, out, 8, 0) == 0);
     assert(close(ep) == 0 && close(native) == 0);

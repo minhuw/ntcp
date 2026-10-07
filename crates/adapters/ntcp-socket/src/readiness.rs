@@ -257,7 +257,6 @@ unsafe fn epwait(
     // ponytail: bounded 10ms readiness polling; use private wake epoll if latency matters.
     // Bounded result storage independent of the caller's maxevents.
     let cap = (max as usize).min(LIMIT);
-    let mut native = vec![epoll_event { events: 0, u64: 0 }; cap];
     loop {
         let regs = {
             let mut map = EPOLLS.lock().map_err(|_| EIO)?;
@@ -288,6 +287,7 @@ unsafe fn epwait(
             let ready = match call(r.id, Op::Ready) {
                 Ok(reply) => reply.value as u32,
                 Err(EBADF) => continue, // Last alias closed during the query.
+                Err(_) if native_count != 0 => return Ok(native_count as i64),
                 Err(e) => return Err(e),
             } & (r.events | EPOLLERR as u32 | EPOLLHUP as u32);
             if ready != 0 {
@@ -309,22 +309,6 @@ unsafe fn epwait(
             remaining(deadline).clamp(0, 10)
         };
         let available = cap - native_count;
-        let native_cap = available.saturating_sub(virtual_events.len().min(available));
-        let n = if native_cap == 0 || native_count != 0 {
-            0
-        } else {
-            raw(unsafe {
-                syscall(
-                    SYS_epoll_pwait,
-                    epfd,
-                    native.as_mut_ptr(),
-                    native_cap as i32,
-                    wait,
-                    mask,
-                    8,
-                )
-            })? as usize
-        };
         // Serialize copyout + disarming with MOD and competing waiters. No owner
         // RPC or socket registry lock is taken while EPOLLS is held.
         let mut map = EPOLLS.lock().map_err(|_| EIO)?;
@@ -343,8 +327,13 @@ unsafe fn epwait(
             output.push(event);
             delivered.push((key, generation));
         }
-        output.extend_from_slice(&native[..n]);
-        store_array(p.wrapping_add(native_count), &output)?;
+        if let Err(e) = store_array(p.wrapping_add(native_count), &output) {
+            return if native_count != 0 {
+                Ok(native_count as i64)
+            } else {
+                Err(e)
+            };
+        }
         for (key, generation) in delivered {
             if let Some(r) = ep.regs.get_mut(&key)
                 && r.generation == generation
@@ -354,8 +343,31 @@ unsafe fn epwait(
             }
         }
         drop(map);
-        if native_count != 0 || !output.is_empty() {
-            return Ok((native_count + output.len()) as i64);
+        let delivered = native_count + output.len();
+        // Virtual-first must finish faultable copyout before consuming native
+        // ONESHOT. Let the kernel copy directly to the remaining caller buffer.
+        let native_cap = cap - delivered;
+        let n = if native_cap == 0 || native_count != 0 {
+            0
+        } else {
+            match raw(unsafe {
+                syscall(
+                    SYS_epoll_pwait,
+                    epfd,
+                    p.wrapping_add(delivered),
+                    native_cap as i32,
+                    wait,
+                    mask,
+                    8,
+                )
+            }) {
+                Ok(n) => n as usize,
+                Err(_) if delivered != 0 => return Ok(delivered as i64),
+                Err(e) => return Err(e),
+            }
+        };
+        if delivered + n != 0 {
+            return Ok((delivered + n) as i64);
         }
         if timeout == 0 || deadline.is_some_and(|d| Instant::now() >= d) {
             return Ok(0);

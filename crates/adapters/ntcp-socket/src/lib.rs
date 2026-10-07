@@ -36,6 +36,7 @@ type Result<T> = std::result::Result<T, i32>;
 thread_local! {
     static INTERNAL: Cell<bool> = const { Cell::new(false) };
     static DEPTH: Cell<usize> = const { Cell::new(0) };
+    static NATIVE_MUTATION: Cell<usize> = const { Cell::new(0) };
 }
 unsafe extern "C" {
     fn ntcp_set_internal(value: i32);
@@ -59,6 +60,67 @@ fn reserve_fd(fds: &[AtomicI32], fd: i32) -> Result<usize> {
         .ok_or(EMFILE)
 }
 static TOKENS: Mutex<BTreeMap<i32, Token>> = Mutex::new(BTreeMap::new());
+// Native close/dup use an atomic read-side guard, never a registry lock. A
+// writer pins classification through the syscall and alias publication.
+// ponytail: one mutation gate; shard by target fd if contention matters.
+static FD_MUTATION: AtomicI32 = AtomicI32::new(0);
+struct NativeMutation;
+impl NativeMutation {
+    fn enter() -> Option<Self> {
+        // Constant TLS, no allocation: a managed signal-handler mutation must
+        // not wait for the native syscall it interrupted on this same thread.
+        NATIVE_MUTATION.with(|depth| depth.set(depth.get() + 1));
+        let mut n = FD_MUTATION.load(Ordering::Acquire);
+        while n >= 0 {
+            match FD_MUTATION.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(Self),
+                Err(value) => n = value,
+            }
+        }
+        NATIVE_MUTATION.with(|depth| depth.set(depth.get() - 1));
+        None
+    }
+}
+impl Drop for NativeMutation {
+    fn drop(&mut self) {
+        FD_MUTATION.fetch_sub(1, Ordering::Release);
+        NATIVE_MUTATION.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+struct Mutation;
+impl Mutation {
+    // Caller holds TOKENS; readers never acquire it while holding their guard.
+    fn enter() -> Self {
+        while FD_MUTATION
+            .compare_exchange(0, -1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        Self
+    }
+}
+impl Drop for Mutation {
+    fn drop(&mut self) {
+        FD_MUTATION.store(0, Ordering::Release);
+    }
+}
+fn mutation_context() -> Result<()> {
+    if DEPTH.with(Cell::get) > 1 || INTERNAL.with(Cell::get) || NATIVE_MUTATION.with(Cell::get) != 0
+    {
+        Err(EDEADLK)
+    } else if child() {
+        Err(EOWNERDEAD)
+    } else {
+        Ok(())
+    }
+}
+#[cfg(test)]
+thread_local! {
+    static CLOSE_BEFORE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static DUP_BEFORE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static DUP_AFTER_KERNEL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
 struct Token {
     slot: Option<usize>,
     id: u64,
@@ -154,7 +216,9 @@ fn owned(fd: i32) -> Result<Option<u64>> {
         if t.matches(fd) {
             return Ok(Some(t.id));
         }
-        tokens.remove(&fd);
+        let last = remove_alias(&mut tokens, fd);
+        drop(tokens);
+        let _ = finish_close(last);
     }
     Ok(None)
 }
@@ -641,25 +705,34 @@ pub unsafe extern "C" fn ntcp_managed_connect(fd: i32, p: *const sockaddr, len: 
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ntcp_managed_close(fd: i32) -> i32 {
-    if !inherited(&SOCKET_FDS, fd) && !readiness::tracked_epoll(fd) {
+    if let Some(_native) = NativeMutation::enter()
+        && !inherited(&SOCKET_FDS, fd)
+        && !readiness::tracked_epoll(fd)
+    {
         return unsafe { syscall(SYS_close, fd) as i32 };
     }
     ffi(|| {
-        if owned(fd)?.is_some() {
-            let (closed, last) = {
-                let mut tokens = TOKENS.lock().map_err(|_| EIO)?;
-                let closed = raw(unsafe { syscall(SYS_close, fd) });
-                let last = remove_alias(&mut tokens, fd);
-                (closed, last)
-            };
-            let engine = finish_close(last);
-            closed?;
-            engine?;
-            Ok(0)
-        } else {
+        mutation_context()?;
+        #[cfg(test)]
+        CLOSE_BEFORE_LOCK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        let (closed, last) = {
+            let mut tokens = TOKENS.lock().map_err(|_| EIO)?;
+            let _mutation = Mutation::enter();
+            // Also remove stale aliases: closing a reused native fd must not
+            // leave an owner lifetime pinned by an invalid registry entry.
+            let closed = raw(unsafe { syscall(SYS_close, fd) });
+            let last = remove_alias(&mut tokens, fd);
             readiness::close_epoll(fd)?;
-            raw(unsafe { syscall(SYS_close, fd) })
-        }
+            (closed, last)
+        };
+        let engine = finish_close(last);
+        closed?;
+        engine?;
+        Ok(0)
     }) as i32
 }
 #[unsafe(no_mangle)]
@@ -1132,10 +1205,10 @@ pub unsafe extern "C" fn getsockopt(
 #[unsafe(no_mangle)]
 pub extern "C" fn ntcp_fcntl_dispatch(fd: i32, cmd: i32, arg: c_ulong) -> i32 {
     ffi(|| {
+        if [F_DUPFD, F_DUPFD_CLOEXEC].contains(&cmd) {
+            return duplicate(fd, None, cmd, arg);
+        }
         let Some(id) = owned(fd)? else {
-            if [F_DUPFD, F_DUPFD_CLOEXEC].contains(&cmd) && readiness::is_epoll(fd)? {
-                return Err(EOPNOTSUPP);
-            }
             if cmd == F_GETOWN {
                 // Linux UAPI constants not exposed by libc on every target.
                 const F_GETOWN_EX: i32 = 16;
@@ -1250,43 +1323,6 @@ fn live_id(id: u64) -> Result<bool> {
         .any(|(&fd, t)| t.id == id && t.matches(fd)))
 }
 fn duplicate(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Result<i64> {
-    let source = owned(fd)?;
-    if new == Some(fd) {
-        readiness::is_epoll(fd)?;
-        return if cmd == SYS_dup3 as i32 {
-            Err(EINVAL)
-        } else {
-            raw(unsafe { syscall(SYS_dup2, fd, fd) })
-        };
-    }
-    // Managed epoll aliases need shared epoll tracking, not just kernel dup.
-    if readiness::is_epoll(fd)? {
-        return Err(EOPNOTSUPP);
-    }
-    if source.is_some() {
-        let mut limit: rlimit = unsafe { std::mem::zeroed() };
-        raw(unsafe { syscall(SYS_getrlimit, RLIMIT_NOFILE, &mut limit) })?;
-        if new.is_some_and(|n| n < 0 || n as rlim_t >= limit.rlim_cur) {
-            return Err(EBADF);
-        }
-        if new.is_none()
-            && [F_DUPFD, F_DUPFD_CLOEXEC].contains(&cmd)
-            && ((arg as i32) < 0 || (arg as i32) as rlim_t >= limit.rlim_cur)
-        {
-            return Err(EINVAL);
-        }
-    }
-    if cmd == SYS_dup3 as i32 && arg & !(O_CLOEXEC as c_ulong) != 0 {
-        return Err(EINVAL);
-    }
-    let target = match new {
-        Some(n) => owned(n)?,
-        None => None,
-    };
-    let target_epoll = match new {
-        Some(n) => readiness::is_epoll(n)?,
-        None => false,
-    };
     let kernel = || unsafe {
         match new {
             Some(n) if cmd == SYS_dup3 as i32 => syscall(SYS_dup3, fd, n, arg),
@@ -1295,37 +1331,60 @@ fn duplicate(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Result<i64> {
             None => syscall(SYS_fcntl, fd, cmd, arg),
         }
     };
-    if source.is_none() && target.is_none() {
-        let result = raw(kernel())?;
-        if target_epoll {
-            readiness::close_epoll(new.unwrap())?;
-        }
-        return Ok(result);
+    // Classify *both* endpoints while protected from managed replacement.
+    if let Some(_native) = NativeMutation::enter()
+        && !inherited(&SOCKET_FDS, fd)
+        && !readiness::tracked_epoll(fd)
+        && new.is_none_or(|n| !inherited(&SOCKET_FDS, n) && !readiness::tracked_epoll(n))
+    {
+        return raw(kernel());
     }
+    mutation_context()?;
+    #[cfg(test)]
+    DUP_BEFORE_LOCK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
     let (result, last) = {
         let mut tokens = TOKENS.lock().map_err(|_| EIO)?;
-        // Revalidate the source under the same lock as close/dup replacement.
-        let alias = if let Some(id) = source {
-            let t = tokens
-                .get(&fd)
-                .filter(|t| t.id == id && t.matches(fd))
-                .ok_or(EBADF)?;
-            Some(Token {
-                slot: None,
-                id,
-                retained: t.retained.clone(),
-                dev: t.dev,
-                ino: t.ino,
-                input: t.input.clone(),
-            })
-        } else {
-            None
-        };
+        let _mutation = Mutation::enter();
+        if readiness::is_epoll(fd)? {
+            return Err(EOPNOTSUPP);
+        }
+        if new == Some(fd) {
+            return raw(kernel());
+        }
+        if cmd == SYS_dup3 as i32 && arg & !(O_CLOEXEC as c_ulong) != 0 {
+            return Err(EINVAL);
+        }
+        let alias = tokens.get(&fd).filter(|t| t.matches(fd)).map(|t| Token {
+            slot: None,
+            id: t.id,
+            retained: t.retained.clone(),
+            dev: t.dev,
+            ino: t.ino,
+            input: t.input.clone(),
+        });
+        let source = alias.as_ref().map(|t| t.id);
+        if alias.is_some() {
+            let mut limit: rlimit = unsafe { std::mem::zeroed() };
+            raw(unsafe { syscall(SYS_getrlimit, RLIMIT_NOFILE, &mut limit) })?;
+            if new.is_some_and(|n| n < 0 || n as rlim_t >= limit.rlim_cur) {
+                return Err(EBADF);
+            }
+            if new.is_none()
+                && [F_DUPFD, F_DUPFD_CLOEXEC].contains(&cmd)
+                && ((arg as i32) < 0 || (arg as i32) as rlim_t >= limit.rlim_cur)
+            {
+                return Err(EINVAL);
+            }
+        }
         let reused_slot = new.and_then(|n| tokens.get(&n)).and_then(|t| t.slot);
         let slot = if alias.is_some() {
             Some(match reused_slot {
                 Some(slot) => slot,
-                None => reserve_fd(&SOCKET_FDS, -2)?,
+                None => reserve_fd(&SOCKET_FDS, new.unwrap_or(-2))?,
             })
         } else {
             None
@@ -1341,6 +1400,12 @@ fn duplicate(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Result<i64> {
                 return Err(e);
             }
         };
+        #[cfg(test)]
+        DUP_AFTER_KERNEL.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         if alias.is_some()
             && let Some(t) = new.and_then(|n| tokens.get_mut(&n))
         {
@@ -1353,12 +1418,12 @@ fn duplicate(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Result<i64> {
             SOCKET_FDS[slot.unwrap()].store(result as i32, Ordering::Release);
             tokens.insert(result as i32, t);
         }
+        if let Some(n) = new {
+            readiness::close_epoll(n)?;
+        }
         // Replacing another alias of the source cannot end its OFD lifetime.
         (result, last.filter(|id| Some(*id) != source))
     };
-    if target_epoll {
-        readiness::close_epoll(new.unwrap())?;
-    }
     // dup2/dup3 ignore errors from the target's implicit close.
     let _ = finish_close(last);
     Ok(result)
@@ -1391,6 +1456,8 @@ mod tests {
                 1,
             )
         } == 1;
+        let native_alias = unsafe { dup(SIGNAL_PIPE.load(Ordering::Relaxed)) };
+        let native_close = native_alias >= 0 && unsafe { close(native_alias) } == 0;
         let mut out = 0u8;
         let recursive = unsafe {
             read(
@@ -1435,6 +1502,7 @@ mod tests {
         p.fd = SIGNAL_SOCKET.load(Ordering::Relaxed);
         let virtual_poll = unsafe { readiness::poll(&mut p, 1, 0) } == -1 && errno() == EDEADLK;
         let passed = native
+            && native_close
             && recursive
             && native_poll
             && native_ppoll
@@ -1492,6 +1560,125 @@ mod tests {
             close(pipes[0]);
             close(pipes[1]);
         }
+    }
+    // Hooks are thread-local and test-only: stop exactly at the two reviewer
+    // windows rather than relying on scheduling or repeated stress loops.
+    #[test]
+    fn duplicate_reclassifies_native_source_after_replacement() {
+        let (source, t) = token(SOCK_CLOEXEC).unwrap();
+        install(source, t, 980).unwrap();
+        let (target, t) = token(SOCK_CLOEXEC).unwrap();
+        install(target, t, 981).unwrap();
+        let native = unsafe { syscall(SYS_eventfd2, 0, EFD_CLOEXEC) as i32 };
+        assert!(native >= 0);
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let worker = {
+            let entered = entered.clone();
+            let resume = resume.clone();
+            std::thread::spawn(move || {
+                DUP_BEFORE_LOCK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        entered.wait();
+                        resume.wait();
+                    }))
+                });
+                duplicate(native, Some(target), SYS_dup2 as i32, 0)
+            })
+        };
+        entered.wait();
+        assert_eq!(
+            duplicate(source, Some(native), SYS_dup2 as i32, 0),
+            Ok(native as i64)
+        );
+        resume.wait();
+        assert_eq!(worker.join().unwrap(), Ok(target as i64));
+        assert_eq!(owned(target), Ok(Some(980)));
+        assert_eq!(owned(native), Ok(Some(980)));
+        let mut tokens = TOKENS.lock().unwrap();
+        for fd in [source, native, target] {
+            tokens.remove(&fd);
+            unsafe {
+                syscall(SYS_close, fd);
+            }
+        }
+    }
+    #[test]
+    fn close_waits_for_managed_over_native_publication() {
+        let (source, t) = token(SOCK_CLOEXEC).unwrap();
+        install(source, t, 982).unwrap();
+        let target = unsafe { syscall(SYS_eventfd2, 0, EFD_CLOEXEC) as i32 };
+        assert!(target >= 0);
+        let replaced = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let worker = {
+            let replaced = replaced.clone();
+            let resume = resume.clone();
+            std::thread::spawn(move || {
+                DUP_AFTER_KERNEL.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        replaced.wait();
+                        resume.wait();
+                    }))
+                });
+                duplicate(source, Some(target), SYS_dup2 as i32, 0)
+            })
+        };
+        replaced.wait();
+        // The target is visible before alias publication and the native fast
+        // path cannot enter while the kernel/registry transaction is open.
+        assert!(inherited(&SOCKET_FDS, target));
+        assert!(NativeMutation::enter().is_none());
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            CLOSE_BEFORE_LOCK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    entered.send(()).unwrap();
+                }))
+            });
+            unsafe { close(target) }
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        resume.wait();
+        assert_eq!(worker.join().unwrap(), Ok(target as i64));
+        assert_eq!(closer.join().unwrap(), 0);
+        // Other tests may immediately allocate this fd number. Assert the
+        // original OFD has no ghost alias, not that the number stays unused.
+        assert!(
+            !TOKENS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(&fd, t)| fd != source && t.id == 982)
+        );
+        assert_eq!(owned(source), Ok(Some(982)));
+        TOKENS.lock().unwrap().remove(&source);
+        unsafe {
+            syscall(SYS_close, source);
+        }
+    }
+    #[test]
+    fn managed_mutation_cannot_wait_on_interrupted_native_reader() {
+        let (fd, t) = token(SOCK_CLOEXEC).unwrap();
+        install(fd, t, 983).unwrap();
+        let native = NativeMutation::enter().unwrap();
+        assert_eq!(unsafe { close(fd) }, -1);
+        assert_eq!(errno(), EDEADLK);
+        drop(native);
+        TOKENS.lock().unwrap().remove(&fd);
+        unsafe {
+            syscall(SYS_close, fd);
+        }
+    }
+    #[test]
+    fn native_duplicate_bypasses_locked_tokens() {
+        let fd = unsafe { syscall(SYS_eventfd2, 0, EFD_CLOEXEC) as i32 };
+        let _tokens = TOKENS.lock().unwrap();
+        let alias = duplicate(fd, None, SYS_dup as i32, 0).unwrap() as i32;
+        assert_eq!(unsafe { close(alias) }, 0);
+        assert_eq!(unsafe { close(fd) }, 0);
     }
     #[test]
     fn timeout_validation_and_absolute_budget() {
