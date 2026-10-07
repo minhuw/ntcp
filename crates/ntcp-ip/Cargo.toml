@@ -7,4 +7,4 @@ description = "Bounded, caller-buffer IP and Ethernet codec for ntcp"
 repository = "https://github.com/minhuw/ntcp"
 
 [dependencies]
-ntcp = { version = "0.0.1", path = "../.." }
+ntcp = { version = "0.0.1", path = "../ntcp" }

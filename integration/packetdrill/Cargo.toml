@@ -9,5 +9,5 @@ license = "GPL-2.0-or-later"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-ntcp = { path = "../..", version = "0.0.1" }
+ntcp = { path = "../../crates/ntcp", version = "0.0.1" }
 libc = "0.2"

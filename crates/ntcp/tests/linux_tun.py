@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 
 def assert_timestamp_negotiation(sock):
@@ -175,7 +175,7 @@ if __name__ == '__main__':
         isolated_test(sys.argv[2])
         isolated_test(sys.argv[2], ipv6=True)
     elif len(sys.argv) == 1:
-        subprocess.run(['cargo', 'build', '--example', 'tun_echo'], cwd=ROOT, check=True)
+        subprocess.run(['cargo', 'build', '-p', 'ntcp', '--example', 'tun_echo'], cwd=ROOT, check=True)
         namespace = str(os.stat('/proc/self/ns/net').st_ino)
         subprocess.run(['unshare', '--user', '--map-root-user', '--net', sys.executable,
                         str(pathlib.Path(__file__).resolve()), '--isolated', namespace], check=True)

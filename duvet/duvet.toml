@@ -1,12 +1,6 @@
 '$schema' = "https://awslabs.github.io/duvet/config/v0.4.json"
 
 [[source]]
-pattern = "src/**/*.rs"
-
-[[source]]
-pattern = "examples/**/*.rs"
-
-[[source]]
 pattern = "crates/**/*.rs"
 
 # Section 2.1 defines keywords; Appendix B repeats the functional requirements.
