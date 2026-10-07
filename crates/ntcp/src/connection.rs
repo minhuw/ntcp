@@ -122,6 +122,14 @@ pub struct ConnectionConfig {
     // Linux tcp_send_active_reset uses RST|ACK; only the flag policy is matched:
     // https://github.com/torvalds/linux/blob/22430ae5d90ab288b0ee2ad99ae941f4a666b694/net/ipv4/tcp_output.c
     pub abort_with_ack: bool,
+    // Opt-in logical output PUSH batches in segments; 0/1 retain legacy hints.
+    // >=2 hints the last segment of each full contiguous ordinary-data batch
+    // only when a queued application PUSH covers it. Trailing singletons keep
+    // only application marks. Input, timeout, application work, idle/control,
+    // sequence/category changes end a batch; poll budget splits do not.
+    // Batches share one caller instant; paced outputs are singleton batches.
+    // This is not GSO emulation and does not change packetization/admission.
+    pub output_push_batch_segments: u16,
     pub timestamps: bool,
     pub timestamp_granularity: TimestampGranularity,
     pub timebase: CallerTimebase,
@@ -222,6 +230,7 @@ impl Default for ConnectionConfig {
             congestion_algorithm: CongestionAlgorithm::default(),
             initial_window: InitialWindow::default(),
             abort_with_ack: false,
+            output_push_batch_segments: 0,
             timestamps: false,
             timestamp_granularity: TimestampGranularity::default(),
             timebase: CallerTimebase::default(),
@@ -540,6 +549,9 @@ pub(crate) struct Connection {
     // Successful data output only; ACKs and keepalives do not restart data-idle time.
     last_sent: Instant,
     retransmit_burst: Option<(Seq, u32)>,
+    // End sequence, retry category, successful segment count, caller instant.
+    // Never stores wire hints in the application SendBuffer PUSH marks.
+    output_push_batch: Option<(Seq, bool, u16, Instant)>,
     keepalive_deadline: Option<Instant>,
     keepalive_probes: u32,
 }
@@ -767,6 +779,7 @@ impl Connection {
             last_received: now,
             last_sent: now,
             retransmit_burst: None,
+            output_push_batch: None,
             keepalive_deadline: None,
             keepalive_probes: 0,
         })
@@ -1487,6 +1500,7 @@ impl Connection {
         if effective as usize == self.mss {
             return Ok(());
         }
+        self.output_push_batch = None;
         self.mss = effective as usize;
         // Also constrain future SYN offers and negotiation if this occurs
         // before the peer's SYN; the scratch allocation never changes.
@@ -2167,6 +2181,7 @@ impl Connection {
             return Err(Error::InvalidState);
         }
         if data.is_empty() {
+            self.output_push_batch = None;
             self.send_issued = true;
             if push {
                 self.send.mark_push();
@@ -2179,6 +2194,7 @@ impl Connection {
         if count == 0 {
             return Err(Error::WouldBlock);
         }
+        self.output_push_batch = None;
         self.send_issued = true;
         if push {
             self.send.mark_push();
@@ -2239,6 +2255,7 @@ impl Connection {
         };
         let retained = sent.max(advertised).max(window_prefix).min(self.send.len());
         let discarded = self.send.len() - retained;
+        self.output_push_batch = None;
         self.send.truncate(retained);
         let end = self.send_base.wrapping_add(retained as u32);
         if self.snd_up.is_some_and(|up| after(up, end)) {
@@ -2392,6 +2409,7 @@ impl Connection {
         if !self.application_timer_needed() {
             self.application_progress_at = self.now;
         }
+        self.output_push_batch = None;
         self.shutdown = true;
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
         //= reason=Cancels protocol work locally; terminal handle storage remains until release.
@@ -2605,6 +2623,7 @@ impl Connection {
         self.receive.clear_dsack();
         self.update_time(now)?;
         self.retransmit_burst = None;
+        self.output_push_batch = None;
         if self.state == State::Closed {
             return Ok(());
         }
@@ -5475,14 +5494,41 @@ impl Connection {
                     .send
                     .pushed(offset, self.send.len().saturating_sub(offset));
         }
-        if count != 0
+        let offset = seq.distance_from(self.send_base) as usize;
+        let application_push = count != 0 && !keepalive && self.send.pushed(offset, count);
+        let batch_limit = self.config.output_push_batch_segments;
+        let output_push_batch = (batch_limit >= 2
+            && count != 0
+            && reset.is_none()
+            && !syn
+            && !challenge
+            && !probe
             && !keepalive
-            && (burst_push
-                || self
-                    .send
-                    .pushed(seq.distance_from(self.send_base) as usize, count))
-        {
+            && !tlp
+            && !self.pacing_enabled())
+        .then(|| {
+            let previous = self
+                .output_push_batch
+                .filter(|&(end, retry, _, at)| end == seq && retry == retransmitted && at == now);
+            let segments = previous.map_or(0, |(_, _, segments, _)| segments) + 1;
+            (seq.wrapping_add(count as u32), retransmitted, segments, now)
+        });
+        if batch_limit >= 2 {
+            // RFC9293 section3.9.1.2: intermediate flush hints are separate
+            // from the application's final PUSH, which always survives below.
+            // Linux tcp_output.c __tcp_transmit_skb hints GSO pcount>1;
+            // tcp_tso_autosize/tcp_cwnd_test define its actual groups. Here
+            // these are bounded logical batches, not Linux GSO packetization.
+            burst_push = output_push_batch.is_some_and(|(_, _, n, _)| n == batch_limit)
+                && (self.send.pushed(self.send.len().saturating_sub(1), 1)
+                    || self
+                        .send
+                        .pushed(offset, self.send.len().saturating_sub(offset)));
+        }
+        if count != 0 && !keepalive && (burst_push || application_push) {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
+            // Scope: write supplies automatic PUSH; explicit no-PUSH SENDs are
+            // supported separately. Batch hints never suppress the final mark.
             //# MUST set the PSH bit in the last buffered segment (i.e., when there is
             //# no more queued data to be sent) (MUST-61).
             flags |= PSH;
@@ -5496,9 +5542,11 @@ impl Connection {
             && !self.ack_pending
             && !challenge
         {
+            self.output_push_batch = None;
             return Ok(None);
         }
         if self.state == State::Closed && reset.is_none() {
+            self.output_push_batch = None;
             return Ok(None);
         }
         let mut urgent_pointer = 0;
@@ -5764,6 +5812,8 @@ impl Connection {
         if !challenge {
             self.retransmit_burst = retransmit_burst;
         }
+        self.output_push_batch =
+            output_push_batch.filter(|&(_, _, n, _)| n < batch_limit && !application_push);
         // Commit only the encoded (possibly clamped) urgent coverage, and only
         // after successful output. Retransmissions must not move it backwards.
         if flags & URG != 0 {
@@ -5774,7 +5824,8 @@ impl Connection {
         }
         // Commit the on-wire endpoint only after output succeeds. A partial ACK
         // past an earlier collapsed mark must not lose PSH on retransmission.
-        if flags & PSH != 0 {
+        // Opt-in batch-only hints are transient, not application PUSH requests.
+        if flags & PSH != 0 && (batch_limit < 2 || application_push) {
             self.send
                 .collapse_push(seq.distance_from(self.send_base) as usize, count);
         }
@@ -6281,6 +6332,7 @@ impl Connection {
             self.pacing_deadline = None;
         }
         self.retransmit_burst = None;
+        self.output_push_batch = None;
         let expired_loss = self
             .loss_timer
             .filter(|&(_, deadline)| now >= deadline)

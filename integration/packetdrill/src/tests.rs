@@ -2553,6 +2553,90 @@ fn native_tcp_shutdown_precedes_inaccessible_send_payload() {
 }
 
 #[test]
+fn owner_loop_cubic_initial_push_pairs_and_other_profiles_legacy_push() {
+    for selected in [
+        Profile::UpstreamCubic,
+        Profile::Baseline,
+        Profile::Sack,
+        Profile::UpstreamWindow8,
+        Profile::UpstreamSack,
+        Profile::UpstreamEcn,
+        Profile::UpstreamBasic,
+    ] {
+        let adapter = Adapter::start((local(), selected)).unwrap();
+        let listener = call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap().value as i32;
+        call(
+            &adapter,
+            2,
+            listener,
+            0,
+            encode_addr(SocketAddr::new(local().into(), 8080)),
+            0,
+        )
+        .unwrap();
+        call(&adapter, 3, listener, 1, vec![], 0).unwrap();
+        let incoming_syn = syn_with_options(100, 8080, &[2, 4, 5, 180]);
+        let ip = parse_frame(&incoming_syn).unwrap().0;
+        call(&adapter, 14, 0, 0, incoming_syn, 0).unwrap();
+        let synack = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap();
+        let base = packet_header(&synack.bytes).sequence.wrapping_add(1);
+        let header = ntcp::wire::Header {
+            source_port: 50000,
+            destination_port: 8080,
+            sequence: 101,
+            acknowledgment: base,
+            flags: ntcp::wire::ACK,
+            window: 65535,
+            urgent_pointer: 0,
+        };
+        let mut tcp = [0; 64];
+        let len = ntcp::wire::encode(ip, header, &[], &[], &mut tcp).unwrap();
+        let ack = frame(
+            ntcp::Transmit {
+                connection: None,
+                ip,
+                len,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+                ipv4_options: Default::default(),
+            },
+            &tcp[..len],
+        )
+        .unwrap();
+        call(&adapter, 14, 0, 0, ack, 0).unwrap();
+        let fd = call(&adapter, 4, listener, 0, vec![], 0).unwrap().value as i32;
+        // A single SEND gives CUBIC two pairs in one owner output turn and
+        // an explicit final PUSH on an unpaired segment. Legacy profiles use
+        // three MSS so the whole write fits their smaller initial window.
+        let segments = if selected == Profile::UpstreamCubic {
+            5
+        } else {
+            3
+        };
+        let payload = vec![0x55; segments * 1460];
+        assert_eq!(
+            call(&adapter, 7, fd, 0, payload.clone(), 0).unwrap().value,
+            payload.len() as i64
+        );
+        for i in 0..segments {
+            let packet = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap();
+            let (ip, tcp) = parse_frame(&packet.bytes).unwrap();
+            let sent = ntcp::wire::parse(ip, tcp).unwrap();
+            assert_eq!(sent.header.sequence, base.wrapping_add((i * 1460) as u32));
+            assert_eq!(sent.header.acknowledgment, 101);
+            assert_eq!(sent.payload, &payload[i * 1460..(i + 1) * 1460]);
+            let push = i == segments - 1 || (selected == Profile::UpstreamCubic && i % 2 == 1);
+            assert_eq!(
+                sent.header.flags,
+                ntcp::wire::ACK | if push { ntcp::wire::PSH } else { 0 },
+                "{selected:?} initial segment {i}"
+            );
+        }
+    }
+}
+
+#[test]
 fn cubic_real_loss_snapshot_and_upstream_reno_independence() {
     for (profile, pacing, threshold) in [
         (Profile::UpstreamCubic, Some(true), 7),

@@ -50,7 +50,15 @@ fn active_prr_mss_lowering_preserves_bytes_and_updates_allowances() {
         assert_eq!(a.prr.unwrap().credit(), 125);
         // Keep the old 1000-byte estimate plus the new 250-byte estimate.
         for (now, advance) in [(52, 1000), (53, 1250)] {
-            inject(&mut a, now, seq, base.wrapping_add(advance), ACK, window, &[]);
+            inject(
+                &mut a,
+                now,
+                seq,
+                base.wrapping_add(advance),
+                ACK,
+                window,
+                &[],
+            );
             assert_eq!(a.prr.unwrap().counters(), (10_000, 1250, 500));
             assert_eq!(a.prr.unwrap().credit(), 125);
         }
@@ -969,6 +977,401 @@ fn cubic_prr_safe_ack_known_loss_vs_new_tail_loss_wire() {
             assert_eq!(a.prr.unwrap().credit(), 1000);
             assert_eq!(outputs(&mut a, ack_time, base), vec![(4000 + credit, 1000)]);
             assert_eq!(a.prr.unwrap().credit(), 0);
+        }
+    }
+}
+
+// Compare every wire byte against unchanged admission/packetization, replacing
+// only the independently specified PSH flag and its checksum.
+fn batch_wire(a: &mut Connection, legacy: &mut Connection, now: u64, seq: Seq, push: bool) {
+    let expected = packet(legacy, now);
+    let segment = wire::parse(ip(tuple()), &expected).unwrap();
+    assert_eq!(segment.header.sequence, seq.0);
+    assert_eq!(segment.payload.len(), 1000);
+    let mut header = segment.header;
+    header.flags = (header.flags & !PSH) | if push { PSH } else { 0 };
+    let mut expected_wire = [0; 1500];
+    let size = wire::encode(
+        ip(tuple()),
+        header,
+        segment.raw_options,
+        segment.payload,
+        &mut expected_wire,
+    )
+    .unwrap();
+    assert_eq!(packet(a, now), expected_wire[..size]);
+}
+
+fn batch_pair(iss: u32, push: bool, bytes: usize) -> (Connection, Connection) {
+    let cfg = ConnectionConfig {
+        sack: true,
+        prr: true,
+        initial_window: InitialWindow::Iw10,
+        congestion_algorithm: CongestionAlgorithm::Cubic,
+        ..config(65_536, 1000)
+    };
+    let (mut a, _) = pair(cfg.clone(), iss);
+    let (mut legacy, _) = pair(cfg, iss);
+    a.config.output_push_batch_segments = 2;
+    for c in [&mut a, &mut legacy] {
+        c.write_with_push(&vec![0x55; bytes], push).unwrap();
+    }
+    (a, legacy)
+}
+
+#[test]
+fn output_push_batch_initial_and_recovery_wire() {
+    assert_eq!(ConnectionConfig::default().output_push_batch_segments, 0);
+    for iss in [0, u32::MAX - 4999] {
+        for push in [false, true] {
+            let (mut a, mut legacy) = batch_pair(iss, push, 10_000);
+            let base = a.send_base;
+            for i in 0..10 {
+                batch_wire(
+                    &mut a,
+                    &mut legacy,
+                    40,
+                    base.wrapping_add(i * 1000),
+                    push && i % 2 == 1,
+                );
+            }
+            // Intermediate hints must not become application marks.
+            assert!(!a.send.pushed(0, 9000));
+            assert_eq!(a.send.pushed(9000, 1000), push);
+            // Real four-loss PRR episode, then a seven-MSS reduced-cwnd output
+            // with three MSS still queued: its trailing singleton stays clear.
+            for end in 5..=10 {
+                for c in [&mut a, &mut legacy] {
+                    rack_sack(c, 50 + end as u64, 0, &[(4000, end * 1000)]);
+                }
+                if end >= 7 {
+                    batch_wire(
+                        &mut a,
+                        &mut legacy,
+                        50 + end as u64,
+                        base.wrapping_add((end - 7) * 1000),
+                        false,
+                    );
+                }
+            }
+            for ack in [1000, 2000, 3000, 10_000] {
+                for c in [&mut a, &mut legacy] {
+                    rack_sack(
+                        c,
+                        70,
+                        ack,
+                        if ack == 10_000 {
+                            &[]
+                        } else {
+                            &[(4000, 10_000)]
+                        },
+                    );
+                }
+            }
+            assert!(a.prr.is_none());
+            assert_eq!(a.congestion.cwnd(), 7000);
+            for c in [&mut a, &mut legacy] {
+                c.write_with_push(&[0x66; 10_000], push).unwrap();
+            }
+            for i in 0..7 {
+                batch_wire(
+                    &mut a,
+                    &mut legacy,
+                    80,
+                    base.wrapping_add(10_000 + i * 1000),
+                    push && i % 2 == 1,
+                );
+            }
+            assert_eq!(a.transmit(80, &mut [0; 1500]), Ok(None));
+            assert!(a.output_push_batch.is_none());
+        }
+    }
+}
+
+#[test]
+fn output_push_batch_fresh_prr_two_mss_wire() {
+    for iss in [0, u32::MAX - 4999] {
+        let (mut a, mut legacy) = batch_pair(iss, true, 20_000);
+        let base = a.send_base;
+        for i in 0..10 {
+            batch_wire(
+                &mut a,
+                &mut legacy,
+                40,
+                base.wrapping_add(i * 1000),
+                i % 2 == 1,
+            );
+        }
+        for end in 5..=12 {
+            let now = 50 + end as u64;
+            for c in [&mut a, &mut legacy] {
+                rack_sack(c, now, 0, &[(4000, end * 1000)]);
+            }
+            let offset = match end {
+                5 => 10_000,
+                6 => 11_000,
+                7..=10 => (end - 7) * 1000,
+                11 => 12_000,
+                12 => 13_000,
+                _ => unreachable!(),
+            };
+            batch_wire(&mut a, &mut legacy, now, base.wrapping_add(offset), false);
+        }
+        for c in [&mut a, &mut legacy] {
+            rack_sack(c, 80, 1000, &[(4000, 12_000)]);
+            assert_eq!(c.prr.unwrap().credit(), 2000);
+        }
+        for i in 0..2 {
+            batch_wire(
+                &mut a,
+                &mut legacy,
+                80,
+                base.wrapping_add(14_000 + i * 1000),
+                i == 1,
+            );
+        }
+        assert_eq!(a.prr.unwrap().credit(), 0);
+    }
+}
+
+#[test]
+fn output_push_batch_failed_output_budgets_and_boundaries() {
+    for boundary in 0..7 {
+        let (mut a, mut legacy) = batch_pair(0, true, 15_000);
+        let base = a.send_base;
+        batch_wire(&mut a, &mut legacy, 40, base, false);
+        let before = (a.output_push_batch, a.snd_nxt, a.now);
+        // Endpoint polls return at most one packet, regardless of budget.
+        // These separate calls exercise that budget split at the core boundary.
+        assert_eq!(a.transmit(40, &mut [0; 19]), Err(Error::OutputTooSmall));
+        assert_eq!((a.output_push_batch, a.snd_nxt, a.now), before);
+        match boundary {
+            0 => {} // successful second output completes the retained pair
+            1 => {
+                for c in [&mut a, &mut legacy] {
+                    c.timeout(40).unwrap();
+                }
+            }
+            2 => {
+                for c in [&mut a, &mut legacy] {
+                    rack_sack(c, 40, 0, &[]);
+                }
+            }
+            3 => {
+                for c in [&mut a, &mut legacy] {
+                    c.write_with_push(&[], false).unwrap();
+                }
+            }
+            4 => {
+                for c in [&mut a, &mut legacy] {
+                    assert_eq!(c.flush().unwrap(), 0);
+                }
+            }
+            5 => {
+                for c in [&mut a, &mut legacy] {
+                    c.challenge_ack_pending = true;
+                }
+                let p = packet(&mut a, 40);
+                assert_eq!(p, packet(&mut legacy, 40));
+                assert!(wire::parse(ip(tuple()), &p).unwrap().payload.is_empty());
+            }
+            6 => {
+                for c in [&mut a, &mut legacy] {
+                    c.probe_pending = true;
+                }
+                let p = packet(&mut a, 40);
+                assert_eq!(p, packet(&mut legacy, 40));
+                assert_eq!(wire::parse(ip(tuple()), &p).unwrap().payload.len(), 1);
+            }
+            _ => unreachable!(),
+        }
+        batch_wire(
+            &mut a,
+            &mut legacy,
+            40,
+            base.wrapping_add(1000),
+            boundary == 0,
+        );
+        if boundary != 0 {
+            batch_wire(&mut a, &mut legacy, 40, base.wrapping_add(2000), true);
+        }
+    }
+    // Changing the caller instant is an idle boundary, even without a None poll.
+    let (mut a, mut legacy) = batch_pair(0, true, 15_000);
+    let base = a.send_base;
+    batch_wire(&mut a, &mut legacy, 40, base, false);
+    batch_wire(&mut a, &mut legacy, 41, base.wrapping_add(1000), false);
+}
+
+#[test]
+fn output_push_batch_explicit_push_flush_and_pacing() {
+    for push in [false, true] {
+        let (mut a, mut legacy) = batch_pair(0, push, 1000);
+        let base = a.send_base;
+        // Application-marked singleton, followed by unmarked queued data.
+        for c in [&mut a, &mut legacy] {
+            c.write_with_push(&[0x66; 2000], false).unwrap();
+        }
+        batch_wire(&mut a, &mut legacy, 40, base, push);
+        batch_wire(&mut a, &mut legacy, 40, base.wrapping_add(1000), false);
+        batch_wire(&mut a, &mut legacy, 40, base.wrapping_add(2000), false);
+    }
+    let (mut a, mut legacy) = batch_pair(0, true, 15_000);
+    let base = a.send_base;
+    for c in [&mut a, &mut legacy] {
+        c.snd_wnd = 3000;
+        assert_eq!(c.flush().unwrap(), 12_000);
+    }
+    // FLUSH removes the application PUSH with discarded bytes; no synthetic mark.
+    for i in 0..3 {
+        batch_wire(&mut a, &mut legacy, 40, base.wrapping_add(i * 1000), false);
+    }
+    let (mut a, mut legacy) = batch_pair(0, true, 3000);
+    let base = a.send_base;
+    for c in [&mut a, &mut legacy] {
+        c.config.prr_pacing = true;
+    }
+    for i in 0..3 {
+        let now = a.pacing_deadline.unwrap_or(40);
+        batch_wire(
+            &mut a,
+            &mut legacy,
+            now,
+            base.wrapping_add(i * 1000),
+            i == 2,
+        );
+        assert!(a.output_push_batch.is_none());
+        assert_eq!(a.transmit(now, &mut [0; 1500]), Ok(None));
+    }
+}
+
+#[test]
+fn output_push_batch_retry_discontinuity_and_category() {
+    for iss in [0, u32::MAX - 4999] {
+        let mut a = rack_flight(iss);
+        let mut legacy = rack_flight(iss);
+        for c in [&mut a, &mut legacy] {
+            rack_sack(c, 200_000, 10_000, &[]);
+            c.write(&[0x55; 6000]).unwrap();
+        }
+        a.config.output_push_batch_segments = 2;
+        let base = a.send_base;
+        for i in 0..6 {
+            batch_wire(
+                &mut a,
+                &mut legacy,
+                200_000,
+                base.wrapping_add(i * 1000),
+                i % 2 == 1,
+            );
+        }
+        for c in [&mut a, &mut legacy] {
+            c.write(&[0x66; 6000]).unwrap();
+            // Holes at 0:2000 and 3000:4000; enough legacy PRR credit to
+            // encode the first pair, skip a SACKed segment, then a singleton.
+            rack_sack(c, 300_000, 10_000, &[(12_000, 13_000), (14_000, 16_000)]);
+        }
+        for (offset, push) in [(0, false), (1000, true), (3000, false)] {
+            let before = a.output_push_batch;
+            assert_eq!(
+                a.transmit(300_000, &mut [0; 20]),
+                Err(Error::OutputTooSmall)
+            );
+            assert_eq!(a.output_push_batch, before);
+            batch_wire(
+                &mut a,
+                &mut legacy,
+                300_000,
+                base.wrapping_add(offset),
+                push,
+            );
+        }
+        // Resume fresh data after recovery without carrying the retry batch.
+        for c in [&mut a, &mut legacy] {
+            c.prr = None;
+            c.sack_recovery = None;
+            c.retx_pending = false;
+            c.congestion = Congestion::new(
+                1000,
+                RecoveryAlgorithm::NewReno,
+                InitialWindow::Iw10,
+                Seq(u32::MAX),
+            );
+        }
+        batch_wire(&mut a, &mut legacy, 300_000, base.wrapping_add(6000), false);
+        // Same-sequence singleton retry of a previously hinted packet must
+        // not inherit a persistent application PUSH mark from its old hint.
+        for c in [&mut a, &mut legacy] {
+            c.snd_una = base.wrapping_add(1000);
+            c.retx_pending = true;
+        }
+        batch_wire(&mut a, &mut legacy, 300_000, base.wrapping_add(1000), false);
+    }
+    // An ordinary head retry ending exactly at SND.NXT followed by fresh
+    // output: sequence continuity alone must not join the two categories.
+    let (mut a, mut legacy) = batch_pair(0, true, 15_000);
+    let base = a.send_base;
+    batch_wire(&mut a, &mut legacy, 40, base, false);
+    batch_wire(&mut a, &mut legacy, 40, base.wrapping_add(1000), true);
+    for c in [&mut a, &mut legacy] {
+        c.snd_una = base.wrapping_add(1000);
+        c.retx_pending = true;
+    }
+    batch_wire(&mut a, &mut legacy, 40, base.wrapping_add(1000), false);
+    assert_eq!(
+        a.output_push_batch,
+        Some((base.wrapping_add(2000), true, 1, 40))
+    );
+    batch_wire(&mut a, &mut legacy, 40, base.wrapping_add(2000), false);
+    batch_wire(&mut a, &mut legacy, 40, base.wrapping_add(3000), true);
+}
+
+#[test]
+fn output_push_batch_endpoint_poll_budgets() {
+    use crate::{Endpoint, EndpointConfig};
+    for budget in [1, 8, 64] {
+        let cfg = EndpointConfig {
+            max_connections: 2,
+            connection: ConnectionConfig {
+                output_push_batch_segments: 2,
+                initial_window: InitialWindow::Iw10,
+                ..config(65_536, 1000)
+            },
+            ..EndpointConfig::default()
+        };
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, |_| true).unwrap();
+        let listener = b.listen(tuple().remote, 1).unwrap();
+        let id = a.connect(0, tuple().local, tuple().remote).unwrap();
+        let mut out = [0; 1500];
+        for now in [0, 10, 20] {
+            let (from, to) = if now == 10 {
+                (&mut b, &mut a)
+            } else {
+                (&mut a, &mut b)
+            };
+            let tx = from
+                .poll_transmit(now, &mut out, 64)
+                .unwrap()
+                .packet
+                .unwrap();
+            to.input(now, tx.ip, &out[..tx.len]).unwrap();
+        }
+        b.accept(listener).unwrap();
+        a.write(id, &[0x55; 15_000]).unwrap();
+        let mut base = None;
+        for i in 0..10 {
+            assert!(a.poll_transmit(40, &mut out, 0).unwrap().packet.is_none());
+            let tx = a
+                .poll_transmit(40, &mut out, budget)
+                .unwrap()
+                .packet
+                .unwrap();
+            let segment = wire::parse(tx.ip, &out[..tx.len]).unwrap();
+            let base = *base.get_or_insert(Seq(segment.header.sequence));
+            assert_eq!(segment.header.sequence, base.wrapping_add(i * 1000).0);
+            assert_eq!(segment.payload, &[0x55; 1000]);
+            assert_eq!(segment.header.flags & PSH != 0, i % 2 == 1);
         }
     }
 }

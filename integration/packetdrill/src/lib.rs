@@ -238,6 +238,7 @@ struct Owner {
     next_port: u32,
     local: Ipv4Addr,
     epoch: Instant,
+    batch_output: bool,
     output: VecDeque<Response>,
     pending: VecDeque<Request>,
     detached: VecDeque<ConnectionId>,
@@ -456,6 +457,11 @@ impl Owner {
         }
         // UpstreamCubic keeps RFC 9937 accounting and exit cwnd.
         config.connection.prr_pacing = prr_pacing;
+        config.connection.output_push_batch_segments = if profile == Profile::UpstreamCubic {
+            2
+        } else {
+            0
+        };
         config.connection.tlp = upstream;
         if upstream {
             // Explicit Linux timing compatibility; the core keeps RFC 6298's
@@ -491,6 +497,7 @@ impl Owner {
             next_port: 40000,
             local,
             epoch: Instant::now(),
+            batch_output: profile == Profile::UpstreamCubic,
             output: VecDeque::new(),
             pending: VecDeque::new(),
             detached: VecDeque::new(),
@@ -551,12 +558,17 @@ impl Owner {
                     *slot = Some((request, early));
                 }
             }
+            // One logical transmit turn shares a caller instant. Capture after
+            // retries, which may have advanced the endpoint clock. Host packet
+            // timestamps below still record each actual output separately.
+            let transmit_now = self.batch_output.then(|| self.now());
             for _ in 0..BUDGET {
                 if self.output.len() == LIMIT || !self.endpoint.has_pending_output() {
                     break;
                 }
                 let mut buf = vec![0; BYTES - 20];
-                match self.endpoint.poll_transmit(self.now(), &mut buf, BUDGET) {
+                let now = transmit_now.unwrap_or_else(|| self.now());
+                match self.endpoint.poll_transmit(now, &mut buf, BUDGET) {
                     Ok(p) => {
                         if let Some(p) = p.packet {
                             let stamp = SystemTime::now()

@@ -1222,7 +1222,8 @@
         "reasons": [
           "UpstreamCubic disables PRR pacing only in this unpublished isolated-test profile to target same-time Linux aggregated bursts: a test-profile exception to RFC 9937 section 6.4 RECOMMENDED pacing. RFC 9937 delivery, credit and exit equations remain unchanged; the core default stays paced. The explicit 200 ms RTO floor and budgeted preallocation are unchanged.",
           "Pinned defaults.sh selects Linux CUBIC; UpstreamCubic selects actual ntcp CUBIC with beta=0.7 and NewReno recovery. Packet/cwnd/ssthresh expectations remain unchanged and mismatches remain behavioral failures.",
-          "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced."
+          "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
+          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -1236,7 +1237,8 @@
           "preallocate_connections": 1,
           "receive_capacity": 8388608,
           "ecn": false,
-          "congestion_control": "Cubic"
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
         },
         "claim": "Diagnostic CUBIC execution with RFC 9937 PRR equations and a test-only pacing exception; full Linux recovery equivalence and conformance are not claimed."
       }
@@ -1258,7 +1260,8 @@
         "reasons": [
           "UpstreamCubic disables PRR pacing only in this unpublished isolated-test profile to target same-time Linux aggregated bursts: a test-profile exception to RFC 9937 section 6.4 RECOMMENDED pacing. RFC 9937 delivery, credit and exit equations remain unchanged; the core default stays paced. The explicit 200 ms RTO floor and budgeted preallocation are unchanged.",
           "Pinned defaults.sh selects Linux CUBIC; UpstreamCubic selects actual ntcp CUBIC with beta=0.7 and NewReno recovery. Packet/cwnd/ssthresh expectations remain unchanged and mismatches remain behavioral failures.",
-          "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced."
+          "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
+          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -1272,7 +1275,8 @@
           "preallocate_connections": 1,
           "receive_capacity": 8388608,
           "ecn": false,
-          "congestion_control": "Cubic"
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
         },
         "claim": "Diagnostic CUBIC execution with RFC 9937 PRR equations and a test-only pacing exception; full Linux recovery equivalence and conformance are not claimed."
       }
@@ -1294,7 +1298,8 @@
         "reasons": [
           "UpstreamCubic disables PRR pacing only in this unpublished isolated-test profile to target same-time Linux aggregated bursts: a test-profile exception to RFC 9937 section 6.4 RECOMMENDED pacing. RFC 9937 delivery, credit and exit equations remain unchanged; the core default stays paced. The explicit 200 ms RTO floor and budgeted preallocation are unchanged.",
           "Pinned defaults.sh selects Linux CUBIC; UpstreamCubic selects actual ntcp CUBIC with beta=0.7 and NewReno recovery. Packet/cwnd/ssthresh expectations remain unchanged and mismatches remain behavioral failures.",
-          "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced."
+          "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
+          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -1308,7 +1313,8 @@
           "preallocate_connections": 1,
           "receive_capacity": 8388608,
           "ecn": false,
-          "congestion_control": "Cubic"
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
         },
         "claim": "Diagnostic CUBIC execution with RFC 9937 PRR equations and a test-only pacing exception; full Linux recovery equivalence and conformance are not claimed."
       }
@@ -1330,7 +1336,8 @@
         "reasons": [
           "UpstreamCubic disables PRR pacing only in this unpublished isolated-test profile to target same-time Linux aggregated bursts: a test-profile exception to RFC 9937 section 6.4 RECOMMENDED pacing. RFC 9937 delivery, credit and exit equations remain unchanged; the core default stays paced. The explicit 200 ms RTO floor and budgeted preallocation are unchanged.",
           "Pinned defaults.sh selects Linux CUBIC; UpstreamCubic selects actual ntcp CUBIC with beta=0.7 and NewReno recovery. Packet/cwnd/ssthresh expectations remain unchanged and mismatches remain behavioral failures.",
-          "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced."
+          "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
+          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -1344,7 +1351,8 @@
           "preallocate_connections": 1,
           "receive_capacity": 8388608,
           "ecn": false,
-          "congestion_control": "Cubic"
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
         },
         "claim": "Diagnostic CUBIC execution with RFC 9937 PRR equations and a test-only pacing exception; full Linux recovery equivalence and conformance are not claimed."
       }

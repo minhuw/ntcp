@@ -416,6 +416,7 @@ class AdaptationChecks(unittest.TestCase):
                 'rack': True, 'prr': 'Rfc9937', 'prr_pacing': False, 'tlp': True,
                 'rto_min_us': 200000, 'preallocate_connections': 1,
                 'receive_capacity': 8388608, 'ecn': False, 'congestion_control': 'Cubic',
+                'output_push_batch_segments': 2,
             })
             self.assertIn('full Linux recovery equivalence and conformance are not claimed',
                           entry['mapping']['claim'])
