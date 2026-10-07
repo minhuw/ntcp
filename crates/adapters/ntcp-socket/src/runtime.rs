@@ -1166,6 +1166,22 @@ mod tests {
 
     #[test]
     fn startup_failure_joins_before_closing_wake() {
+        // The post-close fd-number assertion needs its own process: parallel
+        // tests may legitimately allocate the just-closed number immediately.
+        const CHILD: &str = "NTCP_TEST_STARTUP_CLOSE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::tests::startup_failure_joins_before_closing_wake",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
         let wake = unsafe { syscall(SYS_eventfd2, 0, EFD_NONBLOCK | EFD_CLOEXEC) as i32 };
         assert!(wake >= 0);
         let (tx, rx) = mpsc::sync_channel(0);
