@@ -23,6 +23,9 @@ pub enum Op {
     Accept(i32),
     Connect(SocketAddr),
     Read(usize),
+    Peek(usize),
+    SetTimeout(bool, u64),
+    GetTimeout(bool),
     Write(Vec<u8>),
     Close,
     Shutdown(i32),
@@ -36,6 +39,7 @@ pub enum Op {
 #[derive(Default, Debug)]
 pub struct Reply {
     pub value: i32,
+    pub timeout_us: u64,
     pub bytes: Vec<u8>,
     pub addr: Option<SocketAddr>,
 }
@@ -159,6 +163,8 @@ struct Socket {
     acceptable: bool,
     write_shutdown: bool,
     read_shutdown: bool,
+    receive_timeout_us: u64,
+    send_timeout_us: u64,
 }
 impl Socket {
     fn new(flags: i32) -> Self {
@@ -177,6 +183,8 @@ impl Socket {
             acceptable: false,
             write_shutdown: false,
             read_shutdown: false,
+            receive_timeout_us: 0,
+            send_timeout_us: 0,
         }
     }
     fn keepalive_config(&self) -> Option<ntcp::KeepaliveConfig> {
@@ -548,6 +556,8 @@ impl Owner {
                 child.idle = s.idle;
                 child.interval = s.interval;
                 child.probes = s.probes;
+                child.receive_timeout_us = s.receive_timeout_us;
+                child.send_timeout_us = s.send_timeout_us;
                 let accepted = self.endpoint.accept(listener);
                 if matches!(accepted, Err(EndpointError::Connection(Error::WouldBlock))) {
                     self.sockets.get_mut(&id).unwrap().acceptable = false;
@@ -618,7 +628,8 @@ impl Owner {
                 s.local = Some(local);
                 return Err(EINPROGRESS);
             }
-            Op::Read(capacity) => {
+            Op::Read(capacity) | Op::Peek(capacity) => {
+                let peek = matches!(op, Op::Peek(_));
                 let Handle::Connection(cid) = s.handle else {
                     return Err(ENOTCONN);
                 };
@@ -640,7 +651,11 @@ impl Owner {
                     return Err(e);
                 }
                 out.bytes.resize(capacity.min(BYTES), 0);
-                let n = if terminal {
+                let n = if peek && terminal {
+                    self.endpoint.peek_terminal(cid, &mut out.bytes)
+                } else if peek {
+                    self.endpoint.peek(cid, &mut out.bytes)
+                } else if terminal {
                     self.endpoint.read_terminal(cid, &mut out.bytes)
                 } else {
                     self.endpoint.read(cid, &mut out.bytes)
@@ -733,6 +748,21 @@ impl Owner {
                     }
                     _ => return Err(EOPNOTSUPP),
                 }
+            }
+            Op::SetTimeout(send, micros) => {
+                let s = self.sockets.get_mut(&id).unwrap();
+                if send {
+                    s.send_timeout_us = micros;
+                } else {
+                    s.receive_timeout_us = micros;
+                }
+            }
+            Op::GetTimeout(send) => {
+                out.timeout_us = if send {
+                    s.send_timeout_us
+                } else {
+                    s.receive_timeout_us
+                };
             }
             Op::Set(level, name, value) => {
                 let mut candidate = s.clone();
@@ -922,6 +952,48 @@ mod tests {
         let server = b.execute(listen, Op::Accept(SOCK_NONBLOCK)).unwrap().value as u64;
         (a, b, client, server, listen)
     }
+    #[test]
+    fn peek_dispatch_and_timeout_inheritance() {
+        let (mut a, mut b, client, server, listen) = pair();
+        assert_eq!(b.execute(server, Op::Peek(8)).unwrap_err(), EAGAIN);
+        a.execute(client, Op::Write(b"abcdef".to_vec())).unwrap();
+        pump(&mut a, &mut b);
+        let Handle::Connection(cid) = b.sockets[&server].handle else {
+            panic!()
+        };
+        let before = b.endpoint.transport_info(cid).unwrap();
+        for _ in 0..2 {
+            assert_eq!(b.execute(server, Op::Peek(3)).unwrap().bytes, b"abc");
+            assert_eq!(
+                b.endpoint.transport_info(cid).unwrap().receive_used,
+                before.receive_used
+            );
+        }
+        assert_eq!(b.execute(server, Op::Read(8)).unwrap().bytes, b"abcdef");
+        b.execute(listen, Op::SetTimeout(false, 123456)).unwrap();
+        b.execute(listen, Op::SetTimeout(true, u64::MAX)).unwrap();
+        let next = new(&mut a, SOCK_NONBLOCK);
+        assert_eq!(
+            a.execute(next, Op::Connect("10.73.0.3:16379".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        pump(&mut a, &mut b);
+        let child = b.execute(listen, Op::Accept(0)).unwrap().value as u64;
+        assert_eq!(
+            b.execute(child, Op::GetTimeout(false)).unwrap().timeout_us,
+            123456
+        );
+        assert_eq!(
+            b.execute(child, Op::GetTimeout(true)).unwrap().timeout_us,
+            u64::MAX
+        );
+        assert_eq!(
+            b.execute(child, Op::Flags(F_GETFL, 0)).unwrap().value & O_NONBLOCK,
+            0
+        );
+    }
+
     #[test]
     fn dispatch_stream_readiness_eof_and_listener_drain() {
         let (mut a, mut b, client, server, listen) = pair();

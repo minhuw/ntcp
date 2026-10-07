@@ -279,6 +279,7 @@ fn read_into(
     flags: i32,
     output: impl FnOnce(&[u8]) -> Result<()>,
 ) -> Result<i64> {
+    let deadline = Deadline::socket(id, false, flags & MSG_DONTWAIT != 0)?;
     let input = TOKENS
         .lock()
         .map_err(|_| EIO)?
@@ -295,7 +296,7 @@ fn read_into(
                 if flags & MSG_DONTWAIT != 0 || !blocking(id)? {
                     return Err(EAGAIN);
                 }
-                wait(id, EPOLLIN)?;
+                wait_until(id, EPOLLIN, &deadline)?;
                 std::thread::yield_now();
             }
         }
@@ -305,19 +306,33 @@ fn read_into(
         output(&[])?;
         return Ok(0);
     }
+    if flags & MSG_PEEK != 0 && bytes.is_empty() {
+        let reply = retry_until(
+            id,
+            Op::Peek(n.min(runtime::BYTES)),
+            flags & MSG_DONTWAIT != 0,
+            EPOLLIN,
+            &deadline,
+        )?;
+        output(&reply.bytes)?;
+        return Ok(reply.bytes.len() as i64);
+    }
     if bytes.is_empty() {
-        *bytes = retry(
+        *bytes = retry_until(
             id,
             Op::Read(n.min(runtime::BYTES)),
             flags & MSG_DONTWAIT != 0,
             EPOLLIN,
+            &deadline,
         )?
         .bytes;
         input.ready.store(bytes.len(), Ordering::Release);
     }
     let n = n.min(bytes.len());
     output(&bytes[..n])?;
-    bytes.drain(..n);
+    if flags & MSG_PEEK == 0 {
+        bytes.drain(..n);
+    }
     input.ready.store(bytes.len(), Ordering::Release);
     Ok(n as i64)
 }
@@ -375,8 +390,41 @@ fn install(fd: i32, mut t: Token, id: u64) -> Result<i64> {
 fn blocking(id: u64) -> Result<bool> {
     Ok(call(id, Op::Flags(F_GETFL, 0))?.value & O_NONBLOCK == 0)
 }
-fn wait(id: u64, events: i32) -> Result<()> {
+// Use an elapsed budget rather than Instant + duration: every finite u64
+// microsecond timeout remains representable, even beyond Instant's range.
+struct Deadline {
+    start: std::time::Instant,
+    budget: Option<std::time::Duration>,
+}
+impl Deadline {
+    fn socket(id: u64, send: bool, dontwait: bool) -> Result<Self> {
+        let start = std::time::Instant::now();
+        let micros = if dontwait {
+            0
+        } else {
+            call(id, Op::GetTimeout(send))?.timeout_us
+        };
+        Ok(Self {
+            start,
+            budget: (micros != 0).then(|| std::time::Duration::from_micros(micros)),
+        })
+    }
+    fn poll_ms(&self) -> Result<i32> {
+        match self.budget {
+            None => Ok(10),
+            Some(budget) => {
+                let left = budget.checked_sub(self.start.elapsed()).ok_or(EAGAIN)?;
+                if left.is_zero() {
+                    return Err(EAGAIN);
+                }
+                Ok(left.as_millis().saturating_add(1).min(10) as i32)
+            }
+        }
+    }
+}
+fn wait_until(id: u64, events: i32, deadline: &Deadline) -> Result<()> {
     loop {
+        let ms = deadline.poll_ms()?;
         if call(id, Op::Ready)?.value & (events | EPOLLERR | EPOLLHUP) != 0 {
             return Ok(());
         }
@@ -385,7 +433,7 @@ fn wait(id: u64, events: i32) -> Result<()> {
             events: POLLIN,
             revents: 0,
         };
-        raw(unsafe { syscall(SYS_poll, &mut p, 1, 10) })?;
+        raw(unsafe { syscall(SYS_poll, &mut p, 1, ms) })?;
         drain_wake();
     }
 }
@@ -398,9 +446,13 @@ fn drain_wake() {
     }
 }
 fn retry(id: u64, op: Op, dontwait: bool, events: i32) -> Result<Reply> {
+    let deadline = Deadline::socket(id, events == EPOLLOUT, dontwait)?;
+    retry_until(id, op, dontwait, events, &deadline)
+}
+fn retry_until(id: u64, op: Op, dontwait: bool, events: i32, deadline: &Deadline) -> Result<Reply> {
     loop {
         match call(id, op.clone()) {
-            Err(EAGAIN) if !dontwait && blocking(id)? => wait(id, events)?,
+            Err(EAGAIN) if !dontwait && blocking(id)? => wait_until(id, events, deadline)?,
             r => return r,
         }
     }
@@ -552,9 +604,11 @@ pub unsafe extern "C" fn connect(fd: i32, p: *const sockaddr, len: socklen_t) ->
         let Some(id) = owned(fd)? else {
             return raw(unsafe { syscall(SYS_connect, fd, p, len) });
         };
+        let deadline = Deadline::socket(id, true, false)?;
         match call(id, Op::Connect(unsafe { address(p, len)? })) {
             Err(EINPROGRESS) if blocking(id)? => {
-                wait(id, EPOLLOUT)?;
+                wait_until(id, EPOLLOUT, &deadline)
+                    .map_err(|e| if e == EAGAIN { EINPROGRESS } else { e })?;
                 let e = call(id, Op::Get(SOL_SOCKET, SO_ERROR))?.value;
                 if e != 0 { Err(e) } else { Ok(0) }
             }
@@ -657,7 +711,7 @@ unsafe fn transfer(fd: i32, p: *mut c_void, n: usize, flags: i32, write: bool) -
             }
         });
     };
-    if flags & !(MSG_DONTWAIT | if write { MSG_NOSIGNAL } else { 0 }) != 0 {
+    if flags & !(MSG_DONTWAIT | if write { MSG_NOSIGNAL } else { MSG_PEEK }) != 0 {
         return Err(EOPNOTSUPP);
     }
     if n != 0 && p.is_null() {
@@ -817,7 +871,7 @@ unsafe fn vectors_output(
     if write {
         return unsafe { transfer(fd, bytes.as_mut_ptr().cast(), bytes.len(), flags, true) };
     }
-    if flags & !MSG_DONTWAIT != 0 {
+    if flags & !(MSG_DONTWAIT | MSG_PEEK) != 0 {
         return Err(EOPNOTSUPP);
     }
     let id = owned(fd)?.ok_or(EBADF)?;
@@ -933,7 +987,7 @@ pub unsafe extern "C" fn recvfrom(
         if !addr.is_null() && len.is_null() {
             return Err(EFAULT);
         }
-        if flags & !MSG_DONTWAIT != 0 {
+        if flags & !(MSG_DONTWAIT | MSG_PEEK) != 0 {
             return Err(EOPNOTSUPP);
         }
         if n > isize::MAX as usize {
@@ -950,6 +1004,32 @@ pub unsafe extern "C" fn recvfrom(
         })
     }) as ssize_t
 }
+// Linux old timeval and new __kernel_sock_timeval are both two signed
+// 64-bit fields on the supported x86_64/aarch64 ABIs.
+fn timeout_option(level: i32, name: i32) -> Option<bool> {
+    if level != SOL_SOCKET {
+        return None;
+    }
+    match name {
+        SO_RCVTIMEO | 66 => Some(false),
+        SO_SNDTIMEO | 67 => Some(true),
+        _ => None,
+    }
+}
+fn timeout_micros(value: [i64; 2]) -> Result<u64> {
+    let [seconds, micros] = value;
+    if !(0..1_000_000).contains(&micros) {
+        return Err(EDOM);
+    }
+    if seconds < 0 {
+        return Ok(0);
+    }
+    // Explicit precision policy: exact microseconds, not host jiffy rounding.
+    (seconds as u64)
+        .checked_mul(1_000_000)
+        .and_then(|n| n.checked_add(micros as u64))
+        .ok_or(EINVAL)
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn setsockopt(
     fd: i32,
@@ -964,6 +1044,14 @@ pub unsafe extern "C" fn setsockopt(
         };
         if p.is_null() {
             return Err(EFAULT);
+        }
+        if let Some(send) = timeout_option(level, name) {
+            if len < 16 {
+                return Err(EINVAL);
+            }
+            let micros = timeout_micros(load(p.cast::<[i64; 2]>())?)?;
+            call(id, Op::SetTimeout(send, micros))?;
+            return Ok(0);
         }
         if len < 4 {
             return Err(EINVAL);
@@ -987,6 +1075,14 @@ pub unsafe extern "C" fn getsockopt(
         };
         if p.is_null() || len.is_null() {
             return Err(EFAULT);
+        }
+        if let Some(send) = timeout_option(level, name) {
+            let micros = call(id, Op::GetTimeout(send))?.timeout_us;
+            let value = [(micros / 1_000_000) as i64, (micros % 1_000_000) as i64];
+            let n = (load(len)? as usize).min(16);
+            memory(value.as_ptr().cast_mut().cast(), p.cast(), n, true)?;
+            store(len, &(n as u32))?;
+            return Ok(0);
         }
         let value = call(id, Op::Get(level, name))?.value.to_ne_bytes();
         let n = (load(len)? as usize).min(4);
@@ -1359,6 +1455,77 @@ mod tests {
             close(pipes[1]);
         }
     }
+    #[test]
+    fn timeout_validation_and_absolute_budget() {
+        assert_eq!(timeout_micros([0, 1]), Ok(1));
+        assert_eq!(timeout_micros([-1, 0]), Ok(0));
+        assert_eq!(timeout_micros([1, -1]), Err(EDOM));
+        assert_eq!(timeout_micros([1, 1_000_000]), Err(EDOM));
+        assert_eq!(timeout_micros([i64::MAX, 0]), Err(EINVAL));
+        let mut deadline = Deadline {
+            start: std::time::Instant::now(),
+            budget: Some(std::time::Duration::from_micros(u64::MAX)),
+        };
+        assert_eq!(deadline.poll_ms(), Ok(10));
+        deadline.budget = Some(std::time::Duration::from_millis(30));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(deadline.poll_ms(), Err(EAGAIN));
+        assert_eq!(deadline.poll_ms(), Err(EAGAIN));
+    }
+
+    #[test]
+    fn staged_peek_fault_rollback_and_shared_input() {
+        let (fd, t) = token(SOCK_CLOEXEC).unwrap();
+        let input = t.input.clone();
+        *input.bytes.lock().unwrap() = b"abcdef".to_vec();
+        input.ready.store(6, Ordering::Release);
+        install(fd, t, 995).unwrap();
+        let (alias, mut t) = token(SOCK_CLOEXEC).unwrap();
+        t.input = input.clone();
+        install(alias, t, 995).unwrap();
+        let mut out = [0u8; 8];
+        for descriptor in [fd, alias] {
+            assert_eq!(
+                unsafe {
+                    recv(
+                        descriptor,
+                        out.as_mut_ptr().cast(),
+                        6,
+                        MSG_PEEK | MSG_DONTWAIT,
+                    )
+                },
+                6
+            );
+            assert_eq!(&out[..6], b"abcdef");
+        }
+        assert_eq!(
+            read_into(fd, 995, 3, MSG_DONTWAIT, |_| Err(EFAULT)),
+            Err(EFAULT)
+        );
+        assert_eq!(input.ready.load(Ordering::Acquire), 6);
+        assert_eq!(
+            unsafe { recv(alias, out.as_mut_ptr().cast(), 3, MSG_DONTWAIT) },
+            3
+        );
+        assert_eq!(&out[..3], b"abc");
+        assert_eq!(
+            unsafe { recv(fd, out.as_mut_ptr().cast(), 3, MSG_PEEK | MSG_DONTWAIT) },
+            3
+        );
+        assert_eq!(&out[..3], b"def");
+        assert_eq!(
+            unsafe { recv(fd, out.as_mut_ptr().cast(), 3, MSG_DONTWAIT) },
+            3
+        );
+        assert_eq!(input.ready.load(Ordering::Acquire), 0);
+        for descriptor in [fd, alias] {
+            TOKENS.lock().unwrap().remove(&descriptor);
+            unsafe {
+                syscall(SYS_close, descriptor);
+            }
+        }
+    }
+
     #[test]
     fn nonblocking_read_does_not_wait_for_another_reader() {
         let (fd, t) = token(SOCK_CLOEXEC).unwrap();

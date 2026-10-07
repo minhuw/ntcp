@@ -600,6 +600,17 @@ impl ReceiveBuffer {
         }
     }
 
+    pub(crate) fn peek(&self, out: &mut [u8]) -> usize {
+        let count = out.len().min(self.contiguous_len);
+        for (offset, dst) in out[..count].iter_mut().enumerate() {
+            let index = self.index(offset);
+            assert!(self.is_present(index));
+            // Presence guarantees an initialized payload byte.
+            *dst = unsafe { self.data[index].assume_init() };
+        }
+        count
+    }
+
     pub(crate) fn read(&mut self, out: &mut [u8]) -> usize {
         let count = out.len().min(self.contiguous_len);
         for (offset, dst) in out[..count].iter_mut().enumerate() {
@@ -1562,6 +1573,25 @@ mod tests {
             assert_eq!(&out[..capacity - 1], &payload[..capacity - 1]);
             assert!(recv.metadata.iter().all(|&byte| byte == 0));
         }
+    }
+
+    #[test]
+    fn peek_preserves_credit_frontiers_metadata_and_wraparound() {
+        let mut recv = ReceiveBuffer::new(Seq(100), 8).unwrap();
+        recv.insert(Seq(100), b"abcdef", false);
+        assert_eq!(recv.read(&mut [0; 5]), 5);
+        recv.insert(Seq(106), b"ghij", false);
+        recv.insert(Seq(112), b"z", false); // Out-of-order byte is not readable.
+        let before = alloc::format!("{recv:?}");
+        let mut out = [0; 16];
+        for _ in 0..2 {
+            assert_eq!(recv.peek(&mut out), 5);
+            assert_eq!(&out[..5], b"fghij");
+            assert_eq!(alloc::format!("{recv:?}"), before);
+        }
+        assert_eq!(recv.read(&mut out), 5);
+        assert_eq!(&out[..5], b"fghij");
+        assert_eq!(recv.peek(&mut out), 0);
     }
 
     #[test]

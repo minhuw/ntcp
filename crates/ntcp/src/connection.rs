@@ -1334,6 +1334,17 @@ impl Connection {
         }
     }
 
+    pub(crate) fn peek_terminal(&self, out: &mut [u8]) -> Result<usize, Error> {
+        if self.state != State::Closed {
+            return Err(Error::InvalidState);
+        }
+        Ok(if self.terminal_readable_bytes() != 0 {
+            self.receive.peek(out)
+        } else {
+            0
+        })
+    }
+
     pub(crate) fn read_terminal(&mut self, out: &mut [u8]) -> Result<usize, Error> {
         if self.state != State::Closed {
             return Err(Error::InvalidState);
@@ -2265,6 +2276,26 @@ impl Connection {
     //# clear the data is valid (e.g., the data is buffered at the receiver until the connection
     //# reaches the ESTABLISHED state, given that the three-way handshake reduces the
     //# possibility of false connections).
+    pub(crate) fn peek(&self, out: &mut [u8]) -> Result<usize, Error> {
+        if self.read_closed
+            || self.state == State::Closed
+                && (self.reason != Some(CloseReason::Normal) || !self.receive.eof())
+        {
+            return Err(Error::InvalidState);
+        }
+        if out.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+        if self.handshake_pending() {
+            return Err(Error::WouldBlock);
+        }
+        let count = self.receive.peek(out);
+        if count == 0 && !self.receive.eof() {
+            return Err(Error::WouldBlock);
+        }
+        Ok(count)
+    }
+
     pub(crate) fn read(&mut self, out: &mut [u8]) -> Result<usize, Error> {
         if self.read_closed {
             return Err(Error::InvalidState);
@@ -16332,12 +16363,14 @@ mod tests {
         uncompleted.abort();
         assert_eq!(uncompleted.receive.readable(), 3);
         assert_eq!(uncompleted.terminal_readable_bytes(), 0);
+        assert_eq!(uncompleted.peek_terminal(&mut [0; 8]), Ok(0));
         assert_eq!(uncompleted.read_terminal(&mut [0; 8]), Ok(0));
         assert_eq!(uncompleted.receive_used, 3);
         let mut b = Connection::passive(reverse(tuple()), config(64, 8), 900, 0, &syn).unwrap();
         assert_eq!(b.receive.next(), Seq(2));
         assert!(!b.events_pending());
         assert_eq!(b.read(&mut [0; 8]), Err(Error::WouldBlock));
+        assert_eq!(b.peek(&mut [0; 8]), Err(Error::WouldBlock));
         assert_eq!(b.urgent_remaining(), 0);
         let synack_bytes = packet(&mut b, 10);
         let synack = wire::parse(ip(reverse(tuple())), &synack_bytes).unwrap();
@@ -16358,6 +16391,29 @@ mod tests {
     }
 
     #[test]
+    fn peek_does_not_release_credit_or_schedule_ack_and_respects_shutdown() {
+        let (mut a, mut b) = pair(config(64, 8), 100);
+        a.write(b"abc").unwrap();
+        deliver(&mut a, &mut b, 40);
+        let used = b.receive_used;
+        let read = b.received_read;
+        let edge = b.receive.right_edge();
+        let ack = b.ack_pending;
+        let mut out = [0; 8];
+        for _ in 0..2 {
+            assert_eq!(b.peek(&mut out), Ok(3));
+            assert_eq!(&out[..3], b"abc");
+            assert_eq!(b.receive_used, used);
+            assert_eq!(b.received_read, read);
+            assert_eq!(b.receive.right_edge(), edge);
+            assert_eq!(b.ack_pending, ack);
+        }
+        assert_eq!(b.read(&mut out), Ok(3));
+        b.read_closed = true;
+        assert_eq!(b.peek(&mut out), Err(Error::InvalidState));
+    }
+
+    #[test]
     fn terminal_drain_preserves_read_contract_and_excludes_out_of_order_data() {
         let (mut a, mut b) = pair(config(64, 8), 100);
         assert_eq!(b.read_terminal(&mut [0; 8]), Err(Error::InvalidState));
@@ -16374,6 +16430,13 @@ mod tests {
         assert_eq!(b.terminal_readable_bytes(), 3);
         let read_before = b.received_read;
         let mut out = [0; 8];
+        for _ in 0..2 {
+            assert_eq!(b.peek_terminal(&mut out), Ok(3));
+            assert_eq!(&out[..3], b"abc");
+            assert_eq!(b.receive_used, 6);
+            assert_eq!(b.received_read, read_before);
+            assert!(!b.ack_pending);
+        }
         assert_eq!(b.read_terminal(&mut out[..1]), Ok(1));
         assert_eq!(&out[..1], b"a");
         assert_eq!(b.terminal_readable_bytes(), 2);

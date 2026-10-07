@@ -1535,6 +1535,15 @@ impl Endpoint {
         self.refresh(id.slot);
         Ok(count)
     }
+    // Inspect accepted contiguous bytes without consuming receive credit or
+    // scheduling output. Terminal eligibility matches read_terminal.
+    pub fn peek(&self, id: ConnectionId, out: &mut [u8]) -> Result<usize, EndpointError> {
+        Ok(self.slot(id)?.connection.peek(out)?)
+    }
+    pub fn peek_terminal(&self, id: ConnectionId, out: &mut [u8]) -> Result<usize, EndpointError> {
+        Ok(self.slot(id)?.connection.peek_terminal(out)?)
+    }
+
     pub fn read(&mut self, id: ConnectionId, out: &mut [u8]) -> Result<usize, EndpointError> {
         let count = self.slot_mut(id)?.connection.read(out)?;
         self.refresh(id.slot);
