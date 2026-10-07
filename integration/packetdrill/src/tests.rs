@@ -2095,3 +2095,199 @@ fn transport_encoding_counts_recovery_and_invalid_ledger() {
     assert!(transport_option(info, 2).unwrap().is_empty());
     assert_eq!(transport_option(info, 3).unwrap().len(), 36);
 }
+
+fn shutdown_data(owner: &mut Owner, tx: ntcp::Transmit, syn: ntcp::wire::Header, seq: u32) {
+    let (ip, mut header) = reverse_ack(tx, syn, syn.sequence.wrapping_add(1));
+    header.sequence = seq;
+    let mut tcp = [0; 64];
+    let len = ntcp::wire::encode(ip, header, &[], b"data", &mut tcp).unwrap();
+    owner.endpoint.input(owner.now(), ip, &tcp[..len]).unwrap();
+    owner.events();
+}
+
+fn shutdown_poll(fd: i32) -> Request {
+    let p = pollfd {
+        fd,
+        events: POLLIN | POLLOUT,
+        revents: 0,
+    };
+    let bytes = unsafe {
+        slice::from_raw_parts((&p as *const pollfd).cast(), std::mem::size_of::<pollfd>())
+    }
+    .to_vec();
+    request(13, 0, 0, bytes, std::mem::size_of::<pollfd>()).0
+}
+
+#[test]
+fn shutdown_modes_drain_queue_repeat_and_preserve_single_fin() {
+    for how in [SHUT_RD, SHUT_WR, SHUT_RDWR] {
+        let mut owner = Owner::new((local(), Profile::Sack)).unwrap();
+        let (fd, id, tx, syn) = active_ip_connection(&mut owner, 0, IP_PMTUDISC_WANT);
+        for invalid in [-1, 3, i32::MAX] {
+            assert_eq!(execute_value(&mut owner, 9, fd, invalid, 0), Err(EINVAL));
+            assert!(!owner.sockets[&fd].read_shutdown);
+            assert!(!owner.sockets[&fd].write_shutdown);
+            assert!(poll_frame(&mut owner).is_none());
+        }
+        shutdown_data(&mut owner, tx, syn, 101);
+        for _ in 0..3 {
+            assert_eq!(execute_value(&mut owner, 9, fd, how, 0), Ok(0));
+        }
+        assert_eq!(owner.sockets[&fd].read_shutdown, how != SHUT_WR);
+        assert_eq!(owner.sockets[&fd].write_shutdown, how != SHUT_RD);
+        assert_eq!(execute_value(&mut owner, 17, fd, 0, 0), Ok(4));
+        let (mut read, _) = request(6, fd, 0, vec![], 10);
+        assert_eq!(owner.execute(&mut read).unwrap().unwrap().bytes, b"data");
+        assert_eq!(execute_value(&mut owner, 17, fd, 0, 0), Ok(0));
+        if how == SHUT_WR {
+            assert_eq!(owner.execute(&mut read).err(), Some(EAGAIN));
+        } else {
+            assert_eq!(owner.execute(&mut read).unwrap().unwrap().value, 0);
+        }
+        let mut poll = shutdown_poll(fd);
+        let response = owner.execute(&mut poll).unwrap().unwrap();
+        let p = unsafe { ptr::read_unaligned(response.bytes.as_ptr().cast::<pollfd>()) };
+        assert_eq!(p.revents & POLLIN != 0, how != SHUT_WR);
+        assert_eq!(p.revents & POLLHUP != 0, how == SHUT_RDWR);
+        assert_ne!(p.revents & POLLOUT, 0);
+        let (mut write, _) = request(7, fd, 0, b"send".to_vec(), 0);
+        if how == SHUT_RD {
+            assert_eq!(owner.execute(&mut write).unwrap().unwrap().value, 4);
+            shutdown_data(&mut owner, tx, syn, 105);
+            assert_eq!(owner.execute(&mut read).unwrap().unwrap().bytes, b"data");
+            assert_eq!(owner.execute(&mut read).unwrap().unwrap().value, 0);
+            // Upgrade RD to RDWR; the write half shuts down exactly once.
+            assert_eq!(execute_value(&mut owner, 9, fd, SHUT_RDWR, 0), Ok(0));
+        } else {
+            assert_eq!(owner.execute(&mut write).err(), Some(EPIPE));
+        }
+        assert_eq!(execute_value(&mut owner, 9, fd, SHUT_RDWR, 0), Ok(0));
+        assert_eq!(execute_value(&mut owner, 8, fd, 0, 0), Ok(0));
+        let mut fins = 0;
+        while let Some((_, bytes)) = poll_frame(&mut owner) {
+            let h = packet_header(&bytes);
+            assert_eq!(h.flags & ntcp::wire::RST, 0);
+            fins += usize::from(h.flags & ntcp::wire::FIN != 0);
+        }
+        assert_eq!(
+            fins, 1,
+            "{how}: shutdown/repeat/close must queue only one FIN"
+        );
+        assert_eq!(owner.endpoint.state(id), Ok(State::FinWait1));
+    }
+    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    assert_eq!(execute_value(&mut owner, 9, -1, SHUT_RD, 0), Err(EBADF));
+    let fd = owner.alloc(Socket::new(0)).unwrap();
+    assert_eq!(execute_value(&mut owner, 9, fd, SHUT_RD, 0), Err(ENOTCONN));
+}
+
+#[test]
+fn shutdown_close_resets_unread_data_in_all_modes() {
+    for how in [SHUT_RD, SHUT_WR, SHUT_RDWR] {
+        let mut owner = Owner::new((local(), Profile::Sack)).unwrap();
+        let (fd, id, tx, syn) = active_ip_connection(&mut owner, 0, IP_PMTUDISC_WANT);
+        shutdown_data(&mut owner, tx, syn, 101);
+        execute_value(&mut owner, 9, fd, how, 0).unwrap();
+        execute_value(&mut owner, 8, fd, 0, 0).unwrap();
+        assert_eq!(
+            owner.endpoint.close_reason(id),
+            Ok(Some(CloseReason::Aborted))
+        );
+        let (_, bytes) = poll_frame(&mut owner).unwrap();
+        assert_ne!(packet_header(&bytes).flags & ntcp::wire::RST, 0);
+        assert!(poll_frame(&mut owner).is_none());
+    }
+}
+
+#[test]
+fn shutdown_completes_pending_reads_poll_and_blocked_writes() {
+    for how in [SHUT_RD, SHUT_WR, SHUT_RDWR] {
+        let (tx, rx) = mpsc::sync_channel(8);
+        let (ready, setup) = mpsc::sync_channel(1);
+        let join = thread::spawn(move || {
+            let mut owner = Owner::new((local(), Profile::Sack)).unwrap();
+            let (fd, id, _, _) = active_ip_connection(&mut owner, 0, IP_PMTUDISC_WANT);
+            owner.sockets.get_mut(&fd).unwrap().nonblock = false;
+            // Fill the real send queue so SEND, READ, and POLLIN all start blocked.
+            let capacity = owner.endpoint.transport_info(id).unwrap().send_capacity;
+            let (mut fill, _) = request(7, fd, 0, vec![0; capacity], 0);
+            assert_eq!(
+                owner.execute(&mut fill).unwrap().unwrap().value,
+                capacity as i64
+            );
+            let (mut send, sent) = request(7, fd, 0, b"x".to_vec(), 0);
+            let (mut read, received) = request(6, fd, 0, vec![], 10);
+            let (poll_reply, polled) = mpsc::sync_channel(1);
+            let mut poll = shutdown_poll(fd);
+            // Only POLLIN, infinite timeout.
+            let p = pollfd {
+                fd,
+                events: POLLIN,
+                revents: 0,
+            };
+            unsafe {
+                ptr::write_unaligned(poll.bytes.as_mut_ptr().cast::<pollfd>(), p);
+            }
+            poll.a = -1;
+            poll.reply = poll_reply;
+            for r in [&mut send, &mut read, &mut poll] {
+                assert!(!owner.retry(r));
+            }
+            owner.pending.extend([send, read, poll]);
+            ready.send((fd, sent, received, polled)).unwrap();
+            owner.run(rx, &AtomicBool::new(false));
+        });
+        let (fd, sent, received, polled) = setup.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (r, shutdown) = request(9, fd, how, vec![], 0);
+        tx.send(r).unwrap();
+        assert_eq!(
+            shutdown
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap()
+                .value,
+            0
+        );
+        if how != SHUT_WR {
+            assert_eq!(
+                received
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .unwrap()
+                    .value,
+                0
+            );
+            let result = polled
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            let p = unsafe { ptr::read_unaligned(result.bytes.as_ptr().cast::<pollfd>()) };
+            assert_ne!(p.revents & POLLIN, 0);
+        }
+        if how != SHUT_RD {
+            assert_eq!(
+                sent.recv_timeout(Duration::from_secs(3)).unwrap().err(),
+                Some(EPIPE)
+            );
+        }
+        // FIFO barrier confirms unchanged directions remain pending.
+        let (r, barrier) = request(17, fd, 0, vec![], 0);
+        tx.send(r).unwrap();
+        barrier
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        if how == SHUT_WR {
+            assert!(matches!(
+                received.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            assert!(matches!(polled.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+        if how == SHUT_RD {
+            assert!(matches!(sent.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+        drop(tx);
+        join.join().unwrap();
+    }
+}

@@ -139,7 +139,6 @@ static int ioctl_socket(void *u, int fd, unsigned long request, ...) {
 }
 static int close_socket(void *u, int fd) { return SIMPLE(8, fd, 0, 0); }
 static int shutdown_socket(void *u, int fd, int how) {
-    if (how != SHUT_WR) return unsupported("shutdown: only SHUT_WR");
     return SIMPLE(9, fd, how, 0);
 }
 static int setopt(void *u, int fd, int level, int name, const void *p, socklen_t n) {

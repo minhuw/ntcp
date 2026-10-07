@@ -132,6 +132,7 @@ struct Socket {
     error: i32,
     written: u64,
     write_shutdown: bool,
+    read_shutdown: bool,
     connected: bool,
 }
 impl Socket {
@@ -151,6 +152,7 @@ impl Socket {
             error: 0,
             written: 0,
             write_shutdown: false,
+            read_shutdown: false,
             connected: false,
         }
     }
@@ -826,6 +828,7 @@ impl Owner {
                         if r.op == 6 {
                             response.bytes.truncate(n);
                             socket.readable = if n == 0
+                                || socket.read_shutdown
                                 || matches!(
                                     self.endpoint.state(id),
                                     Ok(State::CloseWait
@@ -846,6 +849,13 @@ impl Owner {
                     }
                     Err(EndpointError::Connection(Error::WouldBlock)) => {
                         if r.op == 6 {
+                            // Linux still accepts and drains data after SHUT_RD;
+                            // only an empty receive queue becomes immediate EOF.
+                            if socket.read_shutdown {
+                                socket.readable = Some(true);
+                                response.bytes.clear();
+                                return Ok(Some(response));
+                            }
                             socket.readable = Some(false);
                         }
                         return self.block(r);
@@ -884,8 +894,18 @@ impl Owner {
             }
             9 => {
                 let id = self.connection(r.fd)?;
-                self.endpoint.shutdown(id).map_err(error)?;
-                self.sockets.get_mut(&r.fd).unwrap().write_shutdown = true;
+                if !(SHUT_RD..=SHUT_RDWR).contains(&r.a) {
+                    return Err(EINVAL);
+                }
+                let socket = self.sockets.get_mut(&r.fd).unwrap();
+                if r.a != SHUT_RD && !socket.write_shutdown {
+                    self.endpoint.shutdown(id).map_err(error)?;
+                }
+                socket.read_shutdown |= r.a != SHUT_WR;
+                socket.write_shutdown |= r.a != SHUT_RD;
+                if socket.read_shutdown {
+                    socket.readable = Some(true);
+                }
             }
             10 => {
                 let socket = self.sockets.get_mut(&r.fd).ok_or(EBADF)?;
@@ -1005,7 +1025,12 @@ impl Owner {
                                 if p.events & POLLIN != 0 {
                                     let ready = match s.handle {
                                         Handle::Connection(id) => Some(
-                                            self.endpoint.readable_bytes(id).map_err(error)? != 0
+                                            s.read_shutdown
+                                                || self
+                                                    .endpoint
+                                                    .readable_bytes(id)
+                                                    .map_err(error)?
+                                                    != 0
                                                 || matches!(
                                                     self.endpoint.state(id).map_err(error)?,
                                                     State::CloseWait
@@ -1051,6 +1076,7 @@ impl Owner {
                                     // HUP is unconditional when both socket directions are
                                     // shut, even while TCP retains its TIME-WAIT record.
                                     if state == State::Closed
+                                        || s.write_shutdown && s.read_shutdown
                                         || s.write_shutdown
                                             && matches!(
                                                 state,
