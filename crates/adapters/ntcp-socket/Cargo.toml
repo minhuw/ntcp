@@ -1,0 +1,18 @@
+[package]
+name = "ntcp-socket"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+libc = "0.2"
+ntcp = { path = "../../ntcp", version = "0.0.1" }
+ntcp-ip = { path = "../../ntcp-ip", version = "0.0.1" }
+ntcp-io = { path = "../../io/ntcp-io", version = "0.0.1" }
+ntcp-io-tun = { path = "../../io/ntcp-io-tun", version = "0.0.1" }
+
+[build-dependencies]
+cc = "1"
