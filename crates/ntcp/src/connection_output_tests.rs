@@ -875,3 +875,100 @@ fn pacing_no_sack_retries_with_default_policy() {
     assert_eq!(a.prr.unwrap().counters(), counters);
     assert!(prr_packet(&mut a, deadline).1 as u32 <= credit);
 }
+
+#[test]
+fn cubic_prr_safe_ack_known_loss_vs_new_tail_loss_wire() {
+    for iss in [0, u32::MAX - 4999] {
+        for ack_time in [28_000, 32_000] {
+            let cfg = ConnectionConfig {
+                sack: true,
+                rack: true,
+                prr: true,
+                prr_algorithm: PrrAlgorithm::Rfc9937,
+                congestion_algorithm: CongestionAlgorithm::Cubic,
+                initial_window: InitialWindow::Iw10,
+                ..config(65_536, 1000)
+            };
+            let mut b = Connection::active(reverse(tuple()), cfg.clone(), 900, 0).unwrap();
+            let syn = packet(&mut b, 0);
+            let syn = wire::parse(ip(reverse(tuple())), &syn).unwrap();
+            let mut a = Connection::passive(tuple(), cfg, iss, 0, &syn).unwrap();
+            let syn_ack = packet(&mut a, 0);
+            let syn_ack = wire::parse(ip(tuple()), &syn_ack).unwrap();
+            b.input(10_000, &syn_ack).unwrap();
+            deliver(&mut b, &mut a, 10_000);
+            let base = a.snd_una;
+            assert!(!a.config.prr_pacing);
+            a.write(&[0x55; 10_000]).unwrap();
+            assert_eq!(
+                outputs(&mut a, 10_000, base),
+                (0..10).map(|i| (i * 1000, 1000)).collect::<Vec<_>>()
+            );
+            for sacks in [&[(1000, 2000)][..], &[(1000, 3000)][..]] {
+                rack_sack(&mut a, 20_000, 0, sacks);
+                assert!(a.prr.is_none());
+                assert!(outputs(&mut a, 20_000, base).is_empty());
+            }
+            rack_sack(&mut a, 20_000, 0, &[(1000, 3000), (8000, 9000)]);
+            // Earlier ACKs' 2 MSS do not belong to this recovery episode.
+            assert_eq!(a.prr.unwrap().counters(), (8000, 1000, 0));
+            assert_eq!(a.congestion.ssthresh(), 7000);
+            assert_eq!(a.rack.counts().lost, 6);
+            assert_eq!(a.rack.pipe(), 1000); // Only the unsacked tail is in flight.
+            assert_eq!(outputs(&mut a, 20_000, base), vec![(0, 1000)]);
+            assert_eq!(a.rack.pipe(), 2000); // Tail plus committed head retry.
+            assert_eq!(
+                a.rack.lowest_lost(1000),
+                Some((base.wrapping_add(3000), base.wrapping_add(4000)))
+            );
+
+            // Partial cumulative ACK: 4000 deltaUNA - 2000 old SACK = 2000
+            // DeliveredData. Outstanding holes [4000,8000) were already lost.
+            rack_sack(&mut a, ack_time, 4000, &[(8000, 9000)]);
+            assert_eq!(a.snd_una, base.wrapping_add(4000));
+            assert!(!a.retx_pending);
+            assert_eq!(a.prr.unwrap().counters(), (8000, 3000, 1000));
+            let new_loss = ack_time == 32_000;
+            let credit = if new_loss { 2000 } else { 3000 };
+            assert_eq!(a.rack.counts().lost, if new_loss { 5 } else { 4 });
+            assert_eq!(a.rack.pipe(), if new_loss { 0 } else { 1000 });
+            assert_eq!(a.sack_recovery.unwrap().pipe, a.rack.pipe());
+            // At 32ms the 20ms head retry is unambiguous (12ms >= minRTT
+            // 10ms). RFC8985's timestamp ordering makes the 10ms tail eligible,
+            // despite its higher sequence number: 10 + 12 + 2.5 < 32ms.
+            // This is NEW loss, not the old pending holes. RFC9937 requires
+            // min(7000 - 0, max(3000 - 1000, 2000)) = 2000, without SafeACK.
+            // At 28ms the retry sample is ambiguous (8ms < minRTT); the tail
+            // remains in flight. With no new loss SafeACK adds one MSS:
+            // min(7000 - 1000, max(3000 - 1000, 2000) + 1000) = 3000.
+            assert_eq!(a.prr.unwrap().credit(), credit);
+            assert_eq!(a.congestion.cwnd(), a.rack.pipe() + credit);
+            let before = a.prr.unwrap();
+            assert_eq!(
+                a.transmit(ack_time, &mut [0; 20]),
+                Err(Error::OutputTooSmall)
+            );
+            assert_eq!(a.prr.unwrap().counters(), before.counters());
+            assert_eq!(a.prr.unwrap().credit(), credit);
+            assert_eq!(
+                outputs(&mut a, ack_time, base),
+                (0..credit / 1000)
+                    .map(|i| (4000 + i * 1000, 1000))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(a.prr.unwrap().credit(), 0);
+            // Repeating the same evidence has zero delivery, hence no credit.
+            let before = a.prr.unwrap().counters();
+            rack_sack(&mut a, ack_time, 4000, &[(8000, 9000)]);
+            assert_eq!(a.prr.unwrap().counters(), before);
+            assert_eq!(a.prr.unwrap().credit(), 0);
+            assert!(outputs(&mut a, ack_time, base).is_empty());
+            // Fresh SACK-only delivery earns one MSS, never the SafeACK bonus.
+            rack_sack(&mut a, ack_time, 4000, &[(8000, 10_000)]);
+            assert_eq!(a.prr.unwrap().counters(), (8000, 4000, before.2));
+            assert_eq!(a.prr.unwrap().credit(), 1000);
+            assert_eq!(outputs(&mut a, ack_time, base), vec![(4000 + credit, 1000)]);
+            assert_eq!(a.prr.unwrap().credit(), 0);
+        }
+    }
+}
