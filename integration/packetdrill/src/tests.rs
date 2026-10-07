@@ -2409,7 +2409,12 @@ fn receive_retry_fault_preserves_stream_and_short_copyout() {
 #[test]
 fn send_payload_faults_follow_owner_errors_and_shutdown() {
     // Both scalar and vector bridge requests converge on these source descriptors.
-    for sources in [vec![(1, 6)], vec![(0, 0), (1, 3), (1, 3)]] {
+    for sources in [
+        vec![(1, 6)],
+        vec![(0, 6)],
+        vec![(0, 0), (1, 3), (1, 3)],
+        vec![(0, 0), (0, 3), (0, 3)],
+    ] {
         let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
         let (fd, id, tx, syn) = active_ip_connection(&mut owner, 0, IP_PMTUDISC_WANT);
         let (mut send, _) = request(7, fd, 0, vec![], 0);
@@ -2471,6 +2476,11 @@ fn native_tcp_shutdown_precedes_inaccessible_send_payload() {
         let mut msg: msghdr = std::mem::zeroed();
         msg.msg_iov = &mut vector;
         msg.msg_iovlen = 1;
+        assert_eq!(sendmsg(stream.as_raw_fd(), &msg, MSG_NOSIGNAL), -1);
+        assert_eq!(*__errno_location(), EPIPE);
+        assert_eq!(send(stream.as_raw_fd(), ptr::null(), 6, MSG_NOSIGNAL), -1);
+        assert_eq!(*__errno_location(), EPIPE);
+        vector.iov_base = ptr::null_mut();
         assert_eq!(sendmsg(stream.as_raw_fd(), &msg, MSG_NOSIGNAL), -1);
         assert_eq!(*__errno_location(), EPIPE);
         assert_eq!(munmap(payload, 4096), 0);

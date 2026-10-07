@@ -71,7 +71,7 @@ static ssize_t vector(void *u, int fd, const struct iovec *v, int count, int wri
     if (memory(vectors, v, count * sizeof(*v), 0)) return -1;
     size_t total = 0;
     for (int i = 0; i < count; i++) {
-        if (vectors[i].iov_len && !vectors[i].iov_base) return bad(EFAULT);
+        if (!writing && vectors[i].iov_len && !vectors[i].iov_base) return bad(EFAULT);
         if (vectors[i].iov_len > 65535 - total) return bad(EMSGSIZE);
         total += vectors[i].iov_len;
     }
@@ -259,7 +259,7 @@ void ntcp_abi_check(void *u) {
     v.iov_base = &v; v.iov_len = 65536;
     assert(p.writev(u, -1, &v, 1) == -1 && errno == EMSGSIZE);
     assert(p.read(u, -1, NULL, 1) == -1 && errno == EFAULT);
-    assert(p.write(u, -1, NULL, 1) == -1 && errno == EFAULT);
+    assert(p.write(u, -1, NULL, 1) == -1 && errno == EBADF);
     assert(p.bind(u, -1, NULL, 0) == -1 && errno == EFAULT);
     assert(p.accept(u, -1, (struct sockaddr *)&v, NULL) == -1 && errno == EFAULT);
     assert(p.sendmsg(u, -1, NULL, 0) == -1 && errno == EFAULT);
@@ -423,6 +423,12 @@ void ntcp_abi_send_error_check(void *u, int fd, int first_error) {
     assert(p.write(u, fd, payload, 6) == -1 && errno == first_error);
     assert(p.send(u, fd, payload, 6, MSG_NOSIGNAL) == -1 && errno == EPIPE);
     assert(p.sendto(u, fd, payload, 6, 0, NULL, 0) == -1 && errno == EPIPE);
+    assert(p.writev(u, fd, &v, 1) == -1 && errno == EPIPE);
+    assert(p.sendmsg(u, fd, &msg, MSG_NOSIGNAL) == -1 && errno == EPIPE);
+    v.iov_base = NULL;
+    assert(p.write(u, fd, NULL, 6) == -1 && errno == EPIPE);
+    assert(p.send(u, fd, NULL, 6, MSG_NOSIGNAL) == -1 && errno == EPIPE);
+    assert(p.sendto(u, fd, NULL, 6, 0, NULL, 0) == -1 && errno == EPIPE);
     assert(p.writev(u, fd, &v, 1) == -1 && errno == EPIPE);
     assert(p.sendmsg(u, fd, &msg, MSG_NOSIGNAL) == -1 && errno == EPIPE);
     assert(munmap(payload, page) == 0);

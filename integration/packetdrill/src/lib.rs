@@ -1587,7 +1587,7 @@ unsafe fn call_inner(
         if input_len > BYTES || (matches!(op, 6 | 20 | 21) && output_len > BYTES) {
             return Err(unsupported("scalar I/O exceeds 65535-byte adapter bound"));
         }
-        if input_len != 0 && input.is_null()
+        if op != 7 && input_len != 0 && input.is_null()
             || !matches!(op, 20 | 21) && output_len != 0 && output.is_null()
         {
             return Err(EFAULT);
@@ -1618,7 +1618,7 @@ unsafe fn call_inner(
                     .checked_add(v.iov_len)
                     .filter(|&n| n <= BYTES)
                     .ok_or(EMSGSIZE)?;
-                if v.iov_len != 0 && v.iov_base.is_null() {
+                if op == 20 && v.iov_len != 0 && v.iov_base.is_null() {
                     return Err(EFAULT);
                 }
                 destinations.push((v.iov_base as usize, v.iov_len));
