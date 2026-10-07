@@ -41,7 +41,7 @@ static TOKENS: Mutex<BTreeMap<i32, Token>> = Mutex::new(BTreeMap::new());
 struct Token {
     slot: Option<usize>,
     id: u64,
-    retained: i32,
+    retained: Arc<Retained>,
     dev: dev_t,
     ino: ino_t,
     input: Arc<Input>,
@@ -59,13 +59,18 @@ impl Token {
         }
     }
 }
+struct Retained(i32);
+impl Drop for Retained {
+    fn drop(&mut self) {
+        unsafe {
+            syscall(SYS_close, self.0);
+        }
+    }
+}
 impl Drop for Token {
     fn drop(&mut self) {
         if let Some(slot) = self.slot {
             SOCKET_FDS[slot].store(-1, Ordering::Release);
-        }
-        unsafe {
-            syscall(SYS_close, self.retained);
         }
     }
 }
@@ -345,7 +350,7 @@ fn token(flags: i32) -> Result<(i32, Token)> {
         Token {
             slot: None,
             id: 0,
-            retained,
+            retained: Arc::new(Retained(retained)),
             dev: st.st_dev,
             ino: st.st_ino,
             input: Arc::new(Input::default()),
@@ -563,13 +568,14 @@ pub unsafe extern "C" fn close(fd: i32) -> i32 {
         return unsafe { syscall(SYS_close, fd) as i32 };
     }
     ffi(|| {
-        if let Some(id) = owned(fd)? {
-            let t = TOKENS.lock().map_err(|_| EIO)?.remove(&fd);
-            // OS lifetime ends even when the engine runtime has failed.
-            let closed = raw(unsafe { syscall(SYS_close, fd) });
-            drop(t);
-            readiness::closed(fd, id);
-            let engine = call(id, Op::Close);
+        if owned(fd)?.is_some() {
+            let (closed, last) = {
+                let mut tokens = TOKENS.lock().map_err(|_| EIO)?;
+                let closed = raw(unsafe { syscall(SYS_close, fd) });
+                let last = remove_alias(&mut tokens, fd);
+                (closed, last)
+            };
+            let engine = finish_close(last);
             closed?;
             engine?;
             Ok(0)
@@ -1018,6 +1024,7 @@ pub extern "C" fn ntcp_fcntl_dispatch(fd: i32, cmd: i32, arg: c_ulong) -> i32 {
         match cmd {
             F_GETFL | F_SETFL => Ok(call(id, Op::Flags(cmd, arg as i32))?.value as i64),
             F_GETFD | F_SETFD => raw(unsafe { syscall(SYS_fcntl, fd, cmd, arg) }),
+            F_DUPFD | F_DUPFD_CLOEXEC => duplicate(fd, None, cmd, arg),
             _ => Err(EOPNOTSUPP),
         }
     }) as i32
@@ -1086,45 +1093,153 @@ pub unsafe extern "C" fn fcntl64() -> i32 {
 pub unsafe extern "C" fn ioctl() -> i32 {
     core::arch::naked_asm!("b ntcp_variadic_ioctl");
 }
+// Registry mutation and the kernel descriptor operation are serialized together.
+// Close/dup release TOKENS before epoll cleanup and owner RPCs; ctl alone
+// nests the locks in TOKENS -> EPOLLS order.
+fn remove_alias(tokens: &mut BTreeMap<i32, Token>, fd: i32) -> Option<u64> {
+    let t = tokens.remove(&fd)?;
+    (!tokens.values().any(|alias| alias.id == t.id)).then_some(t.id)
+}
+fn finish_close(last: Option<u64>) -> Result<()> {
+    if let Some(id) = last {
+        readiness::closed(id);
+        call(id, Op::Close)?;
+    }
+    Ok(())
+}
+// ponytail: bounded 512-alias scan; index by id if readiness cost matters.
+fn live_id(id: u64) -> Result<bool> {
+    Ok(TOKENS
+        .lock()
+        .map_err(|_| EIO)?
+        .iter()
+        .any(|(&fd, t)| t.id == id && t.matches(fd)))
+}
+fn duplicate(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Result<i64> {
+    let source = owned(fd)?;
+    if new == Some(fd) {
+        readiness::is_epoll(fd)?;
+        return if cmd == SYS_dup3 as i32 {
+            Err(EINVAL)
+        } else {
+            raw(unsafe { syscall(SYS_dup2, fd, fd) })
+        };
+    }
+    // Managed epoll aliases need shared epoll tracking, not just kernel dup.
+    if readiness::is_epoll(fd)? {
+        return Err(EOPNOTSUPP);
+    }
+    if source.is_some() {
+        let mut limit: rlimit = unsafe { std::mem::zeroed() };
+        raw(unsafe { syscall(SYS_getrlimit, RLIMIT_NOFILE, &mut limit) })?;
+        if new.is_some_and(|n| n < 0 || n as rlim_t >= limit.rlim_cur) {
+            return Err(EBADF);
+        }
+        if new.is_none()
+            && [F_DUPFD, F_DUPFD_CLOEXEC].contains(&cmd)
+            && ((arg as i32) < 0 || (arg as i32) as rlim_t >= limit.rlim_cur)
+        {
+            return Err(EINVAL);
+        }
+    }
+    if cmd == SYS_dup3 as i32 && arg & !(O_CLOEXEC as c_ulong) != 0 {
+        return Err(EINVAL);
+    }
+    let target = match new {
+        Some(n) => owned(n)?,
+        None => None,
+    };
+    let target_epoll = match new {
+        Some(n) => readiness::is_epoll(n)?,
+        None => false,
+    };
+    let kernel = || unsafe {
+        match new {
+            Some(n) if cmd == SYS_dup3 as i32 => syscall(SYS_dup3, fd, n, arg),
+            Some(n) => syscall(SYS_dup2, fd, n),
+            None if cmd == SYS_dup as i32 => syscall(SYS_dup, fd),
+            None => syscall(SYS_fcntl, fd, cmd, arg),
+        }
+    };
+    if source.is_none() && target.is_none() {
+        let result = raw(kernel())?;
+        if target_epoll {
+            readiness::close_epoll(new.unwrap())?;
+        }
+        return Ok(result);
+    }
+    let (result, last) = {
+        let mut tokens = TOKENS.lock().map_err(|_| EIO)?;
+        // Revalidate the source under the same lock as close/dup replacement.
+        let alias = if let Some(id) = source {
+            let t = tokens
+                .get(&fd)
+                .filter(|t| t.id == id && t.matches(fd))
+                .ok_or(EBADF)?;
+            Some(Token {
+                slot: None,
+                id,
+                retained: t.retained.clone(),
+                dev: t.dev,
+                ino: t.ino,
+                input: t.input.clone(),
+            })
+        } else {
+            None
+        };
+        let reused_slot = new.and_then(|n| tokens.get(&n)).and_then(|t| t.slot);
+        let slot = if alias.is_some() {
+            Some(match reused_slot {
+                Some(slot) => slot,
+                None => reserve_fd(&SOCKET_FDS, -2)?,
+            })
+        } else {
+            None
+        };
+        let result = match raw(kernel()) {
+            Ok(n) => n,
+            Err(e) => {
+                if reused_slot.is_none()
+                    && let Some(slot) = slot
+                {
+                    SOCKET_FDS[slot].store(-1, Ordering::Release);
+                }
+                return Err(e);
+            }
+        };
+        if alias.is_some()
+            && let Some(t) = new.and_then(|n| tokens.get_mut(&n))
+        {
+            // Transfer the slot without briefly publishing a native fast path.
+            t.slot = None;
+        }
+        let last = new.and_then(|n| remove_alias(&mut tokens, n));
+        if let Some(mut t) = alias {
+            t.slot = slot;
+            SOCKET_FDS[slot.unwrap()].store(result as i32, Ordering::Release);
+            tokens.insert(result as i32, t);
+        }
+        // Replacing another alias of the source cannot end its OFD lifetime.
+        (result, last.filter(|id| Some(*id) != source))
+    };
+    if target_epoll {
+        readiness::close_epoll(new.unwrap())?;
+    }
+    // dup2/dup3 ignore errors from the target's implicit close.
+    let _ = finish_close(last);
+    Ok(result)
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dup(fd: i32) -> i32 {
-    ffi(|| {
-        if owned(fd)?.is_some() || readiness::is_epoll(fd)? {
-            return Err(EOPNOTSUPP);
-        }
-        raw(unsafe { syscall(SYS_dup, fd) })
-    }) as i32
+    ffi(|| duplicate(fd, None, SYS_dup as i32, 0)) as i32
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dup2(fd: i32, new: i32) -> i32 {
-    ffi(|| {
-        if fd == new {
-            owned(fd)?;
-            readiness::is_epoll(fd)?;
-            return raw(unsafe { syscall(SYS_dup2, fd, new) });
-        }
-        if owned(fd)?.is_some()
-            || owned(new)?.is_some()
-            || readiness::is_epoll(fd)?
-            || readiness::is_epoll(new)?
-        {
-            return Err(EOPNOTSUPP);
-        }
-        raw(unsafe { syscall(SYS_dup2, fd, new) })
-    }) as i32
+    ffi(|| duplicate(fd, Some(new), SYS_dup2 as i32, 0)) as i32
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dup3(fd: i32, new: i32, flags: i32) -> i32 {
-    ffi(|| {
-        if owned(fd)?.is_some()
-            || owned(new)?.is_some()
-            || readiness::is_epoll(fd)?
-            || readiness::is_epoll(new)?
-        {
-            return Err(EOPNOTSUPP);
-        }
-        raw(unsafe { syscall(SYS_dup3, fd, new, flags) })
-    }) as i32
+    ffi(|| duplicate(fd, Some(new), SYS_dup3 as i32, flags as c_ulong)) as i32
 }
 
 #[cfg(test)]

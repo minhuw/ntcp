@@ -3,8 +3,9 @@ use std::time::{Duration, Instant};
 const LIMIT: usize = 4096;
 #[derive(Clone, Copy)]
 struct Registration {
-    fd: i32,
     id: u64,
+    generation: u64,
+    armed: bool,
     events: u32,
     data: u64,
 }
@@ -13,7 +14,8 @@ struct Epoll {
     retained: i32,
     dev: dev_t,
     ino: ino_t,
-    regs: BTreeMap<i32, Registration>,
+    regs: BTreeMap<(i32, u64), Registration>,
+    generation: u64,
     cursor: usize,
     native_first: bool,
 }
@@ -65,12 +67,10 @@ pub fn close_epoll(fd: i32) -> Result<()> {
     EPOLLS.lock().map_err(|_| EIO)?.remove(&fd);
     Ok(())
 }
-pub fn closed(fd: i32, id: u64) {
+pub fn closed(id: u64) {
     if let Ok(mut map) = EPOLLS.lock() {
         for ep in map.values_mut() {
-            if ep.regs.get(&fd).is_some_and(|r| r.id == id) {
-                ep.regs.remove(&fd);
-            }
+            ep.regs.retain(|&(_, registered_id), _| registered_id != id);
         }
     }
 }
@@ -123,10 +123,18 @@ pub unsafe extern "C" fn epoll_ctl(epfd: i32, op: i32, fd: i32, p: *mut epoll_ev
                 | EPOLLOUT as u32
                 | EPOLLERR as u32
                 | EPOLLHUP as u32
-                | EPOLLRDHUP as u32)
+                | EPOLLRDHUP as u32
+                | EPOLLONESHOT as u32)
             != 0
         {
             return Err(EOPNOTSUPP);
+        }
+        // Lock order is TOKENS -> EPOLLS. Pin this alias through registration
+        // so a concurrent final close cannot clean up before our ADD commits.
+        // Neither registry is held across an owner RPC.
+        let tokens = TOKENS.lock().map_err(|_| EIO)?;
+        if !tokens.get(&fd).is_some_and(|t| t.id == id && t.matches(fd)) {
+            return Err(EBADF);
         }
         let mut map = EPOLLS.lock().map_err(|_| EIO)?;
         if map.get(&epfd).is_some_and(|ep| !ep.matches(epfd)) {
@@ -173,41 +181,47 @@ pub unsafe extern "C" fn epoll_ctl(epfd: i32, op: i32, fd: i32, p: *mut epoll_ev
                     dev: st.st_dev,
                     ino: st.st_ino,
                     regs: BTreeMap::new(),
+                    generation: 0,
                     cursor: 0,
                     native_first: false,
                 },
             );
         }
         let ep = map.get_mut(&epfd).unwrap();
+        ep.generation = ep.generation.wrapping_add(1);
+        let generation = ep.generation;
+        let key = (fd, id);
         match op {
             EPOLL_CTL_ADD => {
-                if ep.regs.contains_key(&fd) {
+                if ep.regs.contains_key(&key) {
                     return Err(EEXIST);
                 }
                 if ep.regs.len() == LIMIT {
                     return Err(ENOSPC);
                 }
                 ep.regs.insert(
-                    fd,
+                    key,
                     Registration {
-                        fd,
                         id,
+                        generation,
+                        armed: true,
                         events: event.events,
                         data: event.u64,
                     },
                 );
             }
             EPOLL_CTL_MOD => {
-                let r = ep.regs.get_mut(&fd).ok_or(ENOENT)?;
+                let r = ep.regs.get_mut(&key).ok_or(ENOENT)?;
                 *r = Registration {
-                    fd,
                     id,
+                    generation,
+                    armed: true,
                     events: event.events,
                     data: event.u64,
                 };
             }
             EPOLL_CTL_DEL => {
-                ep.regs.remove(&fd).ok_or(ENOENT)?;
+                ep.regs.remove(&key).ok_or(ENOENT)?;
             }
             _ => return Err(EINVAL),
         }
@@ -248,7 +262,7 @@ unsafe fn epwait(
         let regs = {
             let mut map = EPOLLS.lock().map_err(|_| EIO)?;
             let ep = map.get_mut(&epfd).ok_or(EBADF)?;
-            let mut regs: Vec<_> = ep.regs.values().copied().collect();
+            let mut regs: Vec<_> = ep.regs.iter().map(|(&key, &r)| (key, r)).collect();
             if !regs.is_empty() {
                 let len = regs.len();
                 regs.rotate_left(ep.cursor % len);
@@ -256,46 +270,47 @@ unsafe fn epwait(
             }
             regs
         };
-        let mut count = 0;
-        if native_first {
-            count =
-                raw(unsafe { syscall(SYS_epoll_pwait, epfd, p, cap as i32, 0, mask, 8) })? as usize;
-            if count == cap {
-                return Ok(count as i64);
-            }
+        // Keep native-first copyout in the kernel: native ONESHOT must retain
+        // its existing fault handling rather than disarm in a staging buffer.
+        let native_count = if native_first {
+            raw(unsafe { syscall(SYS_epoll_pwait, epfd, p, cap as i32, 0, mask, 8) })? as usize
+        } else {
+            0
+        };
+        if native_count == cap {
+            return Ok(native_count as i64);
         }
-        let native_delivered = count != 0;
-        for r in regs {
-            if owned(r.fd)? != Some(r.id) {
+        let mut virtual_events = Vec::new();
+        for (key, r) in regs {
+            if !r.armed || !live_id(r.id)? {
                 continue;
             }
-            let ready = call(r.id, Op::Ready)?.value as u32
-                & (r.events | EPOLLERR as u32 | EPOLLHUP as u32);
+            let ready = match call(r.id, Op::Ready) {
+                Ok(reply) => reply.value as u32,
+                Err(EBADF) => continue, // Last alias closed during the query.
+                Err(e) => return Err(e),
+            } & (r.events | EPOLLERR as u32 | EPOLLHUP as u32);
             if ready != 0 {
-                store(
-                    p.wrapping_add(count),
-                    &epoll_event {
+                virtual_events.push((
+                    key,
+                    r.generation,
+                    epoll_event {
                         events: ready,
                         u64: r.data,
                     },
-                )?;
-                count += 1;
-                if count == cap {
-                    break;
-                }
+                ));
             }
         }
-        let wait = if count != 0 || timeout == 0 {
+        let wait = if native_count != 0 || !virtual_events.is_empty() || timeout == 0 {
             0
+        } else if deadline.is_none() {
+            10
         } else {
             remaining(deadline).clamp(0, 10)
         };
-        let wait = if deadline.is_none() && count == 0 && timeout != 0 {
-            10
-        } else {
-            wait
-        };
-        let n = if count == cap || native_delivered {
+        let available = cap - native_count;
+        let native_cap = available.saturating_sub(virtual_events.len().min(available));
+        let n = if native_cap == 0 || native_count != 0 {
             0
         } else {
             raw(unsafe {
@@ -303,21 +318,44 @@ unsafe fn epwait(
                     SYS_epoll_pwait,
                     epfd,
                     native.as_mut_ptr(),
-                    (cap - count) as i32,
+                    native_cap as i32,
                     wait,
                     mask,
                     8,
                 )
             })? as usize
         };
-        for e in &native[..n] {
-            if count < cap {
-                store(p.wrapping_add(count), e)?;
-                count += 1;
+        // Serialize copyout + disarming with MOD and competing waiters. No owner
+        // RPC or socket registry lock is taken while EPOLLS is held.
+        let mut map = EPOLLS.lock().map_err(|_| EIO)?;
+        let ep = map.get_mut(&epfd).ok_or(EBADF)?;
+        virtual_events.retain(|(key, generation, _)| {
+            ep.regs
+                .get(key)
+                .is_some_and(|r| r.armed && r.generation == *generation)
+        });
+        let mut output = Vec::with_capacity(available);
+        let mut delivered = Vec::new();
+        for (key, generation, event) in virtual_events {
+            if output.len() == available {
+                break;
+            }
+            output.push(event);
+            delivered.push((key, generation));
+        }
+        output.extend_from_slice(&native[..n]);
+        store_array(p.wrapping_add(native_count), &output)?;
+        for (key, generation) in delivered {
+            if let Some(r) = ep.regs.get_mut(&key)
+                && r.generation == generation
+                && r.events & EPOLLONESHOT as u32 != 0
+            {
+                r.armed = false;
             }
         }
-        if count != 0 {
-            return Ok(count as i64);
+        drop(map);
+        if native_count != 0 || !output.is_empty() {
+            return Ok((native_count + output.len()) as i64);
         }
         if timeout == 0 || deadline.is_some_and(|d| Instant::now() >= d) {
             return Ok(0);
