@@ -1356,6 +1356,950 @@
         },
         "claim": "Diagnostic CUBIC execution with RFC 9937 PRR equations and a test-only pacing exception; full Linux recovery equivalence and conformance are not claimed."
       }
+    },
+    "cubic/cubic-bulk-166k-idle-restart.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "854682928b07e3a4490246435c65ae3d4dfb96a97e489c5f6ade76f54f87cba3",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh\ntc qdisc replace dev tun0 root fq\nsysctl -q net.ipv4.tcp_congestion_control=cubic\nsysctl -q net.ipv4.tcp_min_tso_segs=4\n# Disable TLP to avoid flakes from spurious retransmits:\nsysctl -q net.ipv4.tcp_early_retrans=0`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of cubic/cubic-bulk-166k-idle-restart.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
+        "reasons": [
+          "Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced.",
+          "Linux CUBIC HyStart slow-start exit, tcp_min_tso_segs=4 accumulation and tcp_early_retrans=0 TLP disablement have no equivalent UpstreamCubic setup mapping.",
+          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        ]
+      },
+      "blocked_reasons": [
+        "Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced.",
+        "Linux CUBIC HyStart slow-start exit, tcp_min_tso_segs=4 accumulation and tcp_early_retrans=0 TLP disablement have no equivalent UpstreamCubic setup mapping.",
+        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../../common/defaults.sh\ntc qdisc replace dev tun0 root fq\nsysctl -q net.ipv4.tcp_congestion_control=cubic\nsysctl -q net.ipv4.tcp_min_tso_segs=4\n# Disable TLP to avoid flakes from spurious retransmits:\nsysctl -q net.ipv4.tcp_early_retrans=0`",
+          "sha256": "4d45a44e5be4d05fdad548330ecf40a64db7b3cd44a7e8154407de747951bc79",
+          "semantic_mapping": "Unavailable: Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced. Linux CUBIC HyStart slow-start exit, tcp_min_tso_segs=4 accumulation and tcp_early_retrans=0 TLP disablement have no equivalent UpstreamCubic setup mapping. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        }
+      ]
+    },
+    "cubic/cubic-bulk-166k.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "f3c166fc79557070ea845274ab2d1ba5e2001c6eba007aaf7ce401519b2e4804",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh\ntc qdisc replace dev tun0 root fq\nsysctl -q net.ipv4.tcp_congestion_control=cubic\nsysctl -q net.ipv4.tcp_min_tso_segs=4\n# Disable TLP to avoid flakes from spurious retransmits:\nsysctl -q net.ipv4.tcp_early_retrans=0`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of cubic/cubic-bulk-166k.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
+        "reasons": [
+          "Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced.",
+          "Linux CUBIC HyStart slow-start exit, tcp_min_tso_segs=4 accumulation and tcp_early_retrans=0 TLP disablement have no equivalent UpstreamCubic setup mapping.",
+          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        ]
+      },
+      "blocked_reasons": [
+        "Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced.",
+        "Linux CUBIC HyStart slow-start exit, tcp_min_tso_segs=4 accumulation and tcp_early_retrans=0 TLP disablement have no equivalent UpstreamCubic setup mapping.",
+        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../../common/defaults.sh\ntc qdisc replace dev tun0 root fq\nsysctl -q net.ipv4.tcp_congestion_control=cubic\nsysctl -q net.ipv4.tcp_min_tso_segs=4\n# Disable TLP to avoid flakes from spurious retransmits:\nsysctl -q net.ipv4.tcp_early_retrans=0`",
+          "sha256": "4d45a44e5be4d05fdad548330ecf40a64db7b3cd44a7e8154407de747951bc79",
+          "semantic_mapping": "Unavailable: Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced. Linux CUBIC HyStart slow-start exit, tcp_min_tso_segs=4 accumulation and tcp_early_retrans=0 TLP disablement have no equivalent UpstreamCubic setup mapping. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        }
+      ]
+    },
+    "cubic/cubic-hystart-delay-min-rtt-jumps-downward.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "07e4ecdffa40645fda09939091314b709716946d8e8954e84c35f236f0aa1e13",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh\necho 3 > /sys/module/tcp_cubic/parameters/hystart_detect\n`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of cubic/cubic-hystart-delay-min-rtt-jumps-downward.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
+        "reasons": [
+          "Linux CUBIC HYSTART_DELAY and /sys/module/tcp_cubic/parameters/hystart_detect=3 have no ntcp adapter mapping; the RTT-sample exit assertions are not assumed to succeed.",
+          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        ]
+      },
+      "blocked_reasons": [
+        "Linux CUBIC HYSTART_DELAY and /sys/module/tcp_cubic/parameters/hystart_detect=3 have no ntcp adapter mapping; the RTT-sample exit assertions are not assumed to succeed.",
+        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../common/defaults.sh\necho 3 > /sys/module/tcp_cubic/parameters/hystart_detect\n`",
+          "sha256": "776a60146357ee35e8957fe43b1c7d9365b06cbe5fc00407abdeb139cdedd821",
+          "semantic_mapping": "Unavailable: Linux CUBIC HYSTART_DELAY and /sys/module/tcp_cubic/parameters/hystart_detect=3 have no ntcp adapter mapping; the RTT-sample exit assertions are not assumed to succeed. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        }
+      ]
+    },
+    "cubic/cubic-hystart-delay-rtt-jumps-upward.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "ea1f72a4d09f9598619bda2c457d7c60ad0d07406d64cafa16f8093cce42421f",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh\necho 3 > /sys/module/tcp_cubic/parameters/hystart_detect\n`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of cubic/cubic-hystart-delay-rtt-jumps-upward.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
+        "reasons": [
+          "Linux CUBIC HYSTART_DELAY and /sys/module/tcp_cubic/parameters/hystart_detect=3 have no ntcp adapter mapping; the RTT-sample exit assertions are not assumed to succeed.",
+          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        ]
+      },
+      "blocked_reasons": [
+        "Linux CUBIC HYSTART_DELAY and /sys/module/tcp_cubic/parameters/hystart_detect=3 have no ntcp adapter mapping; the RTT-sample exit assertions are not assumed to succeed.",
+        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../common/defaults.sh\necho 3 > /sys/module/tcp_cubic/parameters/hystart_detect\n`",
+          "sha256": "776a60146357ee35e8957fe43b1c7d9365b06cbe5fc00407abdeb139cdedd821",
+          "semantic_mapping": "Unavailable: Linux CUBIC HYSTART_DELAY and /sys/module/tcp_cubic/parameters/hystart_detect=3 have no ntcp adapter mapping; the RTT-sample exit assertions are not assumed to succeed. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        }
+      ]
+    },
+    "cubic/cubic-rack-reo-timeout-retrans-failed-incoming-data.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "d67ca45b65b6ee797407d3fb63f457d3a1fdd73c1ee35347f17d72f84f90e614",
+      "expected_command_count": 2,
+      "command_line": "`../../common/defaults.sh`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of cubic/cubic-rack-reo-timeout-retrans-failed-incoming-data.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
+        "reasons": [
+          "Linux pfifo limit 0 local retransmit failure is not network loss and has no ntcp qdisc/resource-congestion mapping. TCP_INFO fields tcpi_reord_seen, tcpi_min_rtt and tcpi_rtt are outside the existing embedded-field allowlist.",
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        ]
+      },
+      "blocked_reasons": [
+        "Linux pfifo limit 0 local retransmit failure is not network loss and has no ntcp qdisc/resource-congestion mapping. TCP_INFO fields tcpi_reord_seen, tcpi_min_rtt and tcpi_rtt are outside the existing embedded-field allowlist.",
+        "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../../common/defaults.sh`",
+          "sha256": "db987cbec339a8140034dc0a76556fcd8346c3b83c75c17b92ce643980e7c17b",
+          "semantic_mapping": "Unavailable: Linux pfifo limit 0 local retransmit failure is not network loss and has no ntcp qdisc/resource-congestion mapping. TCP_INFO fields tcpi_reord_seen, tcpi_min_rtt and tcpi_rtt are outside the existing embedded-field allowlist. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        },
+        {
+          "command": "`tc qdisc replace dev tun0 root pfifo limit 0`",
+          "sha256": "e9e411cb8f3a4f3097ab4cadb10e1c5ee3b9e0c0608faa5edb61415143e1763d",
+          "semantic_mapping": "Unavailable: Linux pfifo limit 0 local retransmit failure is not network loss and has no ntcp qdisc/resource-congestion mapping. TCP_INFO fields tcpi_reord_seen, tcpi_min_rtt and tcpi_rtt are outside the existing embedded-field allowlist. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        }
+      ]
+    },
+    "cubic/cubic-rto-ss-ca-cwnd-bump.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "edd82fda961653e95c57eba7db52da66eaa69bfb6ea7d0c0dc5d2da95c150d02",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of cubic/cubic-rto-ss-ca-cwnd-bump.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Diagnostic defaults-only CUBIC execution; full Linux equivalence and passing assertions are not claimed.",
+        "reasons": [
+          "UpstreamCubic disables PRR pacing only in this unpublished isolated-test profile to target same-time Linux aggregated bursts: a test-profile exception to RFC 9937 section 6.4 RECOMMENDED pacing. RFC 9937 delivery, credit and exit equations remain unchanged; the core default stays paced. The explicit 200 ms RTO floor and budgeted preallocation are unchanged.",
+          "Pinned defaults.sh selects Linux CUBIC; UpstreamCubic selects actual ntcp CUBIC with beta=0.7 and NewReno recovery. Packet/cwnd/ssthresh expectations remain unchanged and mismatches remain behavioral failures.",
+          "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
+          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
+          "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged.",
+          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting. The original setsockopt remains unchanged and execution reports unsupported if reached; no socket-option success is fabricated."
+        ]
+      },
+      "embedded_tcp_info": true
+    },
+    "cwnd_moderation/cwnd-moderation-disorder-no-moderation.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "429d8027d0c5bd58431478dd99a3d49b38781e90cbe7ae9d17ca8310eaa72743",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of cwnd_moderation/cwnd-moderation-disorder-no-moderation.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Diagnostic defaults-only CUBIC execution; full Linux equivalence and passing assertions are not claimed.",
+        "reasons": [
+          "UpstreamCubic disables PRR pacing only in this unpublished isolated-test profile to target same-time Linux aggregated bursts: a test-profile exception to RFC 9937 section 6.4 RECOMMENDED pacing. RFC 9937 delivery, credit and exit equations remain unchanged; the core default stays paced. The explicit 200 ms RTO floor and budgeted preallocation are unchanged.",
+          "Pinned defaults.sh selects Linux CUBIC; UpstreamCubic selects actual ntcp CUBIC with beta=0.7 and NewReno recovery. Packet/cwnd/ssthresh expectations remain unchanged and mismatches remain behavioral failures.",
+          "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
+          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
+          "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged."
+        ]
+      },
+      "embedded_tcp_info": true
+    },
+    "cwnd_moderation/cwnd-moderation-ecn-enter-cwr-no-moderation-700.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "dca2ea623ec4a480e24a2eb522a6b982741ae663e21a46a53f9cc3e477ea4d9d",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh\nsysctl -q net.ipv4.tcp_ecn=2    # server agrees to ECN if client proposes it\n`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of cwnd_moderation/cwnd-moderation-ecn-enter-cwr-no-moderation-700.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
+        "reasons": [
+          "Linux tcp_ecn=2 passive-only ECN negotiation and CUBIC CWR/PRR behavior have no audited adapter setup mapping; UpstreamCubic disables ECN and upstream-ecn is not CUBIC.",
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        ]
+      },
+      "blocked_reasons": [
+        "Linux tcp_ecn=2 passive-only ECN negotiation and CUBIC CWR/PRR behavior have no audited adapter setup mapping; UpstreamCubic disables ECN and upstream-ecn is not CUBIC.",
+        "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../common/defaults.sh\nsysctl -q net.ipv4.tcp_ecn=2    # server agrees to ECN if client proposes it\n`",
+          "sha256": "b3129d03166005497c2af76dc82a9566db861fb7e88eb3c655a3ed67bd376fa4",
+          "semantic_mapping": "Unavailable: Linux tcp_ecn=2 passive-only ECN negotiation and CUBIC CWR/PRR behavior have no audited adapter setup mapping; UpstreamCubic disables ECN and upstream-ecn is not CUBIC. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        }
+      ]
+    },
+    "slow_start/slow-start-ack-per-1pkt.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "e9dacd1681931bf596488922f3c8e2a01ef54b61aa2fd7475b04c468bc34705f",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh\nsysctl -q net.ipv4.tcp_tso_win_divisor=100`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of slow_start/slow-start-ack-per-1pkt.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
+        "reasons": [
+          "Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent.",
+          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        ]
+      },
+      "blocked_reasons": [
+        "Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent.",
+        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../common/defaults.sh\nsysctl -q net.ipv4.tcp_tso_win_divisor=100`",
+          "sha256": "a8c3b8262f288b3dec8439f54bed04555def76fcf56e1c2ce7ae9074698510aa",
+          "semantic_mapping": "Unavailable: Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        }
+      ]
+    },
+    "slow_start/slow-start-ack-per-2pkt-send-5pkt.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "c18aed1d76f54b97e1af331877f6d99197a907e2c06b73bf1bc1e40c15d435c7",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of slow_start/slow-start-ack-per-2pkt-send-5pkt.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Diagnostic defaults-only CUBIC execution; full Linux equivalence and passing assertions are not claimed.",
+        "reasons": [
+          "UpstreamCubic disables PRR pacing only in this unpublished isolated-test profile to target same-time Linux aggregated bursts: a test-profile exception to RFC 9937 section 6.4 RECOMMENDED pacing. RFC 9937 delivery, credit and exit equations remain unchanged; the core default stays paced. The explicit 200 ms RTO floor and budgeted preallocation are unchanged.",
+          "Pinned defaults.sh selects Linux CUBIC; UpstreamCubic selects actual ntcp CUBIC with beta=0.7 and NewReno recovery. Packet/cwnd/ssthresh expectations remain unchanged and mismatches remain behavioral failures.",
+          "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
+          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
+          "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged."
+        ]
+      },
+      "embedded_tcp_info": true
+    },
+    "slow_start/slow-start-ack-per-2pkt-send-6pkt.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "f6c15a579cb0053421367c00e0a267fd5e417af1f994213c63a436a6f8e6e5bf",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of slow_start/slow-start-ack-per-2pkt-send-6pkt.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Diagnostic defaults-only CUBIC execution; full Linux equivalence and passing assertions are not claimed.",
+        "reasons": [
+          "UpstreamCubic disables PRR pacing only in this unpublished isolated-test profile to target same-time Linux aggregated bursts: a test-profile exception to RFC 9937 section 6.4 RECOMMENDED pacing. RFC 9937 delivery, credit and exit equations remain unchanged; the core default stays paced. The explicit 200 ms RTO floor and budgeted preallocation are unchanged.",
+          "Pinned defaults.sh selects Linux CUBIC; UpstreamCubic selects actual ntcp CUBIC with beta=0.7 and NewReno recovery. Packet/cwnd/ssthresh expectations remain unchanged and mismatches remain behavioral failures.",
+          "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
+          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
+          "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged."
+        ]
+      },
+      "embedded_tcp_info": true
+    },
+    "slow_start/slow-start-ack-per-2pkt.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "d6dc649547109b44e4d8262ff48f6af28e81a31639b871c52d551302006cb571",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh\nsysctl -q net.ipv4.tcp_tso_win_divisor=100`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of slow_start/slow-start-ack-per-2pkt.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
+        "reasons": [
+          "Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent.",
+          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        ]
+      },
+      "blocked_reasons": [
+        "Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent.",
+        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../common/defaults.sh\nsysctl -q net.ipv4.tcp_tso_win_divisor=100`",
+          "sha256": "a8c3b8262f288b3dec8439f54bed04555def76fcf56e1c2ce7ae9074698510aa",
+          "semantic_mapping": "Unavailable: Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        }
+      ]
+    },
+    "slow_start/slow-start-ack-per-4pkt.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "5acfc60f7682a1c51601e084090f8b21807d3d0c1f2154b1798f51f951386f06",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh\nsysctl -q net.ipv4.tcp_tso_win_divisor=100`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of slow_start/slow-start-ack-per-4pkt.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
+        "reasons": [
+          "Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent.",
+          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        ]
+      },
+      "blocked_reasons": [
+        "Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent.",
+        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../common/defaults.sh\nsysctl -q net.ipv4.tcp_tso_win_divisor=100`",
+          "sha256": "a8c3b8262f288b3dec8439f54bed04555def76fcf56e1c2ce7ae9074698510aa",
+          "semantic_mapping": "Unavailable: Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        }
+      ]
+    },
+    "slow_start/slow-start-after-idle.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "e6aa937a156e292148011c1e13897b6f36d532a7c219c88747511010823452fe",
+      "expected_command_count": 2,
+      "command_line": "`../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_slow_start_after_idle=1 \\\n\t\t\t /proc/sys/net/ipv4/tcp_min_tso_segs=10`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of slow_start/slow-start-after-idle.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
+        "reasons": [
+          "Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted.",
+          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        ]
+      },
+      "blocked_reasons": [
+        "Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted.",
+        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_slow_start_after_idle=1 \\\n\t\t\t /proc/sys/net/ipv4/tcp_min_tso_segs=10`",
+          "sha256": "b8e7a4d240cda50b47904bdf80e8d7e8a446378e010fa798135017b22c57ef3f",
+          "semantic_mapping": "Unavailable: Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        },
+        {
+          "command": "`/tmp/sysctl_restore_${PPID}.sh`",
+          "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
+          "semantic_mapping": "Unavailable: Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        }
+      ],
+      "additional_setup_files": [
+        {
+          "path": "common/set_sysctls.py",
+          "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
+        }
+      ]
+    },
+    "slow_start/slow-start-after-win-update.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "33ad8bd05e7e892114447e54bc10c8abd2f6f2f4a496b5ba69b1a561d153ff21",
+      "expected_command_count": 2,
+      "command_line": "`../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_slow_start_after_idle=1 \\\n\t\t\t /proc/sys/net/ipv4/tcp_min_tso_segs=10`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of slow_start/slow-start-after-win-update.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
+        "reasons": [
+          "Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted.",
+          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        ]
+      },
+      "blocked_reasons": [
+        "Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted.",
+        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_slow_start_after_idle=1 \\\n\t\t\t /proc/sys/net/ipv4/tcp_min_tso_segs=10`",
+          "sha256": "b8e7a4d240cda50b47904bdf80e8d7e8a446378e010fa798135017b22c57ef3f",
+          "semantic_mapping": "Unavailable: Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        },
+        {
+          "command": "`/tmp/sysctl_restore_${PPID}.sh`",
+          "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
+          "semantic_mapping": "Unavailable: Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        }
+      ],
+      "additional_setup_files": [
+        {
+          "path": "common/set_sysctls.py",
+          "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
+        }
+      ]
+    },
+    "slow_start/slow-start-app-limited-9-packets-out.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "278d947ade76d63bf8f1fbb8ee3374e7815b05f4e7fdb17f8391edd9f0c4fbc9",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of slow_start/slow-start-app-limited-9-packets-out.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Diagnostic defaults-only CUBIC execution; full Linux equivalence and passing assertions are not claimed.",
+        "reasons": [
+          "UpstreamCubic disables PRR pacing only in this unpublished isolated-test profile to target same-time Linux aggregated bursts: a test-profile exception to RFC 9937 section 6.4 RECOMMENDED pacing. RFC 9937 delivery, credit and exit equations remain unchanged; the core default stays paced. The explicit 200 ms RTO floor and budgeted preallocation are unchanged.",
+          "Pinned defaults.sh selects Linux CUBIC; UpstreamCubic selects actual ntcp CUBIC with beta=0.7 and NewReno recovery. Packet/cwnd/ssthresh expectations remain unchanged and mismatches remain behavioral failures.",
+          "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
+          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
+          "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged.",
+          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting. The original setsockopt remains unchanged and execution reports unsupported if reached; no socket-option success is fabricated."
+        ]
+      },
+      "embedded_tcp_info": true
+    },
+    "slow_start/slow-start-app-limited.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "7c486a28882c3c2748e1b9c5771052b2c947da38032438e5214249f767b9c7a0",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of slow_start/slow-start-app-limited.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Diagnostic defaults-only CUBIC execution; full Linux equivalence and passing assertions are not claimed.",
+        "reasons": [
+          "UpstreamCubic disables PRR pacing only in this unpublished isolated-test profile to target same-time Linux aggregated bursts: a test-profile exception to RFC 9937 section 6.4 RECOMMENDED pacing. RFC 9937 delivery, credit and exit equations remain unchanged; the core default stays paced. The explicit 200 ms RTO floor and budgeted preallocation are unchanged.",
+          "Pinned defaults.sh selects Linux CUBIC; UpstreamCubic selects actual ntcp CUBIC with beta=0.7 and NewReno recovery. Packet/cwnd/ssthresh expectations remain unchanged and mismatches remain behavioral failures.",
+          "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
+          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
+          "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged.",
+          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting. The original setsockopt remains unchanged and execution reports unsupported if reached; no socket-option success is fabricated."
+        ]
+      },
+      "embedded_tcp_info": true
+    },
+    "slow_start/slow-start-fq-ack-per-2pkt.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "source_sha256": "cc58c3e67eeefe30228d4f0815279e14f87fd4377034a8ed5b5a9b648bf205dc",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh\ntc qdisc replace dev tun0 root fq\nsysctl -q net/ipv4/tcp_pacing_ss_ratio=200\nsysctl -e -q net.ipv4.tcp_min_tso_segs=2`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of slow_start/slow-start-fq-ack-per-2pkt.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "Rfc9937",
+          "prr_pacing": false,
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "Cubic",
+          "output_push_batch_segments": 2
+        },
+        "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
+        "reasons": [
+          "Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced.",
+          "Linux tcp_pacing_ss_ratio=200 and tcp_min_tso_segs=2 pacing/TSO controls have no ntcp adapter setup mapping.",
+          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        ]
+      },
+      "blocked_reasons": [
+        "Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced.",
+        "Linux tcp_pacing_ss_ratio=200 and tcp_min_tso_segs=2 pacing/TSO controls have no ntcp adapter setup mapping.",
+        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../common/defaults.sh\ntc qdisc replace dev tun0 root fq\nsysctl -q net/ipv4/tcp_pacing_ss_ratio=200\nsysctl -e -q net.ipv4.tcp_min_tso_segs=2`",
+          "sha256": "69befee75ae5e68acc7fefc2761755fb0c86ca862b564dbafc909607cf9ffbb7",
+          "semantic_mapping": "Unavailable: Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced. Linux tcp_pacing_ss_ratio=200 and tcp_min_tso_segs=2 pacing/TSO controls have no ntcp adapter setup mapping. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        }
+      ]
+    },
+    "syscall_bad_arg/fastopen-invalid-buf-ptr.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "source_sha256": "1f2c1ab6dab023fb2aa37ae26b80c130c71df34376d6b54b9bb4ef39ab98f330",
+      "expected_command_count": 2,
+      "command_line": "`../common/defaults.sh\n ../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of syscall_bad_arg/fastopen-invalid-buf-ptr.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
+        "reasons": [
+          "TCP Fast Open cookie caching, TCP_FASTOPEN_CONNECT and MSG_FASTOPEN are unsupported by the adapter; NULL-buffer Fast Open assertions cannot execute. The tcp_timestamps=0 set_sysctls.py setup and generated restore command are not executed.",
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        ]
+      },
+      "blocked_reasons": [
+        "TCP Fast Open cookie caching, TCP_FASTOPEN_CONNECT and MSG_FASTOPEN are unsupported by the adapter; NULL-buffer Fast Open assertions cannot execute. The tcp_timestamps=0 set_sysctls.py setup and generated restore command are not executed.",
+        "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../common/defaults.sh\n ../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`",
+          "sha256": "ba92a9193093da1759b3f8060d685f9a43f7c942586dc9037f06dc4c0ebe5ba6",
+          "semantic_mapping": "Unavailable: TCP Fast Open cookie caching, TCP_FASTOPEN_CONNECT and MSG_FASTOPEN are unsupported by the adapter; NULL-buffer Fast Open assertions cannot execute. The tcp_timestamps=0 set_sysctls.py setup and generated restore command are not executed. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        },
+        {
+          "command": "`/tmp/sysctl_restore_${PPID}.sh`",
+          "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
+          "semantic_mapping": "Unavailable: TCP Fast Open cookie caching, TCP_FASTOPEN_CONNECT and MSG_FASTOPEN are unsupported by the adapter; NULL-buffer Fast Open assertions cannot execute. The tcp_timestamps=0 set_sysctls.py setup and generated restore command are not executed. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+        }
+      ],
+      "additional_setup_files": [
+        {
+          "path": "common/set_sysctls.py",
+          "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
+        }
+      ]
+    },
+    "syscall_bad_arg/sendmsg-empty-iov.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "source_sha256": "25b62895d91458fd05da099f89dad2a5097547851038bcf26cc4624289be4e15",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Diagnostic audit of syscall_bad_arg/sendmsg-empty-iov.pkt; all original non-setup bytes and timing preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic execution with copied-fallback MSG_ZEROCOPY and bounded copied-completion notifications; upstream assertions unchanged.",
+        "reasons": [
+          "SO_ZEROCOPY enables copied fallback: each successful nonempty flagged send gets a completion ID; MSG_ERRQUEUE exposes IP_RECVERR with SO_EE_CODE_ZEROCOPY_COPIED. Empty or failed sends generate no completion.",
+          "Only the exact defaults invocation is replaced. Original packets, zero-length iovecs, socket options, assertions and timing are preserved."
+        ]
+      }
     }
   }
 }

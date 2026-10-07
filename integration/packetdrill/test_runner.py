@@ -2,6 +2,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -10,6 +11,55 @@ from pathlib import Path
 from unittest.mock import patch
 
 from run import HERE, PIN, adapt_source, invoke, main, outcome, preflight, select_cases, variants
+
+
+BASIC17 = (
+    'blocking/blocking-accept.pkt',
+    'blocking/blocking-connect.pkt',
+    'blocking/blocking-read.pkt',
+    'blocking/blocking-write.pkt',
+    'close/close-local-close-then-remote-fin.pkt',
+    'close/close-on-syn-sent.pkt',
+    'close/close-remote-fin-then-close.pkt',
+    'ioctl/ioctl-siocinq-fin.pkt',
+    'shutdown/shutdown-rd-close.pkt',
+    'shutdown/shutdown-rd-wr-close.pkt',
+    'shutdown/shutdown-rdwr-close.pkt',
+    'shutdown/shutdown-rdwr-send-queue-ack-close.pkt',
+    'shutdown/shutdown-rdwr-write-queue-close.pkt',
+    'shutdown/shutdown-wr-close.pkt',
+    'syscall_bad_arg/fastopen-invalid-buf-ptr.pkt',
+    'syscall_bad_arg/sendmsg-empty-iov.pkt',
+    'syscall_bad_arg/syscall-invalid-buf-ptr.pkt',
+)
+CONGESTION18 = (
+    'cubic/cubic-bulk-166k-idle-restart.pkt',
+    'cubic/cubic-bulk-166k.pkt',
+    'cubic/cubic-hystart-delay-min-rtt-jumps-downward.pkt',
+    'cubic/cubic-hystart-delay-rtt-jumps-upward.pkt',
+    'cubic/cubic-rack-reo-timeout-retrans-failed-incoming-data.pkt',
+    'cubic/cubic-rto-ss-ca-cwnd-bump.pkt',
+    'cwnd_moderation/cwnd-moderation-disorder-no-moderation.pkt',
+    'cwnd_moderation/cwnd-moderation-ecn-enter-cwr-no-moderation-700.pkt',
+    'slow_start/slow-start-ack-per-1pkt.pkt',
+    'slow_start/slow-start-ack-per-2pkt-send-5pkt.pkt',
+    'slow_start/slow-start-ack-per-2pkt-send-6pkt.pkt',
+    'slow_start/slow-start-ack-per-2pkt.pkt',
+    'slow_start/slow-start-ack-per-4pkt.pkt',
+    'slow_start/slow-start-after-idle.pkt',
+    'slow_start/slow-start-after-win-update.pkt',
+    'slow_start/slow-start-app-limited-9-packets-out.pkt',
+    'slow_start/slow-start-app-limited.pkt',
+    'slow_start/slow-start-fq-ack-per-2pkt.pkt',
+)
+DEFAULTS_ONLY_CUBIC = {
+    'cubic/cubic-rto-ss-ca-cwnd-bump.pkt',
+    'cwnd_moderation/cwnd-moderation-disorder-no-moderation.pkt',
+    'slow_start/slow-start-ack-per-2pkt-send-5pkt.pkt',
+    'slow_start/slow-start-ack-per-2pkt-send-6pkt.pkt',
+    'slow_start/slow-start-app-limited-9-packets-out.pkt',
+    'slow_start/slow-start-app-limited.pkt',
+}
 
 
 class RunnerChecks(unittest.TestCase):
@@ -407,7 +457,8 @@ class AdaptationChecks(unittest.TestCase):
             'fast_recovery/prr-ss-ack-below-snd_una-cubic.pkt',
         }
         entries = {name: entry for name, entry in self.manifest['scripts'].items()
-                   if entry['adapter_flags'].startswith('upstream-cubic,')}
+                   if name.startswith('fast_recovery/')
+                   and entry['adapter_flags'].startswith('upstream-cubic,')}
         self.assertEqual(set(entries), names)
         for entry in entries.values():
             self.assertEqual(entry['adapter_flags'], 'upstream-cubic,local=192.168.0.1')
@@ -428,6 +479,45 @@ class AdaptationChecks(unittest.TestCase):
                 self.assertIn(policy, reason)
             self.assertTrue(entry['mapping']['assertions_preserved'])
             self.assertNotIn('blocked_reasons', entry)
+
+
+    def test_congestion_basic_selection_and_diagnostic_profiles(self):
+        manifest = json.loads((HERE / 'adaptations.json').read_text())
+        self.assertEqual(manifest['upstream_revision'], PIN['revision'])
+        selection = BASIC17 + CONGESTION18
+        self.assertEqual((len(BASIC17), len(CONGESTION18), len(set(selection))), (17, 18, 35))
+        self.assertTrue(set(selection) <= manifest['scripts'].keys())
+        cubic = {name for name, entry in manifest['scripts'].items()
+                 if not name.startswith('fast_recovery/')
+                 and entry['adapter_flags'].startswith('upstream-cubic,')
+                 and not entry.get('blocked_reasons')}
+        self.assertEqual(cubic, DEFAULTS_ONLY_CUBIC)
+        settings = manifest['scripts']['fast_recovery/prr-ss-10pkt-lost-1.pkt']['mapping']['ntcp_settings']
+        for name in DEFAULTS_ONLY_CUBIC:
+            entry = manifest['scripts'][name]
+            self.assertEqual(entry['mapping']['ntcp_settings'], settings)
+            self.assertTrue(entry['embedded_tcp_info'])
+            self.assertEqual(entry['expected_command_count'], 1)
+            self.assertEqual(entry['command_line'], '`../common/defaults.sh`\n')
+            self.assertTrue(entry['mapping']['assertions_preserved'])
+            self.assertFalse(entry['mapping']['linux_defaults_reproduced'])
+        blocked = {name for name in selection if manifest['scripts'][name].get('blocked_reasons')}
+        self.assertEqual(blocked, (set(CONGESTION18) - DEFAULTS_ONLY_CUBIC) | {
+            'blocking/blocking-write.pkt', 'syscall_bad_arg/fastopen-invalid-buf-ptr.pkt',
+        })
+        copied = manifest['scripts']['syscall_bad_arg/sendmsg-empty-iov.pkt']
+        self.assertEqual(copied['adapter_flags'], 'upstream-basic,local=192.168.0.1')
+        self.assertNotIn('blocked_reasons', copied)
+        self.assertIn('copied-fallback MSG_ZEROCOPY', copied['mapping']['claim'])
+        self.assertTrue(copied['mapping']['assertions_preserved'])
+        for name in blocked:
+            entry = manifest['scripts'][name]
+            self.assertTrue(entry['blocked_reasons'])
+            self.assertEqual(len(entry['audited_shell_commands']), entry['expected_command_count'])
+            for command in entry['audited_shell_commands']:
+                self.assertEqual(hashlib.sha256(command['command'].encode()).hexdigest(),
+                                 command['sha256'])
+                self.assertIn('Unavailable:', command['semantic_mapping'])
 
     def test_mapping_requires_allowlist_exact_flags_count_and_replacement(self):
         with self.assertRaisesRegex(ValueError, 'allowlisted'):
@@ -548,6 +638,109 @@ class AdaptationChecks(unittest.TestCase):
             self.assertEqual(main(), 1)
             execute.assert_not_called()
         self.assertEqual(json.loads(report.read_text())['counts'], {'adaptation_rejected': 3 * count})
+
+
+class PublishedSelectionChecks(unittest.TestCase):
+    def setUp(self):
+        # Optional pinned upstream checkout, as used by the runner itself.
+        self.checkout = Path(os.environ.get('NTCP_PACKETDRILL_CHECKOUT',
+                            HERE.parent.parent / 'workbench/packetdrill-upstream'))
+        self.directory = self.checkout / PIN['tcp_tests']
+        if not self.directory.is_dir():
+            self.skipTest('pinned packetdrill checkout unavailable; set NTCP_PACKETDRILL_CHECKOUT')
+        self.manifest = json.loads((HERE / 'adaptations.json').read_text())
+
+    def test_all_35_published_hashes_commands_and_nonsetup_bytes(self):
+        for name in BASIC17 + CONGESTION18:
+            with self.subTest(script=name):
+                entry = self.manifest['scripts'][name]
+                source = (self.directory / name).read_bytes()
+                self.assertEqual(hashlib.sha256(source).hexdigest(), entry['source_sha256'])
+                self.assertEqual(hashlib.sha256((self.directory / entry['setup_path']).read_bytes()).hexdigest(),
+                                 entry['setup_sha256'])
+                for extra in entry.get('additional_setup_files', []):
+                    self.assertEqual(hashlib.sha256((self.directory / extra['path']).read_bytes()).hexdigest(),
+                                     extra['sha256'])
+                commands = re.findall(rb'`[^`]*`', source)
+                self.assertEqual(len(commands), entry['expected_command_count'])
+                generated, audit = adapt_source(self.directory, name, self.manifest, entry['adapter_flags'])
+                if entry.get('blocked_reasons'):
+                    self.assertEqual([c['command'].encode() for c in entry['audited_shell_commands']], commands)
+                    self.assertEqual(generated, source)
+                    self.assertNotIn('generated_sha256', audit)
+                else:
+                    command = entry['command_line'].encode()
+                    self.assertEqual(source.count(command), 1)
+                    before, after = source.split(command)
+                    self.assertEqual(generated, before + entry['replacement_line'].encode() + after)
+                    self.assertEqual(preflight(generated.decode(), entry.get('embedded_tcp_info') is True), [])
+                    self.assertEqual(audit['generated_sha256'], hashlib.sha256(generated).hexdigest())
+                self.assertEqual((self.directory / name).read_bytes(), source)
+                if name in DEFAULTS_ONLY_CUBIC and b'SO_SNDBUF' in source:
+                    self.assertTrue(any('no SO_SNDBUF mapping' in r for r in entry['mapping']['reasons']))
+
+    def test_exact_35_selection_blocks_unmapped_setup_without_execution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            # Real sources and manifest; mock only the external executable boundary.
+            (checkout / PIN['tcp_tests']).parent.mkdir(parents=True)
+            (checkout / PIN['tcp_tests']).symlink_to(self.directory.resolve(), target_is_directory=True)
+            runner = checkout / PIN['runner']
+            runner.parent.mkdir(parents=True)
+            runner.write_text('unused')
+            runner.chmod(0o700)
+            plugin = checkout / 'plugin.so'
+            plugin.write_text('unused')
+            report = checkout / 'report.json'
+            selection = BASIC17 + CONGESTION18
+            executed = []
+
+            def execute(argv, cwd, timeout):
+                path = Path(argv[-1])
+                name = next(n for n in selection if Path(n).name == path.name)
+                entry = self.manifest['scripts'][name]
+                self.assertFalse(entry.get('blocked_reasons'), name)
+                self.assertNotIn(b'`', path.read_bytes())
+                if '--dry_run' in argv:
+                    return 0, False, ''
+                executed.append(name)
+                if name in DEFAULTS_ONLY_CUBIC:
+                    self.assertIn('PYTHONOPTIMIZE=0', argv)
+                    self.assertIn(f'LD_PRELOAD={plugin}', argv)
+                if b'SO_SNDBUF' in path.read_bytes() and name in DEFAULTS_ONLY_CUBIC:
+                    return 0, False, 'NTCP_PACKETDRILL_UNSUPPORTED: SO_SNDBUF'
+                return 1, False, 'packet mismatch'
+
+            tracked = '\0'.join(str(Path(PIN['tcp_tests']) / name)
+                                 for name in self.manifest['scripts'])
+            argv = ['run.py', '--checkout', str(checkout), '--plugin', str(plugin),
+                    '--suite', 'adapted', '--variant', 'ipv4', '--report', str(report)]
+            for name in selection:
+                argv.extend(['--script', name])
+            with patch('run.check_checkout', return_value=PIN['revision']), \
+                    patch('run.subprocess.check_output', return_value=tracked), \
+                    patch('run.invoke', side_effect=execute), patch.object(sys, 'argv', argv):
+                self.assertEqual(main(), 1)
+            data = json.loads(report.read_text())
+            self.assertEqual(data['selected_total'], 35)
+            self.assertEqual(data['script_files'], 35)
+            self.assertEqual({row['script'] for row in data['results']}, set(selection))
+            self.assertFalse(data['all_passed'])
+            self.assertEqual(len(executed), 21)
+            self.assertIn('syscall_bad_arg/sendmsg-empty-iov.pkt', executed)
+            for row in data['results']:
+                entry = self.manifest['scripts'][row['script']]
+                if entry.get('blocked_reasons'):
+                    self.assertEqual(row['status'], 'unsupported')
+                    self.assertEqual(row['reasons'], entry['blocked_reasons'])
+                    self.assertFalse(row['behavior_executed'])
+                    self.assertFalse(row['adapted'])
+                    self.assertIsNone(row['syntax_returncode'])
+                else:
+                    self.assertTrue(row['behavior_executed'])
+                    self.assertEqual(row['status'], 'unsupported' if row['script'] in DEFAULTS_ONLY_CUBIC
+                                     and b'SO_SNDBUF' in (self.directory / row['script']).read_bytes()
+                                     else 'failed')
 
 
 if __name__ == '__main__':
