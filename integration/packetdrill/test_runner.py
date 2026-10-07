@@ -28,6 +28,8 @@ class RunnerChecks(unittest.TestCase):
         text = '0 %{ assert tcpi_lost == 0 }%'
         self.assertTrue(preflight(text))
         self.assertEqual(preflight(text, embedded_tcp_info=True), [])
+        self.assertEqual(preflight('0 %{ assert tcpi_snd_cwnd == 7\n'
+                                   'assert tcpi_snd_ssthresh == 7 }%', True), [])
         self.assertTrue(preflight('0 %{ assert tcpi_pacing_rate == 0 }%', True))
         self.assertTrue(preflight('`sysctl something`\n' + text, True))
 
@@ -344,14 +346,16 @@ class AdaptationChecks(unittest.TestCase):
     def test_embedded_assertions_preserved_and_hash_bound(self):
         entry = self.manifest['scripts'][self.name]
         path = self.directory / self.name
-        original = self.source + b'0 %{ assert tcpi_lost == 0 }%\n'
+        original = (self.source + b'0 %{ assert tcpi_lost == 0\n'
+                    b'assert tcpi_snd_cwnd == 7\nassert tcpi_snd_ssthresh == 7 }%\n')
         path.write_bytes(original)
         entry['source_sha256'] = hashlib.sha256(original).hexdigest()
         with self.assertRaises(ValueError):
             adapt_source(self.directory, self.name, self.manifest, self.flags)
         entry['embedded_tcp_info'] = True
         generated, audit = adapt_source(self.directory, self.name, self.manifest, self.flags)
-        self.assertTrue(generated.endswith(b'0 %{ assert tcpi_lost == 0 }%\n'))
+        self.assertEqual(generated, original.replace(entry['command_line'].encode(),
+                                                    entry['replacement_line'].encode()))
         self.assertTrue(audit['embedded_tcp_info'])
         path.write_bytes(original.replace(b'== 0', b'== 1'))
         with self.assertRaisesRegex(ValueError, 'hash differs'):
@@ -394,6 +398,35 @@ class AdaptationChecks(unittest.TestCase):
                 self.assertEqual(entry['mapping']['ntcp_settings']['prr'], 'LegacyInitialCredit')
                 self.assertTrue(any('not claimed to conform to RFC 6937 or RFC 9937' in reason
                                     for reason in entry['mapping']['reasons']))
+
+    def test_only_four_prr_mappings_select_real_cubic_and_test_only_unpaced_prr(self):
+        names = {
+            'fast_recovery/prr-ss-10pkt-lost-1.pkt',
+            'fast_recovery/prr-ss-30pkt-lost-1_4-11_16.pkt',
+            'fast_recovery/prr-ss-30pkt-lost1_4.pkt',
+            'fast_recovery/prr-ss-ack-below-snd_una-cubic.pkt',
+        }
+        entries = {name: entry for name, entry in self.manifest['scripts'].items()
+                   if entry['adapter_flags'].startswith('upstream-cubic,')}
+        self.assertEqual(set(entries), names)
+        for entry in entries.values():
+            self.assertEqual(entry['adapter_flags'], 'upstream-cubic,local=192.168.0.1')
+            self.assertEqual(entry['mapping']['ntcp_settings'], {
+                'sack': True, 'timestamps': True, 'initial_window': 'Iw10',
+                'rack': True, 'prr': 'Rfc9937', 'prr_pacing': False, 'tlp': True,
+                'rto_min_us': 200000, 'preallocate_connections': 1,
+                'receive_capacity': 8388608, 'ecn': False, 'congestion_control': 'Cubic',
+            })
+            self.assertIn('full Linux recovery equivalence and conformance are not claimed',
+                          entry['mapping']['claim'])
+            self.assertIn('test-only pacing exception', entry['mapping']['claim'])
+            reason = entry['mapping']['reasons'][0]
+            for policy in ('unpublished isolated-test profile', 'same-time Linux aggregated bursts',
+                           'section 6.4 RECOMMENDED pacing', 'delivery, credit and exit equations',
+                           'core default stays paced'):
+                self.assertIn(policy, reason)
+            self.assertTrue(entry['mapping']['assertions_preserved'])
+            self.assertNotIn('blocked_reasons', entry)
 
     def test_mapping_requires_allowlist_exact_flags_count_and_replacement(self):
         with self.assertRaisesRegex(ValueError, 'allowlisted'):

@@ -280,6 +280,7 @@ enum Profile {
     UpstreamWindow8,
     Sack,
     UpstreamSack,
+    UpstreamCubic,
     UpstreamEcn,
     UpstreamBasic,
 }
@@ -301,6 +302,7 @@ fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
                 "upstream-window8" => Profile::UpstreamWindow8,
                 "sack" => Profile::Sack,
                 "upstream-sack" => Profile::UpstreamSack,
+                "upstream-cubic" => Profile::UpstreamCubic,
                 "upstream-ecn" => Profile::UpstreamEcn,
                 "upstream-basic" => Profile::UpstreamBasic,
                 _ => return Err(unsupported("unknown so_flags token")),
@@ -387,10 +389,22 @@ impl Drop for Adapter {
     }
 }
 impl Owner {
-    fn new((local, profile): (Ipv4Addr, Profile)) -> Result<Self> {
+    fn new(settings: (Ipv4Addr, Profile)) -> Result<Self> {
+        // Unpublished isolated-test profile: match Linux's same-time bursts.
+        // Exception to RFC 9937 section 6.4 RECOMMENDED pacing, not PRR equations.
+        Self::new_with_prr_pacing(settings, settings.1 != Profile::UpstreamCubic)
+    }
+
+    fn new_with_prr_pacing(
+        (local, profile): (Ipv4Addr, Profile),
+        prr_pacing: bool,
+    ) -> Result<Self> {
         let upstream = matches!(
             profile,
-            Profile::UpstreamSack | Profile::UpstreamEcn | Profile::UpstreamBasic
+            Profile::UpstreamSack
+                | Profile::UpstreamCubic
+                | Profile::UpstreamEcn
+                | Profile::UpstreamBasic
         );
         let mut config = EndpointConfig {
             max_connections: LIMIT,
@@ -404,6 +418,7 @@ impl Owner {
             // Real receive storage: 8 MiB requires scale 8, not 7 (65535 << 7).
             Profile::UpstreamWindow8
             | Profile::UpstreamSack
+            | Profile::UpstreamCubic
             | Profile::UpstreamEcn
             | Profile::UpstreamBasic => 8 * 1024 * 1024,
         };
@@ -428,12 +443,19 @@ impl Owner {
         };
         // Explicit synchronized local-abort formatting, not a reactive RST policy.
         config.connection.abort_with_ack = profile == Profile::UpstreamBasic;
+        config.connection.congestion_algorithm = if profile == Profile::UpstreamCubic {
+            ntcp::CongestionAlgorithm::Cubic
+        } else {
+            ntcp::CongestionAlgorithm::Reno
+        };
         config.connection.timestamps = upstream;
         config.connection.rack = upstream;
         config.connection.prr = upstream;
-        if upstream {
+        if upstream && profile != Profile::UpstreamCubic {
             config.connection.prr_algorithm = ntcp::PrrAlgorithm::LegacyInitialCredit;
         }
+        // UpstreamCubic keeps RFC 9937 accounting and exit cwnd.
+        config.connection.prr_pacing = prr_pacing;
         config.connection.tlp = upstream;
         if upstream {
             // Explicit Linux timing compatibility; the core keeps RFC 6298's

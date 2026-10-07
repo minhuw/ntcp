@@ -760,7 +760,14 @@ fn profiles_require_one_selection_and_one_ipv4_address() {
         profile("upstream-sack,local=192.0.2.1").unwrap(),
         (local(), Profile::UpstreamSack)
     );
+    assert_eq!(
+        profile("upstream-cubic,local=192.0.2.1").unwrap(),
+        (local(), Profile::UpstreamCubic)
+    );
     for flags in [
+        "upstream-cubic",
+        "upstream-cubic,upstream-sack,local=192.0.2.1",
+        "upstream-cubic,upstream-cubic,local=192.0.2.1",
         "",
         "upstream-sack",
         "upstream-sack,sack,local=192.0.2.1",
@@ -1137,6 +1144,17 @@ fn upstream_sack_rto_uses_linux_floor_while_baseline_keeps_core_floor() {
         let info = owner.endpoint.transport_info(id).unwrap();
         assert_eq!(info.rtt_us, Some(100_000));
         assert_eq!(info.rto_us, floor, "{profile:?}");
+        // Query the real owner snapshot after ACK-driven cwnd growth. Never
+        // substitute the upstream CUBIC script's expected seven segments.
+        let (mut query, _) = request(18, fd, 1, vec![], TCP_INFO_SIZE);
+        let data = owner.execute(&mut query).unwrap().unwrap().bytes;
+        for (offset, actual) in [(76, info.ssthresh), (80, info.cwnd)] {
+            assert_eq!(
+                u32::from_ne_bytes(data[offset..offset + 4].try_into().unwrap()),
+                actual / info.mss,
+                "{profile:?} TCP_INFO offset {offset}"
+            );
+        }
     }
 }
 
@@ -1475,6 +1493,7 @@ fn upstream_profiles_use_iw10() {
         (Profile::UpstreamWindow8, 4380),
         (Profile::Sack, 4380),
         (Profile::UpstreamSack, 14600),
+        (Profile::UpstreamCubic, 14600),
         (Profile::UpstreamEcn, 14600),
         (Profile::UpstreamBasic, 14600),
     ] {
@@ -2185,10 +2204,17 @@ fn transport_encoding_counts_recovery_and_invalid_ledger() {
         .unwrap();
     let data = transport_option(info, 1).unwrap();
     assert_eq!(data.len(), 280);
-    assert_eq!(
-        u32::from_ne_bytes(data[80..84].try_into().unwrap()),
-        info.cwnd / info.mss
-    );
+    for (offset, actual) in [(76, info.ssthresh), (80, info.cwnd)] {
+        assert_eq!(
+            u32::from_ne_bytes(data[offset..offset + 4].try_into().unwrap()),
+            actual / info.mss
+        );
+    }
+    // Distinct non-MSS-multiple byte values verify truncating segment units,
+    // including during recovery, rather than a hard-coded CUBIC expectation.
+    info.mss = 1000;
+    info.cwnd = 5999;
+    info.ssthresh = 8999;
     // Exercise each ABI category independently of packet sequence fixtures.
     info.unacked = 10;
     info.sacked = 3;
@@ -2204,7 +2230,10 @@ fn transport_encoding_counts_recovery_and_invalid_ledger() {
     }
     assert_eq!(data[1], 1);
     info.recovery = true;
-    assert_eq!(transport_option(info, 1).unwrap()[1], 3);
+    let data = transport_option(info, 1).unwrap();
+    assert_eq!(data[1], 3);
+    assert_eq!(u32::from_ne_bytes(data[76..80].try_into().unwrap()), 8);
+    assert_eq!(u32::from_ne_bytes(data[80..84].try_into().unwrap()), 5);
     info.loss = true;
     assert_eq!(transport_option(info, 1).unwrap()[1], 4);
     info.ledger_valid = false;
@@ -2520,5 +2549,134 @@ fn native_tcp_shutdown_precedes_inaccessible_send_payload() {
         assert_eq!(sendmsg(stream.as_raw_fd(), &msg, MSG_NOSIGNAL), -1);
         assert_eq!(*__errno_location(), EPIPE);
         assert_eq!(munmap(payload, 4096), 0);
+    }
+}
+
+#[test]
+fn cubic_real_loss_snapshot_and_upstream_reno_independence() {
+    for (profile, pacing, threshold) in [
+        (Profile::UpstreamCubic, Some(true), 7),
+        (Profile::UpstreamCubic, Some(false), 7),
+        (Profile::UpstreamCubic, None, 7),
+        (Profile::UpstreamSack, Some(true), 5),
+        (Profile::UpstreamSack, Some(false), 5),
+        (Profile::UpstreamSack, None, 5),
+    ] {
+        let mut owner = match pacing {
+            Some(pacing) => Owner::new_with_prr_pacing((local(), profile), pacing),
+            None => Owner::new((local(), profile)),
+        }
+        .unwrap();
+        // Default CUBIC matches explicit false; legacy Reno ignores pacing.
+        let pacing = pacing.unwrap_or(profile != Profile::UpstreamCubic);
+        let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
+        let (mut connect, _) = request(
+            5,
+            fd,
+            0,
+            encode_addr(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080)),
+            0,
+        );
+        assert_eq!(owner.execute(&mut connect).err(), Some(EINPROGRESS));
+        let id = owner.connection(fd).unwrap();
+        let mut tcp = vec![0; BYTES];
+        let now = owner.now();
+        let tx = owner
+            .endpoint
+            .poll_transmit(now, &mut tcp, BUDGET)
+            .unwrap()
+            .packet
+            .unwrap();
+        let syn = ntcp::wire::parse(tx.ip, &tcp[..tx.len]).unwrap().header;
+        let (ip, mut ack) = reverse_ack(tx, syn, syn.sequence.wrapping_add(1));
+        ack.sequence = 100;
+        ack.flags |= ntcp::wire::SYN;
+        let n = ntcp::wire::encode(ip, ack, &[2, 4, 3, 232, 1, 1, 4, 2], &[], &mut tcp).unwrap();
+        owner.endpoint.input(now + 10_000, ip, &tcp[..n]).unwrap();
+        owner
+            .endpoint
+            .poll_transmit(now + 10_000, &mut tcp, BUDGET)
+            .unwrap();
+        owner.endpoint.write(id, &[0; 10_000]).unwrap();
+        let mut emitted = 0;
+        while let Some(tx) = owner
+            .endpoint
+            .poll_transmit(now + 10_000, &mut tcp, BUDGET)
+            .unwrap()
+            .packet
+        {
+            emitted += ntcp::wire::parse(tx.ip, &tcp[..tx.len])
+                .unwrap()
+                .payload
+                .len();
+        }
+        assert_eq!(
+            emitted,
+            if profile == Profile::UpstreamCubic && pacing {
+                1000
+            } else {
+                10_000
+            }
+        );
+        for tick in 11..=19 {
+            owner
+                .endpoint
+                .on_timeout(now + tick * 1000, BUDGET)
+                .unwrap();
+            while let Some(tx) = owner
+                .endpoint
+                .poll_transmit(now + tick * 1000, &mut tcp, BUDGET)
+                .unwrap()
+                .packet
+            {
+                emitted += ntcp::wire::parse(tx.ip, &tcp[..tx.len])
+                    .unwrap()
+                    .payload
+                    .len();
+            }
+        }
+        assert_eq!(emitted, 10_000);
+        assert_eq!(owner.endpoint.transport_info(id).unwrap().cwnd, 10_000);
+        ack.sequence = 101;
+        ack.flags = ntcp::wire::ACK;
+        for i in 0..3 {
+            let mut sack = vec![5, 10];
+            sack.extend_from_slice(&ack.acknowledgment.wrapping_add(1000).to_be_bytes());
+            sack.extend_from_slice(
+                &ack.acknowledgment
+                    .wrapping_add(2000 + i * 1000)
+                    .to_be_bytes(),
+            );
+            sack.extend_from_slice(&[1, 1]);
+            let n = ntcp::wire::encode(ip, ack, &sack, &[], &mut tcp).unwrap();
+            owner
+                .endpoint
+                .input(now + 40_000 + u64::from(i) * 2000, ip, &tcp[..n])
+                .unwrap();
+        }
+        assert_eq!(
+            owner.endpoint.transport_info(id).unwrap().ssthresh,
+            threshold * 1000
+        );
+        ack.acknowledgment = ack.acknowledgment.wrapping_add(10_000);
+        let n = ntcp::wire::encode(ip, ack, &[], &[], &mut tcp).unwrap();
+        owner.endpoint.input(now + 50_000, ip, &tcp[..n]).unwrap();
+        let info = owner.endpoint.transport_info(id).unwrap();
+        assert_eq!(
+            info.cwnd,
+            if profile == Profile::UpstreamCubic {
+                7000
+            } else {
+                2000
+            }
+        );
+        let (mut query, _) = request(18, fd, 1, vec![], TCP_INFO_SIZE);
+        let bytes = owner.execute(&mut query).unwrap().unwrap().bytes;
+        for (offset, value) in [(76, info.ssthresh), (80, info.cwnd)] {
+            assert_eq!(
+                u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap()),
+                value / 1000
+            );
+        }
     }
 }

@@ -18,7 +18,8 @@ PIN = json.loads((HERE / 'upstream.json').read_text())
 
 
 TCP_INFO_FIELDS = {'tcpi_ca_state', 'tcpi_unacked', 'tcpi_sacked',
-                   'tcpi_lost', 'tcpi_retrans', 'tcpi_reordering'}
+                   'tcpi_lost', 'tcpi_retrans', 'tcpi_reordering',
+                   'tcpi_snd_cwnd', 'tcpi_snd_ssthresh'}
 
 
 def preflight(text, embedded_tcp_info=False):
