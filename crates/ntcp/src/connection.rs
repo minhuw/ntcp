@@ -2320,15 +2320,12 @@ impl Connection {
             return Err(Error::WouldBlock);
         }
         self.received_read = self.received_read.saturating_add(count as u64);
-        let credit = self
-            .receive
-            .right_edge()
-            .distance_from(self.advertised_edge);
-        if count != 0
-            && !self.receive.eof()
-            && credit < 1 << 31
-            && credit >= self.window_threshold()
-        {
+        // Only credit that an ordinary ACK can actually offer is useful:
+        // backing storage may exceed the wire cap, or be below a scale unit.
+        let shift = if self.scaling { self.local_scale } else { 0 };
+        let credit = (u32::from(self.advertised_window(false)) << shift)
+            .saturating_sub(self.receive_window());
+        if count != 0 && !self.receive.eof() && credit >= self.window_threshold() {
             self.immediate_ack();
         }
         Ok(count)
@@ -4160,6 +4157,7 @@ impl Connection {
     }
 
     fn window_threshold(&self) -> u32 {
+        // RFC 9293 section 3.8.6.2.2: min(Fr * RCV.BUFF, Eff.snd.MSS), Fr = 1/2.
         (self.config.receive_capacity / 2).max(1).min(self.mss) as u32
     }
 
@@ -4208,7 +4206,8 @@ impl Connection {
         let unit = 1u32 << shift;
         let available = self.receive.right_edge().distance_from(self.receive.next());
         let old = self.receive_window();
-        let candidate = available / unit;
+        // Apply both wire limits before SWS avoidance, not just at encoding.
+        let candidate = (available / unit).min(u32::from(u16::MAX));
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
         //= reason=Retains prior acceptance credit; RFC 7323 rounding can retract the encoded edge by less than one scale unit.
         //# A TCP receiver SHOULD NOT shrink the window, i.e., move the right window
@@ -4218,9 +4217,9 @@ impl Connection {
         // promise separately so in-flight bytes remain acceptable.
         let old_field = old.div_ceil(unit).min(candidate);
         if candidate.saturating_mul(unit).saturating_sub(old) >= self.window_threshold() {
-            candidate.min(65535) as u16
+            candidate as u16
         } else {
-            old_field.min(65535) as u16
+            old_field as u16
         }
     }
 
@@ -16908,6 +16907,142 @@ mod tests {
     }
 
     #[test]
+    fn read_credit_unscaled_wire_cap_does_not_schedule_redundant_ack() {
+        let cfg = ConnectionConfig {
+            delayed_ack_us: 0,
+            ..config(8 * 1024 * 1024, 1460)
+        };
+        // Peer offers MSS=1000 but no WS, as in ioctl-siocinq-fin.pkt.
+        let mut bytes = [0; 64];
+        let n = wire::encode(
+            ip(tuple()),
+            Header {
+                source_port: 1000,
+                destination_port: 2000,
+                sequence: 0,
+                acknowledgment: 0,
+                flags: SYN,
+                window: 20000,
+                urgent_pointer: 0,
+            },
+            &[2, 4, 3, 232],
+            b"",
+            &mut bytes,
+        )
+        .unwrap();
+        let syn = wire::parse(ip(tuple()), &bytes[..n]).unwrap();
+        let mut b = Connection::passive(reverse(tuple()), cfg, 900, 0, &syn).unwrap();
+        packet(&mut b, 10);
+        let ack = b.snd_nxt;
+        inject(&mut b, 20, Seq(1), ack, ACK, 20000, b"");
+        assert!(!b.scaling);
+        assert_eq!(b.window_threshold(), 1000);
+        for (time, count, window) in [
+            (30, 500, u16::MAX - 500), // Capped credit below MSS stays withheld.
+            (40, 500, u16::MAX),
+            (50, 1000, u16::MAX),
+            (60, 2000, u16::MAX),
+        ] {
+            let next = b.receive.next();
+            inject(&mut b, time, next, ack, ACK, 20000, &vec![1; count]);
+            let bytes = packet(&mut b, time);
+            let segment = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+            assert_eq!(segment.header.window, window);
+            let promised = b.advertised_edge;
+            assert_eq!(b.read(&mut vec![0; count]), Ok(count));
+            assert_eq!(b.advertised_window(false), window);
+            assert_eq!(b.advertised_edge, promised);
+            assert!(!b.ack_pending);
+            assert_eq!(b.transmit(time + 1, &mut [0; 64]), Ok(None));
+        }
+        let next = b.receive.next();
+        inject(&mut b, 70, next, ack, ACK | FIN, 20000, b"");
+        let bytes = packet(&mut b, 70);
+        let segment = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+        assert_eq!(segment.header.acknowledgment, next.wrapping_add(1).0);
+    }
+
+    #[test]
+    fn read_credit_scaled_waits_for_encodable_sws_credit() {
+        for mss in [1000, 1460] {
+            let cfg = ConnectionConfig {
+                delayed_ack_us: 0,
+                ..config(8 * 1024 * 1024, mss)
+            };
+            let (_, mut b) = pair(cfg, u32::MAX - 2048);
+            assert_eq!(b.local_scale, 8);
+            let next = b.receive.next();
+            let ack = b.snd_una;
+            let count = if mss == 1000 { 1000 } else { 2048 };
+            inject(&mut b, 40, next, ack, ACK, 20000, &vec![1; count]);
+            packet(&mut b, 40);
+            let promised = b.advertised_edge;
+            assert_eq!(b.read(&mut [0; 1000]), Ok(1000));
+            if mss == 1460 {
+                assert!(!b.ack_pending);
+                assert_eq!(b.transmit(41, &mut [0; 64]), Ok(None));
+                // Raw freed credit meets MSS, but floor(1460 / 256) does not.
+                assert_eq!(b.read(&mut [0; 460]), Ok(460));
+                assert!(!b.ack_pending);
+                assert_eq!(b.transmit(42, &mut [0; 64]), Ok(None));
+                assert_eq!(b.read(&mut [0; 76]), Ok(76));
+            }
+            // MSS=1000 intentionally still sends the useful 1024-byte update;
+            // Linux's shutdown-wr-close script expects silence here.
+            assert!(b.ack_pending);
+            let bytes = packet(&mut b, 43);
+            let segment = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+            let encoded_edge = Seq(segment.header.acknowledgment)
+                .wrapping_add(u32::from(segment.header.window) << b.local_scale);
+            let credit = if mss == 1000 { 1024 } else { 1536 };
+            assert_eq!(encoded_edge.distance_from(promised), credit);
+            assert_eq!(b.advertised_edge, encoded_edge);
+            assert!(at_or_after(b.receive.right_edge(), encoded_edge));
+            assert_eq!(b.transmit(44, &mut [0; 64]), Ok(None));
+        }
+    }
+
+    #[test]
+    fn read_credit_reopens_zero_window_at_sws_threshold() {
+        for (capacity, mss) in [(64, 32), (65536, 1460)] {
+            let cfg = ConnectionConfig {
+                delayed_ack_us: 0,
+                ..config(capacity, mss)
+            };
+            let (_, mut b) = pair(cfg, u32::MAX - 32);
+            b.immediate_ack();
+            packet(&mut b, 40); // Advertise full scaled credit after SYN.
+            let ack = b.snd_una;
+            let mut remaining = capacity;
+            while remaining != 0 {
+                let count = remaining.min(32768);
+                let next = b.receive.next();
+                inject(&mut b, 41, next, ack, ACK, 20000, &vec![1; count]);
+                packet(&mut b, 41);
+                remaining -= count;
+            }
+            assert_eq!(b.receive_window(), 0);
+            assert_eq!(b.advertised_window(false), 0);
+            let promised = b.advertised_edge;
+            let threshold = b.window_threshold() as usize;
+            assert_eq!(b.read(&mut vec![0; threshold - 1]), Ok(threshold - 1));
+            assert!(!b.ack_pending);
+            assert_eq!(b.advertised_window(false), 0);
+            assert_eq!(b.transmit(42, &mut [0; 64]), Ok(None));
+            assert_eq!(b.read(&mut [0; 1]), Ok(1));
+            assert!(b.ack_pending);
+            let bytes = packet(&mut b, 43);
+            let segment = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+            assert_eq!(
+                u32::from(segment.header.window) << b.local_scale,
+                threshold as u32
+            );
+            assert_eq!(b.advertised_edge.distance_from(promised), threshold as u32);
+            assert_eq!(b.transmit(44, &mut [0; 64]), Ok(None));
+        }
+    }
+
+    #[test]
     fn eof_reads_do_not_generate_an_unbounded_ack_stream() {
         let (mut a, mut b) = pair(config(64, 8), 100);
         b.shutdown().unwrap();
@@ -20931,10 +21066,20 @@ mod tests {
                 inject(&mut a, 42, next.wrapping_add(1), ack, ACK, 9, b"");
                 assert_eq!(a.snd_wnd, 9u32 << shift);
                 a.immediate_ack();
-                let expected = ((capacity - 1) >> shift).min(65535) as u16;
+                // Without WS, the one byte below the wire cap is sub-MSS
+                // credit: preserve the old edge rather than advancing it.
+                let expected = if offered {
+                    ((capacity - 1) >> shift).min(65535) as u16
+                } else {
+                    (capacity.min(65535) - 1) as u16
+                };
+                let promised = a.advertised_edge;
                 let bytes = packet(&mut a, 43);
                 let seg = wire::parse(ip(tuple()), &bytes).unwrap();
                 assert_eq!(seg.header.window, expected);
+                if !offered {
+                    assert_eq!(a.advertised_edge, promised);
+                }
                 assert!(seg.options.window_scale.is_none());
             }
         }
