@@ -2517,7 +2517,7 @@ impl Connection {
     //# In this case, a TCP sender SHOULD use this SACK information when determining
     //# what data should be sent in each segment following an RTO.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Validated negotiated ACKs update in-flight ranges; stale/future/DSACK-only blocks cannot count as fresh delivery.
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Validated negotiated ACKs, including reordered ACKs, update live in-flight ranges; malformed/future/DSACK-only blocks cannot count as fresh delivery.
     //# Upon the receipt of any ACK containing SACK information, the scoreboard MUST
     //# be updated via the Update () routine.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
@@ -3238,18 +3238,23 @@ impl Connection {
         //# NOT send new segments in response to duplicate ACKs that contain no new SACK information,
         //# as a misbehaving receiver can generate such ACKs to trigger inappropriate transmission of
         //# data segments.
-        let sack_evidence = if self.sack_receive
-            && at_or_after(ack, self.snd_una)
-            && self.sack_fallback.is_none_or(|end| at_or_after(ack, end))
-        {
+        // RFC5961 ACK bounds were checked above. A reordered ACK may carry
+        // fresh SACK evidence, but cannot move the cumulative edge backwards.
+        let live_ack = if advancing { ack } else { self.snd_una };
+        let sack_allowed =
+            self.sack_receive && self.sack_fallback.is_none_or(|end| at_or_after(ack, end));
+        let sack_evidence = if sack_allowed {
             let cumulative_delivery = if advancing {
                 self.scoreboard.unsacked_bytes(self.snd_una, ack)
             } else {
                 0
             };
-            let update =
-                self.scoreboard
-                    .update(ack, self.data_high(), &segment.options.sack_blocks);
+            let update = self.scoreboard.update_with_packet_ack(
+                live_ack,
+                ack,
+                self.data_high(),
+                &segment.options.sack_blocks,
+            );
             dsack = update.dsack;
             if update.overflow {
                 // SACK advice exhaustion disables inference, never timestamp
@@ -3266,7 +3271,7 @@ impl Connection {
                 self.reset_limited_transmit();
             }
             let ledger_delivery = self.rack.acknowledge(
-                ack,
+                live_ack,
                 self.data_high(),
                 &self.scoreboard,
                 now,
@@ -3336,10 +3341,8 @@ impl Connection {
                 segment.options.timestamps.map(|ts| ts.1),
             );
         }
-        if at_or_after(ack, self.snd_una)
-            && let Some(mut recovery) = self.sack_recovery
-        {
-            if at_or_after(ack, recovery.recovery_point) {
+        if let Some(mut recovery) = self.sack_recovery {
+            if at_or_after(self.snd_una, recovery.recovery_point) {
                 if self.prr.is_some() && self.config.prr_algorithm == PrrAlgorithm::Rfc9937 {
                     self.congestion.complete_prr();
                     #[cfg(test)]
@@ -9825,6 +9828,231 @@ mod tests {
         a
     }
 
+    #[test]
+    fn reordered_ack_delivers_fresh_sack_once_and_commits_only_successful_output() {
+        for iss in [0, u32::MAX - 4999] {
+            for rack in [false, true] {
+                for algorithm in [PrrAlgorithm::Rfc9937, PrrAlgorithm::LegacyInitialCredit] {
+                    let mut a = strict_flight(iss);
+                    a.config.rack = rack;
+                    a.config.prr_algorithm = algorithm;
+                    rack_sack(&mut a, 200_000, 4000, &[(7000, 8000)]);
+                    assert!(a.prr.is_none());
+                    if rack {
+                        // RACK allows reordered originals a settling interval;
+                        // enter on its existing timer, not RFC6675 IsLost.
+                        a.timeout(225_000).unwrap();
+                        assert!(a.prr.is_some());
+                    }
+                    let delivered_before = a.prr.map_or(0, |p| p.counters().1);
+                    let base = a.iss.wrapping_add(1);
+                    let storage = (a.snd_una, a.send_base, a.send.len(), a.snd_nxt);
+                    let window = (a.snd_wnd, a.wl1, a.wl2, a.max_snd_wnd);
+                    let timer = a.rto_deadline;
+                    // Packet ACK=3001 after UNA=4001, SACK=5001:7001.
+                    inject_sack(
+                        &mut a,
+                        226_000,
+                        Seq(901),
+                        base.wrapping_add(3000),
+                        ACK | ECE,
+                        1,
+                        &[],
+                        &[(base.wrapping_add(5000).0, base.wrapping_add(7000).0)],
+                    );
+                    assert!(a.ecn_feedback());
+                    assert_eq!((a.snd_una, a.send_base, a.send.len(), a.snd_nxt), storage);
+                    assert_eq!((a.snd_wnd, a.wl1, a.wl2, a.max_snd_wnd), window);
+                    assert_eq!(a.rto_deadline, timer);
+                    assert_eq!(a.congestion.ssthresh(), 3000); // Loss, not stale ECE.
+                    assert_eq!(
+                        a.scoreboard.ranges(),
+                        &[(base.wrapping_add(5000), base.wrapping_add(8000))]
+                    );
+                    let prr = a.prr.unwrap();
+                    assert_eq!(prr.counters().1, delivered_before + 2000); // No replay of earlier delivery.
+                    assert!(prr.credit() > 0);
+                    let recovery = a.sack_recovery.unwrap();
+                    assert_eq!(recovery.pipe, a.recovery_pipe(recovery.high_rxt));
+                    assert_eq!(
+                        a.transmit(226_000, &mut [0; 20]),
+                        Err(Error::OutputTooSmall)
+                    );
+                    assert_eq!(a.prr.unwrap().counters(), prr.counters());
+                    assert_eq!(a.prr.unwrap().credit(), prr.credit());
+                    assert_eq!(a.sack_recovery.unwrap().high_rxt, recovery.high_rxt);
+                    // Replaying the ACK cannot grant delivery or extra credit.
+                    rack_sack(&mut a, 227_000, 3000, &[(5000, 7000)]);
+                    assert_eq!(a.prr.unwrap().counters(), prr.counters());
+                    assert_eq!(a.prr.unwrap().credit(), prr.credit());
+                    assert_eq!(a.rack.ack_sample, None);
+                    let (_, bytes) = prr_packet(&mut a, 227_000);
+                    assert!(bytes > 0 && bytes <= prr.credit() as usize);
+                    assert_eq!(a.prr.unwrap().counters().2, bytes as u64);
+                    let committed = a.prr.unwrap();
+                    rack_sack(&mut a, 228_000, 3000, &[(5000, 7000)]);
+                    assert_eq!(a.prr.unwrap().counters(), committed.counters());
+                    assert_eq!(a.prr.unwrap().credit(), committed.credit());
+                    // Cumulative coverage of already SACKed data adds only the hole.
+                    rack_sack(&mut a, 229_000, 8000, &[]);
+                    assert_eq!(a.prr.unwrap().counters().1, delivered_before + 3000);
+                    assert!(a.scoreboard.ranges().is_empty());
+                    assert_eq!(a.send.len(), 2000);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reordered_ack_wire_dsack_classification_and_live_trim_are_independent() {
+        for iss in [0, u32::MAX - 4999] {
+            let mut a = strict_flight(iss);
+            a.config.rack = false; // Keep loss detection out of this classification check.
+            rack_sack(&mut a, 200_000, 4000, &[]);
+            let state = (a.snd_una, a.send_base, a.send.len());
+            let adaptation = a.rack.adaptation();
+            // Below current UNA, but ABOVE the ACK in this packet: not DSACK.
+            rack_sack(&mut a, 201_000, 3000, &[(3100, 3900)]);
+            assert_eq!(a.rack.adaptation(), adaptation);
+            assert!(a.scoreboard.ranges().is_empty());
+            assert_eq!(a.rack.ack_sample, None);
+            // A crossing ordinary block records only the still-live suffix.
+            rack_sack(&mut a, 202_000, 3000, &[(3500, 4500)]);
+            let base = a.iss.wrapping_add(1);
+            assert_eq!(
+                a.scoreboard.ranges(),
+                &[(base.wrapping_add(4000), base.wrapping_add(4500))]
+            );
+            assert_eq!(a.rack.adaptation(), adaptation);
+            // Containment must be classified before clipping to the live base.
+            rack_sack(&mut a, 203_000, 3000, &[(3200, 3300), (3100, 3900)]);
+            assert_eq!(a.rack.adaptation().0, adaptation.0 + 1);
+            assert_eq!(a.rack.ack_sample, None);
+            assert_eq!((a.snd_una, a.send_base, a.send.len()), state);
+            // Below the packet ACK is a true DSACK, still never delivery.
+            let mut b = strict_flight(iss);
+            b.config.rack = false;
+            rack_sack(&mut b, 200_000, 4000, &[]);
+            let adaptation = b.rack.adaptation();
+            rack_sack(&mut b, 201_000, 3000, &[(2000, 2500)]);
+            assert_eq!(b.rack.adaptation().0, adaptation.0 + 1);
+            assert!(b.scoreboard.ranges().is_empty());
+            assert_eq!(b.rack.ack_sample, None);
+            assert_eq!((b.snd_una, b.send_base, b.send.len()), state);
+        }
+    }
+
+    #[test]
+    fn reordered_ack_sack_security_bounds_and_fallback_remain_gated() {
+        for iss in [0, u32::MAX - 4999] {
+            let mut a = strict_flight(iss);
+            a.config.rack = false;
+            rack_sack(&mut a, 200_000, 4000, &[]);
+            let base = a.iss.wrapping_add(1);
+            let state = (a.snd_una, a.send_base, a.send.len(), a.snd_wnd);
+            for (i, block) in [
+                (5000, 5000),
+                (7000, 5000),
+                (5000, 10_001),
+                (5000 + (1 << 31), 7000),
+                (2000, 5000),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                rack_sack(&mut a, 201_000 + i as u64, 3000, &[block]);
+                assert!(a.scoreboard.ranges().is_empty());
+                assert!(a.prr.is_none());
+                assert_eq!(a.rack.ack_sample, None);
+            }
+            let seq = a.receive.next();
+            for (i, ack) in [
+                a.snd_nxt.wrapping_add(1),
+                a.snd_una.wrapping_add(0u32.wrapping_sub(a.max_snd_wnd + 1)),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                inject_sack(
+                    &mut a,
+                    202_000 + i as u64,
+                    seq,
+                    ack,
+                    ACK | ECE,
+                    1,
+                    &[],
+                    &[(base.wrapping_add(5000).0, base.wrapping_add(7000).0)],
+                );
+                assert!(a.scoreboard.ranges().is_empty());
+                assert!(a.prr.is_none());
+            }
+            assert_eq!((a.snd_una, a.send_base, a.send.len(), a.snd_wnd), state);
+            // Advice exhaustion/RTO fallback cannot be bypassed by an old ACK.
+            a.sack_fallback = Some(a.data_high());
+            rack_sack(&mut a, 203_000, 3000, &[(5000, 7000)]);
+            assert!(a.scoreboard.ranges().is_empty());
+            assert!(a.prr.is_none());
+            assert_eq!(a.sack_fallback, Some(a.data_high()));
+        }
+    }
+
+    #[test]
+    fn reordered_ack_scoreboard_overflow_cancels_recovery_without_delivery() {
+        for iss in [0, u32::MAX - 4999] {
+            let mut a = strict_flight(iss);
+            a.config.rack = false;
+            rack_sack(&mut a, 200_000, 4000, &[(7000, 8000)]);
+            rack_sack(&mut a, 201_000, 3000, &[(5000, 7000)]);
+            assert!(a.prr.is_some());
+            let state = (a.snd_una, a.send_base, a.send.len(), a.snd_nxt);
+            // Production backing fits every live byte union. Artificially
+            // shrink it to exercise defensive overflow on a reordered ACK.
+            a.scoreboard = Scoreboard::with_capacity(2).unwrap();
+            rack_sack(&mut a, 202_000, 3000, &[(5000, 5001), (7000, 7001)]);
+            assert!(a.scoreboard.ranges().is_empty());
+            assert!(a.prr.is_none() && a.sack_recovery.is_none());
+            assert_eq!(a.sack_fallback, Some(a.data_high()));
+            assert_eq!((a.snd_una, a.send_base, a.send.len(), a.snd_nxt), state);
+            rack_sack(&mut a, 203_000, 3000, &[(5000, 7000)]);
+            assert!(a.scoreboard.ranges().is_empty());
+            assert!(a.prr.is_none());
+        }
+    }
+
+    #[test]
+    fn reordered_ack_does_not_enable_sack_on_default_connection() {
+        for iss in [0, u32::MAX - 4999] {
+            let (mut a, _) = pair(config(16_384, 1000), iss);
+            assert!(!a.sack_receive && !a.config.sack);
+            a.write(&[0x55; 4000]).unwrap();
+            for _ in 0..4 {
+                packet(&mut a, 100_000);
+            }
+            rack_sack(&mut a, 200_000, 1000, &[]);
+            let state = (
+                a.snd_una,
+                a.send_base,
+                a.send.len(),
+                a.snd_wnd,
+                a.congestion.cwnd(),
+            );
+            rack_sack(&mut a, 201_000, 0, &[(2000, 4000)]);
+            assert_eq!(
+                (
+                    a.snd_una,
+                    a.send_base,
+                    a.send.len(),
+                    a.snd_wnd,
+                    a.congestion.cwnd()
+                ),
+                state
+            );
+            assert!(a.scoreboard.ranges().is_empty());
+            assert!(a.sack_recovery.is_none() && a.prr.is_none());
+            assert_eq!(a.duplicate_acks, 0);
+        }
+    }
+
     // Independent RFC9937 equation oracle for every ACK and successful
     // packet in the strict traces. The boundary ACK exits the epoch; it cannot
     // grant PRR output afterward. RTO/overflow/persist cancellation is separate.
@@ -13449,7 +13677,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc6675#section-5
     //= type=test
-    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Validated negotiated ACKs update in-flight ranges; stale/future/DSACK-only blocks cannot count as fresh delivery.
+    //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. Validated negotiated ACKs, including reordered ACKs, update live in-flight ranges; malformed/future/DSACK-only blocks cannot count as fresh delivery.
     //# Upon the receipt of any ACK containing SACK information, the scoreboard MUST
     //# be updated via the Update () routine.
     // Scope: Wrapped prior-cycle D-SACK below UNA or within already-SACKed data remains advisory during RACK/PRR recovery: no send storage release, UNA advance, congestion undo, new delivery or RTT credit. Reordering adaptation is bounded; duplicate reports cannot authenticate a sequence cycle.
@@ -13459,7 +13687,7 @@ mod tests {
     //# TCP senders receiving D-SACK blocks should be aware that a segment
     //# reported as a duplicate segment could possibly have been from a prior
     //# cycle through the sequence number space.
-    fn sack_invalid_future_stale_ack_and_dsack_are_not_delivery() {
+    fn sack_invalid_future_out_of_bounds_ack_and_dsack_are_not_delivery() {
         let mut a = sack_flight(128, 100, 6);
         let una = a.snd_una;
         let end = a.data_high();
@@ -13467,7 +13695,10 @@ mod tests {
         let timer = a.rto_deadline;
         for (i, (ack, block)) in [
             (end.wrapping_add(1), (una.wrapping_add(128).0, end.0)),
-            (una.wrapping_add(u32::MAX), (una.wrapping_add(128).0, end.0)),
+            (
+                una.wrapping_add(0u32.wrapping_sub(a.max_snd_wnd + 1)),
+                (una.wrapping_add(128).0, end.0),
+            ),
             (una, (una.wrapping_add(128).0, end.wrapping_add(1).0)),
             (una, (end.0, una.0)),
             (una, (una.0, una.0)),

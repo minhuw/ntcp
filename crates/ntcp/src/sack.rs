@@ -64,6 +64,16 @@ impl Scoreboard {
         self.len = 0;
     }
 
+    #[cfg(test)]
+    pub(crate) fn update(
+        &mut self,
+        ack: Seq,
+        high_data: Seq,
+        blocks: &[Option<(u32, u32)>; 4],
+    ) -> UpdateOutcome {
+        self.update_with_packet_ack(ack, ack, high_data, blocks)
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc2018#section-5
     //= reason=Admission preallocates ceil(send_capacity/2) intervals plus four temporary slots: every possible disjoint byte union inside the configured flight fits, without incoming-SACK allocation.
     //# When receiving an ACK containing a SACK option, the data sender SHOULD
@@ -91,9 +101,10 @@ impl Scoreboard {
     //# sender will turn on the SACKed flags for all segments in the retransmission
     //# queue that are wholly contained within that block. This requires
     //# straightforward sequence number comparisons.
-    pub(crate) fn update(
+    pub(crate) fn update_with_packet_ack(
         &mut self,
         ack: Seq,
+        packet_ack: Seq,
         high_data: Seq,
         blocks: &[Option<(u32, u32)>; 4],
     ) -> UpdateOutcome {
@@ -125,18 +136,21 @@ impl Scoreboard {
         }
         self.ack = ack;
 
+        // Validate wire ranges before intersecting with the live flight.
+        // DSACK classification must see the original, unclipped blocks.
+        let packet_span = high_data.distance_from(packet_ack);
         let valid = |block: Option<(u32, u32)>| -> Option<(Seq, Seq)> {
             let (left, right) = block?;
             let left = Seq(left);
             let right = Seq(right);
-            let start = left.distance_from(ack);
-            let end = right.distance_from(ack);
-            (start < end && end <= span).then_some((left, right))
+            let start = left.distance_from(packet_ack);
+            let end = right.distance_from(packet_ack);
+            (packet_span < HALF_SPACE && start < end && end <= packet_span).then_some((left, right))
         };
 
-        // Scope: Detection compares first block to current packet ACK argument, never saved scoreboard ACK or connection snd_una. Wrap regression changes saved scoreboard ACK from u32::MAX-99 to packet ACK=10 and asserts below-packet-ACK duplicate recognition; comparing against old saved ACK would fail. Connection passes wire ack directly and declines stale ACK detection rather than comparing it against newer snd_una. RFC2883 does not mandate sender response to each stale duplicate report.
+        // Scope: Detection compares the original first block to the packet ACK, independently of the live trim edge. Reordered ACK regressions distinguish ordinary blocks below snd_una from true below-packet-ACK and contained DSACK, including wrap.
         //= https://www.rfc-editor.org/rfc/rfc2883#section-5
-        //= reason=Detection compares first block to current packet ACK argument, never saved scoreboard ACK or connection snd_una. Wrap regression changes saved scoreboard ACK from u32::MAX-99 to packet ACK=10 and asserts below-packet-ACK duplicate recognition; comparing against old saved ACK would fail. Connection passes wire ack directly and declines stale ACK detection rather than comparing it against newer snd_una. RFC2883 does not mandate sender response to each stale duplicate report.
+        //= reason=Detection compares the original first block to the packet ACK, independently of the live trim edge. Reordered ACK regressions distinguish ordinary blocks below snd_una from true below-packet-ACK and contained DSACK, including wrap.
         //# An implementation MUST NOT compare the
         //# sequence space in the SACK block to the TCP state variable snd.una
         //# (which carries the total cumulative ACK), as this may result in the
@@ -154,9 +168,9 @@ impl Scoreboard {
         //# TCP senders receiving D-SACK blocks should be aware that a segment
         //# reported as a duplicate segment could possibly have been from a prior
         //# cycle through the sequence number space.
-        // Scope: Current packet ACK supplied by connection, prior saved scoreboard ACK never substituted; valid stale ACKs may be ignored instead of producing sender adaptation.
+        // Scope: Connection supplies the wire ACK separately from the live cumulative trim edge; reordered ACK SACK evidence is retained without substituting snd_una for DSACK classification.
         //= https://www.rfc-editor.org/rfc/rfc2883#section-5
-        //= reason=Current packet ACK supplied by connection, prior saved scoreboard ACK never substituted; valid stale ACKs may be ignored instead of producing sender adaptation.
+        //= reason=Connection supplies the wire ACK separately from the live cumulative trim edge; reordered ACK SACK evidence is retained without substituting snd_una for DSACK classification.
         //# In order for the sender to check that the first (D)SACK block of an
         //# acknowledgement in fact acknowledges duplicate data, the sender
         //# should compare the sequence space in the first SACK block to the
@@ -168,15 +182,15 @@ impl Scoreboard {
             let size = right.distance_from(left);
             let below = size > 0
                 && size < HALF_SPACE
-                && left.serial_cmp(ack) == Some(Ordering::Less)
+                && left.serial_cmp(packet_ack) == Some(Ordering::Less)
                 && matches!(
-                    right.serial_cmp(ack),
+                    right.serial_cmp(packet_ack),
                     Some(Ordering::Less | Ordering::Equal)
                 );
             let contained = match (valid(blocks[0]), valid(blocks[1])) {
                 (Some((a, b)), Some((c, d))) => {
-                    a.distance_from(ack) >= c.distance_from(ack)
-                        && b.distance_from(ack) <= d.distance_from(ack)
+                    a.distance_from(packet_ack) >= c.distance_from(packet_ack)
+                        && b.distance_from(packet_ack) <= d.distance_from(packet_ack)
                 }
                 _ => false,
             };
@@ -186,8 +200,15 @@ impl Scoreboard {
             if index == 0 && outcome.dsack {
                 continue;
             }
-            if let Some(range) = valid(block) {
-                self.ranges[count] = range;
+            if let Some((left, right)) = valid(block)
+                && right.serial_cmp(ack) == Some(Ordering::Greater)
+            {
+                let left = if left.serial_cmp(ack) == Some(Ordering::Greater) {
+                    left
+                } else {
+                    ack
+                };
+                self.ranges[count] = (left, right);
                 count += 1;
             }
         }
@@ -599,18 +620,18 @@ mod tests {
     }
 
     #[test]
-    // Scope: Detection compares first block to current packet ACK argument, never saved scoreboard ACK or connection snd_una. Wrap regression changes saved scoreboard ACK from u32::MAX-99 to packet ACK=10 and asserts below-packet-ACK duplicate recognition; comparing against old saved ACK would fail. Connection passes wire ack directly and declines stale ACK detection rather than comparing it against newer snd_una. RFC2883 does not mandate sender response to each stale duplicate report.
+    // Scope: Detection compares the original first block to the packet ACK, independently of the live trim edge. Reordered ACK regressions distinguish ordinary blocks below snd_una from true below-packet-ACK and contained DSACK, including wrap.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-5
     //= type=test
-    //= reason=Detection compares first block to current packet ACK argument, never saved scoreboard ACK or connection snd_una. Wrap regression changes saved scoreboard ACK from u32::MAX-99 to packet ACK=10 and asserts below-packet-ACK duplicate recognition; comparing against old saved ACK would fail. Connection passes wire ack directly and declines stale ACK detection rather than comparing it against newer snd_una. RFC2883 does not mandate sender response to each stale duplicate report.
+    //= reason=Detection compares the original first block to the packet ACK, independently of the live trim edge. Reordered ACK regressions distinguish ordinary blocks below snd_una from true below-packet-ACK and contained DSACK, including wrap.
     //# An implementation MUST NOT compare the
     //# sequence space in the SACK block to the TCP state variable snd.una
     //# (which carries the total cumulative ACK), as this may result in the
     //# wrong conclusion if ACK packets are reordered.
-    // Scope: Current packet ACK supplied by connection, prior saved scoreboard ACK never substituted; valid stale ACKs may be ignored instead of producing sender adaptation.
+    // Scope: Connection supplies the wire ACK separately from the live cumulative trim edge; reordered ACK SACK evidence is retained without substituting snd_una for DSACK classification.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-5
     //= type=test
-    //= reason=Current packet ACK supplied by connection, prior saved scoreboard ACK never substituted; valid stale ACKs may be ignored instead of producing sender adaptation.
+    //= reason=Connection supplies the wire ACK separately from the live cumulative trim edge; reordered ACK SACK evidence is retained without substituting snd_una for DSACK classification.
     //# In order for the sender to check that the first (D)SACK block of an
     //# acknowledgement in fact acknowledges duplicate data, the sender
     //# should compare the sequence space in the first SACK block to the
