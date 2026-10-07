@@ -330,6 +330,18 @@ impl Congestion {
         }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-4.10
+    //= reason=CUBIC selects initial HyStart by default, independent of recovery; explicit opt-out selects standard SS. Global Reno default and peer/router wire protocol unchanged.
+    //# In general, CUBIC SHOULD use the HyStart++ slow
+    //# start algorithm [RFC9406] or MAY use the Reno TCP slow start
+    //# algorithm [RFC5681] in the rare cases when HyStart++ is not suitable.
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-5.10
+    //= reason=CUBIC selects initial HyStart by default, independent of recovery; explicit opt-out selects standard SS. Global Reno default and peer/router wire protocol unchanged.
+    //# CUBIC requires only changes to congestion control at the sender, and
+    //# it does not require any changes at receivers.  That is, a CUBIC
+    //# sender works correctly with Reno receivers.  In addition, CUBIC does
+    //# not require any changes to routers and does not require any
+    //# assistance from routers.
     pub(crate) fn with_congestion(
         mut self,
         algorithm: CongestionAlgorithm,
@@ -609,10 +621,10 @@ impl Congestion {
     //# 3.2, step 3), cwnd should not be updated until a further event occurs (e.g., arrival
     //# of an ack, or timeout) after this adjustment.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
-    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //= reason=Traditional CongestionAlgorithm::Reno startup/avoidance shared by RecoveryAlgorithm::Reno/NewReno; applies outside fast/SACK recovery. Excludes selected-Cubic HyStart++ (RFC9406 byte-counted L=8 or paced infinity) and Cubic avoidance (RFC9438); global Reno default is unchanged. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
     //# * MAY increment cwnd by SMSS bytes
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
-    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //= reason=Traditional CongestionAlgorithm::Reno startup/avoidance shared by RecoveryAlgorithm::Reno/NewReno; applies outside fast/SACK recovery. Excludes selected-Cubic HyStart++ (RFC9406 byte-counted L=8 or paced infinity) and Cubic avoidance (RFC9438); global Reno default is unchanged. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
     //# The RECOMMENDED way to increase cwnd during congestion avoidance is to count the number
     //# of bytes that have been acknowledged by ACKs for new data.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
@@ -620,12 +632,12 @@ impl Congestion {
     //# When the next ACK arrives that acknowledges previously unacknowledged data, a TCP MUST
     //# set cwnd to ssthresh (the value set in step 2).
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
-    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //= reason=Traditional CongestionAlgorithm::Reno startup/avoidance shared by RecoveryAlgorithm::Reno/NewReno; applies outside fast/SACK recovery. Excludes selected-Cubic HyStart++ (RFC9406 byte-counted L=8 or paced infinity) and Cubic avoidance (RFC9438); global Reno default is unchanged. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
     //# The slow start algorithm is used when cwnd < ssthresh, while the congestion avoidance
     //# algorithm is used when cwnd > ssthresh. When cwnd and ssthresh are equal, the sender may
     //# use either slow start or congestion avoidance.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
-    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //= reason=Traditional CongestionAlgorithm::Reno startup/avoidance shared by RecoveryAlgorithm::Reno/NewReno; applies outside fast/SACK recovery. Excludes selected-Cubic HyStart++ (RFC9406 byte-counted L=8 or paced infinity) and Cubic avoidance (RFC9438); global Reno default is unchanged. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
     //# During slow start, a TCP increments cwnd by at most SMSS bytes for each ACK received
     //# that cumulatively acknowledges new data. Slow start ends when cwnd exceeds ssthresh (or,
     //# optionally, when it reaches it, as noted above) or when congestion is observed. While
@@ -633,10 +645,10 @@ impl Congestion {
     //# receipt of an ACK covering new data, we RECOMMEND that TCP implementations increase
     //# cwnd, per:
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
-    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //= reason=Traditional CongestionAlgorithm::Reno startup/avoidance shared by RecoveryAlgorithm::Reno/NewReno; applies outside fast/SACK recovery. Excludes selected-Cubic HyStart++ (RFC9406 byte-counted L=8 or paced infinity) and Cubic avoidance (RFC9438); global Reno default is unchanged. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
     //# cwnd += min (N, SMSS) (2)
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
-    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //= reason=Traditional CongestionAlgorithm::Reno startup/avoidance shared by RecoveryAlgorithm::Reno/NewReno; applies outside fast/SACK recovery. Excludes selected-Cubic HyStart++ (RFC9406 byte-counted L=8 or paced infinity) and Cubic avoidance (RFC9438); global Reno default is unchanged. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
     //# We note that [RFC3465] allows for cwnd increases of more than SMSS bytes for incoming
     //# acknowledgments during slow start on an experimental basis; however, such behavior is
     //# not allowed as part of the standard.
@@ -648,7 +660,7 @@ impl Congestion {
     //# not the only two algorithms that conform to the above general principles these two
     //# algorithms have been vetted by the community and are currently on the Standards Track.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-5
-    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //= reason=Traditional CongestionAlgorithm::Reno startup/avoidance shared by RecoveryAlgorithm::Reno/NewReno; applies outside fast/SACK recovery. Excludes selected-Cubic HyStart++ (RFC9406 byte-counted L=8 or paced infinity) and Cubic avoidance (RFC9438); global Reno default is unchanged. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
     //# In response to the ACK division attack outlined in [SCWA99], this document RECOMMENDS
     //# increasing the congestion window based on the number of bytes newly acknowledged in each
     //# arriving ACK rather than by a particular constant on each arriving ACK (as outlined in
@@ -693,6 +705,12 @@ impl Congestion {
     //# Deflate the congestion window by the amount of new data acknowledged by the Cumulative
     //# Acknowledgment field. If the partial ACK acknowledges at least one SMSS of new data, then add
     //# back SMSS bytes to the congestion window.
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-4.2
+    //= reason=Growth consumes newly acknowledged bytes after existing fast/SACK recovery handling; no CUBIC-only fast retransmit/recovery override.
+    //# CUBIC maintains the ACK clocking of Reno by increasing the congestion
+    //# window only at the reception of a new ACK.  It does not make any
+    //# changes to the TCP Fast Recovery and Fast Retransmit algorithms
+    //# [RFC6582] [RFC6675].
     pub(crate) fn on_ack_with_ecn(
         &mut self,
         ack: Seq,
@@ -797,11 +815,18 @@ impl Congestion {
             self.ecn_end = None;
         }
         if ece {
+            if let Some(cubic) = &mut self.cubic {
+                cubic.ack_flight(flight_after_ack, self.cwnd);
+            }
             return false;
         }
         if let Some(cubic) = &mut self.cubic {
             // Published section 4.10 uses slow start at equality. Recovery's
             // explicit congestion-avoidance state remains authoritative.
+            //= https://www.rfc-editor.org/rfc/rfc9438#section-4.10
+            //= reason=Slow start includes equality until explicit CSS exit/congestion/recovery makes CA authoritative; this authority prevents restarting startup at exit equality.
+            //# When _cwnd_ is no more than _ssthresh_, CUBIC MUST employ a slow
+            //# start algorithm.
             if !self.congestion_avoidance && self.cwnd <= self.ssthresh {
                 if let (Some(hystart), Some(context)) = (&mut self.hystart, self.startup_ack.take())
                 {
@@ -814,6 +839,12 @@ impl Congestion {
                     );
                     self.cwnd = self.cwnd.saturating_add(increase).min(MAX_WINDOW);
                     if exit {
+                        //= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
+                        //= reason=CSS completion sets threshold to grown cwnd and makes CA authoritative at equality.
+                        //# If CSS_ROUNDS rounds are complete, enter congestion avoidance by
+                        //# setting the ssthresh to the current cwnd.
+                        //#
+                        //# ssthresh = cwnd
                         self.ssthresh = self.cwnd;
                         self.congestion_avoidance = true;
                         self.hystart = None;
@@ -829,6 +860,7 @@ impl Congestion {
                 self.hystart = None;
                 self.cwnd = cubic.grow(self.cwnd, self.mss);
             }
+            cubic.ack_flight(flight_after_ack, self.cwnd);
             return false;
         }
         if !self.congestion_avoidance && self.cwnd < self.ssthresh {
@@ -894,6 +926,11 @@ impl Congestion {
     //= reason=Enhanced SACK recovery target halves eligible flight with two-MSS floor; sack_entry_partial_and_full_ack asserts 8000 -> 4000 and minimum case. Negotiated SACK/non-RACK and RACK lost-retransmission responses separately tested; ECN shared epoch is distinct policy.
     //# That is, when the first loss in a window of data is detected, ssthresh MUST be set to no
     //# more than the value given by equation (4).
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
+    //= reason=Loss entry invokes shared beta threshold immediately; Reno/NewReno fast recovery and optional PRR retain their existing inflation/credit rules.
+    //# In the case of packet loss, the
+    //# sender MUST reduce _cwnd_ and _ssthresh_ immediately upon entering
+    //# loss recovery, similar to [RFC5681] (and [RFC6675]).
     pub(crate) fn on_sack_recovery(&mut self, ack: Seq, flight: u32, highest_sent: Seq) -> bool {
         if self.sack_recovery
             || self.fast_recovery
@@ -1168,6 +1205,11 @@ impl Congestion {
     //= reason=Congestion helper asserts cwnd/threshold values after eligible ECN and mixed-loss epochs; one-MSS timer rate reduction is separately audited.
     //# That is, the TCP source halves the congestion window "cwnd" and reduces the slow start threshold "ssthresh".
     // Actor/condition: TCP endpoint; eligible ECE ACK.
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
+    //= reason=Distinct eligible ECE events reduce cwnd down to one SMSS independently of two-SMSS ssthresh; shared epoch suppresses repeat flight reductions.
+    //# Note that CUBIC MUST continue to reduce _cwnd_ in response to
+    //# congestion events detected by ECN-Echo ACKs until it reaches a value
+    //# of 1 SMSS.
     pub(crate) fn on_ecn(&mut self, ack: Seq, flight: u32, highest_sent: Seq) -> bool {
         if self
             .tlp_reduction_end
@@ -1199,6 +1241,38 @@ impl Congestion {
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
     //= reason=Default CongestionAlgorithm::Reno only; optional CUBIC follows RFC9438 sections 4.6/4.8. Threshold helper uses actual eligible flight /2 with two-MSS minimum; timeout vectors assert 10000->5000 and SACK boundary vectors assert floor. Limited Transmit exclusion is caller-owned and separately evidenced.
     //# ssthresh = max (FlightSize / 2, 2*SMSS) (4)
+    //= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
+    //= reason=Loss/ECE permanently end initial HyStart. Selected CUBIC composes RFC9438 beta reduction and existing recovery/PRR, not an upward overwrite with the pre-event startup cwnd; RTO uses standard SS.
+    //# If loss or Explicit Congestion Notification (ECN) marking is observed
+    //# at any time during standard slow start or CSS, enter congestion
+    //# avoidance by setting the ssthresh to the current cwnd.
+    //#
+    //# ssthresh = cwnd
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-3.1
+    //= reason=Selected CUBIC saves pre-event cwnd and sets beta=0.7 of supplied actual eligible flight; two-SMSS threshold/loss floor, independent one-SMSS ECE floor in on_ecn. Existing recovery/PRR owns temporary ACK-clock response cwnd; QUIC is not implemented.
+    //# After a window reduction in response to a congestion event detected
+    //# by duplicate acknowledgments (ACKs), Explicit Congestion
+    //# Notification-Echo (ECN-Echo (ECE)) ACKs [RFC3168], RACK-TLP for TCP
+    //# [RFC8985], or QUIC loss detection [RFC9002], CUBIC remembers the
+    //# congestion window size at which it received the congestion event and
+    //# performs a multiplicative decrease of the congestion window.
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
+    //= reason=Selected CUBIC saves pre-event cwnd and sets beta=0.7 of supplied actual eligible flight; two-SMSS threshold/loss floor, independent one-SMSS ECE floor in on_ecn. Existing recovery/PRR owns temporary ACK-clock response cwnd; QUIC is not implemented.
+    //# ssthresh =  flight_size * β      new  ssthresh
+    //# cubic
+    //# cwnd      = cwnd                 save  cwnd
+    //# prior
+    //# ⎧max(ssthresh, 2)    reduction on loss, cwnd >= 2 SMSS
+    //# cwnd =      ⎨max(ssthresh, 1)    reduction on ECE, cwnd >= 1 SMSS
+    //# ⎩
+    //# ssthresh =  max(ssthresh, 2)     ssthresh >= 2 SMSS
+    //#
+    //# Figure 5
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
+    //= reason=Selected CUBIC saves pre-event cwnd and sets beta=0.7 of supplied actual eligible flight; two-SMSS threshold/loss floor, independent one-SMSS ECE floor in on_ecn. Existing recovery/PRR owns temporary ACK-clock response cwnd; QUIC is not implemented.
+    //# The parameter β__cubic_ SHOULD be set to 0.7, which is different from
+    //# the multiplicative decrease factor used in [RFC5681] (and [RFC6675])
+    //# during fast recovery.
     fn reduce_threshold(&mut self, flight: u32) {
         self.hystart = None;
         self.startup_ack = None;
@@ -1211,6 +1285,9 @@ impl Congestion {
         } else {
             flight / 2
         };
+        //= https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2
+        //= reason=Threshold is in bytes with two-SMSS floor; selector changes beta, not the segment unit.
+        //# *  _ssthresh_: Current slow start threshold in segments.
         self.ssthresh = reduced.max(self.mss.saturating_mul(2)).min(MAX_WINDOW);
     }
 
@@ -1283,6 +1360,17 @@ impl Congestion {
     //# Loss in two successive windows of data, or the loss of a retransmission, should be taken as two
     //# indications of congestion and, therefore, cwnd (and ssthresh) MUST be lowered twice in this
     //# case.
+    //= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
+    //= reason=Initial HyStart is removed on congestion/RTO and never re-enabled; subsequent RTO startup is standard SS.
+    //# An implementation SHOULD use HyStart++ only for the initial slow
+    //# start (when the ssthresh is at its initial value of arbitrarily high
+    //# per [RFC5681]) and fall back to using standard slow start for the
+    //# remainder of the connection lifetime.
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-4.8
+    //= reason=First timeout selects beta threshold and one-MSS loss window; repeated head timeout retains threshold; clears CUBIC origin for next CA epoch.
+    //# In the case of a timeout, CUBIC follows Reno to reduce _cwnd_
+    //# [RFC5681] but sets _ssthresh_ using β__cubic_ (same as in
+    //# Section 4.6) in a way that is different from Reno TCP [RFC5681].
     pub(crate) fn on_timeout(&mut self, flight: u32, highest_sent: Seq) {
         self.hystart = None;
         self.startup_ack = None;
@@ -2294,11 +2382,11 @@ mod tests {
     //# collapse conditions (MUST-19).
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
     //= type=test
-    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //= reason=Traditional CongestionAlgorithm::Reno startup/avoidance shared by RecoveryAlgorithm::Reno/NewReno; applies outside fast/SACK recovery. Excludes selected-Cubic HyStart++ (RFC9406 byte-counted L=8 or paced infinity) and Cubic avoidance (RFC9438); global Reno default is unchanged. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
     //# * MAY increment cwnd by SMSS bytes
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
     //= type=test
-    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //= reason=Traditional CongestionAlgorithm::Reno startup/avoidance shared by RecoveryAlgorithm::Reno/NewReno; applies outside fast/SACK recovery. Excludes selected-Cubic HyStart++ (RFC9406 byte-counted L=8 or paced infinity) and Cubic avoidance (RFC9438); global Reno default is unchanged. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
     //# The RECOMMENDED way to increase cwnd during congestion avoidance is to count the number
     //# of bytes that have been acknowledged by ACKs for new data.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
@@ -2308,13 +2396,13 @@ mod tests {
     //# the loss window, LW, which equals 1 full-sized segment (regardless of the value of IW).
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
     //= type=test
-    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //= reason=Traditional CongestionAlgorithm::Reno startup/avoidance shared by RecoveryAlgorithm::Reno/NewReno; applies outside fast/SACK recovery. Excludes selected-Cubic HyStart++ (RFC9406 byte-counted L=8 or paced infinity) and Cubic avoidance (RFC9438); global Reno default is unchanged. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
     //# The slow start algorithm is used when cwnd < ssthresh, while the congestion avoidance
     //# algorithm is used when cwnd > ssthresh. When cwnd and ssthresh are equal, the sender may
     //# use either slow start or congestion avoidance.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
     //= type=test
-    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //= reason=Traditional CongestionAlgorithm::Reno startup/avoidance shared by RecoveryAlgorithm::Reno/NewReno; applies outside fast/SACK recovery. Excludes selected-Cubic HyStart++ (RFC9406 byte-counted L=8 or paced infinity) and Cubic avoidance (RFC9438); global Reno default is unchanged. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
     //# During slow start, a TCP increments cwnd by at most SMSS bytes for each ACK received
     //# that cumulatively acknowledges new data. Slow start ends when cwnd exceeds ssthresh (or,
     //# optionally, when it reaches it, as noted above) or when congestion is observed. While
@@ -2323,17 +2411,17 @@ mod tests {
     //# cwnd, per:
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
     //= type=test
-    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //= reason=Traditional CongestionAlgorithm::Reno startup/avoidance shared by RecoveryAlgorithm::Reno/NewReno; applies outside fast/SACK recovery. Excludes selected-Cubic HyStart++ (RFC9406 byte-counted L=8 or paced infinity) and Cubic avoidance (RFC9438); global Reno default is unchanged. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
     //# cwnd += min (N, SMSS) (2)
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
     //= type=test
-    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //= reason=Traditional CongestionAlgorithm::Reno startup/avoidance shared by RecoveryAlgorithm::Reno/NewReno; applies outside fast/SACK recovery. Excludes selected-Cubic HyStart++ (RFC9406 byte-counted L=8 or paced infinity) and Cubic avoidance (RFC9438); global Reno default is unchanged. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
     //# We note that [RFC3465] allows for cwnd increases of more than SMSS bytes for incoming
     //# acknowledgments during slow start on an experimental basis; however, such behavior is
     //# not allowed as part of the standard.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-5
     //= type=test
-    //= reason=Shared Reno/NewReno slow start and byte-counting congestion avoidance; applies outside fast/SACK recovery. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
+    //= reason=Traditional CongestionAlgorithm::Reno startup/avoidance shared by RecoveryAlgorithm::Reno/NewReno; applies outside fast/SACK recovery. Excludes selected-Cubic HyStart++ (RFC9406 byte-counted L=8 or paced infinity) and Cubic avoidance (RFC9438); global Reno default is unchanged. Helper vectors assert min(acked,SMSS), zero-ACK no growth, threshold equality chooses avoidance, and 4000 one-byte ACKs produce exactly one MSS increase; not a wall-clock RTT/output proof.
     //# In response to the ACK division attack outlined in [SCWA99], this document RECOMMENDS
     //# increasing the congestion window based on the number of bytes newly acknowledged in each
     //# arriving ACK rather than by a particular constant on each arriving ACK (as outlined in

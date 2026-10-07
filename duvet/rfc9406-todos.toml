@@ -1,0 +1,21 @@
+# Unresolved behavior/integration or evidence gaps are TODOs, not waivers.
+# Optional/actor exceptions are explicit; no QUIC, deployment results or undo claimed.
+
+# 9406-generated-section-4.3-2
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.3"
+reason = "Optional tuning permission is not selected: HyStart uses published fixed constants. No runtime tuning API is required by this MAY; fixed-value and minimum-divisor obligations remain inventoried. Reviewed candidate code/tests: crates/ntcp/src/hystart.rs::HyStart::ack; crates/ntcp/src/recovery.rs::Congestion::on_ack_with_ecn; crates/ntcp/src/connection.rs::Connection::input."
+quote = '''
+An implementation MAY tune them for different
+network characteristics.
+'''
+
+# 9406-generated-section-4.3-7
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.3"
+reason = "Optional HyStart++ restart after idle is not selected. Initial HyStart++ startup and subsequent standard slow start remain separate obligations; no restart-HyStart++ behavior is claimed. Reviewed candidate code/tests: crates/ntcp/src/hystart.rs::HyStart::ack; crates/ntcp/src/recovery.rs::Congestion::on_ack_with_ecn; crates/ntcp/src/connection.rs::Connection::input."
+quote = '''
+An implementation MAY
+use HyStart++ to grow the restart window [RFC5681] after a long idle
+period.
+'''

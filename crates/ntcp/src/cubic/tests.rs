@@ -8,6 +8,75 @@ fn state(cwnd: u32, mss: u32) -> Cubic {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.1.1
+//= type=test
+//= reason=Independent cube-root floor bounds, signed curve origin and +/-one second +/-400 byte vectors establish C=0.4 at MSS1000.
+//# *  _C_: Constant that determines the aggressiveness of CUBIC in
+//# competing with other congestion control algorithms in high-BDP
+//# networks.  Please see Section 5 for more explanation on how it is
+//# set.  The unit for _C_ is
+//#
+//# segment
+//# ───────
+//# 3
+//# second
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2
+//= type=test
+//= reason=Independent cube-root floor bounds, signed curve origin and +/-one second +/-400 byte vectors establish C=0.4 at MSS1000.
+//# *  _K_: The time period in seconds it takes to increase the
+//# congestion window size at the beginning of the current congestion
+//# avoidance stage to _W_max_.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2
+//= type=test
+//= reason=Independent cube-root floor bounds, signed curve origin and +/-one second +/-400 byte vectors establish C=0.4 at MSS1000.
+//# *  W_cubic(_t_): The congestion window in segments at time _t_ in
+//# seconds based on the cubic increase function, as described in
+//# Section 4.2.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.2
+//= type=test
+//= reason=Independent cube-root floor bounds, signed curve origin and +/-one second +/-400 byte vectors establish C=0.4 at MSS1000.
+//# CUBIC uses the following window increase function:
+//#
+//# 3
+//# W     (t) = C * (t - K)  + W
+//# cubic                      max
+//#
+//# Figure 1
+//#
+//# where _t_ is the elapsed time in seconds from the beginning of the
+//# current congestion avoidance stage -- that is,
+//#
+//# t = t        - t
+//# current    epoch
+//#
+//# and where _t_epoch_ is the time at which the current congestion
+//# avoidance stage starts.  _K_ is the time period that the above
+//# function takes to increase the congestion window size at the
+//# beginning of the current congestion avoidance stage to _W_max_ if
+//# there are no further congestion events.  _K_ is calculated using the
+//# following equation:
+//#
+//# ┌────────────────┐
+//# 3  │W    - cwnd
+//# ╲  │ max       epoch
+//# K =  ╲ │────────────────
+//# ╲│       C
+//#
+//# Figure 2
+//#
+//# where _cwnd_epoch_ is the congestion window at the beginning of the
+//# current congestion avoidance stage.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-5.1
+//= type=test
+//= reason=Independent cube-root floor bounds, signed curve origin and +/-one second +/-400 byte vectors establish C=0.4 at MSS1000.
+//# However, it is NOT
+//# RECOMMENDED to set _C_ to a very low value like 0.04, since CUBIC
+//# with a low _C_ cannot efficiently use the bandwidth in fast and long-
+//# distance networks.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-5.1
+//= type=test
+//= reason=Independent cube-root floor bounds, signed curve origin and +/-one second +/-400 byte vectors establish C=0.4 at MSS1000.
+//# Therefore, _C_ SHOULD be set to 0.4.
 fn cube_root_and_curve_reference_vectors() {
     for value in [0, 1, 2, 7, 8, 9, 27, 1000, (1u128 << 96) - 1, u128::MAX] {
         let root = u128::from(cube_root(value));
@@ -57,6 +126,78 @@ fn published_per_ack_cubic_rule_not_reported_erratum_9186() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.1
+//= type=test
+//= reason=Exact byte-scaled Figure4 at alpha9/17, switch to one at prior cwnd, delayed versus one-byte ACKs and fractional accumulation.
+//# The unit of all window sizes in this document is segments of the
+//# SMSS, and the unit of all times is seconds.  Implementations can use
+//# bytes to express window sizes, which would require factoring in the
+//# SMSS wherever necessary and replacing _segments_acked_ (Figure 4)
+//# with the number of acknowledged bytes.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2
+//= type=test
+//= reason=Exact byte-scaled Figure4 at alpha9/17, switch to one at prior cwnd, delayed versus one-byte ACKs and fractional accumulation.
+//# *  _W_est_: An estimate for the congestion window in segments in the
+//# Reno-friendly region -- that is, an estimate for the congestion
+//# window of Reno.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2
+//= type=test
+//= reason=Exact byte-scaled Figure4 at alpha9/17, switch to one at prior cwnd, delayed versus one-byte ACKs and fractional accumulation.
+//# *  _segments_acked_: Number of SMSS-sized segments acked when a "new
+//# ACK" is received, i.e., an ACK that cumulatively acknowledges the
+//# delivery of previously unacknowledged data.  This number will be a
+//# decimal value when a new ACK acknowledges an amount of data that
+//# is not SMSS-sized.  Specifically, it can be less than 1 when a new
+//# ACK acknowledges a segment smaller than the SMSS.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.2
+//= type=test
+//= reason=Exact byte-scaled Figure4 at alpha9/17, switch to one at prior cwnd, delayed versus one-byte ACKs and fractional accumulation.
+//# To summarize, CUBIC computes both W_cubic(_t_) and _W_est_ (see
+//# Section 4.3) on receiving a new ACK in congestion avoidance and
+//# chooses the larger of the two values.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.3
+//= type=test
+//= reason=Exact byte-scaled Figure4 at alpha9/17, switch to one at prior cwnd, delayed versus one-byte ACKs and fractional accumulation.
+//# Thus, CUBIC uses Figure 4 to estimate the window size _W_est_ in the
+//# Reno-friendly region with
+//#
+//# 1 - β
+//# cubic
+//# α      = 3 * ──────────
+//# cubic       1 + β
+//# cubic
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.3
+//= type=test
+//= reason=Exact byte-scaled Figure4 at alpha9/17, switch to one at prior cwnd, delayed versus one-byte ACKs and fractional accumulation.
+//# _W_est_ is set equal to _cwnd_epoch_ at the start of the congestion
+//# avoidance stage.  After that, on every new ACK, _W_est_ is updated
+//# using Figure 4.  Note that this equation uses _segments_acked_ and
+//# _cwnd_ is measured in segments.  An implementation that measures
+//# _cwnd_ in bytes should adjust the equation accordingly using the
+//# number of acknowledged bytes and the SMSS.  Also note that this
+//# equation works for connections with enabled or disabled delayed ACKs
+//# [RFC5681], as _segments_acked_ will be different based on the
+//# segments actually acknowledged by a new ACK.
+//#
+//# segments_acked
+//# W    = W    + α      * ──────────────
+//# est    est    cubic        cwnd
+//#
+//# Figure 4
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.3
+//= type=test
+//= reason=Exact byte-scaled Figure4 at alpha9/17, switch to one at prior cwnd, delayed versus one-byte ACKs and fractional accumulation.
+//# If so, CUBIC is in the
+//# Reno-friendly region and _cwnd_ SHOULD be set to _W_est_ at each
+//# reception of a new ACK.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.3
+//= type=test
+//= reason=Exact byte-scaled Figure4 at alpha9/17, switch to one at prior cwnd, delayed versus one-byte ACKs and fractional accumulation.
+//# Once _W_est_ has grown to reach the _cwnd_ at the time of most
+//# recently setting _ssthresh_ -- that is, _W_est_ >= _cwnd_prior_ --
+//# the sender SHOULD set α__cubic_ to 1 to ensure that it can achieve
+//# the same congestion window increment rate as Reno, which uses AIMD(1,
+//# 0.5).
 fn reno_friendly_byte_counting_alpha_switch_and_fractional_growth() {
     let mut c = state(7000, 1000);
     c.acked = 1000;
@@ -96,6 +237,40 @@ fn reno_friendly_byte_counting_alpha_switch_and_fractional_growth() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2
+//= type=test
+//= reason=Asserts pre-event cwnd, enabled 17/20 history and signed K; timeout origin is tested independently.
+//# *  _cwnd_prior_: Size of _cwnd_ in segments at the time of setting
+//# _ssthresh_ most recently, either upon exiting the first slow start
+//# or just before _cwnd_ was reduced in the last congestion event.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2
+//= type=test
+//= reason=Asserts pre-event cwnd, enabled 17/20 history and signed K; timeout origin is tested independently.
+//# *  _W_max_: Size of _cwnd_ in segments just before _cwnd_ was reduced
+//# in the last congestion event when fast convergence is disabled
+//# (same as _cwnd_prior_ on a congestion event).  However, if fast
+//# convergence is enabled, _W_max_ may be further reduced based on
+//# the current saturation point.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.7
+//= type=test
+//= reason=Asserts pre-event cwnd, enabled 17/20 history and signed K; timeout origin is tested independently.
+//# With fast convergence, when a congestion event occurs, _W_max_ is
+//# updated as follows, before the window reduction described in
+//# Section 4.6.
+//#
+//# ⎧       1 + β
+//# ⎪            cubic
+//# ⎪cwnd * ────────── if  cwnd < W     and fast convergence enabled,
+//# W    = ⎨           2                  max
+//# max   ⎪                  further reduce  W
+//# ⎪                                   max
+//# ⎩cwnd             otherwise, remember cwnd before reduction
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.7
+//= type=test
+//= reason=Asserts pre-event cwnd, enabled 17/20 history and signed K; timeout origin is tested independently.
+//# To speed up this
+//# bandwidth release by existing flows, the following fast convergence
+//# mechanism SHOULD be implemented.
 fn fast_convergence_and_timeout_epoch() {
     let mut c = Cubic::new(CallerTimebase::default());
     c.congestion(10_000);
@@ -244,48 +419,91 @@ fn nonadvancing_receive_window_limit_freezes_clock() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc9438#section-5.8
+//= type=test
+//= reason=Post-ACK underfill freezes clock immediately in us/ns, with no output or a delayed short suffix before RTO; historical full-flight ACKs retain credit, suffix receives none.
+//# A flow is application limited if it is currently sending less than
+//# what is allowed by the congestion window.  This can happen if the
+//# flow is limited by either the sender application or the receiver
+//# application (via the receiver's advertised window) and thus sends
+//# less data than what is allowed by the sender's congestion window.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-5.8
+//= type=test
+//= reason=Post-ACK underfill freezes clock immediately in us/ns, with no output or a delayed short suffix before RTO; historical full-flight ACKs retain credit, suffix receives none.
+//# CUBIC does not increase its congestion window if a flow is
+//# application limited.  Per Section 4.2, it is required that _t_ in
+//# Figure 1 not include application-limited periods, such as idle
+//# periods; otherwise, W_cubic(_t_) might be very high after restarting
+//# from these periods.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.2
+//= type=test
+//= reason=Post-ACK underfill freezes clock immediately in us/ns, with no output or a delayed short suffix before RTO; historical full-flight ACKs retain credit, suffix receives none.
+//# The elapsed time _t_ in Figure 1 MUST NOT include periods during
+//# which _cwnd_ has not been updated due to application-limited behavior
+//# (see Section 5.8).
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
+//= type=test
+//= reason=Post-ACK underfill freezes clock immediately in us/ns, with no output or a delayed short suffix before RTO; historical full-flight ACKs retain credit, suffix receives none.
+//# Implementations
+//# that use _cwnd_ MUST use other measures to prevent _cwnd_ from
+//# growing when the volume of bytes in flight is smaller than
+//# _cwnd_.
 fn short_application_suffix_pauses_clock_not_historical_ack_credit() {
     for scale in [1, 1000] {
-        let mut c = Cubic::new(CallerTimebase {
-            units_per_second: 1_000_000 * scale,
-            ..CallerTimebase::default()
-        });
-        c.congestion(10_000);
-        c.sent(0, 7000, 7000, Seq(7000), false, false);
-        c.prepare_ack(
-            100_000 * scale,
-            Some(100_000 * scale),
-            Seq(1000),
-            1000,
-            true,
-        );
-        let cwnd = c.grow(7000, 1000);
-        // Drained original plus a final short application suffix: less than
-        // current cwnd, no queued remainder. This is well before any RTO.
-        c.sent(110_000 * scale, 6500, cwnd, Seq(7500), false, false);
-        assert!(!c.active);
-        assert_eq!(c.limited_end, Some(Seq(7000)));
-        assert_eq!(c.elapsed, 10_000 * scale);
-        c.prepare_ack(
-            200_000 * scale,
-            Some(100_000 * scale),
-            Seq(2000),
-            1000,
-            true,
-        );
-        assert!(c.can_grow());
-        assert_eq!(c.elapsed, 10_000 * scale);
-        let next = c.grow(cwnd, 1000);
-        assert!(next > cwnd);
-        c.prepare_ack(
-            300_000 * scale,
-            Some(100_000 * scale),
-            Seq(7500),
-            5500,
-            true,
-        );
-        assert_eq!(c.slow_start_acked(), 5000); // Suffix itself earns no credit.
-        assert_eq!(c.elapsed, 10_000 * scale);
+        for suffix in [0, 500] {
+            let mut c = Cubic::new(CallerTimebase {
+                units_per_second: 1_000_000 * scale,
+                ..CallerTimebase::default()
+            });
+            c.congestion(10_000);
+            c.sent(0, 7000, 7000, Seq(7000), false, false);
+            c.prepare_ack(
+                100_000 * scale,
+                Some(100_000 * scale),
+                Seq(1000),
+                1000,
+                true,
+            );
+            let cwnd = c.grow(7000, 1000);
+            c.ack_flight(6000, cwnd);
+            assert_eq!(cwnd, 7075);
+            assert!(!c.active);
+            assert_eq!(c.limited_end, Some(Seq(7000)));
+            // Either no output, or a delayed short suffix before the 1s RTO.
+            if suffix != 0 {
+                c.sent(
+                    600_000 * scale,
+                    6000 + suffix,
+                    cwnd,
+                    Seq(7000 + suffix),
+                    false,
+                    false,
+                );
+            }
+            assert_eq!(c.elapsed, 0);
+            c.prepare_ack(
+                700_000 * scale,
+                Some(100_000 * scale),
+                Seq(2000),
+                1000,
+                true,
+            );
+            assert_eq!(c.slow_start_acked(), 1000);
+            assert_eq!(c.elapsed, 0);
+            let next = c.grow(cwnd, 1000);
+            c.ack_flight(5000 + suffix, next);
+            assert_eq!(next, 7150);
+            c.prepare_ack(
+                800_000 * scale,
+                Some(100_000 * scale),
+                Seq(7000 + suffix),
+                5000 + suffix,
+                true,
+            );
+            assert_eq!(c.slow_start_acked(), 5000); // Suffix earns no credit.
+            assert_eq!(c.elapsed, 0);
+            assert_eq!(c.grow(next, 1000), 7520);
+        }
     }
 }
 
@@ -306,6 +524,31 @@ fn explicit_single_flow_fast_convergence_opt_out_and_lossless_epoch() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2
+//= type=test
+//= reason=CA epoch begins at exiting ACK with W_est=cwnd_epoch and K=0; next CA ACK must not reset elapsed time.
+//# *  _t_current_: Current time of the system in seconds.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2
+//= type=test
+//= reason=CA epoch begins at exiting ACK with W_est=cwnd_epoch and K=0; next CA ACK must not reset elapsed time.
+//# *  _t_epoch_: The time in seconds at which the current congestion
+//# avoidance stage started.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2
+//= type=test
+//= reason=CA epoch begins at exiting ACK with W_est=cwnd_epoch and K=0; next CA ACK must not reset elapsed time.
+//# *  _cwnd_epoch_: The _cwnd_ at the beginning of the current
+//# congestion avoidance stage, i.e., at time _t_epoch_.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.10
+//= type=test
+//= reason=CA epoch begins at exiting ACK with W_est=cwnd_epoch and K=0; next CA ACK must not reset elapsed time.
+//# When CUBIC uses HyStart++ [RFC9406], it may exit the first slow start
+//# without incurring any packet loss and thus _W_max_ is undefined.  In
+//# this special case, CUBIC sets _cwnd_prior = cwnd_ and switches to
+//# congestion avoidance.  It then increases its congestion window size
+//# using Figure 1, where _t_ is the elapsed time since the beginning of
+//# the current congestion avoidance stage, _K_ is set to 0, and _W_max_
+//# is set to the congestion window size at the beginning of the current
+//# congestion avoidance stage.
 fn lossless_epoch_starts_at_exit_ack_not_first_ca_ack() {
     let mut c = Cubic::new(CallerTimebase::default());
     c.clock(100_000);
@@ -316,4 +559,97 @@ fn lossless_epoch_starts_at_exit_ack_not_first_ca_ack() {
     assert_eq!(c.elapsed, 100_000);
     c.grow(20_000, 1000);
     assert_eq!(c.elapsed, 100_000); // First CA ACK must not reset the exit epoch.
+}
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2
+//= type=test
+//= reason=Concave, equality/convex and larger-cwnd convex vectors assert per-new-ACK increment and retained fraction; upper/interior/lower targets explicit. Lower clamp uses an isolated arithmetic state, not a reachable-state claim.
+//# *  _target_: Target value of the congestion window in segments after
+//# the next RTT -- that is, W_cubic(_t_ + _RTT_), as described in
+//# Section 4.2.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.2
+//= type=test
+//= reason=Concave, equality/convex and larger-cwnd convex vectors assert per-new-ACK increment and retained fraction; upper/interior/lower targets explicit. Lower clamp uses an isolated arithmetic state, not a reachable-state claim.
+//# Upon receiving a new ACK during congestion avoidance, CUBIC computes
+//# the _target_ congestion window size after the next _RTT_ using
+//# Figure 1 as follows, where _RTT_ is the smoothed round-trip time.
+//# The lower and upper bounds below ensure that CUBIC's congestion
+//# window increase rate is non-decreasing and is less than the increase
+//# rate of slow start [SXEZ19].
+//#
+//# ⎧
+//# ⎪cwnd            if  W     (t + RTT) < cwnd
+//# ⎪                     cubic
+//# ⎨1.5 * cwnd      if  W     (t + RTT) > 1.5 * cwnd
+//# target = ⎪                     cubic
+//# ⎪W     (t + RTT) otherwise
+//# ⎩ cubic
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.4
+//= type=test
+//= reason=Concave, equality/convex and larger-cwnd convex vectors assert per-new-ACK increment and retained fraction; upper/interior/lower targets explicit. Lower clamp uses an isolated arithmetic state, not a reachable-state claim.
+//# When receiving a new ACK in congestion avoidance, if CUBIC is not in
+//# the Reno-friendly region and _cwnd_ is less than _W_max_, then CUBIC
+//# is in the concave region.  In this region, _cwnd_ MUST be incremented
+//# by
+//#
+//# target - cwnd
+//# ─────────────
+//# cwnd
+//#
+//# for each received new ACK, where _target_ is calculated as described
+//# in Section 4.2.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.5
+//= type=test
+//= reason=Concave, equality/convex and larger-cwnd convex vectors assert per-new-ACK increment and retained fraction; upper/interior/lower targets explicit. Lower clamp uses an isolated arithmetic state, not a reachable-state claim.
+//# In this region, _cwnd_ MUST be
+//# incremented by
+//#
+//# target - cwnd
+//# ─────────────
+//# cwnd
+//#
+//# for each received new ACK, where _target_ is calculated as described
+//# in Section 4.2.
+fn concave_convex_equality_and_target_bounds() {
+    for (cwnd, elapsed, bound) in [
+        (7000, 3_000_000, 1),   // concave, upper clamp
+        (10_000, 3_000_000, 0), // equality belongs to convex
+        (12_000, 4_000_000, 0), // convex, interior target
+        (12_000, 5_000_000, 1), // convex, upper clamp
+        (12_000, 0, -1),        // lower clamp (isolated arithmetic state)
+    ] {
+        let mut c = state(7000, 1000);
+        c.elapsed = elapsed;
+        c.rtt = 100_000;
+        // Isolate the cubic branch, including the otherwise rarely reached
+        // lower target clamp; this is not a reachable-state integration claim.
+        c.w_est = 0;
+        c.acked = 1;
+        let current = u128::from(cwnd) * WINDOW_SCALE;
+        let raw = c.window(c.seconds(elapsed + c.rtt), 1000);
+        match bound {
+            -1 => assert!(raw < current),
+            1 => assert!(raw > current * 3 / 2),
+            _ => assert!(raw > current && raw < current * 3 / 2),
+        }
+        let increment = (raw.clamp(current, current * 3 / 2) - current) * 1000 / u128::from(cwnd);
+        let expected = cwnd + (increment / WINDOW_SCALE) as u32;
+        assert_eq!(c.grow(cwnd, 1000), expected);
+        assert_eq!(c.fraction, increment % WINDOW_SCALE);
+        if bound == 1 {
+            assert_eq!(expected, cwnd + 500);
+        } else if bound == -1 {
+            assert_eq!(expected, cwnd);
+        }
+        // Delayed and sub-MSS new ACKs use the same published cubic increment.
+        for acked in [1000, 2000] {
+            let mut delayed = state(7000, 1000);
+            delayed.elapsed = elapsed;
+            delayed.rtt = 100_000;
+            delayed.w_est = 0;
+            delayed.acked = acked;
+            assert_eq!(delayed.grow(cwnd, 1000), expected);
+        }
+    }
 }

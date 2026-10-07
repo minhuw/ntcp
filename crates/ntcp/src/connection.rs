@@ -647,6 +647,10 @@ impl Connection {
         )
         .with_congestion(config.congestion_algorithm, config.timebase)
         .with_cubic_hystart(config.cubic_hystart)
+        //= https://www.rfc-editor.org/rfc/rfc9438#section-4.7
+        //= reason=Shared active/passive construction forwards caller-selected fast convergence. Known isolated-single-flow policy is supplied by caller; no topology inference.
+        //# In network environments with only a single CUBIC flow
+        //# and without any other traffic, fast convergence SHOULD be disabled.
         .with_cubic_fast_convergence(config.cubic_fast_convergence);
         //= https://www.rfc-editor.org/rfc/rfc6928#section-2
         //= reason=All initial-window choices share RFC6298 estimator and connection timer/sampling implementation. Default/configured >=1s floors retain the recommended floor; explicit subsecond Linux compatibility is a scoped departure, not universal inherited conformance.
@@ -3472,7 +3476,8 @@ impl Connection {
         //# further.
         //= https://www.rfc-editor.org/rfc/rfc9438#section-5.5
         //= reason=Successive distinct marked one-MSS flights double the send interval up to the existing 60-second timer cap in caller units. Only advancing no-ECE delivery beyond the marked flight resets persistence; loss backoff remains independent.
-        //# After reducing the sending rate to one packet per RTT in
+        //# CUBIC also satisfies the "full backoff" requirement as described in
+        //# [RFC5033].  After reducing the sending rate to one packet per RTT in
         //# response to congestion events detected by ECN-Echo ACKs, CUBIC then
         //# exponentially increases the transmission timer for each packet
         //# retransmission while congestion persists.
@@ -4010,6 +4015,10 @@ impl Connection {
         if !syn_ack {
             // send_base is the cumulative DATA edge (unlike SEG.ACK it excludes
             // an acknowledged FIN), matching the successful-output data marker.
+            //= https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2
+            //= reason=CUBIC receives freshly updated RFC6298 SRTT in caller ticks; raw HyStart RTT is forwarded separately.
+            //# *  _RTT_: Smoothed round-trip time in seconds, calculated as
+            //# described in [RFC6298].
             self.congestion.prepare_ack(
                 self.now,
                 self.rtt.srtt(),
@@ -4022,6 +4031,11 @@ impl Connection {
             // ledger excludes incomplete/retransmitted/previously delivered
             // originals even when time-based loss detection is disabled.
             self.congestion
+                //= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
+                //= reason=At most one fresh original-delivery RTT per ACK, independent of RTO estimator gating; Karn-safe scalar fallback only without original-send ledger coverage. Retransmitted/incomplete/cached candidates are excluded.
+                //# While all TCP implementations are REQUIRED to take at least one RTT
+                //# sample each round, implementations of HyStart++ are RECOMMENDED to
+                //# take at least N_RTT_SAMPLE RTT samples.
                 .prepare_startup_ack(crate::hystart::StartupAck {
                     rtt: self
                         .rack
@@ -5437,6 +5451,12 @@ impl Connection {
             //= https://www.rfc-editor.org/rfc/rfc3042#section-2
             //= reason=All fresh-data branches subtract sequence-space flight from peer window. limited_transmit_window_queue_and_failed_output and sack_limited_transmit_repeats_setpipe_on_same_ack assert exhausted and one-segment headroom.
             //# The receiver's advertised window allows the transmission of the segment.
+            //= https://www.rfc-editor.org/rfc/rfc9406#section-3
+            //= reason=Ordinary SS/CSS/CA uses min(cwnd,rwnd) minus sequence flight. Separately selected RFC3042/RFC6675/RFC8985/RFC9937 recovery/probe policies retain their own admission rules, not an unconditional sequence-edge claim.
+            //# At any given time, a TCP MUST NOT
+            //# send data with a sequence number higher than the sum of the
+            //# highest acknowledged sequence number and the minimum of the cwnd
+            //# and rwnd.
             let usable = if self.sack_recovery.is_none()
                 && let Some(prr) = self.prr
             {
@@ -21016,7 +21036,8 @@ mod tests {
     //= https://www.rfc-editor.org/rfc/rfc9438#section-5.5
     //= type=test
     //= reason=Eighteen independently delivered marked flights double the independent timer to the existing 60-second cap without loss timeouts; expiry and successful fresh output remain live.
-    //# After reducing the sending rate to one packet per RTT in
+    //# CUBIC also satisfies the "full backoff" requirement as described in
+    //# [RFC5033].  After reducing the sending rate to one packet per RTT in
     //# response to congestion events detected by ECN-Echo ACKs, CUBIC then
     //# exponentially increases the transmission timer for each packet
     //# retransmission while congestion persists.
@@ -24883,6 +24904,33 @@ mod tests {
         }
     }
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
+    //= type=test
+    //= reason=Actual ten-MSS loss lowers threshold immediately to7000, existing PRR controls repairs and exits to reduced cwnd for both recovery selectors; peer/packet format unchanged. Floor helpers complement this flight vector.
+    //# ssthresh =  flight_size * β      new  ssthresh
+    //# cubic
+    //# cwnd      = cwnd                 save  cwnd
+    //# prior
+    //# ⎧max(ssthresh, 2)    reduction on loss, cwnd >= 2 SMSS
+    //# cwnd =      ⎨max(ssthresh, 1)    reduction on ECE, cwnd >= 1 SMSS
+    //# ⎩
+    //# ssthresh =  max(ssthresh, 2)     ssthresh >= 2 SMSS
+    //#
+    //# Figure 5
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
+    //= type=test
+    //= reason=Actual ten-MSS loss lowers threshold immediately to7000, existing PRR controls repairs and exits to reduced cwnd for both recovery selectors; peer/packet format unchanged. Floor helpers complement this flight vector.
+    //# In the case of packet loss, the
+    //# sender MUST reduce _cwnd_ and _ssthresh_ immediately upon entering
+    //# loss recovery, similar to [RFC5681] (and [RFC6675]).
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-5.10
+    //= type=test
+    //= reason=Actual ten-MSS loss lowers threshold immediately to7000, existing PRR controls repairs and exits to reduced cwnd for both recovery selectors; peer/packet format unchanged. Floor helpers complement this flight vector.
+    //# CUBIC requires only changes to congestion control at the sender, and
+    //# it does not require any changes at receivers.  That is, a CUBIC
+    //# sender works correctly with Reno receivers.  In addition, CUBIC does
+    //# not require any changes to routers and does not require any
+    //# assistance from routers.
     fn cubic_ten_mss_loss_threshold_and_existing_prr_wire_exit() {
         assert_eq!(
             ConnectionConfig::default().congestion_algorithm,
@@ -24979,6 +25027,18 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2
+    //= type=test
+    //= reason=Real handshake supplies SRTT; actual loss/recovery/CA ACKs, unfilled suffix and idle/output failure prove composed byte growth and caller-unit timing.
+    //# *  _RTT_: Smoothed round-trip time in seconds, calculated as
+    //# described in [RFC6298].
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-4.2
+    //= type=test
+    //= reason=Real handshake supplies SRTT; actual loss/recovery/CA ACKs, unfilled suffix and idle/output failure prove composed byte growth and caller-unit timing.
+    //# CUBIC maintains the ACK clocking of Reno by increasing the congestion
+    //# window only at the reception of a new ACK.  It does not make any
+    //# changes to the TCP Fast Recovery and Fast Retransmit algorithms
+    //# [RFC6582] [RFC6675].
     fn cubic_wire_growth_idle_and_transactional_clocks_in_caller_units() {
         let trace = |scale: u64| {
             let cfg = ConnectionConfig {

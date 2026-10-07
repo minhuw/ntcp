@@ -36,7 +36,7 @@ class CoverageGate(unittest.TestCase):
     def test_config_extracts_all_requested_rfcs_and_all_extension_sections(self):
         config = tomllib.loads((Path(__file__).parent / "duvet.toml").read_text())
         self.assertEqual(set(RFCS), {9293, 2018, 6675, 8985, 9937, 6298,
-                                     5681, 6582, 6928, 7323, 2883, 3168, 5961, 3042})
+                                     5681, 6582, 6928, 7323, 2883, 3168, 5961, 3042, 9406, 9438})
         self.assertEqual({s["source"] for s in config["specification"]},
                          {f"{PREFIX}{rfc}" for rfc in RFCS})
         patterns = {r["pattern"] for r in config["requirement"]}
@@ -45,6 +45,45 @@ class CoverageGate(unittest.TestCase):
             self.assertIn(f"workbench/duvet/requirements/**/rfc{rfc}/{sections}.toml", patterns)
         self.assertIn("duvet/rfc*-additions.toml", patterns)
         self.assertIn("duvet/rfc*-todos.toml", patterns)
+
+    def test_new_rfc_supplements_include_operative_algorithm_spans(self):
+        # Keyword extraction truncates equations and misses operative prose.
+        required = {
+            9406: ("windowEnd", "rttSampleCount = 0", "lastRoundMinRTT = infinity",
+                   "cwnd = cwnd + min(N, L * SMSS)", "CSS_GROWTH_DIVISOR",
+                   "cssBaselineMinRtt = infinity", "that partial round counts",
+                   "ssthresh = cwnd", "MIN_RTT_THRESH = 4 msec",
+                   "L = infinity if paced, L = 8 if non-paced"),
+            9438: ("unit of all times is seconds", "_segments_acked_",
+                   "W     (t) = C * (t - K)", "1.5 * cwnd", "segments_acked",
+                   "target - cwnd", "ssthresh =  flight_size", "1 + β",
+                   "_K_ is set to 0", "_cwnd_prior = cwnd_", "undo_cwnd",
+                   "application limited", "exponentially increases"),
+        }
+        for rfc, fragments in required.items():
+            data = tomllib.loads((Path(__file__).parent /
+                                  f"rfc{rfc}-additions.toml").read_text())
+            quotes = [" ".join(s["quote"].split()) for s in data["spec"]]
+            for spec in data["spec"]:
+                self.assertTrue(spec["target"].startswith(f"{PREFIX}{rfc}#section-"))
+                self.assertNotIn("level", spec)  # Do not invent BCP14 levels.
+            for fragment in fragments:
+                with self.subTest(rfc=rfc, fragment=fragment):
+                    self.assertTrue(any(" ".join(fragment.split()) in q for q in quotes))
+
+    def test_new_rfc_quotes_match_full_official_text_when_available(self):
+        root = Path(__file__).resolve().parent.parent
+        for rfc in (9406, 9438):
+            text = root / f"workbench/hystart-rfcs/rfc{rfc}.txt"
+            if not text.exists():
+                self.skipTest("Local official RFC texts are not shipped with the repository")
+            official = " ".join(text.read_text(encoding="utf-8-sig").split())
+            for suffix in ("additions", "todos"):
+                data = tomllib.loads((root / f"duvet/rfc{rfc}-{suffix}.toml").read_text())
+                for kind in ("spec", "TODO", "exception"):
+                    for entry in data.get(kind, []):
+                        with self.subTest(rfc=rfc, suffix=suffix, quote=entry["quote"][:80]):
+                            self.assertIn(" ".join(entry["quote"].split()), official)
 
     def test_all_requested_rfcs_require_complete_spans_and_inventory(self):
         report = complete_report()

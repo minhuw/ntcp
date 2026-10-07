@@ -1223,7 +1223,8 @@
           "UpstreamCubic disables PRR pacing only in this unpublished isolated-test profile to target same-time Linux aggregated bursts: a test-profile exception to RFC 9937 section 6.4 RECOMMENDED pacing. RFC 9937 delivery, credit and exit equations remain unchanged; the core default stays paced. The explicit 200 ms RTO floor and budgeted preallocation are unchanged.",
           "Pinned defaults.sh selects Linux CUBIC; UpstreamCubic selects actual ntcp CUBIC with beta=0.7 and NewReno recovery. Packet/cwnd/ssthresh expectations remain unchanged and mismatches remain behavioral failures.",
           "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
-          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged."
+          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -1238,7 +1239,9 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Diagnostic CUBIC execution with RFC 9937 PRR equations and a test-only pacing exception; full Linux recovery equivalence and conformance are not claimed."
       }
@@ -1261,7 +1264,8 @@
           "UpstreamCubic disables PRR pacing only in this unpublished isolated-test profile to target same-time Linux aggregated bursts: a test-profile exception to RFC 9937 section 6.4 RECOMMENDED pacing. RFC 9937 delivery, credit and exit equations remain unchanged; the core default stays paced. The explicit 200 ms RTO floor and budgeted preallocation are unchanged.",
           "Pinned defaults.sh selects Linux CUBIC; UpstreamCubic selects actual ntcp CUBIC with beta=0.7 and NewReno recovery. Packet/cwnd/ssthresh expectations remain unchanged and mismatches remain behavioral failures.",
           "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
-          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged."
+          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -1276,7 +1280,9 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Diagnostic CUBIC execution with RFC 9937 PRR equations and a test-only pacing exception; full Linux recovery equivalence and conformance are not claimed."
       }
@@ -1299,7 +1305,8 @@
           "UpstreamCubic disables PRR pacing only in this unpublished isolated-test profile to target same-time Linux aggregated bursts: a test-profile exception to RFC 9937 section 6.4 RECOMMENDED pacing. RFC 9937 delivery, credit and exit equations remain unchanged; the core default stays paced. The explicit 200 ms RTO floor and budgeted preallocation are unchanged.",
           "Pinned defaults.sh selects Linux CUBIC; UpstreamCubic selects actual ntcp CUBIC with beta=0.7 and NewReno recovery. Packet/cwnd/ssthresh expectations remain unchanged and mismatches remain behavioral failures.",
           "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
-          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged."
+          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -1314,7 +1321,9 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Diagnostic CUBIC execution with RFC 9937 PRR equations and a test-only pacing exception; full Linux recovery equivalence and conformance are not claimed."
       }
@@ -1337,7 +1346,8 @@
           "UpstreamCubic disables PRR pacing only in this unpublished isolated-test profile to target same-time Linux aggregated bursts: a test-profile exception to RFC 9937 section 6.4 RECOMMENDED pacing. RFC 9937 delivery, credit and exit equations remain unchanged; the core default stays paced. The explicit 200 ms RTO floor and budgeted preallocation are unchanged.",
           "Pinned defaults.sh selects Linux CUBIC; UpstreamCubic selects actual ntcp CUBIC with beta=0.7 and NewReno recovery. Packet/cwnd/ssthresh expectations remain unchanged and mismatches remain behavioral failures.",
           "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
-          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged."
+          "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -1352,7 +1362,9 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Diagnostic CUBIC execution with RFC 9937 PRR equations and a test-only pacing exception; full Linux recovery equivalence and conformance are not claimed."
       }
@@ -1383,14 +1395,17 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced.",
           "Linux CUBIC HyStart slow-start exit, tcp_min_tso_segs=4 accumulation and tcp_early_retrans=0 TLP disablement have no equivalent UpstreamCubic setup mapping.",
           "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
-          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
@@ -1433,14 +1448,17 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced.",
           "Linux CUBIC HyStart slow-start exit, tcp_min_tso_segs=4 accumulation and tcp_early_retrans=0 TLP disablement have no equivalent UpstreamCubic setup mapping.",
           "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
-          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
@@ -1483,13 +1501,16 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux CUBIC HYSTART_DELAY and /sys/module/tcp_cubic/parameters/hystart_detect=3 have no ntcp adapter mapping; the RTT-sample exit assertions are not assumed to succeed.",
           "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
-          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
@@ -1531,13 +1552,16 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux CUBIC HYSTART_DELAY and /sys/module/tcp_cubic/parameters/hystart_detect=3 have no ntcp adapter mapping; the RTT-sample exit assertions are not assumed to succeed.",
           "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
-          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
@@ -1579,12 +1603,15 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux pfifo limit 0 local retransmit failure is not network loss and has no ntcp qdisc/resource-congestion mapping. TCP_INFO fields tcpi_reord_seen, tcpi_min_rtt and tcpi_rtt are outside the existing embedded-field allowlist.",
-          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
@@ -1630,7 +1657,9 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Diagnostic defaults-only CUBIC execution; full Linux equivalence and passing assertions are not claimed.",
         "reasons": [
@@ -1639,7 +1668,8 @@
           "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
           "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
           "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged.",
-          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting. The original setsockopt remains unchanged and execution reports unsupported if reached; no socket-option success is fabricated."
+          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting. The original setsockopt remains unchanged and execution reports unsupported if reached; no socket-option success is fabricated.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "embedded_tcp_info": true
@@ -1670,7 +1700,9 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Diagnostic defaults-only CUBIC execution; full Linux equivalence and passing assertions are not claimed.",
         "reasons": [
@@ -1678,7 +1710,8 @@
           "Pinned defaults.sh selects Linux CUBIC; UpstreamCubic selects actual ntcp CUBIC with beta=0.7 and NewReno recovery. Packet/cwnd/ssthresh expectations remain unchanged and mismatches remain behavioral failures.",
           "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
           "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
-          "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged."
+          "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "embedded_tcp_info": true
@@ -1709,12 +1742,15 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux tcp_ecn=2 passive-only ECN negotiation and CUBIC CWR/PRR behavior have no audited adapter setup mapping; UpstreamCubic disables ECN and upstream-ecn is not CUBIC.",
-          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
@@ -1755,13 +1791,16 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent.",
           "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
-          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
@@ -1803,7 +1842,9 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Diagnostic defaults-only CUBIC execution; full Linux equivalence and passing assertions are not claimed.",
         "reasons": [
@@ -1811,7 +1852,8 @@
           "Pinned defaults.sh selects Linux CUBIC; UpstreamCubic selects actual ntcp CUBIC with beta=0.7 and NewReno recovery. Packet/cwnd/ssthresh expectations remain unchanged and mismatches remain behavioral failures.",
           "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
           "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
-          "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged."
+          "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "embedded_tcp_info": true
@@ -1842,7 +1884,9 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Diagnostic defaults-only CUBIC execution; full Linux equivalence and passing assertions are not claimed.",
         "reasons": [
@@ -1850,7 +1894,8 @@
           "Pinned defaults.sh selects Linux CUBIC; UpstreamCubic selects actual ntcp CUBIC with beta=0.7 and NewReno recovery. Packet/cwnd/ssthresh expectations remain unchanged and mismatches remain behavioral failures.",
           "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
           "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
-          "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged."
+          "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "embedded_tcp_info": true
@@ -1881,13 +1926,16 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent.",
           "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
-          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
@@ -1929,13 +1977,16 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent.",
           "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
-          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
@@ -1977,13 +2028,16 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted.",
           "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
-          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
@@ -2036,13 +2090,16 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted.",
           "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
-          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
@@ -2095,7 +2152,9 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Diagnostic defaults-only CUBIC execution; full Linux equivalence and passing assertions are not claimed.",
         "reasons": [
@@ -2104,7 +2163,8 @@
           "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
           "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
           "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged.",
-          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting. The original setsockopt remains unchanged and execution reports unsupported if reached; no socket-option success is fabricated."
+          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting. The original setsockopt remains unchanged and execution reports unsupported if reached; no socket-option success is fabricated.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "embedded_tcp_info": true
@@ -2135,7 +2195,9 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Diagnostic defaults-only CUBIC execution; full Linux equivalence and passing assertions are not claimed.",
         "reasons": [
@@ -2144,7 +2206,8 @@
           "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
           "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
           "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged.",
-          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting. The original setsockopt remains unchanged and execution reports unsupported if reached; no socket-option success is fabricated."
+          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting. The original setsockopt remains unchanged and execution reports unsupported if reached; no socket-option success is fabricated.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "embedded_tcp_info": true
@@ -2175,14 +2238,17 @@
           "receive_capacity": 8388608,
           "ecn": false,
           "congestion_control": "Cubic",
-          "output_push_batch_segments": 2
+          "output_push_batch_segments": 2,
+          "cubic_hystart": true,
+          "cubic_fast_convergence": true
         },
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced.",
           "Linux tcp_pacing_ss_ratio=200 and tcp_min_tso_segs=2 pacing/TSO controls have no ntcp adapter setup mapping.",
           "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
-          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
+          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [

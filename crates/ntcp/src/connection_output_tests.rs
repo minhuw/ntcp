@@ -1569,6 +1569,60 @@ fn hystart_wire_round(a: &mut Connection, sent: u64, delay: u64) {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
+//= type=test
+//= reason=Actual committed flights and parsed ACKs assert ten fresh raw samples versus at most one RTO update, application-limited fallback/reentry/five-round exit and authoritative CA, with wrap and us/ns clocks.
+//# HyStart++ measures rounds using sequence numbers, as follows:
+//#
+//# *  Define windowEnd as a sequence number initialized to SND.NXT.
+//#
+//# *  When windowEnd is ACKed, the current round ends and windowEnd is
+//# set to SND.NXT.
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
+//= type=test
+//= reason=Actual committed flights and parsed ACKs assert ten fresh raw samples versus at most one RTO update, application-limited fallback/reentry/five-round exit and authoritative CA, with wrap and us/ns clocks.
+//# Keep track of the minimum observed RTT:
+//#
+//# currentRoundMinRTT = min(currentRoundMinRTT, currRTT)
+//# rttSampleCount += 1
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
+//= type=test
+//= reason=Actual committed flights and parsed ACKs assert ten fresh raw samples versus at most one RTO update, application-limited fallback/reentry/five-round exit and authoritative CA, with wrap and us/ns clocks.
+//# cwnd = cwnd + (min(N, L * SMSS) / CSS_GROWTH_DIVISOR)
+//#
+//# Keep track of the minimum observed RTT:
+//#
+//# currentRoundMinRTT = min(currentRoundMinRTT, currRTT)
+//# rttSampleCount += 1
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
+//= type=test
+//= reason=Actual committed flights and parsed ACKs assert ten fresh raw samples versus at most one RTO update, application-limited fallback/reentry/five-round exit and authoritative CA, with wrap and us/ns clocks.
+//# CSS lasts at most CSS_ROUNDS rounds.  If the transition into CSS
+//# happens in the middle of a round, that partial round counts towards
+//# the limit.
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
+//= type=test
+//= reason=Actual committed flights and parsed ACKs assert ten fresh raw samples versus at most one RTO update, application-limited fallback/reentry/five-round exit and authoritative CA, with wrap and us/ns clocks.
+//# If CSS_ROUNDS rounds are complete, enter congestion avoidance by
+//# setting the ssthresh to the current cwnd.
+//#
+//# ssthresh = cwnd
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
+//= type=test
+//= reason=Actual committed flights and parsed ACKs assert ten fresh raw samples versus at most one RTO update, application-limited fallback/reentry/five-round exit and authoritative CA, with wrap and us/ns clocks.
+//# In application-limited scenarios, the amount of data in flight could
+//# fall below the bandwidth-delay product (BDP) and result in smaller
+//# RTT samples, which can trigger an exit back to slow start.  It is
+//# expected that a connection might oscillate between CSS and slow start
+//# in such scenarios.  But this behavior will neither result in a
+//# connection prematurely entering congestion avoidance nor cause
+//# overshooting compared to slow start.
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
+//= type=test
+//= reason=Actual committed flights and parsed ACKs assert ten fresh raw samples versus at most one RTO update, application-limited fallback/reentry/five-round exit and authoritative CA, with wrap and us/ns clocks.
+//# While all TCP implementations are REQUIRED to take at least one RTT
+//# sample each round, implementations of HyStart++ are RECOMMENDED to
+//# take at least N_RTT_SAMPLE RTT samples.
 fn hystart_wire_raw_samples_css_fallback_five_rounds_and_wrap() {
     for timestamps in [false, true] {
         for (sack, rack) in [(false, false), (true, false), (true, true)] {
@@ -1632,6 +1686,34 @@ fn hystart_wire_raw_samples_css_fallback_five_rounds_and_wrap() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
+//= type=test
+//= reason=Actual ten-segment ACK applies L=8 unless all effective pacing prerequisites hold; explicit standard-SS opt-out remains separate.
+//# The following pseudocode uses a limit, L, to control the
+//# aggressiveness of the cwnd increase during both standard slow start
+//# and CSS.  While an arriving ACK may newly acknowledge an arbitrary
+//# number of bytes, the HyStart++ algorithm limits the number of those
+//# bytes applied to increase the cwnd to L*SMSS bytes.
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
+//= type=test
+//= reason=Actual ten-segment ACK applies L=8 unless all effective pacing prerequisites hold; explicit standard-SS opt-out remains separate.
+//# For each arriving ACK in slow start, where N is the number of
+//# previously unacknowledged bytes acknowledged in the arriving ACK:
+//#
+//# Update the cwnd:
+//#
+//# cwnd = cwnd + min(N, L * SMSS)
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
+//= type=test
+//= reason=Actual ten-segment ACK applies L=8 unless all effective pacing prerequisites hold; explicit standard-SS opt-out remains separate.
+//# A paced TCP implementation SHOULD use L =
+//# infinity.
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.10
+//= type=test
+//= reason=Actual selected-CUBIC startup uses HyStart by default; explicit unsuitable-path opt-out applies standard Reno SS growth.
+//# In general, CUBIC SHOULD use the HyStart++ slow
+//# start algorithm [RFC9406] or MAY use the Reno TCP slow start
+//# algorithm [RFC5681] in the rare cases when HyStart++ is not suitable.
 fn hystart_wire_delayed_ack_runtime_pacing_and_opt_out() {
     for (prr, algorithm, pacing, expected) in [
         (false, PrrAlgorithm::Rfc9937, true, 8000),
@@ -1686,6 +1768,21 @@ fn hystart_wire_delayed_ack_runtime_pacing_and_opt_out() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
+//= type=test
+//= reason=Committed retry is Karn-excluded; RTO removes initial startup and restores standard SS; ECE ends startup with beta-reduced cwnd=ssthresh, not the pre-event window.
+//# If loss or Explicit Congestion Notification (ECN) marking is observed
+//# at any time during standard slow start or CSS, enter congestion
+//# avoidance by setting the ssthresh to the current cwnd.
+//#
+//# ssthresh = cwnd
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
+//= type=test
+//= reason=Committed retry is Karn-excluded; RTO removes initial startup and restores standard SS; ECE ends startup with beta-reduced cwnd=ssthresh, not the pre-event window.
+//# An implementation SHOULD use HyStart++ only for the initial slow
+//# start (when the ssthresh is at its initial value of arbitrarily high
+//# per [RFC5681]) and fall back to using standard slow start for the
+//# remainder of the connection lifetime.
 fn hystart_wire_karn_loss_ecn_and_standard_ss_after_rto() {
     for timestamps in [false, true] {
         let (mut a, _) = primed_pair(
@@ -1739,6 +1836,22 @@ fn hystart_wire_karn_loss_ecn_and_standard_ss_after_rto() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
+//= type=test
+//= reason=Actual CSS ACKs grow by 250 bytes per MSS after entry; divided SS ACKs yield the same byte growth; SACK-only delivery cannot be sampled again.
+//# For each arriving ACK in CSS, where N is the number of previously
+//# unacknowledged bytes acknowledged in the arriving ACK:
+//#
+//# Update the cwnd:
+//#
+//# cwnd = cwnd + (min(N, L * SMSS) / CSS_GROWTH_DIVISOR)
+//= https://www.rfc-editor.org/rfc/rfc9406#section-6
+//= type=test
+//= reason=Actual CSS ACKs grow by 250 bytes per MSS after entry; divided SS ACKs yield the same byte growth; SACK-only delivery cannot be sampled again.
+//# The ACK division attack outlined in [SCWA99] does not affect
+//# HyStart++ because the congestion window increase in HyStart++ is
+//# based on the number of bytes newly acknowledged in each arriving ACK
+//# rather than by a particular constant on each arriving ACK.
 fn hystart_wire_css_byte_growth_division_and_sack_sample_not_reused() {
     let (mut a, _) = primed_pair(
         ConnectionConfig {
@@ -1898,4 +2011,72 @@ fn hystart_wire_paced_tlp_bypass_retains_unpaced_ack_cap() {
     assert!(a.tlp_end.is_some());
     hystart_wire_ack(&mut a, now + 100_000, base.wrapping_add(11_000), ACK);
     assert_eq!(a.congestion.cwnd(), 18_000); // Not 21k despite pacing flag.
+}
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.7
+//= type=test
+//= reason=Both constructed active/passive controllers retain false/true option and actually produce W_max7000/5950 on second event, with unchanged beta threshold4900.
+//# In network environments with only a single CUBIC flow
+//# and without any other traffic, fast convergence SHOULD be disabled.
+fn cubic_fast_convergence_config_forwarded_active_and_passive() {
+    assert!(ConnectionConfig::default().cubic_fast_convergence);
+    for enabled in [false, true] {
+        let (mut a, mut b) = primed_pair(
+            ConnectionConfig {
+                congestion_algorithm: CongestionAlgorithm::Cubic,
+                cubic_fast_convergence: enabled,
+                initial_window: InitialWindow::Iw10,
+                ..config(32_000, 1000)
+            },
+            100,
+        );
+        for endpoint in [&mut a, &mut b] {
+            assert!(alloc::format!("{:?}", endpoint.congestion)
+                .contains(&alloc::format!("fast_convergence: {enabled}")));
+            // Exercise the constructed controller rather than the config field:
+            // first event remembers 10k; second smaller event optionally takes
+            // the additional 17/20 reduction before the beta threshold.
+            let base = endpoint.snd_una;
+            assert!(endpoint.congestion.on_ecn(base, 10_000, base.wrapping_add(10_000)));
+            assert!(endpoint.congestion.on_ecn(base.wrapping_add(10_001), 7000, base.wrapping_add(17_001)));
+            let expected = if enabled { 5950 } else { 7000 };
+            assert!(alloc::format!("{:?}", endpoint.congestion)
+                .contains(&alloc::format!("w_max: {expected},")));
+            assert_eq!(endpoint.congestion.ssthresh(), 4900);
+        }
+    }
+}
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc9406#section-3
+//= type=test
+//= reason=Actual ordinary initial startup output stops exactly at min(cwnd,rwnd), with full/receiver-limited windows and wrap. Recovery/probe exceptions are separately selected policies.
+//# At any given time, a TCP MUST NOT
+//# send data with a sequence number higher than the sum of the
+//# highest acknowledged sequence number and the minimum of the cwnd
+//# and rwnd.
+fn hystart_ordinary_wire_minimum_window_bound() {
+    for iss in [100, u32::MAX - 4000] {
+        for window in [2000, 32_000] {
+            let (mut a, _) = primed_pair(
+                ConnectionConfig {
+                    congestion_algorithm: CongestionAlgorithm::Cubic,
+                    initial_window: InitialWindow::Iw10,
+                    nagle: false,
+                    ..config(32_000, 1000)
+                },
+                iss,
+            );
+            let base = a.snd_una;
+            let next = a.receive.next();
+            inject(&mut a, 90_000, next, base, ACK, window, &[]);
+            a.write(&[0x55; 20_000]).unwrap();
+            let budget = u32::from(window).min(a.congestion.cwnd());
+            assert_eq!(outputs(&mut a, 100_000, base),
+                (0..budget).step_by(1000).map(|n| (n, 1000)).collect::<Vec<_>>());
+            assert_eq!(a.snd_nxt, base.wrapping_add(budget));
+            assert_eq!(a.transmit(100_000, &mut [0; 1500]), Ok(None));
+        }
+    }
 }

@@ -1,0 +1,196 @@
+# Operative clauses omitted or truncated by Duvet keyword extraction.
+# Exact published text (whitespace only); no invented uppercase or levels.
+# RFC9406 errata search: no matching errata.
+
+# 9406-ack-limit
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.2"
+quote = '''
+The following pseudocode uses a limit, L, to control the
+   aggressiveness of the cwnd increase during both standard slow start
+   and CSS.  While an arriving ACK may newly acknowledge an arbitrary
+   number of bytes, the HyStart++ algorithm limits the number of those
+   bytes applied to increase the cwnd to L*SMSS bytes.
+'''
+
+# 9406-rtt-initialization
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.2"
+quote = '''
+lastRoundMinRTT and currentRoundMinRTT are initialized to infinity at
+   the initialization time.  currRTT is the RTT sampled from the latest
+   incoming ACK and initialized to infinity.
+
+   lastRoundMinRTT = infinity
+   currentRoundMinRTT = infinity
+   currRTT = infinity
+'''
+
+# 9406-sequence-rounds
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.2"
+quote = '''
+HyStart++ measures rounds using sequence numbers, as follows:
+
+   *  Define windowEnd as a sequence number initialized to SND.NXT.
+
+   *  When windowEnd is ACKed, the current round ends and windowEnd is
+      set to SND.NXT.
+'''
+
+# 9406-round-reset
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.2"
+quote = '''
+At the start of each round during standard slow start [RFC5681] and
+   CSS, initialize the variables used to compute the last round's and
+   current round's minimum RTT:
+
+   lastRoundMinRTT = currentRoundMinRTT
+   currentRoundMinRTT = infinity
+   rttSampleCount = 0
+'''
+
+# 9406-ss-growth
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.2"
+quote = '''
+For each arriving ACK in slow start, where N is the number of
+   previously unacknowledged bytes acknowledged in the arriving ACK:
+
+   Update the cwnd:
+
+     cwnd = cwnd + min(N, L * SMSS)
+'''
+
+# 9406-ss-samples
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.2"
+quote = '''
+Keep track of the minimum observed RTT:
+
+     currentRoundMinRTT = min(currentRoundMinRTT, currRTT)
+     rttSampleCount += 1
+'''
+
+# 9406-delay-entry
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.2"
+quote = '''
+For rounds where at least N_RTT_SAMPLE RTT samples have been obtained
+   and currentRoundMinRTT and lastRoundMinRTT are valid, check to see if
+   delay increase triggers slow start exit:
+
+   if ((rttSampleCount >= N_RTT_SAMPLE) AND
+       (currentRoundMinRTT != infinity) AND
+       (lastRoundMinRTT != infinity))
+     RttThresh = max(MIN_RTT_THRESH,
+       min(lastRoundMinRTT / MIN_RTT_DIVISOR, MAX_RTT_THRESH))
+     if (currentRoundMinRTT >= (lastRoundMinRTT + RttThresh))
+       cssBaselineMinRtt = currentRoundMinRTT
+       exit slow start and enter CSS
+'''
+
+# 9406-css-growth
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.2"
+quote = '''
+For each arriving ACK in CSS, where N is the number of previously
+   unacknowledged bytes acknowledged in the arriving ACK:
+
+   Update the cwnd:
+
+   cwnd = cwnd + (min(N, L * SMSS) / CSS_GROWTH_DIVISOR)
+'''
+
+# 9406-css-samples
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.2"
+quote = '''
+cwnd = cwnd + (min(N, L * SMSS) / CSS_GROWTH_DIVISOR)
+
+   Keep track of the minimum observed RTT:
+
+   currentRoundMinRTT = min(currentRoundMinRTT, currRTT)
+   rttSampleCount += 1
+'''
+
+# 9406-css-resume
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.2"
+quote = '''
+For CSS rounds where at least N_RTT_SAMPLE RTT samples have been
+   obtained, check to see if the current round's minRTT drops below
+   baseline (cssBaselineMinRtt) indicating that slow start exit was
+   spurious:
+
+   if (currentRoundMinRTT < cssBaselineMinRtt)
+     cssBaselineMinRtt = infinity
+     resume slow start including HyStart++
+'''
+
+# 9406-css-round-limit
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.2"
+quote = '''
+CSS lasts at most CSS_ROUNDS rounds.  If the transition into CSS
+   happens in the middle of a round, that partial round counts towards
+   the limit.
+'''
+
+# 9406-css-exit
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.2"
+quote = '''
+If CSS_ROUNDS rounds are complete, enter congestion avoidance by
+   setting the ssthresh to the current cwnd.
+
+   ssthresh = cwnd
+'''
+
+# 9406-congestion-exit
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.2"
+quote = '''
+If loss or Explicit Congestion Notification (ECN) marking is observed
+   at any time during standard slow start or CSS, enter congestion
+   avoidance by setting the ssthresh to the current cwnd.
+
+   ssthresh = cwnd
+'''
+
+# 9406-constant-values
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.3"
+quote = '''
+MIN_RTT_THRESH = 4 msec
+   MAX_RTT_THRESH = 16 msec
+   MIN_RTT_DIVISOR = 8
+   N_RTT_SAMPLE = 8
+   CSS_GROWTH_DIVISOR = 4
+   CSS_ROUNDS = 5
+   L = infinity if paced, L = 8 if non-paced
+'''
+
+# 9406-app-limited-css
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.3"
+quote = '''
+In application-limited scenarios, the amount of data in flight could
+   fall below the bandwidth-delay product (BDP) and result in smaller
+   RTT samples, which can trigger an exit back to slow start.  It is
+   expected that a connection might oscillate between CSS and slow start
+   in such scenarios.  But this behavior will neither result in a
+   connection prematurely entering congestion avoidance nor cause
+   overshooting compared to slow start.
+'''
+
+# 9406-ack-division
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-6"
+quote = '''
+The ACK division attack outlined in [SCWA99] does not affect
+   HyStart++ because the congestion window increase in HyStart++ is
+   based on the number of bytes newly acknowledged in each arriving ACK
+   rather than by a particular constant on each arriving ACK.
+'''

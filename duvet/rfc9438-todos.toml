@@ -1,0 +1,110 @@
+# Unresolved behavior/integration or evidence gaps are TODOs, not waivers.
+# Optional/actor exceptions are explicit; no QUIC, deployment results or undo claimed.
+
+# 9438-undo-save
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.9.2"
+reason = "Optional CUBIC spurious-event detection/state undo is unselected: no saved undo state or CUBIC restoration is implemented. D-SACK/RACK reordering adaptation does not select this optional CUBIC undo algorithm. The conditional high-cwnd preserve rule and save/restore equations apply only if that option is selected; no undo conformance is claimed. Reviewed candidate code/tests: crates/ntcp/src/cubic.rs::Cubic; crates/ntcp/src/recovery.rs::Congestion."
+quote = '''
+undo_cwnd =      cwnd
+                        undo_cwnd      = cwnd
+                                 prior       prior
+                        undo_ssthresh =  ssthresh
+                        undo_W    =      W
+                              max         max
+                        undo_K =         K
+                        undo_t      =    t
+                              epoch       epoch
+                        undo_W    =      W
+                              est         est
+'''
+
+# 9438-undo-restore
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.9.2"
+reason = "Optional CUBIC spurious-event detection/state undo is unselected: no saved undo state or CUBIC restoration is implemented. D-SACK/RACK reordering adaptation does not select this optional CUBIC undo algorithm. The conditional high-cwnd preserve rule and save/restore equations apply only if that option is selected; no undo conformance is claimed. Reviewed candidate code/tests: crates/ntcp/src/cubic.rs::Cubic; crates/ntcp/src/recovery.rs::Congestion."
+quote = '''
+cwnd =      undo_cwnd      ⎫
+              cwnd      = undo_cwnd      ⎮
+                  prior            prior ⎮
+              ssthresh =  undo_ssthresh  ⎮
+              W    =      undo_W         ⎮
+               max              max      ⎬if cwnd < cwnd
+              K =         undo_K         ⎮              prior
+              t      =    undo_t         ⎮
+               epoch            epoch    ⎮
+              W    =      undo_W         ⎮
+               est              est      ⎭
+'''
+
+# 9438-generated-section-4.6-4
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.6"
+reason = "QUIC-only actor requirement is inapplicable to this TCP library. No QUIC implementation or QUIC compliance is claimed; TCP flight-size/growth obligations remain active."
+quote = '''
+A QUIC sender that uses a _cwnd_ _value_ to calculate new values for
+_cwnd_ and _ssthresh_ after detecting a congestion event is REQUIRED
+to apply similar mechanisms [RFC9002].
+'''
+
+# 9438-generated-section-4.9.1-1
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.9.1"
+reason = "Optional CUBIC spurious-event detection/state undo is unselected: no saved undo state or CUBIC restoration is implemented. D-SACK/RACK reordering adaptation does not select this optional CUBIC undo algorithm. The conditional high-cwnd preserve rule and save/restore equations apply only if that option is selected; no undo conformance is claimed. Reviewed candidate code/tests: crates/ntcp/src/cubic.rs::Cubic; crates/ntcp/src/recovery.rs::Congestion."
+quote = '''
+An implementation MAY detect spurious timeouts based on the
+mechanisms described in Forward RTO-Recovery [RFC5682].
+'''
+
+# 9438-generated-section-4.9.1-2
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.9.1"
+reason = "Optional CUBIC spurious-event detection/state undo is unselected: no saved undo state or CUBIC restoration is implemented. D-SACK/RACK reordering adaptation does not select this optional CUBIC undo algorithm. The conditional high-cwnd preserve rule and save/restore equations apply only if that option is selected; no undo conformance is claimed. Reviewed candidate code/tests: crates/ntcp/src/cubic.rs::Cubic; crates/ntcp/src/recovery.rs::Congestion."
+quote = '''
+When a
+spurious timeout is detected, a TCP implementation MAY follow the
+response algorithm described in [RFC4015] to restore the congestion
+control state and adapt the retransmission timer to avoid further
+spurious timeouts.
+'''
+
+# 9438-generated-section-4.9.2-1
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.9.2"
+reason = "Optional CUBIC spurious-event detection/state undo is unselected: no saved undo state or CUBIC restoration is implemented. D-SACK/RACK reordering adaptation does not select this optional CUBIC undo algorithm. The conditional high-cwnd preserve rule and save/restore equations apply only if that option is selected; no undo conformance is claimed. Reviewed candidate code/tests: crates/ntcp/src/cubic.rs::Cubic; crates/ntcp/src/recovery.rs::Congestion."
+quote = '''
+Upon receiving an ACK, a TCP implementation MAY detect spurious fast
+retransmits either using TCP Timestamps or via D-SACK [RFC2883].
+'''
+
+# 9438-generated-section-4.9.2-2
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.9.2"
+reason = "Optional CUBIC spurious-event detection/state undo is unselected: no saved undo state or CUBIC restoration is implemented. D-SACK/RACK reordering adaptation does not select this optional CUBIC undo algorithm. The conditional high-cwnd preserve rule and save/restore equations apply only if that option is selected; no undo conformance is claimed. Reviewed candidate code/tests: crates/ntcp/src/cubic.rs::Cubic; crates/ntcp/src/recovery.rs::Congestion."
+quote = '''
+When packet loss is detected via acknowledgments, a CUBIC
+implementation MAY save the current value of the following variables
+before the congestion window is reduced.
+'''
+
+# 9438-generated-section-4.9.2-3
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.9.2"
+reason = "Optional CUBIC spurious-event detection/state undo is unselected: no saved undo state or CUBIC restoration is implemented. D-SACK/RACK reordering adaptation does not select this optional CUBIC undo algorithm. The conditional high-cwnd preserve rule and save/restore equations apply only if that option is selected; no undo conformance is claimed. Reviewed candidate code/tests: crates/ntcp/src/cubic.rs::Cubic; crates/ntcp/src/recovery.rs::Congestion."
+quote = '''
+Once the previously declared packet loss is confirmed to be spurious,
+CUBIC MAY restore the original values of the above-mentioned
+variables as follows if the current _cwnd_ is lower than
+_cwnd_prior_.
+'''
+
+# 9438-generated-section-4.9.2-4
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.9.2"
+reason = "Optional CUBIC spurious-event detection/state undo is unselected: no saved undo state or CUBIC restoration is implemented. D-SACK/RACK reordering adaptation does not select this optional CUBIC undo algorithm. The conditional high-cwnd preserve rule and save/restore equations apply only if that option is selected; no undo conformance is claimed. Reviewed candidate code/tests: crates/ntcp/src/cubic.rs::Cubic; crates/ntcp/src/recovery.rs::Congestion."
+quote = '''
+In rare cases, when the detection happens long after a spurious fast
+retransmit event and the current _cwnd_ is already higher than
+_cwnd_prior_, CUBIC SHOULD continue to use the current and the most
+recent values of these variables.
+'''

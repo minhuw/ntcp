@@ -28,6 +28,21 @@ fn round(h: &mut HyStart, base: Seq, rtt: u64, ticks: u64) -> bool {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
+//= type=test
+//= reason=Together with threshold and cap/division tests, asserts published fixed constants, five-round limit including partial entry, wrap and us/ns clocks.
+//# MIN_RTT_THRESH = 4 msec
+//# MAX_RTT_THRESH = 16 msec
+//# MIN_RTT_DIVISOR = 8
+//# N_RTT_SAMPLE = 8
+//# CSS_GROWTH_DIVISOR = 4
+//# CSS_ROUNDS = 5
+//# L = infinity if paced, L = 8 if non-paced
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
+//= type=test
+//= reason=Together with threshold and cap/division tests, asserts published fixed constants, five-round limit including partial entry, wrap and us/ns clocks.
+//# It is RECOMMENDED that a HyStart++ implementation use the following
+//# constants:
 fn delay_css_fallback_and_five_rounds_include_entry_partial_round() {
     for base in [Seq(0), Seq(u32::MAX - 4)] {
         for scale in [1, 1000] {
@@ -74,6 +89,32 @@ fn delay_css_fallback_and_five_rounds_include_entry_partial_round() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
+//= type=test
+//= reason=Seven fresh samples cannot trigger entry/fallback; None cannot count; 4ms/interior/16ms threshold vectors.
+//# For rounds where at least N_RTT_SAMPLE RTT samples have been obtained
+//# and currentRoundMinRTT and lastRoundMinRTT are valid, check to see if
+//# delay increase triggers slow start exit:
+//#
+//# if ((rttSampleCount >= N_RTT_SAMPLE) AND
+//# (currentRoundMinRTT != infinity) AND
+//# (lastRoundMinRTT != infinity))
+//# RttThresh = max(MIN_RTT_THRESH,
+//# min(lastRoundMinRTT / MIN_RTT_DIVISOR, MAX_RTT_THRESH))
+//# if (currentRoundMinRTT >= (lastRoundMinRTT + RttThresh))
+//# cssBaselineMinRtt = currentRoundMinRTT
+//# exit slow start and enter CSS
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
+//= type=test
+//= reason=Seven fresh samples cannot trigger entry/fallback; None cannot count; 4ms/interior/16ms threshold vectors.
+//# For CSS rounds where at least N_RTT_SAMPLE RTT samples have been
+//# obtained, check to see if the current round's minRTT drops below
+//# baseline (cssBaselineMinRtt) indicating that slow start exit was
+//# spurious:
+//#
+//# if (currentRoundMinRTT < cssBaselineMinRtt)
+//# cssBaselineMinRtt = infinity
+//# resume slow start including HyStart++
 fn eight_fresh_samples_threshold_clamps_and_no_cached_samples() {
     for (last, threshold) in [(1_000, 4_000), (80_000, 10_000), (1_000_000, 16_000)] {
         let mut h = HyStart::default();
@@ -113,6 +154,10 @@ fn eight_fresh_samples_threshold_clamps_and_no_cached_samples() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
+//= type=test
+//= reason=CSS one-byte ACK credit equals whole-byte credit with divisor four across the retained remainder.
+//# The minimum value of CSS_GROWTH_DIVISOR MUST be at least 2.
 fn delayed_ack_cap_division_fraction_mss_and_actual_pacing() {
     let tb = CallerTimebase::default();
     for mss in [1, 500, 1000, 9000] {
@@ -162,4 +207,42 @@ fn committed_boundary_is_not_extended_by_new_output() {
     assert_eq!(h.window_end, Some(Seq(20)));
     assert_eq!(h.last_min, Some(100));
     assert_eq!(h.samples, 0);
+}
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
+//= type=test
+//= reason=Asserts unavailable initial minima, no sample from None, descending/mixed minima and rotation to unavailable after an unsampled round.
+//# lastRoundMinRTT and currentRoundMinRTT are initialized to infinity at
+//# the initialization time.  currRTT is the RTT sampled from the latest
+//# incoming ACK and initialized to infinity.
+//#
+//# lastRoundMinRTT = infinity
+//# currentRoundMinRTT = infinity
+//# currRTT = infinity
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
+//= type=test
+//= reason=Asserts unavailable initial minima, no sample from None, descending/mixed minima and rotation to unavailable after an unsampled round.
+//# At the start of each round during standard slow start [RFC5681] and
+//# CSS, initialize the variables used to compute the last round's and
+//# current round's minimum RTT:
+//#
+//# lastRoundMinRTT = currentRoundMinRTT
+//# currentRoundMinRTT = infinity
+//# rttSampleCount = 0
+fn unavailable_rtt_initialization_and_round_minima() {
+    let mut h = HyStart::default();
+    assert_eq!((h.last_min, h.current_min, h.baseline), (None, None, None));
+    assert_eq!((h.samples, h.css_rounds, h.fraction), (0, 0, 0));
+    let tb = CallerTimebase::default();
+    h.ack(Seq(1), context(Seq(10), None, false), 1, 1000, tb);
+    assert_eq!((h.last_min, h.current_min, h.samples), (None, None, 0));
+    for (ack, rtt) in [(2, 110), (3, 90), (4, 100)] {
+        h.ack(Seq(ack), context(Seq(10), Some(rtt), false), 0, 1000, tb);
+    }
+    assert_eq!((h.current_min, h.samples), (Some(90), 3));
+    h.ack(Seq(10), context(Seq(20), None, false), 0, 1000, tb);
+    assert_eq!((h.last_min, h.current_min, h.samples), (Some(90), None, 0));
+    h.ack(Seq(20), context(Seq(20), None, false), 0, 1000, tb);
+    assert_eq!((h.last_min, h.current_min, h.samples), (None, None, 0));
 }

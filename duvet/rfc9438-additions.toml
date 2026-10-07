@@ -1,0 +1,442 @@
+# Operative clauses omitted or truncated by Duvet keyword extraction.
+# Exact published text (whitespace only); no invented uppercase or levels.
+# RFC9438 errata: 7806 rejected, 9186 reported; published per-new-ACK rule retained.
+
+# 9438-units
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.1"
+quote = '''
+The unit of all window sizes in this document is segments of the
+   SMSS, and the unit of all times is seconds.  Implementations can use
+   bytes to express window sizes, which would require factoring in the
+   SMSS wherever necessary and replacing _segments_acked_ (Figure 4)
+   with the number of acknowledged bytes.
+'''
+
+# 9438-c-unit
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.1.1"
+quote = '''
+*  _C_: Constant that determines the aggressiveness of CUBIC in
+      competing with other congestion control algorithms in high-BDP
+      networks.  Please see Section 5 for more explanation on how it is
+      set.  The unit for _C_ is
+
+                                  segment
+                                  ───────
+                                        3
+                                  second
+'''
+
+# 9438-definition-rtt
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2"
+quote = '''
+*  _RTT_: Smoothed round-trip time in seconds, calculated as
+      described in [RFC6298].
+'''
+
+# 9438-definition-cwnd
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2"
+quote = '''
+*  _cwnd_: Current congestion window in segments.
+'''
+
+# 9438-definition-ssthresh
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2"
+quote = '''
+*  _ssthresh_: Current slow start threshold in segments.
+'''
+
+# 9438-definition-cwnd-prior
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2"
+quote = '''
+*  _cwnd_prior_: Size of _cwnd_ in segments at the time of setting
+      _ssthresh_ most recently, either upon exiting the first slow start
+      or just before _cwnd_ was reduced in the last congestion event.
+'''
+
+# 9438-definition-w-max
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2"
+quote = '''
+*  _W_max_: Size of _cwnd_ in segments just before _cwnd_ was reduced
+      in the last congestion event when fast convergence is disabled
+      (same as _cwnd_prior_ on a congestion event).  However, if fast
+      convergence is enabled, _W_max_ may be further reduced based on
+      the current saturation point.
+'''
+
+# 9438-definition-k
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2"
+quote = '''
+*  _K_: The time period in seconds it takes to increase the
+      congestion window size at the beginning of the current congestion
+      avoidance stage to _W_max_.
+'''
+
+# 9438-definition-t-current
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2"
+quote = '''
+*  _t_current_: Current time of the system in seconds.
+'''
+
+# 9438-definition-t-epoch
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2"
+quote = '''
+*  _t_epoch_: The time in seconds at which the current congestion
+      avoidance stage started.
+'''
+
+# 9438-definition-cwnd-epoch
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2"
+quote = '''
+*  _cwnd_epoch_: The _cwnd_ at the beginning of the current
+      congestion avoidance stage, i.e., at time _t_epoch_.
+'''
+
+# 9438-definition-w-cubic
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2"
+quote = '''
+*  W_cubic(_t_): The congestion window in segments at time _t_ in
+      seconds based on the cubic increase function, as described in
+      Section 4.2.
+'''
+
+# 9438-definition-target
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2"
+quote = '''
+*  _target_: Target value of the congestion window in segments after
+      the next RTT -- that is, W_cubic(_t_ + _RTT_), as described in
+      Section 4.2.
+'''
+
+# 9438-definition-w-est
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2"
+quote = '''
+*  _W_est_: An estimate for the congestion window in segments in the
+      Reno-friendly region -- that is, an estimate for the congestion
+      window of Reno.
+'''
+
+# 9438-definition-segments-acked
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2"
+quote = '''
+*  _segments_acked_: Number of SMSS-sized segments acked when a "new
+      ACK" is received, i.e., an ACK that cumulatively acknowledges the
+      delivery of previously unacknowledged data.  This number will be a
+      decimal value when a new ACK acknowledges an amount of data that
+      is not SMSS-sized.  Specifically, it can be less than 1 when a new
+      ACK acknowledges a segment smaller than the SMSS.
+'''
+
+# 9438-congestion-signals
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-3.1"
+quote = '''
+After a window reduction in response to a congestion event detected
+   by duplicate acknowledgments (ACKs), Explicit Congestion
+   Notification-Echo (ECN-Echo (ECE)) ACKs [RFC3168], RACK-TLP for TCP
+   [RFC8985], or QUIC loss detection [RFC9002], CUBIC remembers the
+   congestion window size at which it received the congestion event and
+   performs a multiplicative decrease of the congestion window.
+'''
+
+# 9438-ack-clock-recovery
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.2"
+quote = '''
+CUBIC maintains the ACK clocking of Reno by increasing the congestion
+   window only at the reception of a new ACK.  It does not make any
+   changes to the TCP Fast Recovery and Fast Retransmit algorithms
+   [RFC6582] [RFC6675].
+'''
+
+# 9438-cubic-equation
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.2"
+quote = '''
+CUBIC uses the following window increase function:
+
+                                             3
+                      W     (t) = C * (t - K)  + W
+                       cubic                      max
+
+                                  Figure 1
+
+   where _t_ is the elapsed time in seconds from the beginning of the
+   current congestion avoidance stage -- that is,
+
+                           t = t        - t
+                                current    epoch
+
+   and where _t_epoch_ is the time at which the current congestion
+   avoidance stage starts.  _K_ is the time period that the above
+   function takes to increase the congestion window size at the
+   beginning of the current congestion avoidance stage to _W_max_ if
+   there are no further congestion events.  _K_ is calculated using the
+   following equation:
+
+                                ┌────────────────┐
+                             3  │W    - cwnd
+                             ╲  │ max       epoch
+                         K =  ╲ │────────────────
+                               ╲│       C
+
+                                  Figure 2
+
+   where _cwnd_epoch_ is the congestion window at the beginning of the
+   current congestion avoidance stage.
+'''
+
+# 9438-target-equation
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.2"
+quote = '''
+Upon receiving a new ACK during congestion avoidance, CUBIC computes
+   the _target_ congestion window size after the next _RTT_ using
+   Figure 1 as follows, where _RTT_ is the smoothed round-trip time.
+   The lower and upper bounds below ensure that CUBIC's congestion
+   window increase rate is non-decreasing and is less than the increase
+   rate of slow start [SXEZ19].
+
+                 ⎧
+                 ⎪cwnd            if  W     (t + RTT) < cwnd
+                 ⎪                     cubic
+                 ⎨1.5 * cwnd      if  W     (t + RTT) > 1.5 * cwnd
+        target = ⎪                     cubic
+                 ⎪W     (t + RTT) otherwise
+                 ⎩ cubic
+'''
+
+# 9438-region-selection
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.2"
+quote = '''
+To summarize, CUBIC computes both W_cubic(_t_) and _W_est_ (see
+   Section 4.3) on receiving a new ACK in congestion avoidance and
+   chooses the larger of the two values.
+'''
+
+# 9438-alpha-equation
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.3"
+quote = '''
+Thus, CUBIC uses Figure 4 to estimate the window size _W_est_ in the
+   Reno-friendly region with
+
+                                       1 - β
+                                            cubic
+                          α      = 3 * ──────────
+                           cubic       1 + β
+                                            cubic
+'''
+
+# 9438-w-est-equation
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.3"
+quote = '''
+_W_est_ is set equal to _cwnd_epoch_ at the start of the congestion
+   avoidance stage.  After that, on every new ACK, _W_est_ is updated
+   using Figure 4.  Note that this equation uses _segments_acked_ and
+   _cwnd_ is measured in segments.  An implementation that measures
+   _cwnd_ in bytes should adjust the equation accordingly using the
+   number of acknowledged bytes and the SMSS.  Also note that this
+   equation works for connections with enabled or disabled delayed ACKs
+   [RFC5681], as _segments_acked_ will be different based on the
+   segments actually acknowledged by a new ACK.
+
+                                          segments_acked
+                   W    = W    + α      * ──────────────
+                    est    est    cubic        cwnd
+
+                                  Figure 4
+'''
+
+# 9438-concave-full
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.4"
+quote = '''
+When receiving a new ACK in congestion avoidance, if CUBIC is not in
+   the Reno-friendly region and _cwnd_ is less than _W_max_, then CUBIC
+   is in the concave region.  In this region, _cwnd_ MUST be incremented
+   by
+
+                               target - cwnd
+                               ─────────────
+                                    cwnd
+
+   for each received new ACK, where _target_ is calculated as described
+   in Section 4.2.
+'''
+
+# 9438-convex-full
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.5"
+quote = '''
+In this region, _cwnd_ MUST be
+   incremented by
+
+                               target - cwnd
+                               ─────────────
+                                    cwnd
+
+   for each received new ACK, where _target_ is calculated as described
+   in Section 4.2.
+'''
+
+# 9438-decrease-equation
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.6"
+quote = '''
+ssthresh =  flight_size * β      new  ssthresh
+                               cubic
+    cwnd      = cwnd                 save  cwnd
+        prior
+                ⎧max(ssthresh, 2)    reduction on loss, cwnd >= 2 SMSS
+    cwnd =      ⎨max(ssthresh, 1)    reduction on ECE, cwnd >= 1 SMSS
+                ⎩
+    ssthresh =  max(ssthresh, 2)     ssthresh >= 2 SMSS
+
+                                  Figure 5
+'''
+
+# 9438-fast-convergence-equation
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.7"
+quote = '''
+With fast convergence, when a congestion event occurs, _W_max_ is
+   updated as follows, before the window reduction described in
+   Section 4.6.
+
+       ⎧       1 + β
+       ⎪            cubic
+       ⎪cwnd * ────────── if  cwnd < W     and fast convergence enabled,
+W    = ⎨           2                  max
+ max   ⎪                  further reduce  W
+       ⎪                                   max
+       ⎩cwnd             otherwise, remember cwnd before reduction
+'''
+
+# 9438-timeout-decrease
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.8"
+quote = '''
+In the case of a timeout, CUBIC follows Reno to reduce _cwnd_
+   [RFC5681] but sets _ssthresh_ using β__cubic_ (same as in
+   Section 4.6) in a way that is different from Reno TCP [RFC5681].
+'''
+
+# 9438-timeout-epoch
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.8"
+quote = '''
+During the first congestion avoidance stage after a timeout, CUBIC
+   increases its congestion window size using Figure 1, where _t_ is the
+   elapsed time since the beginning of the current congestion avoidance
+   stage, _K_ is set to 0, and _W_max_ is set to the congestion window
+   size at the beginning of the current congestion avoidance stage.
+'''
+
+# 9438-undo-save
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.9.2"
+quote = '''
+undo_cwnd =      cwnd
+                        undo_cwnd      = cwnd
+                                 prior       prior
+                        undo_ssthresh =  ssthresh
+                        undo_W    =      W
+                              max         max
+                        undo_K =         K
+                        undo_t      =    t
+                              epoch       epoch
+                        undo_W    =      W
+                              est         est
+'''
+
+# 9438-undo-restore
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.9.2"
+quote = '''
+cwnd =      undo_cwnd      ⎫
+              cwnd      = undo_cwnd      ⎮
+                  prior            prior ⎮
+              ssthresh =  undo_ssthresh  ⎮
+              W    =      undo_W         ⎮
+               max              max      ⎬if cwnd < cwnd
+              K =         undo_K         ⎮              prior
+              t      =    undo_t         ⎮
+               epoch            epoch    ⎮
+              W    =      undo_W         ⎮
+               est              est      ⎭
+'''
+
+# 9438-startup-epoch
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-4.10"
+quote = '''
+When CUBIC uses HyStart++ [RFC9406], it may exit the first slow start
+   without incurring any packet loss and thus _W_max_ is undefined.  In
+   this special case, CUBIC sets _cwnd_prior = cwnd_ and switches to
+   congestion avoidance.  It then increases its congestion window size
+   using Figure 1, where _t_ is the elapsed time since the beginning of
+   the current congestion avoidance stage, _K_ is set to 0, and _W_max_
+   is set to the congestion window size at the beginning of the current
+   congestion avoidance stage.
+'''
+
+# 9438-full-backoff
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-5.5"
+quote = '''
+CUBIC also satisfies the "full backoff" requirement as described in
+   [RFC5033].  After reducing the sending rate to one packet per RTT in
+   response to congestion events detected by ECN-Echo ACKs, CUBIC then
+   exponentially increases the transmission timer for each packet
+   retransmission while congestion persists.
+'''
+
+# 9438-app-limit-definition
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-5.8"
+quote = '''
+A flow is application limited if it is currently sending less than
+   what is allowed by the congestion window.  This can happen if the
+   flow is limited by either the sender application or the receiver
+   application (via the receiver's advertised window) and thus sends
+   less data than what is allowed by the sender's congestion window.
+'''
+
+# 9438-app-limit-growth
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-5.8"
+quote = '''
+CUBIC does not increase its congestion window if a flow is
+   application limited.  Per Section 4.2, it is required that _t_ in
+   Figure 1 not include application-limited periods, such as idle
+   periods; otherwise, W_cubic(_t_) might be very high after restarting
+   from these periods.
+'''
+
+# 9438-sender-only
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9438#section-5.10"
+quote = '''
+CUBIC requires only changes to congestion control at the sender, and
+   it does not require any changes at receivers.  That is, a CUBIC
+   sender works correctly with Reno receivers.  In addition, CUBIC does
+   not require any changes to routers and does not require any
+   assistance from routers.
+'''
