@@ -227,6 +227,7 @@ enum Profile {
     Sack,
     UpstreamSack,
     UpstreamEcn,
+    UpstreamBasic,
 }
 fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
     let mut local = None;
@@ -247,6 +248,7 @@ fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
                 "sack" => Profile::Sack,
                 "upstream-sack" => Profile::UpstreamSack,
                 "upstream-ecn" => Profile::UpstreamEcn,
+                "upstream-basic" => Profile::UpstreamBasic,
                 _ => return Err(unsupported("unknown so_flags token")),
             };
             if selected.replace(profile).is_some() {
@@ -332,7 +334,10 @@ impl Drop for Adapter {
 }
 impl Owner {
     fn new((local, profile): (Ipv4Addr, Profile)) -> Result<Self> {
-        let upstream = matches!(profile, Profile::UpstreamSack | Profile::UpstreamEcn);
+        let upstream = matches!(
+            profile,
+            Profile::UpstreamSack | Profile::UpstreamEcn | Profile::UpstreamBasic
+        );
         let mut config = EndpointConfig {
             max_connections: LIMIT,
             max_listeners: LIMIT,
@@ -343,15 +348,16 @@ impl Owner {
         config.connection.receive_capacity = match profile {
             Profile::Baseline | Profile::Sack => 65535,
             // Real receive storage: 8 MiB requires scale 8, not 7 (65535 << 7).
-            Profile::UpstreamWindow8 | Profile::UpstreamSack | Profile::UpstreamEcn => {
-                8 * 1024 * 1024
-            }
+            Profile::UpstreamWindow8
+            | Profile::UpstreamSack
+            | Profile::UpstreamEcn
+            | Profile::UpstreamBasic => 8 * 1024 * 1024,
         };
         // Reserve owned receive storage before packetdrill starts timed events.
         // Its mlockall(MCL_FUTURE) makes first-touch allocation synchronous.
         config.preallocate_connections = usize::from(upstream);
         config.connection.mss = 1460;
-        if profile == Profile::UpstreamWindow8 {
+        if matches!(profile, Profile::UpstreamWindow8 | Profile::UpstreamBasic) {
             // Immediate-ACK compatibility policy, not Linux quickACK emulation.
             config.connection.delayed_ack_us = 0;
         }
@@ -373,7 +379,11 @@ impl Owner {
             config.connection.rto_min_us = 200_000;
         }
         config.connection.sack = upstream || profile == Profile::Sack;
-        config.connection.recovery_algorithm = ntcp::RecoveryAlgorithm::NewReno;
+        config.connection.recovery_algorithm = if profile == Profile::UpstreamBasic {
+            ntcp::RecoveryAlgorithm::Reno
+        } else {
+            ntcp::RecoveryAlgorithm::NewReno
+        };
         config.connection.receive_ip_payload_limit = 65515;
         config.connection.send_ip_payload_limit = 65515;
         config.connection.ecn = profile == Profile::UpstreamEcn;

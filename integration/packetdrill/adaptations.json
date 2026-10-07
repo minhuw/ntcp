@@ -103,7 +103,14 @@
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "Active open, data transfer, local FIN followed by remote FIN",
-        "ntcp_settings": {"sack": true, "timestamps": false, "ecn": false, "mss": 1460, "receive_capacity": 65535, "congestion_control": "NewReno"}
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": false,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 65535,
+          "congestion_control": "NewReno"
+        }
       }
     },
     "validate/validate-established-no-flags.pkt": {
@@ -119,7 +126,14 @@
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "SACK handshake, flag validation and receive-queue byte counts",
-        "ntcp_settings": {"sack": true, "timestamps": false, "ecn": false, "mss": 1460, "receive_capacity": 65535, "congestion_control": "NewReno"}
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": false,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 65535,
+          "congestion_control": "NewReno"
+        }
       }
     },
     "close/close-remote-fin-then-close.pkt": {
@@ -135,126 +149,8 @@
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "SACK/window-scale handshake, passive close and post-close reset; peer omits timestamps",
-        "reasons": ["LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."],
-        "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "LegacyInitialCredit", "tlp": true, "rto_min_us": 200000, "preallocate_connections": 1, "ecn": false, "mss": 1460, "receive_capacity": 8388608, "window_scale": 8, "endpoint_max_buffer_bytes": 33554432, "congestion_control": "NewReno"}
-      }
-    },
-    "ts_recent/fin_tsval.pkt": {
-      "source_sha256": "a9ce0dba2d7807617edfb8ecb532e53184386f2c5cd720cbda88a307bc758ccf",
-      "setup_path": "common/defaults.sh",
-      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
-      "variant": "ipv4",
-      "expected_command_count": 1,
-      "command_line": "`../common/defaults.sh`\n",
-      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
-      "mapping": {
-        "linux_defaults_reproduced": false,
-        "assertions_preserved": true,
-        "scope": "SACK/timestamp handshake and FIN timestamp progression; peer omits window scaling",
-        "reasons": ["LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."],
-        "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "LegacyInitialCredit", "tlp": true, "rto_min_us": 200000, "preallocate_connections": 1, "ecn": false, "mss": 1460, "receive_capacity": 8388608, "window_scale": 8, "endpoint_max_buffer_bytes": 33554432, "congestion_control": "NewReno"}
-      }
-    },
-    "sack/sack-route-refresh-ip-tos.pkt": {
-      "source_sha256": "bb81fc984053853bc5891c9e6081539920f3313b995cb56e887d82ba4a7abd04",
-      "setup_path": "common/defaults.sh",
-      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
-      "variant": "ipv4", "expected_command_count": 1,
-      "command_line": "`../common/defaults.sh`\n",
-      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
-      "mapping": {"linux_defaults_reproduced": false, "assertions_preserved": true, "scope": "IPv4 TOS/DF controls and selective retransmission", "reasons": ["LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."], "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "LegacyInitialCredit", "tlp": true, "rto_min_us": 200000, "preallocate_connections": 1, "receive_capacity": 8388608, "ecn": false, "congestion_control": "NewReno"}}
-    },
-    "sack/sack-shift-sacked-2-6-8-3-9-nofack.pkt": {
-      "source_sha256": "bb59cdf5e2bd04b93aba1611718589a799c245f524a514c06e7c70956d559114",
-      "setup_path": "common/defaults.sh",
-      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
-      "variant": "ipv4", "expected_command_count": 1,
-      "command_line": "`../common/defaults.sh`\n",
-      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
-      "embedded_tcp_info": true,
-      "mapping": {"linux_defaults_reproduced": false, "assertions_preserved": true, "scope": "SACK range shifts with unchanged TCP_INFO assertions over live transport state", "reasons": ["LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."], "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "LegacyInitialCredit", "tlp": true, "rto_min_us": 200000, "preallocate_connections": 1, "receive_capacity": 8388608, "ecn": false, "congestion_control": "NewReno"}}
-    },
-    "sack/sack-shift-sacked-7-3-4-8-9-fack.pkt": {
-      "source_sha256": "2a03adf13ac63a8c2fdf6dfe53a2533bff60ed0ae4c194ca1c44dc4991270c5d",
-      "setup_path": "common/defaults.sh",
-      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
-      "variant": "ipv4", "expected_command_count": 1,
-      "command_line": "`../common/defaults.sh`\n",
-      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
-      "embedded_tcp_info": true,
-      "mapping": {"linux_defaults_reproduced": false, "assertions_preserved": true, "scope": "RACK timer, SACK range shifts and live TCP_INFO assertions", "reasons": ["LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."], "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "LegacyInitialCredit", "tlp": true, "rto_min_us": 200000, "preallocate_connections": 1, "receive_capacity": 8388608, "ecn": false, "congestion_control": "NewReno"}}
-    },
-    "sack/sack-shift-sacked-7-5-6-8-9-fack.pkt": {
-      "source_sha256": "6801395a10a2ff12d2b592e781d8135cc719113eb9d9ea92bf5d024cba4e95d7",
-      "setup_path": "common/defaults.sh",
-      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
-      "variant": "ipv4", "expected_command_count": 1,
-      "command_line": "`../common/defaults.sh`\n",
-      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
-      "embedded_tcp_info": true,
-      "mapping": {"linux_defaults_reproduced": false, "assertions_preserved": true, "scope": "RACK timer, SACK range shifts and live TCP_INFO assertions", "reasons": ["LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."], "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "LegacyInitialCredit", "tlp": true, "rto_min_us": 200000, "preallocate_connections": 1, "receive_capacity": 8388608, "ecn": false, "congestion_control": "NewReno"}}
-    },
-    "fast_retransmit/fr-4pkt-sack.pkt": {
-      "source_sha256": "8757d3c2629272099d7a1f58c9add1de80821abc75f8b2ee245efcefdcca5d5c",
-      "setup_path": "common/defaults.sh",
-      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
-      "variant": "ipv4", "expected_command_count": 1,
-      "command_line": "`../common/defaults.sh`\n",
-      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
-      "mapping": {"linux_defaults_reproduced": false, "assertions_preserved": true, "scope": "Four-segment SACK fast retransmit", "reasons": ["LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."], "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "LegacyInitialCredit", "tlp": true, "rto_min_us": 200000, "preallocate_connections": 1, "receive_capacity": 8388608, "ecn": false, "congestion_control": "NewReno"}}
-    },
-    "fast_retransmit/fr-4pkt-fack-last-byte.pkt": {
-      "source_sha256": "48417e7646583308d05e76d64656556bd2f61052504e2173d39be926ebfe7d77",
-      "setup_path": "common/defaults.sh",
-      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
-      "variant": "ipv4", "expected_command_count": 1,
-      "command_line": "`../common/defaults.sh`\n",
-      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
-      "mapping": {"linux_defaults_reproduced": false, "assertions_preserved": true, "scope": "Tail-byte SACK recovery", "reasons": ["LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."], "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "LegacyInitialCredit", "tlp": true, "rto_min_us": 200000, "preallocate_connections": 1, "receive_capacity": 8388608, "ecn": false, "congestion_control": "NewReno"}}
-    },
-    "fast_retransmit/fr-4pkt-fack-last-mss.pkt": {
-      "source_sha256": "2cd06f233c10a8ca5a895251ca026a3690d15708b75112546b150ba72f3075d2",
-      "setup_path": "common/defaults.sh",
-      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
-      "variant": "ipv4", "expected_command_count": 1,
-      "command_line": "`../common/defaults.sh`\n",
-      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
-      "mapping": {"linux_defaults_reproduced": false, "assertions_preserved": true, "scope": "Tail-segment SACK recovery", "reasons": ["LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."], "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "LegacyInitialCredit", "tlp": true, "rto_min_us": 200000, "preallocate_connections": 1, "receive_capacity": 8388608, "ecn": false, "congestion_control": "NewReno"}}
-    },
-    "limited_transmit/limited-transmit-sack.pkt": {
-      "source_sha256": "39d66783f8042c09de3ca7fa2ac702c9d4447299b31037358240b853333db3a1",
-      "setup_path": "common/defaults.sh",
-      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
-      "variant": "ipv4", "expected_command_count": 1,
-      "command_line": "`../common/defaults.sh`\n",
-      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
-      "mapping": {"linux_defaults_reproduced": false, "assertions_preserved": true, "scope": "SACK evidence driven Limited Transmit", "reasons": ["LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."], "ntcp_settings": {"sack": true, "timestamps": true, "initial_window": "Iw10", "rack": true, "prr": "LegacyInitialCredit", "tlp": true, "rto_min_us": 200000, "preallocate_connections": 1, "receive_capacity": 8388608, "ecn": false, "congestion_control": "NewReno"}}
-    },
-    "blocking/blocking-connect.pkt": {
-      "source_sha256": "351b07cc9061749b268561c30e0cbf04763a5f595b0071daa070f2691c2b8fad",
-      "setup_path": "common/defaults.sh",
-      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
-      "variant": "ipv4",
-      "expected_command_count": 1,
-      "command_line": "`../common/defaults.sh`\n",
-      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
-      "mapping": {
-        "linux_defaults_reproduced": false,
-        "assertions_preserved": true,
-        "scope": "blocking/blocking-connect; original packet/syscall/assertion/timing bytes preserved",
         "reasons": [
-          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
-          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; NewReno is used. Profile mismatches remain test failures, not assertion edits."
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -274,22 +170,21 @@
         }
       }
     },
-    "blocking/blocking-write.pkt": {
-      "source_sha256": "92051dff53277fa0b39accb4e6b10289be21b6b1ce535b4e0cf67cf6c90643cd",
+    "ts_recent/fin_tsval.pkt": {
+      "source_sha256": "a9ce0dba2d7807617edfb8ecb532e53184386f2c5cd720cbda88a307bc758ccf",
       "setup_path": "common/defaults.sh",
       "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
       "variant": "ipv4",
-      "expected_command_count": 2,
-      "command_line": "`../common/defaults.sh\n ../common/set_sysctls.py /proc/sys/net/ipv4/tcp_min_tso_segs=10\n`\n",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
       "adapter_flags": "upstream-sack,local=192.168.0.1",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
-        "scope": "blocking/blocking-write; original packet/syscall/assertion/timing bytes preserved",
+        "scope": "SACK/timestamp handshake and FIN timestamp progression; peer omits window scaling",
         "reasons": [
-          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
-          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; NewReno is used. Profile mismatches remain test failures, not assertion edits."
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -306,6 +201,331 @@
           "window_scale": 8,
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "NewReno"
+        }
+      }
+    },
+    "sack/sack-route-refresh-ip-tos.pkt": {
+      "source_sha256": "bb81fc984053853bc5891c9e6081539920f3313b995cb56e887d82ba4a7abd04",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "IPv4 TOS/DF controls and selective retransmission",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "NewReno"
+        }
+      }
+    },
+    "sack/sack-shift-sacked-2-6-8-3-9-nofack.pkt": {
+      "source_sha256": "bb59cdf5e2bd04b93aba1611718589a799c245f524a514c06e7c70956d559114",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "embedded_tcp_info": true,
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "SACK range shifts with unchanged TCP_INFO assertions over live transport state",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "NewReno"
+        }
+      }
+    },
+    "sack/sack-shift-sacked-7-3-4-8-9-fack.pkt": {
+      "source_sha256": "2a03adf13ac63a8c2fdf6dfe53a2533bff60ed0ae4c194ca1c44dc4991270c5d",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "embedded_tcp_info": true,
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "RACK timer, SACK range shifts and live TCP_INFO assertions",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "NewReno"
+        }
+      }
+    },
+    "sack/sack-shift-sacked-7-5-6-8-9-fack.pkt": {
+      "source_sha256": "6801395a10a2ff12d2b592e781d8135cc719113eb9d9ea92bf5d024cba4e95d7",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "embedded_tcp_info": true,
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "RACK timer, SACK range shifts and live TCP_INFO assertions",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "NewReno"
+        }
+      }
+    },
+    "fast_retransmit/fr-4pkt-sack.pkt": {
+      "source_sha256": "8757d3c2629272099d7a1f58c9add1de80821abc75f8b2ee245efcefdcca5d5c",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Four-segment SACK fast retransmit",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "NewReno"
+        }
+      }
+    },
+    "fast_retransmit/fr-4pkt-fack-last-byte.pkt": {
+      "source_sha256": "48417e7646583308d05e76d64656556bd2f61052504e2173d39be926ebfe7d77",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Tail-byte SACK recovery",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "NewReno"
+        }
+      }
+    },
+    "fast_retransmit/fr-4pkt-fack-last-mss.pkt": {
+      "source_sha256": "2cd06f233c10a8ca5a895251ca026a3690d15708b75112546b150ba72f3075d2",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "Tail-segment SACK recovery",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "NewReno"
+        }
+      }
+    },
+    "limited_transmit/limited-transmit-sack.pkt": {
+      "source_sha256": "39d66783f8042c09de3ca7fa2ac702c9d4447299b31037358240b853333db3a1",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "SACK evidence driven Limited Transmit",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "receive_capacity": 8388608,
+          "ecn": false,
+          "congestion_control": "NewReno"
+        }
+      }
+    },
+    "blocking/blocking-connect.pkt": {
+      "source_sha256": "351b07cc9061749b268561c30e0cbf04763a5f595b0071daa070f2691c2b8fad",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "blocking/blocking-connect; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0
+        }
+      }
+    },
+    "blocking/blocking-write.pkt": {
+      "source_sha256": "92051dff53277fa0b39accb4e6b10289be21b6b1ce535b4e0cf67cf6c90643cd",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 2,
+      "command_line": "`../common/defaults.sh\n ../common/set_sysctls.py /proc/sys/net/ipv4/tcp_min_tso_segs=10\n`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "blocking/blocking-write; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0
         }
       },
       "blocked_reasons": [
@@ -331,7 +551,6 @@
         }
       ]
     },
-
     "ecn/ecn-uses-ect0.pkt": {
       "source_sha256": "f3352745dc9d8847bdfddeab1820341d4d2ed501194778a3f95fa38b8eeb03f5",
       "setup_path": "common/defaults.sh",
@@ -369,7 +588,6 @@
       },
       "command_sha256": "2d3c5dcf9e257d8801039155e9811ba0a473e5231cfcb8e8e1f4153a09d6bc85"
     },
-
     "fast_retransmit/fr-4pkt.pkt": {
       "source_sha256": "7ce31ac42d071da88a2b6e40743ca4789912b6473232db2e5cc8e108205f5770",
       "setup_path": "common/defaults.sh",
@@ -378,14 +596,15 @@
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh`\n",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "fast_retransmit/fr-4pkt; original packet/syscall/assertion/timing bytes preserved",
         "reasons": [
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
-          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; NewReno is used. Profile mismatches remain test failures, not assertion edits."
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -401,7 +620,8 @@
           "receive_capacity": 8388608,
           "window_scale": 8,
           "endpoint_max_buffer_bytes": 33554432,
-          "congestion_control": "NewReno"
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0
         }
       }
     },
@@ -413,14 +633,15 @@
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh`\n",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "ioctl/ioctl-siocinq-fin; original packet/syscall/assertion/timing bytes preserved",
         "reasons": [
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
-          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; NewReno is used. Profile mismatches remain test failures, not assertion edits."
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -436,7 +657,8 @@
           "receive_capacity": 8388608,
           "window_scale": 8,
           "endpoint_max_buffer_bytes": 33554432,
-          "congestion_control": "NewReno"
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0
         }
       }
     },
@@ -448,14 +670,15 @@
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh`\n",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "limited_transmit/limited-transmit-no-sack; original packet/syscall/assertion/timing bytes preserved",
         "reasons": [
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
-          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; NewReno is used. Profile mismatches remain test failures, not assertion edits."
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -471,7 +694,8 @@
           "receive_capacity": 8388608,
           "window_scale": 8,
           "endpoint_max_buffer_bytes": 33554432,
-          "congestion_control": "NewReno"
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0
         }
       }
     },
@@ -483,14 +707,15 @@
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh`\n",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "shutdown/shutdown-rd-close; original packet/syscall/assertion/timing bytes preserved",
         "reasons": [
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
-          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; NewReno is used. Profile mismatches remain test failures, not assertion edits."
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -506,7 +731,8 @@
           "receive_capacity": 8388608,
           "window_scale": 8,
           "endpoint_max_buffer_bytes": 33554432,
-          "congestion_control": "NewReno"
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0
         }
       }
     },
@@ -518,14 +744,15 @@
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh`\n",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "shutdown/shutdown-rd-wr-close; original packet/syscall/assertion/timing bytes preserved",
         "reasons": [
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
-          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; NewReno is used. Profile mismatches remain test failures, not assertion edits."
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -541,7 +768,8 @@
           "receive_capacity": 8388608,
           "window_scale": 8,
           "endpoint_max_buffer_bytes": 33554432,
-          "congestion_control": "NewReno"
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0
         }
       }
     },
@@ -553,14 +781,15 @@
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh`\n",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "shutdown/shutdown-rdwr-close; original packet/syscall/assertion/timing bytes preserved",
         "reasons": [
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
-          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; NewReno is used. Profile mismatches remain test failures, not assertion edits."
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -576,7 +805,8 @@
           "receive_capacity": 8388608,
           "window_scale": 8,
           "endpoint_max_buffer_bytes": 33554432,
-          "congestion_control": "NewReno"
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0
         }
       }
     },
@@ -588,14 +818,15 @@
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh`\n",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "shutdown/shutdown-rdwr-send-queue-ack-close; original packet/syscall/assertion/timing bytes preserved",
         "reasons": [
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
-          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; NewReno is used. Profile mismatches remain test failures, not assertion edits."
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -611,7 +842,8 @@
           "receive_capacity": 8388608,
           "window_scale": 8,
           "endpoint_max_buffer_bytes": 33554432,
-          "congestion_control": "NewReno"
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0
         }
       }
     },
@@ -623,14 +855,15 @@
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh`\n",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "shutdown/shutdown-rdwr-write-queue-close; original packet/syscall/assertion/timing bytes preserved",
         "reasons": [
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
-          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; NewReno is used. Profile mismatches remain test failures, not assertion edits."
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -646,7 +879,8 @@
           "receive_capacity": 8388608,
           "window_scale": 8,
           "endpoint_max_buffer_bytes": 33554432,
-          "congestion_control": "NewReno"
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0
         }
       }
     },
@@ -658,14 +892,15 @@
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh`\n",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "shutdown/shutdown-wr-close; original packet/syscall/assertion/timing bytes preserved",
         "reasons": [
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
-          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; NewReno is used. Profile mismatches remain test failures, not assertion edits."
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -681,7 +916,8 @@
           "receive_capacity": 8388608,
           "window_scale": 8,
           "endpoint_max_buffer_bytes": 33554432,
-          "congestion_control": "NewReno"
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0
         }
       }
     },
@@ -693,15 +929,16 @@
       "expected_command_count": 1,
       "command_line": "`../../common/defaults.sh`\n",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "syscall_bad_arg/syscall-invalid-buf-ptr; original packet/syscall/assertion/timing bytes preserved",
         "reasons": [
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
-          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; NewReno is used. Profile mismatches remain test failures, not assertion edits.",
-          "The source spells ../../common/defaults.sh, which does not resolve to tcp/common/defaults.sh from this script directory. The audited semantic mapping explicitly uses pinned tcp/common/defaults.sh, without executing that upstream path."
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The source spells ../../common/defaults.sh, which does not resolve to tcp/common/defaults.sh from this script directory. The audited semantic mapping explicitly uses pinned tcp/common/defaults.sh, without executing that upstream path.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -717,7 +954,8 @@
           "receive_capacity": 8388608,
           "window_scale": 8,
           "endpoint_max_buffer_bytes": 33554432,
-          "congestion_control": "NewReno"
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0
         }
       }
     },
@@ -729,14 +967,15 @@
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh\n`\n",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "ts_recent/invalid_ack; original packet/syscall/assertion/timing bytes preserved",
         "reasons": [
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
-          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; NewReno is used. Profile mismatches remain test failures, not assertion edits."
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -752,7 +991,8 @@
           "receive_capacity": 8388608,
           "window_scale": 8,
           "endpoint_max_buffer_bytes": 33554432,
-          "congestion_control": "NewReno"
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0
         }
       }
     },
@@ -764,14 +1004,15 @@
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh`\n",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "ts_recent/reset_tsval; original packet/syscall/assertion/timing bytes preserved",
         "reasons": [
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
-          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; NewReno is used. Profile mismatches remain test failures, not assertion edits."
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -787,7 +1028,8 @@
           "receive_capacity": 8388608,
           "window_scale": 8,
           "endpoint_max_buffer_bytes": 33554432,
-          "congestion_control": "NewReno"
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0
         }
       }
     },
@@ -799,15 +1041,16 @@
       "expected_command_count": 2,
       "command_line": "`../../common/defaults.sh`\n",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "user_timeout/user-timeout-probe; original packet/syscall/assertion/timing bytes preserved",
         "reasons": [
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
-          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; NewReno is used. Profile mismatches remain test failures, not assertion edits.",
-          "The source spells ../../common/defaults.sh, which does not resolve to tcp/common/defaults.sh from this script directory. The audited semantic mapping explicitly uses pinned tcp/common/defaults.sh, without executing that upstream path."
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The source spells ../../common/defaults.sh, which does not resolve to tcp/common/defaults.sh from this script directory. The audited semantic mapping explicitly uses pinned tcp/common/defaults.sh, without executing that upstream path.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -823,7 +1066,8 @@
           "receive_capacity": 8388608,
           "window_scale": 8,
           "endpoint_max_buffer_bytes": 33554432,
-          "congestion_control": "NewReno"
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0
         }
       },
       "blocked_reasons": [
@@ -851,15 +1095,16 @@
       "expected_command_count": 1,
       "command_line": "`../../common/defaults.sh`\n",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-sack,local=192.168.0.1",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "user_timeout/user_timeout; original packet/syscall/assertion/timing bytes preserved",
         "reasons": [
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
-          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; NewReno is used. Profile mismatches remain test failures, not assertion edits.",
-          "The source spells ../../common/defaults.sh, which does not resolve to tcp/common/defaults.sh from this script directory. The audited semantic mapping explicitly uses pinned tcp/common/defaults.sh, without executing that upstream path."
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The source spells ../../common/defaults.sh, which does not resolve to tcp/common/defaults.sh from this script directory. The audited semantic mapping explicitly uses pinned tcp/common/defaults.sh, without executing that upstream path.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -875,7 +1120,8 @@
           "receive_capacity": 8388608,
           "window_scale": 8,
           "endpoint_max_buffer_bytes": 33554432,
-          "congestion_control": "NewReno"
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0
         }
       }
     }

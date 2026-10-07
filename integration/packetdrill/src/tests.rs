@@ -1394,6 +1394,7 @@ fn upstream_profiles_use_iw10() {
         (Profile::Sack, 4380),
         (Profile::UpstreamSack, 14600),
         (Profile::UpstreamEcn, 14600),
+        (Profile::UpstreamBasic, 14600),
     ] {
         let mut owner = Owner::new((local(), profile)).unwrap();
         let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
