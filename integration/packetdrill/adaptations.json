@@ -472,7 +472,8 @@
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
           "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
-          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged."
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -491,7 +492,8 @@
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
           "abort_with_ack": true,
-          "coalesce_read_window_updates": true
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
         }
       }
     },
@@ -512,7 +514,8 @@
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
           "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
-          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged."
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -531,7 +534,8 @@
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
           "abort_with_ack": true,
-          "coalesce_read_window_updates": true
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
         }
       },
       "blocked_reasons": [
@@ -611,7 +615,8 @@
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
           "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
-          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged."
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -630,7 +635,8 @@
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
           "abort_with_ack": true,
-          "coalesce_read_window_updates": true
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
         }
       }
     },
@@ -651,7 +657,8 @@
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
           "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
-          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged."
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -670,7 +677,8 @@
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
           "abort_with_ack": true,
-          "coalesce_read_window_updates": true
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
         }
       }
     },
@@ -691,7 +699,8 @@
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
           "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
-          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged."
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -710,7 +719,8 @@
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
           "abort_with_ack": true,
-          "coalesce_read_window_updates": true
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
         }
       }
     },
@@ -731,7 +741,8 @@
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
           "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
-          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged."
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -750,7 +761,8 @@
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
           "abort_with_ack": true,
-          "coalesce_read_window_updates": true
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
         }
       }
     },
@@ -771,7 +783,8 @@
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
           "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
-          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged."
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -790,7 +803,8 @@
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
           "abort_with_ack": true,
-          "coalesce_read_window_updates": true
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
         }
       }
     },
@@ -811,7 +825,8 @@
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
           "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
-          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged."
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -830,7 +845,8 @@
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
           "abort_with_ack": true,
-          "coalesce_read_window_updates": true
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
         }
       }
     },
@@ -851,7 +867,8 @@
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
           "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
-          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged."
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -870,7 +887,8 @@
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
           "abort_with_ack": true,
-          "coalesce_read_window_updates": true
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
         }
       }
     },
@@ -891,7 +909,8 @@
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
           "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
-          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged."
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -910,7 +929,8 @@
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
           "abort_with_ack": true,
-          "coalesce_read_window_updates": true
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
         }
       }
     },
@@ -931,7 +951,8 @@
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
           "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
-          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged."
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -950,7 +971,8 @@
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
           "abort_with_ack": true,
-          "coalesce_read_window_updates": true
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
         }
       }
     },
@@ -972,7 +994,8 @@
           "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
           "The source spells ../../common/defaults.sh, which does not resolve to tcp/common/defaults.sh from this script directory. The audited semantic mapping explicitly uses pinned tcp/common/defaults.sh, without executing that upstream path.",
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
-          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged."
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -991,7 +1014,8 @@
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
           "abort_with_ack": true,
-          "coalesce_read_window_updates": true
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
         }
       }
     },
@@ -1012,7 +1036,8 @@
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
           "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
-          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged."
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -1031,7 +1056,8 @@
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
           "abort_with_ack": true,
-          "coalesce_read_window_updates": true
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
         }
       }
     },
@@ -1052,7 +1078,8 @@
           "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
           "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
-          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged."
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -1071,7 +1098,8 @@
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
           "abort_with_ack": true,
-          "coalesce_read_window_updates": true
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
         }
       }
     },
@@ -1093,7 +1121,8 @@
           "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
           "The source spells ../../common/defaults.sh, which does not resolve to tcp/common/defaults.sh from this script directory. The audited semantic mapping explicitly uses pinned tcp/common/defaults.sh, without executing that upstream path.",
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
-          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged."
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -1112,7 +1141,8 @@
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
           "abort_with_ack": true,
-          "coalesce_read_window_updates": true
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
         }
       },
       "blocked_reasons": [
@@ -1150,7 +1180,8 @@
           "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
           "The source spells ../../common/defaults.sh, which does not resolve to tcp/common/defaults.sh from this script directory. The audited semantic mapping explicitly uses pinned tcp/common/defaults.sh, without executing that upstream path.",
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
-          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged."
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -1169,7 +1200,8 @@
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
           "abort_with_ack": true,
-          "coalesce_read_window_updates": true
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
         }
       }
     }
