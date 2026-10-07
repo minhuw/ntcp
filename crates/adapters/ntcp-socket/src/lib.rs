@@ -70,6 +70,11 @@ impl NativeMutation {
         // Constant TLS, no allocation: a managed signal-handler mutation must
         // not wait for the native syscall it interrupted on this same thread.
         NATIVE_MUTATION.with(|depth| depth.set(depth.get() + 1));
+        // A fork child has no managed mutations: its inherited writer/readers
+        // may belong to vanished threads. Keep TLS protection, skip the gate.
+        if child() {
+            return Some(Self);
+        }
         let mut n = FD_MUTATION.load(Ordering::Acquire);
         while n >= 0 {
             match FD_MUTATION.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
@@ -83,7 +88,9 @@ impl NativeMutation {
 }
 impl Drop for NativeMutation {
     fn drop(&mut self) {
-        FD_MUTATION.fetch_sub(1, Ordering::Release);
+        if !child() {
+            FD_MUTATION.fetch_sub(1, Ordering::Release);
+        }
         NATIVE_MUTATION.with(|depth| depth.set(depth.get() - 1));
     }
 }
@@ -225,17 +232,8 @@ fn owned(fd: i32) -> Result<Option<u64>> {
     if !inherited(&SOCKET_FDS, fd) {
         return Ok(None);
     }
-    if DEPTH.with(Cell::get) > 1 || INTERNAL.with(Cell::get) {
-        return Err(EDEADLK);
-    }
-    // Check before touching a lock inherited from a vanished fork thread.
-    if child() {
-        return if inherited(&SOCKET_FDS, fd) {
-            Err(EOWNERDEAD)
-        } else {
-            Ok(None)
-        };
-    }
+    // Reject interrupted native readers and vanished fork-thread locks alike.
+    mutation_context()?;
     let mut tokens = TOKENS.lock().map_err(|_| EIO)?;
     if let Some(t) = tokens.get(&fd) {
         if t.matches(fd) {
@@ -620,9 +618,7 @@ pub unsafe extern "C" fn ntcp_managed_socket(domain: i32, kind: i32, protocol: i
         {
             return raw(unsafe { syscall(SYS_socket, domain, kind, protocol) });
         }
-        if DEPTH.with(Cell::get) > 1 {
-            return Err(EDEADLK);
-        }
+        mutation_context()?;
         if kind & !(SOCK_NONBLOCK | SOCK_CLOEXEC | 0xf) != 0 {
             return Err(EINVAL);
         }
@@ -1485,6 +1481,7 @@ mod tests {
     use super::*;
     static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
     static SIGNAL_SOCKET: AtomicI32 = AtomicI32::new(-1);
+    static SIGNAL_EPOLL: AtomicI32 = AtomicI32::new(-1);
     static SIGNAL_RESULT: AtomicI32 = AtomicI32::new(0);
     extern "C" fn signal_io(_: i32) {
         let byte = 1u8;
@@ -1553,9 +1550,30 @@ mod tests {
     unsafe extern "C" fn signal_close(_: i32) {
         let managed =
             unsafe { close(SIGNAL_SOCKET.load(Ordering::Relaxed)) } == -1 && errno() == EDEADLK;
+        let mut byte = 0u8;
+        let managed_read = unsafe {
+            read(
+                SIGNAL_SOCKET.load(Ordering::Relaxed),
+                (&mut byte as *mut u8).cast(),
+                1,
+            )
+        } == -1
+            && errno() == EDEADLK;
+        let mut event = epoll_event { events: 0, u64: 0 };
+        let managed_epoll = unsafe {
+            readiness::epoll_wait(SIGNAL_EPOLL.load(Ordering::Relaxed), &mut event, 1, 0)
+        } == -1
+            && errno() == EDEADLK;
         let alias = unsafe { dup(SIGNAL_PIPE.load(Ordering::Relaxed)) };
         let native = alias >= 0 && unsafe { close(alias) } == 0;
-        SIGNAL_RESULT.store(if managed && native { 1 } else { -1 }, Ordering::Relaxed);
+        SIGNAL_RESULT.store(
+            if managed && managed_read && managed_epoll && native {
+                1
+            } else {
+                -1
+            },
+            Ordering::Relaxed,
+        );
     }
     #[test]
     fn signal_native_pipe_bypasses_locked_tokens_and_virtual_recursion_fails_closed() {
@@ -1592,7 +1610,19 @@ mod tests {
         );
         assert_eq!(SIGNAL_RESULT.load(Ordering::Relaxed), 1);
         // Interrupt the exported C native close while its reader is held.
-        // Managed mutation fails closed; nested native dup/close stays lockfree.
+        // All managed registry access fails closed at Rust DEPTH=1; nested
+        // native dup/close stays lockfree even while TOKENS is held.
+        let epfd = unsafe { syscall(SYS_epoll_create1, EPOLL_CLOEXEC) as i32 };
+        assert!(epfd >= 0);
+        let mut event = epoll_event {
+            events: EPOLLIN as u32,
+            u64: 0,
+        };
+        assert_eq!(
+            unsafe { readiness::epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &mut event) },
+            0
+        );
+        SIGNAL_EPOLL.store(epfd, Ordering::Relaxed);
         action.sa_sigaction = signal_close as *const () as usize;
         assert_eq!(
             unsafe { libc::sigaction(SIGUSR1, &action, ptr::null_mut()) },
@@ -1629,8 +1659,10 @@ mod tests {
             unsafe { read(pipes[0], (&mut byte as *mut u8).cast(), 1) },
             1
         );
+        readiness::close_epoll(epfd).unwrap();
         TOKENS.lock().unwrap().remove(&fd);
         unsafe {
+            close(epfd);
             syscall(SYS_close, fd);
             close(pipes[0]);
             close(pipes[1]);
@@ -1740,14 +1772,126 @@ mod tests {
         }
     }
     #[test]
+    fn fork_child_native_mutations_bypass_vanished_writer() {
+        // Other tests deliberately leave stale aliases during raw fd reuse.
+        // Isolate the fork snapshot, as in the runtime startup-close test.
+        const CHILD: &str = "NTCP_TEST_FORK_MUTATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::fork_child_native_mutations_bypass_vanished_writer",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        PID.store(unsafe { syscall(SYS_getpid) as i32 }, Ordering::Release);
+        let (source, t) = token(SOCK_CLOEXEC).unwrap();
+        install(source, t, 984).unwrap();
+        let target = unsafe { syscall(SYS_eventfd2, 0, EFD_CLOEXEC) as i32 };
+        let epfd = unsafe { syscall(SYS_epoll_create1, EPOLL_CLOEXEC) as i32 };
+        assert!(target >= 0 && epfd >= 0);
+        let mut event = epoll_event {
+            events: EPOLLIN as u32,
+            u64: 0,
+        };
+        assert_eq!(
+            unsafe { readiness::epoll_ctl(epfd, EPOLL_CTL_ADD, source, &mut event) },
+            0
+        );
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let worker = {
+            let entered = entered.clone();
+            let resume = resume.clone();
+            std::thread::spawn(move || {
+                DUP_AFTER_MUTATION.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        entered.wait();
+                        resume.wait();
+                    }));
+                });
+                duplicate(source, Some(target), SYS_dup2 as i32, 0)
+            })
+        };
+        entered.wait();
+        assert_eq!(FD_MUTATION.load(Ordering::Acquire), -1);
+        let pid = unsafe { syscall(SYS_fork) as i32 };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // No inherited mutexes, allocation, or panic reporting in the child.
+            unsafe { libc::alarm(5) };
+            let alias = unsafe { dup(target) };
+            let fcntl_alias = ntcp_fcntl_dispatch(target, F_DUPFD_CLOEXEC, 0);
+            let native = alias >= 0
+                && unsafe { dup2(target, alias) } == alias
+                && unsafe { dup3(target, alias, O_CLOEXEC) } == alias
+                && fcntl_alias >= 0
+                && unsafe { close(fcntl_alias) } == 0;
+            let managed = unsafe { dup(source) } == -1 && errno() == EOWNERDEAD;
+            let managed_target = unsafe { dup2(alias, source) } == -1 && errno() == EOWNERDEAD;
+            let epoll_target = unsafe { dup2(alias, epfd) } == -1 && errno() == EOWNERDEAD;
+            let native_close = unsafe { close(alias) } == 0 && unsafe { close(target) } == 0;
+            let managed_close = unsafe { close(source) } == -1 && errno() == EOWNERDEAD;
+            let epoll_close = unsafe { close(epfd) } == -1 && errno() == EOWNERDEAD;
+            let managed_read =
+                unsafe { read(source, ptr::null_mut(), 0) } == -1 && errno() == EOWNERDEAD;
+            let epoll_wait = unsafe { readiness::epoll_wait(epfd, &mut event, 1, 0) } == -1
+                && errno() == EOWNERDEAD;
+            let gate_untouched =
+                FD_MUTATION.load(Ordering::Acquire) == -1 && NATIVE_MUTATION.with(Cell::get) == 0;
+            unsafe {
+                libc::_exit(
+                    if native
+                        && gate_untouched
+                        && managed
+                        && managed_target
+                        && epoll_target
+                        && native_close
+                        && managed_close
+                        && epoll_close
+                        && managed_read
+                        && epoll_wait
+                    {
+                        0
+                    } else {
+                        1
+                    },
+                );
+            }
+        }
+        let mut status = 0;
+        assert_eq!(
+            unsafe { syscall(SYS_wait4, pid, &mut status, 0, ptr::null_mut::<rusage>()) },
+            pid as i64
+        );
+        // Release the parent writer even if the child's regression check failed.
+        resume.wait();
+        assert_eq!(worker.join().unwrap(), Ok(target as i64));
+        readiness::close_epoll(epfd).unwrap();
+        let mut tokens = TOKENS.lock().unwrap();
+        for fd in [source, target, epfd] {
+            tokens.remove(&fd);
+            unsafe { syscall(SYS_close, fd) };
+        }
+        assert_eq!(status, 0, "fork child failed or timed out: {status}");
+    }
+    #[test]
     fn managed_mutation_cannot_wait_on_interrupted_native_reader() {
         let (fd, t) = token(SOCK_CLOEXEC).unwrap();
         install(fd, t, 983).unwrap();
+        // Exclude concurrent test writers before admitting this reader; the
+        // managed close must reject before trying this already-held lock.
+        let mut tokens = TOKENS.lock().unwrap();
         let native = NativeMutation::enter().unwrap();
         assert_eq!(unsafe { close(fd) }, -1);
         assert_eq!(errno(), EDEADLK);
         drop(native);
-        TOKENS.lock().unwrap().remove(&fd);
+        tokens.remove(&fd);
         unsafe {
             syscall(SYS_close, fd);
         }

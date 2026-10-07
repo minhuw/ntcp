@@ -44,16 +44,7 @@ pub fn is_epoll(fd: i32) -> Result<bool> {
     if !inherited(&EPOLL_FDS, fd) {
         return Ok(false);
     }
-    if DEPTH.with(Cell::get) > 1 || INTERNAL.with(Cell::get) {
-        return Err(EDEADLK);
-    }
-    if child() {
-        return if inherited(&EPOLL_FDS, fd) {
-            Err(EOWNERDEAD)
-        } else {
-            Ok(false)
-        };
-    }
+    mutation_context()?;
     Ok(EPOLLS.lock().map_err(|_| EIO)?.contains_key(&fd))
 }
 pub fn tracked_epoll(fd: i32) -> bool {
