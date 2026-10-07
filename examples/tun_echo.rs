@@ -9,11 +9,11 @@ mod linux {
         AddressValidation, ConnectionConfig, ConnectionId, Endpoint, EndpointConfig, EndpointError,
         Error, Event, IpMetadata, Ipv4Options, State,
     };
+    use ntcp_io::{PacketIo, TxOutcome, tun::Tun};
     use std::{
-        fs::{File, OpenOptions},
-        io::{self, Read, Write},
+        io,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
-        os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+        os::fd::AsRawFd,
         time::Instant,
     };
 
@@ -78,16 +78,8 @@ mod linux {
         })
     }
 
-    fn checksum(bytes: &[u8]) -> u16 {
-        let mut sum = 0u32;
-        for pair in bytes.chunks(2) {
-            sum += u32::from(pair[0]) << 8 | u32::from(*pair.get(1).unwrap_or(&0));
-        }
-        while sum >> 16 != 0 {
-            sum = (sum & 0xffff) + (sum >> 16);
-        }
-        !(sum as u16)
-    }
+    #[cfg(test)]
+    use ntcp_ip::checksum;
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
     //#   A TCP implementation MUST silently discard an incoming SYN segment
@@ -119,50 +111,30 @@ mod linux {
         enabled: bool,
         timestamp: u32,
     ) -> Option<(IpMetadata, &[u8], Ipv4Options)> {
-        if packet.len() < IP_HEADER || packet[0] >> 4 != 4 {
+        // Preserve the example's historical IPv4 padding allowance, while the
+        // reusable complete-frame codec requires exact bounds.
+        let total = usize::from(u16::from_be_bytes([*packet.get(2)?, *packet.get(3)?]));
+        let parsed = ntcp_ip::parse(packet.get(..total)?, enabled).ok()?;
+        let (IpAddr::V4(source), IpAddr::V4(destination)) =
+            (parsed.ip.source, parsed.ip.destination)
+        else {
             return None;
-        }
-        let header_len = usize::from(packet[0] & 15) * 4;
-        let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
-        if header_len < IP_HEADER
-            || header_len > total_len
-            || total_len > packet.len()
-            || packet[9] != 6
-            // Reject reserved flag, MF and every nonzero fragment offset; allow DF.
-            || u16::from_be_bytes([packet[6], packet[7]]) & !0x4000 != 0
-            || checksum(&packet[..header_len]) != 0
-        {
-            return None;
-        }
-        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
-        //# When received options are passed up to TCP from the IP layer, a TCP
-        //# implementation MUST ignore options that it does not understand (MUST-
-        //# 50).
-        let options = Ipv4Options::parse(&packet[IP_HEADER..header_len], enabled).ok()?;
-        let options = if enabled {
-            options.record(local, timestamp).ok()?
-        } else {
-            Ipv4Options::default()
         };
-        let source = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
-        let destination = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
         //# |  An incoming SYN with an invalid source address MUST be ignored
         //# |  either by TCP or by the IP layer [(MUST-63)] (see
         //# |  Section 3.2.1.3).
-
-        // The required endpoint policy checks directed broadcasts in this TUN context.
-        if destination != local || !unicast(source) || !unicast(destination) {
+        // Endpoint additionally checks directed broadcasts in this TUN subnet.
+        if parsed.protocol != 6 || destination != local || !unicast(source) || !unicast(destination)
+        {
             return None;
         }
-        Some((
-            IpMetadata {
-                source: source.into(),
-                destination: destination.into(),
-            },
-            &packet[header_len..total_len],
-            options,
-        ))
+        let options = if enabled {
+            parsed.ipv4_options.record(local, timestamp).ok()?
+        } else {
+            Ipv4Options::default()
+        };
+        Some((parsed.ip, parsed.payload, options))
     }
 
     #[cfg(test)]
@@ -194,64 +166,17 @@ mod linux {
         transmit: ntcp::Transmit,
         timestamp: u32,
     ) -> io::Result<usize> {
-        let ntcp::Transmit {
-            ip,
-            len: tcp_len,
-            hop_limit,
-            dscp,
-            ecn,
-            ipv4_options,
-            ..
-        } = transmit;
-        let (IpAddr::V4(source), IpAddr::V4(destination)) = (ip.source, ip.destination) else {
-            return Err(invalid("TUN adapter only supports IPv4"));
+        let (IpAddr::V4(source), IpAddr::V4(destination)) =
+            (transmit.ip.source, transmit.ip.destination)
+        else {
+            return Err(invalid("expected IPv4 transmit addresses"));
         };
-        let mut options = [0; 40];
-        let (destination, option_len) = ipv4_options
-            .encode(source, destination, timestamp, &mut options)
-            .map_err(|_| invalid("invalid outgoing IPv4 options"))?;
-        let header_len = IP_HEADER + option_len;
-        let total_len = tcp_len
-            .checked_add(header_len)
-            .ok_or_else(|| invalid("IP length overflow"))?;
-        if total_len > MTU || total_len > packet.len() || !unicast(source) || !unicast(destination)
-        {
-            return Err(invalid("invalid outgoing IPv4 packet or MTU exceeded"));
+        if !unicast(source) || !unicast(destination) {
+            return Err(invalid("invalid outgoing IPv4 address"));
         }
-        packet.copy_within(IP_HEADER..IP_HEADER + tcp_len, header_len);
-        let header = &mut packet[..header_len];
-        header.fill(0);
-        header[0] = 0x40 | (header_len / 4) as u8;
-        header[IP_HEADER..].copy_from_slice(&options[..option_len]);
-        header[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.1
-        //# RFC 1122 allows that if a retransmitted packet is identical to the
-        //# original packet (which implies not only that the data boundaries have
-        //# not changed, but also that none of the headers have changed), then
-        //# the same IPv4 Identification field MAY be used (see Section 3.2.1.5
-        //# of RFC 1122) (MAY-4).
-        // Atomic IPv4 datagrams need no unique ID (RFC 6864); ID remains zero.
-        //= https://www.rfc-editor.org/rfc/rfc3168#section-5.3
-        //= reason=IPv4 example sets DF for all packets; ECN/DSCP matrix explicitly asserts DF and no fragment offset, including both ECT codepoints.
-        //# ECN-capable packets MAY have the DF (Don't Fragment) bit set.
-        header[6] = 0x40; // DF: this example never fragments.
-
-        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
-        //# Time to Live (TTL):  The TTL value used to send TCP segments MUST be
-        //# configurable (MUST-49).
-        header[8] = hop_limit;
-        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.9
-        //# TCP implementations
-        //# SHOULD pass the current Differentiated Services field value without
-        //# change to the IP layer, when it sends segments on the connection
-        //# (SHLD-22).
-        header[1] = (dscp << 2) | (ecn & 3);
-        header[9] = 6;
-        header[12..16].copy_from_slice(&source.octets());
-        header[16..20].copy_from_slice(&destination.octets());
-        let sum = checksum(header);
-        header[10..12].copy_from_slice(&sum.to_be_bytes());
-        Ok(total_len)
+        let capacity = packet.len().min(MTU);
+        ntcp_ip::encode(&mut packet[..capacity], transmit, timestamp)
+            .map_err(|_| invalid("invalid outgoing IPv4 packet or MTU exceeded"))
     }
 
     const IPV6_HEADER: usize = 40;
@@ -271,33 +196,20 @@ mod linux {
     //= reason=Direct-TCP IPv6 base-header adapter extracts the identical ECN field from Traffic Class; extension headers, fragmentation and jumbograms are scoped adapter limits.
     //# Bits 6 and 7 in the IPv4 TOS octet are designated as the ECN field. The IPv4 TOS octet corresponds to the Traffic Class octet in IPv6, and the ECN field is defined identically in both cases.
     fn parse_ipv6(packet: &[u8], local: Ipv6Addr) -> Option<(IpMetadata, u8, &[u8])> {
-        if packet.len() < IPV6_HEADER || packet[0] >> 4 != 6 {
+        let parsed = ntcp_ip::parse(packet, false).ok()?;
+        let (IpAddr::V6(source), IpAddr::V6(destination)) =
+            (parsed.ip.source, parsed.ip.destination)
+        else {
             return None;
-        }
-        let payload_len = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
-        // ponytail: direct TCP only; add an extension-header walker if needed.
-        // Next Header 6 excludes every extension/fragment header; zero length
-        // excludes jumbograms. Require exact TUN packet bounds and a live hop.
-        if payload_len == 0
-            || packet.len() != IPV6_HEADER + payload_len
-            || packet[6] != 6
-            || packet[7] == 0
+        };
+        if parsed.protocol != 6
+            || destination != local
+            || !unicast_v6(source)
+            || !unicast_v6(destination)
         {
             return None;
         }
-        let source = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).ok()?);
-        let destination = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).ok()?);
-        if destination != local || !unicast_v6(source) || !unicast_v6(destination) {
-            return None;
-        }
-        Some((
-            IpMetadata {
-                source: source.into(),
-                destination: destination.into(),
-            },
-            (packet[0] << 4) | (packet[1] >> 4),
-            &packet[IPV6_HEADER..],
-        ))
+        Some((parsed.ip, parsed.traffic_class, parsed.payload))
     }
 
     fn build_ipv6(packet: &mut [u8], transmit: ntcp::Transmit) -> io::Result<usize> {
@@ -306,33 +218,12 @@ mod linux {
         else {
             return Err(invalid("expected IPv6 transmit addresses"));
         };
-        let total = transmit
-            .len
-            .checked_add(IPV6_HEADER)
-            .ok_or_else(|| invalid("IPv6 length overflow"))?;
-        if total > MTU
-            || total > packet.len()
-            || transmit.len == 0
-            || transmit.hop_limit == 0
-            || transmit.dscp > 63
-            || transmit.ecn > 3
-            || !unicast_v6(source)
-            || !unicast_v6(destination)
-            || transmit.ipv4_options != ntcp::OutgoingIpv4Options::default()
-        {
-            return Err(invalid("invalid outgoing IPv6 base-header packet"));
+        if !unicast_v6(source) || !unicast_v6(destination) {
+            return Err(invalid("invalid outgoing IPv6 address"));
         }
-        let header = &mut packet[..IPV6_HEADER];
-        header.fill(0);
-        let class = (transmit.dscp << 2) | transmit.ecn;
-        header[0] = 0x60 | (class >> 4);
-        header[1] = class << 4;
-        header[4..6].copy_from_slice(&(transmit.len as u16).to_be_bytes());
-        header[6] = 6;
-        header[7] = transmit.hop_limit;
-        header[8..24].copy_from_slice(&source.octets());
-        header[24..40].copy_from_slice(&destination.octets());
-        Ok(total)
+        let capacity = packet.len().min(MTU);
+        ntcp_ip::encode(&mut packet[..capacity], transmit, 0)
+            .map_err(|_| invalid("invalid outgoing IPv6 base-header packet"))
     }
 
     fn checked_peer(value: &str, local: IpAddr) -> io::Result<SocketAddr> {
@@ -439,7 +330,7 @@ mod linux {
         Ok(())
     }
 
-    fn interface_ipv6(tun: &File, local: Ipv6Addr) -> io::Result<()> {
+    fn interface_ipv6(tun: &Tun, local: Ipv6Addr) -> io::Result<()> {
         // SAFETY: zero initializes ifreq; the live TUN fd writes its actual name.
         let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
         if unsafe { libc::ioctl(tun.as_raw_fd(), libc::TUNGETIFF, &mut request) } < 0 {
@@ -494,29 +385,8 @@ mod linux {
         }
     }
 
-    fn open_tun(name: &str) -> io::Result<File> {
-        if name.is_empty() || name.len() >= libc::IFNAMSIZ || name.as_bytes().contains(&0) {
-            return Err(invalid(
-                "TUN name must be nonempty, NUL-free and shorter than IFNAMSIZ",
-            ));
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open("/dev/net/tun")?;
-        // SAFETY: zero is valid for ifreq's integer, byte and pointer fields;
-        // it also supplies the trailing name terminator.
-        let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
-        for (out, byte) in request.ifr_name.iter_mut().zip(name.bytes()) {
-            *out = byte as libc::c_char;
-        }
-        request.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
-        // SAFETY: the fd is live and request is a writable, correctly sized ifreq.
-        if unsafe { libc::ioctl(file.as_raw_fd(), libc::TUNSETIFF, &mut request) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(file)
+    fn open_tun(name: &str) -> io::Result<Tun> {
+        Tun::open(name)
     }
 
     fn prefix_length(mask: u32) -> io::Result<u8> {
@@ -573,7 +443,7 @@ mod linux {
         }
     }
 
-    fn interface_subnet(tun: &File, local: Ipv4Addr) -> io::Result<(Ipv4Addr, u8)> {
+    fn interface_subnet(tun: &Tun, local: Ipv4Addr) -> io::Result<(Ipv4Addr, u8)> {
         // SAFETY: zero initializes every ifreq union member and the name buffer.
         let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
         // SAFETY: live TUN fd and writable, correctly sized ifreq. Querying the
@@ -680,10 +550,61 @@ mod linux {
         start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
     }
 
-    fn wait(tun: &File, timeout_ms: i32) -> io::Result<()> {
+    // Generation commits a TCP send; retain the complete frame until the
+    // backend accepts it. No new poll_transmit may overwrite this buffer.
+    fn flush_pending(
+        output: &[u8],
+        pending: &mut usize,
+        send: impl FnOnce(&[u8]) -> io::Result<TxOutcome>,
+    ) -> io::Result<bool> {
+        if *pending == 0 {
+            return Ok(true);
+        }
+        match send(&output[..*pending]) {
+            Ok(TxOutcome::Submitted) => {
+                *pending = 0;
+                Ok(true)
+            }
+            Ok(TxOutcome::WouldBlock) => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn transmit_frames(
+        endpoint: &mut Endpoint,
+        time: u64,
+        output: &mut [u8],
+        pending: &mut usize,
+        header_len: usize,
+        timestamp: u32,
+        backend: &mut impl PacketIo,
+    ) -> io::Result<()> {
+        // Each poll spends one engine work unit, at most 32 units/packets.
+        for _ in 0..BUDGET {
+            if !flush_pending(output, pending, |packet| backend.transmit(packet))? {
+                break;
+            }
+            let polled = endpoint
+                .poll_transmit(time, &mut output[header_len..], 1)
+                .map_err(engine)?;
+            if let Some(packet) = polled.packet {
+                *pending = build_frame(output, packet, timestamp)?;
+                if !flush_pending(output, pending, |packet| backend.transmit(packet))? {
+                    break;
+                }
+            }
+            if !polled.more_work {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn wait(tun: &Tun, timeout_ms: i32, pending: bool) -> io::Result<()> {
         let mut fd = libc::pollfd {
             fd: tun.as_raw_fd(),
-            events: libc::POLLIN,
+            events: libc::POLLIN | if pending { libc::POLLOUT } else { 0 },
             revents: 0,
         };
         // SAFETY: fd points to one initialized pollfd for the duration of poll.
@@ -802,6 +723,7 @@ mod linux {
         let mut input = [0u8; 65576];
         // Reserve all output storage BEFORE polling: generation commits a send.
         let mut output = [0u8; MTU];
+        let mut pending = 0;
         let mut accepting = false;
         eprintln!(
             "echo listening on {local}:{port} via {} (caller-configured TUN)",
@@ -810,11 +732,11 @@ mod linux {
         loop {
             let mut immediate = false;
             for _ in 0..BUDGET {
-                match tun.read(&mut input) {
-                    Ok(0) => {
+                match tun.receive(&mut input) {
+                    Ok(Some(0)) => {
                         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "TUN closed"));
                     }
-                    Ok(len) => {
+                    Ok(Some(len)) => {
                         input_frame(
                             &mut endpoint,
                             now(start),
@@ -824,7 +746,7 @@ mod linux {
                             (start.elapsed().as_millis() as u32) | 0x8000_0000,
                         )?;
                     }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Ok(None) => break,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => return Err(error),
                 }
@@ -877,36 +799,16 @@ mod linux {
                     index += 1;
                 }
             }
-            // Each call spends one engine work unit, at most 32 units/packets.
-            for _ in 0..BUDGET {
-                let polled = endpoint
-                    .poll_transmit(now(start), &mut output[header_len..], 1)
-                    .map_err(engine)?;
-                if let Some(packet) = polled.packet {
-                    let len = build_frame(
-                        &mut output,
-                        packet,
-                        (start.elapsed().as_millis() as u32) | 0x8000_0000,
-                    )?;
-                    match tun.write(&output[..len]) {
-                        Ok(written) if written == len => {}
-                        // Generation already committed: drop locally and let TCP
-                        // recover. Do not stage indefinitely or pretend peer ACK.
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                        Ok(_) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::WriteZero,
-                                "short TUN packet write",
-                            ));
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                if !polled.more_work {
-                    break;
-                }
-            }
-            immediate |= endpoint.has_pending_output();
+            transmit_frames(
+                &mut endpoint,
+                now(start),
+                &mut output,
+                &mut pending,
+                header_len,
+                (start.elapsed().as_millis() as u32) | 0x8000_0000,
+                &mut tun,
+            )?;
+            immediate |= pending == 0 && endpoint.has_pending_output();
             let current = now(start);
             let delay = endpoint.next_deadline().map_or(TICK_US, |deadline| {
                 deadline.saturating_sub(current).min(TICK_US)
@@ -916,7 +818,7 @@ mod linux {
             } else {
                 delay.div_ceil(1000) as i32
             };
-            wait(&tun, timeout_ms)?;
+            wait(&tun, timeout_ms, pending != 0)?;
         }
     }
 
@@ -999,6 +901,100 @@ mod linux {
 
             // Exercise the real OS path, not a statistical entropy test.
             let _secret = acquire_secret().unwrap();
+        }
+
+        #[test]
+        fn pending_packet_survives_backpressure() {
+            use ntcp_io::{PacketIo, PacketLayer};
+            struct Mock {
+                attempts: usize,
+                submitted: Vec<Vec<u8>>,
+            }
+            impl PacketIo for Mock {
+                fn layer(&self) -> PacketLayer {
+                    PacketLayer::Ip
+                }
+                fn receive(&mut self, _: &mut [u8]) -> io::Result<Option<usize>> {
+                    Ok(None)
+                }
+                fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
+                    self.attempts += 1;
+                    if self.attempts <= 2 {
+                        return Ok(TxOutcome::WouldBlock);
+                    }
+                    self.submitted.push(packet.to_vec());
+                    Ok(TxOutcome::Submitted)
+                }
+            }
+            let (mut output, len, local) = packet();
+            let staged = output[..len].to_vec();
+            let mut pending = len;
+            let mut backend = Mock {
+                attempts: 0,
+                submitted: Vec::new(),
+            };
+            let mut endpoint =
+                Endpoint::new(EndpointConfig::default(), [1; 32], 0, test_policy(local)).unwrap();
+            endpoint
+                .connect(
+                    0,
+                    SocketAddr::new(local.into(), 1234),
+                    "10.0.0.1:8080".parse().unwrap(),
+                )
+                .unwrap();
+            for _ in 0..2 {
+                transmit_frames(
+                    &mut endpoint,
+                    0,
+                    &mut output,
+                    &mut pending,
+                    IP_HEADER,
+                    0,
+                    &mut backend,
+                )
+                .unwrap();
+                assert_eq!(pending, len);
+                assert_eq!(&output[..len], staged);
+                assert!(
+                    endpoint.has_pending_output(),
+                    "next SYN generated while frame blocked"
+                );
+                assert!(backend.submitted.is_empty());
+                assert_eq!(backend.receive(&mut [0; 1]).unwrap(), None);
+            }
+            transmit_frames(
+                &mut endpoint,
+                0,
+                &mut output,
+                &mut pending,
+                IP_HEADER,
+                0,
+                &mut backend,
+            )
+            .unwrap();
+            assert_eq!(pending, 0);
+            assert_eq!(backend.submitted.len(), 2);
+            assert_eq!(backend.submitted[0], staged);
+            let next = ntcp_ip::parse(&backend.submitted[1], false).unwrap();
+            assert_ne!(
+                ntcp::wire::parse(next.ip, next.payload)
+                    .unwrap()
+                    .header
+                    .flags
+                    & ntcp::wire::SYN,
+                0
+            );
+            transmit_frames(
+                &mut endpoint,
+                0,
+                &mut output,
+                &mut pending,
+                IP_HEADER,
+                0,
+                &mut backend,
+            )
+            .unwrap();
+            assert_eq!(backend.submitted.len(), 2, "duplicate send");
         }
 
         fn v6_transmit(len: usize) -> ntcp::Transmit {

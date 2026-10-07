@@ -1,0 +1,10 @@
+[package]
+name = "ntcp-af-xdp"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+description = "Copy-mode AF_XDP packet I/O adapter"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ntcp-io = { version = "0.0.1", path = "../ntcp-io" }
+libc = "0.2"

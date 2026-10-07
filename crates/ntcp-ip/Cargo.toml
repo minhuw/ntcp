@@ -1,0 +1,10 @@
+[package]
+name = "ntcp-ip"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+description = "Bounded, caller-buffer IP and Ethernet codec for ntcp"
+repository = "https://github.com/minhuw/ntcp"
+
+[dependencies]
+ntcp = { version = "0.0.1", path = "../.." }

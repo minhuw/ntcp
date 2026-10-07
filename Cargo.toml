@@ -11,7 +11,7 @@ categories = ["network-programming"]
 include = ["/src/**", "/examples/**", "/tests/**", "/Cargo.toml", "/README.md", "/LICENSE"]
 
 [workspace]
-members = ["integration/packetdrill"]
+members = ["integration/packetdrill", "crates/*"]
 resolver = "3"
 
 [dependencies]
@@ -20,3 +20,5 @@ sha2 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 libc = "0.2"
+ntcp-ip = { version = "0.0.1", path = "crates/ntcp-ip" }
+ntcp-io = { version = "0.0.1", path = "crates/ntcp-io" }

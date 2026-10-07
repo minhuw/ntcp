@@ -1,0 +1,26 @@
+[package]
+name = "ntcp-dpdk"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+description = "Caller-driven native DPDK packet I/O"
+links = "ntcp_dpdk_shim"
+
+[features]
+default = []
+native = ["dep:cc", "dep:pkg-config", "dep:shlex"]
+# Statically link DPDK, not the Rust standard library or all system libraries.
+static = ["native"]
+test-pmd = ["native"]
+
+[dependencies]
+ntcp-io = { version = "0.0.1", path = "../ntcp-io" }
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+pkg-config = { version = "0.3", optional = true }
+shlex = { version = "2", optional = true }
+
+[[test]]
+name = "ring_pmd"
+required-features = ["test-pmd"]

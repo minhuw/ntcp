@@ -6,6 +6,9 @@ pattern = "src/**/*.rs"
 [[source]]
 pattern = "examples/**/*.rs"
 
+[[source]]
+pattern = "crates/**/*.rs"
+
 # Section 2.1 defines keywords; Appendix B repeats the functional requirements.
 [[requirement]]
 pattern = "workbench/duvet/requirements/**/rfc9293/section-3*.toml"
