@@ -415,6 +415,12 @@ impl Owner {
             // Immediate-ACK compatibility policy, not Linux quickACK emulation.
             config.connection.delayed_ack_us = 0;
         }
+        if profile == Profile::UpstreamBasic {
+            // Linux tcp_schedule_loss_probe adds its 200ms minimum RTO for
+            // a single packet; RFC8985 section7.2 permits this peer ACK budget.
+            // Multi-packet full-sized flights retain the ordinary 2*SRTT PTO.
+            config.connection.peer_max_ack_delay_us = 200_000;
+        }
         config.connection.initial_window = if upstream {
             ntcp::InitialWindow::Iw10
         } else {
