@@ -146,8 +146,9 @@ pub struct ConnectionConfig {
     pub retransmit_beyond_window: bool,
     pub delayed_ack_us: u64,
     // Coalesce standalone read-triggered window updates up to two effective
-    // send MSS (bounded by half receive capacity). Ordinary ACKs still offer
-    // one-MSS SWS credit; zero-window reopening uses that same lower threshold.
+    // send MSS (bounded by half the wire-representable receive capacity).
+    // Ordinary ACKs still offer one-MSS SWS credit; zero-window reopening
+    // uses that same lower threshold.
     // Boolean policy has no invalid values; existing capacity/MSS validation applies.
     pub coalesce_read_window_updates: bool,
     // Per-connection fixed-window challenge budget, in microseconds.
@@ -4223,9 +4224,13 @@ impl Connection {
         // __tcp_cleanup_rbuf, similarly separate ACK scheduling from window
         // selection (new_window >= 2 * rcv_window_now). Our two-MSS bound
         // is NOT that doubling algorithm or tcp_rcv_space_adjust autotuning.
-        (self.config.receive_capacity / 2)
-            .max(1)
-            .min(self.mss.saturating_mul(2)) as u32
+        // Match advertised_window/read credit's negotiated wire cap: without
+        // WS, even a large backing buffer can offer at most 65535 bytes.
+        let capacity = self
+            .config
+            .receive_capacity
+            .min((u32::from(u16::MAX) << shift) as usize);
+        (capacity / 2).max(1).min(self.mss.saturating_mul(2)) as u32
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.2.2
@@ -17460,6 +17465,92 @@ mod tests {
     }
 
     #[test]
+    fn coalesced_read_credit_unscaled_large_mss_buffer_drain() {
+        for iss in [100, u32::MAX - 32] {
+            for coalesce in [false, true] {
+                let cfg = ConnectionConfig {
+                    delayed_ack_us: 0,
+                    coalesce_read_window_updates: coalesce,
+                    ..config(262144, 40000)
+                };
+                // Real peer SYN offers a large MSS but no Window Scale.
+                let mut bytes = [0; 64];
+                let n = wire::encode(
+                    ip(tuple()),
+                    Header {
+                        source_port: 1000,
+                        destination_port: 2000,
+                        sequence: iss,
+                        acknowledgment: 0,
+                        flags: SYN,
+                        window: u16::MAX,
+                        urgent_pointer: 0,
+                    },
+                    &[2, 4, 156, 64], // MSS = 40000.
+                    b"",
+                    &mut bytes,
+                )
+                .unwrap();
+                let syn = wire::parse(ip(tuple()), &bytes[..n]).unwrap();
+                let mut b = Connection::passive(reverse(tuple()), cfg, 900, 0, &syn).unwrap();
+                let bytes = packet(&mut b, 10);
+                let synack = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+                assert_eq!(synack.options.window_scale, None);
+                assert_eq!(synack.header.window, u16::MAX);
+                let ack = b.snd_nxt;
+                inject(
+                    &mut b,
+                    20,
+                    Seq(iss).wrapping_add(1),
+                    ack,
+                    ACK,
+                    u16::MAX,
+                    b"",
+                );
+                assert_eq!(b.state(), State::Established);
+                assert!(!b.scaling);
+                assert_eq!(b.window_threshold(), 40000);
+                for step in 0..5 {
+                    let next = b.receive.next();
+                    inject(&mut b, 30 + step, next, ack, ACK, u16::MAX, &vec![1; 40000]);
+                    let bytes = packet(&mut b, 30 + step);
+                    let segment = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+                    assert_eq!(segment.header.acknowledgment, next.wrapping_add(40000).0);
+                    assert_eq!(
+                        segment.header.window,
+                        if step < 4 { u16::MAX } else { 25535 }
+                    );
+                }
+                assert_eq!(b.receive_window(), 25535);
+                let promised = b.advertised_edge;
+                let mut drained = vec![0; 200000];
+                assert_eq!(b.read(&mut drained), Ok(200000));
+                assert!(drained.iter().all(|&byte| byte == 1));
+                assert_eq!(b.receive_used, 0);
+                assert_eq!(b.advertised_window(false), u16::MAX);
+                // Only 40000 bytes of new credit fit on the wire, even after
+                // draining all 200000 bytes from the larger backing buffer.
+                assert!(b.ack_pending);
+                assert_eq!(
+                    b.read_window_threshold(),
+                    if coalesce { 32767 } else { 40000 }
+                );
+                assert_eq!(b.advertised_edge, promised);
+                assert_eq!(b.transmit(40, &mut [0; 19]), Err(Error::OutputTooSmall));
+                assert_eq!(b.advertised_edge, promised);
+                let bytes = packet(&mut b, 41);
+                let segment = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+                assert_eq!(segment.header.flags, ACK);
+                assert_eq!(segment.header.window, u16::MAX);
+                assert!(segment.payload.is_empty());
+                assert_eq!(b.advertised_edge.distance_from(promised), 40000);
+                assert!(at_or_after(b.receive.right_edge(), b.advertised_edge));
+                assert_eq!(b.transmit(42, &mut [0; 64]), Ok(None));
+            }
+        }
+    }
+
+    #[test]
     fn coalesced_read_credit_reopens_scaled_zero_with_retained_promise() {
         let cfg = ConnectionConfig {
             delayed_ack_us: 0,
@@ -17532,8 +17623,12 @@ mod tests {
         let (_, mut b) = pair(config(64, 8), 100);
         b.config.coalesce_read_window_updates = true;
         b.config.receive_capacity = 65535usize << 14;
+        b.local_scale = 14;
+        b.advertised_edge = b.receive.next().wrapping_add(1 << 14);
         b.mss = 65495;
         assert_eq!(b.read_window_threshold(), 130990);
+        b.scaling = false;
+        assert_eq!(b.read_window_threshold(), 32767);
     }
 
     #[test]
