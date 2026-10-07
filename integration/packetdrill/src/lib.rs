@@ -226,6 +226,7 @@ enum Profile {
     UpstreamWindow8,
     Sack,
     UpstreamSack,
+    UpstreamEcn,
 }
 fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
     let mut local = None;
@@ -245,6 +246,7 @@ fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
                 "upstream-window8" => Profile::UpstreamWindow8,
                 "sack" => Profile::Sack,
                 "upstream-sack" => Profile::UpstreamSack,
+                "upstream-ecn" => Profile::UpstreamEcn,
                 _ => return Err(unsupported("unknown so_flags token")),
             };
             if selected.replace(profile).is_some() {
@@ -330,6 +332,7 @@ impl Drop for Adapter {
 }
 impl Owner {
     fn new((local, profile): (Ipv4Addr, Profile)) -> Result<Self> {
+        let upstream = matches!(profile, Profile::UpstreamSack | Profile::UpstreamEcn);
         let mut config = EndpointConfig {
             max_connections: LIMIT,
             max_listeners: LIMIT,
@@ -340,38 +343,40 @@ impl Owner {
         config.connection.receive_capacity = match profile {
             Profile::Baseline | Profile::Sack => 65535,
             // Real receive storage: 8 MiB requires scale 8, not 7 (65535 << 7).
-            Profile::UpstreamWindow8 | Profile::UpstreamSack => 8 * 1024 * 1024,
+            Profile::UpstreamWindow8 | Profile::UpstreamSack | Profile::UpstreamEcn => {
+                8 * 1024 * 1024
+            }
         };
         // Reserve owned receive storage before packetdrill starts timed events.
         // Its mlockall(MCL_FUTURE) makes first-touch allocation synchronous.
-        config.preallocate_connections = usize::from(profile == Profile::UpstreamSack);
+        config.preallocate_connections = usize::from(upstream);
         config.connection.mss = 1460;
         if profile == Profile::UpstreamWindow8 {
             // Immediate-ACK compatibility policy, not Linux quickACK emulation.
             config.connection.delayed_ack_us = 0;
         }
-        config.connection.initial_window = if profile == Profile::UpstreamSack {
+        config.connection.initial_window = if upstream {
             ntcp::InitialWindow::Iw10
         } else {
             ntcp::InitialWindow::Rfc5681
         };
-        config.connection.timestamps = profile == Profile::UpstreamSack;
-        config.connection.rack = profile == Profile::UpstreamSack;
-        config.connection.prr = profile == Profile::UpstreamSack;
-        if profile == Profile::UpstreamSack {
+        config.connection.timestamps = upstream;
+        config.connection.rack = upstream;
+        config.connection.prr = upstream;
+        if upstream {
             config.connection.prr_algorithm = ntcp::PrrAlgorithm::LegacyInitialCredit;
         }
-        config.connection.tlp = profile == Profile::UpstreamSack;
-        if profile == Profile::UpstreamSack {
+        config.connection.tlp = upstream;
+        if upstream {
             // Explicit Linux timing compatibility; the core keeps RFC 6298's
             // recommended one-second floor as its default.
             config.connection.rto_min_us = 200_000;
         }
-        config.connection.sack = matches!(profile, Profile::Sack | Profile::UpstreamSack);
+        config.connection.sack = upstream || profile == Profile::Sack;
         config.connection.recovery_algorithm = ntcp::RecoveryAlgorithm::NewReno;
         config.connection.receive_ip_payload_limit = 65515;
         config.connection.send_ip_payload_limit = 65515;
-        config.connection.ecn = false;
+        config.connection.ecn = profile == Profile::UpstreamEcn;
         // Test-only deterministic key and synthetic address domain, never a
         // production entropy source or routing policy. This crate is unpublished.
         let endpoint = Endpoint::new(config, [42; 32], 0, move |validation| match validation {
