@@ -206,6 +206,7 @@ struct Owner {
     next_id: u64,
     detached: Vec<ConnectionId>,
     pending_packet: Option<Vec<u8>>,
+    child_timeouts: Vec<(ConnectionId, u64, u64, u64)>,
 }
 fn unicast(ip: Ipv4Addr) -> bool {
     ip.octets()[0] != 0 && ip.octets()[0] < 224 && !ip.is_loopback()
@@ -338,6 +339,7 @@ impl Owner {
             next_id: 1,
             detached: Vec::new(),
             pending_packet: None,
+            child_timeouts: Vec::new(),
         })
     }
     fn now(&self) -> u64 {
@@ -356,12 +358,7 @@ impl Owner {
                         if let Ok(p) = ntcp_ip::parse(&input[..n], false)
                             && p.protocol == 6
                         {
-                            let _ = self.endpoint.input_with_traffic_class(
-                                now,
-                                p.ip,
-                                p.traffic_class,
-                                p.payload,
-                            );
+                            let _ = self.input(now, p.ip, p.traffic_class, p.payload);
                         }
                     }
                     Ok(None) => break,
@@ -434,6 +431,48 @@ impl Owner {
             signal(wake);
         }
     }
+    fn prune_child_timeouts(&mut self) {
+        self.child_timeouts
+            .retain(|(cid, _, _, _)| self.endpoint.connection_exists(*cid));
+    }
+    fn input(
+        &mut self,
+        now: u64,
+        ip: ntcp::IpMetadata,
+        traffic_class: u8,
+        bytes: &[u8],
+    ) -> std::result::Result<ntcp::InputDisposition, EndpointError> {
+        // Endpoint validates the packet; the ports are only used to observe
+        // generation-aware tuple ownership before and after passive admission.
+        let tuple = bytes.get(..4).map(|ports| ntcp::Tuple {
+            local: SocketAddr::new(ip.destination, u16::from_be_bytes([ports[2], ports[3]])),
+            remote: SocketAddr::new(ip.source, u16::from_be_bytes([ports[0], ports[1]])),
+        });
+        let before = tuple.and_then(|tuple| self.endpoint.connection_id(tuple));
+        let result = self
+            .endpoint
+            .input_with_traffic_class(now, ip, traffic_class, bytes);
+        self.prune_child_timeouts();
+        if let Some(tuple) = tuple
+            && let Some(cid) = self.endpoint.connection_id(tuple)
+            && Some(cid) != before
+            && let Some((&listener, s)) = self.sockets.iter().find(|(_, s)| {
+                matches!(s.handle, Handle::Listener(_))
+                    && s.local.is_some_and(|local| {
+                        local.port() == tuple.local.port()
+                            && (local.ip().is_unspecified() || local == tuple.local)
+                    })
+            })
+        {
+            // Runtime bind policy admits only one listener per port. Input can
+            // only create passive children; active opens go through Connect.
+            // ponytail: bounded linear metadata lookup, index if LIMIT grows.
+            debug_assert!(self.child_timeouts.len() < LIMIT);
+            self.child_timeouts
+                .push((cid, listener, s.receive_timeout_us, s.send_timeout_us));
+        }
+        result
+    }
     fn events(&mut self) {
         for _ in 0..BUDGET {
             let Some(event) = self.endpoint.next_event() else {
@@ -499,6 +538,7 @@ impl Owner {
     }
     fn execute(&mut self, id: u64, op: Op) -> Result<Reply> {
         self.endpoint.on_timeout(self.now(), 0).map_err(engine)?;
+        self.prune_child_timeouts();
         let mut out = Reply::default();
         if let Op::New(flags) = op {
             out.value = self.alloc(Socket::new(flags))?;
@@ -556,13 +596,20 @@ impl Owner {
                 child.idle = s.idle;
                 child.interval = s.interval;
                 child.probes = s.probes;
-                child.receive_timeout_us = s.receive_timeout_us;
-                child.send_timeout_us = s.send_timeout_us;
                 let accepted = self.endpoint.accept(listener);
                 if matches!(accepted, Err(EndpointError::Connection(Error::WouldBlock))) {
                     self.sockets.get_mut(&id).unwrap().acceptable = false;
                 }
                 let cid = accepted.map_err(engine)?;
+                if let Some(index) = self
+                    .child_timeouts
+                    .iter()
+                    .position(|(other, _, _, _)| *other == cid)
+                {
+                    let (_, _, receive, send) = self.child_timeouts.swap_remove(index);
+                    child.receive_timeout_us = receive;
+                    child.send_timeout_us = send;
+                }
                 let tuple = match self.endpoint.tuple(cid).map_err(engine) {
                     Ok(tuple) => tuple,
                     Err(e) => {
@@ -708,6 +755,8 @@ impl Owner {
                         }
                     }
                 }
+                self.child_timeouts
+                    .retain(|(_, listener, _, _)| *listener != id);
                 self.sockets.remove(&id);
             }
             Op::Shutdown(how) => {
@@ -915,13 +964,7 @@ mod tests {
                     let Some(p) = p.packet else {
                         break;
                     };
-                    to.endpoint
-                        .input_with_traffic_class(
-                            to.now(),
-                            p.ip,
-                            p.dscp << 2 | p.ecn,
-                            &bytes[..p.len],
-                        )
+                    to.input(to.now(), p.ip, p.dscp << 2 | p.ecn, &bytes[..p.len])
                         .unwrap();
                     progress = true;
                 }
@@ -979,7 +1022,10 @@ mod tests {
             EINPROGRESS
         );
         pump(&mut a, &mut b);
+        b.execute(listen, Op::SetTimeout(false, 654321)).unwrap();
+        b.execute(listen, Op::SetTimeout(true, 987654)).unwrap();
         let child = b.execute(listen, Op::Accept(0)).unwrap().value as u64;
+        assert!(b.child_timeouts.is_empty());
         assert_eq!(
             b.execute(child, Op::GetTimeout(false)).unwrap().timeout_us,
             123456
@@ -992,6 +1038,57 @@ mod tests {
             b.execute(child, Op::Flags(F_GETFL, 0)).unwrap().value & O_NONBLOCK,
             0
         );
+    }
+
+    #[test]
+    fn passive_timeouts_snapshot_at_syn_and_cleanup_on_listener_close() {
+        let (mut a, mut b, _, _, listen) = pair();
+        b.execute(listen, Op::SetTimeout(false, 123456)).unwrap();
+        b.execute(listen, Op::SetTimeout(true, 234567)).unwrap();
+        let next = new(&mut a, 0);
+        assert_eq!(
+            a.execute(next, Op::Connect("10.73.0.3:16379".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        let mut bytes = [0; 1480];
+        let syn = a
+            .endpoint
+            .poll_transmit(a.now(), &mut bytes, BUDGET)
+            .unwrap()
+            .packet
+            .unwrap();
+        b.input(b.now(), syn.ip, syn.dscp << 2 | syn.ecn, &bytes[..syn.len])
+            .unwrap();
+        let cid = b.child_timeouts[0].0;
+        assert_eq!(b.endpoint.state(cid).unwrap(), State::SynReceived);
+        b.execute(listen, Op::SetTimeout(false, 345678)).unwrap();
+        b.execute(listen, Op::SetTimeout(true, 456789)).unwrap();
+        // A retransmitted SYN must not replace the initial snapshot.
+        b.input(b.now(), syn.ip, syn.dscp << 2 | syn.ecn, &bytes[..syn.len])
+            .unwrap();
+        assert_eq!(b.child_timeouts.len(), 1);
+        pump(&mut a, &mut b);
+        let child = b.execute(listen, Op::Accept(0)).unwrap().value as u64;
+        assert_eq!(
+            b.execute(child, Op::GetTimeout(false)).unwrap().timeout_us,
+            123456
+        );
+        assert_eq!(
+            b.execute(child, Op::GetTimeout(true)).unwrap().timeout_us,
+            234567
+        );
+        assert!(b.child_timeouts.is_empty());
+        let next = new(&mut a, 0);
+        assert_eq!(
+            a.execute(next, Op::Connect("10.73.0.3:16379".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        pump(&mut a, &mut b);
+        assert_eq!(b.child_timeouts.len(), 1);
+        b.execute(listen, Op::Close).unwrap();
+        assert!(b.child_timeouts.is_empty());
     }
 
     #[test]
@@ -1187,6 +1284,7 @@ mod tests {
         b.sockets.get_mut(&listen).unwrap().probes = 1;
         assert_eq!(b.execute(listen, Op::Accept(0)).unwrap_err(), EINVAL);
         assert_eq!(b.sockets.len(), 1);
+        assert!(b.child_timeouts.is_empty());
         // The failed child owes a reset: release must retain it until output.
         assert_ne!(b.endpoint.buffer_bytes(), 0);
         pump(&mut a, &mut b);

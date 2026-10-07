@@ -191,6 +191,14 @@ static void accept_controls(const char *local) {
     elapsed(start);
     puts("ACCEPT");
     fflush(stdout);
+    /* Wait for a queued child, then mutate through an alias before accept. */
+    struct pollfd queued = {.fd = fd, .events = POLLIN};
+    assert(poll(&queued, 1, 3000) == 1 && (queued.revents & POLLIN));
+    int alias = dup(fd);
+    assert(alias >= 0);
+    timeout(alias, SO_RCVTIMEO, 350000);
+    timeout(alias, SO_SNDTIMEO, 450000);
+    assert(close(alias) == 0);
     int child = accept(fd, NULL, NULL);
     assert(child >= 0);
     struct timeval t = {0};
