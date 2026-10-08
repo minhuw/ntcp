@@ -6692,10 +6692,6 @@ impl Connection {
         }
         let length = count as u32 + u32::from(flags & SYN != 0) + u32::from(flags & FIN != 0);
         if length != 0 && !keepalive {
-            if count != 0 && !syn {
-                self.send
-                    .mark_transmitted(seq.distance_from(self.send_base) as usize, count);
-            }
             let end = seq.wrapping_add(length);
             if retransmitted {
                 if !syn && !probe {
@@ -26852,9 +26848,9 @@ mod tests {
         );
         assert_eq!(
             a.write_with_timestamp(b"abc", true, true, Some(1), request),
-            Ok(3)
+            Ok(1)
         );
-        // EOR seals the admission chunk, so LOWAT rejects opening another.
+        // The accepted prefix exhausts LOWAT, without reserving a rejected write.
         assert_eq!(
             a.write_with_timestamp(b"xyz", false, false, Some(1), request),
             Err(Error::WouldBlock)

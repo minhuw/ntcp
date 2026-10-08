@@ -404,3 +404,77 @@ fn splice_stops_at_urgent_octet_without_consuming_it() {
     }
     packet_test::stop();
 }
+
+#[test]
+fn lowat_shared_alias_partial_write() {
+    const CHILD: &str = "NTCP_TEST_LOWAT_ABI_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        assert!(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "inq_tests::lowat_shared_alias_partial_write",
+                    "--test-threads=1"
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap()
+                .success()
+        );
+        return;
+    }
+    packet_test::start((
+        Ipv4Addr::new(192, 0, 2, 1),
+        packet_profile::Profile::UpstreamBasic,
+    ))
+    .unwrap();
+    unsafe {
+        let (fd, mut h) = connected();
+        h.window = 0;
+        inject(h, TS, b"x");
+        assert_eq!(header(&capture()).acknowledgment, 102);
+        let alias = dup(fd);
+        assert!(alias >= 0);
+        let lowat = 1u32;
+        assert_eq!(
+            setsockopt(
+                alias,
+                IPPROTO_TCP,
+                TCP_NOTSENT_LOWAT,
+                (&lowat as *const u32).cast(),
+                4
+            ),
+            0
+        );
+        let mut observed = 0u32;
+        let mut len = 4;
+        assert_eq!(
+            getsockopt(
+                fd,
+                IPPROTO_TCP,
+                TCP_NOTSENT_LOWAT,
+                (&mut observed as *mut u32).cast(),
+                &mut len
+            ),
+            0
+        );
+        assert_eq!(observed, lowat);
+        assert_eq!(send(fd, b"abc".as_ptr().cast(), 3, MSG_MORE), 1);
+        assert_eq!(send(alias, b"x".as_ptr().cast(), 1, MSG_MORE), -1);
+        assert_eq!(errno(), EAGAIN);
+        let unlimited = 0u32; // Socket zero still resolves to its default, UINT_MAX.
+        assert_eq!(
+            setsockopt(
+                fd,
+                IPPROTO_TCP,
+                TCP_NOTSENT_LOWAT,
+                (&unlimited as *const u32).cast(),
+                4
+            ),
+            0
+        );
+        assert_eq!(send(alias, b"bc".as_ptr().cast(), 2, MSG_MORE), 2);
+        assert_eq!(close(alias), 0);
+        assert_eq!(close(fd), 0);
+    }
+}

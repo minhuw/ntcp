@@ -2284,18 +2284,19 @@ mod tests {
         }
     }
     #[test]
-    fn lowwater_admits_tail_overshoot_then_gates_next_chunk_and_eor() {
+    fn lowwater_bounds_partial_send_before_copy_and_preserves_hysteresis() {
         let (mut a, _b, client, _, _) = pair();
         a.execute(client, Op::Set(IPPROTO_TCP, TCP_CORK, 1))
             .unwrap();
         a.execute(client, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, 4000))
             .unwrap();
         assert_eq!(
-            a.execute(client, Op::WriteFlags(vec![1; 8000], MSG_MORE))
+            a.execute(client, Op::WriteFlags(vec![1; 1999], MSG_MORE))
                 .unwrap()
                 .value,
-            8000
+            1999
         );
+        assert_ne!(a.execute(client, Op::Ready).unwrap().value & EPOLLOUT, 0);
         assert_eq!(
             a.execute(client, Op::WriteFlags(vec![2], MSG_MORE))
                 .unwrap()
@@ -2311,13 +2312,13 @@ mod tests {
             a.execute(client, Op::Send(sources, MSG_MORE | MSG_EOR))
                 .unwrap()
                 .value,
-            8383
+            2000
         );
         assert_eq!(a.execute(client, Op::Write(vec![4])).unwrap_err(), EAGAIN);
         let Handle::Connection(cid) = a.sockets[&client].handle else {
             panic!()
         };
-        assert_eq!(a.endpoint.transport_info(cid).unwrap().notsent_bytes, 16384);
+        assert_eq!(a.endpoint.transport_info(cid).unwrap().notsent_bytes, 4000);
         a.execute(client, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, -1))
             .unwrap();
         assert_eq!(

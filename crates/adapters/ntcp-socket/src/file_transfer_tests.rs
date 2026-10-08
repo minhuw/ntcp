@@ -62,7 +62,7 @@ fn transfer_reserves_bytes_and_timestamp_metadata_before_pipe_consumption() {
     assert_eq!(queued(), 3);
     a.execute(client, Op::Set(SOL_SOCKET, SO_RCVBUF, 65536))
         .unwrap();
-    assert_eq!(a.execute(client, op).unwrap().value, 3);
+    assert_eq!(a.execute(client, op.clone()).unwrap().value, 3);
     assert_eq!(queued(), 0);
     let Handle::Connection(cid) = a.sockets[&client].handle else {
         panic!()
@@ -82,17 +82,17 @@ fn transfer_reserves_bytes_and_timestamp_metadata_before_pipe_consumption() {
         3
     );
     fresh
-        .execute(
-            client,
-            Op::Transfer {
-                source: source[0],
-                staging,
-                offset: None,
-                count: 3,
-                flags: MSG_MORE,
-            },
-        )
+        .execute(client, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, 2))
         .unwrap();
+    assert_eq!(fresh.execute(client, op.clone()).unwrap().value, 2);
+    assert_eq!(queued(), 1);
+    assert_eq!(fresh.execute(client, op.clone()).unwrap_err(), EAGAIN);
+    assert_eq!(queued(), 1); // LOWAT must reject before consuming native input.
+    fresh
+        .execute(client, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, 0))
+        .unwrap();
+    assert_eq!(fresh.execute(client, op).unwrap().value, 1);
+    assert_eq!(queued(), 0);
     let mut packet = [0; 1480];
     assert!(
         fresh

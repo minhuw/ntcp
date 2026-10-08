@@ -1810,9 +1810,8 @@ impl Endpoint {
         Ok(count)
     }
 
-    /// LOWAT gates opening bounded logical admission chunks (at most 16KiB,
-    /// capped by send capacity), not appending to an unsent, unsealed tail.
-    /// None and u32::MAX preserve unlimited admission. This is not an skb model.
+    // Finite LOWAT caps accepted bytes at LOWAT minus actual unsent bytes.
+    // None and u32::MAX impose no limit beyond available send capacity.
     pub fn write_with_options_and_notsent_lowat(
         &mut self,
         id: ConnectionId,
