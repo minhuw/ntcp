@@ -39,11 +39,20 @@ pub(crate) fn transport_option(info: ntcp::TransportInfo, option: i32) -> Result
     put(28, info.sacked as u64);
     put(32, info.lost as u64);
     put(36, info.retransmitted as u64);
+    put(52, info.last_data_recv_ms as u64);
+    put(144, info.notsent_bytes as u64);
     put(68, info.rtt_us.unwrap_or(0));
     put(72, info.rttvar_us);
     put(76, (info.ssthresh / info.mss) as u64);
     put(80, (info.cwnd / info.mss) as u64);
     put(88, info.reordering as u64);
+    for (offset, value) in [
+        (168, info.busy_time_us),
+        (176, info.rwnd_limited_us),
+        (184, info.sndbuf_limited_us),
+    ] {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
+    }
     bytes[0] = match info.state {
         State::Established => 1,
         State::SynSent => 2,
@@ -66,4 +75,59 @@ pub(crate) fn transport_option(info: ntcp::TransportInfo, option: i32) -> Result
         0
     };
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn linux_info_metrics_offsets_preserve_existing_fields() {
+        let info = ntcp::TransportInfo {
+            state: State::Established,
+            recovery: false,
+            loss: false,
+            ledger_valid: true,
+            unacked: 3,
+            sacked: 1,
+            lost: 1,
+            retransmitted: 2,
+            reordering: 3,
+            cwnd: 10000,
+            ssthresh: 8000,
+            mss: 1000,
+            rtt_us: Some(12000),
+            rttvar_us: 3000,
+            rto_us: 200000,
+            notsent_bytes: 4000,
+            last_data_recv_ms: 789,
+            busy_time_us: 0x1122334455667788,
+            rwnd_limited_us: 0x2233445566778899,
+            sndbuf_limited_us: 0x33445566778899aa,
+            send_used: 5000,
+            send_capacity: 65536,
+            receive_used: 42,
+            receive_capacity: 65536,
+        };
+        let bytes = transport_option(info, 1).unwrap();
+        assert_eq!(bytes.len(), TCP_INFO_SIZE);
+        for (offset, value) in [
+            (8, 200000u32),
+            (16, 1000),
+            (24, 3),
+            (28, 1),
+            (52, 789),
+            (68, 12000),
+            (80, 10),
+            (144, 4000),
+        ] {
+            assert_eq!(&bytes[offset..offset + 4], &value.to_ne_bytes());
+        }
+        for (offset, value) in [
+            (168, 0x1122334455667788u64),
+            (176, 0x2233445566778899),
+            (184, 0x33445566778899aa),
+        ] {
+            assert_eq!(&bytes[offset..offset + 8], &value.to_ne_bytes());
+        }
+    }
 }

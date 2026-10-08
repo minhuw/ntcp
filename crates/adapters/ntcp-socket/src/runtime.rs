@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
+use crate::socket_options::{effective_notsent_lowat, notsent_writable};
 use crate::*;
 use ntcp::{
     AddressValidation, CloseReason, ConnectionId, Endpoint, EndpointConfig, EndpointError, Error,
@@ -61,11 +62,13 @@ pub enum Op {
     Name(bool),
     Ready,
     Available,
+    Inq(usize),
 }
 #[derive(Default, Debug)]
 pub struct Reply {
     pub value: i32,
     pub timeout_us: u64,
+    pub readiness_generations: [u64; 5],
     pub bytes: Vec<u8>,
     pub addr: Option<SocketAddr>,
     #[cfg(feature = "packet-test")]
@@ -266,6 +269,11 @@ struct Socket {
     // no kernel bind table or Linux TIME-WAIT option emulation.
     reuse: bool,
     nodelay: bool,
+    cork: bool,
+    inq: bool,
+    notsent_lowat: u32,
+    readiness: i32,
+    readiness_generations: [u64; 5],
     keepalive: bool,
     idle: i32,
     interval: i32,
@@ -294,6 +302,11 @@ impl Socket {
             flags,
             reuse: false,
             nodelay: false,
+            cork: false,
+            inq: false,
+            notsent_lowat: 0,
+            readiness: 0,
+            readiness_generations: [0; 5],
             keepalive: false,
             idle: 7200,
             interval: 75,
@@ -355,7 +368,7 @@ struct Owner {
     detached: Vec<ConnectionId>,
     pending_packet: Option<Vec<u8>>,
     pending: VecDeque<Request>,
-    child_timeouts: Vec<(ConnectionId, u64, u64, u64)>,
+    child_timeouts: Vec<(ConnectionId, u64, u64, u64, (bool, bool, bool, u32))>,
     connection_options: Vec<(ConnectionId, u8, i32, Option<bool>)>,
     #[cfg(feature = "packet-test")]
     packets: Option<PacketBackend>,
@@ -749,7 +762,7 @@ impl Owner {
     }
     fn prune_child_timeouts(&mut self) {
         self.child_timeouts
-            .retain(|(cid, _, _, _)| self.endpoint.connection_exists(*cid));
+            .retain(|(cid, _, _, _, _)| self.endpoint.connection_exists(*cid));
     }
     fn input(
         &mut self,
@@ -765,6 +778,7 @@ impl Owner {
             remote: SocketAddr::new(ip.source, u16::from_be_bytes([ports[0], ports[1]])),
         });
         let before = tuple.and_then(|tuple| self.endpoint.connection_id(tuple));
+        let before_state = before.and_then(|cid| self.endpoint.state(cid).ok());
         let listener_options = tuple.and_then(|tuple| {
             self.sockets
                 .values()
@@ -817,12 +831,31 @@ impl Owner {
             // only create passive children; active opens go through Connect.
             // ponytail: bounded linear metadata lookup, index if LIMIT grows.
             debug_assert!(self.child_timeouts.len() < LIMIT);
-            self.child_timeouts
-                .push((cid, listener, s.receive_timeout_us, s.send_timeout_us));
+            self.child_timeouts.push((
+                cid,
+                listener,
+                s.receive_timeout_us,
+                s.send_timeout_us,
+                (s.nodelay, s.cork, s.inq, s.notsent_lowat),
+            ));
         }
         if let Some(tuple) = tuple
             && let Some(cid) = self.endpoint.connection_id(tuple)
         {
+            if before_state == Some(State::SynReceived)
+                && matches!(
+                    self.endpoint.state(cid),
+                    Ok(State::Established | State::CloseWait)
+                )
+                && let Some((_, listener, _, _, _)) =
+                    self.child_timeouts.iter().find(|p| p.0 == cid)
+                && let Some(s) = self.sockets.get_mut(listener)
+                && s.acceptable
+            {
+                // Core Acceptable covers empty->nonempty. A subsequent child
+                // is also a Linux ET wake even while the accept queue is ready.
+                s.readiness_generations[0] = s.readiness_generations[0].wrapping_add(1);
+            }
             if Some(cid) != before
                 && let Some((tos, discover, _)) = listener_options
             {
@@ -848,10 +881,14 @@ impl Owner {
             for s in self.sockets.values_mut() {
                 match (s.handle, &event) {
                     (Handle::Listener(id), Event::Acceptable(other)) if id == *other => {
-                        s.acceptable = true
+                        s.acceptable = true;
+                        s.readiness_generations[0] = s.readiness_generations[0].wrapping_add(1);
                     }
                     (Handle::Connection(id), Event::Connection(other, e)) if id == *other => {
                         s.connected |= e.connected;
+                        if e.readable {
+                            s.readiness_generations[0] = s.readiness_generations[0].wrapping_add(1);
+                        }
                         if let Some(reason) = e.closed {
                             s.error = match reason {
                                 CloseReason::Reset if !s.connected => ECONNREFUSED,
@@ -866,6 +903,11 @@ impl Owner {
                     _ => (),
                 }
             }
+        }
+        // ponytail: bounded per-socket scan; index changed connections if LIMIT grows.
+        let ids: Vec<_> = self.sockets.keys().copied().collect();
+        for id in ids {
+            let _ = self.refresh_readiness(id);
         }
     }
     fn alloc(&mut self, s: Socket) -> Result<i32> {
@@ -904,7 +946,8 @@ impl Owner {
             .set_application_timeout(cid, user_timeout_us(s.user_timeout_ms)?)
             .map_err(engine)?;
         self.endpoint.set_dscp(cid, s.tos >> 2).map_err(engine)?;
-        self.endpoint.set_nagle(cid, !s.nodelay).map_err(engine)
+        self.endpoint.set_nagle(cid, !s.nodelay).map_err(engine)?;
+        self.endpoint.set_cork(cid, s.cork).map_err(engine)
     }
     fn rollback_connection(&mut self, cid: ConnectionId) {
         // release retains storage until any reset output has drained.
@@ -954,7 +997,21 @@ impl Owner {
         }
         let completion = self.reserve_completion(id, true, flags)?;
         let s = self.sockets.get_mut(&id).unwrap();
-        let n = self.endpoint.write(cid, &bytes).map_err(engine)?;
+        let info = self.endpoint.transport_info(cid).map_err(engine)?;
+        let room =
+            (effective_notsent_lowat(s.notsent_lowat) as usize).saturating_sub(info.notsent_bytes);
+        if room == 0 {
+            return Err(EAGAIN);
+        }
+        let n = self
+            .endpoint
+            .write_with_options(
+                cid,
+                &bytes[..bytes.len().min(room)],
+                flags & MSG_MORE != 0,
+                flags & MSG_EOR != 0 && bytes.len() <= room,
+            )
+            .map_err(engine)?;
         if n != 0 && completion {
             let next = s.zc_next;
             if let Some(tail) = s.completions.back_mut()
@@ -965,12 +1022,80 @@ impl Owner {
                 s.completions.push_back((next, next));
             }
             s.zc_next = next.wrapping_add(1);
+            // A newly completed send wakes ET error-queue consumers even if
+            // an older completion still keeps EPOLLERR asserted.
+            s.readiness_generations[2] = s.readiness_generations[2].wrapping_add(1);
         }
         Ok(n as i32)
     }
+    fn readiness_bits(&self, id: u64) -> Result<i32> {
+        let s = self.sockets.get(&id).ok_or(EBADF)?;
+        let mut bits = 0;
+        if s.error != 0 || !s.completions.is_empty() {
+            bits |= EPOLLERR;
+        }
+        match s.handle {
+            Handle::Fresh => (),
+            Handle::Listener(_) => {
+                if s.acceptable {
+                    bits |= EPOLLIN;
+                }
+            }
+            Handle::Connection(cid) => {
+                let state = self.endpoint.state(cid).map_err(engine)?;
+                let info = self.endpoint.transport_info(cid).map_err(engine)?;
+                let eof = matches!(
+                    state,
+                    State::CloseWait
+                        | State::Closing
+                        | State::LastAck
+                        | State::TimeWait
+                        | State::Closed
+                );
+                let readable = if state == State::Closed {
+                    self.endpoint.terminal_readable_bytes(cid)
+                } else {
+                    self.endpoint.readable_bytes(cid)
+                }
+                .map_err(engine)?;
+                if readable != 0 || eof || s.read_shutdown {
+                    bits |= EPOLLIN;
+                }
+                if eof {
+                    bits |= EPOLLRDHUP;
+                }
+                if s.write_shutdown
+                    || s.error != 0
+                    || matches!(state, State::Closed | State::TimeWait)
+                    || (matches!(state, State::Established | State::CloseWait)
+                        && info.send_used < info.send_capacity
+                        && notsent_writable(info.notsent_bytes, s.notsent_lowat))
+                {
+                    bits |= EPOLLOUT;
+                }
+                if state == State::Closed || (s.write_shutdown && (eof || s.read_shutdown)) {
+                    bits |= EPOLLHUP;
+                }
+            }
+        }
+        Ok(bits)
+    }
+    fn refresh_readiness(&mut self, id: u64) -> Result<i32> {
+        let bits = self.readiness_bits(id)?;
+        let s = self.sockets.get_mut(&id).ok_or(EBADF)?;
+        for (i, bit) in socket_options::EDGE_BITS.into_iter().enumerate() {
+            if bits & !s.readiness & bit != 0 {
+                s.readiness_generations[i] = s.readiness_generations[i].wrapping_add(1);
+            }
+        }
+        s.readiness = bits;
+        Ok(bits)
+    }
     fn execute(&mut self, id: u64, op: Op) -> Result<Reply> {
         self.endpoint.on_timeout(self.now(), 0).map_err(engine)?;
-        self.dispatch(id, op)
+        let result = self.dispatch(id, op);
+        let _ = self.refresh_readiness(id);
+        result
     }
     fn dispatch(&mut self, id: u64, op: Op) -> Result<Reply> {
         self.prune_child_timeouts();
@@ -1067,6 +1192,9 @@ impl Owner {
                 let mut child = self.fresh_socket(flags);
                 child.reuse = s.reuse;
                 child.nodelay = s.nodelay;
+                child.cork = s.cork;
+                child.inq = s.inq;
+                child.notsent_lowat = s.notsent_lowat;
                 child.keepalive = s.keepalive;
                 child.idle = s.idle;
                 child.interval = s.interval;
@@ -1082,11 +1210,16 @@ impl Owner {
                 if let Some(index) = self
                     .child_timeouts
                     .iter()
-                    .position(|(other, _, _, _)| *other == cid)
+                    .position(|(other, _, _, _, _)| *other == cid)
                 {
-                    let (_, _, receive, send) = self.child_timeouts.swap_remove(index);
+                    let (_, _, receive, send, (nodelay, cork, inq, lowat)) =
+                        self.child_timeouts.swap_remove(index);
                     child.receive_timeout_us = receive;
                     child.send_timeout_us = send;
+                    child.nodelay = nodelay;
+                    child.cork = cork;
+                    child.inq = inq;
+                    child.notsent_lowat = lowat;
                 }
                 let tuple = match self.endpoint.tuple(cid).map_err(engine) {
                     Ok(tuple) => tuple,
@@ -1274,24 +1407,46 @@ impl Owner {
                 // Connected/terminal errors precede payload faults. Fresh and
                 // listening fds retain the adapter's foreign-input validation.
                 let connection = matches!(s.handle, Handle::Connection(_));
-                if connection {
-                    self.send_state(id)?;
-                }
+                let cid = if connection {
+                    Some(self.send_state(id)?)
+                } else {
+                    None
+                };
                 let total = sources
                     .iter()
                     .try_fold(0usize, |n, p| n.checked_add(p.1).ok_or(EINVAL))?;
                 if total > BYTES {
                     return Err(EMSGSIZE);
                 }
-                if connection {
+                let accepted = if let Some(cid) = cid {
+                    let info = self.endpoint.transport_info(cid).map_err(engine)?;
+                    let lowat = effective_notsent_lowat(self.sockets[&id].notsent_lowat) as usize;
+                    // Only lowwater truncates here. Let core observe actual
+                    // short/blocked send-buffer writes for TCP_INFO accounting.
+                    let room = lowat.saturating_sub(info.notsent_bytes);
+                    if room == 0 && total != 0 {
+                        return Err(EAGAIN);
+                    }
                     self.reserve_completion(id, total != 0, flags)?;
-                }
-                let mut bytes = vec![0; total];
+                    total.min(room)
+                } else {
+                    total
+                };
+                let mut bytes = vec![0; accepted];
                 let mut at = 0;
                 for (address, len) in sources {
+                    let len = len.min(accepted - at);
                     memory(bytes[at..].as_mut_ptr(), address as *mut u8, len, false)?;
                     at += len;
+                    if at == accepted {
+                        break;
+                    }
                 }
+                let flags = if accepted < total {
+                    flags & !MSG_EOR
+                } else {
+                    flags
+                };
                 out.value = self.write(id, bytes, flags)?;
             }
             Op::ErrorQueueTo(address) => {
@@ -1325,7 +1480,7 @@ impl Owner {
                     }
                 }
                 self.child_timeouts
-                    .retain(|(_, listener, _, _)| *listener != id);
+                    .retain(|(_, listener, _, _, _)| *listener != id);
                 self.pending.retain(|request| {
                     if request.id == id {
                         let _ = request.reply.send(Err(EBADF));
@@ -1434,6 +1589,15 @@ impl Owner {
                         s.user_timeout_ms = value;
                     }
                     (IPPROTO_TCP, TCP_NODELAY) => s.nodelay = value != 0,
+                    (IPPROTO_TCP, TCP_CORK) => s.cork = value != 0,
+                    // Linux copies an int into an unsigned u32, including negative inputs.
+                    (IPPROTO_TCP, TCP_NOTSENT_LOWAT) => s.notsent_lowat = value as u32,
+                    (IPPROTO_TCP, TCP_INQ) => {
+                        if !(0..=1).contains(&value) {
+                            return Err(EINVAL);
+                        }
+                        s.inq = value != 0;
+                    }
                     (IPPROTO_TCP, TCP_KEEPIDLE) if value > 0 && value <= 32767 => s.idle = value,
                     (IPPROTO_TCP, TCP_KEEPINTVL) if value > 0 && value <= 32767 => {
                         s.interval = value
@@ -1467,7 +1631,32 @@ impl Owner {
                         Handle::Fresh => (),
                     }
                 } else if let Handle::Connection(cid) = s.handle {
-                    self.apply_options(cid, s)?;
+                    // Preserve transactional invalid-handle rejection even for
+                    // adapter-only options; querying state does not flush data.
+                    self.endpoint.state(cid).map_err(engine)?;
+                    // NODELAY is an explicit flush, including when already set. Do
+                    // not reapply it for unrelated option changes on a corked stream.
+                    match (level, name) {
+                        (IPPROTO_TCP, TCP_NODELAY) => {
+                            self.endpoint.set_nagle(cid, !s.nodelay).map_err(engine)?
+                        }
+                        (IPPROTO_TCP, TCP_CORK) => {
+                            self.endpoint.set_cork(cid, s.cork).map_err(engine)?
+                        }
+                        (SOL_SOCKET, SO_KEEPALIVE)
+                        | (IPPROTO_TCP, TCP_KEEPIDLE | TCP_KEEPINTVL | TCP_KEEPCNT) => self
+                            .endpoint
+                            .set_keepalive(cid, s.keepalive_config())
+                            .map_err(engine)?,
+                        (IPPROTO_TCP, TCP_USER_TIMEOUT) => self
+                            .endpoint
+                            .set_application_timeout(cid, user_timeout_us(s.user_timeout_ms)?)
+                            .map_err(engine)?,
+                        (IPPROTO_IP, IP_TOS) => {
+                            self.endpoint.set_dscp(cid, s.tos >> 2).map_err(engine)?
+                        }
+                        _ => (),
+                    }
                 }
                 if let Handle::Connection(cid) = s.handle
                     && let Some(p) = self.connection_options.iter_mut().find(|p| p.0 == cid)
@@ -1504,6 +1693,9 @@ impl Owner {
                     (SOL_SOCKET, SO_SNDBUF) => s.send_capacity as i32,
                     (SOL_SOCKET, SO_RCVBUF) => s.receive_capacity as i32,
                     (IPPROTO_TCP, TCP_NODELAY) => s.nodelay as i32,
+                    (IPPROTO_TCP, TCP_CORK) => s.cork as i32,
+                    (IPPROTO_TCP, TCP_INQ) => s.inq as i32,
+                    (IPPROTO_TCP, TCP_NOTSENT_LOWAT) => s.notsent_lowat as i32,
                     (IPPROTO_TCP, TCP_USER_TIMEOUT) => s.user_timeout_ms,
                     (IPPROTO_IP, IP_TOS) => s.tos as i32,
                     (IPPROTO_IP, IP_MTU_DISCOVER) => s.discover,
@@ -1548,52 +1740,30 @@ impl Owner {
                 };
             }
             Op::Ready => {
-                if s.error != 0 || !s.completions.is_empty() {
-                    out.value |= EPOLLERR;
-                }
-                match s.handle {
-                    Handle::Fresh => (),
-                    Handle::Listener(_) => {
-                        if s.acceptable {
-                            out.value |= EPOLLIN;
-                        }
+                out.value = self.refresh_readiness(id)?;
+                out.readiness_generations = self.sockets[&id].readiness_generations;
+            }
+            Op::Inq(consumed) => {
+                let Handle::Connection(cid) = s.handle else {
+                    return Err(ENOTCONN);
+                };
+                out.timeout_us = u64::from(s.inq);
+                if s.inq {
+                    let state = self.endpoint.state(cid).map_err(engine)?;
+                    let available = if state == State::Closed {
+                        self.endpoint.terminal_readable_bytes(cid)
+                    } else {
+                        self.endpoint.readable_bytes(cid)
                     }
-                    Handle::Connection(cid) => {
-                        let state = self.endpoint.state(cid).map_err(engine)?;
-                        let info = self.endpoint.transport_info(cid).map_err(engine)?;
-                        let eof = matches!(
-                            state,
-                            State::CloseWait
-                                | State::Closing
-                                | State::LastAck
-                                | State::TimeWait
-                                | State::Closed
-                        );
-                        let readable = if state == State::Closed {
-                            self.endpoint.terminal_readable_bytes(cid)
-                        } else {
-                            self.endpoint.readable_bytes(cid)
-                        }
-                        .map_err(engine)?;
-                        if readable != 0 || eof || s.read_shutdown {
-                            out.value |= EPOLLIN;
-                        }
-                        if eof {
-                            out.value |= EPOLLRDHUP;
-                        }
-                        if s.write_shutdown
-                            || s.error != 0
-                            || matches!(state, State::Closed | State::TimeWait)
-                            || (matches!(state, State::Established | State::CloseWait)
-                                && info.send_used < info.send_capacity)
-                        {
-                            out.value |= EPOLLOUT;
-                        }
-                        if state == State::Closed || (s.write_shutdown && (eof || s.read_shutdown))
-                        {
-                            out.value |= EPOLLHUP;
-                        }
-                    }
+                    .map_err(engine)?;
+                    let fin = matches!(
+                        state,
+                        State::CloseWait | State::Closing | State::LastAck | State::TimeWait
+                    ) || (state == State::Closed && s.error == 0 && s.connected);
+                    out.value = available
+                        .saturating_sub(consumed)
+                        .saturating_add(usize::from(fin))
+                        .min(i32::MAX as usize) as i32;
                 }
             }
             #[cfg(all(test, feature = "packet-test"))]
@@ -1690,6 +1860,128 @@ mod tests {
         let server = b.execute(listen, Op::Accept(SOCK_NONBLOCK)).unwrap().value as u64;
         (a, b, client, server, listen)
     }
+    #[test]
+    fn new_data_generations_and_post_read_inq_fin() {
+        let (mut a, mut b, client, server, _) = pair();
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
+            .unwrap();
+        b.execute(server, Op::Set(IPPROTO_TCP, TCP_INQ, 1)).unwrap();
+        a.execute(client, Op::Write(b"abcdef".to_vec())).unwrap();
+        pump(&mut a, &mut b);
+        let first = b.execute(server, Op::Ready).unwrap();
+        assert_ne!(first.value & EPOLLIN, 0);
+        for _ in 0..32 {
+            assert_eq!(
+                b.execute(server, Op::Ready).unwrap().readiness_generations,
+                first.readiness_generations
+            );
+        }
+        assert_eq!(b.execute(server, Op::Inq(0)).unwrap().value, 6);
+        assert_eq!(b.execute(server, Op::Inq(2)).unwrap().value, 4);
+        assert_eq!(b.execute(server, Op::Peek(2)).unwrap().bytes, b"ab");
+        assert_eq!(b.execute(server, Op::Inq(0)).unwrap().value, 6);
+        b.execute(server, Op::Read(2)).unwrap();
+        assert_eq!(
+            b.execute(server, Op::Ready).unwrap().readiness_generations,
+            first.readiness_generations
+        );
+        a.execute(client, Op::Write(b"ghi".to_vec())).unwrap();
+        pump(&mut a, &mut b);
+        let next = b.execute(server, Op::Ready).unwrap();
+        assert_ne!(
+            next.readiness_generations[0],
+            first.readiness_generations[0]
+        );
+        assert_eq!(b.execute(server, Op::Inq(0)).unwrap().value, 7);
+        a.execute(client, Op::Shutdown(SHUT_WR)).unwrap();
+        pump(&mut a, &mut b);
+        assert_eq!(b.execute(server, Op::Inq(0)).unwrap().value, 8);
+        assert_eq!(b.execute(server, Op::Inq(7)).unwrap().value, 1);
+        assert_eq!(b.execute(server, Op::Read(32)).unwrap().bytes, b"cdefghi");
+        assert_eq!(b.execute(server, Op::Read(32)).unwrap().value, 0);
+        assert_eq!(b.execute(server, Op::Inq(0)).unwrap().value, 1);
+    }
+    #[test]
+    fn lowwater_tracks_unsent_not_unacked_and_option_wakes() {
+        let (mut a, _b, client, _, _) = pair();
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
+            .unwrap();
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, 4000))
+            .unwrap();
+        assert_eq!(
+            a.execute(client, Op::Write(vec![1; 8000])).unwrap().value,
+            4000
+        );
+        let blocked = a.execute(client, Op::Ready).unwrap();
+        assert_eq!(blocked.value & EPOLLOUT, 0);
+        assert_eq!(a.execute(client, Op::Write(vec![2])).unwrap_err(), EAGAIN);
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, -1))
+            .unwrap();
+        let ready = a.execute(client, Op::Ready).unwrap();
+        assert_ne!(ready.value & EPOLLOUT, 0);
+        assert_ne!(
+            ready.readiness_generations[1],
+            blocked.readiness_generations[1]
+        );
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, 4000))
+            .unwrap();
+        let Handle::Connection(cid) = a.sockets[&client].handle else {
+            panic!()
+        };
+        let mut packet = [0; 65535];
+        for _ in 0..8 {
+            let _ = a.endpoint.poll_transmit(a.now(), &mut packet, 32).unwrap();
+        }
+        let info = a.endpoint.transport_info(cid).unwrap();
+        assert_eq!(info.notsent_bytes, 0);
+        assert_eq!(info.send_used, 4000); // No peer ACKs were delivered.
+        a.events();
+        assert_ne!(a.execute(client, Op::Ready).unwrap().value & EPOLLOUT, 0);
+    }
+    #[test]
+    fn stream_options_inherit_at_child_admission() {
+        let mut a = owner(2);
+        let mut b = owner(3);
+        let listener = new(&mut b, 0);
+        b.execute(listener, Op::Bind("10.73.0.3:16379".parse().unwrap()))
+            .unwrap();
+        for (option, value) in [
+            (TCP_INQ, 1),
+            (TCP_CORK, 1),
+            (TCP_NODELAY, 1),
+            (TCP_NOTSENT_LOWAT, -1),
+        ] {
+            b.execute(listener, Op::Set(IPPROTO_TCP, option, value))
+                .unwrap();
+        }
+        b.execute(listener, Op::Listen(16)).unwrap();
+        let client = new(&mut a, SOCK_NONBLOCK);
+        assert_eq!(
+            a.execute(client, Op::Connect("10.73.0.3:16379".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        pump(&mut a, &mut b);
+        for option in [TCP_INQ, TCP_CORK, TCP_NODELAY, TCP_NOTSENT_LOWAT] {
+            b.execute(listener, Op::Set(IPPROTO_TCP, option, 0))
+                .unwrap();
+        }
+        let child = b.execute(listener, Op::Accept(0)).unwrap().value as u64;
+        for (option, value) in [
+            (TCP_INQ, 1),
+            (TCP_CORK, 1),
+            (TCP_NODELAY, 1),
+            (TCP_NOTSENT_LOWAT, -1),
+        ] {
+            assert_eq!(
+                b.execute(child, Op::Get(IPPROTO_TCP, option))
+                    .unwrap()
+                    .value,
+                value
+            );
+        }
+    }
+
     #[test]
     fn finish_connect_after_handshake_and_immediate_fin() {
         let (mut a, mut b, _, _, listen) = pair();

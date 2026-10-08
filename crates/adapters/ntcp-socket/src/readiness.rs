@@ -8,6 +8,11 @@ struct Registration {
     armed: bool,
     events: u32,
     data: u64,
+    seen: Option<[u64; 5]>,
+}
+fn eligible(r: &Registration, ready: u32, observed: [u64; 5]) -> bool {
+    ready != 0
+        && (r.events & EPOLLET as u32 == 0 || socket_options::edge_changed(ready, r.seen, observed))
 }
 struct Epoll {
     slot: usize,
@@ -128,7 +133,8 @@ pub unsafe extern "C" fn ntcp_managed_epoll_ctl(
                 | EPOLLERR as u32
                 | EPOLLHUP as u32
                 | EPOLLRDHUP as u32
-                | EPOLLONESHOT as u32)
+                | EPOLLONESHOT as u32
+                | EPOLLET as u32)
             != 0
         {
             return Err(EOPNOTSUPP);
@@ -211,6 +217,7 @@ pub unsafe extern "C" fn ntcp_managed_epoll_ctl(
                         armed: true,
                         events: event.events,
                         data: event.u64,
+                        seen: None,
                     },
                 );
             }
@@ -222,6 +229,7 @@ pub unsafe extern "C" fn ntcp_managed_epoll_ctl(
                     armed: true,
                     events: event.events,
                     data: event.u64,
+                    seen: None,
                 };
             }
             EPOLL_CTL_DEL => {
@@ -288,16 +296,18 @@ unsafe fn epwait(
             if !r.armed || !live_id(r.id)? {
                 continue;
             }
-            let ready = match call(r.id, Op::Ready) {
-                Ok(reply) => reply.value as u32,
+            let reply = match call(r.id, Op::Ready) {
+                Ok(reply) => reply,
                 Err(EBADF) => continue, // Last alias closed during the query.
                 Err(_) if native_count != 0 => return Ok(native_count as i64),
                 Err(e) => return Err(e),
-            } & (r.events | EPOLLERR as u32 | EPOLLHUP as u32);
-            if ready != 0 {
+            };
+            let ready = reply.value as u32 & (r.events | EPOLLERR as u32 | EPOLLHUP as u32);
+            if eligible(&r, ready, reply.readiness_generations) {
                 virtual_events.push((
                     key,
                     r.generation,
+                    reply.readiness_generations,
                     epoll_event {
                         events: ready,
                         u64: r.data,
@@ -315,21 +325,27 @@ unsafe fn epwait(
         let available = cap - native_count;
         // Serialize copyout + disarming with MOD and competing waiters. No owner
         // RPC or socket registry lock is taken while EPOLLS is held.
+        // Pin live aliases through copyout in the established TOKENS -> EPOLLS
+        // lock order. Final close cannot commit a stale socket delivery.
+        let tokens = TOKENS.lock().map_err(|_| EIO)?;
         let mut map = EPOLLS.lock().map_err(|_| EIO)?;
         let ep = map.get_mut(&epfd).ok_or(EBADF)?;
-        virtual_events.retain(|(key, generation, _)| {
-            ep.regs
-                .get(key)
-                .is_some_and(|r| r.armed && r.generation == *generation)
+        virtual_events.retain(|(key, generation, observed, event)| {
+            ep.regs.get(key).is_some_and(|r| {
+                r.armed
+                    && r.generation == *generation
+                    && tokens.values().any(|t| t.id == r.id)
+                    && eligible(r, event.events, *observed)
+            })
         });
         let mut output = Vec::with_capacity(available);
         let mut delivered = Vec::new();
-        for (key, generation, event) in virtual_events {
+        for (key, generation, observed, event) in virtual_events {
             if output.len() == available {
                 break;
             }
             output.push(event);
-            delivered.push((key, generation));
+            delivered.push((key, generation, observed));
         }
         if let Err(e) = store_array(p.wrapping_add(native_count), &output) {
             return if native_count != 0 {
@@ -338,15 +354,18 @@ unsafe fn epwait(
                 Err(e)
             };
         }
-        for (key, generation) in delivered {
+        for (key, generation, observed) in delivered {
             if let Some(r) = ep.regs.get_mut(&key)
                 && r.generation == generation
-                && r.events & EPOLLONESHOT as u32 != 0
             {
-                r.armed = false;
+                r.seen = Some(observed);
+                if r.events & EPOLLONESHOT as u32 != 0 {
+                    r.armed = false;
+                }
             }
         }
         drop(map);
+        drop(tokens);
         let delivered = native_count + output.len();
         // Virtual-first must finish faultable copyout before consuming native
         // ONESHOT. Let the kernel copy directly to the remaining caller buffer.

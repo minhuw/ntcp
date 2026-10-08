@@ -35,6 +35,7 @@ pub mod packet_profile;
 pub mod packet_test;
 mod readiness;
 mod runtime;
+mod socket_options;
 mod stdio;
 mod transport;
 use runtime::{Op, Reply, Runtime};
@@ -427,6 +428,15 @@ fn read_into(
         call(id, Op::Read(0))?;
         output(&[])?;
         return Ok(0);
+    }
+    if !bytes.is_empty() && n > bytes.len() && input.pending.load(Ordering::Acquire) == bytes.len()
+    {
+        // All staged bytes still belong to core. A prior small EFAULT must
+        // not limit a later larger receive to that old staging size.
+        let reply = call(id, Op::Peek(n.min(runtime::BYTES)))?;
+        *bytes = reply.bytes;
+        input.pending.store(bytes.len(), Ordering::Release);
+        input.ready.store(bytes.len(), Ordering::Release);
     }
     if flags & MSG_PEEK != 0 && bytes.is_empty() {
         let reply = retry_until(
@@ -921,7 +931,7 @@ unsafe fn transfer(fd: i32, p: *mut c_void, n: usize, flags: i32, write: bool) -
     if flags
         & !(MSG_DONTWAIT
             | if write {
-                MSG_NOSIGNAL | MSG_ZEROCOPY
+                MSG_NOSIGNAL | MSG_ZEROCOPY | MSG_MORE | MSG_EOR
             } else {
                 MSG_PEEK
             })
@@ -1106,6 +1116,35 @@ fn copy_completion(p: *mut msghdr, mut m: msghdr, (lo, hi): (u32, u32)) -> Resul
     store(p, &m)?;
     Ok(())
 }
+// Linux v6.12 net/core/scm.c put_cmsg: header must fit, payload may
+// truncate; reported control usage includes only available alignment padding.
+fn copy_recvmsg_metadata(p: *mut msghdr, mut m: msghdr, inq: Option<i32>) -> Result<()> {
+    let mut used = 0;
+    m.msg_flags = 0;
+    if let Some(inq) = inq {
+        let (control, length, truncated) =
+            socket_options::inq_control(m.msg_controllen, !m.msg_control.is_null(), inq);
+        used = length;
+        if truncated {
+            m.msg_flags |= MSG_CTRUNC;
+        }
+        copy_out(m.msg_control.cast(), &control)?;
+    }
+    m.msg_controllen = used;
+    // Only output fields, never overwrite input pointers (or msghdr padding).
+    copy_out(
+        (p as usize + std::mem::offset_of!(msghdr, msg_namelen)) as *mut u8,
+        &m.msg_namelen.to_ne_bytes(),
+    )?;
+    copy_out(
+        (p as usize + std::mem::offset_of!(msghdr, msg_controllen)) as *mut u8,
+        &m.msg_controllen.to_ne_bytes(),
+    )?;
+    copy_out(
+        (p as usize + std::mem::offset_of!(msghdr, msg_flags)) as *mut u8,
+        &m.msg_flags.to_ne_bytes(),
+    )
+}
 unsafe fn vectors(fd: i32, v: *const iovec, count: i32, flags: i32, write: bool) -> Result<i64> {
     unsafe { vectors_output(fd, v, count, flags, write, Vec::new()) }
 }
@@ -1143,7 +1182,7 @@ unsafe fn vectors_output(
     }
     let bytes = vec![0u8; total.min(runtime::BYTES)];
     if write {
-        if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_ZEROCOPY) != 0 {
+        if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_ZEROCOPY | MSG_MORE | MSG_EOR) != 0 {
             return Err(runtime::unsupported_option("send flags"));
         }
         let id = owned(fd)?.ok_or(EBADF)?;
@@ -1256,21 +1295,47 @@ pub unsafe extern "C" fn ntcp_managed_recvmsg(fd: i32, p: *mut msghdr, flags: i3
                 )?;
             }
         }
-        let copies = vec![
-            (
-                p as usize + std::mem::offset_of!(msghdr, msg_namelen),
-                m.msg_namelen.to_ne_bytes().to_vec(),
-            ),
-            (
-                p as usize + std::mem::offset_of!(msghdr, msg_controllen),
-                0usize.to_ne_bytes().to_vec(),
-            ),
-            (
-                p as usize + std::mem::offset_of!(msghdr, msg_flags),
-                0i32.to_ne_bytes().to_vec(),
-            ),
-        ];
-        unsafe { vectors_output(fd, m.msg_iov, n, flags, false, copies) }
+        if !(0..=1024).contains(&n) {
+            return Err(EINVAL);
+        }
+        let vectors = load_array(m.msg_iov, n as usize, 1024)?;
+        let total = vectors.iter().try_fold(0usize, |total, v| {
+            if v.iov_len != 0 && v.iov_base.is_null() {
+                return Err(EFAULT);
+            }
+            total
+                .checked_add(v.iov_len)
+                .filter(|&n| n <= isize::MAX as usize)
+                .ok_or(EINVAL)
+        })?;
+        if io_limit() < runtime::BYTES && total > io_limit() {
+            return Err(runtime::unsupported_option(
+                "receive I/O exceeds 65535-byte adapter bound",
+            ));
+        }
+        // Keep stream bytes staged until payload, ancillary data and msghdr
+        // copyouts all succeed. INQ observes the logically post-read queue;
+        // PEEK never subtracts the copied bytes (Linux tcp_inq_hint).
+        read_into(fd, id, total, flags, |bytes| {
+            let mut at = 0;
+            for v in &vectors {
+                let count = v.iov_len.min(bytes.len() - at);
+                copy_out(v.iov_base.cast(), &bytes[at..at + count])?;
+                at += count;
+                if at == bytes.len() {
+                    break;
+                }
+            }
+            let inq = call(
+                id,
+                Op::Inq(if flags & MSG_PEEK != 0 {
+                    0
+                } else {
+                    bytes.len()
+                }),
+            )?;
+            copy_recvmsg_metadata(p, m, (inq.timeout_us != 0).then_some(inq.value))
+        })
     }) as ssize_t
 }
 #[unsafe(no_mangle)]
@@ -1426,6 +1491,9 @@ pub unsafe extern "C" fn ntcp_managed_getsockopt(
         }
         if p.is_null() || len.is_null() {
             return Err(EFAULT);
+        }
+        if level == IPPROTO_TCP && (load(len)? as i32) < 0 {
+            return Err(EINVAL);
         }
         if let Some(send) = timeout_option(level, name) {
             let micros = call(id, Op::GetTimeout(send))?.timeout_us;
