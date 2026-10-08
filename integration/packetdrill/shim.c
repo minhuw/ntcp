@@ -386,10 +386,10 @@ void ntcp_abi_zerocopy_check(void *u, int fd) {
     assert(p.setsockopt(u, fd, SOL_SOCKET, SO_ZEROCOPY, &value, 3) == -1 && errno == EINVAL);
     assert(p.setsockopt(u, fd, SOL_SOCKET, SO_ZEROCOPY, (void *)1, 4) == -1 && errno == EFAULT);
     assert(p.getsockopt(u, fd, SOL_SOCKET, SO_ZEROCOPY, &value, &size) == 0 && value == 1);
-    assert(p.send(u, fd, "x", 1, MSG_MORE) == -1 && errno == ENOSYS);
+    assert(p.send(u, fd, "x", 1, MSG_OOB) == -1 && errno == ENOSYS);
     struct iovec v[4] = {{(void *)1, 0}, {NULL, 0}, {(void *)1, 0}, {NULL, 0}};
     struct msghdr send = {.msg_iov = v, .msg_iovlen = 4};
-    assert(p.sendmsg(u, fd, &send, MSG_MORE) == -1 && errno == ENOSYS);
+    assert(p.sendmsg(u, fd, &send, MSG_OOB) == -1 && errno == ENOSYS);
     assert(p.send(u, fd, "ordinary", 8, 0) == 8);
     assert(p.send(u, fd, (void *)1, 0, MSG_ZEROCOPY) == 0);
     assert(p.sendmsg(u, fd, &send, MSG_ZEROCOPY) == 0);
