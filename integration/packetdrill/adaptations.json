@@ -3457,7 +3457,7 @@
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
           "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
           "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
-          "tcpi_rtt is populated at Linux TCP_INFO offset 68 by transport::transport_option; original RTT and timestamping assertions remain intact. SO_TIMESTAMPING is not implemented; diagnostic execution should stop at that option, not interpret reserved TCP_INFO metrics."
+          "tcpi_rtt is populated at Linux TCP_INFO offset 68 by transport::transport_option. Native stream requests provide SCHED, userspace-handoff SOFTWARE and cumulative ACK observations; fresh paired monotonic/realtime samples map caller ticks at owner input/output, without changing protocol clocks. Original RTT, timestamp, packet and timing assertions remain intact. Optimized client-only-last-byte and server runs pass; partial remains diagnostic because Linux skb send-buffer accounting expects 2964 accepted bytes while the adapter payload-byte buffer accepts 4608."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -3502,7 +3502,7 @@
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
           "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
           "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
-          "tcpi_rtt is populated at Linux TCP_INFO offset 68 by transport::transport_option; original RTT and timestamping assertions remain intact. SO_TIMESTAMPING is not implemented; diagnostic execution should stop at that option, not interpret reserved TCP_INFO metrics."
+          "tcpi_rtt is populated at Linux TCP_INFO offset 68 by transport::transport_option. Native stream requests provide SCHED, userspace-handoff SOFTWARE and cumulative ACK observations; fresh paired monotonic/realtime samples map caller ticks at owner input/output, without changing protocol clocks. Original RTT, timestamp, packet and timing assertions remain intact. Optimized client-only-last-byte and server runs pass; partial remains diagnostic because Linux skb send-buffer accounting expects 2964 accepted bytes while the adapter payload-byte buffer accepts 4608."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -3547,7 +3547,7 @@
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
           "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
           "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
-          "tcpi_rtt is populated at Linux TCP_INFO offset 68 by transport::transport_option; original RTT and timestamping assertions remain intact. SO_TIMESTAMPING is not implemented; diagnostic execution should stop at that option, not interpret reserved TCP_INFO metrics."
+          "tcpi_rtt is populated at Linux TCP_INFO offset 68 by transport::transport_option. Native stream requests provide SCHED, userspace-handoff SOFTWARE and cumulative ACK observations; fresh paired monotonic/realtime samples map caller ticks at owner input/output, without changing protocol clocks. Original RTT, timestamp, packet and timing assertions remain intact. Optimized client-only-last-byte and server runs pass; partial remains diagnostic because Linux skb send-buffer accounting expects 2964 accepted bytes while the adapter payload-byte buffer accepts 4608."
         ],
         "ntcp_settings": {
           "sack": true,

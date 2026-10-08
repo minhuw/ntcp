@@ -37,10 +37,8 @@ mod readiness;
 mod runtime;
 mod socket_options;
 mod stdio;
-mod transport;
-// ABI preparation is tested, not advertised before native timestamp integration.
-#[cfg(test)]
 mod timestamping;
+mod transport;
 use runtime::{Op, Reply, Runtime};
 type Result<T> = std::result::Result<T, i32>;
 thread_local! {
@@ -219,7 +217,9 @@ fn io_limit() -> usize {
         .map_or(runtime::BYTES, |r| r.io_limit)
 }
 fn configured() -> bool {
-    env("NTCP_SOCKET_TUN").is_some() || env("NTCP_SOCKET_ADDR").is_some()
+    env("NTCP_SOCKET_TUN").is_some()
+        || env("NTCP_SOCKET_ADDR").is_some()
+        || env("NTCP_SOCKET_BACKEND").is_some()
 }
 fn child() -> bool {
     let pid = PID.load(Ordering::Acquire);
@@ -1104,8 +1104,82 @@ fn error_queue(id: u64, p: *mut msghdr, m: msghdr) -> Result<i64> {
         .clone();
     let _guard = input.bytes.lock().map_err(|_| EIO)?;
     let _ = m;
-    call(id, Op::ErrorQueueTo(p as usize))?;
-    Ok(0)
+    Ok(call(id, Op::ErrorQueueTo(p as usize))?.value as i64)
+}
+// Linux __sock_cmsg_send: only generation bits can be overridden per send.
+fn send_timestamp_control(m: &msghdr) -> Result<Option<u32>> {
+    let bytes = load_array(m.msg_control.cast::<u8>(), m.msg_controllen, 4096)?;
+    let mut at = 0;
+    let mut stamp = None;
+    while bytes.len() - at >= 16 {
+        let len = usize::from_ne_bytes(bytes[at..at + 8].try_into().unwrap());
+        if len < 16 || len > bytes.len() - at {
+            return Err(EINVAL);
+        }
+        let level = i32::from_ne_bytes(bytes[at + 8..at + 12].try_into().unwrap());
+        let kind = i32::from_ne_bytes(bytes[at + 12..at + 16].try_into().unwrap());
+        if level != SOL_SOCKET || !matches!(kind, 37 | 65) {
+            return Err(EOPNOTSUPP);
+        }
+        if len != 20 {
+            return Err(EINVAL);
+        }
+        let flags = u32::from_ne_bytes(bytes[at + 16..at + 20].try_into().unwrap());
+        timestamping::Options::default().per_send(flags)?;
+        stamp = Some(flags);
+        let advance = len.next_multiple_of(8);
+        if advance > bytes.len() - at {
+            break;
+        }
+        at += advance;
+    }
+    if !bytes.is_empty() && bytes.len() < 16 {
+        return Err(EINVAL);
+    }
+    Ok(stamp)
+}
+fn copy_timestamp_completion(
+    p: *mut msghdr,
+    mut m: msghdr,
+    kind: i32,
+    stamp: Option<&[u8; 48]>,
+    error: &[u8; 32],
+    payload: &[u8],
+) -> Result<usize> {
+    let vectors = load_array(m.msg_iov, m.msg_iovlen, 1024)?;
+    let mut copied = 0;
+    for v in vectors {
+        let n = v.iov_len.min(payload.len() - copied);
+        copy_out(v.iov_base.cast(), &payload[copied..copied + n])?;
+        copied += n;
+        if copied == payload.len() {
+            break;
+        }
+    }
+    m.msg_flags = MSG_ERRQUEUE | if copied < payload.len() { MSG_TRUNC } else { 0 };
+    let mut used = 0;
+    for (level, kind, data) in stamp
+        .map(|stamp| (SOL_SOCKET, kind, stamp.as_slice()))
+        .into_iter()
+        .chain(std::iter::once((SOL_IP, IP_RECVERR, error.as_slice())))
+    {
+        let (control, n, truncated) = socket_options::cmsg_control(
+            m.msg_controllen - used,
+            !m.msg_control.is_null(),
+            level,
+            kind,
+            data,
+        );
+        copy_out((m.msg_control as usize + used) as *mut u8, &control)?;
+        used += n;
+        if truncated {
+            m.msg_flags |= MSG_CTRUNC;
+        }
+    }
+    m.msg_namelen = 0;
+    m.msg_controllen = used;
+    store(p, &m)?;
+    Ok(copied)
 }
 // SPDX-License-Identifier: GPL-2.0-or-later
 fn copy_completion(p: *mut msghdr, mut m: msghdr, (lo, hi): (u32, u32)) -> Result<()> {
@@ -1130,7 +1204,12 @@ fn copy_completion(p: *mut msghdr, mut m: msghdr, (lo, hi): (u32, u32)) -> Resul
 }
 // Linux v6.12 net/core/scm.c put_cmsg: header must fit, payload may
 // truncate; reported control usage includes only available alignment padding.
-fn copy_recvmsg_metadata(p: *mut msghdr, mut m: msghdr, inq: Option<i32>) -> Result<()> {
+fn copy_recvmsg_timestamp(
+    p: *mut msghdr,
+    mut m: msghdr,
+    inq: Option<i32>,
+    stamp: Option<(i32, &[u8])>,
+) -> Result<()> {
     let mut used = 0;
     m.msg_flags = 0;
     if let Some(inq) = inq {
@@ -1141,6 +1220,20 @@ fn copy_recvmsg_metadata(p: *mut msghdr, mut m: msghdr, inq: Option<i32>) -> Res
             m.msg_flags |= MSG_CTRUNC;
         }
         copy_out(m.msg_control.cast(), &control)?;
+    }
+    if let Some((kind, stamp)) = stamp {
+        let (control, length, truncated) = socket_options::cmsg_control(
+            m.msg_controllen - used,
+            !m.msg_control.is_null(),
+            SOL_SOCKET,
+            kind,
+            stamp,
+        );
+        copy_out((m.msg_control as usize + used) as *mut u8, &control)?;
+        used += length;
+        if truncated {
+            m.msg_flags |= MSG_CTRUNC;
+        }
     }
     m.msg_controllen = used;
     // Only output fields, never overwrite input pointers (or msghdr padding).
@@ -1167,6 +1260,17 @@ unsafe fn vectors_output(
     flags: i32,
     write: bool,
     copies: Vec<(usize, Vec<u8>)>,
+) -> Result<i64> {
+    unsafe { vectors_timestamp(fd, v, count, flags, write, copies, None) }
+}
+unsafe fn vectors_timestamp(
+    fd: i32,
+    v: *const iovec,
+    count: i32,
+    flags: i32,
+    write: bool,
+    copies: Vec<(usize, Vec<u8>)>,
+    stamp: Option<u32>,
 ) -> Result<i64> {
     if !(0..=1024).contains(&count) {
         return Err(EINVAL);
@@ -1209,7 +1313,11 @@ unsafe fn vectors_output(
             .collect();
         let result = retry(
             id,
-            Op::Send(sources, flags),
+            if let Some(stamp) = stamp {
+                Op::SendTimestamp(sources, flags, stamp)
+            } else {
+                Op::Send(sources, flags)
+            },
             flags & MSG_DONTWAIT != 0,
             EPOLLOUT,
         );
@@ -1265,16 +1373,14 @@ pub unsafe extern "C" fn ntcp_managed_sendmsg(fd: i32, p: *const msghdr, flags: 
             return Err(EFAULT);
         }
         let m = load(p)?;
-        if m.msg_controllen != 0 {
-            return Err(runtime::unsupported_option("sendmsg ancillary data"));
-        }
+        let stamp = send_timestamp_control(&m)?;
         if !m.msg_name.is_null() {
             unsafe {
                 address(m.msg_name.cast(), m.msg_namelen)?;
             }
         }
         let n = i32::try_from(m.msg_iovlen).map_err(|_| EINVAL)?;
-        unsafe { vectors(fd, m.msg_iov, n, flags, true) }
+        unsafe { vectors_timestamp(fd, m.msg_iov, n, flags, true, Vec::new(), stamp) }
     }) as ssize_t
 }
 #[unsafe(no_mangle)]
@@ -1346,7 +1452,13 @@ pub unsafe extern "C" fn ntcp_managed_recvmsg(fd: i32, p: *mut msghdr, flags: i3
                     bytes.len()
                 }),
             )?;
-            copy_recvmsg_metadata(p, m, (inq.timeout_us != 0).then_some(inq.value))
+            let stamp = call(id, Op::RxTimestamp(bytes.len()))?;
+            copy_recvmsg_timestamp(
+                p,
+                m,
+                (inq.timeout_us != 0).then_some(inq.value),
+                (!stamp.bytes.is_empty()).then_some((stamp.value, &stamp.bytes)),
+            )
         })
     }) as ssize_t
 }
@@ -1446,7 +1558,9 @@ pub unsafe extern "C" fn ntcp_managed_setsockopt(
         let Some(id) = owned(fd)? else {
             return raw(unsafe { syscall(SYS_setsockopt, fd, level, name, p, len) });
         };
-        if matches!((level, name), (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF)) && (len as i32) < 4 {
+        if matches!((level, name), (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF | 37 | 65))
+            && (len as i32) < 4
+        {
             return Err(EINVAL);
         }
         if p.is_null() {
@@ -1459,6 +1573,9 @@ pub unsafe extern "C" fn ntcp_managed_setsockopt(
             let micros = timeout_micros(load(p.cast::<[i64; 2]>())?)?;
             call(id, Op::SetTimeout(send, micros))?;
             return Ok(0);
+        }
+        if level == SOL_SOCKET && matches!(name, 37 | 65) && len == 8 {
+            let _ = load(p.cast::<[i32; 2]>())?; // Linux copies all of so_timestamping, even without BIND_PHC.
         }
         let value = if level == IPPROTO_IP && matches!(name, IP_TOS | IP_MTU_DISCOVER) {
             if len == 1 {
@@ -1498,6 +1615,17 @@ pub unsafe extern "C" fn ntcp_managed_getsockopt(
             let value = call(id, Op::Get(level, name))?.value.to_ne_bytes();
             let n = (requested as usize).min(4);
             copy_out(p.cast(), &value[..n])?;
+            store(len, &(n as u32))?;
+            return Ok(0);
+        }
+        if level == SOL_SOCKET && matches!(name, 37 | 65) {
+            let requested = load(len)?;
+            if (requested as i32) < 0 {
+                return Err(EINVAL);
+            }
+            let bytes = call(id, Op::Get(level, name))?.bytes;
+            let n = (requested as usize).min(bytes.len());
+            copy_out(p.cast(), &bytes[..n])?;
             store(len, &(n as u32))?;
             return Ok(0);
         }

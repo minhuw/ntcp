@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
+#[path = "runtime_backend.rs"]
+mod backend;
+#[path = "runtime_timestamping.rs"]
+mod timestamps;
 use crate::socket_options::{effective_notsent_lowat, notsent_writable};
 use crate::*;
 use ntcp::{
@@ -13,6 +17,7 @@ use std::{
     sync::mpsc::{self, Receiver, SyncSender},
     time::Instant,
 };
+use timestamps::{ClockPair, Completion, TimestampState};
 
 #[cfg(feature = "packet-test")]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,6 +53,8 @@ pub enum Op {
     #[cfg(test)]
     WriteFlags(Vec<u8>, i32),
     Send(Vec<(usize, usize)>, i32),
+    SendTimestamp(Vec<(usize, usize)>, i32, u32),
+    RxTimestamp(usize),
     ErrorQueueTo(usize),
     Transport(i32),
     #[cfg(feature = "packet-test")]
@@ -116,12 +123,30 @@ impl Runtime {
     }
 
     pub fn start() -> Result<Self> {
-        let name = env("NTCP_SOCKET_TUN").ok_or(EINVAL)?;
+        let backend = env("NTCP_SOCKET_BACKEND").unwrap_or_else(|| "tun".into());
+        if !matches!(backend.as_str(), "tun" | "af-packet") {
+            return Err(EINVAL);
+        }
+        let name = env(if backend == "tun" {
+            "NTCP_SOCKET_TUN"
+        } else {
+            "NTCP_SOCKET_IFACE"
+        })
+        .ok_or(EINVAL)?;
         let local: Ipv4Addr = env("NTCP_SOCKET_ADDR")
             .ok_or(EINVAL)?
             .parse()
             .map_err(|_| EAFNOSUPPORT)?;
-        Self::spawn(move || Owner::new(&name, local), false)
+        Self::spawn(
+            move || {
+                if backend == "af-packet" {
+                    Owner::af_packet(&name, local)
+                } else {
+                    Owner::new(&name, local)
+                }
+            },
+            false,
+        )
     }
     #[cfg(feature = "packet-test")]
     pub fn packet(settings: (Ipv4Addr, crate::packet_profile::Profile)) -> Result<Self> {
@@ -292,7 +317,8 @@ struct Socket {
     discover: i32,
     zerocopy: bool,
     zc_next: u32,
-    completions: VecDeque<(u32, u32)>,
+    completions: VecDeque<Completion>,
+    timestamps: TimestampState,
 }
 impl Socket {
     fn new(flags: i32) -> Self {
@@ -327,6 +353,7 @@ impl Socket {
             zerocopy: false,
             zc_next: 0,
             completions: VecDeque::new(),
+            timestamps: TimestampState::default(),
         }
     }
     fn keepalive_config(&self) -> Option<ntcp::KeepaliveConfig> {
@@ -365,6 +392,7 @@ type ChildOptionsSnapshot = (ConnectionId, u64, u64, u64, (bool, bool, bool, u32
 struct Owner {
     endpoint: Endpoint,
     tun: Option<Tun>,
+    ethernet: Option<backend::EthernetBackend>,
     sockets: BTreeMap<u64, Socket>,
     local: Ipv4Addr,
     epoch: Instant,
@@ -372,6 +400,9 @@ struct Owner {
     next_id: u64,
     detached: Vec<ConnectionId>,
     pending_packet: Option<Vec<u8>>,
+    pending_token: Option<ntcp::TxTimestampToken>,
+    timestamp_cookie: u64,
+    child_timestamps: Vec<(ConnectionId, crate::timestamping::Options)>,
     pending: VecDeque<Request>,
     child_timeouts: Vec<ChildOptionsSnapshot>,
     connection_options: Vec<(ConnectionId, u8, i32, Option<bool>)>,
@@ -502,6 +533,7 @@ impl Owner {
         Ok(Self {
             endpoint,
             tun,
+            ethernet: None,
             sockets: BTreeMap::new(),
             local,
             epoch: Instant::now(),
@@ -509,6 +541,9 @@ impl Owner {
             next_id: 1,
             detached: Vec::new(),
             pending_packet: None,
+            pending_token: None,
+            timestamp_cookie: 1,
+            child_timestamps: Vec::new(),
             pending: VecDeque::new(),
             child_timeouts: Vec::new(),
             connection_options: Vec::new(),
@@ -629,17 +664,27 @@ impl Owner {
                 break;
             }
             for _ in 0..BUDGET {
-                match self
-                    .tun
-                    .as_mut()
-                    .map(|tun| tun.receive(&mut input))
-                    .unwrap_or(Ok(None))
-                {
-                    Ok(Some(n)) => {
-                        if let Ok(p) = ntcp_ip::parse(&input[..n], false)
+                match self.receive_backend(&mut input) {
+                    Ok(Some(received)) => {
+                        let bytes = &input[..received.len];
+                        let bytes = if self.ethernet.is_some() {
+                            let Ok(frame) = ntcp_ip::parse_ethernet(bytes) else {
+                                continue;
+                            };
+                            frame.payload
+                        } else {
+                            bytes
+                        };
+                        if let Ok(p) = ntcp_ip::parse(bytes, false)
                             && p.protocol == 6
                         {
-                            let _ = self.input(now, p.ip, p.traffic_class, p.payload);
+                            let _ = self.input_stamped(
+                                self.now(),
+                                p.ip,
+                                p.traffic_class,
+                                p.payload,
+                                backend::core_stamps(received.timestamps),
+                            );
                         }
                     }
                     Ok(None) => break,
@@ -649,6 +694,7 @@ impl Owner {
                     Err(_) => return,
                 }
             }
+            self.poll_backend_timestamps();
             self.events();
             let mut after_output = Vec::with_capacity(BUDGET);
             for _ in 0..self.pending.len().min(BUDGET) {
@@ -670,7 +716,15 @@ impl Owner {
                     {
                         break;
                     }
-                    let mut packet = vec![0; if self.tun.is_some() { 1500 } else { 65535 }];
+                    let mut packet = vec![
+                        0;
+                        if self.tun.is_some() || self.ethernet.is_some() {
+                            1500
+                        } else {
+                            65535
+                        }
+                    ];
+                    let pair = ClockPair::sample(self);
                     let transmit = match self.endpoint.poll_transmit(
                         transmit_now.unwrap_or_else(|| self.now()),
                         &mut packet[20..],
@@ -686,19 +740,41 @@ impl Owner {
                         Ok(packet) => packet,
                         Err(_) => return,
                     };
+                    self.timestamp_packet(tx.tx_timestamp, &packet);
+                    self.drain_timestamps(pair);
+                    self.pending_token = tx.tx_timestamp;
                     self.pending_packet = Some(packet);
                 }
                 // Never poll another TCP segment until this complete packet is submitted.
                 if let Some(tun) = self.tun.as_mut() {
                     match tun.transmit(self.pending_packet.as_ref().unwrap()) {
-                        Ok(TxOutcome::Submitted) => self.pending_packet = None,
+                        Ok(TxOutcome::Submitted) => {
+                            let stamp = timestamps::realtime();
+                            let token = self.pending_token.take();
+                            self.software_transmitted(token, stamp);
+                            self.pending_packet = None;
+                        }
+                        Ok(TxOutcome::WouldBlock) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
+                        Err(_) => return,
+                    }
+                }
+                if self.ethernet.is_some() {
+                    match self.transmit_ethernet() {
+                        Ok(TxOutcome::Submitted) => {
+                            self.pending_packet = None;
+                            self.pending_token = None;
+                        }
                         Ok(TxOutcome::WouldBlock) => break,
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
                         Err(_) => return,
                     }
                 }
                 #[cfg(feature = "packet-test")]
-                if let Some(packets) = self.packets.as_mut() {
+                if self.packets.is_some() {
+                    let token = self.pending_token.take();
+                    self.software_transmitted(token, timestamps::realtime());
+                    let packets = self.packets.as_mut().unwrap();
                     let bytes = self.pending_packet.take().unwrap();
                     packets.output.push_back(Reply {
                         value: bytes.len() as i32,
@@ -768,13 +844,33 @@ impl Owner {
     fn prune_child_timeouts(&mut self) {
         self.child_timeouts
             .retain(|(cid, _, _, _, _)| self.endpoint.connection_exists(*cid));
+        self.child_timestamps
+            .retain(|(cid, _)| self.endpoint.connection_exists(*cid));
     }
+    #[cfg(any(test, feature = "packet-test"))]
     fn input(
         &mut self,
         now: u64,
         ip: ntcp::IpMetadata,
         traffic_class: u8,
         bytes: &[u8],
+    ) -> std::result::Result<ntcp::InputDisposition, EndpointError> {
+        let stamps = ntcp::RxPacketTimestamps {
+            software: self.software_rx_enabled().then(|| ntcp::RxTimestamp {
+                value: timestamps::realtime(),
+                clock: ntcp::TimestampClock::RealtimeNanoseconds,
+            }),
+            hardware: None,
+        };
+        self.input_stamped(now, ip, traffic_class, bytes, stamps)
+    }
+    fn input_stamped(
+        &mut self,
+        now: u64,
+        ip: ntcp::IpMetadata,
+        traffic_class: u8,
+        bytes: &[u8],
+        stamps: ntcp::RxPacketTimestamps,
     ) -> std::result::Result<ntcp::InputDisposition, EndpointError> {
         // Endpoint validates the packet; the ports are only used to observe
         // generation-aware tuple ownership before and after passive admission.
@@ -817,9 +913,16 @@ impl Owner {
             }
         }
 
-        let result = self
-            .endpoint
-            .input_with_traffic_class(now, ip, traffic_class, bytes);
+        let pair = ClockPair::sample(self);
+        let result = self.endpoint.input_with_timestamps(
+            now,
+            ip,
+            traffic_class,
+            ntcp::Ipv4Options::default(),
+            bytes,
+            stamps,
+        );
+        self.drain_timestamps(pair);
         self.prune_child_timeouts();
         if let Some(tuple) = tuple
             && let Some(cid) = self.endpoint.connection_id(tuple)
@@ -836,6 +939,7 @@ impl Owner {
             // only create passive children; active opens go through Connect.
             // ponytail: bounded linear metadata lookup, index if LIMIT grows.
             debug_assert!(self.child_timeouts.len() < LIMIT);
+            self.child_timestamps.push((cid, s.timestamps.options));
             self.child_timeouts.push((
                 cid,
                 listener,
@@ -953,7 +1057,16 @@ impl Owner {
             .map_err(engine)?;
         self.endpoint.set_dscp(cid, s.tos >> 2).map_err(engine)?;
         self.endpoint.set_nagle(cid, !s.nodelay).map_err(engine)?;
-        self.endpoint.set_cork(cid, s.cork).map_err(engine)
+        self.endpoint.set_cork(cid, s.cork).map_err(engine)?;
+        if s.timestamps.options.flags != 0 {
+            self.endpoint
+                .set_rx_timestamp_capacity(cid, timestamps::PHASES)
+                .map_err(engine)?;
+            self.endpoint
+                .set_tx_timestamp_capacity(cid, timestamps::PHASES)
+                .map_err(engine)?;
+        }
+        Ok(())
     }
     fn rollback_connection(&mut self, cid: ConnectionId) {
         // release retains storage until any reset output has drained.
@@ -981,46 +1094,65 @@ impl Owner {
     }
     fn reserve_completion(&mut self, id: u64, nonempty: bool, flags: i32) -> Result<bool> {
         let limit = self.socket_limit();
+        let charged = self.timestamp_charge();
         let s = self.sockets.get_mut(&id).ok_or(EBADF)?;
         let completion = nonempty && s.zerocopy && flags & MSG_ZEROCOPY != 0;
         if completion
             && !s
                 .completions
                 .back()
-                .is_some_and(|&p| extends_completion(p, s.zc_next))
+                .and_then(Completion::range)
+                .is_some_and(|p| extends_completion(p, s.zc_next))
         {
-            if s.completions.len() == limit {
+            if s.completions.len() + s.timestamps.reserved() >= limit
+                || charged
+                    + (s.completions.len() + s.timestamps.reserved() + 1)
+                        * 2
+                        * std::mem::size_of::<Completion>()
+                    > timestamps::RUNTIME_BYTES
+            {
                 return Err(ENOBUFS);
             }
-            s.completions.try_reserve(1).map_err(|_| ENOBUFS)?;
+            s.completions
+                .try_reserve(s.timestamps.reserved() + 1)
+                .map_err(|_| ENOBUFS)?;
         }
         Ok(completion)
     }
+    #[cfg(test)]
     fn write(&mut self, id: u64, bytes: Vec<u8>, flags: i32) -> Result<i32> {
+        self.write_timestamp(id, bytes, flags, None)
+    }
+    fn write_timestamp(
+        &mut self,
+        id: u64,
+        bytes: Vec<u8>,
+        flags: i32,
+        override_flags: Option<u32>,
+    ) -> Result<i32> {
+        if let Some(flags) = override_flags {
+            self.sockets
+                .get(&id)
+                .ok_or(EBADF)?
+                .timestamps
+                .options
+                .per_send(flags)?;
+        }
         let cid = self.send_state(id)?;
         if bytes.is_empty() {
             return Ok(0);
         }
         let completion = self.reserve_completion(id, true, flags)?;
+        let n = self.timestamp_write(id, cid, &bytes, flags, override_flags)?;
         let s = self.sockets.get_mut(&id).unwrap();
-        let n = self
-            .endpoint
-            .write_with_options_and_notsent_lowat(
-                cid,
-                &bytes,
-                flags & MSG_MORE != 0,
-                flags & MSG_EOR != 0,
-                Some(effective_notsent_lowat(s.notsent_lowat)),
-            )
-            .map_err(engine)?;
         if n != 0 && completion {
             let next = s.zc_next;
-            if let Some(tail) = s.completions.back_mut()
-                && extends_completion(*tail, next)
+            if let Some(Completion::ZeroCopy(lo, hi)) = s.completions.back_mut()
+                && extends_completion((*lo, *hi), next)
             {
-                tail.1 = next;
+                *hi = next;
             } else {
-                s.completions.push_back((next, next));
+                s.completions.push_back(Completion::ZeroCopy(next, next));
             }
             s.zc_next = next.wrapping_add(1);
             // A newly completed send wakes ET error-queue consumers even if
@@ -1179,6 +1311,14 @@ impl Owner {
                     let _ = self.endpoint.close_listener(listener);
                     return Err(engine(e));
                 }
+                if self.sockets[&id].timestamps.options.flags != 0
+                    && let Err(e) = self
+                        .endpoint
+                        .set_listener_rx_timestamp_capacity(listener, timestamps::PHASES)
+                {
+                    let _ = self.endpoint.close_listener(listener);
+                    return Err(engine(e));
+                }
                 let s = self.sockets.get_mut(&id).unwrap();
                 s.local = Some(local);
                 s.handle = Handle::Listener(listener);
@@ -1238,6 +1378,9 @@ impl Owner {
                     child.tos = p.1;
                     child.discover = p.2;
                     child.zerocopy = p.3.unwrap_or(false);
+                }
+                if let Some(index) = self.child_timestamps.iter().position(|p| p.0 == cid) {
+                    child.timestamps.options = self.child_timestamps.swap_remove(index).1;
                 }
                 child.handle = Handle::Connection(cid);
                 child.local = Some(tuple.local);
@@ -1408,7 +1551,12 @@ impl Owner {
             Op::WriteFlags(bytes, flags) => {
                 out.value = self.write(id, bytes, flags)?;
             }
-            Op::Send(sources, flags) => {
+            Op::Send(_, _) | Op::SendTimestamp(..) => {
+                let (sources, flags, override_flags) = match op {
+                    Op::Send(sources, flags) => (sources, flags, None),
+                    Op::SendTimestamp(sources, flags, stamp) => (sources, flags, Some(stamp)),
+                    _ => unreachable!(),
+                };
                 // Connected/terminal errors precede payload faults. Fresh and
                 // listening fds retain the adapter's foreign-input validation.
                 let connection = matches!(s.handle, Handle::Connection(_));
@@ -1455,12 +1603,77 @@ impl Owner {
                         break;
                     }
                 }
-                out.value = self.write(id, bytes, flags)?;
+                out.value = self.write_timestamp(id, bytes, flags, override_flags)?;
+            }
+            Op::RxTimestamp(count) => {
+                let Handle::Connection(cid) = s.handle else {
+                    return Err(ENOTCONN);
+                };
+                let flags = s.timestamps.options.flags;
+                if let Some(stamp) = self
+                    .endpoint
+                    .peek_rx_timestamps(cid, count)
+                    .map_err(engine)?
+                {
+                    let ns = |t: Option<ntcp::RxTimestamp>| {
+                        t.and_then(|t| match t.clock {
+                            ntcp::TimestampClock::RealtimeNanoseconds
+                            | ntcp::TimestampClock::DeviceTicks {
+                                units_per_second: Some(1_000_000_000),
+                                ..
+                            } => Some(t.value),
+                            _ => None,
+                        })
+                    };
+                    let sw = (flags & crate::timestamping::SOFTWARE != 0
+                        && (flags & crate::timestamping::OPT_RX_FILTER == 0
+                            || flags & crate::timestamping::RX_SOFTWARE != 0))
+                        .then(|| ns(stamp.timestamps.software))
+                        .flatten();
+                    let hw = (flags & crate::timestamping::RAW_HARDWARE != 0
+                        && (flags & crate::timestamping::OPT_RX_FILTER == 0
+                            || flags & crate::timestamping::RX_HARDWARE != 0))
+                        .then(|| ns(stamp.timestamps.hardware))
+                        .flatten();
+                    if sw.is_some() || hw.is_some() {
+                        out.bytes = crate::timestamping::timestamps(sw, hw).to_vec();
+                        out.value = if s.timestamps.options.new_abi { 65 } else { 37 };
+                    }
+                }
             }
             Op::ErrorQueueTo(address) => {
-                let completion = *s.completions.front().ok_or(EAGAIN)?;
+                let completion = s.completions.front().ok_or(EAGAIN)?;
                 let p = address as *mut msghdr;
-                copy_completion(p, load(p)?, completion)?;
+                out.value = match completion {
+                    Completion::ZeroCopy(lo, hi) => {
+                        copy_completion(p, load(p)?, (*lo, *hi))?;
+                        0
+                    }
+                    Completion::Timestamp {
+                        stamp,
+                        error,
+                        payload,
+                    } => {
+                        // Linux reports timestamp CMSGs using the current options,
+                        // independently of the generation flags on the old send.
+                        let options = s.timestamps.options;
+                        let mut reported = *stamp;
+                        if options.flags & crate::timestamping::SOFTWARE == 0 {
+                            reported[..16].fill(0);
+                        }
+                        if options.flags & crate::timestamping::RAW_HARDWARE == 0 {
+                            reported[32..].fill(0);
+                        }
+                        copy_timestamp_completion(
+                            p,
+                            load(p)?,
+                            if options.new_abi { 65 } else { 37 },
+                            reported.iter().any(|&b| b != 0).then_some(&reported),
+                            error,
+                            payload,
+                        )? as i32
+                    }
+                };
                 self.sockets.get_mut(&id).unwrap().completions.pop_front();
             }
             Op::Transport(option) => {
@@ -1477,6 +1690,9 @@ impl Owner {
                     Handle::Fresh => (),
                     Handle::Listener(l) => self.endpoint.close_listener(l).map_err(engine)?,
                     Handle::Connection(cid) => {
+                        let _ = self.endpoint.cancel_tx_timestamps(cid);
+                        while matches!(self.endpoint.next_tx_timestamp(cid), Ok(Some(_))) {}
+                        let _ = self.endpoint.set_tx_timestamp_capacity(cid, 0);
                         if !matches!(
                             self.endpoint.state(cid),
                             Ok(State::Closed | State::TimeWait)
@@ -1498,6 +1714,7 @@ impl Owner {
                     }
                 });
                 self.sockets.remove(&id);
+                self.cancel_unused_backend_timestamps();
             }
             Op::Shutdown(how) => {
                 let Handle::Connection(cid) = s.handle else {
@@ -1563,8 +1780,26 @@ impl Owner {
                     s.receive_timeout_us
                 };
             }
+            Op::Set(SOL_SOCKET, name @ (37 | 65), value) => {
+                self.timestamp_options(id, name, value as u32)?;
+            }
             Op::Set(level, name, value) => {
+                // Account for the transient option snapshot as well as retained
+                // queue capacity; cloning Arc packet references copies no payload.
+                if self.timestamp_charge()
+                    + s.timestamps.staging_charge()
+                    + (s.completions.len() + s.timestamps.reserved())
+                        * 2
+                        * std::mem::size_of::<Completion>()
+                    > timestamps::RUNTIME_BYTES
+                {
+                    return Err(ENOBUFS);
+                }
                 let mut candidate = s.clone();
+                candidate
+                    .completions
+                    .try_reserve(candidate.timestamps.reserved())
+                    .map_err(|_| ENOBUFS)?;
                 let s = &mut candidate;
                 match (level, name) {
                     (SOL_SOCKET, SO_REUSEADDR) => s.reuse = value != 0,
@@ -1689,6 +1924,10 @@ impl Owner {
                     let s = self.sockets.get_mut(&id).unwrap();
                     s.readiness_generations[1] = s.readiness_generations[1].wrapping_add(1);
                 }
+            }
+            Op::Get(SOL_SOCKET, name @ (37 | 65)) => {
+                out.bytes = s.timestamps.options.get(name)?.to_vec();
+                out.value = i32::from_ne_bytes(out.bytes[..4].try_into().unwrap());
             }
             Op::Get(level, name) => {
                 let s = self.sockets.get_mut(&id).unwrap();
@@ -1816,6 +2055,7 @@ impl Owner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("timestamp_tests.rs");
     fn owner(last: u8) -> Owner {
         let local = Ipv4Addr::new(10, 73, 0, last);
         Owner::with_endpoint(local, (Ipv4Addr::new(10, 73, 0, 1), 24), [last; 32], None).unwrap()
@@ -1834,6 +2074,7 @@ mod tests {
                 };
                 for _ in 0..32 {
                     let mut bytes = [0u8; 1480];
+                    let pair = ClockPair::sample(from);
                     let p = from
                         .endpoint
                         .poll_transmit(from.now(), &mut bytes, 32)
@@ -1841,6 +2082,10 @@ mod tests {
                     let Some(p) = p.packet else {
                         break;
                     };
+                    let frame = from.frame(p, &bytes[..p.len]).unwrap();
+                    from.timestamp_packet(p.tx_timestamp, &frame);
+                    from.drain_timestamps(pair);
+                    from.software_transmitted(p.tx_timestamp, timestamps::realtime());
                     to.input(to.now(), p.ip, p.dscp << 2 | p.ecn, &bytes[..p.len])
                         .unwrap();
                     progress = true;
@@ -1890,7 +2135,7 @@ mod tests {
             assert_ne!(ready.value & EPOLLERR, 0);
             assert_ne!(ready.readiness_generations[2], before);
             let mut header: msghdr = unsafe { std::mem::zeroed() };
-            header.msg_control = 1usize as *mut c_void;
+            header.msg_control = std::ptr::dangling_mut::<c_void>();
             header.msg_controllen = 48;
             let address = (&mut header as *mut msghdr) as usize;
             assert_eq!(

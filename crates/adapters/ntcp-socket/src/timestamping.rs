@@ -1,46 +1,45 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Linux-only ABI preparation; NOT wired into socket options until native TX/RX
-// contracts are complete. No timestamp generation or core clock conversion here.
+// Linux timestamping ABI. Native observations remain independent of this module.
 // Check: cargo test -p ntcp-socket timestamping
 // Verified against Linux v6.12 net/core/sock.c sock_set_timestamping,
 // __sock_cmsg_send, and sk_getsockopt. The supported socket ABIs are 64-bit.
 
-const OLD: i32 = 37;
-const NEW: i32 = 65;
-const TX_HARDWARE: u32 = 1;
-const TX_SOFTWARE: u32 = 1 << 1;
-const RX_HARDWARE: u32 = 1 << 2;
-const RX_SOFTWARE: u32 = 1 << 3;
-const SOFTWARE: u32 = 1 << 4;
-const SYS_HARDWARE: u32 = 1 << 5;
-const RAW_HARDWARE: u32 = 1 << 6;
-const OPT_ID: u32 = 1 << 7;
-const TX_SCHED: u32 = 1 << 8;
-const TX_ACK: u32 = 1 << 9;
-const OPT_CMSG: u32 = 1 << 10;
-const OPT_TSONLY: u32 = 1 << 11;
-const OPT_STATS: u32 = 1 << 12;
-const OPT_PKTINFO: u32 = 1 << 13;
-const OPT_TX_SWHW: u32 = 1 << 14;
-const BIND_PHC: u32 = 1 << 15;
-const OPT_ID_TCP: u32 = 1 << 16;
-const OPT_RX_FILTER: u32 = 1 << 17;
-const MASK: u32 = (1 << 18) - 1;
-const TX_RECORD: u32 = TX_HARDWARE | TX_SOFTWARE | TX_SCHED | TX_ACK;
-const UNSUPPORTED: u32 = OPT_CMSG | OPT_STATS | OPT_PKTINFO | BIND_PHC;
-const EINVAL: i32 = 22;
-const EOPNOTSUPP: i32 = 95;
+pub(crate) const OLD: i32 = 37;
+pub(crate) const NEW: i32 = 65;
+pub(crate) const TX_HARDWARE: u32 = 1;
+pub(crate) const TX_SOFTWARE: u32 = 1 << 1;
+pub(crate) const RX_HARDWARE: u32 = 1 << 2;
+pub(crate) const RX_SOFTWARE: u32 = 1 << 3;
+pub(crate) const SOFTWARE: u32 = 1 << 4;
+pub(crate) const SYS_HARDWARE: u32 = 1 << 5;
+pub(crate) const RAW_HARDWARE: u32 = 1 << 6;
+pub(crate) const OPT_ID: u32 = 1 << 7;
+pub(crate) const TX_SCHED: u32 = 1 << 8;
+pub(crate) const TX_ACK: u32 = 1 << 9;
+pub(crate) const OPT_CMSG: u32 = 1 << 10;
+pub(crate) const OPT_TSONLY: u32 = 1 << 11;
+pub(crate) const OPT_STATS: u32 = 1 << 12;
+pub(crate) const OPT_PKTINFO: u32 = 1 << 13;
+pub(crate) const OPT_TX_SWHW: u32 = 1 << 14;
+pub(crate) const BIND_PHC: u32 = 1 << 15;
+pub(crate) const OPT_ID_TCP: u32 = 1 << 16;
+pub(crate) const OPT_RX_FILTER: u32 = 1 << 17;
+pub(crate) const MASK: u32 = ((1 << 18) - 1) | SYS_HARDWARE;
+pub(crate) const TX_RECORD: u32 = TX_HARDWARE | TX_SOFTWARE | TX_SCHED | TX_ACK;
+pub(crate) const UNSUPPORTED: u32 = OPT_CMSG | OPT_STATS | OPT_PKTINFO | BIND_PHC;
+pub(crate) const EINVAL: i32 = 22;
+pub(crate) const EOPNOTSUPP: i32 = 95;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Options {
-    flags: u32,
-    new_abi: bool,
+pub(crate) struct Options {
+    pub(crate) flags: u32,
+    pub(crate) new_abi: bool,
 }
 
 impl Options {
     // Validate without mutation: caller commits only after native reservations
     // and ID-base acquisition succeed. `active` excludes TCP_CLOSE/TCP_LISTEN.
-    fn updated(self, name: i32, flags: u32, active: bool) -> Result<Self, i32> {
+    pub(crate) fn updated(self, name: i32, flags: u32, active: bool) -> Result<Self, i32> {
         if !matches!(name, OLD | NEW)
             || flags & !MASK != 0
             || flags & OPT_ID_TCP != 0 && flags & OPT_ID == 0
@@ -58,7 +57,7 @@ impl Options {
         })
     }
 
-    fn get(self, name: i32) -> Result<[u8; 8], i32> {
+    pub(crate) fn get(self, name: i32) -> Result<[u8; 8], i32> {
         if !matches!(name, OLD | NEW) {
             return Err(EINVAL);
         }
@@ -70,14 +69,14 @@ impl Options {
         Ok(value)
     }
 
-    fn per_send(self, override_flags: u32) -> Result<u32, i32> {
+    pub(crate) fn per_send(self, override_flags: u32) -> Result<u32, i32> {
         if override_flags & !TX_RECORD != 0 {
             return Err(EINVAL);
         }
         Ok((self.flags & !TX_RECORD) | override_flags)
     }
 
-    fn resets_id(self, next: Self) -> bool {
+    pub(crate) fn resets_id(self, next: Self) -> bool {
         self.flags & OPT_ID == 0 && next.flags & OPT_ID != 0
     }
 }
@@ -85,7 +84,7 @@ impl Options {
 // Inputs must already be verified realtime nanoseconds or calibrated raw-device
 // nanoseconds by the integration. This helper never accepts/converts device ticks.
 // ts[1] (deprecated SYS_HARDWARE) is always zero. OLD and NEW coincide on 64-bit.
-fn timestamps(software_ns: Option<u64>, hardware_ns: Option<u64>) -> [u8; 48] {
+pub(crate) fn timestamps(software_ns: Option<u64>, hardware_ns: Option<u64>) -> [u8; 48] {
     let mut bytes = [0; 48];
     for (slot, nanos) in [(0, software_ns), (2, hardware_ns)] {
         if let Some(nanos) = nanos {
@@ -99,7 +98,7 @@ fn timestamps(software_ns: Option<u64>, hardware_ns: Option<u64>) -> [u8; 48] {
 
 // sock_extended_err plus AF_UNSPEC sockaddr_in offender, matching zero-copy's
 // current errorqueue layout. `id` is Linux's byte ID, never a native core cookie.
-fn extended_error(stage: u32, id: u32) -> [u8; 32] {
+pub(crate) fn extended_error(stage: u32, id: u32) -> [u8; 32] {
     let mut bytes = [0; 32];
     bytes[..4].copy_from_slice(&42u32.to_ne_bytes()); // ENOMSG
     bytes[4] = 4; // SO_EE_ORIGIN_TIMESTAMPING

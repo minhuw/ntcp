@@ -1842,7 +1842,10 @@ fn copied_completions_wrap_coalesce_and_reserve_before_accepting_bytes() {
         assert_eq!(owner.execute(&mut send).unwrap().unwrap().value, 1);
     }
     assert_eq!(owner.sockets[&fd].zc_next, 1);
-    assert_eq!(owner.sockets[&fd].completions, [(u32::MAX - 1, 0)]);
+    assert_eq!(
+        owner.sockets[&fd].completions,
+        [Completion::ZeroCopy(u32::MAX - 1, 0)]
+    );
     let mut control = [0u8; 64];
     let mut header: msghdr = unsafe { std::mem::zeroed() };
     header.msg_control = control.as_mut_ptr().cast();
@@ -1872,8 +1875,9 @@ fn copied_completions_wrap_coalesce_and_reserve_before_accepting_bytes() {
     assert_eq!(header.msg_flags, MSG_ERRQUEUE);
     assert_eq!(owner.execute(&mut receive).err(), Some(EAGAIN));
     // Seed unreachable-in-a-short-test ranges to exercise the real capacity gate.
-    owner.sockets.get_mut(&fd).unwrap().completions =
-        (0..LIMIT as u32).map(|n| (n + 10, n + 10)).collect();
+    owner.sockets.get_mut(&fd).unwrap().completions = (0..LIMIT as u32)
+        .map(|n| Completion::ZeroCopy(n + 10, n + 10))
+        .collect();
     let written = owner
         .inner
         .endpoint
@@ -1901,24 +1905,52 @@ fn copied_completions_wrap_coalesce_and_reserve_before_accepting_bytes() {
     assert_eq!(send.destinations, [(1, 1)]); // Capacity failure precedes payload faults.
     send.destinations.clear();
     assert_eq!(owner.execute(&mut send).unwrap().unwrap().value, 0);
-    let next = owner.sockets[&fd].completions.back().unwrap().1 + 1;
+    let next = owner.sockets[&fd]
+        .completions
+        .back()
+        .unwrap()
+        .range()
+        .unwrap()
+        .1
+        + 1;
     owner.sockets.get_mut(&fd).unwrap().zc_next = next;
     send.bytes = b"x".to_vec();
     assert_eq!(owner.execute(&mut send).unwrap().unwrap().value, 1);
     assert_eq!(owner.sockets[&fd].completions.len(), LIMIT);
-    assert_eq!(owner.sockets[&fd].completions.back().unwrap().1, next);
+    assert_eq!(
+        owner.sockets[&fd]
+            .completions
+            .back()
+            .unwrap()
+            .range()
+            .unwrap()
+            .1,
+        next
+    );
     // A range covering almost a full counter turn cannot grow to 2^32 IDs.
     let socket = owner.sockets.get_mut(&fd).unwrap();
-    socket.completions = [(1, u32::MAX)].into();
+    socket.completions = [Completion::ZeroCopy(1, u32::MAX)].into();
     socket.zc_next = 0;
     assert_eq!(owner.execute(&mut send).unwrap().unwrap().value, 1);
-    assert_eq!(owner.sockets[&fd].completions, [(1, u32::MAX), (0, 0)]);
+    assert_eq!(
+        owner.sockets[&fd].completions,
+        [
+            Completion::ZeroCopy(1, u32::MAX),
+            Completion::ZeroCopy(0, 0)
+        ]
+    );
     execute_value(&mut owner, 11, fd, 8, 0).unwrap();
     assert_eq!(owner.execute(&mut send).unwrap().unwrap().value, 1);
     assert_eq!(owner.sockets[&fd].zc_next, 1);
     execute_value(&mut owner, 11, fd, 8, 1).unwrap();
     assert_eq!(owner.execute(&mut send).unwrap().unwrap().value, 1);
-    assert_eq!(owner.sockets[&fd].completions, [(1, u32::MAX), (0, 1)]);
+    assert_eq!(
+        owner.sockets[&fd].completions,
+        [
+            Completion::ZeroCopy(1, u32::MAX),
+            Completion::ZeroCopy(0, 1)
+        ]
+    );
 }
 
 #[test]

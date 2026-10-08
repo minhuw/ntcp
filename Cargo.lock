@@ -164,6 +164,7 @@ dependencies = [
  "libc",
  "ntcp",
  "ntcp-io",
+ "ntcp-io-af-packet",
  "ntcp-io-tun",
  "ntcp-ip",
 ]

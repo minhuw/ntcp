@@ -160,6 +160,7 @@ fn syn_with_options(sequence: u32, destination_port: u16, options: &[u8]) -> Vec
     let n = ntcp::wire::encode(ip, header, options, &[], &mut tcp).unwrap();
     frame(
         ntcp::Transmit {
+            tx_timestamp: None,
             connection: None,
             ip,
             len: n,
@@ -219,6 +220,7 @@ fn abi_table_null_counts_vectors_variadics_and_host_clock() {
     let len = ntcp::wire::encode(ip, header, &[], b"abcdef", &mut bytes).unwrap();
     let packet = frame(
         ntcp::Transmit {
+            tx_timestamp: None,
             connection: None,
             ip,
             len,
@@ -253,6 +255,7 @@ fn abi_table_null_counts_vectors_variadics_and_host_clock() {
     let len = ntcp::wire::encode(ip, reset, &[], &[], &mut bytes).unwrap();
     let packet = frame(
         ntcp::Transmit {
+            tx_timestamp: None,
             connection: None,
             ip,
             len,
@@ -593,6 +596,7 @@ fn inject(ip: IpMetadata, header: ntcp::wire::Header, payload: &[u8]) {
     let len = ntcp::wire::encode(ip, header, &[], payload, &mut tcp).unwrap();
     let bytes = frame(
         ntcp::Transmit {
+            tx_timestamp: None,
             connection: None,
             ip,
             len,
