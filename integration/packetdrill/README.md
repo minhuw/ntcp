@@ -2,6 +2,15 @@
 
 The 14 selected upstream loss-recovery tests are accounted for: **12 pass**, and **2 fail with the documented differences below**.
 
+### Application-limited slow start
+
+- `slow_start/slow-start-ack-per-2pkt-send-6pkt.pkt`
+- `slow_start/slow-start-app-limited-9-packets-out.pkt`
+
+**Accepted window-growth mismatch: 12 MSS expected at the first data ACK, 10 MSS observed.**
+
+Both start with a 10-MSS window and send only 6 or 9 MSS. Linux's slow-start heuristic allows growth toward twice the actual flight peak: 12 or 18 MSS. ntcp follows [RFC 9438 §5.8](https://www.rfc-editor.org/rfc/rfc9438.html#section-5.8), keeping the window at 10 MSS while application-limited.
+
 ### `ts_recent/invalid_ack.pkt`
 
 **Accepted extra ACK: ntcp replies to an ACK beyond `SND.NXT`.**
