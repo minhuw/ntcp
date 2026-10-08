@@ -521,3 +521,148 @@ fn logical_zero_progress_backpressure_counts_byte_capacity_not_lowat() {
         }
     }
 }
+
+// Diagnostic replay of tcp_info/tcp-info-sndbuf-limited.pkt, not a Linux
+// chronograph equivalence assertion. Keep upstream-basic (Reno) unchanged.
+#[cfg(feature = "packet-test")]
+#[test]
+fn logical_sndbuf_upstream_ack_timeline() {
+    use ntcp::wire::{self, ACK, SYN};
+    let mut a = Owner::packet((
+        Ipv4Addr::new(192, 168, 0, 1),
+        crate::packet_profile::Profile::UpstreamBasic,
+    ))
+    .unwrap();
+    a.test_now = Some(0);
+    let client = new(&mut a, SOCK_NONBLOCK);
+    assert_eq!(
+        a.execute(client, Op::Connect("192.0.2.1:8080".parse().unwrap()))
+            .unwrap_err(),
+        EINPROGRESS
+    );
+    let Handle::Connection(cid) = a.sockets[&client].handle else {
+        unreachable!()
+    };
+    let mut packet = [0; 65515];
+    let tx = a
+        .endpoint
+        .poll_transmit(0, &mut packet, BUDGET)
+        .unwrap()
+        .packet
+        .unwrap();
+    let syn = wire::parse(tx.ip, &packet[..tx.len]).unwrap().header;
+    let ip = ntcp::IpMetadata {
+        source: tx.ip.destination,
+        destination: tx.ip.source,
+    };
+    let mut header = wire::Header {
+        source_port: syn.destination_port,
+        destination_port: syn.source_port,
+        sequence: 0,
+        acknowledgment: syn.sequence.wrapping_add(1),
+        flags: SYN | ACK,
+        window: 10000,
+        urgent_pointer: 0,
+    };
+    // Exact peer SYN-ACK options: MSS 1000, SACK permitted, scale 8, no TS.
+    let n = wire::encode(
+        ip,
+        header,
+        &[2, 4, 3, 232, 4, 2, 1, 1, 1, 3, 3, 8],
+        &[],
+        &mut packet,
+    )
+    .unwrap();
+    a.test_now = Some(10000);
+    a.input(10000, ip, 0, &packet[..n]).unwrap();
+    a.events();
+    a.execute(client, Op::Set(SOL_SOCKET, SO_SNDBUF, 10000))
+        .unwrap();
+    assert_eq!(
+        a.execute(client, Op::Get(SOL_SOCKET, SO_SNDBUF))
+            .unwrap()
+            .value,
+        20000
+    );
+    let bytes = vec![0; 150000];
+    let (mut request, reply) = logical_request(
+        &mut a,
+        client,
+        Op::Send(vec![(bytes.as_ptr() as usize, bytes.len())], 0),
+    );
+    header.sequence = 1;
+    header.flags = ACK;
+    let mut high = 1;
+    for now in (10000..=170000).step_by(1000) {
+        a.test_now = Some(now);
+        a.endpoint.on_timeout(now, BUDGET).unwrap();
+        let ack = match now {
+            110000 => Some(10001),
+            120000 => Some(30001),
+            130000 => Some(70001),
+            150000 => Some(95001),
+            170000 => Some(150001),
+            _ => None,
+        };
+        if let Some(ack) = ack {
+            let before = a.endpoint.send_progress(cid).unwrap();
+            eprintln!(
+                "TIMELINE before ACK{ack} t={now} high={high} progress={before:?} info={:?}",
+                a.endpoint.transport_info(cid).unwrap()
+            );
+            header.acknowledgment = syn.sequence.wrapping_add(ack);
+            let n = wire::encode(ip, header, &[], &[], &mut packet).unwrap();
+            a.input(now, ip, 0, &packet[..n]).unwrap();
+            let after = a.endpoint.send_progress(cid).unwrap();
+            if ack == 10001 {
+                assert_eq!(a.endpoint.transport_info(cid).unwrap().cwnd, 11000);
+            } else {
+                // Script ACKs exceed the actual transmitted frontier. They
+                // cannot reclaim bytes or clear the blocked logical write.
+                assert!(ack > high);
+                assert_eq!(after, before);
+            }
+        }
+        a.events();
+        // Owner::run outputs before retrying pending sends; new requests also
+        // arrive after output. Subsequent turns flush/refill the same request.
+        for _ in 0..BUDGET {
+            let Some(tx) = a
+                .endpoint
+                .poll_transmit(now, &mut packet, BUDGET)
+                .unwrap()
+                .packet
+            else {
+                break;
+            };
+            let segment = wire::parse(tx.ip, &packet[..tx.len]).unwrap();
+            if !segment.payload.is_empty() {
+                let end = segment.header.sequence.wrapping_sub(syn.sequence)
+                    + segment.payload.len() as u32;
+                high = high.max(end);
+                eprintln!(
+                    "TIMELINE output t={now} end={end} info={:?}",
+                    a.endpoint.transport_info(cid).unwrap()
+                );
+            }
+        }
+        a.events();
+        if now >= 100000 {
+            assert!(!a.service(&mut request));
+        }
+        if ack.is_some() {
+            let info = a.endpoint.transport_info(cid).unwrap();
+            let accepted = request.send.as_ref().unwrap().accepted;
+            eprintln!("TIMELINE after retry t={now} accepted={accepted} high={high} info={info:?}");
+            assert_eq!(accepted, 30000);
+            assert_eq!(info.busy_time_us, now - 100000);
+            assert_eq!(info.send_used, 20000);
+            assert!(info.notsent_bytes > 0);
+            if ack != Some(10001) {
+                assert!(info.send_used - info.notsent_bytes >= info.cwnd as usize);
+            }
+            assert_eq!(info.sndbuf_limited_us, 0);
+        }
+    }
+    assert!(reply.try_recv().is_err());
+}

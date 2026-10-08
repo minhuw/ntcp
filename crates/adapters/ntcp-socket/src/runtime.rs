@@ -403,6 +403,8 @@ struct Owner {
     sockets: BTreeMap<u64, Socket>,
     local: Ipv4Addr,
     epoch: Instant,
+    #[cfg(test)]
+    test_now: Option<u64>,
     next_port: u16,
     next_id: u64,
     detached: Vec<ConnectionId>,
@@ -544,6 +546,8 @@ impl Owner {
             sockets: BTreeMap::new(),
             local,
             epoch: Instant::now(),
+            #[cfg(test)]
+            test_now: None,
             next_port: 40000,
             next_id: 1,
             detached: Vec::new(),
@@ -630,6 +634,10 @@ impl Owner {
         Ok(packet)
     }
     fn now(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(now) = self.test_now {
+            return now;
+        }
         self.epoch.elapsed().as_micros().min(u64::MAX as u128) as u64
     }
     fn packet_wait(&self, op: &Op) -> bool {
