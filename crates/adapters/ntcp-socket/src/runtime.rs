@@ -1683,6 +1683,14 @@ impl Owner {
                         .map_err(engine)?;
                 }
                 self.sockets.insert(id, candidate);
+                // Linux tcp_setsockopt calls sk_write_space even for a repeated
+                // LOWAT value. Notify each ET registration, not just 0->OUT.
+                if (level, name) == (IPPROTO_TCP, TCP_NOTSENT_LOWAT)
+                    && self.refresh_readiness(id)? & EPOLLOUT != 0
+                {
+                    let s = self.sockets.get_mut(&id).unwrap();
+                    s.readiness_generations[1] = s.readiness_generations[1].wrapping_add(1);
+                }
             }
             Op::Get(level, name) => {
                 let s = self.sockets.get_mut(&id).unwrap();
@@ -1953,6 +1961,36 @@ mod tests {
             0
         );
         assert_eq!(b.execute(server, Op::Inq(0)).unwrap().value, 1);
+    }
+    #[test]
+    fn lowwater_sets_notify_independent_writable_registrations() {
+        let (mut a, _b, client, _, _) = pair();
+        let mut first = a.execute(client, Op::Ready).unwrap().readiness_generations;
+        let mut second = first;
+        for value in [4000, 4000, -1, 0] {
+            a.execute(client, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, value))
+                .unwrap();
+            let ready = a.execute(client, Op::Ready).unwrap();
+            assert_ne!(ready.value & EPOLLOUT, 0);
+            assert!(socket_options::edge_changed(
+                EPOLLOUT as u32,
+                Some(first),
+                ready.readiness_generations
+            ));
+            first = ready.readiness_generations;
+            assert!(!socket_options::edge_changed(
+                EPOLLOUT as u32,
+                Some(first),
+                ready.readiness_generations
+            ));
+            // Consuming one registration must not consume another's edge.
+            assert!(socket_options::edge_changed(
+                EPOLLOUT as u32,
+                Some(second),
+                ready.readiness_generations
+            ));
+            second = ready.readiness_generations;
+        }
     }
     #[test]
     fn lowwater_tracks_unsent_not_unacked_and_option_wakes() {

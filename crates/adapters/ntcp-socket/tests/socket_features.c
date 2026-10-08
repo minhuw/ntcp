@@ -85,6 +85,25 @@ int main(int argc, char **argv) {
     struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(atoi(argv[2]))};
     assert(inet_pton(AF_INET, argv[1], &addr.sin_addr) == 1);
     assert(connect(fd, (void *)&addr, sizeof(addr)) == 0);
+    if (strstr(argv[3], "admission")) {
+        /* Explicit regression probe (native-admission / managed-admission).
+           No EOR: LOWAT gates allocation, not appends to an admitted skb. */
+        set(fd, TCP_CORK, 1);
+        set(fd, TCP_NOTSENT_LOWAT, 4000);
+        char payload[8000] = {0};
+        ssize_t first = send(fd, payload, sizeof(payload), MSG_DONTWAIT | MSG_MORE);
+        ssize_t next = send(fd, payload, 1, MSG_DONTWAIT | MSG_MORE);
+        struct tcp_info info = {0};
+        socklen_t size = sizeof(info);
+        assert(getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &size) == 0);
+        fprintf(stderr, "admission: first=%zd next=%zd notsent=%u\n",
+                first, next, info.tcpi_notsent_bytes);
+        assert(first == 8000 && next == 1);
+        if (!managed) assert(info.tcpi_notsent_bytes == 8001);
+        close(fd);
+        puts("PASS: LOWAT admission overshoot and subsequent append without EOR");
+        return 0;
+    }
     if (strstr(argv[3], "lowwater")) {
         int buffer = 65536;
         assert(setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer, 4) == 0);
@@ -153,6 +172,18 @@ int main(int argc, char **argv) {
     struct epoll_event registration = {.events = EPOLLIN | EPOLLOUT | EPOLLET, .data.u64 = 42};
     assert(epoll_ctl(ep, EPOLL_CTL_ADD, fd, &registration) == 0);
     edge(ep, EPOLLOUT);
+    /* Each successful LOWAT set calls write_space, even unchanged values.
+       Separate epolls must independently observe the resulting OUT edge. */
+    int ep2 = epoll_create1(EPOLL_CLOEXEC);
+    assert(ep2 >= 0);
+    assert(epoll_ctl(ep2, EPOLL_CTL_ADD, fd, &registration) == 0);
+    edge(ep2, EPOLLOUT);
+    for (int i = 0; i < 4; i++) {
+        set(fd, TCP_NOTSENT_LOWAT, (int[]){4000, 4000, -1, 0}[i]);
+        edge(ep, EPOLLOUT);
+        edge(ep2, EPOLLOUT);
+    }
+    close(ep2);
     assert(send(fd, "A", 1, MSG_NOSIGNAL) == 1);
     queue(fd, 6);
     /* Failed ET output must not consume this edge. */
