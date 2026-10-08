@@ -19,6 +19,12 @@ After two 100-ms RTT samples, [RFC 6298 §2.3](https://www.rfc-editor.org/rfc/rf
 
 A diagnostic run with adjusted timing subsequently reaches the 200,000-byte write, which exceeds the current 65,535-byte packet-backend I/O limit. That interface limit remains separate from this accepted timing difference.
 
+### `inq/client.pkt`
+
+**Accepted timeout: the script waits for an ACK to data missing negotiated timestamps.**
+
+Linux accepts these packets, accommodating devices that strip TCP options. ntcp follows [RFC 7323 §3.2](https://www.rfc-editor.org/rfc/rfc7323.html#section-3.2): senders MUST include timestamps after negotiation; receivers SHOULD silently drop packets that omit them, preserving PAWS protection against old duplicates. Adding timestamps to the incoming data and FIN in a diagnostic copy passes all unchanged INQ/EOF assertions.
+
 ### `ts_recent/invalid_ack.pkt`
 
 **Accepted extra ACK: ntcp replies to an ACK beyond `SND.NXT`.**
