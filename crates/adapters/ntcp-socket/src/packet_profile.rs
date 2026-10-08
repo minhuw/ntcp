@@ -70,7 +70,11 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
         max_connections: LIMIT,
         max_listeners: LIMIT,
         max_control_packets: LIMIT,
-        max_buffer_bytes: 32 * 1024 * 1024,
+        max_buffer_bytes: if profile == Profile::UpstreamCubic {
+            128 * 1024 * 1024
+        } else {
+            32 * 1024 * 1024
+        },
         ..EndpointConfig::default()
     };
     config.connection.receive_capacity = match profile {

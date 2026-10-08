@@ -888,6 +888,54 @@ fn upstream_sack_rto_uses_linux_floor_while_baseline_keeps_core_floor() {
 }
 
 #[test]
+fn only_upstream_cubic_budget_allows_200000_sndbuf_growth() {
+    for profile in [
+        Profile::Baseline,
+        Profile::UpstreamWindow8,
+        Profile::Sack,
+        Profile::UpstreamSack,
+        Profile::UpstreamEcn,
+        Profile::UpstreamBasic,
+    ] {
+        assert_eq!(
+            crate::packet_profile::config(profile).max_buffer_bytes,
+            32 * 1024 * 1024,
+            "{profile:?}"
+        );
+    }
+    let config = crate::packet_profile::config(Profile::UpstreamCubic);
+    assert_eq!(config.max_buffer_bytes, 128 * 1024 * 1024);
+    assert_eq!(config.connection.send_capacity, 65536);
+    assert_eq!(config.connection.receive_capacity, 8 * 1024 * 1024);
+    assert_eq!(config.preallocate_connections, 1);
+    for (budget, expected) in [
+        (32 * 1024 * 1024, Err(EndpointError::LimitReached)),
+        (config.max_buffer_bytes, Ok(())),
+    ] {
+        let mut limited = config.clone();
+        limited.max_buffer_bytes = budget;
+        let mut endpoint = Endpoint::new(limited, [42; 32], 0, |_| true).unwrap();
+        let id = endpoint
+            .connect(
+                0,
+                SocketAddr::new(local().into(), 40000),
+                SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080),
+            )
+            .unwrap();
+        // All three pinned scripts request 200000; SO_SNDBUF doubles it.
+        assert_eq!(
+            endpoint.set_buffer_capacities(id, 400000, config.connection.receive_capacity),
+            expected
+        );
+        assert_eq!(
+            endpoint.buffer_capacities(id).unwrap().0,
+            if expected.is_ok() { 400000 } else { 65536 }
+        );
+        assert!(endpoint.buffer_bytes() <= budget);
+    }
+}
+
+#[test]
 fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
     for (name, receive_capacity) in [
         ("baseline", 65535),

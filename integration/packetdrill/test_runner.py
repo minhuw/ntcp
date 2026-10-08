@@ -610,6 +610,7 @@ class AdaptationChecks(unittest.TestCase):
                 'receive_capacity': 8388608, 'ecn': False, 'congestion_control': 'Cubic',
                 'output_push_batch_segments': 2,
                 'cubic_hystart': True, 'cubic_fast_convergence': True,
+                'endpoint_max_buffer_bytes': 134217728,
             })
             self.assertIn('full Linux recovery equivalence and conformance are not claimed',
                           entry['mapping']['claim'])
@@ -622,6 +623,17 @@ class AdaptationChecks(unittest.TestCase):
             self.assertTrue(entry['mapping']['assertions_preserved'])
             self.assertNotIn('blocked_reasons', entry)
 
+
+    def test_only_cubic_mappings_use_128_mib_budget(self):
+        for entry in self.manifest['scripts'].values():
+            cubic = entry['adapter_flags'].startswith('upstream-cubic,')
+            settings = entry['mapping']['ntcp_settings']
+            if cubic or 'endpoint_max_buffer_bytes' in settings:
+                self.assertEqual(settings['endpoint_max_buffer_bytes'],
+                                 134217728 if cubic else 33554432)
+            if cubic:
+                self.assertTrue(any('bounded 128 MiB aggregate buffer budget' in reason
+                                    for reason in entry['mapping']['reasons']))
 
     def test_congestion_basic_selection_and_diagnostic_profiles(self):
         manifest = json.loads((HERE / 'adaptations.json').read_text())
