@@ -187,6 +187,19 @@ impl TxTimestamps {
         }
     }
 
+    pub(crate) fn cancel_transmit(&mut self, range: TxStreamRange, source: TxTimestampSource) {
+        for record in &mut self.records {
+            if !record.ready
+                && record.event.stage == TxTimestampStage::Transmit
+                && record.event.source == source
+                && (range.start..range.end).contains(&record.event.target)
+            {
+                record.event.outcome = TxTimestampOutcome::Cancelled;
+                record.ready = true;
+            }
+        }
+    }
+
     pub(crate) fn cancel_from(&mut self, start: u64) {
         for record in &mut self.records {
             if !record.ready && record.event.target >= start {

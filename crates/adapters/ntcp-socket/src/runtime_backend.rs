@@ -11,7 +11,7 @@ use std::{
 };
 
 pub(super) struct EthernetBackend {
-    io: AfPacket,
+    io: Box<dyn PacketIo + Send>,
     local: [u8; 6],
     next_hop: [u8; 6],
     next_cookie: u64,
@@ -134,7 +134,7 @@ impl Owner {
         }
         let mut owner = Self::with_endpoint(local, subnet, secret, None)?;
         owner.ethernet = Some(EthernetBackend {
-            io,
+            io: Box::new(io),
             local: hardware,
             next_hop,
             next_cookie: 1,
@@ -172,62 +172,74 @@ impl Owner {
             },
         }))
     }
+    // Each rejected frame consumes one iteration, just like an accepted frame.
+    pub(super) fn receive_batch(&mut self, input: &mut [u8]) -> std::io::Result<()> {
+        for _ in 0..BUDGET {
+            match self.receive_backend(input) {
+                Ok(Some(received)) => {
+                    let bytes = &input[..received.len];
+                    let bytes = if self.ethernet.is_some() {
+                        let Ok(frame) = ntcp_ip::parse_ethernet(bytes) else {
+                            continue;
+                        };
+                        frame.payload
+                    } else {
+                        bytes
+                    };
+                    if let Ok(p) = ntcp_ip::parse(bytes, false)
+                        && p.protocol == 6
+                    {
+                        let _ = self.input_stamped(
+                            self.now(),
+                            p.ip,
+                            p.traffic_class,
+                            p.payload,
+                            core_stamps(received.timestamps),
+                        );
+                    }
+                }
+                Ok(None) => break,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::InvalidData
+                            | std::io::ErrorKind::Unsupported
+                    ) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
     pub(super) fn transmit_ethernet(&mut self) -> std::io::Result<TxOutcome> {
         let sources = self
             .pending_token
             .map(|token| self.backend_sources(token))
             .unwrap_or_default();
-        let backend = self.ethernet.as_mut().unwrap();
-        if (sources.0 || sources.1) && backend.pending.len() >= timestamps::PHASES {
-            return Ok(TxOutcome::WouldBlock);
-        }
-        let packet = self.pending_packet.as_ref().unwrap();
-        let mut frame = vec![0; (packet.len() + 14).max(60)];
-        let n = ntcp_ip::encode_ethernet(
-            &mut frame,
-            backend.local,
-            backend.next_hop,
-            ntcp_ip::ETHERTYPE_IPV4,
-            packet,
-        )
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
-        if !(sources.0 || sources.1) {
-            return backend.io.transmit(&frame[..n]);
-        }
-        if backend.next_cookie == u64::MAX {
-            return Err(std::io::Error::other("timestamp cookie exhausted"));
-        }
-        let cookie = backend.next_cookie;
-        let outcome = backend.io.transmit_with_timestamp(
-            &frame[..n],
-            ntcp_io::TxTimestampRequest {
-                cookie,
-                software: sources.0,
-                hardware: sources.1,
-            },
-        )?;
-        if outcome == TxOutcome::Submitted {
-            backend
-                .pending
-                .push((cookie, self.pending_token.unwrap(), sources.0, sources.1));
-            backend.next_cookie += 1;
-        }
-        Ok(outcome)
+        let result = self.ethernet.as_mut().unwrap().transmit(
+            &mut self.endpoint,
+            self.pending_token,
+            sources,
+            self.pending_packet.as_ref().unwrap(),
+        );
+        // Cancellation frees adapter reservations exactly once, via native events.
+        self.drain_timestamps(ClockPair::sample(self));
+        result
     }
-    pub(super) fn poll_backend_timestamps(&mut self) {
+    pub(super) fn poll_backend_timestamps(&mut self) -> std::io::Result<()> {
         if let Some(backend) = &mut self.ethernet {
             for _ in 0..BUDGET {
                 let completion = match backend.io.poll_tx_timestamp() {
                     Ok(Some(completion)) => completion,
                     Ok(None) => break,
-                    Err(_) => {
-                        // Explicitly free every backend reservation on failure.
-                        for (cookie, token, _, _) in backend.pending.drain(..) {
-                            let _ = backend.io.cancel_tx_timestamp(cookie);
-                            let _ = self.endpoint.cancel_tx_timestamps(token.connection());
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                        while !backend.pending.is_empty() {
+                            backend.cancel_oldest(&mut self.endpoint)?;
                         }
                         break;
                     }
+                    Err(e) => return Err(e),
                 };
                 let Some(index) = backend
                     .pending
@@ -254,14 +266,17 @@ impl Owner {
                         stamp.value,
                         stamp.clock,
                     );
+                } else {
+                    let _ = self.endpoint.cancel_tx_timestamp(entry.1, source);
                 }
                 if !entry.2 && !entry.3 {
-                    backend.pending.swap_remove(index);
+                    backend.pending.remove(index);
                 }
             }
         }
         self.drain_timestamps(ClockPair::sample(self));
         self.cancel_unused_backend_timestamps();
+        Ok(())
     }
     pub(super) fn cancel_unused_backend_timestamps(&mut self) {
         let Some(mut backend) = self.ethernet.take() else {
@@ -279,3 +294,91 @@ impl Owner {
         self.ethernet = Some(backend);
     }
 }
+
+impl EthernetBackend {
+    fn cancel_sources(endpoint: &mut Endpoint, token: ntcp::TxTimestampToken, sw: bool, hw: bool) {
+        for (enabled, source) in [
+            (sw, ntcp::TxTimestampSource::Software),
+            (hw, ntcp::TxTimestampSource::Hardware),
+        ] {
+            if enabled {
+                let _ = endpoint.cancel_tx_timestamp(token, source);
+            }
+        }
+    }
+    fn cancel_oldest(&mut self, endpoint: &mut Endpoint) -> std::io::Result<()> {
+        let (cookie, token, sw, hw) = self.pending[0];
+        self.io.cancel_tx_timestamp(cookie)?;
+        self.pending.remove(0);
+        Self::cancel_sources(endpoint, token, sw, hw);
+        Ok(())
+    }
+    fn transmit(
+        &mut self,
+        endpoint: &mut Endpoint,
+        token: Option<ntcp::TxTimestampToken>,
+        sources: (bool, bool),
+        packet: &[u8],
+    ) -> std::io::Result<TxOutcome> {
+        let mut frame = vec![0; (packet.len() + 14).max(60)];
+        let n = ntcp_ip::encode_ethernet(
+            &mut frame,
+            self.local,
+            self.next_hop,
+            ntcp_ip::ETHERTYPE_IPV4,
+            packet,
+        )
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        let requested = usize::from(sources.0) + usize::from(sources.1);
+        if requested == 0 {
+            return self.io.transmit(&frame[..n]);
+        }
+        let token = token.unwrap();
+        let capabilities = self.io.timestamp_capabilities();
+        let capacity = capabilities.tx_completion_capacity.min(timestamps::PHASES);
+        if requested <= capacity
+            && self.next_cookie != u64::MAX
+            && (!sources.0 || capabilities.tx_software)
+            && (!sources.1 || capabilities.tx_hardware)
+        {
+            // Count sources, including callbacks queued inside IO until polled.
+            // Ordered removal preserves oldest-submission eviction across sources.
+            while self
+                .pending
+                .iter()
+                .map(|p| usize::from(p.2) + usize::from(p.3))
+                .sum::<usize>()
+                + requested
+                > capacity
+            {
+                self.cancel_oldest(endpoint)?;
+            }
+            let cookie = self.next_cookie;
+            match self.io.transmit_with_timestamp(
+                &frame[..n],
+                ntcp_io::TxTimestampRequest {
+                    cookie,
+                    software: sources.0,
+                    hardware: sources.1,
+                },
+            ) {
+                Ok(outcome) => {
+                    if outcome == TxOutcome::Submitted {
+                        self.pending.push((cookie, token, sources.0, sources.1));
+                        self.next_cookie += 1;
+                    }
+                    return Ok(outcome);
+                }
+                // PacketIo guarantees Unsupported before submission (also ID exhaustion).
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Self::cancel_sources(endpoint, token, sources.0, sources.1);
+        self.io.transmit(&frame[..n])
+    }
+}
+
+#[cfg(test)]
+#[path = "runtime_backend_tests.rs"]
+mod tests;

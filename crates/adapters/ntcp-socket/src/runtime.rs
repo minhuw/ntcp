@@ -663,38 +663,9 @@ impl Owner {
             if self.endpoint.on_timeout(now, BUDGET).is_err() {
                 break;
             }
-            for _ in 0..BUDGET {
-                match self.receive_backend(&mut input) {
-                    Ok(Some(received)) => {
-                        let bytes = &input[..received.len];
-                        let bytes = if self.ethernet.is_some() {
-                            let Ok(frame) = ntcp_ip::parse_ethernet(bytes) else {
-                                continue;
-                            };
-                            frame.payload
-                        } else {
-                            bytes
-                        };
-                        if let Ok(p) = ntcp_ip::parse(bytes, false)
-                            && p.protocol == 6
-                        {
-                            let _ = self.input_stamped(
-                                self.now(),
-                                p.ip,
-                                p.traffic_class,
-                                p.payload,
-                                backend::core_stamps(received.timestamps),
-                            );
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::Interrupted
-                            || e.kind() == std::io::ErrorKind::InvalidData => {}
-                    Err(_) => return,
-                }
+            if self.receive_batch(&mut input).is_err() || self.poll_backend_timestamps().is_err() {
+                return;
             }
-            self.poll_backend_timestamps();
             self.events();
             let mut after_output = Vec::with_capacity(BUDGET);
             for _ in 0..self.pending.len().min(BUDGET) {
@@ -2060,10 +2031,10 @@ mod tests {
         let local = Ipv4Addr::new(10, 73, 0, last);
         Owner::with_endpoint(local, (Ipv4Addr::new(10, 73, 0, 1), 24), [last; 32], None).unwrap()
     }
-    fn new(o: &mut Owner, flags: i32) -> u64 {
+    pub(super) fn new(o: &mut Owner, flags: i32) -> u64 {
         o.execute(0, Op::New(flags)).unwrap().value as u64
     }
-    fn pump(a: &mut Owner, b: &mut Owner) {
+    pub(super) fn pump(a: &mut Owner, b: &mut Owner) {
         for _ in 0..32 {
             let mut progress = false;
             for reverse in [false, true] {
@@ -2098,7 +2069,7 @@ mod tests {
             }
         }
     }
-    fn pair() -> (Owner, Owner, u64, u64, u64) {
+    pub(super) fn pair() -> (Owner, Owner, u64, u64, u64) {
         let mut a = owner(2);
         let mut b = owner(3);
         let listen = new(&mut b, SOCK_NONBLOCK);

@@ -1941,6 +1941,22 @@ impl Endpoint {
         Ok(())
     }
 
+    // Cancel only pending Transmit phases matching this output range and source.
+    // Like report_tx_timestamp, validates the connection generation; preserves
+    // recorded events, Scheduled/ACK phases, and opaque (possibly equal) cookies.
+    // Reservations become Cancelled events in place and are freed only on drain.
+    pub fn cancel_tx_timestamp(
+        &mut self,
+        token: TxTimestampToken,
+        source: TxTimestampSource,
+    ) -> Result<(), EndpointError> {
+        self.slot_mut(token.connection())?
+            .connection
+            .tx_timestamps
+            .cancel_transmit(token.stream_range(), source);
+        Ok(())
+    }
+
     pub fn next_tx_timestamp(
         &mut self,
         id: ConnectionId,
@@ -2973,6 +2989,120 @@ mod recovery_observation_tests {
             )
             .unwrap();
         assert_eq!(a.transport_info(evicted).unwrap().cwnd, 10_000);
+    }
+    #[test]
+    fn targeted_tx_cancel_preserves_other_phases_ranges_events_and_generation() {
+        use crate::{TxStreamRange, TxTimestampOutcome as Outcome, TxTimestampRequest};
+        use TxTimestampSource::{Hardware, Software};
+        use TxTimestampStage::{Acknowledged, Scheduled, Transmit};
+        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
+        let id = endpoint
+            .connect(
+                0,
+                "192.0.2.1:40000".parse().unwrap(),
+                "192.0.2.2:8080".parse().unwrap(),
+            )
+            .unwrap();
+        endpoint.set_tx_timestamp_capacity(id, 12).unwrap();
+        let request = TxTimestampRequest {
+            cookie: 7,
+            scheduled: true,
+            software_transmit: true,
+            hardware_transmit: true,
+            acknowledged: true,
+        };
+        for byte in [b"a", b"b", b"c"] {
+            endpoint
+                .write_with_timestamp(id, byte, false, false, None, request)
+                .unwrap();
+        }
+        // Equal opaque cookies are deliberately not cancellation identities.
+        let range = TxStreamRange { start: 0, end: 2 };
+        let token = TxTimestampToken::new(id, range);
+        endpoint
+            .report_tx_timestamp(token, Software, 123, TxTimestampClock::RealtimeNanoseconds)
+            .unwrap();
+        endpoint.cancel_tx_timestamp(token, Software).unwrap(); // Preserve ready records.
+        endpoint.cancel_tx_timestamp(token, Hardware).unwrap();
+        endpoint.cancel_tx_timestamp(token, Hardware).unwrap(); // Idempotent, no extra events.
+        endpoint
+            .report_tx_timestamp(token, Hardware, 456, TxTimestampClock::RealtimeNanoseconds)
+            .unwrap(); // Late completion ignored.
+        let mut events = Vec::new();
+        while let Some(event) = endpoint.next_tx_timestamp(id).unwrap() {
+            events.push(event);
+        }
+        assert_eq!(events.len(), 4);
+        assert!(events.iter().all(|e| e.stage == Transmit && e.target < 2));
+        for event in events {
+            assert_eq!(
+                event.outcome,
+                if event.source == Software {
+                    Outcome::Recorded {
+                        value: 123,
+                        clock: TxTimestampClock::RealtimeNanoseconds,
+                    }
+                } else {
+                    Outcome::Cancelled
+                }
+            );
+        }
+        let clock = TxTimestampClock::RealtimeNanoseconds;
+        let all = TxStreamRange { start: 0, end: 3 };
+        for stage in [Scheduled, Acknowledged] {
+            endpoint
+                .slot_mut(id)
+                .unwrap()
+                .connection
+                .tx_timestamps
+                .observe(all, stage, Software, 789, clock);
+        }
+        for _ in 0..6 {
+            let event = endpoint.next_tx_timestamp(id).unwrap().unwrap();
+            assert!(matches!(event.stage, Scheduled | Acknowledged));
+            assert_eq!(event.outcome, Outcome::Recorded { value: 789, clock });
+        }
+        let last = TxTimestampToken::new(id, TxStreamRange { start: 2, end: 3 });
+        for source in [Software, Hardware] {
+            endpoint
+                .report_tx_timestamp(last, source, 999, clock)
+                .unwrap();
+        }
+        for _ in 0..2 {
+            let event = endpoint.next_tx_timestamp(id).unwrap().unwrap();
+            assert_eq!(event.target, 2);
+            assert_eq!(event.outcome, Outcome::Recorded { value: 999, clock });
+        }
+        assert_eq!(endpoint.next_tx_timestamp(id).unwrap(), None);
+        endpoint.abort(id).unwrap();
+        endpoint.release(id).unwrap();
+        assert_eq!(
+            endpoint.cancel_tx_timestamp(token, Hardware),
+            Err(EndpointError::InvalidHandle)
+        );
+        endpoint.poll_transmit(1, &mut [0; 128], 16).unwrap();
+        endpoint.on_timeout(240_000_001, 16).unwrap();
+        endpoint
+            .poll_transmit(240_000_001, &mut [0; 128], 16)
+            .unwrap();
+        let replacement = endpoint
+            .connect(
+                240_000_001,
+                "192.0.2.1:40000".parse().unwrap(),
+                "192.0.2.2:8080".parse().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(replacement.slot, id.slot);
+        assert_ne!(replacement.generation, id.generation);
+        endpoint.set_tx_timestamp_capacity(replacement, 4).unwrap();
+        endpoint
+            .write_with_timestamp(replacement, b"a", false, false, None, request)
+            .unwrap();
+        assert_eq!(
+            endpoint.cancel_tx_timestamp(token, Hardware),
+            Err(EndpointError::InvalidHandle)
+        );
+        assert_eq!(endpoint.next_tx_timestamp(replacement).unwrap(), None);
     }
     #[test]
     fn tx_timestamp_capacity_peak_budget_allocation_failure_and_buffer_resize() {
