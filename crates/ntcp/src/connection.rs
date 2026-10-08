@@ -163,10 +163,9 @@ pub struct ConnectionConfig {
     pub rto_min_us: u64,
     pub retransmit_beyond_window: bool,
     pub delayed_ack_us: u64,
-    // Coalesce standalone read-triggered window updates up to two effective
-    // send MSS (bounded by half the wire-representable receive capacity).
-    // Ordinary ACKs still offer one-MSS SWS credit; zero-window reopening
-    // uses that same lower threshold.
+    // Default Linux-style standalone read updates: double the remaining
+    // receive window. Ordinary ACKs and zero/sub-scale reopening retain
+    // receiver SWS selection. False opts into eager one-MSS read updates.
     // Boolean policy has no invalid values; existing capacity/MSS validation applies.
     pub coalesce_read_window_updates: bool,
     // Per-connection fixed-window challenge budget, in microseconds.
@@ -252,7 +251,7 @@ impl Default for ConnectionConfig {
             rto_min_us: 1_000_000,
             retransmit_beyond_window: false,
             delayed_ack_us: 200_000,
-            coalesce_read_window_updates: false,
+            coalesce_read_window_updates: true,
             challenge_ack_limit: 100,
             challenge_ack_interval_us: 1_000_000,
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
@@ -4742,24 +4741,16 @@ impl Connection {
         if !self.config.coalesce_read_window_updates || self.receive_window() < (1u32 << shift) {
             return self.window_threshold();
         }
-        // RFC9293 3.8.6.2.2 / RFC1122 4.2.3.3 prescribe receiver SWS
-        // avoidance, but the one-MSS formula is suggested, not mandatory.
-        // This only delays unsolicited read updates; it neither delays data
-        // ACKs nor changes their advertised window or prior acceptance edge.
-        // Linux 22430ae5d90ab288b0ee2ad99ae941f4a666b694 and current tcp.c,
-        // __tcp_cleanup_rbuf, similarly separate ACK scheduling from window
-        // selection (new_window >= 2 * rcv_window_now). Our two-MSS bound
-        // is NOT that doubling algorithm or tcp_rcv_space_adjust autotuning.
-        // Match advertised_window/read credit's negotiated wire cap: without
-        // WS, even a large backing buffer can offer at most 65535 bytes.
-        let capacity = self
-            .config
-            .receive_capacity
-            .min((u32::from(u16::MAX) << shift) as usize);
-        (capacity / 2).max(1).min(self.mss.saturating_mul(2)) as u32
+        // Linux v6.12 __tcp_cleanup_rbuf: new_window >= 2 * rcv_window_now.
+        // read() compares encodable new credit with the remaining window,
+        // equivalently doubling without multiplication/overflow. Selection
+        // still enforces RFC9293 3.8.6.2.2 / RFC1122 4.2.3.3 receiver SWS;
+        // this only gates unsolicited read updates, not data/delayed ACKs.
+        self.receive_window().max(1)
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.2.2
+    //= reason=Window selection enforces receiver SWS independently of ACK scheduling; standalone read updates default to remaining-window doubling, with SWS-qualified zero/sub-scale reopening.
     //# A TCP implementation MUST include a SWS avoidance algorithm in the receiver
     //# (MUST-39).
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
@@ -18897,6 +18888,8 @@ mod tests {
         for mss in [1000, 1460] {
             let cfg = ConnectionConfig {
                 delayed_ack_us: 0,
+                // Exercise the eager opt-out's encodable one-MSS boundary.
+                coalesce_read_window_updates: false,
                 ..config(8 * 1024 * 1024, mss)
             };
             let (_, mut b) = pair(cfg, u32::MAX - 2048);
@@ -18917,8 +18910,7 @@ mod tests {
                 assert_eq!(b.transmit(42, &mut [0; 64]), Ok(None));
                 assert_eq!(b.read(&mut [0; 76]), Ok(76));
             }
-            // MSS=1000 intentionally still sends the useful 1024-byte update;
-            // Linux's shutdown-wr-close script expects silence here.
+            // The eager opt-out sends the first encodable one-MSS update.
             assert!(b.ack_pending);
             let bytes = packet(&mut b, 43);
             let segment = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
@@ -18934,7 +18926,7 @@ mod tests {
 
     #[test]
     fn coalesced_read_credit_is_bounded_and_commits_only_on_output() {
-        assert!(!ConnectionConfig::default().coalesce_read_window_updates);
+        assert!(ConnectionConfig::default().coalesce_read_window_updates);
         for (capacity, mss) in [
             (64, 8),
             (65536, 1460),
@@ -18952,16 +18944,25 @@ mod tests {
                 packet(&mut b, 40);
                 let ack = b.snd_una;
                 let count = usize::from(mss);
-                let next = b.receive.next();
-                inject(&mut b, 41, next, ack, ACK, 20000, &vec![1; 2 * count]);
-                packet(&mut b, 41);
+                let mut remaining = capacity * 3 / 4;
+                while remaining != 0 {
+                    let received = remaining.min(32768);
+                    let next = b.receive.next();
+                    inject(&mut b, 41, next, ack, ACK, 20000, &vec![1; received]);
+                    packet(&mut b, 41);
+                    remaining -= received;
+                }
                 let promised = b.advertised_edge;
-                assert_eq!(b.read_window_threshold(), 2 * u32::from(mss));
-                assert_eq!(b.read(&mut vec![0; count]), Ok(count));
+                let old = b.receive_window();
+                assert_eq!(old as usize, capacity / 4);
+                let unit = 1usize << b.local_scale;
+                let below = old as usize - unit;
+                assert!(below >= count);
+                assert_eq!(b.read(&mut vec![0; below]), Ok(below));
                 assert!(!b.ack_pending);
                 assert_eq!(b.transmit(42, &mut [0; 64]), Ok(None));
                 assert_eq!(b.advertised_edge, promised);
-                assert_eq!(b.read(&mut vec![0; count]), Ok(count));
+                assert_eq!(b.read(&mut vec![0; unit]), Ok(unit));
                 assert!(b.ack_pending);
                 assert_eq!(b.transmit(43, &mut [0; 19]), Err(Error::OutputTooSmall));
                 assert!(b.ack_pending);
@@ -18970,13 +18971,14 @@ mod tests {
                 let segment = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
                 let edge = Seq(segment.header.acknowledgment)
                     .wrapping_add(u32::from(segment.header.window) << b.local_scale);
-                assert!(edge.distance_from(promised) >= 2 * u32::from(mss));
+                assert_eq!(u32::from(segment.header.window) << b.local_scale, 2 * old);
+                assert_eq!(edge.distance_from(promised), old);
                 assert_eq!(b.advertised_edge, edge);
                 assert!(at_or_after(b.receive.right_edge(), edge));
                 assert_eq!(b.transmit(45, &mut [0; 64]), Ok(None));
 
                 // Continued incoming traffic carries one-MSS read credit on
-                // its ordinary ACK, without waiting for two-MSS read credit.
+                // its ordinary ACK, without waiting for window doubling.
                 let next = b.receive.next();
                 inject(&mut b, 46, next, ack, ACK, 20000, &vec![1; count]);
                 packet(&mut b, 46);
@@ -18991,6 +18993,62 @@ mod tests {
                 assert!(at_or_after(b.receive.right_edge(), b.advertised_edge));
                 assert_eq!(b.read(&mut vec![0; count]), Ok(count));
             }
+        }
+    }
+
+    #[test]
+    fn coalesced_reads_preserve_ack_triggers_and_suppress_eof_updates() {
+        for iss in [100, u32::MAX - 32] {
+            for trigger in [0, 1, 2, 3] {
+                let (_, mut b) = pair(config(64, 8), iss);
+                let next = b.receive.next();
+                let ack = b.snd_una;
+                inject(&mut b, 40, next, ack, ACK, 20000, &[1; 8]);
+                let deadline = b.ack_deadline.unwrap();
+                if trigger == 1 {
+                    b.immediate_ack();
+                } else if trigger == 2 {
+                    b.write(b"reply").unwrap();
+                } else if trigger == 3 {
+                    let next = b.receive.next();
+                    inject(&mut b, 41, next, ack, ACK | FIN, 20000, b"");
+                    assert!(b.receive.eof());
+                }
+                let pending = b.ack_pending;
+                let scheduled = b.ack_deadline;
+                assert_eq!(b.read(&mut [0; 8]), Ok(8));
+                assert_eq!(b.ack_pending, pending);
+                assert_eq!(b.ack_deadline, scheduled);
+                let now = if trigger == 0 {
+                    assert_eq!(b.transmit(42, &mut [0; 64]), Ok(None));
+                    b.timeout(deadline).unwrap();
+                    deadline
+                } else {
+                    42
+                };
+                let bytes = packet(&mut b, now);
+                let segment = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+                assert_eq!(segment.header.flags & ACK, ACK);
+                assert_eq!(segment.header.acknowledgment, b.receive.next().0);
+                assert_eq!(segment.header.window, if trigger == 3 { 0 } else { 64 });
+                assert_eq!(
+                    segment.payload,
+                    if trigger == 2 { &b"reply"[..] } else { b"" }
+                );
+                assert_eq!(b.transmit(now + 1, &mut [0; 64]), Ok(None));
+                if trigger == 3 {
+                    assert_eq!(b.read(&mut [0; 8]), Ok(0));
+                    assert_eq!(b.transmit(now + 2, &mut [0; 64]), Ok(None));
+                }
+            }
+            // A FIN ACK already sent must not be recreated by draining text.
+            let (_, mut b) = pair(config(64, 8), iss);
+            let next = b.receive.next();
+            let ack = b.snd_una;
+            inject(&mut b, 40, next, ack, ACK | FIN, 20000, &[1; 48]);
+            packet(&mut b, 40);
+            assert_eq!(b.read(&mut [0; 48]), Ok(48));
+            assert_eq!(b.transmit(41, &mut [0; 64]), Ok(None));
         }
     }
 
@@ -19063,7 +19121,7 @@ mod tests {
                 assert!(b.ack_pending);
                 assert_eq!(
                     b.read_window_threshold(),
-                    if coalesce { 32767 } else { 40000 }
+                    if coalesce { 25535 } else { 40000 }
                 );
                 assert_eq!(b.advertised_edge, promised);
                 assert_eq!(b.transmit(40, &mut [0; 19]), Err(Error::OutputTooSmall));
@@ -19127,7 +19185,7 @@ mod tests {
             };
             let (_, mut b) = pair(cfg, u32::MAX);
             let threshold = (capacity / 2).max(1);
-            assert_eq!(b.read_window_threshold(), threshold as u32);
+            assert_eq!(b.read_window_threshold(), capacity as u32);
             let next = b.receive.next();
             let ack = b.snd_una;
             inject(&mut b, 40, next, ack, ACK, 20000, &vec![1; capacity]);
@@ -19148,17 +19206,17 @@ mod tests {
                 Err(Error::InvalidArgument)
             ));
         }
-        // Maximum legal MSS doubles in usize, not overflowing u16; window
-        // scaling arithmetic remains u32 and < 2^31 under validated bounds.
+        // Credit comparison avoids multiplying even the largest retained
+        // window. Negotiated scaling only affects the reopening exception.
         let (_, mut b) = pair(config(64, 8), 100);
         b.config.coalesce_read_window_updates = true;
         b.config.receive_capacity = 65535usize << 14;
         b.local_scale = 14;
-        b.advertised_edge = b.receive.next().wrapping_add(1 << 14);
+        b.advertised_edge = b.receive.next().wrapping_add(65535 << 14);
         b.mss = 65495;
-        assert_eq!(b.read_window_threshold(), 130990);
+        assert_eq!(b.read_window_threshold(), 65535 << 14);
         b.scaling = false;
-        assert_eq!(b.read_window_threshold(), 32767);
+        assert_eq!(b.read_window_threshold(), 65535 << 14);
     }
 
     #[test]
