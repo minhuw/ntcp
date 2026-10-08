@@ -19,7 +19,7 @@ PIN = json.loads((HERE / 'upstream.json').read_text())
 
 TCP_INFO_FIELDS = {'tcpi_ca_state', 'tcpi_unacked', 'tcpi_sacked',
                    'tcpi_lost', 'tcpi_retrans', 'tcpi_reordering',
-                   'tcpi_snd_cwnd', 'tcpi_snd_ssthresh'}
+                   'tcpi_snd_cwnd', 'tcpi_snd_ssthresh', 'tcpi_rtt'}
 
 
 def preflight(text, embedded_tcp_info=False):
@@ -83,7 +83,8 @@ def adapt_source(directory, relative, manifest, so_flags):
     if (entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
             or not (command in (b'`../common/defaults.sh`\n',
                                 b'`../common/defaults.sh\n`\n',
-                                b'`../../common/defaults.sh`\n') or ecn_mapped)
+                                b'`../../common/defaults.sh`\n',
+                                b'`../../common/defaults.sh\n`\n') or ecn_mapped)
             or replacement != b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n'
             or entry['expected_command_count'] != 1
             or source.count(command) != 1
@@ -113,9 +114,8 @@ def invoke(argv, cwd, timeout):
             expired = True
             os.killpg(proc.pid, signal.SIGKILL)
             code = proc.wait()
-        output.seek(0, os.SEEK_END)
-        size = output.tell()
-        output.seek(max(0, size - 16384))
+        # Preserve complete diagnostic output; report consumers retain raw logs.
+        output.seek(0)
         log = output.read().decode(errors='replace')
         return code, expired, log
 
@@ -282,7 +282,8 @@ def main():
                    'suite': args.suite, 'adapted': False,
                    'sha256': hashlib.sha256(source).hexdigest(),
                    'effective_flags': {'adapter': args.so_flags, 'packetdrill': flags},
-                   'syntax_returncode': None, 'behavior_executed': False}
+                   'syntax_returncode': None, 'behavior_executed': False,
+                   'stage': 'adaptation' if manifest is not None else 'syntax'}
             so_flags = args.so_flags
             if manifest is not None and so_flags is None:
                 so_flags = manifest['scripts'][row['script']]['adapter_flags']
@@ -307,14 +308,17 @@ def main():
                 except (ValueError, OSError) as error:
                     row.update(status='adaptation_rejected', reasons=[str(error)])
             if 'status' not in row:
+                row['stage'] = 'syntax'
                 code, expired, log = invoke(
                     [str(runner), '--dry_run', *flags, str(execution_script)],
                     execution_script.parent, args.timeout)
                 row['syntax_returncode'] = code
+                row['syntax_log'] = log
                 if code != 0 or expired:
                     row.update(status='syntax_error' if code is not None and not expired
                                else 'environment_error', log=log)
                 else:
+                    row['stage'] = 'preflight'
                     embedded_tcp_info = (row['adapted'] and
                                          row['adaptation'].get('embedded_tcp_info') is True)
                     reasons = preflight(text, embedded_tcp_info)
@@ -336,8 +340,10 @@ def main():
                             check_plugin_hash(plugin, plugin_sha256)
                         except (ValueError, OSError) as error:
                             parser.error(str(error))
-                        row.update(status=outcome(code, expired, log), returncode=code,
-                                   behavior_executed=True, log=log)
+                        status = outcome(code, expired, log)
+                        row.update(status=status, returncode=code,
+                                   stage='environment' if status == 'environment_error' else 'behavior',
+                                   behavior_executed=status != 'environment_error', log=log)
             results.append(row)
             print(f'{row["status"]}: {row["script"]} ({variant}, {args.suite})', flush=True)
     try:

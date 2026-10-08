@@ -2410,6 +2410,1194 @@
           "Only the exact defaults invocation is replaced. Original packets, zero-length iovecs, socket options, assertions and timing are preserved."
         ]
       }
+    },
+    "eor/no-coalesce-large.pkt": {
+      "source_sha256": "09eab536892018d7f1aba2e66360719feeedc17ac5e558c9f1083c4e21ba06be",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh\n`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "eor/no-coalesce-large.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      }
+    },
+    "eor/no-coalesce-retrans.pkt": {
+      "source_sha256": "de2216ef82ab7e0e30879cad0b797d6a2874a61e9cb9fe43f44ddf41dacc87b0",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh\n`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "eor/no-coalesce-retrans.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      }
+    },
+    "eor/no-coalesce-small.pkt": {
+      "source_sha256": "f3e275f73bbf9fd441310f6e42933d5ad84af5eb41fff161e51b0d0305323688",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh\n`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "eor/no-coalesce-small.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      }
+    },
+    "eor/no-coalesce-subsequent.pkt": {
+      "source_sha256": "b6f0e0ba505315db102966eeb2ac3982dd55604837dda09daed26c3cae89b750",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh\n`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "eor/no-coalesce-subsequent.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      }
+    },
+    "epoll/epoll_in_edge.pkt": {
+      "source_sha256": "f37d39748eef723555c98ac5cccb6c63439fc8fedd2d2c4864ee1c6002477e73",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "epoll/epoll_in_edge.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      }
+    },
+    "epoll/epoll_out_edge.pkt": {
+      "source_sha256": "9b19fb287c49efbeecf90f5a2a75eedbb1bc3ce3b91772b0c7c4b684bdbdcd24",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_wmem=\"4096 50000 4194304\"\n`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "epoll/epoll_out_edge.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
+          "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      },
+      "blocked_reasons": [
+        "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_wmem=\"4096 50000 4194304\"\n`",
+          "sha256": "cb94e4b9d3983743fb43d323333d3aede977cbd840eb9764563e5802ede26b12",
+          "semantic_mapping": "Unavailable: Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+        }
+      ],
+      "additional_setup_files": [
+        {
+          "path": "common/set_sysctls.py",
+          "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
+        }
+      ]
+    },
+    "epoll/epoll_out_edge_default_notsent_lowat.pkt": {
+      "source_sha256": "dfef6226aa011c2ddc8676d8a448ff3ff6f7668e06edde4f6469011ff0fca15b",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_wmem=\"4096 50000 4194304\"\n`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "epoll/epoll_out_edge_default_notsent_lowat.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
+          "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      },
+      "blocked_reasons": [
+        "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_wmem=\"4096 50000 4194304\"\n`",
+          "sha256": "cb94e4b9d3983743fb43d323333d3aede977cbd840eb9764563e5802ede26b12",
+          "semantic_mapping": "Unavailable: Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+        }
+      ],
+      "additional_setup_files": [
+        {
+          "path": "common/set_sysctls.py",
+          "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
+        }
+      ]
+    },
+    "epoll/epoll_out_edge_notsent_lowat.pkt": {
+      "source_sha256": "1c92e45e15289838e41e562c41c214071b1c9a196e4e2df9015893578d776ba2",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_wmem=\"4096 50000 4194304\"\n`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "epoll/epoll_out_edge_notsent_lowat.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
+          "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      },
+      "blocked_reasons": [
+        "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_wmem=\"4096 50000 4194304\"\n`",
+          "sha256": "cb94e4b9d3983743fb43d323333d3aede977cbd840eb9764563e5802ede26b12",
+          "semantic_mapping": "Unavailable: Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+        }
+      ],
+      "additional_setup_files": [
+        {
+          "path": "common/set_sysctls.py",
+          "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
+        }
+      ]
+    },
+    "inq/client.pkt": {
+      "source_sha256": "9c4310459add0ae80f98542bd5fabb7d8e3f8e882b545d3dd68aef80e46976d9",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh\n`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "inq/client.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      }
+    },
+    "inq/server.pkt": {
+      "source_sha256": "ecb0cf518c8aade9e6f77efd7ed1af0b310054a2993f8323d7ec2777b3e44138",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh\n`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "inq/server.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      }
+    },
+    "nagle/https_client.pkt": {
+      "source_sha256": "df02e8441d76886b7369da1c875e3565e51c8461d9078c31360ba27a09efe246",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 2,
+      "command_line": "`../common/defaults.sh\nethtool -K tun0 tso off gso off\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "nagle/https_client.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
+          "Linux ethtool TSO/GSO disablement and tcp_timestamps=0 setup/restore have no audited combined adapter mapping; no shell command is executed."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      },
+      "blocked_reasons": [
+        "Linux ethtool TSO/GSO disablement and tcp_timestamps=0 setup/restore have no audited combined adapter mapping; no shell command is executed."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../common/defaults.sh\nethtool -K tun0 tso off gso off\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`",
+          "sha256": "a91138417319b7b34fa75ef74630c768a892a64c69d393ec1eb0cba79c2b1845",
+          "semantic_mapping": "Unavailable: Linux ethtool TSO/GSO disablement and tcp_timestamps=0 setup/restore have no audited combined adapter mapping; no shell command is executed."
+        },
+        {
+          "command": "`/tmp/sysctl_restore_${PPID}.sh`",
+          "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
+          "semantic_mapping": "Unavailable: Linux ethtool TSO/GSO disablement and tcp_timestamps=0 setup/restore have no audited combined adapter mapping; no shell command is executed."
+        }
+      ],
+      "additional_setup_files": [
+        {
+          "path": "common/set_sysctls.py",
+          "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
+        }
+      ]
+    },
+    "nagle/sendmsg_msg_more.pkt": {
+      "source_sha256": "41e0c81d6c501a17978eb7ad974850e52bc15016195d2dfd1a5b7dc299317ec2",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "nagle/sendmsg_msg_more.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      }
+    },
+    "nagle/sockopt_cork_nodelay.pkt": {
+      "source_sha256": "31f228dfcf4ddd8118e854fe8e5109108ae6f3159aa666fe1c0aa60f3417ebd6",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "nagle/sockopt_cork_nodelay.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      }
+    },
+    "notsent_lowat/notsent-lowat-default.pkt": {
+      "source_sha256": "b96dc3e7a6bc4d4f7369895120c77503cb94c18f18bccc4e9e8b5ee15903ac87",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 2,
+      "command_line": "`../../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_wmem=\"4096 50000 4194304\" \\\n                         /proc/sys/net/ipv4/tcp_min_tso_segs=10\n`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "notsent_lowat/notsent-lowat-default.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
+          "Linux tcp_wmem=\"4096 50000 4194304\", tcp_min_tso_segs=10 and skb write-wakeup accounting have no audited adapter-profile equivalent; setup and restore remain unexecuted. TCP_NOTSENT_LOWAT is also unavailable."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      },
+      "blocked_reasons": [
+        "Linux tcp_wmem=\"4096 50000 4194304\", tcp_min_tso_segs=10 and skb write-wakeup accounting have no audited adapter-profile equivalent; setup and restore remain unexecuted. TCP_NOTSENT_LOWAT is also unavailable."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_wmem=\"4096 50000 4194304\" \\\n                         /proc/sys/net/ipv4/tcp_min_tso_segs=10\n`",
+          "sha256": "37cb637ee255a451c2bf8b69c3b49d461ab9471b833848f7e299fad84d0bc194",
+          "semantic_mapping": "Unavailable: Linux tcp_wmem=\"4096 50000 4194304\", tcp_min_tso_segs=10 and skb write-wakeup accounting have no audited adapter-profile equivalent; setup and restore remain unexecuted. TCP_NOTSENT_LOWAT is also unavailable."
+        },
+        {
+          "command": "`/tmp/sysctl_restore_${PPID}.sh`",
+          "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
+          "semantic_mapping": "Unavailable: Linux tcp_wmem=\"4096 50000 4194304\", tcp_min_tso_segs=10 and skb write-wakeup accounting have no audited adapter-profile equivalent; setup and restore remain unexecuted. TCP_NOTSENT_LOWAT is also unavailable."
+        }
+      ],
+      "additional_setup_files": [
+        {
+          "path": "common/set_sysctls.py",
+          "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
+        }
+      ]
+    },
+    "notsent_lowat/notsent-lowat-setsockopt.pkt": {
+      "source_sha256": "44d8b348c0044c61b2d8d1cac518f912664123257a1996779243c53e3c0fe255",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "notsent_lowat/notsent-lowat-setsockopt.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      }
+    },
+    "notsent_lowat/notsent-lowat-sysctl.pkt": {
+      "source_sha256": "1eccbbf8187a17b6852bb588a5d9136a4c16faea9c4482eb4c58ab336154bc6d",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh\nsysctl -q net.ipv4.tcp_notsent_lowat=4000`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "notsent_lowat/notsent-lowat-sysctl.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
+          "Linux global net.ipv4.tcp_notsent_lowat=4000 has no adapter configuration equivalent; it cannot be replaced by a per-socket option because the script asserts the option remains zero. No shell command is executed."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      },
+      "blocked_reasons": [
+        "Linux global net.ipv4.tcp_notsent_lowat=4000 has no adapter configuration equivalent; it cannot be replaced by a per-socket option because the script asserts the option remains zero. No shell command is executed."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../../common/defaults.sh\nsysctl -q net.ipv4.tcp_notsent_lowat=4000`",
+          "sha256": "865f4fd5fad828a002c79d345198b72a15addbb39451c6df3978852de451e0fd",
+          "semantic_mapping": "Unavailable: Linux global net.ipv4.tcp_notsent_lowat=4000 has no adapter configuration equivalent; it cannot be replaced by a per-socket option because the script asserts the option remains zero. No shell command is executed."
+        }
+      ]
+    },
+    "sendfile/sendfile-simple.pkt": {
+      "source_sha256": "0e6286b66e1d1ba427977f2c7c47c891f26b178ab8bc467379af27d0466adfd7",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh\n/bin/rm -f /tmp/testfile\n/bin/dd bs=1 count=5 if=/dev/zero of=/tmp/testfile status=none\n`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "sendfile/sendfile-simple.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
+          "Stock syscall_sendfile calls libc sendfile directly, the packetdrill callback ABI has no sendfile slot, and ntcp-socket does not interpose sendfile. Native I/O on the socket token is not ntcp behavior. /tmp/testfile rm/dd setup has no audited isolated filesystem mapping and is not executed."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      },
+      "blocked_reasons": [
+        "Stock syscall_sendfile calls libc sendfile directly, the packetdrill callback ABI has no sendfile slot, and ntcp-socket does not interpose sendfile. Native I/O on the socket token is not ntcp behavior. /tmp/testfile rm/dd setup has no audited isolated filesystem mapping and is not executed."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../../common/defaults.sh\n/bin/rm -f /tmp/testfile\n/bin/dd bs=1 count=5 if=/dev/zero of=/tmp/testfile status=none\n`",
+          "sha256": "e53530dd15bf49e9f50bf090fbc701b9654ac8a0e321da5a72cdecc1d83d23ec",
+          "semantic_mapping": "Unavailable: Stock syscall_sendfile calls libc sendfile directly, the packetdrill callback ABI has no sendfile slot, and ntcp-socket does not interpose sendfile. Native I/O on the socket token is not ntcp behavior. /tmp/testfile rm/dd setup has no audited isolated filesystem mapping and is not executed."
+        }
+      ]
+    },
+    "splice/tcp_splice_loop_test.pkt": {
+      "source_sha256": "4459f9f3ef31812da8f660397d911cf0efeec53cfb114dae54112cd176b18019",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "splice/tcp_splice_loop_test.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      }
+    },
+    "tcp_info/tcp-info-last_data_recv.pkt": {
+      "source_sha256": "8fe43d56afc4c2dbc49efd88747987a4c7b9c85d7a946947a079908a073ea130",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "tcp_info/tcp-info-last_data_recv.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
+          "Unsupported TCP_INFO metrics: tcpi_last_data_recv. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      },
+      "blocked_reasons": [
+        "Unsupported TCP_INFO metrics: tcpi_last_data_recv. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../../common/defaults.sh`",
+          "sha256": "db987cbec339a8140034dc0a76556fcd8346c3b83c75c17b92ce643980e7c17b",
+          "semantic_mapping": "Unavailable: Unsupported TCP_INFO metrics: tcpi_last_data_recv. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
+        }
+      ]
+    },
+    "tcp_info/tcp-info-rwnd-limited.pkt": {
+      "source_sha256": "21a528da9d97b69da4e4c33b2614c5ecb39f4c1c7de9660d58bbaf9770dd5531",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "tcp_info/tcp-info-rwnd-limited.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
+          "Unsupported TCP_INFO metrics: tcpi_busy_time, tcpi_rwnd_limited. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      },
+      "blocked_reasons": [
+        "Unsupported TCP_INFO metrics: tcpi_busy_time, tcpi_rwnd_limited. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../../common/defaults.sh`",
+          "sha256": "db987cbec339a8140034dc0a76556fcd8346c3b83c75c17b92ce643980e7c17b",
+          "semantic_mapping": "Unavailable: Unsupported TCP_INFO metrics: tcpi_busy_time, tcpi_rwnd_limited. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
+        }
+      ]
+    },
+    "tcp_info/tcp-info-sndbuf-limited.pkt": {
+      "source_sha256": "b210842cadfbc6d0ce1fee19afb3790dc9b9fe8c1fe02673288a646e3239e644",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "tcp_info/tcp-info-sndbuf-limited.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
+          "Unsupported TCP_INFO metrics: tcpi_busy_time, tcpi_rwnd_limited, tcpi_sndbuf_limited. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      },
+      "blocked_reasons": [
+        "Unsupported TCP_INFO metrics: tcpi_busy_time, tcpi_rwnd_limited, tcpi_sndbuf_limited. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
+      ],
+      "audited_shell_commands": [
+        {
+          "command": "`../../common/defaults.sh`",
+          "sha256": "db987cbec339a8140034dc0a76556fcd8346c3b83c75c17b92ce643980e7c17b",
+          "semantic_mapping": "Unavailable: Unsupported TCP_INFO metrics: tcpi_busy_time, tcpi_rwnd_limited, tcpi_sndbuf_limited. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
+        }
+      ]
+    },
+    "timestamping/client-only-last-byte.pkt": {
+      "source_sha256": "286067559d5f054d7240de8b904305e5b498368eaa528e4e1049d2eec341bc4f",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh\n`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "timestamping/client-only-last-byte.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
+          "tcpi_rtt is populated at Linux TCP_INFO offset 68 by transport::transport_option; original RTT and timestamping assertions remain intact. SO_TIMESTAMPING is not implemented; diagnostic execution should stop at that option, not interpret reserved TCP_INFO metrics."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      },
+      "embedded_tcp_info": true
+    },
+    "timestamping/partial.pkt": {
+      "source_sha256": "5a119eceac60170a8d3cc160c06ee272da119d63286ba1e1a9a87b992490038c",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh\n`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "timestamping/partial.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
+          "tcpi_rtt is populated at Linux TCP_INFO offset 68 by transport::transport_option; original RTT and timestamping assertions remain intact. SO_TIMESTAMPING is not implemented; diagnostic execution should stop at that option, not interpret reserved TCP_INFO metrics."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      },
+      "embedded_tcp_info": true
+    },
+    "timestamping/server.pkt": {
+      "source_sha256": "34bc2b1921b69b525ee1c0f67984c8e76c0574d6cd987f17b22fdfb719b9e6d9",
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "expected_command_count": 1,
+      "command_line": "`../../common/defaults.sh\n`\n",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "timestamping/server.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "reasons": [
+          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
+          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
+          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
+          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
+          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
+          "tcpi_rtt is populated at Linux TCP_INFO offset 68 by transport::transport_option; original RTT and timestamping assertions remain intact. SO_TIMESTAMPING is not implemented; diagnostic execution should stop at that option, not interpret reserved TCP_INFO metrics."
+        ],
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": true,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 33554432,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000
+        },
+        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+      },
+      "embedded_tcp_info": true
     }
   }
 }

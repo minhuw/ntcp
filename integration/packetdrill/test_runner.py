@@ -91,6 +91,8 @@ class RunnerChecks(unittest.TestCase):
         self.assertEqual(preflight(text, embedded_tcp_info=True), [])
         self.assertEqual(preflight('0 %{ assert tcpi_snd_cwnd == 7\n'
                                    'assert tcpi_snd_ssthresh == 7 }%', True), [])
+        self.assertEqual(preflight('0 %{ assert tcpi_rtt > 0 }%', True), [])
+        self.assertTrue(preflight('0 %{ assert tcpi_last_data_recv == 0 }%', True))
         self.assertTrue(preflight('0 %{ assert tcpi_pacing_rate == 0 }%', True))
         self.assertTrue(preflight('`sysctl something`\n' + text, True))
 
@@ -120,6 +122,12 @@ class RunnerChecks(unittest.TestCase):
         self.assertEqual(outcome(None, False, 'not found'), 'environment_error')
         self.assertEqual(outcome(1, False, 'unshare: unshare failed'), 'environment_error')
         self.assertEqual(outcome(-9, True, ''), 'timeout')
+
+    def test_invoke_preserves_full_raw_output(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            code, expired, log = invoke(
+                [sys.executable, '-c', 'print("a" * 20000)'], cwd, 5)
+            self.assertEqual((code, expired, log), (0, False, 'a' * 20000 + '\n'))
 
     def test_process_exit_timeout_and_missing_executable(self):
         with tempfile.TemporaryDirectory() as cwd:
@@ -343,7 +351,10 @@ class SelectionChecks(unittest.TestCase):
                         self.assertEqual(len(data['excluded_cases']), data['excluded_total'])
                         self.assertEqual(data['selection'], {'variants': [variant],
                                                             'scripts': ['basic.pkt']})
-                        self.assertTrue(data['results'][0]['behavior_executed'])
+                        self.assertEqual(data['results'][0]['behavior_executed'],
+                                         status != 'environment_error')
+                        self.assertEqual(data['results'][0]['stage'],
+                                         'environment' if status == 'environment_error' else 'behavior')
                         self.assertEqual(execute.call_args_list[0].args[0],
                                          [str(runner), '--dry_run',
                                           *data['results'][0]['effective_flags']['packetdrill'],
@@ -442,7 +453,8 @@ class AdaptationChecks(unittest.TestCase):
 
     def test_alternate_defaults_spellings_preserve_every_other_byte(self):
         entry = self.manifest['scripts'][self.name]
-        for command in ('`../common/defaults.sh\n`\n', '`../../common/defaults.sh`\n'):
+        for command in ('`../common/defaults.sh\n`\n', '`../../common/defaults.sh`\n',
+                        '`../../common/defaults.sh\n`\n'):
             original = self.source.replace(entry['command_line'].encode(), command.encode())
             (self.directory / self.name).write_bytes(original)
             entry['command_line'] = command
@@ -864,6 +876,31 @@ class PublishedSelectionChecks(unittest.TestCase):
                 if name in DEFAULTS_ONLY_CUBIC and b'SO_SNDBUF' in source:
                     self.assertTrue(any('real send-capacity/quota updates' in r
                                         and 'ENOBUFS' in r for r in entry['mapping']['reasons']))
+
+    def test_socket43_inventory_hashes_and_assertions(self):
+        counts = {'blocking': 4, 'close': 3, 'shutdown': 6, 'ioctl': 1,
+                  'syscall_bad_arg': 3, 'epoll': 4, 'inq': 2, 'notsent_lowat': 3,
+                  'eor': 4, 'sendfile': 1, 'splice': 1, 'tcp_info': 3,
+                  'timestamping': 3, 'nagle': 3, 'user_timeout': 2}
+        self.assertEqual(sum(counts.values()), 43)
+        for directory, count in counts.items():
+            scripts = sorted((self.directory / directory).glob('*.pkt'))
+            self.assertEqual(len(scripts), count)
+            for script in scripts:
+                name = str(script.relative_to(self.directory))
+                entry = self.manifest['scripts'][name]
+                source = script.read_bytes()
+                generated, audit = adapt_source(self.directory, name, self.manifest,
+                                                entry['adapter_flags'])
+                self.assertEqual(len(re.findall(rb'`[^`]*`', source)),
+                                 entry['expected_command_count'])
+                if entry.get('blocked_reasons'):
+                    self.assertEqual(generated, source)
+                else:
+                    self.assertEqual(generated.replace(entry['replacement_line'].encode(),
+                                                       entry['command_line'].encode(), 1), source)
+                    self.assertIn('generated_sha256', audit)
+                self.assertFalse(entry['mapping']['linux_defaults_reproduced'])
 
     def test_exact_35_selection_blocks_unmapped_setup_without_execution(self):
         with tempfile.TemporaryDirectory() as temporary:
