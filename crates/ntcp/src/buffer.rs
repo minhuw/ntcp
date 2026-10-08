@@ -810,6 +810,18 @@ impl ReceiveBuffer {
         fin: bool,
         push: bool,
     ) -> ReceiveOutcome {
+        self.insert_observed(sequence, payload, fin, push, |_, _| {})
+    }
+
+    // Accepted runs are relative to the unread payload base, excluding duplicates and FIN.
+    pub(crate) fn insert_observed(
+        &mut self,
+        sequence: Seq,
+        payload: &[u8],
+        fin: bool,
+        push: bool,
+        mut accepted: impl FnMut(usize, usize),
+    ) -> ReceiveOutcome {
         let previous_next = self.next();
         let had_holes = self.occupied > self.contiguous_len;
         let mut outcome = ReceiveOutcome {
@@ -828,10 +840,14 @@ impl ReceiveBuffer {
             .fin_sequence
             .map_or(capacity, |end| end.distance_from(self.read_base) as usize);
         let mut new_anchor = None;
+        let mut run = None;
         for (offset, &byte) in payload.iter().enumerate() {
             let position = sequence.wrapping_add(offset as u32);
             let distance = position.distance_from(self.read_base) as usize;
             if distance >= data_limit {
+                if let Some((start, end)) = run.take() {
+                    accepted(start, end);
+                }
                 continue;
             }
             let index = self.index(distance);
@@ -844,7 +860,14 @@ impl ReceiveBuffer {
                 outcome.new_bytes += 1;
                 self.occupied += 1;
                 new_anchor.get_or_insert(position);
+                let entry = run.get_or_insert((distance, distance));
+                entry.1 = distance + 1;
+            } else if let Some((start, end)) = run.take() {
+                accepted(start, end);
             }
+        }
+        if let Some((start, end)) = run {
+            accepted(start, end);
         }
 
         if let Some(anchor) = new_anchor

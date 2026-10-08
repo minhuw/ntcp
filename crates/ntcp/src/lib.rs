@@ -21,6 +21,7 @@ mod hystart;
 mod ipv4_options;
 mod rack;
 mod recovery;
+mod rx_timestamp;
 mod sack;
 mod schedule;
 mod seq;
@@ -44,4 +45,9 @@ pub use wire::{IpMetadata, WireError};
 pub use tx_timestamp::{
     TxStreamRange, TxTimestampClock, TxTimestampEvent, TxTimestampOutcome, TxTimestampRequest,
     TxTimestampSource, TxTimestampStage, TxTimestampToken,
+};
+
+pub use rx_timestamp::{
+    RxPacketTimestamps, RxReadTimestamps, RxTimestamp, RxTimestampStatus, SendProgress,
+    TimestampClock, TimestampSource,
 };

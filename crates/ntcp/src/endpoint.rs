@@ -6,9 +6,9 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::{
-    Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options, SourceRoute, TimestampRequest,
-    TxTimestampClock, TxTimestampEvent, TxTimestampRequest, TxTimestampSource, TxTimestampStage,
-    TxTimestampToken,
+    Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options, RxPacketTimestamps, RxReadTimestamps,
+    RxTimestampStatus, SendProgress, SourceRoute, TimestampRequest, TxTimestampClock,
+    TxTimestampEvent, TxTimestampRequest, TxTimestampSource, TxTimestampStage, TxTimestampToken,
     buffer::ReceiveBuffer,
     connection::{Connection, ConnectionConfig, ConnectionEvents, Error, Instant, State, Tuple},
     schedule::{Deadlines, ReadyQueue},
@@ -1467,6 +1467,27 @@ impl Endpoint {
         options: Ipv4Options,
         bytes: &[u8],
     ) -> Result<InputDisposition, EndpointError> {
+        self.input_with_timestamps(
+            now,
+            ip,
+            traffic_class,
+            options,
+            bytes,
+            RxPacketTimestamps::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn input_with_timestamps(
+        &mut self,
+        now: Instant,
+        ip: IpMetadata,
+        traffic_class: u8,
+        options: Ipv4Options,
+        bytes: &[u8],
+        timestamps: RxPacketTimestamps,
+    ) -> Result<InputDisposition, EndpointError> {
+        timestamps.validate(self.config.connection.timebase)?;
         self.clock(now)?;
         if !options.is_empty()
             && (!self.config.ipv4_options_enabled
@@ -1540,7 +1561,7 @@ impl Endpoint {
             let slot = self.slots[index].as_mut().unwrap();
             slot.received_dscp = Some(traffic_class >> 2);
             slot.connection
-                .input_with_traffic_class(now, traffic_class, &segment)?;
+                .input_with_timestamps(now, traffic_class, &segment, timestamps)?;
             if slot.connection.accepted_metadata {
                 Self::save_ipv4_options(slot, options, route);
             }
@@ -1733,6 +1754,44 @@ impl Endpoint {
             .write_with_options_and_notsent_lowat(bytes, more, end_of_record, lowat)?;
         self.refresh(id.slot);
         Ok(count)
+    }
+
+    pub fn send_progress(&self, id: ConnectionId) -> Result<SendProgress, EndpointError> {
+        Ok(self.slot(id)?.connection.send_progress())
+    }
+
+    pub fn set_rx_timestamp_capacity(
+        &mut self,
+        id: ConnectionId,
+        ranges: usize,
+    ) -> Result<(), EndpointError> {
+        let old = self.slot(id)?.connection.rx_timestamps.storage_bytes();
+        let spare = self
+            .config
+            .max_buffer_bytes
+            .saturating_sub(self.buffer_bytes);
+        self.slot_mut(id)?
+            .connection
+            .rx_timestamps
+            .resize(ranges, spare)?;
+        self.buffer_bytes =
+            self.buffer_bytes - old + self.slot(id)?.connection.rx_timestamps.storage_bytes();
+        Ok(())
+    }
+
+    pub fn rx_timestamp_status(
+        &self,
+        id: ConnectionId,
+    ) -> Result<RxTimestampStatus, EndpointError> {
+        Ok(self.slot(id)?.connection.rx_timestamps.status())
+    }
+
+    pub fn peek_rx_timestamps(
+        &self,
+        id: ConnectionId,
+        count: usize,
+    ) -> Result<Option<RxReadTimestamps>, EndpointError> {
+        Ok(self.slot(id)?.connection.peek_rx_timestamps(count)?)
     }
 
     pub fn set_tx_timestamp_capacity(
@@ -2083,8 +2142,10 @@ impl Endpoint {
             return Err(Error::InvalidState.into());
         }
         let slot = self.slot_mut(id)?;
-        let charge = slot.connection.tx_timestamps.storage_bytes();
+        let charge = slot.connection.tx_timestamps.storage_bytes()
+            + slot.connection.rx_timestamps.storage_bytes();
         slot.connection.tx_timestamps = Default::default();
+        slot.connection.rx_timestamps = Default::default();
         slot.released = true;
         self.buffer_bytes -= charge;
         self.events.remove(id.slot);
@@ -2958,5 +3019,112 @@ mod recovery_observation_tests {
             endpoint.write_with_timestamp(replacement, b"x", false, false, None, request),
             Err(Error::WouldBlock.into())
         );
+    }
+    #[test]
+    fn rx_timestamp_capacity_budget_resize_rollback_and_release() {
+        use crate::{RxTimestamp, TimestampClock};
+        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
+        let id = endpoint
+            .connect(
+                0,
+                "192.0.2.1:40000".parse().unwrap(),
+                "192.0.2.2:8080".parse().unwrap(),
+            )
+            .unwrap();
+        let baseline = endpoint.buffer_bytes();
+        endpoint.config.max_buffer_bytes = baseline;
+        assert_eq!(
+            endpoint.set_rx_timestamp_capacity(id, 1),
+            Err(Error::NoMemory.into())
+        );
+        endpoint.config.max_buffer_bytes = usize::MAX;
+        assert_eq!(
+            crate::allocation_tests::fail_after(0, || endpoint.set_rx_timestamp_capacity(id, 1)),
+            Err(Error::NoMemory.into())
+        );
+        assert_eq!(endpoint.buffer_bytes(), baseline);
+        endpoint.set_rx_timestamp_capacity(id, 1).unwrap();
+        let charge = endpoint.buffer_bytes() - baseline;
+        let timestamps = RxPacketTimestamps {
+            software: Some(RxTimestamp {
+                value: 7,
+                clock: TimestampClock::RealtimeNanoseconds,
+            }),
+            hardware: None,
+        };
+        // Direct storage setup isolates allocation accounting; wire acceptance tested separately.
+        endpoint
+            .slot_mut(id)
+            .unwrap()
+            .connection
+            .rx_timestamps
+            .insert(0, 3, timestamps);
+        endpoint.config.max_buffer_bytes = baseline + 2 * charge;
+        assert_eq!(
+            endpoint.set_rx_timestamp_capacity(id, 2),
+            Err(Error::NoMemory.into())
+        );
+        assert_eq!(endpoint.rx_timestamp_status(id).unwrap().retained_ranges, 1);
+        assert_eq!(
+            endpoint.set_rx_timestamp_capacity(id, 0),
+            Err(Error::WouldBlock.into())
+        );
+        endpoint.config.max_buffer_bytes = baseline + 3 * charge;
+        assert_eq!(
+            crate::allocation_tests::fail_after(0, || endpoint.set_rx_timestamp_capacity(id, 2)),
+            Err(Error::NoMemory.into())
+        );
+        endpoint.set_rx_timestamp_capacity(id, 2).unwrap();
+        assert_eq!(endpoint.buffer_bytes(), baseline + 2 * charge);
+        assert_eq!(
+            endpoint.slot(id).unwrap().connection.rx_timestamps.at(2),
+            timestamps
+        );
+        let (send, receive) = endpoint.buffer_capacities(id).unwrap();
+        let peak = endpoint
+            .slot(id)
+            .unwrap()
+            .connection
+            .resize_peak_charge(send, receive * 2)
+            .unwrap();
+        endpoint.config.max_buffer_bytes = peak - 1;
+        assert_eq!(
+            endpoint.set_buffer_capacities(id, send, receive * 2),
+            Err(EndpointError::LimitReached)
+        );
+        assert_eq!(
+            endpoint.slot(id).unwrap().connection.rx_timestamps.at(2),
+            timestamps
+        );
+        endpoint.config.max_buffer_bytes = peak;
+        endpoint
+            .set_buffer_capacities(id, send, receive * 2)
+            .unwrap();
+        assert_eq!(
+            endpoint.buffer_bytes(),
+            endpoint.slot(id).unwrap().connection.buffer_charge()
+        );
+        endpoint.set_buffer_capacities(id, send, 1).unwrap();
+        assert_eq!(
+            endpoint.slot(id).unwrap().connection.rx_timestamps.at(2),
+            timestamps
+        );
+        endpoint
+            .slot_mut(id)
+            .unwrap()
+            .connection
+            .rx_timestamps
+            .consumed(3);
+        let retained = endpoint.buffer_bytes();
+        endpoint.set_rx_timestamp_capacity(id, 0).unwrap();
+        assert_eq!(endpoint.buffer_bytes(), retained - 2 * charge);
+        endpoint.abort(id).unwrap();
+        endpoint.release(id).unwrap();
+        endpoint.poll_transmit(1, &mut [0; 128], 16).unwrap();
+        endpoint.on_timeout(240_000_001, 16).unwrap();
+        endpoint
+            .poll_transmit(240_000_001, &mut [0; 128], 16)
+            .unwrap();
+        assert_eq!(endpoint.buffer_bytes(), 0);
     }
 }

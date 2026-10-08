@@ -4,13 +4,15 @@ use alloc::vec::Vec;
 use core::{cmp::Ordering, net::SocketAddr};
 
 use crate::{
-    TxStreamRange, TxTimestampClock, TxTimestampRequest, TxTimestampSource, TxTimestampStage,
+    RxPacketTimestamps, RxReadTimestamps, SendProgress, TxStreamRange, TxTimestampClock,
+    TxTimestampRequest, TxTimestampSource, TxTimestampStage,
     buffer::{ReceiveBuffer, SendBuffer},
     rack::Rack,
     recovery::{
         Congestion, CongestionAlgorithm, InitialWindow, Prr, PrrAlgorithm, RecoveryAlgorithm,
         RttEstimator,
     },
+    rx_timestamp::RxTimestamps,
     sack::Scoreboard,
     seq::Seq,
     tx_timestamp::TxTimestamps,
@@ -506,6 +508,8 @@ pub(crate) struct Connection {
     acknowledged: u64,
     pub(crate) tx_timestamps: TxTimestamps,
     pub(crate) last_output_range: Option<TxStreamRange>,
+    pub(crate) rx_timestamps: RxTimestamps,
+    input_timestamps: RxPacketTimestamps,
     received_read: u64,
     received_total: u64,
     snd_up: Option<Seq>,
@@ -758,6 +762,8 @@ impl Connection {
             acknowledged: 0,
             tx_timestamps: TxTimestamps::default(),
             last_output_range: None,
+            rx_timestamps: RxTimestamps::default(),
+            input_timestamps: RxPacketTimestamps::default(),
             received_read: 0,
             received_total: 0,
             snd_up: None,
@@ -912,6 +918,7 @@ impl Connection {
             &self.rack,
             self.scratch.capacity(),
         ) + self.tx_timestamps.storage_bytes()
+            + self.rx_timestamps.storage_bytes()
     }
 
     pub(crate) fn resize_peak_charge(&self, send: usize, receive: usize) -> Option<usize> {
@@ -987,6 +994,7 @@ impl Connection {
             staged_rack,
             self.scratch.capacity(),
         ) + self.tx_timestamps.storage_bytes()
+            + self.rx_timestamps.storage_bytes()
             > max_charge
         {
             return Err(Error::NoMemory);
@@ -1618,6 +1626,78 @@ impl Connection {
         (new_response, further_loss)
     }
 
+    fn receive_payload(
+        &mut self,
+        sequence: Seq,
+        payload: &[u8],
+        fin: bool,
+        push: bool,
+    ) -> crate::buffer::ReceiveOutcome {
+        if !self.rx_timestamps.enabled() || self.input_timestamps == RxPacketTimestamps::default() {
+            return self.receive.insert_with_push(sequence, payload, fin, push);
+        }
+        let base = self.received_read;
+        let timestamps = self.input_timestamps;
+        let metadata = &mut self.rx_timestamps;
+        self.receive
+            .insert_observed(sequence, payload, fin, push, |start, end| {
+                if let (Some(start), Some(end)) =
+                    (base.checked_add(start as u64), base.checked_add(end as u64))
+                {
+                    metadata.insert(start, end, timestamps);
+                } else {
+                    metadata.lost((end - start) as u64);
+                }
+            })
+    }
+
+    pub(crate) fn send_progress(&self) -> SendProgress {
+        SendProgress {
+            acknowledged: self.acknowledged,
+            queued_end: self.acknowledged + self.send.len() as u64,
+            unacknowledged_sequence: self.snd_una.0,
+            next_write_sequence: self.send_base.wrapping_add(self.send.len() as u32).0,
+        }
+    }
+
+    pub(crate) fn peek_rx_timestamps(
+        &self,
+        count: usize,
+    ) -> Result<Option<RxReadTimestamps>, Error> {
+        if count == 0 {
+            return Ok(None);
+        }
+        if count > self.readable_bytes().max(self.terminal_readable_bytes()) {
+            return Err(Error::InvalidArgument);
+        }
+        let end = self
+            .received_read
+            .checked_add(count as u64)
+            .ok_or(Error::InvalidArgument)?;
+        Ok(Some(RxReadTimestamps {
+            start: self.received_read,
+            end,
+            timestamps: self.rx_timestamps.at(end - 1),
+        }))
+    }
+
+    pub(crate) fn input_with_timestamps(
+        &mut self,
+        now: Instant,
+        traffic_class: u8,
+        segment: &Segment<'_>,
+        timestamps: RxPacketTimestamps,
+    ) -> Result<(), Error> {
+        timestamps.validate(self.config.timebase)?;
+        if !self.rx_timestamps.enabled() || timestamps == RxPacketTimestamps::default() {
+            return self.input_with_traffic_class(now, traffic_class, segment);
+        }
+        self.input_timestamps = timestamps;
+        let result = self.input_with_traffic_class(now, traffic_class, segment);
+        self.input_timestamps = RxPacketTimestamps::default();
+        result
+    }
+
     pub(crate) fn acknowledged(&self) -> u64 {
         self.acknowledged
     }
@@ -1685,6 +1765,7 @@ impl Connection {
         };
         self.receive_used -= count;
         self.received_read = self.received_read.saturating_add(count as u64);
+        self.rx_timestamps.consumed(self.received_read);
         // Terminal draining never schedules ACKs or window updates.
         Ok(count)
     }
@@ -2067,7 +2148,7 @@ impl Connection {
         self.wl2 = Seq(syn.header.acknowledgment);
         let count = syn.payload.len().min(self.syn_window as usize);
         let fin = syn.header.flags & FIN != 0 && syn.payload.len() < self.syn_window as usize;
-        let outcome = self.receive.insert_with_push(
+        let outcome = self.receive_payload(
             start,
             &syn.payload[..count],
             fin,
@@ -2754,6 +2835,7 @@ impl Connection {
             return Err(Error::WouldBlock);
         }
         self.received_read = self.received_read.saturating_add(count as u64);
+        self.rx_timestamps.consumed(self.received_read);
         // Only credit that an ordinary ACK can actually offer is useful:
         // backing storage may exceed the wire cap, or be below a scale unit.
         let shift = if self.scaling { self.local_scale } else { 0 };
@@ -4666,7 +4748,7 @@ impl Connection {
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
         //# Segments with higher beginning sequence numbers SHOULD be held for later
         //# processing (SHLD-31).
-        let outcome = self.receive.insert_with_push(
+        let outcome = self.receive_payload(
             start,
             &payload[skip..skip + count],
             fin && skip + count == payload.len(),
@@ -4695,6 +4777,7 @@ impl Connection {
             self.reset_echo = segment.options.timestamps.map(|ts| ts.0);
             self.reset_reply = true;
             self.receive.clear();
+            self.rx_timestamps.clear();
             self.receive
                 .reset_start(next)
                 .expect("cleared receive buffer");
@@ -26721,5 +26804,9 @@ mod tests {
             Err(Error::WouldBlock)
         );
         a.tx_timestamps.resize(0, 0).unwrap();
+    }
+    mod rx_metadata {
+        use super::*;
+        include!("connection_rx_tests.rs");
     }
 }

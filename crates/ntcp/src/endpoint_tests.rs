@@ -5003,3 +5003,163 @@ fn tx_timestamp_retransmit_stable_range_preserves_first_observation_and_timewait
         a.set_tx_timestamp_capacity(client, 0).unwrap();
     }
 }
+
+#[test]
+fn rx_timestamp_endpoint_validation_peek_copyout_retry_and_sources() {
+    let (mut a, mut b, listener, client) = endpoints();
+    pump(&mut a, &mut b, 0);
+    let server = b.accept(listener).unwrap();
+    b.set_rx_timestamp_capacity(server, 4).unwrap();
+    a.write(client, b"abcdef").unwrap();
+    let mut out = [0; 2048];
+    let tx = a.poll_transmit(1, &mut out, 16).unwrap().packet.unwrap();
+    let bytes = &out[..tx.len];
+    let stamp = RxTimestamp {
+        value: u64::MAX,
+        clock: TimestampClock::DeviceTicks {
+            identity: 7,
+            units_per_second: None,
+        },
+    };
+    let timestamps = RxPacketTimestamps {
+        software: None,
+        hardware: Some(stamp),
+    };
+    let before = b.rx_timestamp_status(server).unwrap();
+    // Invalid caller metadata is rejected before changing endpoint time.
+    for invalid in [
+        RxPacketTimestamps {
+            hardware: Some(RxTimestamp {
+                clock: TimestampClock::CallerTicks(CallerTimebase::default()),
+                ..stamp
+            }),
+            ..Default::default()
+        },
+        RxPacketTimestamps {
+            software: Some(RxTimestamp {
+                clock: TimestampClock::CallerTicks(CallerTimebase {
+                    units_per_second: 1_000_000_000,
+                    ..Default::default()
+                }),
+                ..stamp
+            }),
+            ..Default::default()
+        },
+        RxPacketTimestamps {
+            hardware: Some(RxTimestamp {
+                clock: TimestampClock::DeviceTicks {
+                    identity: 7,
+                    units_per_second: Some(0),
+                },
+                ..stamp
+            }),
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            b.input_with_timestamps(100, tx.ip, 0, Ipv4Options::default(), bytes, invalid),
+            Err(EndpointError::Connection(Error::InvalidArgument))
+        );
+    }
+    let mut corrupt = bytes.to_vec();
+    corrupt[16] ^= 1;
+    assert_eq!(
+        b.input_with_timestamps(2, tx.ip, 0, Ipv4Options::default(), &corrupt, timestamps),
+        Ok(InputDisposition::Dropped)
+    );
+    assert_eq!(
+        b.input_with_timestamps(
+            3,
+            tx.ip,
+            0,
+            Ipv4Options::default(),
+            &bytes[..19],
+            timestamps
+        ),
+        Ok(InputDisposition::Dropped)
+    );
+    let segment = wire::parse(tx.ip, bytes).unwrap();
+    let mut header = segment.header;
+    header.destination_port += 1;
+    let mut wrong_tuple = [0; 128];
+    let len = wire::encode(tx.ip, header, &[], segment.payload, &mut wrong_tuple).unwrap();
+    b.input_with_timestamps(
+        4,
+        tx.ip,
+        0,
+        Ipv4Options::default(),
+        &wrong_tuple[..len],
+        timestamps,
+    )
+    .unwrap();
+    assert_eq!(b.rx_timestamp_status(server).unwrap(), before);
+    assert_eq!(
+        b.peek_rx_timestamps(server, 1),
+        Err(EndpointError::Connection(Error::InvalidArgument))
+    );
+    crate::allocation_tests::fail_after(0, || {
+        b.input_with_timestamps(5, tx.ip, 0, Ipv4Options::default(), bytes, timestamps)
+    })
+    .unwrap();
+    let info = b.peek_rx_timestamps(server, 6).unwrap().unwrap();
+    assert_eq!((info.start, info.end, info.timestamps), (0, 6, timestamps));
+    assert_eq!(
+        b.peek_rx_timestamps(server, 7),
+        Err(EndpointError::Connection(Error::InvalidArgument))
+    );
+    let deadline = b.next_deadline();
+    let mut peek = [0; 4];
+    for _ in 0..2 {
+        assert_eq!(b.peek(server, &mut peek), Ok(4));
+        assert_eq!(&peek, b"abcd");
+        assert_eq!(
+            b.peek_rx_timestamps(server, 4).unwrap().unwrap().timestamps,
+            timestamps
+        );
+    }
+    assert_eq!(b.next_deadline(), deadline);
+    assert_eq!(b.read(server, &mut peek), Ok(4));
+    assert_eq!(b.peek_rx_timestamps(server, 2).unwrap().unwrap().start, 4);
+    assert_eq!(b.read(server, &mut peek), Ok(2));
+    assert_eq!(b.rx_timestamp_status(server).unwrap().retained_ranges, 0);
+    // Matching caller ticks are a software observation, not protocol time input.
+    a.write(client, b"gh").unwrap();
+    let tx = a.poll_transmit(6, &mut out, 16).unwrap().packet.unwrap();
+    let software = RxPacketTimestamps {
+        software: Some(RxTimestamp {
+            value: 999,
+            clock: TimestampClock::CallerTicks(CallerTimebase::default()),
+        }),
+        hardware: None,
+    };
+    b.input_with_timestamps(
+        6,
+        tx.ip,
+        0,
+        Ipv4Options::default(),
+        &out[..tx.len],
+        software,
+    )
+    .unwrap();
+    assert_eq!(
+        b.peek_rx_timestamps(server, 2).unwrap().unwrap().timestamps,
+        software
+    );
+    b.abort(server).unwrap();
+    let charge = b.buffer_bytes();
+    b.release(server).unwrap();
+    assert!(b.buffer_bytes() < charge);
+    assert_eq!(
+        b.rx_timestamp_status(server),
+        Err(EndpointError::InvalidHandle)
+    );
+    assert_eq!(
+        b.peek_rx_timestamps(server, 1),
+        Err(EndpointError::InvalidHandle)
+    );
+    assert_eq!(b.send_progress(server), Err(EndpointError::InvalidHandle));
+    assert_eq!(
+        a.send_progress(client).unwrap().acknowledged,
+        a.acknowledged(client).unwrap()
+    );
+}
