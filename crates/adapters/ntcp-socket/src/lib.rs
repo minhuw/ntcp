@@ -456,7 +456,7 @@ fn read_into_locked(
             Op::Peek(n.min(runtime::BYTES)),
             flags & MSG_DONTWAIT != 0,
             EPOLLIN,
-            &deadline,
+            deadline,
         )?;
         output(&reply.bytes)?;
         return Ok(reply.bytes.len() as i64);
@@ -467,7 +467,7 @@ fn read_into_locked(
             Op::Peek(n.min(runtime::BYTES)),
             flags & MSG_DONTWAIT != 0,
             EPOLLIN,
-            &deadline,
+            deadline,
         )?
         .bytes;
         input.pending.store(bytes.len(), Ordering::Release);

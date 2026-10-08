@@ -360,6 +360,8 @@ struct PacketBackend {
     profile: crate::packet_profile::Profile,
     output: VecDeque<Reply>,
 }
+type ChildOptionsSnapshot = (ConnectionId, u64, u64, u64, (bool, bool, bool, u32));
+
 struct Owner {
     endpoint: Endpoint,
     tun: Option<Tun>,
@@ -371,7 +373,7 @@ struct Owner {
     detached: Vec<ConnectionId>,
     pending_packet: Option<Vec<u8>>,
     pending: VecDeque<Request>,
-    child_timeouts: Vec<(ConnectionId, u64, u64, u64, (bool, bool, bool, u32))>,
+    child_timeouts: Vec<ChildOptionsSnapshot>,
     connection_options: Vec<(ConnectionId, u8, i32, Option<bool>)>,
     #[cfg(feature = "packet-test")]
     packets: Option<PacketBackend>,
