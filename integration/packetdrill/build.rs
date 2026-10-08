@@ -32,4 +32,5 @@ fn main() {
     println!("cargo:rustc-link-lib=static=shim");
     println!("cargo:rerun-if-changed=shim.c");
     println!("cargo:rerun-if-changed=packetdrill.h");
+    println!("cargo:rerun-if-changed=../../crates/adapters/ntcp-socket/src/boundary.h");
 }

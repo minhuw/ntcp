@@ -435,3 +435,11 @@ extern int ntcp_managed_epoll_ctl(int epfd, int op, int fd, struct epoll_event *
 int ntcp_c_epoll_ctl(int epfd, int op, int fd, struct epoll_event * p) {
     MANAGED(int, epoll_ctl, (epfd,op,fd,p));
 }
+
+// Explicit plugin socket creation does not change native socket classification.
+extern int ntcp_packet_managed_socket(int, int, int);
+#pragma weak ntcp_packet_managed_socket
+int ntcp_c_packet_socket(int domain, int kind, int protocol) {
+    if (!ntcp_packet_managed_socket) { errno = ENOSYS; return -1; }
+    return NTCP_RUST_CALL(int, ntcp_packet_managed_socket(domain,kind,protocol));
+}

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #define _GNU_SOURCE
 #include "packetdrill.h"
+#include "../../crates/adapters/ntcp-socket/src/boundary.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -14,227 +15,141 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-extern long long ntcp_call(void *, int, int, int, int, const void *, size_t, void *, size_t, long long *);
+static int bad(int error) { errno = error; return -1; }
 extern void ntcp_free(void *);
-extern long long ntcp_host_call(int, int, void *, size_t);
+extern int ntcp_plugin_active(void *);
+extern int ntcp_net_send(void *, const void *, size_t);
+extern int ntcp_net_receive(void *, void *, size_t *, long long *);
 static int unsupported(const char *why) {
     fprintf(stderr, "NTCP_PACKETDRILL_UNSUPPORTED: %s\n", why);
     errno = ENOSYS; return -1;
 }
-static int bad(int error) { errno = error; return -1; }
-// Bounded self-process copies report inaccessible or partially mapped buffers.
-static int memory(void *local, const void *remote, size_t n, int writing) {
-    if (!n) return 0;
-    if ((uintptr_t)remote > INTPTR_MAX || n > INTPTR_MAX - (uintptr_t)remote) return bad(EFAULT);
-    struct iovec l = {local, n}, r = {(void *)remote, n};
-    long result = syscall(writing ? SYS_process_vm_writev : SYS_process_vm_readv,
-                          syscall(SYS_getpid), &l, 1UL, &r, 1UL, 0UL);
-    if (result < 0) return -1;
-    return (size_t)result == n ? 0 : bad(EFAULT);
-}
-#define CALL(op, fd, a, b, in, n, out, m, aux) ntcp_call(u, op, fd, a, b, in, n, out, m, aux)
-#define SIMPLE(op, fd, a, b) CALL(op, fd, a, b, NULL, 0, NULL, 0, NULL)
+extern int ntcp_c_packet_socket(int domain, int type, int protocol);
 static int sock(void *u, int domain, int type, int protocol) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
     if (domain != AF_INET || (type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) != SOCK_STREAM || (protocol && protocol != IPPROTO_TCP)) return unsupported("socket: only IPv4 TCP");
-    return SIMPLE(1, 0, type, 0);
+    return ntcp_c_packet_socket(domain,type,protocol);
 }
-static int address(void *u, int op, int fd, const struct sockaddr *p, socklen_t n) {
-    if (!p) return bad(EFAULT);
-    if (n < sizeof(struct sockaddr_in)) return bad(EINVAL);
-    struct sockaddr_in addr; if (memory(&addr, p, sizeof(addr), 0)) return -1;
-    if (addr.sin_family != AF_INET) return unsupported("address family");
-    return CALL(op, fd, 0, 0, &addr, sizeof(addr), NULL, 0, NULL);
+extern int ntcp_c_bind(int fd, const struct sockaddr *p, socklen_t n);
+static int bind_socket(void *u, int fd, const struct sockaddr *p, socklen_t n) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_bind(fd,p,n);
 }
-static int bind_socket(void *u, int fd, const struct sockaddr *p, socklen_t n) { return address(u, 2, fd, p, n); }
-static int connect_socket(void *u, int fd, const struct sockaddr *p, socklen_t n) { return address(u, 5, fd, p, n); }
-static int listen_socket(void *u, int fd, int backlog) { return SIMPLE(3, fd, backlog, 0); }
+extern int ntcp_c_connect(int fd, const struct sockaddr *p, socklen_t n);
+static int connect_socket(void *u, int fd, const struct sockaddr *p, socklen_t n) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_connect(fd,p,n);
+}
+extern int ntcp_c_listen(int fd, int n);
+static int listen_socket(void *u, int fd, int n) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_listen(fd,n);
+}
+extern int ntcp_c_accept(int fd, struct sockaddr *p, socklen_t *n);
 static int accept_socket(void *u, int fd, struct sockaddr *p, socklen_t *n) {
-    if (p && !n) return bad(EFAULT);
-    struct sockaddr_in addr;
-    int result = CALL(4, fd, 0, 0, NULL, 0, &addr, sizeof(addr), NULL);
-    if (result >= 0 && p) { size_t size = *n < sizeof(addr) ? *n : sizeof(addr); memcpy(p, &addr, size); *n = sizeof(addr); }
-    return result;
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_accept(fd,p,n);
 }
-static ssize_t read_socket(void *u, int fd, void *p, size_t n) { return CALL(6, fd, 0, 0, NULL, 0, p, n, NULL); }
-static ssize_t write_socket(void *u, int fd, const void *p, size_t n) { return CALL(7, fd, 0, 0, p, n, NULL, 0, NULL); }
-static ssize_t recv_socket(void *u, int fd, void *p, size_t n, int flags) {
-    if (flags & ~MSG_DONTWAIT) return unsupported("recv flags");
-    return CALL(6, fd, flags, 0, NULL, 0, p, n, NULL);
+extern ssize_t ntcp_c_read(int fd, void *p, size_t n);
+static ssize_t read_socket(void *u, int fd, void *p, size_t n) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_read(fd,p,n);
 }
+extern ssize_t ntcp_c_write(int fd, const void *p, size_t n);
+static ssize_t write_socket(void *u, int fd, const void *p, size_t n) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_write(fd,p,n);
+}
+extern ssize_t ntcp_c_send(int fd, const void *p, size_t n, int flags);
 static ssize_t send_socket(void *u, int fd, const void *p, size_t n, int flags) {
-    if (flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_ZEROCOPY)) return unsupported("send flags");
-    return CALL(7, fd, flags, 0, p, n, NULL, 0, NULL);
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_send(fd,p,n,flags);
 }
-static ssize_t vector(void *u, int fd, const struct iovec *v, int count, int writing, int flags) {
-    if (count < 0 || count > 1024) return bad(EINVAL);
-    struct iovec vectors[1024];
-    if (memory(vectors, v, count * sizeof(*v), 0)) return -1;
-    size_t total = 0;
-    for (int i = 0; i < count; i++) {
-        if (!writing && vectors[i].iov_len && !vectors[i].iov_base) return bad(EFAULT);
-        if (vectors[i].iov_len > 65535 - total) return bad(EMSGSIZE);
-        total += vectors[i].iov_len;
-    }
-    if (!writing) {
-        if (flags & ~MSG_DONTWAIT) return unsupported("recv flags");
-        // Rust owns copyout and commits stream bytes only after all vectors succeed.
-        return CALL(20, fd, flags, 0, vectors, count * sizeof(*v), NULL, total, NULL);
-    }
-    if (flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_ZEROCOPY)) return unsupported("send flags");
-    // Snapshot only bounded descriptors here; the owner checks state before payload copy.
-    return CALL(21, fd, flags, 0, vectors, count * sizeof(*v), NULL, total, NULL);
+extern ssize_t ntcp_c_recv(int fd, void *p, size_t n, int flags);
+static ssize_t recv_socket(void *u, int fd, void *p, size_t n, int flags) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_recv(fd,p,n,flags);
 }
-static ssize_t readv_socket(void *u, int fd, const struct iovec *v, int n) { return vector(u, fd, v, n, 0, 0); }
-static ssize_t writev_socket(void *u, int fd, const struct iovec *v, int n) { return vector(u, fd, v, n, 1, 0); }
-static int destination(void *u, int fd, const struct sockaddr *addr, socklen_t len) {
-    if (!addr) return len ? bad(EFAULT) : 0;
-    if (len < sizeof(struct sockaddr_in)) return bad(EINVAL);
-    struct sockaddr_in requested;
-    if (memory(&requested, addr, sizeof(requested), 0)) return -1;
-    if (requested.sin_family != AF_INET) return unsupported("send destination family");
-    // A connection-mode TCP send uses its established peer, not msg_name.
-    return 0;
+extern ssize_t ntcp_c_readv(int fd, const struct iovec *v, int n);
+static ssize_t readv_socket(void *u, int fd, const struct iovec *v, int n) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_readv(fd,v,n);
 }
-static int source(void *u, int fd, struct sockaddr *addr, socklen_t *len) {
-    if (!addr) return 0;
-    if (!len) return bad(EFAULT);
-    struct sockaddr_in peer;
-    if (CALL(16, fd, 0, 0, NULL, 0, &peer, sizeof(peer), NULL) < 0) return -1;
-    socklen_t capacity;
-    if (memory(&capacity, len, sizeof(capacity), 0)) return -1;
-    size_t n = capacity < sizeof(peer) ? capacity : sizeof(peer);
-    if (memory(&peer, addr, n, 1)) return -1;
-    capacity = sizeof(peer);
-    return memory(&capacity, len, sizeof(capacity), 1);
+extern ssize_t ntcp_c_writev(int fd, const struct iovec *v, int n);
+static ssize_t writev_socket(void *u, int fd, const struct iovec *v, int n) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_writev(fd,v,n);
 }
-static ssize_t recvfrom_socket(void *u, int fd, void *p, size_t n, int flags, struct sockaddr *addr, socklen_t *len) {
-    if (source(u, fd, addr, len)) return -1;
-    return recv_socket(u, fd, p, n, flags);
-}
+extern ssize_t ntcp_c_sendto(int fd, const void *p, size_t n, int flags, const struct sockaddr *addr, socklen_t len);
 static ssize_t sendto_socket(void *u, int fd, const void *p, size_t n, int flags, const struct sockaddr *addr, socklen_t len) {
-    if (destination(u, fd, addr, len)) return -1;
-    return send_socket(u, fd, p, n, flags);
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_sendto(fd,p,n,flags,addr,len);
 }
+extern ssize_t ntcp_c_recvfrom(int fd, void *p, size_t n, int flags, struct sockaddr *addr, socklen_t *len);
+static ssize_t recvfrom_socket(void *u, int fd, void *p, size_t n, int flags, struct sockaddr *addr, socklen_t *len) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_recvfrom(fd,p,n,flags,addr,len);
+}
+extern ssize_t ntcp_c_sendmsg(int fd, const struct msghdr *msg, int flags);
 static ssize_t sendmsg_socket(void *u, int fd, const struct msghdr *msg, int flags) {
-    struct msghdr header;
-    if (memory(&header, msg, sizeof(header), 0)) return -1;
-    if (header.msg_controllen) return unsupported("sendmsg ancillary data");
-    if (destination(u, fd, header.msg_name, header.msg_namelen)) return -1;
-    if (header.msg_iovlen > 1024) return bad(EINVAL);
-    return vector(u, fd, header.msg_iov, header.msg_iovlen, 1, flags);
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_sendmsg(fd,msg,flags);
 }
+extern ssize_t ntcp_c_recvmsg(int fd, struct msghdr *msg, int flags);
 static ssize_t recvmsg_socket(void *u, int fd, struct msghdr *msg, int flags) {
-    struct msghdr header;
-    if (memory(&header, msg, sizeof(header), 0)) return -1;
-    if (flags & MSG_ERRQUEUE) {
-        if (flags & ~(MSG_ERRQUEUE | MSG_DONTWAIT)) return unsupported("error queue recv flags");
-        if (header.msg_iovlen > 1024) return bad(EINVAL);
-        struct iovec vectors[1024];
-        if (memory(vectors, header.msg_iov, header.msg_iovlen * sizeof(*vectors), 0)) return -1;
-        // The owner copies control and metadata before committing the completion.
-        return CALL(22, fd, flags, 0, &header, sizeof(header), msg, sizeof(header), NULL);
-    }
-    if (header.msg_controllen) return unsupported("recvmsg ancillary data");
-    if (header.msg_iovlen > 1024) return bad(EINVAL);
-    if (source(u, fd, header.msg_name, &header.msg_namelen)) return -1;
-    header.msg_flags = 0; header.msg_controllen = 0;
-    // Complete metadata copyout before a receive can consume stream bytes.
-    if (memory(&header, msg, sizeof(header), 1)) return -1;
-    return vector(u, fd, header.msg_iov, header.msg_iovlen, 0, flags);
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_recvmsg(fd,msg,flags);
 }
+extern int ntcp_c_close(int fd);
+static int close_socket(void *u, int fd) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_close(fd);
+}
+extern int ntcp_c_shutdown(int fd, int how);
+static int shutdown_socket(void *u, int fd, int how) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_shutdown(fd,how);
+}
+extern int ntcp_c_setsockopt(int fd, int level, int name, const void *p, socklen_t n);
+static int setopt(void *u, int fd, int level, int name, const void *p, socklen_t n) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_setsockopt(fd,level,name,p,n);
+}
+extern int ntcp_c_getsockopt(int fd, int level, int name, void *p, socklen_t *n);
+static int getopt_socket(void *u, int fd, int level, int name, void *p, socklen_t *n) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_getsockopt(fd,level,name,p,n);
+}
+extern int ntcp_c_poll(struct pollfd *fds, nfds_t n, int timeout);
+static int poll_socket(void *u, struct pollfd *fds, nfds_t n, int timeout) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return ntcp_c_poll(fds,n,timeout);
+}
+extern int ntcp_variadic_fcntl(int, int, ...);
+extern int ntcp_variadic_ioctl(int, unsigned long, ...);
 static int fcntl_socket(void *u, int fd, int cmd, ...) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
     int arg = 0;
     if (cmd == F_SETFL || cmd == F_SETFD) { va_list ap; va_start(ap, cmd); arg = va_arg(ap, int); va_end(ap); }
     else if (cmd != F_GETFL && cmd != F_GETFD) return unsupported("fcntl command");
-    return SIMPLE(10, fd, cmd, arg);
+    return ntcp_variadic_fcntl(fd, cmd, arg);
 }
 static int ioctl_socket(void *u, int fd, unsigned long request, ...) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
     if (request != SIOCINQ) return unsupported("ioctl request");
-    va_list ap; va_start(ap, request); int *out = va_arg(ap, int *); va_end(ap);
-    // Validate the fd/state before touching the caller's output, as Linux does.
-    int value = SIMPLE(17, fd, 0, 0);
-    if (value < 0) return -1;
-    if (!out) return bad(EFAULT);
-    memcpy(out, &value, sizeof(value)); return 0;
+    va_list ap; va_start(ap, request); void *out = va_arg(ap, void *); va_end(ap);
+    return ntcp_variadic_ioctl(fd, request, out);
 }
-static int close_socket(void *u, int fd) { return SIMPLE(8, fd, 0, 0); }
-static int shutdown_socket(void *u, int fd, int how) {
-    return SIMPLE(9, fd, how, 0);
-}
-static int setopt(void *u, int fd, int level, int name, const void *p, socklen_t n) {
-    if (!((level == SOL_SOCKET && (name == SO_REUSEADDR || name == SO_ZEROCOPY)) || (level == IPPROTO_TCP && (name == TCP_NODELAY || name == TCP_USER_TIMEOUT)) || (level == IPPROTO_IP && (name == IP_TOS || name == IP_MTU_DISCOVER)))) return unsupported("setsockopt option");
-    if (!p) return bad(EFAULT);
-    if (level == IPPROTO_IP ? (n != 1 && n != sizeof(int)) : n < sizeof(int)) return bad(EINVAL);
-    int value = 0;
-    if (memory(&value, p, n == 1 ? 1 : sizeof(value), 0)) return -1;
-    int key = level == IPPROTO_IP ? (name == IP_TOS ? 6 : 7) : level == SOL_SOCKET ? (name == SO_ZEROCOPY ? 8 : 1) : name == TCP_NODELAY ? 2 : 5;
-    return SIMPLE(11, fd, key, value);
-}
-static int metric_option(int level, int name) {
-    if (level == IPPROTO_TCP && name == TCP_INFO) return 1;
-    if (level == IPPROTO_TCP && name == TCP_CC_INFO) return 2;
-    if (level == SOL_SOCKET && name == SO_MEMINFO) return 3;
-    return 0;
-}
-static int metric_getopt(void *u, int host, int fd, int option, void *p, socklen_t *n) {
-    if (!n) return bad(EFAULT);
-    socklen_t capacity; memcpy(&capacity, n, sizeof(capacity));
-    if (!p && capacity) return bad(EFAULT);
-    // Entire pinned ABI is initialized in Rust, never copied from Rust padding.
-    unsigned char data[280] = {0};
-    size_t size = capacity < sizeof(data) ? capacity : sizeof(data);
-    long long result = host ? ntcp_host_call(fd, option, data, size)
-        : CALL(18, fd, option, 0, NULL, 0, data, size, NULL);
-    if (result < 0) return -1;
-    if (result) memcpy(p, data, result);
-    capacity = result; memcpy(n, &capacity, sizeof(capacity));
-    return 0;
-}
-int ntcp_getsockopt_host(int fd, int level, int name, void *p, socklen_t *n) {
-    int option = metric_option(level, name);
-    if (option) {
-        int result = metric_getopt(NULL, 1, fd, option, p, n);
-        if (result >= 0 || errno != ENOENT) return result;
-    }
-    return syscall(SYS_getsockopt, fd, level, name, p, n);
-}
-static int getopt_socket(void *u, int fd, int level, int name, void *p, socklen_t *n) {
-    int option = metric_option(level, name);
-    if (option) return metric_getopt(u, 0, fd, option, p, n);
-    if (!((level == SOL_SOCKET && (name == SO_REUSEADDR || name == SO_ERROR || name == SO_TYPE || name == SO_ZEROCOPY)) || (level == IPPROTO_TCP && (name == TCP_NODELAY || name == TCP_USER_TIMEOUT)) || (level == IPPROTO_IP && (name == IP_TOS || name == IP_MTU_DISCOVER)))) return unsupported("getsockopt option (including TCP_INFO)");
-    if (!p || !n) return bad(EFAULT);
-    int key = level == IPPROTO_IP ? (name == IP_TOS ? 6 : 7) : level == IPPROTO_TCP ? (name == TCP_NODELAY ? 2 : 5) : name == SO_ZEROCOPY ? 8 : name == SO_REUSEADDR ? 1 : name == SO_ERROR ? 3 : 4;
-    int value = SIMPLE(12, fd, key, 0);
-    if (value < 0) return -1;
-    if (name == SO_ZEROCOPY && level == SOL_SOCKET) {
-        socklen_t capacity;
-        if (memory(&capacity, n, sizeof(capacity), 0)) return -1;
-        capacity = capacity < sizeof(value) ? capacity : sizeof(value);
-        if (memory(&value, p, capacity, 1)) return -1;
-        return memory(&capacity, n, sizeof(capacity), 1);
-    }
-    // Linux's IPv4 integer options return a byte for short, nonzero buffers.
-    if (level == IPPROTO_IP && *n && *n < sizeof(value)) {
-        unsigned char byte = value; memcpy(p, &byte, 1); *n = 1; return 0;
-    }
-    size_t size = *n < sizeof(value) ? *n : sizeof(value); memcpy(p, &value, size); *n = size; return 0;
-}
-static int poll_socket(void *u, struct pollfd *fds, nfds_t n, int timeout) {
-    if (n > 128) return bad(EINVAL);
-    return CALL(13, 0, timeout, 0, fds, n * sizeof(*fds), fds, n * sizeof(*fds), NULL);
-}
-static int net_send(void *u, const void *p, size_t n) { return CALL(14, 0, 0, 0, p, n, NULL, 0, NULL); }
-static int net_receive(void *u, void *p, size_t *n, long long *time) {
-    if (!n || !time) return bad(EFAULT);
-    long long result = CALL(15, 0, 0, 0, NULL, 0, p, *n, time);
-    if (result < 0) { *n = 0; return -1; } *n = result; return 0;
-}
+static int net_send(void *u, const void *p, size_t n) { return NTCP_RUST_CALL(int, ntcp_net_send(u,p,n)); }
+static int net_receive(void *u, void *p, size_t *n, long long *time) { return NTCP_RUST_CALL(int, ntcp_net_receive(u,p,n,time)); }
 static int sleep_host(void *u, useconds_t n) { return usleep(n); }
 static int time_host(void *u, struct timeval *tv, struct timezone *tz) { if (!tv) return bad(EFAULT); return gettimeofday(tv, tz); }
-static int ep_create(void *u, int size) { return unsupported("epoll_create"); }
-static int ep_ctl(void *u, int epfd, int op, int fd, struct epoll_event *ev) { return unsupported("epoll_ctl"); }
-static int ep_wait(void *u, int epfd, struct epoll_event *ev, int max, int timeout) { return unsupported("epoll_wait"); }
+extern int ntcp_c_epoll_create(int);
+extern int ntcp_c_epoll_ctl(int, int, int, struct epoll_event *);
+extern int ntcp_c_epoll_wait(int, struct epoll_event *, int, int);
+static int ep_create(void *u, int size) { if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1; return ntcp_c_epoll_create(size); }
+static int ep_ctl(void *u, int epfd, int op, int fd, struct epoll_event *ev) { if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1; return ntcp_c_epoll_ctl(epfd,op,fd,ev); }
+static int ep_wait(void *u, int epfd, struct epoll_event *ev, int max, int timeout) { if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1; return ntcp_c_epoll_wait(epfd,ev,max,timeout); }
 static int pipe_stub(void *u, int fds[2]) { return unsupported("pipe"); }
 static int splice_stub(void *u, int in, loff_t *inoff, int out, loff_t *outoff, size_t n, unsigned int flags) { return unsupported("splice"); }
 void ntcp_fill(struct packetdrill_interface *p, void *u) {
@@ -261,30 +176,32 @@ void ntcp_abi_check(void *u) {
     assert(p.epoll_create && p.epoll_ctl && p.epoll_wait && p.pipe && p.splice);
     assert(p.socket(u, AF_INET6, SOCK_STREAM, 0) == -1 && errno == ENOSYS);
     assert(p.ioctl(u, -1, 0) == -1 && errno == ENOSYS);
-    assert(p.getsockopt(u, -1, IPPROTO_TCP, TCP_INFO, NULL, NULL) == -1 && errno == EFAULT);
-    assert(p.epoll_create(u, 1) == -1 && errno == ENOSYS);
-    assert(p.epoll_ctl(u, -1, 0, -1, NULL) == -1 && errno == ENOSYS);
-    assert(p.epoll_wait(u, -1, NULL, 0, 0) == -1 && errno == ENOSYS);
+    assert(p.getsockopt(u, -1, IPPROTO_TCP, TCP_INFO, NULL, NULL) == -1 && errno == EBADF);
+    int epfd = p.epoll_create(u, 1); assert(epfd >= 0);
+    struct epoll_event event = {.events = EPOLLIN};
+    assert(p.epoll_ctl(u, epfd, EPOLL_CTL_ADD, -1, &event) == -1 && errno == EBADF);
+    assert(p.epoll_wait(u, epfd, &event, 1, 0) == 0);
+    assert(p.close(u, epfd) == 0);
     assert(p.pipe(u, NULL) == -1 && errno == ENOSYS);
     assert(p.splice(u, -1, NULL, -1, NULL, 0, 0) == -1 && errno == ENOSYS);
-    assert(p.readv(u, -1, NULL, 1) == -1 && errno == EFAULT);
-    assert(p.writev(u, -1, NULL, -1) == -1 && errno == EINVAL);
+    assert(p.readv(u, -1, NULL, 1) == -1 && errno == EBADF);
+    assert(p.writev(u, -1, NULL, -1) == -1 && errno == EBADF);
     struct iovec v = { .iov_base = NULL, .iov_len = 1 };
-    assert(p.readv(u, -1, &v, 1) == -1 && errno == EFAULT);
+    assert(p.readv(u, -1, &v, 1) == -1 && errno == EBADF);
     v.iov_base = &v; v.iov_len = 65536;
-    assert(p.writev(u, -1, &v, 1) == -1 && errno == EMSGSIZE);
-    assert(p.read(u, -1, NULL, 1) == -1 && errno == EFAULT);
+    assert(p.writev(u, -1, &v, 1) == -1 && errno == EBADF);
+    assert(p.read(u, -1, NULL, 1) == -1 && errno == EBADF);
     assert(p.write(u, -1, NULL, 1) == -1 && errno == EBADF);
-    assert(p.bind(u, -1, NULL, 0) == -1 && errno == EFAULT);
-    assert(p.accept(u, -1, (struct sockaddr *)&v, NULL) == -1 && errno == EFAULT);
-    assert(p.sendmsg(u, -1, NULL, 0) == -1 && errno == EFAULT);
-    assert(p.recvmsg(u, -1, NULL, 0) == -1 && errno == EFAULT);
+    assert(p.bind(u, -1, NULL, 0) == -1 && errno == EBADF);
+    assert(p.accept(u, -1, (struct sockaddr *)&v, NULL) == -1 && errno == EBADF);
+    assert(p.sendmsg(u, -1, NULL, 0) == -1 && errno == EBADF);
+    assert(p.recvmsg(u, -1, NULL, 0) == -1 && errno == EBADF);
     assert(p.netdev_receive(u, NULL, NULL, NULL) == -1 && errno == EFAULT);
     assert(p.poll(u, NULL, 1, 0) == -1 && errno == EFAULT);
     int fd = p.socket(u, AF_INET, SOCK_STREAM, IPPROTO_TCP);
     assert(fd >= 0);
     int domain = 0; socklen_t domain_size = sizeof(domain);
-    assert(getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &domain_size) == 0 && domain == AF_UNIX);
+    assert(getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &domain_size) == 0 && domain == AF_INET);
     assert(p.fcntl(u, fd, F_GETFL) == O_RDWR);
     assert(p.fcntl(u, fd, F_SETFL, O_RDWR | O_NONBLOCK) == 0);
     assert(p.fcntl(u, fd, F_GETFL) == (O_RDWR | O_NONBLOCK));
@@ -536,4 +453,14 @@ void ntcp_abi_zerocopy_check(void *u, int fd) {
     assert(p.recvmsg(u, fd, &msg, MSG_ERRQUEUE) == 0);
     assert(e->ee_info == 7 && e->ee_data == 7);
     assert(p.recvmsg(u, fd, &msg, MSG_ERRQUEUE) == -1 && errno == EAGAIN);
+}
+
+/* Loader/lifecycle calls also return from Rust before restoring cancellation. */
+extern void ntcp_plugin_init(const char *, void *);
+extern void ntcp_plugin_free(void *);
+void ntcp_c_packet_init(const char *flags, void *interface) {
+    (void)NTCP_RUST_CALL(int, (ntcp_plugin_init(flags, interface), 0));
+}
+void ntcp_c_packet_free(void *userdata) {
+    (void)NTCP_RUST_CALL(int, (ntcp_plugin_free(userdata), 0));
 }

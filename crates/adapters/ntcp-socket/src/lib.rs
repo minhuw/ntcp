@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 #![cfg(target_os = "linux")]
 #![allow(clippy::missing_safety_doc)]
 // Linux preload boundary. Native cancellation points tail-jump through C to
@@ -28,12 +29,18 @@ macro_rules! boundary_entry {
     };
 }
 
+#[cfg(feature = "packet-test")]
+pub mod packet_profile;
+#[cfg(feature = "packet-test")]
+pub mod packet_test;
 mod readiness;
 mod runtime;
 mod stdio;
+mod transport;
 use runtime::{Op, Reply, Runtime};
 type Result<T> = std::result::Result<T, i32>;
 thread_local! {
+    static PACKET_SOCKET: Cell<bool> = const { Cell::new(false) };
     static INTERNAL: Cell<bool> = const { Cell::new(false) };
     static DEPTH: Cell<usize> = const { Cell::new(0) };
     static NATIVE_MUTATION: Cell<usize> = const { Cell::new(0) };
@@ -165,6 +172,7 @@ struct Token {
 struct Input {
     bytes: Mutex<Vec<u8>>,
     ready: AtomicUsize,
+    pending: AtomicUsize,
 }
 impl Token {
     fn matches(&self, fd: i32) -> bool {
@@ -198,6 +206,12 @@ fn env(name: &str) -> Option<String> {
         let p = getenv(name.as_ptr());
         (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned())
     }
+}
+fn io_limit() -> usize {
+    RUNTIME
+        .get()
+        .and_then(|r| r.as_ref().ok())
+        .map_or(runtime::BYTES, |r| r.io_limit)
 }
 fn configured() -> bool {
     env("NTCP_SOCKET_TUN").is_some() || env("NTCP_SOCKET_ADDR").is_some()
@@ -252,7 +266,12 @@ fn call(id: u64, op: Op) -> Result<Reply> {
             .map_err(|_| EIO)?
             .values()
             .find(|t| t.id == id)
-            .map_or(0, |t| t.input.ready.load(Ordering::Acquire))
+            .map_or(0, |t| {
+                t.input
+                    .ready
+                    .load(Ordering::Acquire)
+                    .saturating_sub(t.input.pending.load(Ordering::Acquire))
+            })
     } else {
         0
     };
@@ -329,9 +348,6 @@ fn memory(local: *mut u8, remote: *mut u8, len: usize, write: bool) -> Result<()
         return Err(EFAULT);
     }
     Ok(())
-}
-fn copy_in(p: *const u8, out: &mut [u8]) -> Result<()> {
-    memory(out.as_mut_ptr(), p.cast_mut(), out.len(), false)
 }
 fn copy_out(p: *mut u8, bytes: &[u8]) -> Result<()> {
     memory(bytes.as_ptr().cast_mut(), p, bytes.len(), true)
@@ -426,21 +442,86 @@ fn read_into(
     if bytes.is_empty() {
         *bytes = retry_until(
             id,
-            Op::Read(n.min(runtime::BYTES)),
+            Op::Peek(n.min(runtime::BYTES)),
             flags & MSG_DONTWAIT != 0,
             EPOLLIN,
             &deadline,
         )?
         .bytes;
+        input.pending.store(bytes.len(), Ordering::Release);
         input.ready.store(bytes.len(), Ordering::Release);
     }
     let n = n.min(bytes.len());
     output(&bytes[..n])?;
     if flags & MSG_PEEK == 0 {
+        let pending = input.pending.load(Ordering::Acquire);
+        if pending != 0 {
+            let consumed = call(id, Op::Read(n.min(pending)))?.value as usize;
+            if consumed != n.min(pending) {
+                return Err(EIO);
+            }
+            input.pending.store(pending - consumed, Ordering::Release);
+        }
         bytes.drain(..n);
     }
     input.ready.store(bytes.len(), Ordering::Release);
     Ok(n as i64)
+}
+fn read_to(
+    fd: i32,
+    id: u64,
+    n: usize,
+    flags: i32,
+    destinations: Vec<(usize, usize)>,
+    copies: Vec<(usize, Vec<u8>)>,
+) -> Result<i64> {
+    let input = TOKENS
+        .lock()
+        .map_err(|_| EIO)?
+        .get(&fd)
+        .filter(|t| t.id == id)
+        .ok_or(EBADF)?
+        .input
+        .clone();
+    if input.ready.load(Ordering::Acquire) != 0 {
+        return read_into(fd, id, n, flags, |bytes| {
+            let mut at = 0;
+            for &(address, capacity) in &destinations {
+                let count = capacity.min(bytes.len() - at);
+                copy_out(address as *mut u8, &bytes[at..at + count])?;
+                at += count;
+                if at == bytes.len() {
+                    break;
+                }
+            }
+            for (address, bytes) in &copies {
+                copy_out(*address as *mut u8, bytes)?;
+            }
+            Ok(())
+        });
+    }
+    let deadline = Deadline::socket(id, false, flags & MSG_DONTWAIT != 0)?;
+    let _guard = loop {
+        match input.bytes.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(EIO),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if flags & MSG_DONTWAIT != 0 || !blocking(id)? {
+                    return Err(EAGAIN);
+                }
+                wait_until(id, EPOLLIN, &deadline)?;
+                std::thread::yield_now();
+            }
+        }
+    };
+    let reply = retry_until(
+        id,
+        Op::ReadTo(n.min(runtime::BYTES), flags, destinations, copies),
+        flags & MSG_DONTWAIT != 0,
+        EPOLLIN,
+        &deadline,
+    )?;
+    Ok(reply.value as i64)
 }
 fn token(flags: i32) -> Result<(i32, Token)> {
     let fd = unsafe {
@@ -555,13 +636,21 @@ fn retry(id: u64, op: Op, dontwait: bool, events: i32) -> Result<Reply> {
     let deadline = Deadline::socket(id, events == EPOLLOUT, dontwait)?;
     retry_until(id, op, dontwait, events, &deadline)
 }
-fn retry_until(id: u64, op: Op, dontwait: bool, events: i32, deadline: &Deadline) -> Result<Reply> {
-    loop {
-        match call(id, op.clone()) {
-            Err(EAGAIN) if !dontwait && blocking(id)? => wait_until(id, events, deadline)?,
-            r => return r,
-        }
+fn retry_until(
+    id: u64,
+    op: Op,
+    dontwait: bool,
+    _events: i32,
+    deadline: &Deadline,
+) -> Result<Reply> {
+    if dontwait || !blocking(id)? {
+        return call(id, op);
     }
+    let left = deadline
+        .budget
+        .map(|budget| budget.checked_sub(deadline.start.elapsed()).ok_or(EAGAIN))
+        .transpose()?;
+    call(id, Op::Wait(Box::new(op), left))
 }
 unsafe fn address(p: *const sockaddr, len: socklen_t) -> Result<SocketAddr> {
     if p.is_null() {
@@ -572,7 +661,11 @@ unsafe fn address(p: *const sockaddr, len: socklen_t) -> Result<SocketAddr> {
     }
     let p = load(p.cast::<sockaddr_in>())?;
     if p.sin_family as i32 != AF_INET {
-        return Err(EAFNOSUPPORT);
+        return Err(if io_limit() < runtime::BYTES {
+            runtime::unsupported_option("address family")
+        } else {
+            EAFNOSUPPORT
+        });
     }
     Ok(SocketAddr::new(
         Ipv4Addr::from(p.sin_addr.s_addr.to_ne_bytes()).into(),
@@ -612,7 +705,7 @@ unsafe fn output_addr(addr: SocketAddr, p: *mut sockaddr, len: *mut socklen_t) -
 pub unsafe extern "C" fn ntcp_managed_socket(domain: i32, kind: i32, protocol: i32) -> i32 {
     ffi(|| {
         if INTERNAL.with(Cell::get)
-            || !configured()
+            || !(configured() || PACKET_SOCKET.with(Cell::get))
             || ![AF_INET, AF_INET6].contains(&domain)
             || kind & 0xf != SOCK_STREAM
         {
@@ -713,14 +806,14 @@ pub unsafe extern "C" fn ntcp_managed_connect(fd: i32, p: *const sockaddr, len: 
             return raw(unsafe { syscall(SYS_connect, fd, p, len) });
         };
         let deadline = Deadline::socket(id, true, false)?;
-        match call(id, Op::Connect(unsafe { address(p, len)? })) {
+        let remote = unsafe { address(p, len)? };
+        match call(id, Op::Connect(remote)) {
             Err(EINPROGRESS) if blocking(id)? => {
-                wait_until(id, EPOLLOUT, &deadline)
-                    .map_err(|e| if e == EAGAIN { EINPROGRESS } else { e })?;
-                let e = call(id, Op::Get(SOL_SOCKET, SO_ERROR))?.value;
-                if e != 0 { Err(e) } else { Ok(0) }
+                retry_until(id, Op::FinishConnect, false, EPOLLOUT, &deadline)
+                    .map(|_| 0)
+                    .map_err(|e| if e == EAGAIN { EINPROGRESS } else { e })
             }
-            r => r.map(|_| 0),
+            result => result.map(|_| 0),
         }
     }) as i32
 }
@@ -761,17 +854,6 @@ pub unsafe extern "C" fn ntcp_managed_shutdown(fd: i32, how: i32) -> i32 {
     ffi(|| match owned(fd)? {
         Some(id) => {
             call(id, Op::Shutdown(how))?;
-            if how != SHUT_WR {
-                let input = TOKENS
-                    .lock()
-                    .map_err(|_| EIO)?
-                    .get(&fd)
-                    .ok_or(EBADF)?
-                    .input
-                    .clone();
-                input.bytes.lock().map_err(|_| EIO)?.clear();
-                input.ready.store(0, Ordering::Release);
-            }
             Ok(0)
         }
         None => raw(unsafe { syscall(SYS_shutdown, fd, how) }),
@@ -836,21 +918,32 @@ unsafe fn transfer(fd: i32, p: *mut c_void, n: usize, flags: i32, write: bool) -
             }
         });
     };
-    if flags & !(MSG_DONTWAIT | if write { MSG_NOSIGNAL } else { MSG_PEEK }) != 0 {
-        return Err(EOPNOTSUPP);
+    if flags
+        & !(MSG_DONTWAIT
+            | if write {
+                MSG_NOSIGNAL | MSG_ZEROCOPY
+            } else {
+                MSG_PEEK
+            })
+        != 0
+    {
+        return Err(runtime::unsupported_option("send/recv flags"));
     }
-    if n != 0 && p.is_null() {
+    if !write && n != 0 && p.is_null() {
         return Err(EFAULT);
     }
     if n > isize::MAX as usize {
         return Err(EINVAL);
     }
-    if !write {
-        return read_into(fd, id, n, flags, |bytes| copy_out(p.cast(), bytes));
+    if io_limit() < runtime::BYTES && n > io_limit() {
+        return Err(runtime::unsupported_option(
+            "scalar I/O exceeds 65535-byte adapter bound",
+        ));
     }
-    let mut bytes = vec![0; n.min(runtime::BYTES)];
-    copy_in(p.cast(), &mut bytes)?;
-    let op = Op::Write(bytes);
+    if !write {
+        return read_to(fd, id, n, flags, vec![(p as usize, n)], Vec::new());
+    }
+    let op = Op::Send(vec![(p as usize, n.min(runtime::BYTES))], flags);
     let result = retry(
         id,
         op,
@@ -966,8 +1059,55 @@ pub unsafe extern "C" fn ntcp_managed_write(fd: i32, p: *const c_void, n: usize)
         }
     }) as ssize_t
 }
+// SPDX-License-Identifier: GPL-2.0-or-later (ported copied zerocopy control ABI)
+fn error_queue(id: u64, p: *mut msghdr, m: msghdr) -> Result<i64> {
+    let input = TOKENS
+        .lock()
+        .map_err(|_| EIO)?
+        .values()
+        .find(|t| t.id == id)
+        .ok_or(EBADF)?
+        .input
+        .clone();
+    let _guard = input.bytes.lock().map_err(|_| EIO)?;
+    let _ = m;
+    call(id, Op::ErrorQueueTo(p as usize))?;
+    Ok(0)
+}
+// SPDX-License-Identifier: GPL-2.0-or-later
+fn copy_completion(p: *mut msghdr, mut m: msghdr, (lo, hi): (u32, u32)) -> Result<()> {
+    let cmsg_size = std::mem::size_of::<cmsghdr>();
+    let full = cmsg_size + 16 + std::mem::size_of::<sockaddr_in>();
+    let mut used = 0;
+    m.msg_flags = MSG_ERRQUEUE;
+    if m.msg_control.is_null() || m.msg_controllen < cmsg_size {
+        m.msg_flags |= MSG_CTRUNC;
+    } else {
+        used = m.msg_controllen.min(full);
+        if used < full {
+            m.msg_flags |= MSG_CTRUNC;
+        }
+        let mut control = vec![0u8; used];
+        control[..std::mem::size_of::<usize>()].copy_from_slice(&used.to_ne_bytes());
+        let level = std::mem::offset_of!(cmsghdr, cmsg_level);
+        let kind = std::mem::offset_of!(cmsghdr, cmsg_type);
+        control[level..level + 4].copy_from_slice(&SOL_IP.to_ne_bytes());
+        control[kind..kind + 4].copy_from_slice(&IP_RECVERR.to_ne_bytes());
+        let mut extended = [0u8; 32];
+        extended[4] = 5;
+        extended[6] = 1;
+        extended[8..12].copy_from_slice(&lo.to_ne_bytes());
+        extended[12..16].copy_from_slice(&hi.to_ne_bytes());
+        control[cmsg_size..].copy_from_slice(&extended[..used - cmsg_size]);
+        copy_out(m.msg_control.cast(), &control)?;
+    }
+    m.msg_namelen = 0;
+    m.msg_controllen = used;
+    store(p, &m)?;
+    Ok(())
+}
 unsafe fn vectors(fd: i32, v: *const iovec, count: i32, flags: i32, write: bool) -> Result<i64> {
-    unsafe { vectors_output(fd, v, count, flags, write, || Ok(())) }
+    unsafe { vectors_output(fd, v, count, flags, write, Vec::new()) }
 }
 unsafe fn vectors_output(
     fd: i32,
@@ -975,7 +1115,7 @@ unsafe fn vectors_output(
     count: i32,
     flags: i32,
     write: bool,
-    done: impl FnOnce() -> Result<()>,
+    copies: Vec<(usize, Vec<u8>)>,
 ) -> Result<i64> {
     if !(0..=1024).contains(&count) {
         return Err(EINVAL);
@@ -986,7 +1126,7 @@ unsafe fn vectors_output(
     let vectors = load_array(v, count as usize, 1024)?;
     let mut total = 0usize;
     for v in &vectors {
-        if v.iov_len != 0 && v.iov_base.is_null() {
+        if !write && v.iov_len != 0 && v.iov_base.is_null() {
             return Err(EFAULT);
         }
         total = total
@@ -994,39 +1134,51 @@ unsafe fn vectors_output(
             .filter(|&n| n <= isize::MAX as usize)
             .ok_or(EINVAL)?;
     }
-    let mut bytes = vec![0u8; total.min(runtime::BYTES)];
+    if io_limit() < runtime::BYTES && total > io_limit() {
+        return Err(EMSGSIZE);
+    }
+    let bytes = vec![0u8; total.min(runtime::BYTES)];
     if write {
-        let mut offset = 0;
-        for v in &vectors {
-            let n = v.iov_len.min(bytes.len() - offset);
-            if n != 0 {
-                copy_in(v.iov_base.cast(), &mut bytes[offset..offset + n])?;
-            }
-            offset += n;
-            if offset == bytes.len() {
-                break;
+        if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_ZEROCOPY) != 0 {
+            return Err(runtime::unsupported_option("send flags"));
+        }
+        let id = owned(fd)?.ok_or(EBADF)?;
+        let mut left = total.min(runtime::BYTES);
+        let sources = vectors
+            .iter()
+            .map(|v| {
+                let n = v.iov_len.min(left);
+                left -= n;
+                (v.iov_base as usize, n)
+            })
+            .collect();
+        let result = retry(
+            id,
+            Op::Send(sources, flags),
+            flags & MSG_DONTWAIT != 0,
+            EPOLLOUT,
+        );
+        if matches!(result, Err(EPIPE)) && flags & MSG_NOSIGNAL == 0 {
+            unsafe {
+                syscall(
+                    SYS_tgkill,
+                    syscall(SYS_getpid),
+                    syscall(SYS_gettid),
+                    SIGPIPE,
+                );
             }
         }
-    }
-    if write {
-        return unsafe { transfer(fd, bytes.as_mut_ptr().cast(), bytes.len(), flags, true) };
+        return Ok(result?.value as i64);
     }
     if flags & !(MSG_DONTWAIT | MSG_PEEK) != 0 {
         return Err(EOPNOTSUPP);
     }
     let id = owned(fd)?.ok_or(EBADF)?;
-    read_into(fd, id, bytes.len(), flags, |bytes| {
-        let mut offset = 0;
-        for v in &vectors {
-            let len = v.iov_len.min(bytes.len() - offset);
-            copy_out(v.iov_base.cast(), &bytes[offset..offset + len])?;
-            offset += len;
-            if offset == bytes.len() {
-                break;
-            }
-        }
-        done()
-    })
+    let destinations = vectors
+        .iter()
+        .map(|v| (v.iov_base as usize, v.iov_len))
+        .collect();
+    read_to(fd, id, bytes.len(), flags, destinations, copies)
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ntcp_managed_readv(fd: i32, v: *const iovec, n: i32) -> ssize_t {
@@ -1058,8 +1210,13 @@ pub unsafe extern "C" fn ntcp_managed_sendmsg(fd: i32, p: *const msghdr, flags: 
             return Err(EFAULT);
         }
         let m = load(p)?;
-        if m.msg_controllen != 0 || !m.msg_name.is_null() {
-            return Err(EOPNOTSUPP);
+        if m.msg_controllen != 0 {
+            return Err(runtime::unsupported_option("sendmsg ancillary data"));
+        }
+        if !m.msg_name.is_null() {
+            unsafe {
+                address(m.msg_name.cast(), m.msg_namelen)?;
+            }
         }
         let n = i32::try_from(m.msg_iovlen).map_err(|_| EINVAL)?;
         unsafe { vectors(fd, m.msg_iov, n, flags, true) }
@@ -1075,21 +1232,38 @@ pub unsafe extern "C" fn ntcp_managed_recvmsg(fd: i32, p: *mut msghdr, flags: i3
             return Err(EFAULT);
         }
         let mut m = load(p)?;
-        let n = i32::try_from(m.msg_iovlen).map_err(|_| EINVAL)?;
-        unsafe {
-            vectors_output(fd, m.msg_iov, n, flags, false, || {
-                if !m.msg_name.is_null() {
-                    output_addr(
-                        call(id, Op::Name(true))?.addr.unwrap(),
-                        m.msg_name.cast(),
-                        &mut m.msg_namelen,
-                    )?;
-                }
-                m.msg_controllen = 0;
-                m.msg_flags = 0;
-                store(p, &m)
-            })
+        if flags & MSG_ERRQUEUE != 0 {
+            if flags & !(MSG_ERRQUEUE | MSG_DONTWAIT) != 0 {
+                return Err(runtime::unsupported_option("error queue recv flags"));
+            }
+            let _ = load_array(m.msg_iov, m.msg_iovlen, 1024)?;
+            return error_queue(id, p, m);
         }
+        let n = i32::try_from(m.msg_iovlen).map_err(|_| EINVAL)?;
+        if !m.msg_name.is_null() {
+            unsafe {
+                output_addr(
+                    call(id, Op::Name(true))?.addr.unwrap(),
+                    m.msg_name.cast(),
+                    &mut m.msg_namelen,
+                )?;
+            }
+        }
+        let copies = vec![
+            (
+                p as usize + std::mem::offset_of!(msghdr, msg_namelen),
+                m.msg_namelen.to_ne_bytes().to_vec(),
+            ),
+            (
+                p as usize + std::mem::offset_of!(msghdr, msg_controllen),
+                0usize.to_ne_bytes().to_vec(),
+            ),
+            (
+                p as usize + std::mem::offset_of!(msghdr, msg_flags),
+                0i32.to_ne_bytes().to_vec(),
+            ),
+        ];
+        unsafe { vectors_output(fd, m.msg_iov, n, flags, false, copies) }
     }) as ssize_t
 }
 #[unsafe(no_mangle)]
@@ -1106,7 +1280,11 @@ pub unsafe extern "C" fn ntcp_managed_sendto(
             return raw(unsafe { syscall(SYS_sendto, fd, p, n, flags, addr, len) });
         }
         if !addr.is_null() {
-            return Err(EOPNOTSUPP);
+            unsafe {
+                address(addr, len)?;
+            }
+        } else if len != 0 {
+            return Err(EFAULT);
         }
         unsafe { transfer(fd, p.cast_mut(), n, flags, true) }
     }) as ssize_t
@@ -1133,15 +1311,12 @@ pub unsafe extern "C" fn ntcp_managed_recvfrom(
         if n > isize::MAX as usize {
             return Err(EINVAL);
         }
-        read_into(fd, id, n, flags, |bytes| {
-            copy_out(p.cast(), bytes)?;
-            if !addr.is_null() {
-                unsafe {
-                    output_addr(call(id, Op::Name(true))?.addr.unwrap(), addr, len)?;
-                }
+        if !addr.is_null() {
+            unsafe {
+                output_addr(call(id, Op::Name(true))?.addr.unwrap(), addr, len)?;
             }
-            Ok(())
-        })
+        }
+        read_to(fd, id, n, flags, vec![(p as usize, n)], Vec::new())
     }) as ssize_t
 }
 // Linux old timeval and new __kernel_sock_timeval are both two signed
@@ -1196,10 +1371,20 @@ pub unsafe extern "C" fn ntcp_managed_setsockopt(
             call(id, Op::SetTimeout(send, micros))?;
             return Ok(0);
         }
-        if len < 4 {
-            return Err(EINVAL);
-        }
-        let value = load(p.cast::<i32>())?;
+        let value = if level == IPPROTO_IP && matches!(name, IP_TOS | IP_MTU_DISCOVER) {
+            if len == 1 {
+                load(p.cast::<u8>())? as i32
+            } else if len == 4 {
+                load(p.cast::<i32>())?
+            } else {
+                return Err(EINVAL);
+            }
+        } else {
+            if len < 4 {
+                return Err(EINVAL);
+            }
+            load(p.cast::<i32>())?
+        };
         call(id, Op::Set(level, name, value))?;
         Ok(0)
     }) as i32
@@ -1238,8 +1423,28 @@ pub unsafe extern "C" fn ntcp_managed_getsockopt(
             store(len, &(n as u32))?;
             return Ok(0);
         }
+        if let Some(option) = match (level, name) {
+            (IPPROTO_TCP, TCP_INFO) => Some(1),
+            (IPPROTO_TCP, TCP_CC_INFO) => Some(2),
+            (SOL_SOCKET, SO_MEMINFO) => Some(3),
+            _ => None,
+        } {
+            let bytes = call(id, Op::Transport(option))?.bytes;
+            let n = (load(len)? as usize).min(bytes.len());
+            copy_out(p.cast(), &bytes[..n])?;
+            store(len, &(n as u32))?;
+            return Ok(0);
+        }
         let value = call(id, Op::Get(level, name))?.value.to_ne_bytes();
-        let n = (load(len)? as usize).min(4);
+        let requested = load(len)? as usize;
+        let n = if level == IPPROTO_IP
+            && matches!(name, IP_TOS | IP_MTU_DISCOVER)
+            && (1..4).contains(&requested)
+        {
+            1
+        } else {
+            requested.min(4)
+        };
         copy_out(p.cast(), &value[..n])?;
         store(len, &(n as u32))?;
         Ok(0)

@@ -152,6 +152,8 @@ version = "0.0.1"
 dependencies = [
  "libc",
  "ntcp",
+ "ntcp-ip",
+ "ntcp-socket",
 ]
 
 [[package]]

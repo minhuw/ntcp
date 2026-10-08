@@ -2,10 +2,13 @@
 name = "ntcp-socket"
 version = "0.0.1"
 edition = "2024"
-license = "MIT"
+license = "MIT AND GPL-2.0-or-later"
 
 [lib]
 crate-type = ["rlib", "cdylib"]
+
+[features]
+packet-test = []
 
 [dependencies]
 libc = "0.2"

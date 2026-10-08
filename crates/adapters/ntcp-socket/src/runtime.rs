@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 use crate::*;
 use ntcp::{
     AddressValidation, CloseReason, ConnectionId, Endpoint, EndpointConfig, EndpointError, Error,
@@ -6,11 +7,14 @@ use ntcp::{
 use ntcp_io::{PacketIo, TxOutcome};
 use ntcp_io_tun::Tun;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::mpsc::{self, Receiver, SyncSender},
     time::Instant,
 };
+
+#[cfg(feature = "packet-test")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const LIMIT: usize = 512;
 pub const BYTES: usize = 65536;
@@ -25,15 +29,30 @@ fn socket_buffer_value(name: i32, value: i32) -> usize {
 #[derive(Clone)]
 pub enum Op {
     New(i32),
+    Wait(Box<Op>, Option<std::time::Duration>),
+    FinishConnect,
+    #[cfg(all(test, feature = "packet-test"))]
+    BlockingConnect(SocketAddr),
     Bind(SocketAddr),
     Listen(i32),
     Accept(i32),
     Connect(SocketAddr),
     Read(usize),
+    ReadTo(usize, i32, Vec<(usize, usize)>, Vec<(usize, Vec<u8>)>),
     Peek(usize),
     SetTimeout(bool, u64),
     GetTimeout(bool),
+    #[cfg(test)]
     Write(Vec<u8>),
+    #[cfg(all(test, feature = "packet-test"))]
+    WriteFlags(Vec<u8>, i32),
+    Send(Vec<(usize, usize)>, i32),
+    ErrorQueueTo(usize),
+    Transport(i32),
+    #[cfg(feature = "packet-test")]
+    Inject(Vec<u8>),
+    #[cfg(feature = "packet-test")]
+    Capture(usize),
     Close,
     Shutdown(i32),
     Flags(i32, i32),
@@ -49,16 +68,22 @@ pub struct Reply {
     pub timeout_us: u64,
     pub bytes: Vec<u8>,
     pub addr: Option<SocketAddr>,
+    #[cfg(feature = "packet-test")]
+    pub stamp: i64,
 }
 struct Request {
     id: u64,
     op: Op,
     reply: SyncSender<Result<Reply>>,
+    deadline: Option<Instant>,
 }
 pub struct Runtime {
     tx: SyncSender<Request>,
     pub wake: i32,
     pub family: i32,
+    pub io_limit: usize,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 impl Runtime {
     #[cfg(test)]
@@ -81,6 +106,9 @@ impl Runtime {
             tx,
             wake,
             family: AF_INET,
+            io_limit: BYTES,
+            stop: Default::default(),
+            worker: Mutex::new(None),
         }
     }
 
@@ -90,26 +118,45 @@ impl Runtime {
             .ok_or(EINVAL)?
             .parse()
             .map_err(|_| EAFNOSUPPORT)?;
+        Self::spawn(move || Owner::new(&name, local), false)
+    }
+    #[cfg(feature = "packet-test")]
+    pub fn packet(settings: (Ipv4Addr, crate::packet_profile::Profile)) -> Result<Self> {
+        Self::spawn(move || Owner::packet(settings), true)
+    }
+    fn spawn(
+        start: impl FnOnce() -> Result<Owner> + Send + 'static + std::panic::UnwindSafe,
+        packet: bool,
+    ) -> Result<Self> {
         let wake = unsafe { syscall(SYS_eventfd2, 0, EFD_NONBLOCK | EFD_CLOEXEC) as i32 };
         if wake < 0 {
             return Err(errno());
         }
-        let (tx, rx) = mpsc::sync_channel(LIMIT);
+        let (tx, rx) = mpsc::sync_channel(if packet { 128 } else { LIMIT });
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
         let spawned = std::thread::Builder::new()
             .name("ntcp-socket".into())
             .spawn(move || {
                 set_internal(true);
-                let result = std::panic::catch_unwind(|| match Owner::new(&name, local) {
+                let result = std::panic::catch_unwind(|| match start() {
                     Ok(mut owner) => {
                         let _ = ready_tx.send(Ok(()));
-                        owner.run(rx, wake);
+                        owner.run(rx, wake, &stopping);
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
                     }
                 });
                 // Dropping rx and all requests wakes callers on panic/failure.
+                #[cfg(feature = "packet-test")]
+                if packet && result.is_err() {
+                    crate::packet_profile::diagnostic(
+                        "FAILURE",
+                        "shared socket owner panicked; adapter stopped",
+                    );
+                }
                 let _ = result;
                 signal(wake);
             });
@@ -128,12 +175,37 @@ impl Runtime {
             tx,
             wake,
             family: AF_INET,
+            io_limit: if packet { 65535 } else { BYTES },
+            stop,
+            worker: Mutex::new(Some(worker)),
         })
     }
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        signal(self.wake);
+        if let Ok(mut worker) = self.worker.lock()
+            && let Some(worker) = worker.take()
+        {
+            let _ = worker.join();
+        }
+    }
     pub fn call(&self, id: u64, op: Op) -> Result<Reply> {
+        if self.stop.load(Ordering::Acquire) {
+            return Err(ECANCELED);
+        }
         let (reply, rx) = mpsc::sync_channel(1);
         let closing = matches!(op, Op::Close);
-        let request = Request { id, op, reply };
+        let deadline = if let Op::Wait(_, Some(duration)) = &op {
+            Instant::now().checked_add(*duration)
+        } else {
+            None
+        };
+        let request = Request {
+            id,
+            op,
+            reply,
+            deadline,
+        };
         if closing {
             // Descriptor teardown must not strand an Endpoint socket when the
             // bounded request channel is temporarily full. No registry lock is held.
@@ -145,6 +217,14 @@ impl Runtime {
             })?;
         }
         rx.recv().unwrap_or(Err(EIO))
+    }
+}
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        self.stop();
+        unsafe {
+            syscall(SYS_close, self.wake);
+        }
     }
 }
 fn close_failed_startup(worker: std::thread::JoinHandle<()>, wake: i32) {
@@ -197,6 +277,12 @@ struct Socket {
     read_shutdown: bool,
     receive_timeout_us: u64,
     send_timeout_us: u64,
+    user_timeout_ms: i32,
+    tos: u8,
+    discover: i32,
+    zerocopy: bool,
+    zc_next: u32,
+    completions: VecDeque<(u32, u32)>,
 }
 impl Socket {
     fn new(flags: i32) -> Self {
@@ -219,6 +305,12 @@ impl Socket {
             read_shutdown: false,
             receive_timeout_us: 0,
             send_timeout_us: 0,
+            user_timeout_ms: 0,
+            tos: 0,
+            discover: IP_PMTUDISC_WANT,
+            zerocopy: false,
+            zc_next: 0,
+            completions: VecDeque::new(),
         }
     }
     fn keepalive_config(&self) -> Option<ntcp::KeepaliveConfig> {
@@ -230,6 +322,28 @@ impl Socket {
         })
     }
 }
+fn user_timeout_us(milliseconds: i32) -> Result<Option<u64>> {
+    let ms = u64::try_from(milliseconds).map_err(|_| EINVAL)?;
+    Ok((ms != 0).then_some(ms * 1000))
+}
+// SPDX-License-Identifier: GPL-2.0-or-later (ported copied-completion accounting)
+fn extends_completion(range: (u32, u32), next: u32) -> bool {
+    range.1.wrapping_add(1) == next && u64::from(range.1.wrapping_sub(range.0)) + 2 < (1u64 << 32)
+}
+pub(crate) fn unsupported_option(reason: &str) -> i32 {
+    #[cfg(feature = "packet-test")]
+    return crate::packet_profile::unsupported(reason);
+    #[cfg(not(feature = "packet-test"))]
+    {
+        let _ = reason;
+        EOPNOTSUPP
+    }
+}
+#[cfg(feature = "packet-test")]
+struct PacketBackend {
+    profile: crate::packet_profile::Profile,
+    output: VecDeque<Reply>,
+}
 struct Owner {
     endpoint: Endpoint,
     tun: Option<Tun>,
@@ -240,7 +354,11 @@ struct Owner {
     next_id: u64,
     detached: Vec<ConnectionId>,
     pending_packet: Option<Vec<u8>>,
+    pending: VecDeque<Request>,
     child_timeouts: Vec<(ConnectionId, u64, u64, u64)>,
+    connection_options: Vec<(ConnectionId, u8, i32, Option<bool>)>,
+    #[cfg(feature = "packet-test")]
+    packets: Option<PacketBackend>,
 }
 fn unicast(ip: Ipv4Addr) -> bool {
     ip.octets()[0] != 0 && ip.octets()[0] < 224 && !ip.is_loopback()
@@ -373,21 +491,132 @@ impl Owner {
             next_id: 1,
             detached: Vec::new(),
             pending_packet: None,
+            pending: VecDeque::new(),
             child_timeouts: Vec::new(),
+            connection_options: Vec::new(),
+            #[cfg(feature = "packet-test")]
+            packets: None,
         })
+    }
+    #[cfg(feature = "packet-test")]
+    fn packet((local, profile): (Ipv4Addr, crate::packet_profile::Profile)) -> Result<Self> {
+        // Deterministic key and synthetic address policy are explicit test-only
+        // settings, never a production entropy source or TUN routing policy.
+        let mut owner = Self::with_endpoint(local, (local, 32), [42; 32], None)?;
+        owner.endpoint = Endpoint::new(
+            crate::packet_profile::config(profile),
+            [42; 32],
+            0,
+            move |r| match r {
+                AddressValidation::Bind { local: addr } => {
+                    addr.is_unspecified() || addr == IpAddr::V4(local)
+                }
+                AddressValidation::Open { local: addr, .. } => addr == IpAddr::V4(local),
+                AddressValidation::Incoming { destination, .. } => destination == IpAddr::V4(local),
+                AddressValidation::Route { .. } => false,
+            },
+        )
+        .map_err(engine)?;
+        owner.packets = Some(PacketBackend {
+            profile,
+            output: VecDeque::new(),
+        });
+        Ok(owner)
+    }
+    fn socket_limit(&self) -> usize {
+        #[cfg(feature = "packet-test")]
+        if self.packets.is_some() {
+            return crate::packet_profile::LIMIT;
+        }
+        LIMIT
+    }
+    fn fresh_socket(&self, flags: i32) -> Socket {
+        #[cfg(feature = "packet-test")]
+        if let Some(packets) = &self.packets {
+            let mut socket = Socket::new(flags);
+            let config = crate::packet_profile::config(packets.profile);
+            socket.receive_capacity = config.connection.receive_capacity;
+            socket.send_capacity = config.connection.send_capacity;
+            return socket;
+        }
+        Socket::new(flags)
+    }
+    fn batch_time(&self) -> Option<u64> {
+        #[cfg(feature = "packet-test")]
+        if self
+            .packets
+            .as_ref()
+            .is_some_and(|p| p.profile == crate::packet_profile::Profile::UpstreamCubic)
+        {
+            return Some(self.now());
+        }
+        None
+    }
+    fn frame(&self, tx: ntcp::Transmit, tcp: &[u8]) -> Result<Vec<u8>> {
+        let mut packet = vec![0; 20 + tcp.len()];
+        packet[20..].copy_from_slice(tcp);
+        let n = ntcp_ip::encode(&mut packet, tx, (self.now() / 1000) as u32).map_err(|_| EIO)?;
+        packet.truncate(n);
+        if tx
+            .connection
+            .and_then(|cid| self.connection_options.iter().find(|p| p.0 == cid))
+            .is_some_and(|p| p.2 == IP_PMTUDISC_DONT)
+        {
+            packet[6] = 0;
+            packet[10..12].fill(0);
+            let checksum = ntcp_ip::checksum(&packet[..20]);
+            packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+        }
+        Ok(packet)
     }
     fn now(&self) -> u64 {
         self.epoch.elapsed().as_micros().min(u64::MAX as u128) as u64
     }
-    fn run(&mut self, rx: Receiver<Request>, wake: i32) {
+    fn packet_wait(&self, op: &Op) -> bool {
+        #[cfg(feature = "packet-test")]
+        if matches!(op, Op::Wait(op, _) if matches!(**op, Op::Capture(_))) {
+            return true;
+        }
+        let _ = op;
+        false
+    }
+    fn service(&mut self, request: &Request) -> bool {
+        let (op, wait) = if let Op::Wait(op, _) = &request.op {
+            ((**op).clone(), true)
+        } else {
+            (request.op.clone(), false)
+        };
+        let result = self.execute(request.id, op);
+        if matches!(result, Err(EAGAIN))
+            && wait
+            && (self
+                .sockets
+                .get(&request.id)
+                .is_some_and(|s| s.flags & SOCK_NONBLOCK == 0)
+                || self.packet_wait(&request.op))
+            && request
+                .deadline
+                .is_none_or(|deadline| Instant::now() < deadline)
+        {
+            return false;
+        }
+        let _ = request.reply.send(result);
+        true
+    }
+    fn run(&mut self, rx: Receiver<Request>, wake: i32, stop: &std::sync::atomic::AtomicBool) {
         let mut input = vec![0; 65535];
-        loop {
+        while !stop.load(Ordering::Acquire) {
             let now = self.now();
             if self.endpoint.on_timeout(now, BUDGET).is_err() {
                 break;
             }
             for _ in 0..BUDGET {
-                match self.tun.as_mut().unwrap().receive(&mut input) {
+                match self
+                    .tun
+                    .as_mut()
+                    .map(|tun| tun.receive(&mut input))
+                    .unwrap_or(Ok(None))
+                {
                     Ok(Some(n)) => {
                         if let Ok(p) = ntcp_ip::parse(&input[..n], false)
                             && p.protocol == 6
@@ -403,41 +632,75 @@ impl Owner {
                 }
             }
             self.events();
+            let mut after_output = Vec::with_capacity(BUDGET);
+            for _ in 0..self.pending.len().min(BUDGET) {
+                let request = self.pending.pop_front().unwrap();
+                let early = matches!(&request.op, Op::Wait(op, _) if matches!(**op, Op::Read(_) | Op::Peek(_) | Op::ReadTo(..)))
+                    && self.sockets.get(&request.id).is_some_and(|s| s.error == 0);
+                if !early || !self.service(&request) {
+                    after_output.push((request, early));
+                }
+            }
+            let transmit_now = self.batch_time();
             for _ in 0..BUDGET {
                 if self.pending_packet.is_none() {
-                    let mut packet = vec![0; 1500];
-                    let transmit =
-                        match self
-                            .endpoint
-                            .poll_transmit(self.now(), &mut packet[20..], BUDGET)
-                        {
-                            Ok(tx) => tx.packet,
-                            Err(_) => return,
-                        };
+                    #[cfg(feature = "packet-test")]
+                    if self
+                        .packets
+                        .as_ref()
+                        .is_some_and(|p| p.output.len() == crate::packet_profile::LIMIT)
+                    {
+                        break;
+                    }
+                    let mut packet = vec![0; if self.tun.is_some() { 1500 } else { 65535 }];
+                    let transmit = match self.endpoint.poll_transmit(
+                        transmit_now.unwrap_or_else(|| self.now()),
+                        &mut packet[20..],
+                        BUDGET,
+                    ) {
+                        Ok(tx) => tx.packet,
+                        Err(_) => return,
+                    };
                     let Some(tx) = transmit else {
                         break;
                     };
-                    let n = match ntcp_ip::encode(&mut packet, tx, (self.now() / 1000) as u32) {
-                        Ok(n) => n,
+                    packet = match self.frame(tx, &packet[20..20 + tx.len]) {
+                        Ok(packet) => packet,
                         Err(_) => return,
                     };
-                    packet.truncate(n);
                     self.pending_packet = Some(packet);
                 }
-                // Never poll another TCP segment until this complete IP packet is submitted.
-                match self
-                    .tun
-                    .as_mut()
-                    .unwrap()
-                    .transmit(self.pending_packet.as_ref().unwrap())
-                {
-                    Ok(TxOutcome::Submitted) => self.pending_packet = None,
-                    Ok(TxOutcome::WouldBlock) => break,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
-                    Err(_) => return,
+                // Never poll another TCP segment until this complete packet is submitted.
+                if let Some(tun) = self.tun.as_mut() {
+                    match tun.transmit(self.pending_packet.as_ref().unwrap()) {
+                        Ok(TxOutcome::Submitted) => self.pending_packet = None,
+                        Ok(TxOutcome::WouldBlock) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
+                        Err(_) => return,
+                    }
+                }
+                #[cfg(feature = "packet-test")]
+                if let Some(packets) = self.packets.as_mut() {
+                    let bytes = self.pending_packet.take().unwrap();
+                    packets.output.push_back(Reply {
+                        value: bytes.len() as i32,
+                        bytes,
+                        stamp: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_micros() as i64,
+                        ..Reply::default()
+                    });
                 }
             }
             self.events();
+            for (request, retried) in after_output {
+                if retried || !self.service(&request) {
+                    self.pending.push_back(request);
+                }
+            }
+            self.connection_options
+                .retain(|p| self.endpoint.connection_exists(p.0));
             self.detached.retain(|&id| {
                 if matches!(self.endpoint.state(id), Ok(State::Closed | State::TimeWait)) {
                     let _ = self.endpoint.release(id);
@@ -447,22 +710,41 @@ impl Owner {
                 }
             });
             // Bounded owner work and a 1ms ceiling also cover shared wakefd consumers.
-            match rx.recv_timeout(std::time::Duration::from_millis(1)) {
+            let wait = self
+                .endpoint
+                .next_deadline()
+                .map(|d| std::time::Duration::from_micros(d.saturating_sub(self.now())))
+                .unwrap_or(std::time::Duration::from_millis(1))
+                .min(std::time::Duration::from_millis(1));
+            match rx.recv_timeout(wait) {
                 Ok(r) => {
-                    let result = self.execute(r.id, r.op);
-                    let _ = r.reply.send(result);
-                    for _ in 1..BUDGET {
+                    if self.pending.len() == self.socket_limit() && !matches!(r.op, Op::Close) {
+                        let _ = r.reply.send(Err(EAGAIN));
+                    } else if !self.service(&r) {
+                        self.pending.push_back(r);
+                    }
+                    #[cfg(feature = "packet-test")]
+                    let requests = if self.packets.is_some() { 1 } else { BUDGET };
+                    #[cfg(not(feature = "packet-test"))]
+                    let requests = BUDGET;
+                    for _ in 1..requests {
                         let Ok(r) = rx.try_recv() else {
                             break;
                         };
-                        let result = self.execute(r.id, r.op);
-                        let _ = r.reply.send(result);
+                        if self.pending.len() == self.socket_limit() && !matches!(r.op, Op::Close) {
+                            let _ = r.reply.send(Err(EAGAIN));
+                        } else if !self.service(&r) {
+                            self.pending.push_back(r);
+                        }
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => (),
             }
             signal(wake);
+        }
+        for request in self.pending.drain(..) {
+            let _ = request.reply.send(Err(ECANCELED));
         }
     }
     fn prune_child_timeouts(&mut self) {
@@ -483,6 +765,29 @@ impl Owner {
             remote: SocketAddr::new(ip.source, u16::from_be_bytes([ports[0], ports[1]])),
         });
         let before = tuple.and_then(|tuple| self.endpoint.connection_id(tuple));
+        let listener_options = tuple.and_then(|tuple| {
+            self.sockets
+                .values()
+                .find(|s| {
+                    matches!(s.handle, Handle::Listener(_))
+                        && s.local.is_some_and(|local| {
+                            local.port() == tuple.local.port()
+                                && (local.ip().is_unspecified() || local == tuple.local)
+                        })
+                })
+                .map(|s| (s.tos, s.discover, s.zerocopy))
+        });
+        if listener_options.is_some()
+            && before
+                .is_none_or(|id| matches!(self.endpoint.state(id), Ok(State::TimeWait) | Err(_)))
+        {
+            self.connection_options
+                .retain(|p| self.endpoint.connection_exists(p.0));
+            if self.connection_options.len() == self.socket_limit() {
+                return Err(EndpointError::LimitReached);
+            }
+        }
+
         let result = self
             .endpoint
             .input_with_traffic_class(now, ip, traffic_class, bytes);
@@ -504,6 +809,24 @@ impl Owner {
             debug_assert!(self.child_timeouts.len() < LIMIT);
             self.child_timeouts
                 .push((cid, listener, s.receive_timeout_us, s.send_timeout_us));
+        }
+        if let Some(tuple) = tuple
+            && let Some(cid) = self.endpoint.connection_id(tuple)
+        {
+            if Some(cid) != before
+                && let Some((tos, discover, _)) = listener_options
+            {
+                self.endpoint.set_dscp(cid, tos >> 2)?;
+                self.connection_options.push((cid, tos, discover, None));
+            }
+            if matches!(
+                self.endpoint.state(cid),
+                Ok(State::Established | State::CloseWait)
+            ) && let Some(p) = self.connection_options.iter_mut().find(|p| p.0 == cid)
+                && p.3.is_none()
+            {
+                p.3 = listener_options.map(|p| p.2);
+            }
         }
         result
     }
@@ -536,7 +859,7 @@ impl Owner {
         }
     }
     fn alloc(&mut self, s: Socket) -> Result<i32> {
-        if self.sockets.len() == LIMIT || self.next_id > i32::MAX as u64 {
+        if self.sockets.len() == self.socket_limit() || self.next_id > i32::MAX as u64 {
             return Err(EMFILE);
         }
         let id = self.next_id;
@@ -545,6 +868,10 @@ impl Owner {
         Ok(id as i32)
     }
     fn port(&mut self) -> Result<u16> {
+        #[cfg(feature = "packet-test")]
+        if self.packets.is_some() && self.next_port >= 60000 {
+            return Err(EADDRNOTAVAIL);
+        }
         for _ in 0..20000 {
             let p = self.next_port;
             self.next_port = if p == 59999 { 40000 } else { p + 1 };
@@ -563,6 +890,10 @@ impl Owner {
         self.endpoint
             .set_keepalive(cid, s.keepalive_config())
             .map_err(engine)?;
+        self.endpoint
+            .set_application_timeout(cid, user_timeout_us(s.user_timeout_ms)?)
+            .map_err(engine)?;
+        self.endpoint.set_dscp(cid, s.tos >> 2).map_err(engine)?;
         self.endpoint.set_nagle(cid, !s.nodelay).map_err(engine)
     }
     fn rollback_connection(&mut self, cid: ConnectionId) {
@@ -570,12 +901,95 @@ impl Owner {
         let _ = self.endpoint.abort(cid);
         let _ = self.endpoint.release(cid);
     }
+    fn send_state(&mut self, id: u64) -> Result<ConnectionId> {
+        let s = self.sockets.get_mut(&id).ok_or(EBADF)?;
+        let Handle::Connection(cid) = s.handle else {
+            return Err(ENOTCONN);
+        };
+        if s.error != 0 {
+            let e = s.error;
+            s.error = 0;
+            return Err(e);
+        }
+        let state = self.endpoint.state(cid).map_err(engine)?;
+        if s.write_shutdown || matches!(state, State::Closed | State::TimeWait) {
+            return Err(EPIPE);
+        }
+        if matches!(state, State::SynSent | State::SynReceived) {
+            return Err(EAGAIN);
+        }
+        Ok(cid)
+    }
+    fn reserve_completion(&mut self, id: u64, nonempty: bool, flags: i32) -> Result<bool> {
+        let limit = self.socket_limit();
+        let s = self.sockets.get_mut(&id).ok_or(EBADF)?;
+        let completion = nonempty && s.zerocopy && flags & MSG_ZEROCOPY != 0;
+        if completion
+            && !s
+                .completions
+                .back()
+                .is_some_and(|&p| extends_completion(p, s.zc_next))
+        {
+            if s.completions.len() == limit {
+                return Err(ENOBUFS);
+            }
+            s.completions.try_reserve(1).map_err(|_| ENOBUFS)?;
+        }
+        Ok(completion)
+    }
+    fn write(&mut self, id: u64, bytes: Vec<u8>, flags: i32) -> Result<i32> {
+        let cid = self.send_state(id)?;
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let completion = self.reserve_completion(id, true, flags)?;
+        let s = self.sockets.get_mut(&id).unwrap();
+        let n = self.endpoint.write(cid, &bytes).map_err(engine)?;
+        if n != 0 && completion {
+            let next = s.zc_next;
+            if let Some(tail) = s.completions.back_mut()
+                && extends_completion(*tail, next)
+            {
+                tail.1 = next;
+            } else {
+                s.completions.push_back((next, next));
+            }
+            s.zc_next = next.wrapping_add(1);
+        }
+        Ok(n as i32)
+    }
     fn execute(&mut self, id: u64, op: Op) -> Result<Reply> {
         self.endpoint.on_timeout(self.now(), 0).map_err(engine)?;
+        self.dispatch(id, op)
+    }
+    fn dispatch(&mut self, id: u64, op: Op) -> Result<Reply> {
         self.prune_child_timeouts();
         let mut out = Reply::default();
+        #[cfg(feature = "packet-test")]
+        match &op {
+            Op::Inject(bytes) => {
+                if self.packets.is_none() {
+                    return Err(EOPNOTSUPP);
+                }
+                let packet = crate::packet_profile::parse_frame(bytes)?;
+                self.input(self.now(), packet.ip, packet.traffic_class, packet.payload)
+                    .map_err(engine)?;
+                self.events();
+                return Ok(out);
+            }
+            Op::Capture(capacity) => {
+                let packets = self.packets.as_mut().ok_or(EOPNOTSUPP)?;
+                let front = packets.output.front().ok_or(EAGAIN)?;
+                if front.bytes.len() > *capacity {
+                    return Err(EMSGSIZE);
+                }
+                return Ok(packets.output.pop_front().unwrap());
+            }
+            _ => (),
+        }
+        self.events();
         if let Op::New(flags) = op {
-            out.value = self.alloc(Socket::new(flags))?;
+            out.value = self.alloc(self.fresh_socket(flags))?;
             return Ok(out);
         }
         let s = self.sockets.get(&id).ok_or(EBADF)?;
@@ -605,6 +1019,7 @@ impl Owner {
                     return Err(EOPNOTSUPP);
                 }
                 let capacities = (s.send_capacity, s.receive_capacity);
+                let application_timeout = user_timeout_us(s.user_timeout_ms)?;
                 let local = match s.local {
                     Some(a) => a,
                     None => SocketAddr::new(self.local.into(), self.port()?),
@@ -621,24 +1036,32 @@ impl Owner {
                     let _ = self.endpoint.close_listener(listener);
                     return Err(engine(e));
                 }
+                if let Err(e) = self
+                    .endpoint
+                    .set_listener_application_timeout(listener, application_timeout)
+                {
+                    let _ = self.endpoint.close_listener(listener);
+                    return Err(engine(e));
+                }
                 let s = self.sockets.get_mut(&id).unwrap();
                 s.local = Some(local);
                 s.handle = Handle::Listener(listener);
             }
             Op::Accept(flags) => {
-                if self.sockets.len() == LIMIT {
+                if self.sockets.len() == self.socket_limit() {
                     return Err(EMFILE);
                 }
                 let Handle::Listener(listener) = s.handle else {
                     return Err(EINVAL);
                 };
-                let mut child = Socket::new(flags);
+                let mut child = self.fresh_socket(flags);
                 child.reuse = s.reuse;
                 child.nodelay = s.nodelay;
                 child.keepalive = s.keepalive;
                 child.idle = s.idle;
                 child.interval = s.interval;
                 child.probes = s.probes;
+                child.user_timeout_ms = s.user_timeout_ms;
                 let accepted = self.endpoint.accept(listener);
                 if matches!(accepted, Err(EndpointError::Connection(Error::WouldBlock))) {
                     self.sockets.get_mut(&id).unwrap().acceptable = false;
@@ -662,6 +1085,16 @@ impl Owner {
                         return Err(e);
                     }
                 };
+                child.user_timeout_ms = self
+                    .endpoint
+                    .application_timeout(cid)
+                    .map_err(engine)?
+                    .map_or(0, |us| (us / 1000) as i32);
+                if let Some(p) = self.connection_options.iter().find(|p| p.0 == cid) {
+                    child.tos = p.1;
+                    child.discover = p.2;
+                    child.zerocopy = p.3.unwrap_or(false);
+                }
                 child.handle = Handle::Connection(cid);
                 child.local = Some(tuple.local);
                 child.connected = true;
@@ -700,6 +1133,11 @@ impl Owner {
                     return Err(EINVAL);
                 }
                 let options = s.clone();
+                self.connection_options
+                    .retain(|p| self.endpoint.connection_exists(p.0));
+                if self.connection_options.len() == self.socket_limit() {
+                    return Err(ENOBUFS);
+                }
                 let mut local = match s.local {
                     Some(a) => a,
                     None => SocketAddr::new(self.local.into(), self.port()?),
@@ -721,17 +1159,29 @@ impl Owner {
                     self.rollback_connection(cid);
                     return Err(e);
                 }
+                self.connection_options.push((
+                    cid,
+                    options.tos,
+                    options.discover,
+                    Some(options.zerocopy),
+                ));
                 let s = self.sockets.get_mut(&id).unwrap();
                 s.handle = Handle::Connection(cid);
                 s.local = Some(local);
                 return Err(EINPROGRESS);
             }
-            Op::Read(capacity) | Op::Peek(capacity) => {
-                let peek = matches!(op, Op::Peek(_));
+            Op::Read(capacity) | Op::Peek(capacity) | Op::ReadTo(capacity, _, _, _) => {
+                let foreign = matches!(op, Op::ReadTo(..));
+                let peek = matches!(op, Op::Peek(_) | Op::ReadTo(..));
                 let Handle::Connection(cid) = s.handle else {
                     return Err(ENOTCONN);
                 };
-                if capacity == 0 || s.read_shutdown {
+                if capacity == 0 {
+                    if let Op::ReadTo(_, _, _, copies) = &op {
+                        for (address, bytes) in copies {
+                            copy_out(*address as *mut u8, bytes)?;
+                        }
+                    }
                     return Ok(out);
                 }
                 // Deliver buffered data before the terminal error/EOF.
@@ -748,8 +1198,19 @@ impl Owner {
                     s.error = 0;
                     return Err(e);
                 }
+                if terminal && !s.connected {
+                    return Err(ENOTCONN);
+                }
                 out.bytes.resize(capacity.min(BYTES), 0);
-                let n = if peek && terminal {
+                let n = if available == 0 && s.read_shutdown {
+                    out.bytes.clear();
+                    if let Op::ReadTo(_, _, _, copies) = &op {
+                        for (address, bytes) in copies {
+                            copy_out(*address as *mut u8, bytes)?;
+                        }
+                    }
+                    return Ok(out);
+                } else if peek && terminal {
                     self.endpoint.peek_terminal(cid, &mut out.bytes)
                 } else if peek {
                     self.endpoint.peek(cid, &mut out.bytes)
@@ -761,26 +1222,82 @@ impl Owner {
                 .map_err(engine)?;
                 out.bytes.truncate(n);
                 out.value = n as i32;
+                if foreign && let Op::ReadTo(_, flags, destinations, copies) = op {
+                    let mut at = 0;
+                    for (address, capacity) in destinations {
+                        let count = capacity.min(n - at);
+                        copy_out(address as *mut u8, &out.bytes[at..at + count])?;
+                        at += count;
+                        if at == n {
+                            break;
+                        }
+                    }
+                    if at != n {
+                        return Err(EIO);
+                    }
+                    for (address, bytes) in copies {
+                        copy_out(address as *mut u8, &bytes)?;
+                    }
+                    if flags & MSG_PEEK == 0 && n != 0 {
+                        let consumed = if terminal {
+                            self.endpoint.read_terminal(cid, &mut out.bytes)
+                        } else {
+                            self.endpoint.read(cid, &mut out.bytes)
+                        }
+                        .map_err(engine)?;
+                        if consumed != n {
+                            return Err(EIO);
+                        }
+                    }
+                    out.bytes.clear();
+                }
             }
+            #[cfg(test)]
             Op::Write(bytes) => {
+                out.value = self.write(id, bytes, 0)?;
+            }
+            #[cfg(all(test, feature = "packet-test"))]
+            Op::WriteFlags(bytes, flags) => {
+                out.value = self.write(id, bytes, flags)?;
+            }
+            Op::Send(sources, flags) => {
+                // Connected/terminal errors precede payload faults. Fresh and
+                // listening fds retain the adapter's foreign-input validation.
+                let connection = matches!(s.handle, Handle::Connection(_));
+                if connection {
+                    self.send_state(id)?;
+                }
+                let total = sources
+                    .iter()
+                    .try_fold(0usize, |n, p| n.checked_add(p.1).ok_or(EINVAL))?;
+                if total > BYTES {
+                    return Err(EMSGSIZE);
+                }
+                if connection {
+                    self.reserve_completion(id, total != 0, flags)?;
+                }
+                let mut bytes = vec![0; total];
+                let mut at = 0;
+                for (address, len) in sources {
+                    memory(bytes[at..].as_mut_ptr(), address as *mut u8, len, false)?;
+                    at += len;
+                }
+                out.value = self.write(id, bytes, flags)?;
+            }
+            Op::ErrorQueueTo(address) => {
+                let completion = *s.completions.front().ok_or(EAGAIN)?;
+                let p = address as *mut msghdr;
+                copy_completion(p, load(p)?, completion)?;
+                self.sockets.get_mut(&id).unwrap().completions.pop_front();
+            }
+            Op::Transport(option) => {
                 let Handle::Connection(cid) = s.handle else {
                     return Err(ENOTCONN);
                 };
-                let state = self.endpoint.state(cid).map_err(engine)?;
-                if s.write_shutdown || matches!(state, State::Closed | State::TimeWait) {
-                    return Err(EPIPE);
-                }
-                if s.error != 0 {
-                    return Err(s.error);
-                }
-                if matches!(state, State::SynSent | State::SynReceived) {
-                    return Err(EAGAIN);
-                }
-                out.value = if bytes.is_empty() {
-                    0
-                } else {
-                    self.endpoint.write(cid, &bytes).map_err(engine)? as i32
-                };
+                out.bytes = crate::transport::transport_option(
+                    self.endpoint.transport_info(cid).map_err(engine)?,
+                    option,
+                )?;
             }
             Op::Close => {
                 match s.handle {
@@ -793,27 +1310,32 @@ impl Owner {
                         ) {
                             let _ = self.endpoint.close(cid);
                         }
-                        if matches!(
-                            self.endpoint.state(cid),
-                            Ok(State::Closed | State::TimeWait)
-                        ) {
-                            self.endpoint.release(cid).map_err(engine)?;
-                        } else {
-                            // Endpoint has at most LIMIT records; this attached
-                            // record is not yet in detached, so there is room.
-                            debug_assert!(self.detached.len() < LIMIT);
-                            self.detached.push(cid);
-                        }
+                        debug_assert!(self.detached.len() < LIMIT);
+                        self.detached.push(cid);
                     }
                 }
                 self.child_timeouts
                     .retain(|(_, listener, _, _)| *listener != id);
+                self.pending.retain(|request| {
+                    if request.id == id {
+                        let _ = request.reply.send(Err(EBADF));
+                        false
+                    } else {
+                        true
+                    }
+                });
                 self.sockets.remove(&id);
             }
             Op::Shutdown(how) => {
                 let Handle::Connection(cid) = s.handle else {
                     return Err(ENOTCONN);
                 };
+                if matches!(
+                    self.endpoint.state(cid),
+                    Ok(State::Closed | State::TimeWait)
+                ) {
+                    return Err(ENOTCONN);
+                }
                 if !(SHUT_RD..=SHUT_RDWR).contains(&how) {
                     return Err(EINVAL);
                 }
@@ -837,6 +1359,10 @@ impl Owner {
                     }
                     F_SETFL => {
                         if value & !(O_ACCMODE | O_NONBLOCK) != 0 {
+                            #[cfg(feature = "packet-test")]
+                            if self.packets.is_some() {
+                                return Err(unsupported_option("fcntl status flags"));
+                            }
                             return Err(EOPNOTSUPP);
                         }
                         s.flags = (s.flags & !SOCK_NONBLOCK)
@@ -874,6 +1400,29 @@ impl Owner {
                     (SOL_SOCKET, SO_RCVBUF) => {
                         s.receive_capacity = socket_buffer_value(name, value)
                     }
+                    (SOL_SOCKET, SO_ZEROCOPY) => {
+                        if !(0..=1).contains(&value) {
+                            return Err(EINVAL);
+                        }
+                        s.zerocopy = value != 0;
+                    }
+                    (IPPROTO_IP, IP_TOS) => s.tos = value as u8 & !3,
+                    (IPPROTO_IP, IP_MTU_DISCOVER) => {
+                        match value {
+                            IP_PMTUDISC_DONT | IP_PMTUDISC_WANT | IP_PMTUDISC_DO => (),
+                            3..=5 => {
+                                return Err(unsupported_option(
+                                    "IP_MTU_DISCOVER: PROBE/INTERFACE/OMIT require route features",
+                                ));
+                            }
+                            _ => return Err(EINVAL),
+                        }
+                        s.discover = value;
+                    }
+                    (IPPROTO_TCP, TCP_USER_TIMEOUT) => {
+                        user_timeout_us(value)?;
+                        s.user_timeout_ms = value;
+                    }
                     (IPPROTO_TCP, TCP_NODELAY) => s.nodelay = value != 0,
                     (IPPROTO_TCP, TCP_KEEPIDLE) if value > 0 && value <= 32767 => s.idle = value,
                     (IPPROTO_TCP, TCP_KEEPINTVL) if value > 0 && value <= 32767 => {
@@ -883,7 +1432,13 @@ impl Owner {
                     (IPPROTO_TCP, TCP_KEEPIDLE | TCP_KEEPINTVL | TCP_KEEPCNT) => {
                         return Err(EINVAL);
                     }
-                    _ => return Err(ENOPROTOOPT),
+                    _ => {
+                        #[cfg(feature = "packet-test")]
+                        if self.packets.is_some() {
+                            return Err(unsupported_option("socket option"));
+                        }
+                        return Err(ENOPROTOOPT);
+                    }
                 }
                 if matches!((level, name), (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF)) {
                     match s.handle {
@@ -903,6 +1458,20 @@ impl Owner {
                     }
                 } else if let Handle::Connection(cid) = s.handle {
                     self.apply_options(cid, s)?;
+                }
+                if let Handle::Connection(cid) = s.handle
+                    && let Some(p) = self.connection_options.iter_mut().find(|p| p.0 == cid)
+                {
+                    p.1 = s.tos;
+                    p.2 = s.discover;
+                }
+                if let Handle::Listener(listener) = s.handle {
+                    self.endpoint
+                        .set_listener_application_timeout(
+                            listener,
+                            user_timeout_us(s.user_timeout_ms)?,
+                        )
+                        .map_err(engine)?;
                 }
                 self.sockets.insert(id, candidate);
             }
@@ -925,10 +1494,20 @@ impl Owner {
                     (SOL_SOCKET, SO_SNDBUF) => s.send_capacity as i32,
                     (SOL_SOCKET, SO_RCVBUF) => s.receive_capacity as i32,
                     (IPPROTO_TCP, TCP_NODELAY) => s.nodelay as i32,
+                    (IPPROTO_TCP, TCP_USER_TIMEOUT) => s.user_timeout_ms,
+                    (IPPROTO_IP, IP_TOS) => s.tos as i32,
+                    (IPPROTO_IP, IP_MTU_DISCOVER) => s.discover,
+                    (SOL_SOCKET, SO_ZEROCOPY) => s.zerocopy as i32,
                     (IPPROTO_TCP, TCP_KEEPIDLE) => s.idle,
                     (IPPROTO_TCP, TCP_KEEPINTVL) => s.interval,
                     (IPPROTO_TCP, TCP_KEEPCNT) => s.probes,
-                    _ => return Err(ENOPROTOOPT),
+                    _ => {
+                        #[cfg(feature = "packet-test")]
+                        if self.packets.is_some() {
+                            return Err(unsupported_option("socket option"));
+                        }
+                        return Err(ENOPROTOOPT);
+                    }
                 };
             }
             Op::Name(peer) => {
@@ -948,9 +1527,7 @@ impl Owner {
             Op::Available => {
                 out.value = match s.handle {
                     Handle::Connection(cid) => {
-                        if s.read_shutdown {
-                            0
-                        } else if self.endpoint.state(cid).map_err(engine)? == State::Closed {
+                        if self.endpoint.state(cid).map_err(engine)? == State::Closed {
                             self.endpoint.terminal_readable_bytes(cid).map_err(engine)? as i32
                         } else {
                             self.endpoint.readable_bytes(cid).map_err(engine)? as i32
@@ -961,7 +1538,7 @@ impl Owner {
                 };
             }
             Op::Ready => {
-                if s.error != 0 {
+                if s.error != 0 || !s.completions.is_empty() {
                     out.value |= EPOLLERR;
                 }
                 match s.handle {
@@ -982,7 +1559,13 @@ impl Owner {
                                 | State::TimeWait
                                 | State::Closed
                         );
-                        if info.receive_used != 0 || eof || s.read_shutdown {
+                        let readable = if state == State::Closed {
+                            self.endpoint.terminal_readable_bytes(cid)
+                        } else {
+                            self.endpoint.readable_bytes(cid)
+                        }
+                        .map_err(engine)?;
+                        if readable != 0 || eof || s.read_shutdown {
                             out.value |= EPOLLIN;
                         }
                         if eof {
@@ -996,13 +1579,43 @@ impl Owner {
                         {
                             out.value |= EPOLLOUT;
                         }
-                        if state == State::Closed || (s.write_shutdown && eof) {
+                        if state == State::Closed || (s.write_shutdown && (eof || s.read_shutdown))
+                        {
                             out.value |= EPOLLHUP;
                         }
                     }
                 }
             }
+            #[cfg(all(test, feature = "packet-test"))]
+            Op::BlockingConnect(remote) => {
+                if matches!(s.handle, Handle::Fresh) {
+                    match self.dispatch(id, Op::Connect(remote)) {
+                        Err(EINPROGRESS) => return Err(EAGAIN),
+                        other => return other,
+                    }
+                }
+                return self.dispatch(id, Op::FinishConnect);
+            }
+            Op::FinishConnect => {
+                let Handle::Connection(cid) = s.handle else {
+                    return Err(ENOTCONN);
+                };
+                if s.error != 0 {
+                    let s = self.sockets.get_mut(&id).unwrap();
+                    let e = s.error;
+                    s.error = 0;
+                    return Err(e);
+                }
+                match self.endpoint.state(cid).map_err(engine)? {
+                    State::Established => (),
+                    State::Closed => return Err(ECONNREFUSED),
+                    _ => return Err(EAGAIN),
+                }
+            }
+            Op::Wait(_, _) => unreachable!(),
             Op::New(_) => unreachable!(),
+            #[cfg(feature = "packet-test")]
+            Op::Inject(_) | Op::Capture(_) => unreachable!(),
         }
         Ok(out)
     }
@@ -1388,6 +2001,7 @@ mod tests {
                 id: 1,
                 op: Op::Ready,
                 reply,
+                deadline: None,
             })
             .unwrap();
         }
@@ -1395,6 +2009,9 @@ mod tests {
             tx,
             wake: -1,
             family: AF_INET,
+            io_limit: BYTES,
+            stop: Default::default(),
+            worker: Mutex::new(None),
         };
         let caller = std::thread::spawn(move || runtime.call(1, Op::Close));
         for _ in 0..LIMIT {
@@ -1570,3 +2187,7 @@ mod tests {
         pump(&mut a, &mut b);
     }
 }
+
+#[cfg(all(test, feature = "packet-test"))]
+#[path = "packet_tests.rs"]
+mod packet_tests;

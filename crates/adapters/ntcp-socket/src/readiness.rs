@@ -58,6 +58,18 @@ pub fn close_epoll(fd: i32) -> Result<()> {
     EPOLLS.lock().map_err(|_| EIO)?.remove(&fd);
     Ok(())
 }
+#[cfg(feature = "packet-test")]
+pub(crate) fn stop_packet_backend() {
+    let mut epolls = EPOLLS.lock().unwrap_or_else(|e| e.into_inner());
+    for (&fd, epoll) in epolls.iter() {
+        if epoll.matches(fd) {
+            unsafe {
+                syscall(SYS_close, fd);
+            }
+        }
+    }
+    epolls.clear();
+}
 pub fn closed(id: u64) {
     if let Ok(mut map) = EPOLLS.lock() {
         for ep in map.values_mut() {
@@ -435,7 +447,11 @@ unsafe fn poll_impl(p: *mut pollfd, n: nfds_t, timeout: i32, mask: *const sigset
                     | POLLNVAL)
                 != 0
             {
-                return Err(EOPNOTSUPP);
+                return Err(if io_limit() < runtime::BYTES {
+                    runtime::unsupported_option("poll event mask")
+                } else {
+                    EOPNOTSUPP
+                });
             }
             let revents = if owned(original[i].fd)? != Some(id) {
                 POLLNVAL
@@ -445,12 +461,14 @@ unsafe fn poll_impl(p: *mut pollfd, n: nfds_t, timeout: i32, mask: *const sigset
             original[i].revents = revents;
             virtual_ready |= revents != 0;
         }
+        // ponytail: 1ms readiness polling matches the owner's packet/timer
+        // cadence; add per-waiter wakefds if this polling CPU cost matters.
         let ms = if virtual_ready || timeout == 0 {
             0
         } else if deadline.is_none() {
-            10
+            1
         } else {
-            remaining(deadline).clamp(0, 10)
+            remaining(deadline).clamp(0, 1)
         };
         let ts = timespec {
             tv_sec: 0,
@@ -635,7 +653,7 @@ pub unsafe extern "C" fn ntcp_managed_select(
     }) as i32
 }
 
-fn poll_events(bits: i32, requested: i16) -> i16 {
+pub(crate) fn poll_events(bits: i32, requested: i16) -> i16 {
     let mut result = 0;
     if bits & EPOLLIN != 0 {
         result |= requested & (POLLIN | POLLRDNORM);
