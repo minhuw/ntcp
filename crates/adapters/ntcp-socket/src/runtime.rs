@@ -685,6 +685,8 @@ impl Owner {
     }
     fn run(&mut self, rx: Receiver<Request>, wake: i32, stop: &std::sync::atomic::AtomicBool) {
         let mut input = vec![0; 65535];
+        // Keep in-flight batches owned through every output/backend exit.
+        let mut after_output = Vec::with_capacity(BUDGET);
         'run: while !stop.load(Ordering::Acquire) {
             let now = self.now();
             if self.endpoint.on_timeout(now, BUDGET).is_err() {
@@ -694,7 +696,6 @@ impl Owner {
                 break 'run;
             }
             self.events();
-            let mut after_output = Vec::with_capacity(BUDGET);
             for _ in 0..self.pending.len().min(BUDGET) {
                 let mut request = self.pending.pop_front().unwrap();
                 let early = matches!(&request.op, Op::Wait(op, _) if matches!(**op, Op::Read(_) | Op::Peek(_) | Op::ReadTo(..)))
@@ -786,7 +787,7 @@ impl Owner {
                 }
             }
             self.events();
-            for (mut request, retried) in after_output {
+            for (mut request, retried) in after_output.drain(..) {
                 if retried || !self.service(&mut request) {
                     self.pending.push_back(request);
                 }
@@ -835,6 +836,8 @@ impl Owner {
             }
             signal(wake);
         }
+        self.pending
+            .extend(after_output.into_iter().map(|(request, _)| request));
         let error = if stop.load(Ordering::Acquire) {
             ECANCELED
         } else {

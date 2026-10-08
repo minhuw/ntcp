@@ -16,6 +16,8 @@ struct State {
     completions: VecDeque<TxTimestampCompletion>,
     cancelled: Vec<u64>,
     calls: usize,
+    output_calls: usize,
+    output_error: Option<io::ErrorKind>,
     receives: usize,
     capacity: usize,
     block: bool,
@@ -40,6 +42,10 @@ impl PacketIo for Fixture {
     }
     fn transmit(&mut self, bytes: &[u8]) -> io::Result<TxOutcome> {
         let mut state = self.0.lock().unwrap();
+        state.output_calls += 1;
+        if let Some(error) = state.output_error {
+            return Err(error.into());
+        }
         if state.block {
             return Ok(TxOutcome::WouldBlock);
         }
@@ -505,4 +511,57 @@ fn capability_and_poll_failures_do_not_cancel_unrelated_phases() {
         a.poll_backend_timestamps().unwrap_err().kind(),
         io::ErrorKind::BrokenPipe
     );
+}
+
+#[test]
+fn output_error_finalizes_logical_send_parked_after_output_once() {
+    let (mut a, _, client, _, _) = pair();
+    let state = attach(&mut a, 2);
+    flags(&mut a, client, ts::TX_SOFTWARE | ts::TX_SCHED | ts::TX_ACK);
+    a.execute(client, Op::Set(SOL_SOCKET, SO_SNDBUF, 1000))
+        .unwrap();
+    a.execute(client, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 1))
+        .unwrap();
+    a.execute(client, Op::Flags(F_SETFL, 0)).unwrap();
+    let bytes = vec![7; 150000];
+    let (reply, result) = mpsc::sync_channel(1);
+    let mut request = Request {
+        id: client,
+        op: Op::Wait(
+            Box::new(Op::Send(
+                vec![(bytes.as_ptr() as usize, bytes.len())],
+                MSG_ZEROCOPY,
+            )),
+            None,
+        ),
+        reply,
+        deadline: None,
+        send: None,
+    };
+    assert!(!a.service(&mut request));
+    assert_eq!(request.send.as_ref().unwrap().accepted, 4608);
+    a.pending.push_back(request);
+    state.lock().unwrap().output_error = Some(io::ErrorKind::BrokenPipe);
+    let (_tx, rx) = mpsc::sync_channel(1);
+    // run moves the pending send into after_output, then the real backend
+    // submission fails on its first packet. No synthetic owner exit.
+    a.run(rx, -1, &std::sync::atomic::AtomicBool::new(false));
+    assert_eq!(state.lock().unwrap().output_calls, 1);
+    assert_eq!(result.recv().unwrap().unwrap().value, 4608);
+    assert!(matches!(
+        result.try_recv(),
+        Err(mpsc::TryRecvError::Disconnected)
+    ));
+    assert!(a.pending.is_empty());
+    assert_eq!(a.sockets[&client].zc_reserved, 0);
+    assert_eq!(a.sockets[&client].zc_next, 1);
+    assert_eq!(
+        a.sockets[&client]
+            .completions
+            .iter()
+            .filter_map(Completion::range)
+            .collect::<Vec<_>>(),
+        [(0, 0)]
+    );
+    assert_eq!(stage_count(&a, client, 1), 0);
 }
