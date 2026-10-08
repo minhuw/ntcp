@@ -159,6 +159,7 @@ thread_local! {
     static CLOSE_BEFORE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static DUP_BEFORE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static DUP_AFTER_MUTATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static READ_TO_BEFORE_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static DUP_AFTER_KERNEL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 struct Token {
@@ -424,6 +425,17 @@ fn read_into(
             }
         }
     };
+    read_into_locked(&input, &mut bytes, id, n, flags, &deadline, output)
+}
+fn read_into_locked(
+    input: &Input,
+    bytes: &mut Vec<u8>,
+    id: u64,
+    n: usize,
+    flags: i32,
+    deadline: &Deadline,
+    output: impl FnOnce(&[u8]) -> Result<()>,
+) -> Result<i64> {
     if n == 0 {
         call(id, Op::Read(0))?;
         output(&[])?;
@@ -493,8 +505,30 @@ fn read_to(
         .ok_or(EBADF)?
         .input
         .clone();
-    if input.ready.load(Ordering::Acquire) != 0 {
-        return read_into(fd, id, n, flags, |bytes| {
+    #[cfg(test)]
+    READ_TO_BEFORE_LOCK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    let deadline = Deadline::socket(id, false, flags & MSG_DONTWAIT != 0)?;
+    let mut bytes = loop {
+        match input.bytes.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(EIO),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if flags & MSG_DONTWAIT != 0 || !blocking(id)? {
+                    return Err(EAGAIN);
+                }
+                wait_until(id, EPOLLIN, &deadline)?;
+                std::thread::yield_now();
+            }
+        }
+    };
+    // Decide only under the shared OFD lock: recvmsg may have staged bytes
+    // while this reader waited, including after a failed ancillary copyout.
+    if !bytes.is_empty() {
+        return read_into_locked(&input, &mut bytes, id, n, flags, &deadline, |bytes| {
             let mut at = 0;
             for &(address, capacity) in &destinations {
                 let count = capacity.min(bytes.len() - at);
@@ -510,20 +544,6 @@ fn read_to(
             Ok(())
         });
     }
-    let deadline = Deadline::socket(id, false, flags & MSG_DONTWAIT != 0)?;
-    let _guard = loop {
-        match input.bytes.try_lock() {
-            Ok(guard) => break guard,
-            Err(std::sync::TryLockError::Poisoned(_)) => return Err(EIO),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                if flags & MSG_DONTWAIT != 0 || !blocking(id)? {
-                    return Err(EAGAIN);
-                }
-                wait_until(id, EPOLLIN, &deadline)?;
-                std::thread::yield_now();
-            }
-        }
-    };
     let reply = retry_until(
         id,
         Op::ReadTo(n.min(runtime::BYTES), flags, destinations, copies),
@@ -2646,3 +2666,6 @@ boundary_entry!(getsockopt, "ntcp_c_getsockopt", (
 boundary_entry!(dup, "ntcp_c_dup", (fd: i32) -> i32);
 boundary_entry!(dup2, "ntcp_c_dup2", (fd: i32, new: i32) -> i32);
 boundary_entry!(dup3, "ntcp_c_dup3", (fd: i32, new: i32, flags: i32) -> i32);
+
+#[cfg(all(test, feature = "packet-test"))]
+mod inq_tests;

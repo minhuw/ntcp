@@ -280,6 +280,8 @@ struct Socket {
     probes: i32,
     error: i32,
     connected: bool,
+    // Actual half-close history, independent of consumable socket errors.
+    peer_fin: bool,
     acceptable: bool,
     write_shutdown: bool,
     read_shutdown: bool,
@@ -313,6 +315,7 @@ impl Socket {
             probes: 9,
             error: 0,
             connected: false,
+            peer_fin: false,
             acceptable: false,
             write_shutdown: false,
             read_shutdown: false,
@@ -886,6 +889,7 @@ impl Owner {
                     }
                     (Handle::Connection(id), Event::Connection(other, e)) if id == *other => {
                         s.connected |= e.connected;
+                        s.peer_fin |= e.half_closed;
                         if e.readable {
                             s.readiness_generations[0] = s.readiness_generations[0].wrapping_add(1);
                         }
@@ -1241,6 +1245,10 @@ impl Owner {
                 child.handle = Handle::Connection(cid);
                 child.local = Some(tuple.local);
                 child.connected = true;
+                child.peer_fin = matches!(
+                    self.endpoint.state(cid),
+                    Ok(State::CloseWait | State::Closing | State::LastAck | State::TimeWait)
+                );
                 if let Err(e) = self.apply_options(cid, &child) {
                     self.rollback_connection(cid);
                     return Err(e);
@@ -1756,13 +1764,9 @@ impl Owner {
                         self.endpoint.readable_bytes(cid)
                     }
                     .map_err(engine)?;
-                    let fin = matches!(
-                        state,
-                        State::CloseWait | State::Closing | State::LastAck | State::TimeWait
-                    ) || (state == State::Closed && s.error == 0 && s.connected);
                     out.value = available
                         .saturating_sub(consumed)
-                        .saturating_add(usize::from(fin))
+                        .saturating_add(usize::from(s.peer_fin))
                         .min(i32::MAX as usize) as i32;
                 }
             }
@@ -1899,6 +1903,53 @@ mod tests {
         assert_eq!(b.execute(server, Op::Inq(7)).unwrap().value, 1);
         assert_eq!(b.execute(server, Op::Read(32)).unwrap().bytes, b"cdefghi");
         assert_eq!(b.execute(server, Op::Read(32)).unwrap().value, 0);
+        assert_eq!(b.execute(server, Op::Inq(0)).unwrap().value, 1);
+    }
+    #[test]
+    fn inq_reset_error_consumption_never_fabricates_fin() {
+        for via_so_error in [false, true] {
+            let (mut a, mut b, client, server, _) = pair();
+            b.execute(server, Op::Set(IPPROTO_TCP, TCP_INQ, 1)).unwrap();
+            a.execute(client, Op::Write(b"ab".to_vec())).unwrap();
+            pump(&mut a, &mut b);
+            let Handle::Connection(cid) = a.sockets[&client].handle else {
+                panic!()
+            };
+            a.endpoint.abort(cid).unwrap();
+            pump(&mut a, &mut b);
+            assert_eq!(b.execute(server, Op::Inq(0)).unwrap().value, 2);
+            assert_eq!(b.execute(server, Op::Read(2)).unwrap().bytes, b"ab");
+            assert_eq!(b.execute(server, Op::Inq(0)).unwrap().value, 0);
+            if via_so_error {
+                assert_eq!(
+                    b.execute(server, Op::Get(SOL_SOCKET, SO_ERROR))
+                        .unwrap()
+                        .value,
+                    ECONNRESET
+                );
+            } else {
+                assert_eq!(b.execute(server, Op::Read(1)).unwrap_err(), ECONNRESET);
+            }
+            assert_eq!(b.execute(server, Op::Read(1)).unwrap().value, 0);
+            assert_eq!(b.execute(server, Op::Inq(0)).unwrap().value, 0);
+        }
+        let (mut a, mut b, client, server, _) = pair();
+        b.execute(server, Op::Set(IPPROTO_TCP, TCP_INQ, 1)).unwrap();
+        a.execute(client, Op::Shutdown(SHUT_WR)).unwrap();
+        pump(&mut a, &mut b);
+        b.execute(server, Op::Shutdown(SHUT_WR)).unwrap();
+        pump(&mut a, &mut b);
+        let Handle::Connection(cid) = b.sockets[&server].handle else {
+            panic!()
+        };
+        assert_eq!(b.endpoint.state(cid).unwrap(), State::Closed);
+        assert_eq!(b.execute(server, Op::Read(1)).unwrap().value, 0);
+        assert_eq!(
+            b.execute(server, Op::Get(SOL_SOCKET, SO_ERROR))
+                .unwrap()
+                .value,
+            0
+        );
         assert_eq!(b.execute(server, Op::Inq(0)).unwrap().value, 1);
     }
     #[test]
