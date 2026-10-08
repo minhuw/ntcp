@@ -77,7 +77,7 @@ fn call(
                 let (level, name) = match a {
                     1 => (IPPROTO_TCP, TCP_INFO),
                     2 => (IPPROTO_TCP, TCP_CC_INFO),
-                    _ => (SOL_SOCKET, SO_MEMINFO),
+                    _ => panic!("unsupported transport test option {a}"),
                 };
                 let mut n = capacity as socklen_t;
                 let r =
@@ -320,14 +320,17 @@ fn abi_table_null_counts_vectors_variadics_and_host_clock() {
         }
     }
     n = 36;
+    info.fill(0xa5);
     unsafe {
         assert_eq!(
             getsockopt(fd, SOL_SOCKET, SO_MEMINFO, info.as_mut_ptr().cast(), &mut n),
-            0
+            -1
         );
     }
+    assert_eq!(errno(), ENOSYS);
     assert_eq!(n, 36);
-    assert_eq!(u32::from_ne_bytes(info[4..8].try_into().unwrap()), 65535);
+    assert!(info.iter().all(|b| *b == 0xa5));
+    assert_eq!(get_buffer(fd, SO_RCVBUF), 65535);
     unsafe {
         assert_eq!(
             getsockopt(fd, IPPROTO_TCP, TCP_INFO, ptr::null_mut(), &mut n),
@@ -479,7 +482,7 @@ int main(int argc, char **argv) {
     assert(memcmp(info, abi, sizeof(abi)) == 0 && info[280] == 0xa5);
     n = sizeof(abi); assert(syscall(SYS_getsockopt, fd, IPPROTO_TCP, TCP_INFO, abi, &n) == -1);
     n = sizeof(abi); assert(GETOPT(fd, IPPROTO_TCP, TCP_CC_INFO, abi, &n) == 0 && n == 0);
-    n = sizeof(abi); assert(GETOPT(fd, SOL_SOCKET, SO_MEMINFO, abi, &n) == 0 && n == 36);
+    n = sizeof(abi); assert(GETOPT(fd, SOL_SOCKET, SO_MEMINFO, abi, &n) == -1 && errno == ENOSYS);
     int domain; n = sizeof(domain); assert(GETOPT(fd, SOL_SOCKET, SO_DOMAIN, &domain, &n) == 0 && domain == AF_INET);
     // Register through the shared ABI, but close through ordinary host libc.
     int epfd = p.epoll_create(p.userdata, 1); assert(epfd >= 0);
@@ -502,7 +505,10 @@ int main(int argc, char **argv) {
     int host = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP); assert(host >= 0);
     unsigned char kernel[104], forwarded[104]; socklen_t k = sizeof(kernel); n = sizeof(forwarded);
     assert(syscall(SYS_getsockopt, host, IPPROTO_TCP, TCP_INFO, kernel, &k) == 0);
-    assert(getsockopt(host, IPPROTO_TCP, TCP_INFO, forwarded, &n) == 0 && k == n && !memcmp(kernel, forwarded, n)); close(host);
+    assert(getsockopt(host, IPPROTO_TCP, TCP_INFO, forwarded, &n) == 0 && k == n && !memcmp(kernel, forwarded, n));
+    k = sizeof(kernel); n = sizeof(forwarded);
+    assert(syscall(SYS_getsockopt, host, SOL_SOCKET, SO_MEMINFO, kernel, &k) == 0);
+    assert(GETOPT(host, SOL_SOCKET, SO_MEMINFO, forwarded, &n) == 0 && k == n && !memcmp(kernel, forwarded, n)); close(host);
     // Drain SYN output; next netdev callback blocks until teardown cancels it.
     unsigned char packet[65535]; size_t size = sizeof(packet); long long t;
     assert(p.netdev_receive(p.userdata, packet, &size, &t) == 0);
@@ -536,11 +542,17 @@ int main(int argc, char **argv) {
         if preloaded {
             command.env("LD_PRELOAD", &library);
         }
-        let mut child = command.spawn().unwrap();
+        let mut child = command.stderr(std::process::Stdio::piped()).spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(status) = child.try_wait().unwrap() {
-                assert!(status.success());
+                let output = child.wait_with_output().unwrap();
+                let logs = String::from_utf8_lossy(&output.stderr);
+                assert!(status.success(), "{logs}");
+                assert!(
+                    logs.contains("NTCP_PACKETDRILL_UNSUPPORTED: socket option"),
+                    "{logs}"
+                );
                 break;
             }
             if Instant::now() > deadline {
@@ -737,21 +749,7 @@ fn sndbuf_rcvbuf_end_to_end_shared_abi() {
         );
     }
     assert_eq!(errno(), EFAULT);
-    let mut info = [0u8; 36];
-    let mut size = 36;
-    unsafe {
-        assert_eq!(
-            ntcp_socket::getsockopt(
-                fd,
-                SOL_SOCKET,
-                SO_MEMINFO,
-                info.as_mut_ptr().cast(),
-                &mut size
-            ),
-            0
-        );
-    }
-    assert_eq!(u32::from_ne_bytes(info[..4].try_into().unwrap()), 8192);
+    // The successful full read below proves EFAULT did not consume queued bytes.
     let mut received = vec![0; 8192];
     unsafe {
         assert_eq!(
@@ -947,12 +945,12 @@ fn token_explicit_close_host_close_and_foreign_replacement() {
 }
 
 #[test]
-fn receive_callbacks_report_unsupported_flags_and_bounds() {
+fn receive_callbacks_reject_flags_but_accept_large_requests() {
     if std::env::var_os("NTCP_PACKET_ABI_CHILD").is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "tests::receive_callbacks_report_unsupported_flags_and_bounds",
+                "tests::receive_callbacks_reject_flags_but_accept_large_requests",
                 "--test-threads=1",
             ])
             .env("NTCP_PACKET_ABI_CHILD", "1")
@@ -966,13 +964,13 @@ fn receive_callbacks_report_unsupported_flags_and_bounds() {
         let logs = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
             logs.matches("NTCP_PACKETDRILL_UNSUPPORTED:").count(),
-            8,
+            3,
             "{logs}"
         );
         assert_eq!(logs.matches("send/recv flags").count(), 3, "{logs}");
         assert_eq!(
             logs.matches("65535-byte adapter bound").count(),
-            5,
+            0,
             "{logs}"
         );
         return;

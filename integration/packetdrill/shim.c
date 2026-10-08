@@ -487,11 +487,12 @@ void ntcp_abi_receive_unsupported(void *u) {
     assert(p.recv(u, fd, bytes, 1, MSG_WAITALL) == -1 && errno == ENOSYS);
     assert(p.recvfrom(u, fd, bytes, 1, MSG_WAITALL, NULL, NULL) == -1 && errno == ENOSYS);
     assert(p.recvmsg(u, fd, &m, MSG_WAITALL) == -1 && errno == ENOSYS);
-    assert(p.recv(u, fd, bytes, sizeof(bytes), MSG_DONTWAIT) == -1 && errno == ENOSYS);
-    assert(p.recvfrom(u, fd, bytes, sizeof(bytes), MSG_DONTWAIT, NULL, NULL) == -1 && errno == ENOSYS);
-    assert(p.read(u, fd, bytes, sizeof(bytes)) == -1 && errno == ENOSYS);
+    // Stream request sizes are not packet sizes: reach normal socket validation.
+    assert(p.recv(u, fd, bytes, sizeof(bytes), MSG_DONTWAIT) == -1 && errno == ENOTCONN);
+    assert(p.recvfrom(u, fd, bytes, sizeof(bytes), MSG_DONTWAIT, NULL, NULL) == -1 && errno == ENOTCONN);
+    assert(p.read(u, fd, bytes, sizeof(bytes)) == -1 && errno == ENOTCONN);
     v.iov_len = sizeof(bytes);
-    assert(p.recvmsg(u, fd, &m, MSG_DONTWAIT) == -1 && errno == ENOSYS);
-    assert(p.readv(u, fd, &v, 1) == -1 && errno == ENOSYS);
+    assert(p.recvmsg(u, fd, &m, MSG_DONTWAIT) == -1 && errno == ENOTCONN);
+    assert(p.readv(u, fd, &v, 1) == -1 && errno == ENOTCONN);
     assert(p.close(u, fd) == 0);
 }

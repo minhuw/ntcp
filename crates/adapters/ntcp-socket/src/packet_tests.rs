@@ -1564,7 +1564,9 @@ fn transport_encoding_counts_recovery_and_invalid_ledger() {
     info.ledger_valid = false;
     assert_eq!(transport_option(info, 1).err(), Some(ENOSYS));
     assert!(transport_option(info, 2).unwrap().is_empty());
-    assert_eq!(transport_option(info, 3).unwrap().len(), 36);
+    assert_eq!(transport_option(info, 3).err(), Some(ENOSYS));
+    let (mut req, _) = request(18, fd, 3, vec![], 36);
+    assert_eq!(owner.execute(&mut req).err(), Some(ENOSYS));
 }
 
 #[test]

@@ -988,11 +988,6 @@ unsafe fn transfer(fd: i32, p: *mut c_void, n: usize, flags: i32, write: bool) -
     if n > isize::MAX as usize {
         return Err(EINVAL);
     }
-    if !write && io_limit() < runtime::BYTES && n > io_limit() {
-        return Err(runtime::unsupported_option(
-            "scalar I/O exceeds 65535-byte adapter bound",
-        ));
-    }
     if !write {
         return read_to(fd, id, n, flags, vec![(p as usize, n)], Vec::new());
     }
@@ -1309,11 +1304,6 @@ unsafe fn vectors_timestamp(
             .filter(|&n| n <= isize::MAX as usize)
             .ok_or(EINVAL)?;
     }
-    if !write && io_limit() < runtime::BYTES && total > io_limit() {
-        return Err(runtime::unsupported_option(
-            "receive I/O exceeds 65535-byte adapter bound",
-        ));
-    }
     if write {
         if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_ZEROCOPY | MSG_MORE | MSG_EOR) != 0 {
             return Err(runtime::unsupported_option("send flags"));
@@ -1445,11 +1435,6 @@ pub unsafe extern "C" fn ntcp_managed_recvmsg(fd: i32, p: *mut msghdr, flags: i3
                 .filter(|&n| n <= isize::MAX as usize)
                 .ok_or(EINVAL)
         })?;
-        if io_limit() < runtime::BYTES && total > io_limit() {
-            return Err(runtime::unsupported_option(
-                "receive I/O exceeds 65535-byte adapter bound",
-            ));
-        }
         // Keep stream bytes staged until payload, ancillary data and msghdr
         // copyouts all succeed. INQ observes the logically post-read queue;
         // PEEK never subtracts the copied bytes (Linux tcp_inq_hint).
@@ -1525,11 +1510,6 @@ pub unsafe extern "C" fn ntcp_managed_recvfrom(
         }
         if n > isize::MAX as usize {
             return Err(EINVAL);
-        }
-        if io_limit() < runtime::BYTES && n > io_limit() {
-            return Err(runtime::unsupported_option(
-                "scalar I/O exceeds 65535-byte adapter bound",
-            ));
         }
         if !addr.is_null() {
             unsafe {
@@ -1674,7 +1654,6 @@ pub unsafe extern "C" fn ntcp_managed_getsockopt(
         if let Some(option) = match (level, name) {
             (IPPROTO_TCP, TCP_INFO) => Some(1),
             (IPPROTO_TCP, TCP_CC_INFO) => Some(2),
-            (SOL_SOCKET, SO_MEMINFO) => Some(3),
             _ => None,
         } {
             let bytes = call(id, Op::Transport(option))?.bytes;
@@ -2847,3 +2826,6 @@ boundary_entry!(dup3, "ntcp_c_dup3", (fd: i32, new: i32, flags: i32) -> i32);
 
 #[cfg(all(test, feature = "packet-test"))]
 mod inq_tests;
+
+#[cfg(all(test, feature = "packet-test"))]
+mod stream_read_tests;

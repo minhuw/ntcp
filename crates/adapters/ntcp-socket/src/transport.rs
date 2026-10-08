@@ -10,21 +10,14 @@ pub(crate) fn transport_option(info: ntcp::TransportInfo, option: i32) -> Result
     if option == 2 {
         return Ok(Vec::new());
     } // Reno/NewReno have no CC-specific data.
-    let mut bytes = vec![0; if option == 3 { 9 * 4 } else { TCP_INFO_SIZE }];
+    if option != 1 {
+        return Err(unsupported("transport option"));
+    }
+    let mut bytes = vec![0; TCP_INFO_SIZE];
     let mut put = |offset: usize, value: u64| {
         let value = value.min(u32::MAX as u64) as u32;
         bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
     };
-    if option == 3 {
-        // Fixed core storage, not Linux skb accounting: RMEM_ALLOC
-        // is occupied receive bytes; RCVBUF/SNDBUF are allocated capacities;
-        // WMEM_QUEUED is retained send bytes. No skb/option/backlog/drop buckets.
-        put(0, info.receive_used as u64);
-        put(4, info.receive_capacity as u64);
-        put(12, info.send_capacity as u64);
-        put(20, info.send_used as u64);
-        return Ok(bytes);
-    }
     if !info.ledger_valid {
         return Err(unsupported(
             "TCP_INFO segment counts: bounded transport ledger invalid",
@@ -108,6 +101,15 @@ mod tests {
             receive_used: 42,
             receive_capacity: 65536,
         };
+        let error = if cfg!(feature = "packet-test") {
+            ENOSYS
+        } else {
+            EOPNOTSUPP
+        };
+        for option in [0, 3, i32::MAX] {
+            assert_eq!(transport_option(info, option).err(), Some(error));
+        }
+        assert!(transport_option(info, 2).unwrap().is_empty());
         let bytes = transport_option(info, 1).unwrap();
         assert_eq!(bytes.len(), TCP_INFO_SIZE);
         for (offset, value) in [
