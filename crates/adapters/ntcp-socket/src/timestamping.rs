@@ -76,6 +76,16 @@ impl Options {
         Ok((self.flags & !TX_RECORD) | override_flags)
     }
 
+    // Linux v6.12 __skb_complete_tx_timestamp uses CURRENT OPT_ID and TCP
+    // sk_tskey, not the flags/base from request admission. Queued IDs then freeze.
+    pub(crate) fn completion_id(self, sequence: u32, base: u32) -> u32 {
+        if self.flags & OPT_ID != 0 {
+            sequence.wrapping_sub(base)
+        } else {
+            0
+        }
+    }
+
     pub(crate) fn resets_id(self, next: Self) -> bool {
         self.flags & OPT_ID == 0 && next.flags & OPT_ID != 0
     }
@@ -110,6 +120,17 @@ pub(crate) fn extended_error(stage: u32, id: u32) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_ids_wrap_and_obey_current_options() {
+        let on = Options {
+            flags: OPT_ID,
+            new_abi: false,
+        };
+        assert_eq!(on.completion_id(2, u32::MAX - 2), 5);
+        assert_eq!(on.completion_id(4, 5), u32::MAX);
+        assert_eq!(Options::default().completion_id(4, 5), 0);
+    }
 
     #[test]
     fn old_new_readback_and_validation_are_transactional() {

@@ -44,7 +44,7 @@ fn timestamp_runtime_phases_ids_reset_and_zero_copy_interleave() {
         Op::WriteFlags(b"first".to_vec(), MSG_MORE | MSG_ZEROCOPY),
     )
     .unwrap();
-    // Reset changes the new ID base, never the pending request's saved ID.
+    // Pending observations use the current base at completion, not at write.
     timestamp_set(&mut a, client, 0);
     timestamp_set(&mut a, client, flags | ts::OPT_ID_TCP);
     a.execute(client, Op::Write(b"second".to_vec())).unwrap();
@@ -58,7 +58,7 @@ fn timestamp_runtime_phases_ids_reset_and_zero_copy_interleave() {
     );
     let records = timestamp_records(&a, client);
     assert_eq!(records.len(), 6);
-    for id in [4, 5] {
+    for id in [u32::MAX, 5] {
         for stage in 0..3 {
             assert_eq!(
                 records
@@ -97,11 +97,27 @@ fn timestamp_runtime_partial_failed_zero_per_send_and_budget() {
         client,
         ts::TX_ACK | ts::SOFTWARE | ts::OPT_ID | ts::OPT_ID_TCP | ts::OPT_TSONLY,
     );
+    a.execute(client, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 1))
+        .unwrap();
     let bytes = vec![7; 10000];
-    let n = a.execute(client, Op::Write(bytes)).unwrap().value as u32;
+    let n = a
+        .execute(client, Op::WriteFlags(bytes, MSG_ZEROCOPY))
+        .unwrap()
+        .value as u32;
     assert!(n > 0 && n < 10000);
-    assert_eq!(a.execute(client, Op::Write(vec![1])).unwrap_err(), EAGAIN);
-    assert_eq!(a.execute(client, Op::Write(vec![])).unwrap().value, 0);
+    assert_eq!(
+        a.execute(client, Op::WriteFlags(vec![1], MSG_ZEROCOPY))
+            .unwrap_err(),
+        EAGAIN
+    );
+    assert_eq!(
+        a.execute(client, Op::WriteFlags(vec![], MSG_ZEROCOPY))
+            .unwrap()
+            .value,
+        0
+    );
+    assert_eq!(a.sockets[&client].zc_next, 1);
+    assert_eq!(a.sockets[&client].timestamps.reserved(), 1);
     pump(&mut a, &mut b);
     std::thread::sleep(std::time::Duration::from_millis(220));
     b.endpoint.on_timeout(b.now(), 32).unwrap();
@@ -444,4 +460,369 @@ fn timestamp_runtime_generation_reporting_and_syn_id_bases() {
             EOPNOTSUPP
         );
     }
+}
+
+// Thread-local fault injection does not disturb parallel tests or the harness.
+mod timestamp_allocator {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    std::thread_local! { static FAIL: Cell<bool> = const { Cell::new(false) }; }
+    struct Allocator;
+    #[global_allocator]
+    static ALLOCATOR: Allocator = Allocator;
+    unsafe impl GlobalAlloc for Allocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if FAIL.try_with(Cell::get).unwrap_or(false) {
+                std::ptr::null_mut()
+            } else {
+                unsafe { System.alloc(layout) }
+            }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            if FAIL.try_with(Cell::get).unwrap_or(false) {
+                std::ptr::null_mut()
+            } else {
+                unsafe { System.realloc(ptr, layout, size) }
+            }
+        }
+    }
+    pub(super) fn failing<T>(f: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FAIL.set(false);
+            }
+        }
+        FAIL.set(true);
+        let _reset = Reset;
+        f()
+    }
+}
+
+#[test]
+fn timestamp_runtime_pending_and_queued_ids_use_different_option_epochs() {
+    let (mut a, mut b, client, _, _) = pair();
+    let flags = ts::TX_SCHED
+        | ts::TX_HARDWARE
+        | ts::TX_ACK
+        | ts::SOFTWARE
+        | ts::RAW_HARDWARE
+        | ts::OPT_ID
+        | ts::OPT_ID_TCP
+        | ts::OPT_TSONLY;
+    timestamp_set(&mut a, client, flags);
+    a.execute(client, Op::Write(b"first".to_vec())).unwrap();
+    let mut bytes = [0; 1480];
+    let tx = a
+        .endpoint
+        .poll_transmit(a.now(), &mut bytes, 32)
+        .unwrap()
+        .packet
+        .unwrap();
+    let frame = a.frame(tx, &bytes[..tx.len]).unwrap();
+    a.timestamp_packet(tx.tx_timestamp, &frame);
+    a.drain_timestamps(ClockPair::sample(&a));
+    assert_eq!(timestamp_records(&a, client)[0].1, 4);
+    timestamp_set(&mut a, client, ts::OPT_TSONLY);
+    a.endpoint
+        .report_tx_timestamp(
+            tx.tx_timestamp.unwrap(),
+            ntcp::TxTimestampSource::Hardware,
+            17,
+            ntcp::TxTimestampClock::RealtimeNanoseconds,
+        )
+        .unwrap();
+    a.drain_timestamps(ClockPair::sample(&a));
+    assert_eq!(timestamp_records(&a, client)[1].1, 0);
+    timestamp_set(&mut a, client, flags);
+    b.input(b.now(), tx.ip, 0, &bytes[..tx.len]).unwrap();
+    pump(&mut a, &mut b);
+    std::thread::sleep(std::time::Duration::from_millis(220));
+    b.endpoint.on_timeout(b.now(), 32).unwrap();
+    pump(&mut a, &mut b);
+    assert_eq!(
+        timestamp_records(&a, client)
+            .iter()
+            .map(|r| (r.0, r.1))
+            .collect::<Vec<_>>(),
+        [(1, 4), (0, 0), (2, u32::MAX)]
+    );
+    timestamp_set(&mut a, client, 0);
+    assert_eq!(timestamp_records(&a, client)[2].1, u32::MAX);
+}
+
+#[test]
+fn timestamp_runtime_pending_tsonly_toggles_keep_actual_packet_or_drop_honestly() {
+    for (initial_tsonly, final_tsonly, starve) in [
+        (true, false, false),
+        (false, true, false),
+        (true, false, true),
+        (true, true, true),
+    ] {
+        let (mut a, mut b, client, _, _) = pair();
+        let flags = ts::TX_HARDWARE | ts::TX_ACK | ts::SOFTWARE | ts::RAW_HARDWARE;
+        timestamp_set(
+            &mut a,
+            client,
+            flags | if initial_tsonly { ts::OPT_TSONLY } else { 0 },
+        );
+        a.execute(client, Op::Write(b"real retained packet".to_vec()))
+            .unwrap();
+        let mut bytes = [0; 1480];
+        let tx = a
+            .endpoint
+            .poll_transmit(a.now(), &mut bytes, 32)
+            .unwrap()
+            .packet
+            .unwrap();
+        let frame = a.frame(tx, &bytes[..tx.len]).unwrap();
+        let capacity = a.sockets[&client].receive_capacity;
+        if starve {
+            a.sockets.get_mut(&client).unwrap().receive_capacity = 1;
+        }
+        a.timestamp_packet(tx.tx_timestamp, &frame);
+        a.sockets.get_mut(&client).unwrap().receive_capacity = capacity;
+        timestamp_set(
+            &mut a,
+            client,
+            flags | if final_tsonly { ts::OPT_TSONLY } else { 0 },
+        );
+        b.input(b.now(), tx.ip, 0, &bytes[..tx.len]).unwrap();
+        pump(&mut a, &mut b);
+        std::thread::sleep(std::time::Duration::from_millis(220));
+        b.endpoint.on_timeout(b.now(), 32).unwrap();
+        pump(&mut a, &mut b);
+        a.endpoint
+            .report_tx_timestamp(
+                tx.tx_timestamp.unwrap(),
+                ntcp::TxTimestampSource::Hardware,
+                123,
+                ntcp::TxTimestampClock::RealtimeNanoseconds,
+            )
+            .unwrap();
+        let pair = ClockPair::sample(&a);
+        timestamp_allocator::failing(|| a.drain_timestamps(pair));
+        let records = timestamp_records(&a, client);
+        if starve && !final_tsonly {
+            assert!(records.is_empty());
+        } else {
+            assert_eq!(records.len(), 2);
+            assert_eq!((records[0].0, records[1].0), (2, 0));
+            for completion in &a.sockets[&client].completions {
+                let Completion::Timestamp { payload, .. } = completion else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    &payload[..],
+                    if final_tsonly { &[][..] } else { &frame[..] }
+                );
+            }
+        }
+        assert_eq!(a.sockets[&client].timestamps.reserved(), 0);
+        let queued = a.sockets[&client].completions.clone();
+        timestamp_set(
+            &mut a,
+            client,
+            flags | if final_tsonly { 0 } else { ts::OPT_TSONLY },
+        );
+        assert_eq!(a.sockets[&client].completions, queued);
+    }
+}
+
+#[test]
+fn timestamp_runtime_joint_zerocopy_reservation_is_fallible_before_acceptance() {
+    let (mut a, _, client, _, _) = pair();
+    timestamp_set(
+        &mut a,
+        client,
+        ts::TX_HARDWARE | ts::RAW_HARDWARE | ts::OPT_TSONLY,
+    );
+    a.execute(client, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 1))
+        .unwrap();
+    // Prepare pending storage, but force the reviewed len=3/cap=4 queue case.
+    a.reserve_completion(client, true, 0, None).unwrap();
+    a.sockets.get_mut(&client).unwrap().completions = VecDeque::with_capacity(4);
+    for n in 1..=3 {
+        a.sockets
+            .get_mut(&client)
+            .unwrap()
+            .completions
+            .push_back(Completion::ZeroCopy(n, n));
+    }
+    let Handle::Connection(cid) = a.sockets[&client].handle else {
+        unreachable!()
+    };
+    let before = a.endpoint.send_progress(cid).unwrap();
+    let cookie = a.timestamp_cookie;
+    assert_eq!(
+        timestamp_allocator::failing(|| a.reserve_completion(client, true, MSG_ZEROCOPY, None)),
+        Err(ENOBUFS)
+    );
+    assert_eq!(a.endpoint.send_progress(cid).unwrap(), before);
+    assert_eq!(a.timestamp_cookie, cookie);
+    assert_eq!(a.sockets[&client].zc_next, 0);
+    a.execute(client, Op::WriteFlags(vec![1], MSG_ZEROCOPY))
+        .unwrap();
+    let capacity = a.sockets[&client].completions.capacity();
+    assert!(capacity >= 5);
+    let mut bytes = [0; 1480];
+    let tx = a
+        .endpoint
+        .poll_transmit(a.now(), &mut bytes, 32)
+        .unwrap()
+        .packet
+        .unwrap();
+    a.endpoint
+        .report_tx_timestamp(
+            tx.tx_timestamp.unwrap(),
+            ntcp::TxTimestampSource::Hardware,
+            123,
+            ntcp::TxTimestampClock::RealtimeNanoseconds,
+        )
+        .unwrap();
+    let pair = ClockPair::sample(&a);
+    timestamp_allocator::failing(|| a.drain_timestamps(pair));
+    assert_eq!(a.sockets[&client].completions.len(), 5);
+    assert_eq!(a.sockets[&client].completions.capacity(), capacity);
+}
+
+#[test]
+fn timestamp_runtime_joint_127_boundary_and_zerocopy_coalescing() {
+    let (mut a, _, client, _, _) = pair();
+    timestamp_set(&mut a, client, ts::TX_HARDWARE | ts::OPT_TSONLY);
+    a.execute(client, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 1))
+        .unwrap();
+    let Handle::Connection(cid) = a.sockets[&client].handle else {
+        unreachable!()
+    };
+    for n in 1..=127 {
+        a.sockets
+            .get_mut(&client)
+            .unwrap()
+            .completions
+            .push_back(Completion::ZeroCopy(n, n));
+    }
+    let before = a.endpoint.send_progress(cid).unwrap();
+    let cookie = a.timestamp_cookie;
+    assert_eq!(
+        a.execute(client, Op::WriteFlags(vec![1], MSG_ZEROCOPY))
+            .unwrap_err(),
+        ENOBUFS
+    );
+    assert_eq!(a.endpoint.send_progress(cid).unwrap(), before);
+    assert_eq!(a.timestamp_cookie, cookie);
+    assert_eq!(a.sockets[&client].timestamps.reserved(), 0);
+    assert_eq!(a.sockets[&client].zc_next, 0);
+    // A contiguous last zero-copy record needs no extra slot: 127 + 1 fits.
+    a.sockets.get_mut(&client).unwrap().zc_next = 128;
+    a.execute(client, Op::WriteFlags(vec![1], MSG_ZEROCOPY))
+        .unwrap();
+    assert_eq!(a.sockets[&client].completions.len(), 127);
+    assert_eq!(
+        a.sockets[&client].completions.back().unwrap().range(),
+        Some((127, 128))
+    );
+    assert_eq!(a.sockets[&client].timestamps.reserved(), 1);
+    // Even a non-timestamped ZC send must count the existing native phase.
+    assert_eq!(
+        a.reserve_completion(client, true, MSG_ZEROCOPY, Some(0)),
+        Ok(true)
+    );
+    a.sockets.get_mut(&client).unwrap().zc_next = 999;
+    assert_eq!(
+        a.reserve_completion(client, true, MSG_ZEROCOPY, Some(0)),
+        Err(ENOBUFS)
+    );
+}
+
+#[test]
+fn timestamp_runtime_fin_does_not_replace_last_accepted_byte() {
+    let (mut a, mut b, client, _, _) = pair();
+    let flags = ts::TX_ACK | ts::OPT_ID | ts::OPT_ID_TCP | ts::OPT_TSONLY;
+    timestamp_set(&mut a, client, flags);
+    let Handle::Connection(cid) = a.sockets[&client].handle else {
+        unreachable!()
+    };
+    let first = a.endpoint.send_progress(cid).unwrap().next_write_sequence;
+    a.execute(client, Op::WriteFlags(vec![1, 2, 3], MSG_MORE))
+        .unwrap();
+    a.execute(client, Op::Shutdown(SHUT_WR)).unwrap();
+    timestamp_set(&mut a, client, 0);
+    timestamp_set(&mut a, client, flags);
+    let base = a.endpoint.send_progress(cid).unwrap().next_write_sequence;
+    pump(&mut a, &mut b);
+    std::thread::sleep(std::time::Duration::from_millis(220));
+    b.endpoint.on_timeout(b.now(), 32).unwrap();
+    pump(&mut a, &mut b);
+    let records = timestamp_records(&a, client);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].1, first.wrapping_add(2).wrapping_sub(base));
+}
+
+#[test]
+fn timestamp_runtime_packet_allocation_failure_preserves_tsonly_completion() {
+    let (mut a, _, client, _, _) = pair();
+    timestamp_set(&mut a, client, ts::TX_HARDWARE | ts::OPT_TSONLY);
+    a.execute(client, Op::Write(vec![42])).unwrap();
+    let mut bytes = [0; 1480];
+    let tx = a
+        .endpoint
+        .poll_transmit(a.now(), &mut bytes, 32)
+        .unwrap()
+        .packet
+        .unwrap();
+    let frame = a.frame(tx, &bytes[..tx.len]).unwrap();
+    // No bytes are copied if the fallible packet reservation fails.
+    let before = a.timestamp_charge();
+    timestamp_allocator::failing(|| a.timestamp_packet(tx.tx_timestamp, &frame));
+    assert_eq!(a.timestamp_charge(), before);
+    a.endpoint
+        .report_tx_timestamp(
+            tx.tx_timestamp.unwrap(),
+            ntcp::TxTimestampSource::Hardware,
+            123,
+            ntcp::TxTimestampClock::RealtimeNanoseconds,
+        )
+        .unwrap();
+    let pair = ClockPair::sample(&a);
+    timestamp_allocator::failing(|| a.drain_timestamps(pair));
+    assert_eq!(timestamp_records(&a, client)[0].4, 0);
+    assert!(a.timestamp_charge() < before);
+}
+
+#[test]
+fn timestamp_runtime_timestamp_between_zerocopy_records_prevents_coalescing() {
+    let (mut a, mut b, client, _, _) = pair();
+    timestamp_set(&mut a, client, ts::TX_SOFTWARE | ts::OPT_TSONLY);
+    a.execute(client, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 1))
+        .unwrap();
+    a.execute(client, Op::WriteFlags(vec![1], MSG_ZEROCOPY))
+        .unwrap();
+    pump(&mut a, &mut b);
+    assert_eq!(a.sockets[&client].completions.len(), 2);
+    assert!(matches!(
+        a.sockets[&client].completions.back(),
+        Some(Completion::Timestamp { .. })
+    ));
+    a.write_timestamp(client, vec![2], MSG_ZEROCOPY, Some(0))
+        .unwrap();
+    assert_eq!(a.sockets[&client].completions.len(), 3);
+    assert_eq!(
+        a.sockets[&client].completions.front().unwrap().range(),
+        Some((0, 0))
+    );
+    assert_eq!(
+        a.sockets[&client].completions.back().unwrap().range(),
+        Some((1, 1))
+    );
+    a.write_timestamp(client, vec![3], MSG_ZEROCOPY, Some(0))
+        .unwrap();
+    assert_eq!(a.sockets[&client].completions.len(), 3);
+    assert_eq!(
+        a.sockets[&client].completions.back().unwrap().range(),
+        Some((1, 2))
+    );
 }

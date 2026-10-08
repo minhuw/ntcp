@@ -9,7 +9,26 @@ use std::sync::Arc;
 
 pub(super) const PHASES: usize = 128;
 const RECORD: usize = 256;
+const PACKET_HANDLE: usize = 2 * std::mem::size_of::<usize>() + std::mem::size_of::<Vec<u8>>();
 pub(super) const RUNTIME_BYTES: usize = 32 * 1024 * 1024;
+
+// Empty queued TSONLY records own no packet allocation. Pending packets use a
+// fallibly grown Vec behind an Arc, so completion only clones the shared handle.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct PacketPayload(Option<Arc<Vec<u8>>>);
+impl PacketPayload {
+    // Conservatively charge each shared reference as a full packet. Sharing
+    // saves real memory but never lets fanout escape either socket's budget.
+    fn charge(&self) -> usize {
+        self.0.as_ref().map_or(0, |p| PACKET_HANDLE + p.capacity())
+    }
+}
+impl std::ops::Deref for PacketPayload {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.0.as_deref().map_or(&[], Vec::as_slice)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Completion {
@@ -17,7 +36,7 @@ pub(super) enum Completion {
     Timestamp {
         stamp: [u8; 48],
         error: [u8; 32],
-        payload: Arc<[u8]>,
+        payload: PacketPayload,
     },
 }
 impl Completion {
@@ -30,7 +49,7 @@ impl Completion {
     pub(super) fn charge(&self) -> usize {
         match self {
             Self::ZeroCopy(..) => 0,
-            Self::Timestamp { payload, .. } => RECORD + payload.len(),
+            Self::Timestamp { payload, .. } => RECORD + payload.charge(),
         }
     }
 }
@@ -38,11 +57,11 @@ impl Completion {
 struct Pending {
     cookie: u64,
     target: u64,
-    id: u32,
+    sequence: u32,
     phases: usize,
     software: bool,
     hardware: bool,
-    payload: Arc<[u8]>,
+    payload: PacketPayload,
 }
 #[derive(Clone, Default)]
 pub(super) struct TimestampState {
@@ -62,7 +81,18 @@ impl TimestampState {
             + self
                 .pending
                 .iter()
-                .map(|p| p.phases * RECORD + p.payload.len())
+                .map(|p| p.phases * RECORD + p.payload.charge())
+                .sum::<usize>()
+    }
+}
+impl Socket {
+    fn timestamp_charge(&self) -> usize {
+        self.timestamps.charge()
+            + self.completions.capacity() * std::mem::size_of::<Completion>()
+            + self
+                .completions
+                .iter()
+                .map(Completion::charge)
                 .sum::<usize>()
     }
 }
@@ -127,14 +157,7 @@ impl Owner {
             })
     }
     pub(super) fn timestamp_charge(&self) -> usize {
-        self.sockets
-            .values()
-            .map(|s| {
-                s.timestamps.charge()
-                    + s.completions.capacity() * std::mem::size_of::<Completion>()
-                    + s.completions.iter().map(Completion::charge).sum::<usize>()
-            })
-            .sum()
+        self.sockets.values().map(Socket::timestamp_charge).sum()
     }
     pub(super) fn timestamp_options(&mut self, id: u64, name: i32, flags: u32) -> Result<()> {
         let s = self.sockets.get(&id).ok_or(EBADF)?;
@@ -188,6 +211,74 @@ impl Owner {
         s.timestamps.base = base;
         Ok(())
     }
+    // One joint reservation: queued records + every outstanding native phase +
+    // this send's phases + a non-coalescing zero-copy record. No completion push
+    // may allocate after native acceptance.
+    pub(super) fn reserve_completion(
+        &mut self,
+        id: u64,
+        nonempty: bool,
+        flags: i32,
+        override_flags: Option<u32>,
+    ) -> Result<bool> {
+        let s = self.sockets.get(&id).ok_or(EBADF)?;
+        let bits = override_flags
+            .map(|f| s.timestamps.options.per_send(f))
+            .transpose()?
+            .unwrap_or(s.timestamps.options.flags);
+        if bits & (TX_SOFTWARE | TX_HARDWARE) == TX_SOFTWARE | TX_HARDWARE
+            && bits & OPT_TX_SWHW == 0
+        {
+            return Err(libc::EOPNOTSUPP);
+        }
+        if !nonempty {
+            return Ok(false);
+        }
+        let phases = (bits & TX_RECORD).count_ones() as usize;
+        let completion = s.zerocopy && flags & MSG_ZEROCOPY != 0;
+        if phases == 0 && !completion {
+            return Ok(false);
+        }
+        let new_zc = usize::from(
+            completion
+                && !s
+                    .completions
+                    .back()
+                    .and_then(Completion::range)
+                    .is_some_and(|p| extends_completion(p, s.zc_next)),
+        );
+        let additional = s.timestamps.reserved() + phases + new_zc;
+        let total = s.completions.len() + additional;
+        let pending_bytes = if phases == 0 {
+            0
+        } else {
+            (s.timestamps.pending.len() + 1) * 2 * std::mem::size_of::<Pending>() + PACKET_HANDLE
+        };
+        let queue_bytes = total * 2 * std::mem::size_of::<Completion>();
+        if (phases != 0
+            && (self.timestamp_cookie == u64::MAX || s.timestamps.pending.len() >= PHASES))
+            || (phases != 0 || s.timestamps.reserved() != 0) && total > PHASES
+            || new_zc != 0 && total > self.socket_limit()
+            || phases != 0
+                && s.timestamp_charge() + phases * RECORD + pending_bytes + queue_bytes
+                    > s.receive_capacity
+            || self.timestamp_charge() + phases * RECORD + pending_bytes + queue_bytes
+                > RUNTIME_BYTES
+        {
+            return Err(ENOBUFS);
+        }
+        let s = self.sockets.get_mut(&id).unwrap();
+        if phases != 0 {
+            s.timestamps
+                .pending
+                .try_reserve_exact(1)
+                .map_err(|_| ENOBUFS)?;
+        }
+        s.completions
+            .try_reserve_exact(additional)
+            .map_err(|_| ENOBUFS)?;
+        Ok(completion)
+    }
     pub(super) fn timestamp_write(
         &mut self,
         id: u64,
@@ -215,43 +306,13 @@ impl Owner {
             return Err(libc::EOPNOTSUPP);
         }
         let phases = (bits & TX_RECORD).count_ones() as usize;
-        let reserve = s.timestamps.reserved() + phases;
+        // Allocate the shared handle before native acceptance; packet storage is
+        // reserved fallibly at output, before copying any bytes.
+        let payload = (phases != 0).then(|| PacketPayload(Some(Arc::new(Vec::new()))));
         if phases != 0 {
-            if self.timestamp_cookie == u64::MAX
-                || s.timestamps.pending.len() >= PHASES
-                || s.completions.len()
-                    + s.timestamps.pending.iter().map(|p| p.phases).sum::<usize>()
-                    + phases
-                    > PHASES
-                || s.timestamps.charge()
-                    + s.completions.iter().map(Completion::charge).sum::<usize>()
-                    + phases * RECORD
-                    + (s.timestamps.pending.len() + 1) * 2 * std::mem::size_of::<Pending>()
-                    > s.receive_capacity
-                || self.timestamp_charge()
-                    + phases * RECORD
-                    + (s.timestamps.pending.len() + 1) * 2 * std::mem::size_of::<Pending>()
-                    + (s.completions.len() + reserve) * 2 * std::mem::size_of::<Completion>()
-                    > RUNTIME_BYTES
-            {
-                return Err(ENOBUFS);
-            }
             self.endpoint
                 .set_tx_timestamp_capacity(cid, PHASES)
                 .map_err(engine)?;
-            self.sockets
-                .get_mut(&id)
-                .unwrap()
-                .timestamps
-                .pending
-                .try_reserve(1)
-                .map_err(|_| ENOBUFS)?;
-            self.sockets
-                .get_mut(&id)
-                .unwrap()
-                .completions
-                .try_reserve(reserve)
-                .map_err(|_| ENOBUFS)?;
         }
         let progress = self.endpoint.send_progress(cid).map_err(engine)?;
         let lowat = self.sockets[&id].notsent_lowat;
@@ -271,18 +332,11 @@ impl Owner {
             s.timestamps.pending.push(Pending {
                 cookie: self.timestamp_cookie,
                 target: progress.queued_end + n as u64 - 1,
-                id: if bits & OPT_ID != 0 {
-                    progress
-                        .next_write_sequence
-                        .wrapping_add(n as u32 - 1)
-                        .wrapping_sub(s.timestamps.base)
-                } else {
-                    0
-                },
+                sequence: progress.next_write_sequence.wrapping_add(n as u32 - 1),
                 phases,
                 software: request.software_transmit,
                 hardware: request.hardware_transmit,
-                payload: Arc::from([]),
+                payload: payload.unwrap(),
             });
             self.timestamp_cookie += 1;
         }
@@ -293,17 +347,16 @@ impl Owner {
     pub(super) fn timestamp_packet(&mut self, token: Option<ntcp::TxTimestampToken>, bytes: &[u8]) {
         let Some(token) = token else { return };
         let range = token.stream_range();
+        let mut retained: Option<PacketPayload> = None;
         let mut global = self.timestamp_charge();
         for s in self
             .sockets
             .values_mut()
             .filter(|s| matches!(s.handle, Handle::Connection(cid) if cid == token.connection()))
         {
-            let mut charge =
-                s.timestamps.charge() + s.completions.iter().map(Completion::charge).sum::<usize>();
+            let mut charge = s.timestamp_charge();
             for pending in &mut s.timestamps.pending {
-                if s.timestamps.options.flags & OPT_TSONLY != 0
-                    || !pending.payload.is_empty()
+                if !pending.payload.is_empty()
                     || !(range.start..range.end).contains(&pending.target)
                 {
                     continue;
@@ -313,7 +366,16 @@ impl Owner {
                 if charge + bytes.len() <= s.receive_capacity
                     && global + bytes.len() <= RUNTIME_BYTES
                 {
-                    pending.payload = Arc::from(bytes);
+                    if let Some(packet) = &retained {
+                        pending.payload = packet.clone();
+                    } else {
+                        let packet = Arc::get_mut(pending.payload.0.as_mut().unwrap()).unwrap();
+                        if packet.try_reserve_exact(bytes.len()).is_err() {
+                            continue;
+                        }
+                        packet.extend_from_slice(bytes);
+                        retained = Some(pending.payload.clone());
+                    }
                     charge += bytes.len();
                     global += bytes.len();
                 }
@@ -321,21 +383,15 @@ impl Owner {
         }
     }
     pub(super) fn drain_timestamps(&mut self, pair: ClockPair) {
-        let ids: Vec<_> = self
-            .sockets
-            .iter()
-            .filter_map(|(&id, s)| match s.handle {
-                Handle::Connection(cid) => Some((id, cid)),
-                _ => None,
-            })
-            .collect();
         let mut global = self.timestamp_charge();
-        for (id, cid) in ids {
+        for s in self.sockets.values_mut() {
+            let Handle::Connection(cid) = s.handle else {
+                continue;
+            };
             for _ in 0..PHASES {
                 let Ok(Some(event)) = self.endpoint.next_tx_timestamp(cid) else {
                     break;
                 };
-                let s = self.sockets.get_mut(&id).unwrap();
                 let Some(index) = s
                     .timestamps
                     .pending
@@ -347,16 +403,15 @@ impl Owner {
                 let flags = s.timestamps.options.flags;
                 let pending = &s.timestamps.pending[index];
                 let tsonly = flags & OPT_TSONLY != 0;
-                let payload_len = if tsonly { 0 } else { pending.payload.len() };
+                let payload_charge = if tsonly { 0 } else { pending.payload.charge() };
                 let value = match event.outcome {
                     Outcome::Recorded { value, clock } => pair.convert(value, clock),
                     Outcome::Cancelled => None,
                 };
-                let charge = s.timestamps.charge()
-                    + s.completions.iter().map(Completion::charge).sum::<usize>();
+                let charge = s.timestamp_charge();
                 if let Some(value) = value.filter(|_| tsonly || !pending.payload.is_empty())
-                    && charge + payload_len <= s.receive_capacity
-                    && global + payload_len <= RUNTIME_BYTES
+                    && charge + payload_charge <= s.receive_capacity
+                    && global + payload_charge <= RUNTIME_BYTES
                 {
                     let (sw, hw) = match event.source {
                         Source::Software => (Some(value), None),
@@ -369,14 +424,19 @@ impl Owner {
                     };
                     s.completions.push_back(Completion::Timestamp {
                         stamp: timestamps(sw, hw),
-                        error: extended_error(stage, pending.id),
+                        error: extended_error(
+                            stage,
+                            s.timestamps
+                                .options
+                                .completion_id(pending.sequence, s.timestamps.base),
+                        ),
                         payload: if tsonly {
-                            Arc::from([])
+                            PacketPayload::default()
                         } else {
                             pending.payload.clone()
                         },
                     });
-                    global += payload_len;
+                    global += payload_charge;
                     s.readiness_generations[2] = s.readiness_generations[2].wrapping_add(1);
                 } else {
                     global = global.saturating_sub(RECORD);
@@ -390,7 +450,7 @@ impl Owner {
                 }
                 pending.phases -= 1;
                 if pending.phases == 0 {
-                    global = global.saturating_sub(pending.payload.len());
+                    global = global.saturating_sub(pending.payload.charge());
                     s.timestamps.pending.swap_remove(index);
                 }
             }

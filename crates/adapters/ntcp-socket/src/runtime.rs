@@ -1063,33 +1063,6 @@ impl Owner {
         }
         Ok(cid)
     }
-    fn reserve_completion(&mut self, id: u64, nonempty: bool, flags: i32) -> Result<bool> {
-        let limit = self.socket_limit();
-        let charged = self.timestamp_charge();
-        let s = self.sockets.get_mut(&id).ok_or(EBADF)?;
-        let completion = nonempty && s.zerocopy && flags & MSG_ZEROCOPY != 0;
-        if completion
-            && !s
-                .completions
-                .back()
-                .and_then(Completion::range)
-                .is_some_and(|p| extends_completion(p, s.zc_next))
-        {
-            if s.completions.len() + s.timestamps.reserved() >= limit
-                || charged
-                    + (s.completions.len() + s.timestamps.reserved() + 1)
-                        * 2
-                        * std::mem::size_of::<Completion>()
-                    > timestamps::RUNTIME_BYTES
-            {
-                return Err(ENOBUFS);
-            }
-            s.completions
-                .try_reserve(s.timestamps.reserved() + 1)
-                .map_err(|_| ENOBUFS)?;
-        }
-        Ok(completion)
-    }
     #[cfg(test)]
     fn write(&mut self, id: u64, bytes: Vec<u8>, flags: i32) -> Result<i32> {
         self.write_timestamp(id, bytes, flags, None)
@@ -1113,7 +1086,7 @@ impl Owner {
         if bytes.is_empty() {
             return Ok(0);
         }
-        let completion = self.reserve_completion(id, true, flags)?;
+        let completion = self.reserve_completion(id, true, flags, override_flags)?;
         let n = self.timestamp_write(id, cid, &bytes, flags, override_flags)?;
         let s = self.sockets.get_mut(&id).unwrap();
         if n != 0 && completion {
@@ -1556,7 +1529,7 @@ impl Owner {
                         }
                         total.min(room)
                     };
-                    self.reserve_completion(id, total != 0, flags)?;
+                    self.reserve_completion(id, total != 0, flags, override_flags)?;
                     accepted
                 } else {
                     total
