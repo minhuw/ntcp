@@ -45,7 +45,7 @@ pub enum Op {
     GetTimeout(bool),
     #[cfg(test)]
     Write(Vec<u8>),
-    #[cfg(all(test, feature = "packet-test"))]
+    #[cfg(test)]
     WriteFlags(Vec<u8>, i32),
     Send(Vec<(usize, usize)>, i32),
     ErrorQueueTo(usize),
@@ -1404,7 +1404,7 @@ impl Owner {
             Op::Write(bytes) => {
                 out.value = self.write(id, bytes, 0)?;
             }
-            #[cfg(all(test, feature = "packet-test"))]
+            #[cfg(test)]
             Op::WriteFlags(bytes, flags) => {
                 out.value = self.write(id, bytes, flags)?;
             }
