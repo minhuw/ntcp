@@ -86,4 +86,5 @@ int main(int argc, char **argv) {
     assert(read(fd,received,1)==0);
     assert(close(alias)==0 && close(fd)==0);
     puts("PASS live timestamp ABI, per-send override, alias, RX PEEK/fault rollback");
+    return 0;
 }
