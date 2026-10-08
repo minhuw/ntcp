@@ -3226,7 +3226,7 @@
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
           "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
           "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
-          "Runtime integration pending: enable this audited fixture mapping only after the shared ntcp-socket sendfile interposer is available; mapping eligibility is not a behavior pass claim."
+          "The shared ntcp-socket sendfile interposer transfers native file data through bounded copies into managed TCP; native-only calls retain libc forwarding. The five-byte fixture is isolated in the behavioral child's mount namespace."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -3250,14 +3250,11 @@
         },
         "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
       },
-      "blocked_reasons": [
-        "Runtime integration pending: enable this audited fixture mapping only after the shared ntcp-socket sendfile interposer is available; mapping eligibility is not a behavior pass claim."
-      ],
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh\n/bin/rm -f /tmp/testfile\n/bin/dd bs=1 count=5 if=/dev/zero of=/tmp/testfile status=none\n`",
           "sha256": "e53530dd15bf49e9f50bf090fbc701b9654ac8a0e321da5a72cdecc1d83d23ec",
-          "semantic_mapping": "Exact defaults profile plus five zero bytes at /tmp/testfile in a fresh child-only tmpfs; no upstream shell runs, and namespace lifetime tears down the fixture. Runtime eligibility remains separately gated."
+          "semantic_mapping": "Exact defaults profile plus five zero bytes at /tmp/testfile in a fresh child-only tmpfs; no upstream shell runs, and namespace lifetime tears down the fixture."
         }
       ]
     },
