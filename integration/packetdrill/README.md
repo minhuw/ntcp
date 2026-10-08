@@ -11,6 +11,14 @@ The 14 selected upstream loss-recovery tests are accounted for: **12 pass**, and
 
 Both start with a 10-MSS window and send only 6 or 9 MSS. Linux's slow-start heuristic allows growth toward twice the actual flight peak: 12 or 18 MSS. ntcp follows [RFC 9438 §5.8](https://www.rfc-editor.org/rfc/rfc9438.html#section-5.8), keeping the window at 10 MSS while application-limited.
 
+### `cubic/cubic-rto-ss-ca-cwnd-bump.pkt`
+
+**Accepted TLP timing mismatch: 300–303 ms expected, ~250 ms observed.**
+
+After two 100-ms RTT samples, [RFC 6298 §2.3](https://www.rfc-editor.org/rfc/rfc6298.html#section-2) gives ntcp `RTTVAR = 37.5 ms` and `RTO = 100 + 4 × 37.5 = 250 ms`. Linux retains a 200-ms variation allowance, yielding a 300-ms RTO. [RFC 8985 §7.2](https://www.rfc-editor.org/rfc/rfc8985.html#section-7.2) caps each stack's TLP deadline at its RTO, producing the observed difference.
+
+A diagnostic run with adjusted timing subsequently reaches the 200,000-byte write, which exceeds the current 65,535-byte packet-backend I/O limit. That interface limit remains separate from this accepted timing difference.
+
 ### `ts_recent/invalid_ack.pkt`
 
 **Accepted extra ACK: ntcp replies to an ACK beyond `SND.NXT`.**
