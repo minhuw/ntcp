@@ -464,3 +464,23 @@ void ntcp_c_packet_init(const char *flags, void *interface) {
 void ntcp_c_packet_free(void *userdata) {
     (void)NTCP_RUST_CALL(int, (ntcp_plugin_free(userdata), 0));
 }
+
+// Actual callback-table coverage, including every ordinary receive entry point.
+void ntcp_abi_receive_unsupported(void *u) {
+    struct packetdrill_interface p; ntcp_fill(&p, u);
+    int fd = p.socket(u, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
+    assert(fd >= 0);
+    char bytes[65536];
+    struct iovec v = {.iov_base = bytes, .iov_len = 1};
+    struct msghdr m = {.msg_iov = &v, .msg_iovlen = 1};
+    assert(p.recv(u, fd, bytes, 1, MSG_WAITALL) == -1 && errno == ENOSYS);
+    assert(p.recvfrom(u, fd, bytes, 1, MSG_WAITALL, NULL, NULL) == -1 && errno == ENOSYS);
+    assert(p.recvmsg(u, fd, &m, MSG_WAITALL) == -1 && errno == ENOSYS);
+    assert(p.recv(u, fd, bytes, sizeof(bytes), MSG_DONTWAIT) == -1 && errno == ENOSYS);
+    assert(p.recvfrom(u, fd, bytes, sizeof(bytes), MSG_DONTWAIT, NULL, NULL) == -1 && errno == ENOSYS);
+    assert(p.read(u, fd, bytes, sizeof(bytes)) == -1 && errno == ENOSYS);
+    v.iov_len = sizeof(bytes);
+    assert(p.recvmsg(u, fd, &m, MSG_DONTWAIT) == -1 && errno == ENOSYS);
+    assert(p.readv(u, fd, &v, 1) == -1 && errno == ENOSYS);
+    assert(p.close(u, fd) == 0);
+}

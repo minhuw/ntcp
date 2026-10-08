@@ -61,13 +61,9 @@ pub fn close_epoll(fd: i32) -> Result<()> {
 #[cfg(feature = "packet-test")]
 pub(crate) fn stop_packet_backend() {
     let mut epolls = EPOLLS.lock().unwrap_or_else(|e| e.into_inner());
-    for (&fd, epoll) in epolls.iter() {
-        if epoll.matches(fd) {
-            unsafe {
-                syscall(SYS_close, fd);
-            }
-        }
-    }
+    // Exposed epoll descriptors belong to the caller. In dlopen-only use a host
+    // close can bypass our registry, and anon-inode identity cannot distinguish
+    // a reused epoll. Only Drop's private retained descriptor is safe to close.
     epolls.clear();
 }
 pub fn closed(id: u64) {

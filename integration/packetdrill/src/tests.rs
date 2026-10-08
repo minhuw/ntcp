@@ -445,6 +445,7 @@ fn host_bridge_preloaded_process_and_lifecycle() {
 #include <string.h>
 #include <sys/syscall.h>
 #include <pthread.h>
+#include <fcntl.h>
 static void *blocked(void *arg) {
     struct packetdrill_interface *p = arg;
     unsigned char packet[65535]; size_t n = sizeof(packet); long long t;
@@ -452,9 +453,17 @@ static void *blocked(void *arg) {
     assert(errno == ECANCELED || errno == EIO);
     return NULL;
 }
-int main(void) {
+int main(int argc, char **argv) {
+    assert(argc == 2);
     void (*init)(const char *, struct packetdrill_interface *) = dlsym(RTLD_DEFAULT, "packetdrill_interface_init");
+    int preloaded = init != NULL;
+    void *plugin = NULL;
+    if (!init) {
+        plugin = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL); assert(plugin);
+        init = dlsym(plugin, "packetdrill_interface_init");
+    }
     assert(init);
+#define GETOPT(fd, level, name, value, len) (preloaded ? getsockopt(fd, level, name, value, len) : p.getsockopt(p.userdata, fd, level, name, value, len))
     struct packetdrill_interface p, other;
     init("local=192.0.2.1,upstream-sack", &p); assert(p.userdata);
     init("local=192.0.2.1,baseline", &other); assert(!other.userdata);
@@ -462,13 +471,31 @@ int main(void) {
     struct sockaddr_in addr = {.sin_family=AF_INET, .sin_port=htons(8080), .sin_addr={htonl(0xc0000202)}};
     assert(p.connect(p.userdata, fd, (void *)&addr, sizeof(addr)) == -1 && errno == EINPROGRESS);
     unsigned char info[288], abi[280]; memset(info, 0xa5, sizeof(info)); socklen_t n = sizeof(info);
-    assert(getsockopt(fd, IPPROTO_TCP, TCP_INFO, info, &n) == 0 && n == 280 && info[0] == 2);
+    assert(GETOPT(fd, IPPROTO_TCP, TCP_INFO, info, &n) == 0 && n == 280 && info[0] == 2);
     n = sizeof(abi); assert(p.getsockopt(p.userdata, fd, IPPROTO_TCP, TCP_INFO, abi, &n) == 0);
     assert(memcmp(info, abi, sizeof(abi)) == 0 && info[280] == 0xa5);
     n = sizeof(abi); assert(syscall(SYS_getsockopt, fd, IPPROTO_TCP, TCP_INFO, abi, &n) == -1);
-    n = sizeof(abi); assert(getsockopt(fd, IPPROTO_TCP, TCP_CC_INFO, abi, &n) == 0 && n == 0);
-    n = sizeof(abi); assert(getsockopt(fd, SOL_SOCKET, SO_MEMINFO, abi, &n) == 0 && n == 36);
-    int domain; n = sizeof(domain); assert(getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &n) == 0 && domain == AF_INET);
+    n = sizeof(abi); assert(GETOPT(fd, IPPROTO_TCP, TCP_CC_INFO, abi, &n) == 0 && n == 0);
+    n = sizeof(abi); assert(GETOPT(fd, SOL_SOCKET, SO_MEMINFO, abi, &n) == 0 && n == 36);
+    int domain; n = sizeof(domain); assert(GETOPT(fd, SOL_SOCKET, SO_DOMAIN, &domain, &n) == 0 && domain == AF_INET);
+    // Register through the shared ABI, but close through ordinary host libc.
+    int epfd = p.epoll_create(p.userdata, 1); assert(epfd >= 0);
+    struct epoll_event event = {.events = EPOLLOUT, .data.u64 = 123};
+    int retained = 0;
+    while (syscall(SYS_fcntl, retained, F_GETFD) >= 0) ++retained;
+    assert(p.epoll_ctl(p.userdata, epfd, EPOLL_CTL_ADD, fd, &event) == 0);
+    assert(syscall(SYS_fcntl, retained, F_GETFD) >= 0);
+    assert(close(epfd) == 0);
+    if (preloaded) assert(syscall(SYS_fcntl, retained, F_GETFD) == -1 && errno == EBADF);
+    int native = syscall(SYS_epoll_create1, EPOLL_CLOEXEC); assert(native >= 0);
+    if (native != epfd) { assert(dup2(native, epfd) == epfd); assert(close(native) == 0); }
+    if (preloaded) {
+        // A stale registration would incorrectly make MOD succeed here.
+        assert(p.epoll_ctl(p.userdata, epfd, EPOLL_CTL_MOD, fd, &event) == -1 && errno == ENOENT);
+        assert(close(epfd) == 0);
+        native = syscall(SYS_epoll_create1, EPOLL_CLOEXEC); assert(native >= 0);
+        if (native != epfd) { assert(dup2(native, epfd) == epfd); assert(close(native) == 0); }
+    }
     int host = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP); assert(host >= 0);
     unsigned char kernel[104], forwarded[104]; socklen_t k = sizeof(kernel); n = sizeof(forwarded);
     assert(syscall(SYS_getsockopt, host, IPPROTO_TCP, TCP_INFO, kernel, &k) == 0);
@@ -479,6 +506,9 @@ int main(void) {
     pthread_t thread; assert(!pthread_create(&thread, NULL, blocked, &p)); usleep(10000);
     p.free(p.userdata); assert(!pthread_join(thread, NULL));
     p.free(p.userdata); // Stale userdata never dereferenced.
+    if (!preloaded) assert(syscall(SYS_fcntl, retained, F_GETFD) == -1 && errno == EBADF);
+    assert(fcntl(epfd, F_GETFD) >= 0); // Neither mode may close the foreign epoll.
+    assert(close(epfd) == 0);
     n = sizeof(info); assert(getsockopt(fd, IPPROTO_TCP, TCP_INFO, info, &n) == -1 && errno == EBADF);
     init("local=192.0.2.1,baseline", &p); assert(!p.userdata);
     return 0;
@@ -497,21 +527,25 @@ int main(void) {
             .unwrap()
             .success()
     );
-    let mut child = Command::new(&executable)
-        .env("LD_PRELOAD", library)
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(status.success());
-            break;
+    for preloaded in [true, false] {
+        let mut command = Command::new(&executable);
+        command.arg(&library).env_remove("LD_PRELOAD");
+        if preloaded {
+            command.env("LD_PRELOAD", &library);
         }
-        if Instant::now() > deadline {
-            child.kill().unwrap();
-            panic!("preload helper deadlocked");
+        let mut child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() > deadline {
+                child.kill().unwrap();
+                panic!("preload helper deadlocked");
+            }
+            thread::sleep(Duration::from_millis(10));
         }
-        thread::sleep(Duration::from_millis(10));
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -581,8 +615,25 @@ fn connect_listener(
     adapter: &Adapter,
     port: u16,
     buffers: bool,
+    ip_policy: Option<(i32, i32)>,
 ) -> (i32, i32, IpMetadata, ntcp::wire::Header) {
     let listener = call(adapter, 1, 0, SOCK_NONBLOCK, vec![], 0).unwrap().value as i32;
+    if let Some((tos, pmtu)) = ip_policy {
+        for (name, value) in [(IP_TOS, tos), (IP_MTU_DISCOVER, pmtu)] {
+            unsafe {
+                assert_eq!(
+                    ntcp_socket::setsockopt(
+                        listener,
+                        IPPROTO_IP,
+                        name,
+                        (&value as *const i32).cast(),
+                        4
+                    ),
+                    0
+                );
+            }
+        }
+    }
     if buffers {
         set_buffer(listener, SO_SNDBUF, 4096);
         set_buffer(listener, SO_RCVBUF, 131072);
@@ -636,7 +687,7 @@ fn sndbuf_rcvbuf_end_to_end_shared_abi() {
         return;
     }
     let adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
-    let (listener, fd, ip, header) = connect_listener(&adapter, 8081, true);
+    let (listener, fd, ip, header) = connect_listener(&adapter, 8081, true, None);
     let epfd = unsafe { libc::epoll_create1(EPOLL_CLOEXEC) };
     assert!(epfd >= 0);
     let mut event = epoll_event {
@@ -754,7 +805,7 @@ fn shutdown_completes_pending_reads_poll_and_blocked_writes() {
     }
     let adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
     for (i, how) in [SHUT_RD, SHUT_WR, SHUT_RDWR].into_iter().enumerate() {
-        let (listener, fd, _, _) = connect_listener(&adapter, 8080 + i as u16, false);
+        let (listener, fd, _, _) = connect_listener(&adapter, 8080 + i as u16, false, None);
         let data = vec![0u8; 65535];
         unsafe {
             assert_eq!(
@@ -889,4 +940,171 @@ fn token_explicit_close_host_close_and_foreign_replacement() {
         assert!(syscall(SYS_fcntl, fd, F_GETFD) >= 0);
         assert_eq!(libc::close(fd), 0);
     }
+}
+
+#[test]
+fn receive_callbacks_report_unsupported_flags_and_bounds() {
+    if std::env::var_os("NTCP_PACKET_ABI_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::receive_callbacks_report_unsupported_flags_and_bounds",
+                "--test-threads=1",
+            ])
+            .env("NTCP_PACKET_ABI_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let logs = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            logs.matches("NTCP_PACKETDRILL_UNSUPPORTED:").count(),
+            8,
+            "{logs}"
+        );
+        assert_eq!(logs.matches("send/recv flags").count(), 3, "{logs}");
+        assert_eq!(
+            logs.matches("65535-byte adapter bound").count(),
+            5,
+            "{logs}"
+        );
+        return;
+    }
+    unsafe extern "C" {
+        fn ntcp_abi_receive_unsupported(u: *mut c_void);
+    }
+    let _adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
+    unsafe {
+        ntcp_abi_receive_unsupported(USERDATA);
+    }
+}
+
+#[test]
+fn pending_accept_cancelled_by_real_descriptor_replacement() {
+    if isolated("tests::pending_accept_cancelled_by_real_descriptor_replacement") {
+        return;
+    }
+    let adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
+    let fd = call(&adapter, 1, 0, 0, vec![], 0).unwrap().value as i32;
+    call(
+        &adapter,
+        2,
+        fd,
+        0,
+        encode_addr(SocketAddr::new(local().into(), 8080)),
+        0,
+    )
+    .unwrap();
+    call(&adapter, 3, fd, 1, vec![], 0).unwrap();
+    let (started, ready) = std::sync::mpsc::channel();
+    let (completed, result) = std::sync::mpsc::channel();
+    let waiter = thread::spawn(move || {
+        started.send(()).unwrap();
+        let r = unsafe { ntcp_socket::accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        completed.send((r, errno())).unwrap();
+    });
+    ready.recv().unwrap();
+    thread::sleep(Duration::from_millis(20));
+    assert!(
+        !waiter.is_finished(),
+        "accept must still be blocked before replacement"
+    );
+    let foreign = unsafe { libc::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0) };
+    assert!(foreign >= 0);
+    unsafe {
+        assert_eq!(libc::dup2(foreign, fd), fd);
+        assert_eq!(libc::close(foreign), 0);
+    }
+    assert_eq!(
+        result.recv_timeout(Duration::from_secs(1)).unwrap(),
+        (-1, EBADF)
+    );
+    waiter.join().unwrap();
+    assert_eq!(get_buffer(fd, SO_DOMAIN), AF_UNIX);
+    drop(adapter);
+    unsafe {
+        assert!(syscall(SYS_fcntl, fd, F_GETFD) >= 0);
+        assert_eq!(libc::close(fd), 0);
+    }
+}
+
+#[test]
+fn detached_fin_keeps_ip_policy_after_real_descriptor_reuse() {
+    if isolated("tests::detached_fin_keeps_ip_policy_after_real_descriptor_reuse") {
+        return;
+    }
+    let adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
+    let (listener, fd, ip, mut ack) =
+        connect_listener(&adapter, 8080, false, Some((184, IP_PMTUDISC_DONT)));
+    let set = |fd, name, value: i32| unsafe {
+        assert_eq!(
+            ntcp_socket::setsockopt(fd, IPPROTO_IP, name, (&value as *const i32).cast(), 4),
+            0
+        );
+    };
+    for (name, expected) in [(IP_TOS, 184), (IP_MTU_DISCOVER, IP_PMTUDISC_DONT)] {
+        let mut value = 0i32;
+        let mut n = 4;
+        unsafe {
+            assert_eq!(
+                ntcp_socket::getsockopt(
+                    fd,
+                    IPPROTO_IP,
+                    name,
+                    (&mut value as *mut i32).cast(),
+                    &mut n
+                ),
+                0
+            );
+        }
+        assert_eq!(value, expected);
+    }
+    let replacement = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+        .unwrap()
+        .value as i32;
+    set(replacement, IP_TOS, 4);
+    set(replacement, IP_MTU_DISCOVER, IP_PMTUDISC_DO);
+    unsafe {
+        assert_eq!(libc::dup2(replacement, fd), fd);
+        assert_eq!(libc::close(replacement), 0);
+    }
+    let fin = loop {
+        let bytes = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+        let header = packet_header(&bytes);
+        if header.source_port == 8080 && header.flags & ntcp::wire::FIN != 0 {
+            assert_eq!(bytes[1], 184);
+            assert_eq!(bytes[6] & 0x40, 0);
+            break header;
+        }
+    };
+    let mut tos = 0i32;
+    let mut n = 4;
+    unsafe {
+        assert_eq!(
+            ntcp_socket::getsockopt(
+                fd,
+                IPPROTO_IP,
+                IP_TOS,
+                (&mut tos as *mut i32).cast(),
+                &mut n
+            ),
+            0
+        );
+    }
+    assert_eq!(tos, 4);
+    ack.acknowledgment = fin.sequence.wrapping_add(1);
+    ack.flags |= ntcp::wire::FIN;
+    inject(ip, ack, &[]);
+    let bytes = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+    assert_eq!(
+        packet_header(&bytes).acknowledgment,
+        ack.sequence.wrapping_add(1)
+    );
+    assert_eq!(bytes[1], 184);
+    assert_eq!(bytes[6] & 0x40, 0);
+    call(&adapter, 8, fd, 0, vec![], 0).unwrap();
+    call(&adapter, 8, listener, 0, vec![], 0).unwrap();
 }

@@ -1135,7 +1135,11 @@ unsafe fn vectors_output(
             .ok_or(EINVAL)?;
     }
     if io_limit() < runtime::BYTES && total > io_limit() {
-        return Err(EMSGSIZE);
+        return Err(if write {
+            EMSGSIZE
+        } else {
+            runtime::unsupported_option("receive I/O exceeds 65535-byte adapter bound")
+        });
     }
     let bytes = vec![0u8; total.min(runtime::BYTES)];
     if write {
@@ -1171,7 +1175,7 @@ unsafe fn vectors_output(
         return Ok(result?.value as i64);
     }
     if flags & !(MSG_DONTWAIT | MSG_PEEK) != 0 {
-        return Err(EOPNOTSUPP);
+        return Err(runtime::unsupported_option("send/recv flags"));
     }
     let id = owned(fd)?.ok_or(EBADF)?;
     let destinations = vectors
@@ -1238,6 +1242,9 @@ pub unsafe extern "C" fn ntcp_managed_recvmsg(fd: i32, p: *mut msghdr, flags: i3
             }
             let _ = load_array(m.msg_iov, m.msg_iovlen, 1024)?;
             return error_queue(id, p, m);
+        }
+        if flags & !(MSG_DONTWAIT | MSG_PEEK) != 0 {
+            return Err(runtime::unsupported_option("send/recv flags"));
         }
         let n = i32::try_from(m.msg_iovlen).map_err(|_| EINVAL)?;
         if !m.msg_name.is_null() {
@@ -1306,10 +1313,15 @@ pub unsafe extern "C" fn ntcp_managed_recvfrom(
             return Err(EFAULT);
         }
         if flags & !(MSG_DONTWAIT | MSG_PEEK) != 0 {
-            return Err(EOPNOTSUPP);
+            return Err(runtime::unsupported_option("send/recv flags"));
         }
         if n > isize::MAX as usize {
             return Err(EINVAL);
+        }
+        if io_limit() < runtime::BYTES && n > io_limit() {
+            return Err(runtime::unsupported_option(
+                "scalar I/O exceeds 65535-byte adapter bound",
+            ));
         }
         if !addr.is_null() {
             unsafe {
@@ -1719,6 +1731,41 @@ mod tests {
         let id = call(0, Op::New(SOCK_NONBLOCK)).unwrap().value as u64;
         let (fd, token) = token(SOCK_CLOEXEC).unwrap();
         install(fd, token, id).unwrap();
+        // The ordinary adapter keeps its errno contract and larger I/O bound.
+        #[cfg(not(feature = "packet-test"))]
+        unsafe {
+            let mut bytes = vec![0u8; 65536];
+            let mut v = iovec {
+                iov_base: bytes.as_mut_ptr().cast(),
+                iov_len: bytes.len(),
+            };
+            let mut m: msghdr = std::mem::zeroed();
+            m.msg_iov = &mut v;
+            m.msg_iovlen = 1;
+            for flags in [MSG_WAITALL, MSG_DONTWAIT] {
+                let expected = if flags == MSG_WAITALL {
+                    EOPNOTSUPP
+                } else {
+                    ENOTCONN
+                };
+                assert_eq!(recv(fd, bytes.as_mut_ptr().cast(), bytes.len(), flags), -1);
+                assert_eq!(errno(), expected);
+                assert_eq!(
+                    recvfrom(
+                        fd,
+                        bytes.as_mut_ptr().cast(),
+                        bytes.len(),
+                        flags,
+                        ptr::null_mut(),
+                        ptr::null_mut()
+                    ),
+                    -1
+                );
+                assert_eq!(errno(), expected);
+                assert_eq!(recvmsg(fd, &mut m, flags), -1);
+                assert_eq!(errno(), expected);
+            }
+        }
         let alias = unsafe { dup(fd) };
         assert!(alias >= 0);
         let native = unsafe { syscall(SYS_socket, AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0) as i32 };
