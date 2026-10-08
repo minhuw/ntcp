@@ -4,6 +4,7 @@ use ntcp_ip::*;
 fn tx(v6: bool, len: usize) -> Transmit {
     Transmit {
         connection: None,
+        tx_timestamp: None,
         ip: IpMetadata {
             source: if v6 { "2001:db8::1" } else { "192.0.2.1" }
                 .parse()
