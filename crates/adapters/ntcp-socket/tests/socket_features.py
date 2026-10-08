@@ -45,23 +45,25 @@ def run(executable, virtual=False, preload=False):
                         'managed' if virtual else 'native'], env=env, check=True, timeout=25)
         task.result(timeout=5)
 
-    done = threading.Event()
-    def blocked_peer(listener):
-        listener.settimeout(15)
-        with listener.accept()[0]:
-            assert done.wait(20)
-    with socket.socket() as listener, concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
-        listener.bind((host, 0))
-        listener.listen()
-        task = pool.submit(blocked_peer, listener)
-        try:
-            subprocess.run([str(executable), host, str(listener.getsockname()[1]),
-                            'managed-lowwater' if virtual else 'native-lowwater'],
-                           env=env, check=True, timeout=25)
-        finally:
-            done.set()
-        task.result(timeout=5)
+    for mode in ('lowwater', 'admission'):
+        done = threading.Event()
+        def blocked_peer(listener):
+            listener.settimeout(15)
+            with listener.accept()[0]:
+                assert done.wait(20)
+        with socket.socket() as listener, concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            if mode == 'lowwater':
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            listener.bind((host, 0))
+            listener.listen()
+            task = pool.submit(blocked_peer, listener)
+            try:
+                subprocess.run([str(executable), host, str(listener.getsockname()[1]),
+                                ('managed-' if virtual else 'native-') + mode],
+                               env=env, check=True, timeout=25)
+            finally:
+                done.set()
+            task.result(timeout=5)
 
 
 def main():

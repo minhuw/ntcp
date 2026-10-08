@@ -86,22 +86,30 @@ int main(int argc, char **argv) {
     assert(inet_pton(AF_INET, argv[1], &addr.sin_addr) == 1);
     assert(connect(fd, (void *)&addr, sizeof(addr)) == 0);
     if (strstr(argv[3], "admission")) {
-        /* Explicit regression probe (native-admission / managed-admission).
-           No EOR: LOWAT gates allocation, not appends to an admitted skb. */
+        /* Native Linux gates skb allocation; managed sockets enforce a
+           byte budget. Neither policy changes the EPOLLET contract. */
         set(fd, TCP_CORK, 1);
         set(fd, TCP_NOTSENT_LOWAT, 4000);
         char payload[8000] = {0};
         ssize_t first = send(fd, payload, sizeof(payload), MSG_DONTWAIT | MSG_MORE);
         ssize_t next = send(fd, payload, 1, MSG_DONTWAIT | MSG_MORE);
+        int next_error = errno;
         struct tcp_info info = {0};
         socklen_t size = sizeof(info);
         assert(getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &size) == 0);
         fprintf(stderr, "admission: first=%zd next=%zd notsent=%u\n",
                 first, next, info.tcpi_notsent_bytes);
-        assert(first == 8000 && next == 1);
-        if (!managed) assert(info.tcpi_notsent_bytes == 8001);
+        if (managed) {
+            assert(first == 4000);
+            /* Successful output between calls may make byte credit available. */
+            assert(next == 1 || (next == -1 && next_error == EAGAIN));
+            assert(info.tcpi_notsent_bytes <= 4000);
+        } else {
+            assert(first == 8000 && next == 1);
+            assert(info.tcpi_notsent_bytes == 8001);
+        }
         close(fd);
-        puts("PASS: LOWAT admission overshoot and subsequent append without EOR");
+        puts("PASS: LOWAT native skb admission / managed byte admission");
         return 0;
     }
     if (strstr(argv[3], "lowwater")) {
