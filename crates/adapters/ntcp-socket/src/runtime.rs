@@ -1003,19 +1003,14 @@ impl Owner {
         }
         let completion = self.reserve_completion(id, true, flags)?;
         let s = self.sockets.get_mut(&id).unwrap();
-        let info = self.endpoint.transport_info(cid).map_err(engine)?;
-        let room =
-            (effective_notsent_lowat(s.notsent_lowat) as usize).saturating_sub(info.notsent_bytes);
-        if room == 0 {
-            return Err(EAGAIN);
-        }
         let n = self
             .endpoint
-            .write_with_options(
+            .write_with_options_and_notsent_lowat(
                 cid,
-                &bytes[..bytes.len().min(room)],
+                &bytes,
                 flags & MSG_MORE != 0,
-                flags & MSG_EOR != 0 && bytes.len() <= room,
+                flags & MSG_EOR != 0,
+                Some(effective_notsent_lowat(s.notsent_lowat)),
             )
             .map_err(engine)?;
         if n != 0 && completion {
@@ -1429,20 +1424,28 @@ impl Owner {
                     return Err(EMSGSIZE);
                 }
                 let accepted = if let Some(cid) = cid {
-                    let info = self.endpoint.transport_info(cid).map_err(engine)?;
-                    let lowat = effective_notsent_lowat(self.sockets[&id].notsent_lowat) as usize;
-                    // Only lowwater truncates here. Let core observe actual
-                    // short/blocked send-buffer writes for TCP_INFO accounting.
-                    let room = lowat.saturating_sub(info.notsent_bytes);
-                    if room == 0 && total != 0 {
-                        return Err(EAGAIN);
-                    }
+                    let lowat = effective_notsent_lowat(self.sockets[&id].notsent_lowat);
+                    let accepted = if lowat == u32::MAX {
+                        total
+                    } else {
+                        let room = self
+                            .endpoint
+                            .send_admission_room(cid, Some(lowat))
+                            .map_err(engine)?;
+                        if room == 0 && total != 0 {
+                            return Err(EAGAIN);
+                        }
+                        total.min(room)
+                    };
                     self.reserve_completion(id, total != 0, flags)?;
-                    total.min(room)
+                    accepted
                 } else {
                     total
                 };
-                let mut bytes = vec![0; accepted];
+                // Inspect only the admissible prefix, but pass the original
+                // length so core observes short writes and seals partial EOR.
+                // The zeroed suffix is outside the unchanged core admission room.
+                let mut bytes = vec![0; total];
                 let mut at = 0;
                 for (address, len) in sources {
                     let len = len.min(accepted - at);
@@ -1452,11 +1455,6 @@ impl Owner {
                         break;
                     }
                 }
-                let flags = if accepted < total {
-                    flags & !MSG_EOR
-                } else {
-                    flags
-                };
                 out.value = self.write(id, bytes, flags)?;
             }
             Op::ErrorQueueTo(address) => {
@@ -1993,6 +1991,49 @@ mod tests {
         }
     }
     #[test]
+    fn lowwater_admits_tail_overshoot_then_gates_next_chunk_and_eor() {
+        let (mut a, _b, client, _, _) = pair();
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_CORK, 1))
+            .unwrap();
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, 4000))
+            .unwrap();
+        assert_eq!(
+            a.execute(client, Op::WriteFlags(vec![1; 8000], MSG_MORE))
+                .unwrap()
+                .value,
+            8000
+        );
+        assert_eq!(
+            a.execute(client, Op::WriteFlags(vec![2], MSG_MORE))
+                .unwrap()
+                .value,
+            1
+        );
+        // Readiness retains the independent half-threshold rule.
+        assert_eq!(a.execute(client, Op::Ready).unwrap().value & EPOLLOUT, 0);
+        let tail = vec![3; 9000];
+        // Bytes outside the admitted prefix must not be dereferenced.
+        let sources = vec![(tail.as_ptr() as usize, tail.len()), (0, 1)];
+        assert_eq!(
+            a.execute(client, Op::Send(sources, MSG_MORE | MSG_EOR))
+                .unwrap()
+                .value,
+            8383
+        );
+        assert_eq!(a.execute(client, Op::Write(vec![4])).unwrap_err(), EAGAIN);
+        let Handle::Connection(cid) = a.sockets[&client].handle else {
+            panic!()
+        };
+        assert_eq!(a.endpoint.transport_info(cid).unwrap().notsent_bytes, 16384);
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, -1))
+            .unwrap();
+        assert_eq!(
+            a.execute(client, Op::Write(vec![4; 20000])).unwrap().value,
+            20000
+        );
+    }
+
+    #[test]
     fn lowwater_tracks_unsent_not_unacked_and_option_wakes() {
         let (mut a, _b, client, _, _) = pair();
         a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
@@ -2000,7 +2041,9 @@ mod tests {
         a.execute(client, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, 4000))
             .unwrap();
         assert_eq!(
-            a.execute(client, Op::Write(vec![1; 8000])).unwrap().value,
+            a.execute(client, Op::WriteFlags(vec![1; 4000], MSG_EOR))
+                .unwrap()
+                .value,
             4000
         );
         let blocked = a.execute(client, Op::Ready).unwrap();

@@ -4646,3 +4646,37 @@ fn endpoint_cork_more_eor_deadline_flush_and_failed_output() {
         b"hi"
     );
 }
+
+#[test]
+fn endpoint_lowat_partial_eor_and_unlimited_admission_preserve_heap_quota() {
+    let (mut a, mut b, listener, client) = endpoints();
+    pump(&mut a, &mut b, 0);
+    b.accept(listener).unwrap();
+    a.set_buffer_capacities(client, 32, 32).unwrap();
+    a.set_cork(client, true).unwrap();
+    let charge = a.buffer_bytes();
+    assert_eq!(a.send_admission_room(client, Some(1)), Ok(32));
+    assert_eq!(
+        a.write_with_options_and_notsent_lowat(client, &[1; 40], true, true, Some(1)),
+        Ok(32)
+    );
+    assert_eq!(a.send_admission_room(client, Some(1)), Ok(0));
+    assert_eq!(
+        a.write_with_options_and_notsent_lowat(client, b"x", true, false, Some(1)),
+        Err(EndpointError::Connection(Error::WouldBlock))
+    );
+    assert_eq!(a.buffer_bytes(), charge);
+    a.set_buffer_capacities(client, 64, 32).unwrap();
+    // EOR seals even a short accepted chunk; growing capacity cannot reopen it.
+    assert_eq!(a.send_admission_room(client, Some(1)), Ok(0));
+    let charge = a.buffer_bytes();
+    assert_eq!(
+        a.write_with_options_and_notsent_lowat(client, &[2; 16], true, false, None),
+        Ok(16)
+    );
+    assert_eq!(
+        a.write_with_options_and_notsent_lowat(client, &[3; 32], true, false, Some(u32::MAX)),
+        Ok(16)
+    );
+    assert_eq!(a.buffer_bytes(), charge);
+}

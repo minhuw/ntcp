@@ -2633,3 +2633,71 @@ fn eor_sack_rescue_selects_final_record_not_a_clipped_prefix() {
     assert_eq!(segment.payload, &[3; 64]);
     assert_eq!(a.sack_recovery.unwrap().rescue_rxt, Some(base.wrapping_add(1024)));
 }
+
+#[test]
+fn lowat_chunk_admission_transmission_ack_resize_flush_and_wrap() {
+    for iss in [0, u32::MAX - 7999] {
+        let (mut a, _) = pair(config(32768, 1000), iss);
+        a.set_cork(true);
+        let charge = a.send.storage_bytes();
+        assert_eq!(a.write_with_options_and_notsent_lowat(&[1; 8000], true, false, Some(4000)), Ok(8000));
+        assert_eq!(a.write_with_options_and_notsent_lowat(&[2], true, false, Some(4000)), Ok(1));
+        assert_eq!(a.transport_info().notsent_bytes, 8001);
+        assert_eq!(a.send_admission_room(Some(4000)), 8383);
+        assert_eq!(a.write_with_options_and_notsent_lowat(&[3; 9000], true, true, Some(4000)), Ok(8383));
+        assert_eq!(a.write_with_options_and_notsent_lowat(b"x", false, false, Some(4000)), Err(Error::WouldBlock));
+        assert!(a.more);
+        assert_eq!(a.send.storage_bytes(), charge);
+        a.set_cork(false);
+        let base = a.send_base;
+        let bytes = packet(&mut a, 40);
+        assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 1000);
+        // A transmitted chunk cannot be appended to, including after a partial
+        // ACK removes all bytes actually transmitted from that chunk.
+        let next = a.receive.next();
+        inject(&mut a, 41, next, base.wrapping_add(1000), ACK, 32768, &[]);
+        assert_eq!(a.send_admission_room(Some(4000)), 0);
+        a.set_buffer_capacities(65536, 32768, usize::MAX).unwrap();
+        assert_eq!(a.send_admission_room(Some(4000)), 0);
+        // Retransmission does not reopen admission.
+        let bytes = packet(&mut a, 42);
+        let sequence = wire::parse(ip(tuple()), &bytes).unwrap().header.sequence;
+        let now = a.rto_deadline.unwrap();
+        a.timeout(now).unwrap();
+        let bytes = packet(&mut a, now);
+        assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().header.sequence, sequence);
+        assert_eq!(a.send_admission_room(Some(4000)), 0);
+        // FLUSH discards the unoffered tail; it must not leave stale boundaries.
+        let una = a.snd_una;
+        inject(&mut a, now, next, una, ACK, 0, &[]);
+        a.flush().unwrap();
+        assert_eq!(a.transport_info().notsent_bytes, 0);
+        assert_eq!(a.send_admission_room(Some(4000)), 16384);
+        assert_eq!(a.write_with_options_and_notsent_lowat(b"abc", true, true, Some(1)), Ok(3));
+        assert_eq!(a.send_admission_room(Some(1)), 0);
+        a.close().unwrap();
+        assert_eq!(a.write_with_options_and_notsent_lowat(b"x", true, false, Some(4000)), Err(Error::InvalidState));
+    }
+}
+
+#[test]
+fn lowat_seals_partial_transmission_without_eor() {
+    let (mut a, _) = pair(config(32768, 1000), 0);
+    a.write_with_options_and_notsent_lowat(&[1; 8000], true, false, Some(4000)).unwrap();
+    let base = a.send_base;
+    let bytes = packet(&mut a, 40);
+    assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 1000);
+    assert_eq!(a.send_admission_room(Some(4000)), 0);
+    let next = a.receive.next();
+    inject(&mut a, 41, next, base.wrapping_add(1000), ACK, 32768, &[]);
+    assert_eq!(a.send_admission_room(Some(4000)), 0);
+    assert_eq!(a.write_with_options_and_notsent_lowat(b"x", true, false, Some(4000)), Err(Error::WouldBlock));
+    outputs(&mut a, 41, base);
+    let unsent = a.transport_info().notsent_bytes;
+    assert!(unsent < 4000);
+    // Actual transmission, not ACK/storage credit, opens the next full chunk.
+    assert_eq!(a.send_admission_room(Some(4000)), 16384);
+    assert_eq!(a.write_with_options_and_notsent_lowat(&[2; 20000], true, false, Some(4000)), Ok(16384));
+    assert_eq!(a.transport_info().notsent_bytes, unsent + 16384);
+    assert_eq!(a.send_admission_room(Some(4000)), 0);
+}

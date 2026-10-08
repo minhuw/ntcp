@@ -1713,6 +1713,34 @@ impl Endpoint {
         Ok(count)
     }
 
+    /// LOWAT gates opening bounded logical admission chunks (at most 16KiB,
+    /// capped by send capacity), not appending to an unsent, unsealed tail.
+    /// None and u32::MAX preserve unlimited admission. This is not an skb model.
+    pub fn write_with_options_and_notsent_lowat(
+        &mut self,
+        id: ConnectionId,
+        bytes: &[u8],
+        more: bool,
+        end_of_record: bool,
+        lowat: Option<u32>,
+    ) -> Result<usize, EndpointError> {
+        let count = self
+            .slot_mut(id)?
+            .connection
+            .write_with_options_and_notsent_lowat(bytes, more, end_of_record, lowat)?;
+        self.refresh(id.slot);
+        Ok(count)
+    }
+
+    /// Read-only byte admission budget under the same policy as the write API.
+    pub fn send_admission_room(
+        &self,
+        id: ConnectionId,
+        lowat: Option<u32>,
+    ) -> Result<usize, EndpointError> {
+        Ok(self.slot(id)?.connection.send_admission_room(lowat))
+    }
+
     /// Hold partial output until uncork, explicit NODELAY, or a 200ms timeout.
     pub fn set_cork(&mut self, id: ConnectionId, enabled: bool) -> Result<(), EndpointError> {
         self.slot_mut(id)?.connection.set_cork(enabled);

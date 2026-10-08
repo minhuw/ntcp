@@ -12,7 +12,8 @@ use crate::seq::Seq;
 
 #[derive(Debug)]
 pub(crate) struct SendBuffer {
-    // Bounded PUSH/EOR bits per byte; ACK and truncation move both with data.
+    // Bounded PUSH/EOR/chunk-start/transmission-seal bits per byte.
+    // ACK, truncation, and resize move metadata with the data.
     data: VecDeque<(u8, u8)>,
     capacity: usize,
 }
@@ -55,11 +56,78 @@ impl SendBuffer {
         self.capacity.saturating_sub(self.len())
     }
 
+    fn admission_chunk_size(&self) -> usize {
+        self.capacity.min(16 * 1024)
+    }
+
+    fn admission_tail_room(&self) -> usize {
+        if self.data.back().is_none_or(|byte| byte.1 & (2 | 8) != 0) {
+            return 0;
+        }
+        // ponytail: bounded 16KiB tail scan; cache its length if profiling warrants it.
+        let length = self
+            .data
+            .iter()
+            .rev()
+            .position(|byte| byte.1 & 4 != 0)
+            .map_or(self.len(), |n| n + 1);
+        self.admission_chunk_size().saturating_sub(length)
+    }
+
+    pub(crate) fn admission_room(&self, notsent: usize, lowat: Option<u32>) -> usize {
+        let remaining = self.remaining();
+        let Some(lowat) = lowat.filter(|&value| value != u32::MAX) else {
+            return remaining;
+        };
+        let tail = self.admission_tail_room().min(remaining);
+        let gap = (lowat as usize).saturating_sub(notsent.saturating_add(tail));
+        let chunk = self.admission_chunk_size();
+        if gap == 0 || chunk == 0 {
+            tail
+        } else {
+            // Each new chunk is gated BEFORE admission, not clipped to LOWAT.
+            tail.saturating_add(gap.div_ceil(chunk).saturating_mul(chunk))
+                .min(remaining)
+        }
+    }
+
     pub(crate) fn write(&mut self, input: &[u8]) -> usize {
         let count = input.len().min(self.remaining());
-        self.data
-            .extend(input[..count].iter().map(|&byte| (byte, 0)));
+        let chunk = self.admission_chunk_size();
+        let mut room = self.admission_tail_room();
+        for &byte in &input[..count] {
+            let start = room == 0;
+            if start {
+                room = chunk;
+            }
+            self.data.push_back((byte, if start { 4 } else { 0 }));
+            room -= 1;
+        }
         count
+    }
+
+    // Seal every logical chunk touched by successful wire output. This also
+    // survives partial ACKs that remove its start and all transmitted bytes.
+    pub(crate) fn mark_transmitted(&mut self, offset: usize, count: usize) {
+        if count == 0 || offset >= self.len() {
+            return;
+        }
+        let start = self
+            .data
+            .iter()
+            .take(offset + 1)
+            .rposition(|byte| byte.1 & 4 != 0)
+            .unwrap_or(0);
+        let end = (offset + count).min(self.len());
+        let end = self
+            .data
+            .iter()
+            .skip(end)
+            .position(|byte| byte.1 & 4 != 0)
+            .map_or(self.len(), |n| end + n);
+        for byte in self.data.iter_mut().skip(start).take(end - start) {
+            byte.1 |= 8;
+        }
     }
 
     pub(crate) fn mark_push(&mut self) {
@@ -1896,5 +1964,47 @@ mod tests {
         send.write(b"ij");
         assert_eq!(send.copy(0, &mut bytes), 5);
         assert_eq!(&bytes[..5], b"defij");
+    }
+    #[test]
+    fn lowat_chunk_metadata_stays_bounded_across_resize_discard_and_ack() {
+        for capacity in [1, 6, 16384, 32768, 65536] {
+            let mut send = SendBuffer::new(capacity).unwrap();
+            let charge = send.storage_bytes();
+            let chunk = capacity.min(16384);
+            assert_eq!(send.admission_room(0, Some(1)), chunk);
+            assert_eq!(send.admission_room(0, None), capacity);
+            assert_eq!(send.admission_room(0, Some(u32::MAX)), capacity);
+            send.write(&alloc::vec![1; chunk]);
+            assert_eq!(send.admission_room(chunk, Some(1)), 0);
+            assert_eq!(send.storage_bytes(), charge);
+        }
+        let mut send = SendBuffer::new(32768).unwrap();
+        send.write(&[1; 8000]);
+        assert_eq!(send.admission_room(8000, Some(4000)), 8384);
+        send.mark_end_of_record();
+        assert_eq!(send.admission_room(8000, Some(4000)), 0);
+        send.write(&[2; 500]); // Unlimited writes also establish chunk boundaries.
+        assert_eq!(send.admission_room(8500, Some(4000)), 15884);
+        send.mark_transmitted(8000, 1);
+        send.acknowledge(8001).unwrap();
+        assert_eq!(send.admission_room(499, Some(1)), 0);
+        let mut send = send.resized(65536).unwrap();
+        assert_eq!(send.admission_room(499, Some(1)), 0);
+        send.truncate(100);
+        assert_eq!(send.admission_room(100, Some(1)), 0);
+        send.truncate(0);
+        assert_eq!(send.admission_room(0, Some(1)), 16384);
+        send.write(&[3; 200]);
+        send.truncate(100);
+        assert_eq!(send.admission_room(100, Some(1)), 16284);
+        send.set_limit(6);
+        assert_eq!(send.admission_room(100, Some(1)), 0);
+        send.acknowledge(100).unwrap();
+        assert_eq!(send.admission_room(0, Some(1)), 6);
+        send.set_limit(65536);
+        assert_eq!(send.admission_room(0, Some(20000)), 32768);
+        send.write(&[4; 32768]);
+        send.truncate(20000); // Reopen room in the retained unsent second chunk.
+        assert_eq!(send.admission_room(20000, Some(1)), 12768);
     }
 }

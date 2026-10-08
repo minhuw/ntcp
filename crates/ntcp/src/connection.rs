@@ -2481,7 +2481,7 @@ impl Connection {
     //# Queue the data for transmission after entering ESTABLISHED state. If no space to queue,
     //# respond with "error: insufficient resources".
     pub(crate) fn write_with_push(&mut self, data: &[u8], push: bool) -> Result<usize, Error> {
-        self.queue_write(data, push, false, false)
+        self.queue_write(data, push, false, false, None)
     }
 
     pub(crate) fn write_with_options(
@@ -2490,7 +2490,21 @@ impl Connection {
         more: bool,
         end_of_record: bool,
     ) -> Result<usize, Error> {
-        self.queue_write(data, !more && !data.is_empty(), more, end_of_record)
+        self.write_with_options_and_notsent_lowat(data, more, end_of_record, None)
+    }
+
+    pub(crate) fn write_with_options_and_notsent_lowat(
+        &mut self,
+        data: &[u8],
+        more: bool,
+        end_of_record: bool,
+        lowat: Option<u32>,
+    ) -> Result<usize, Error> {
+        self.queue_write(data, !more && !data.is_empty(), more, end_of_record, lowat)
+    }
+
+    pub(crate) fn send_admission_room(&self, lowat: Option<u32>) -> usize {
+        self.send.admission_room(self.notsent_bytes(), lowat)
     }
 
     fn queue_write(
@@ -2499,6 +2513,7 @@ impl Connection {
         push: bool,
         more: bool,
         end_of_record: bool,
+        lowat: Option<u32>,
     ) -> Result<usize, Error> {
         if self.shutdown
             || !matches!(
@@ -2518,7 +2533,8 @@ impl Connection {
         }
         let application_idle = !self.application_timer_needed();
         let idle = !self.user_timer_needed();
-        let count = self.send.write(data);
+        let room = self.send_admission_room(lowat);
+        let count = self.send.write(&data[..data.len().min(room)]);
         self.send_backpressured |= count < data.len();
         if count == 0 {
             return Err(Error::WouldBlock);
@@ -6479,6 +6495,10 @@ impl Connection {
         }
         let length = count as u32 + u32::from(flags & SYN != 0) + u32::from(flags & FIN != 0);
         if length != 0 && !keepalive {
+            if count != 0 && !syn {
+                self.send
+                    .mark_transmitted(seq.distance_from(self.send_base) as usize, count);
+            }
             let end = seq.wrapping_add(length);
             if retransmitted {
                 if !syn && !probe {
