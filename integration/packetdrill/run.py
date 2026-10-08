@@ -17,6 +17,54 @@ ROOT = HERE.parent.parent
 PIN = json.loads((HERE / 'upstream.json').read_text())
 
 
+SENDFILE_FIXTURE = 'sendfile-five-zero-bytes'
+SENDFILE_SETUP = (b'`../../common/defaults.sh\n'
+                  b'/bin/rm -f /tmp/testfile\n'
+                  b'/bin/dd bs=1 count=5 if=/dev/zero of=/tmp/testfile status=none\n`\n')
+FIXTURE_UNSUPPORTED = 'NTCP_PACKETDRILL_FIXTURE_UNSUPPORTED:'
+# Executed only in the child, before LD_PRELOAD. No upstream shell is evaluated.
+FIXTURE_CHILD = r"""
+import ctypes, os, pathlib, sys
+try:
+    if os.readlink('/proc/self/ns/mnt') == sys.argv[1]:
+        raise OSError('private mount namespace unavailable')
+    argv = sys.argv[2:]
+    script = pathlib.Path(argv[-1])
+    if (not script.is_relative_to('/tmp') or '..' in script.parts
+            or script == pathlib.Path('/tmp/testfile')):
+        raise ValueError('generated script must be a separate path under /tmp')
+    source = script.read_bytes()
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+                          ctypes.c_ulong, ctypes.c_char_p]
+    libc.mount.restype = ctypes.c_int
+    def mount(source, target, kind, flags, data):
+        if libc.mount(source, target, kind, flags, data) != 0:
+            raise OSError(ctypes.get_errno(), 'fixture mount failed')
+    mount(None, b'/', None, (1 << 18) | (1 << 14), None)  # recursive private
+    mount(b'tmpfs', b'/tmp', b'tmpfs', 2 | 4, b'size=16m,mode=1777')
+    # All writes happen after both isolation operations succeeded.
+    pathlib.Path('/tmp/testfile').write_bytes(b'\0' * 5)
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_bytes(source)
+    os.chdir(script.parent)
+    os.execvp(argv[0], argv)
+except (OSError, ValueError) as error:
+    print('NTCP_PACKETDRILL_FIXTURE_UNSUPPORTED:', error, flush=True)
+    sys.exit(125)
+"""
+
+
+def fixture_command(argv, runner, plugin):
+    # /tmp is deliberately hidden. Do not silently run a different executable.
+    for path in (runner, plugin, Path(sys.executable)):
+        if Path(path).resolve().is_relative_to('/tmp'):
+            raise ValueError('isolated fixture cannot access runtime artifacts under /tmp')
+    return [*argv[:4], '--mount', '--propagation', 'private',
+            sys.executable, '-I', '-c', FIXTURE_CHILD,
+            os.readlink('/proc/self/ns/mnt'), *argv[4:]]
+
+
 TCP_INFO_FIELDS = {'tcpi_ca_state', 'tcpi_unacked', 'tcpi_sacked',
                    'tcpi_lost', 'tcpi_retrans', 'tcpi_reordering',
                    'tcpi_snd_cwnd', 'tcpi_snd_ssthresh', 'tcpi_rtt',
@@ -49,7 +97,7 @@ def preflight(text, embedded_tcp_info=False):
 
 
 def adapt_source(directory, relative, manifest, so_flags):
-    """Replace only an audited defaults invocation; never rewrite assertions."""
+    """Replace only audited setup; never rewrite assertions or fixture paths."""
     if manifest['upstream_revision'] != PIN['revision']:
         raise ValueError('adaptation revision differs from upstream pin')
     if relative not in manifest['scripts']:
@@ -81,12 +129,19 @@ def adapt_source(directory, relative, manifest, so_flags):
                   and so_flags == 'upstream-ecn,local=192.168.0.1'
                   and entry['mapping']['ntcp_settings'].get('ecn') is True
                   and entry.get('command_sha256') == hashlib.sha256(command).hexdigest())
-    # Only exact defaults spellings or hashed ECN enablement, not a shell scrubber.
+    fixture_mapped = (relative == 'sendfile/sendfile-simple.pkt'
+                      and command == SENDFILE_SETUP
+                      and entry.get('fixture') == SENDFILE_FIXTURE
+                      and so_flags == 'upstream-basic,local=192.168.0.1'
+                      and entry.get('command_sha256') == hashlib.sha256(command).hexdigest())
+    if entry.get('fixture') is not None and not fixture_mapped:
+        raise ValueError('fixture is not the exact audited sendfile setup')
+    # Only exact defaults, ECN enablement or the bounded fixture, not a shell scrubber.
     if (entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
             or not (command in (b'`../common/defaults.sh`\n',
                                 b'`../common/defaults.sh\n`\n',
                                 b'`../../common/defaults.sh`\n',
-                                b'`../../common/defaults.sh\n`\n') or ecn_mapped)
+                                b'`../../common/defaults.sh\n`\n') or ecn_mapped or fixture_mapped)
             or replacement != b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n'
             or entry['expected_command_count'] != 1
             or source.count(command) != 1
@@ -346,6 +401,17 @@ def main():
                         argv = ['unshare', '--user', '--map-root-user', '--net',
                                 *preload, str(runner), f'--so_filename={plugin}',
                                 f'--so_flags={so_flags}', *flags, str(execution_script)]
+                        fixture = row.get('adaptation', {}).get('fixture')
+                        if fixture:
+                            try:
+                                argv = fixture_command(argv, runner, plugin)
+                            except (ValueError, OSError) as error:
+                                row.update(status='unsupported', stage='environment',
+                                           reasons=[str(error)])
+                                results.append(row)
+                                print(f'unsupported: {row["script"]} ({variant}, {args.suite})', flush=True)
+                                continue
+                            row['effective_flags']['fixture'] = fixture
                         try:
                             check_plugin_hash(plugin, plugin_sha256)
                             code, expired, log = invoke(argv, execution_script.parent, args.timeout)
@@ -353,9 +419,15 @@ def main():
                         except (ValueError, OSError) as error:
                             parser.error(str(error))
                         status = outcome(code, expired, log)
+                        fixture_unavailable = fixture and (
+                            FIXTURE_UNSUPPORTED in log or log.startswith('unshare:')
+                            or status == 'environment_error')
+                        if fixture_unavailable:
+                            status = 'unsupported'
+                            row['reasons'] = ['isolated fixture unavailable: ' + log.strip()]
                         row.update(status=status, returncode=code,
-                                   stage='environment' if status == 'environment_error' else 'behavior',
-                                   behavior_executed=status != 'environment_error', log=log)
+                                   stage='environment' if status == 'environment_error' or fixture_unavailable else 'behavior',
+                                   behavior_executed=status != 'environment_error' and not fixture_unavailable, log=log)
             results.append(row)
             print(f'{row["status"]}: {row["script"]} ({variant}, {args.suite})', flush=True)
     try:

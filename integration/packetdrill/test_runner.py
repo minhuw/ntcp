@@ -12,7 +12,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from run import (HERE, PIN, adapt_source, check_plugin_hash, invoke, main, outcome,
+from run import (FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
+                 fixture_command, HERE, PIN, adapt_source, check_plugin_hash, invoke, main, outcome,
                  preflight, select_cases, variants, verify_backend)
 
 
@@ -452,6 +453,7 @@ class AdaptationChecks(unittest.TestCase):
         for name, entry in self.manifest['scripts'].items():
             entry.pop('blocked_reasons', None)
             entry.pop('additional_setup_files', None)
+            entry.pop('fixture', None)
             entry['command_line'] = '`../common/defaults.sh`\n'
             entry['expected_command_count'] = 1
             path = self.directory / name
@@ -871,6 +873,171 @@ class AdaptationChecks(unittest.TestCase):
         self.assertEqual(json.loads(report.read_text())['counts'], {'adaptation_rejected': 3 * count})
 
 
+class FileFixtureChecks(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(dir='/tmp')
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        self.name = 'sendfile/sendfile-simple.pkt'
+        self.manifest = json.loads((HERE / 'adaptations.json').read_text())
+        self.entry = self.manifest['scripts'][self.name]
+        self.flags = self.entry['adapter_flags']
+        self.source = (b'// preserved\n' + SENDFILE_SETUP +
+                       b'+0 open("/tmp/testfile", O_RDONLY) = 5\n'
+                       b'+0 sendfile(4, 5, [0], 5) = 5\n+0 > P. 1:6(5) ack 1\n')
+        self.path = self.directory / self.name
+        self.path.parent.mkdir()
+        self.path.write_bytes(self.source)
+        setup = self.directory / 'common/defaults.sh'
+        setup.parent.mkdir()
+        setup.write_bytes(b'audited defaults')
+        self.entry.update(source_sha256=hashlib.sha256(self.source).hexdigest(),
+                          setup_sha256=hashlib.sha256(setup.read_bytes()).hexdigest())
+        self.entry.pop('blocked_reasons', None)  # Candidate mapping, not runtime evidence.
+
+    def test_exact_fixture_mapping_hashes_and_unsafe_setup(self):
+        generated, audit = adapt_source(self.directory, self.name, self.manifest, self.flags)
+        self.assertEqual(generated.replace(self.entry['replacement_line'].encode(),
+                                           SENDFILE_SETUP), self.source)
+        self.assertEqual(audit['fixture'], SENDFILE_FIXTURE)
+        self.assertEqual(audit['source_sha256'], hashlib.sha256(self.source).hexdigest())
+        self.assertEqual(audit['generated_sha256'], hashlib.sha256(generated).hexdigest())
+        for field in ('source_sha256', 'setup_sha256', 'command_sha256', 'fixture'):
+            changed = copy.deepcopy(self.manifest)
+            changed['scripts'][self.name][field] = 'invalid'
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                adapt_source(self.directory, self.name, changed, self.flags)
+        for old, new in ((b'count=5', b'count=6'), (b'/tmp/testfile', b'/tmp/other'),
+                         (b'/bin/rm -f', b'/bin/rm -rf')):
+            changed = copy.deepcopy(self.manifest)
+            entry = changed['scripts'][self.name]
+            source = self.source.replace(old, new)
+            self.path.write_bytes(source)
+            entry['source_sha256'] = hashlib.sha256(source).hexdigest()
+            entry['command_line'] = SENDFILE_SETUP.replace(old, new).decode()
+            entry['command_sha256'] = hashlib.sha256(entry['command_line'].encode()).hexdigest()
+            with self.subTest(new=new), self.assertRaises(ValueError):
+                adapt_source(self.directory, self.name, changed, self.flags)
+        self.path.write_bytes(self.source)
+        changed = copy.deepcopy(self.manifest)
+        changed['scripts']['other.pkt'] = changed['scripts'].pop(self.name)
+        (self.directory / 'other.pkt').write_bytes(self.source)
+        with self.assertRaises(ValueError):
+            adapt_source(self.directory, 'other.pkt', changed, self.flags)
+
+    def test_main_fixture_invocation_and_isolation_failure_reporting(self):
+        mock_backend(self)
+        with tempfile.TemporaryDirectory(dir=HERE.parent.parent / 'workbench') as temporary:
+            checkout = Path(temporary).resolve()
+            (checkout / PIN['tcp_tests']).parent.mkdir(parents=True)
+            (checkout / PIN['tcp_tests']).symlink_to(self.directory)
+            runner = checkout / PIN['runner']
+            runner.parent.mkdir(parents=True)
+            runner.write_text('mock runner')
+            runner.chmod(0o700)
+            plugin = checkout / 'plugin.so'
+            plugin.write_text('mock plugin')
+            report = checkout / 'report.json'
+            manifest_dir = checkout / 'manifest'
+            manifest_dir.mkdir()
+            self.manifest['scripts'] = {self.name: self.entry}
+            (manifest_dir / 'adaptations.json').write_text(json.dumps(self.manifest))
+            argv = ['run.py', '--checkout', str(checkout), '--plugin', str(plugin),
+                    '--suite', 'adapted', '--variant', 'ipv4', '--script', self.name,
+                    '--report', str(report)]
+            for log, expected, executed in (
+                    ('packet mismatch', 'failed', True),
+                    ('unshare: unshare failed: Operation not permitted', 'unsupported', False),
+                    ('unshare: mount / failed: Operation not permitted', 'unsupported', False),
+                    (FIXTURE_UNSUPPORTED + ' fixture mount failed', 'unsupported', False)):
+                calls = []
+
+                def execute(command, cwd, timeout):
+                    calls.append(command)
+                    generated = Path(command[-1]).read_bytes()
+                    self.assertEqual(generated.replace(self.entry['replacement_line'].encode(),
+                                                       SENDFILE_SETUP), self.source)
+                    return (0, False, '') if '--dry_run' in command else (1, False, log)
+
+                with patch('run.HERE', manifest_dir), \
+                        patch('run.check_checkout', return_value=PIN['revision']), \
+                        patch('run.subprocess.check_output', return_value=str(Path(PIN['tcp_tests']) / self.name)), \
+                        patch('run.invoke', side_effect=execute), patch.object(sys, 'argv', argv):
+                    self.assertEqual(main(), 1)
+                data = json.loads(report.read_text())
+                row = data['results'][0]
+                self.assertEqual(row['status'], expected)
+                self.assertEqual(row['behavior_executed'], executed)
+                self.assertEqual(row['sha256'], hashlib.sha256(self.source).hexdigest())
+                self.assertEqual(row['adaptation']['source_sha256'], row['sha256'])
+                self.assertFalse(data['all_passed'])
+                self.assertEqual(len(calls), 2)
+                self.assertNotIn('--mount', calls[0])  # syntax only, no fixture needed
+                self.assertIn('--mount', calls[1])
+                self.assertIn(FIXTURE_CHILD, calls[1])
+                self.assertIn(f'LD_PRELOAD={plugin}', calls[1])
+                self.assertIn(f'--so_filename={plugin}', calls[1])
+                self.assertEqual(calls[0][-1], calls[1][-1])
+                self.assertEqual(row['effective_flags']['fixture'], SENDFILE_FIXTURE)
+                if not executed:
+                    self.assertEqual(row['stage'], 'environment')
+                    self.assertIn('isolated fixture unavailable', row['reasons'][0])
+
+    def test_helper_refuses_parent_namespace_before_any_write(self):
+        code, expired, log = invoke([sys.executable, '-I', '-c', FIXTURE_CHILD,
+                                    os.readlink('/proc/self/ns/mnt'), 'unused', str(self.path)],
+                                   self.directory, 5)
+        self.assertEqual((code, expired), (125, False))
+        self.assertIn(FIXTURE_UNSUPPORTED, log)
+        self.assertEqual(self.path.read_bytes(), self.source)
+
+    def test_fixture_namespace_content_identity_and_teardown(self):
+        # Put the sentinel in an OUTER namespace, never write host /tmp/testfile.
+        # Inner namespace must hide it; its teardown must reveal it unchanged.
+        probe = r'''
+import ctypes, os, pathlib, subprocess, sys
+libc = ctypes.CDLL(None)
+assert libc.mount(None, b'/', None, (1 << 18) | (1 << 14), None) == 0
+assert libc.mount(b'tmpfs', b'/tmp', b'tmpfs', 0, b'size=16m') == 0
+pathlib.Path('/tmp/testfile').write_bytes(b'outer sentinel')
+script = pathlib.Path('/tmp/case/test.pkt')
+script.parent.mkdir()
+script.write_bytes(b'unchanged /tmp/testfile assertions')
+check = "import os,pathlib,sys; assert pathlib.Path('/tmp/testfile').read_bytes() == b'\\0'*5; assert pathlib.Path(sys.argv[1]).read_bytes() == b'unchanged /tmp/testfile assertions'; print(os.readlink('/proc/self/ns/mnt'))"
+argv = ['unshare', '--mount', '--propagation', 'private', sys.executable, '-I', '-c',
+        sys.argv[1], os.readlink('/proc/self/ns/mnt'), sys.executable, '-I', '-c', check, str(script)]
+p = subprocess.run(argv, capture_output=True, text=True)
+assert p.returncode == 0, p.stdout + p.stderr
+assert p.stdout.strip() != os.readlink('/proc/self/ns/mnt')
+assert pathlib.Path('/tmp/testfile').read_bytes() == b'outer sentinel'
+assert script.read_bytes() == b'unchanged /tmp/testfile assertions'
+argv[-2] = 'raise SystemExit(7)'
+p = subprocess.run(argv, capture_output=True, text=True)
+assert p.returncode == 7, p.stdout + p.stderr
+assert pathlib.Path('/tmp/testfile').read_bytes() == b'outer sentinel'
+'''
+        code, expired, log = invoke(['unshare', '--user', '--map-root-user', '--net',
+                                    '--mount', '--propagation', 'private',
+                                    sys.executable, '-I', '-c', probe, FIXTURE_CHILD],
+                                   self.directory, 5)
+        if 'unshare: unshare failed' in log:
+            self.skipTest('mount/user namespace unavailable: ' + log.strip())
+        self.assertEqual((code, expired, log), (0, False, ''))
+
+    def test_behavior_wrapper_keeps_preload_plugin_and_script_identity(self):
+        runner = HERE / 'fake-runner'
+        plugin = HERE / 'fake-plugin.so'
+        argv = ['unshare', '--user', '--map-root-user', '--net', 'env',
+                'PYTHONOPTIMIZE=0', f'LD_PRELOAD={plugin}', str(runner),
+                f'--so_filename={plugin}', f'--so_flags={self.flags}', str(self.path)]
+        wrapped = fixture_command(argv, runner, plugin)
+        self.assertEqual(wrapped[:7], argv[:4] + ['--mount', '--propagation', 'private'])
+        self.assertEqual(wrapped[-len(argv[4:]):], argv[4:])
+        self.assertEqual(wrapped[10:12], [FIXTURE_CHILD, os.readlink('/proc/self/ns/mnt')])
+        with self.assertRaisesRegex(ValueError, 'under /tmp'):
+            fixture_command(argv, Path('/tmp/runner'), plugin)
+
+
 class PublishedSelectionChecks(unittest.TestCase):
     def setUp(self):
         mock_backend(self)
@@ -881,6 +1048,24 @@ class PublishedSelectionChecks(unittest.TestCase):
         if not self.directory.is_dir():
             self.skipTest('pinned packetdrill checkout unavailable; set NTCP_PACKETDRILL_CHECKOUT')
         self.manifest = json.loads((HERE / 'adaptations.json').read_text())
+
+    def test_original_file_transfer_sources_candidate_mapping_preserves_all_nonsetup_bytes(self):
+        manifest = copy.deepcopy(self.manifest)
+        for name in ('sendfile/sendfile-simple.pkt', 'splice/tcp_splice_loop_test.pkt'):
+            entry = manifest['scripts'][name]
+            entry.pop('blocked_reasons', None)  # Test adaptation, not runtime readiness.
+            source = (self.directory / name).read_bytes()
+            generated, audit = adapt_source(self.directory, name, manifest, entry['adapter_flags'])
+            before, after = source.split(entry['command_line'].encode())
+            self.assertEqual(generated, before + entry['replacement_line'].encode() + after)
+            self.assertEqual(audit['source_sha256'], hashlib.sha256(source).hexdigest())
+            self.assertEqual(audit['generated_sha256'], hashlib.sha256(generated).hexdigest())
+            self.assertEqual((self.directory / name).read_bytes(), source)
+            if name.startswith('sendfile/'):
+                self.assertIn(b'open("/tmp/testfile", O_RDONLY) = 5', generated)
+                self.assertEqual(audit['fixture'], SENDFILE_FIXTURE)
+            else:
+                self.assertNotIn('fixture', audit)
 
     def test_all_35_published_hashes_commands_and_nonsetup_bytes(self):
         for name in BASIC17 + CONGESTION18:

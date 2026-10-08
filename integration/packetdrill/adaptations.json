@@ -3206,6 +3206,8 @@
       ]
     },
     "sendfile/sendfile-simple.pkt": {
+      "fixture": "sendfile-five-zero-bytes",
+      "command_sha256": "14b5833f14633e48943898015937a9e0aff25f3c2c4071d909d39b42d467349c",
       "source_sha256": "0e6286b66e1d1ba427977f2c7c47c891f26b178ab8bc467379af27d0466adfd7",
       "setup_path": "common/defaults.sh",
       "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
@@ -3224,7 +3226,7 @@
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
           "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
           "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
-          "Stock syscall_sendfile calls libc sendfile directly, the packetdrill callback ABI has no sendfile slot, and ntcp-socket does not interpose sendfile. Native I/O on the socket token is not ntcp behavior. /tmp/testfile rm/dd setup has no audited isolated filesystem mapping and is not executed."
+          "Runtime integration pending: enable this audited fixture mapping only after the shared ntcp-socket sendfile interposer is available; mapping eligibility is not a behavior pass claim."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -3249,13 +3251,13 @@
         "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
       },
       "blocked_reasons": [
-        "Stock syscall_sendfile calls libc sendfile directly, the packetdrill callback ABI has no sendfile slot, and ntcp-socket does not interpose sendfile. Native I/O on the socket token is not ntcp behavior. /tmp/testfile rm/dd setup has no audited isolated filesystem mapping and is not executed."
+        "Runtime integration pending: enable this audited fixture mapping only after the shared ntcp-socket sendfile interposer is available; mapping eligibility is not a behavior pass claim."
       ],
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh\n/bin/rm -f /tmp/testfile\n/bin/dd bs=1 count=5 if=/dev/zero of=/tmp/testfile status=none\n`",
           "sha256": "e53530dd15bf49e9f50bf090fbc701b9654ac8a0e321da5a72cdecc1d83d23ec",
-          "semantic_mapping": "Unavailable: Stock syscall_sendfile calls libc sendfile directly, the packetdrill callback ABI has no sendfile slot, and ntcp-socket does not interpose sendfile. Native I/O on the socket token is not ntcp behavior. /tmp/testfile rm/dd setup has no audited isolated filesystem mapping and is not executed."
+          "semantic_mapping": "Exact defaults profile plus five zero bytes at /tmp/testfile in a fresh child-only tmpfs; no upstream shell runs, and namespace lifetime tears down the fixture. Runtime eligibility remains separately gated."
         }
       ]
     },
