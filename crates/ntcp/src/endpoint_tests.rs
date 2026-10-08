@@ -4588,3 +4588,61 @@ fn buffer_capacities_prehandshake_inheritance_and_pool_mismatch() {
     // A mismatched pool remains charged alongside the new child.
     assert!(b.buffer_bytes() > reserved);
 }
+
+#[test]
+fn endpoint_cork_more_eor_deadline_flush_and_failed_output() {
+    let (mut a, mut b, listener, client) = endpoints();
+    pump(&mut a, &mut b, 0);
+    let server = b.accept(listener).unwrap();
+    a.set_cork(client, true).unwrap();
+    a.write_with_options(client, b"abc", true, true).unwrap();
+    assert!(packets(&mut a, 0).is_empty());
+    assert_eq!(a.next_deadline(), Some(200_000));
+    let charge = a.buffer_bytes();
+    a.write_with_options(client, b"de", true, true).unwrap();
+    let first = packets(&mut a, 0);
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        wire::parse(first[0].0, &first[0].1).unwrap().payload,
+        b"abc"
+    );
+    deliver(&mut b, 0, first);
+    assert_eq!(a.buffer_bytes(), charge); // No per-record allocations.
+    a.set_nagle(client, false).unwrap();
+    assert_eq!(
+        a.poll_transmit(0, &mut [0; 21], 16),
+        Err(EndpointError::Connection(Error::OutputTooSmall))
+    );
+    let flushed = packets(&mut a, 0);
+    assert_eq!(flushed.len(), 1);
+    assert_eq!(
+        wire::parse(flushed[0].0, &flushed[0].1).unwrap().payload,
+        b"de"
+    );
+    deliver(&mut b, 0, flushed);
+    a.write(client, b"fg").unwrap(); // Explicit NODELAY did not clear socket CORK.
+    assert!(packets(&mut a, 0).is_empty());
+    assert_eq!(a.next_deadline(), Some(200_000));
+    assert!(!a.on_timeout(199_999, 16).unwrap());
+    assert!(packets(&mut a, 199_999).is_empty());
+    assert!(!a.on_timeout(200_000, 16).unwrap());
+    let expired = packets(&mut a, 200_000);
+    assert_eq!(expired.len(), 1);
+    assert_eq!(
+        wire::parse(expired[0].0, &expired[0].1).unwrap().payload,
+        b"fg"
+    );
+    deliver(&mut b, 200_000, expired);
+    let mut data = [0; 7];
+    assert_eq!(b.read(server, &mut data), Ok(7));
+    assert_eq!(&data, b"abcdefg"); // Receive remains a byte stream, not records.
+    a.write_with_options(client, b"hi", true, false).unwrap();
+    assert!(packets(&mut a, 200_000).is_empty());
+    a.set_cork(client, false).unwrap();
+    let uncorked = packets(&mut a, 200_000);
+    assert_eq!(uncorked.len(), 1);
+    assert_eq!(
+        wire::parse(uncorked[0].0, &uncorked[0].1).unwrap().payload,
+        b"hi"
+    );
+}

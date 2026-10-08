@@ -560,6 +560,11 @@ pub(crate) struct Connection {
     shrink_unanswered_since: Option<Instant>,
     sws_deadline: Option<Instant>,
     sws_override: bool,
+    cork: bool,
+    more: bool,
+    cork_deadline: Option<Instant>,
+    // Explicit flush covers only bytes already queued, not future corked writes.
+    cork_flush: Option<Seq>,
     time_wait_deadline: Option<Instant>,
     progress_at: Instant,
     application_timeout_us: Option<u64>,
@@ -802,6 +807,10 @@ impl Connection {
             shrink_unanswered_since: None,
             sws_deadline: None,
             sws_override: false,
+            cork: false,
+            more: false,
+            cork_deadline: None,
+            cork_flush: None,
             time_wait_deadline: None,
             progress_at: now,
             application_timeout_us: None,
@@ -2235,6 +2244,8 @@ impl Connection {
         self.persist_deadline = None;
         self.shrink_unanswered_since = None;
         self.sws_deadline = None;
+        self.cork_deadline = None;
+        self.cork_flush = None;
         self.time_wait_deadline = None;
         self.keepalive_deadline = None;
     }
@@ -2384,6 +2395,26 @@ impl Connection {
             }
         }
         let unsent = self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize;
+        if self.cork_flush.is_some_and(|end| !after(end, self.snd_nxt)) {
+            self.cork_flush = None;
+        }
+        let queued_end = self.send_base.wrapping_add(self.send.len() as u32);
+        if unsent
+            && (self.cork || self.more)
+            && !self.shutdown
+            && self.cork_flush.is_none_or(|end| after(queued_end, end))
+        {
+            // Linux tcp(7): corking has a 200ms ceiling. Like all timers this
+            // is caller-clock time, and does not override transport admission.
+            if self.cork_deadline.is_none() {
+                self.cork_deadline = Some(
+                    self.now
+                        .saturating_add(self.config.timebase.ticks_from_us(200_000)),
+                );
+            }
+        } else {
+            self.cork_deadline = None;
+        }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
         //= reason=SWS override, retransmission and user deadlines require driver servicing.
         //# MUST NOT buffer data indefinitely (MUST-60),
@@ -2450,6 +2481,25 @@ impl Connection {
     //# Queue the data for transmission after entering ESTABLISHED state. If no space to queue,
     //# respond with "error: insufficient resources".
     pub(crate) fn write_with_push(&mut self, data: &[u8], push: bool) -> Result<usize, Error> {
+        self.queue_write(data, push, false, false)
+    }
+
+    pub(crate) fn write_with_options(
+        &mut self,
+        data: &[u8],
+        more: bool,
+        end_of_record: bool,
+    ) -> Result<usize, Error> {
+        self.queue_write(data, !more && !data.is_empty(), more, end_of_record)
+    }
+
+    fn queue_write(
+        &mut self,
+        data: &[u8],
+        push: bool,
+        more: bool,
+        end_of_record: bool,
+    ) -> Result<usize, Error> {
         if self.shutdown
             || !matches!(
                 self.state,
@@ -2475,6 +2525,10 @@ impl Connection {
         }
         self.output_push_batch = None;
         self.send_issued = true;
+        self.more = more;
+        if end_of_record {
+            self.send.mark_end_of_record();
+        }
         if push {
             self.send.mark_push();
         }
@@ -2537,6 +2591,9 @@ impl Connection {
         self.output_push_batch = None;
         self.send.truncate(retained);
         let end = self.send_base.wrapping_add(retained as u32);
+        if self.cork_flush.is_some_and(|flush| after(flush, end)) {
+            self.cork_flush = Some(end);
+        }
         if self.snd_up.is_some_and(|up| after(up, end)) {
             self.snd_up = (retained != 0).then_some(end);
         }
@@ -2747,6 +2804,27 @@ impl Connection {
     //# on an individual connection (MUST-17).
     pub(crate) fn set_nagle(&mut self, enabled: bool) {
         self.config.nagle = enabled;
+        // Linux tcp(7): explicitly setting NODELAY flushes currently queued
+        // output even under CORK; CORK still applies to subsequent writes.
+        if !enabled {
+            self.release_corked();
+        }
+        self.arm_work();
+    }
+
+    pub(crate) fn set_cork(&mut self, enabled: bool) {
+        self.cork = enabled;
+        if !enabled {
+            self.release_corked();
+        }
+        self.arm_work();
+    }
+
+    fn release_corked(&mut self) {
+        if self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize {
+            self.cork_flush = Some(self.send_base.wrapping_add(self.send.len() as u32));
+        }
+        self.cork_deadline = None;
     }
 
     #[cfg(test)]
@@ -3990,6 +4068,12 @@ impl Connection {
             self.prr = Some(prr);
         }
         self.receive_text(seq, segment);
+        // MSG_MORE is a per-call hint, unlike persistent TCP_CORK. Linux's
+        // ACK-driven output uses socket Nagle policy, releasing a MORE tail
+        // without inventing PUSH. Retain our existing Nagle flight rule.
+        if advancing && self.more && !self.cork && (!self.config.nagle || self.flight() == 0) {
+            self.release_corked();
+        }
         self.arm_work();
         if advancing {
             self.schedule_tlp();
@@ -5388,10 +5472,11 @@ impl Connection {
         } else {
             u32::MAX
         };
-        let packet_mss = self
+        let wire_mss = self
             .mss
             .saturating_sub(sack_option_len)
-            .min((self.config.send_ip_payload_limit as usize).saturating_sub(20 + option_len))
+            .min((self.config.send_ip_payload_limit as usize).saturating_sub(20 + option_len));
+        let packet_mss = wire_mss
             // With zero credit, retain a plan so the transactional gate reports
             // exhaustion instead of consuming the pending output obligation.
             .min(if timestamp_credit == 0 {
@@ -5470,6 +5555,13 @@ impl Connection {
                         sack_segment = self
                             .scoreboard
                             .tail_hole(self.snd_una, self.data_high(), packet_mss as u32)
+                            .map(|(left, right)| {
+                                let offset = self.send.tail_record_offset(
+                                    left.distance_from(self.send_base) as usize,
+                                    right.distance_from(left) as usize,
+                                );
+                                (self.send_base.wrapping_add(offset as u32), right)
+                            })
                             // A clipped rescue would not contain the highest
                             // outstanding byte but would consume RescueRxt.
                             .filter(|&(left, right)| {
@@ -5694,7 +5786,7 @@ impl Connection {
             && !(pacing_blocked && self.retx_pending)
         {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
-            //= reason=SendBuffer coalesces writes; packetization is independent of application write boundaries.
+            //= reason=SendBuffer coalesces ordinary writes; explicit EOR constrains local coalescing, not stream framing.
             //# The transmitter SHOULD collapse successive bits when it packetizes data,
             //# to send the largest possible segment (SHLD-27).
             let offset = self.snd_nxt.distance_from(self.send_base) as usize;
@@ -5771,27 +5863,50 @@ impl Connection {
             //# However, a TCP implementation SHOULD send a maximum-sized segment
             //# whenever possible (SHLD-28) to improve performance (see Section
             //# 3.8.6.2.1).
-            count = unsent.min(packet_mss).min(usable);
+            let record = self.send.record_len(offset, unsent.min(wire_mss));
+            count = record.min(packet_mss).min(usable);
+            let flush_credit = self
+                .cork_flush
+                .filter(|&end| after(end, self.snd_nxt))
+                .map_or(0, |end| end.distance_from(self.snd_nxt) as usize);
+            // Linux's non-tail EOR buffers can be emitted independently. This
+            // local coalescing constraint does not expose TCP record framing.
+            let complete_record = record < unsent && count == record;
+            let flushing = flush_credit != 0 || complete_record;
             let urgent = self.snd_up.is_some_and(|end| after(end, seq));
             if count < packet_mss && !urgent && self.sack_recovery.is_none() {
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.4
                 //# A TCP implementation SHOULD implement the Nagle algorithm to
                 //# coalesce short segments (SHLD-7).
-                let nagle = self.config.nagle && self.flight() != 0;
+                let nagle = !flushing && self.config.nagle && self.flight() != 0;
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.2.1
                 //# A TCP implementation MUST include a SWS avoidance algorithm in the
                 //# sender (MUST-38).
-                let sws =
-                    !self.sws_override && count < unsent && count < (self.max_snd_wnd / 2) as usize;
+                let sws = !flushing
+                    && !self.sws_override
+                    && count < record
+                    && count < (self.max_snd_wnd / 2) as usize;
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
                 //# When an application issues a series of SEND calls without setting
                 //# the PUSH flag, the TCP implementation MAY aggregate the data
                 //# internally without sending it (MAY-16).
-                let aggregate =
-                    !self.shutdown && !self.sws_override && !self.send.pushed(offset, unsent);
+                let aggregate = !flushing
+                    && !self.shutdown
+                    && !self.sws_override
+                    && !self.send.pushed(offset, unsent);
                 if nagle || sws || aggregate {
                     count = 0;
                 }
+            }
+            // Timestamp/credit clipping does not turn a partial frame into
+            // a full-MSS exception to CORK.
+            if count < wire_mss
+                && (self.cork || self.more)
+                && !self.shutdown
+                && !urgent
+                && !complete_record
+            {
+                count = count.min(flush_credit);
             }
             if self.ecn_pause.is_some_and(|deadline| now < deadline) {
                 count = 0;
@@ -5799,7 +5914,7 @@ impl Connection {
             burst_push = count != 0
                 && self.flight().saturating_add(count as u32) == self.snd_wnd.min(cwnd)
                 && self.send.pushed(offset, unsent);
-            self.send.copy(offset, &mut self.scratch[..count]);
+            count = self.send.copy(offset, &mut self.scratch[..count]);
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
             //# Queue this until all preceding SENDs have been segmentized, then form a
             //# FIN segment and send it.
@@ -6581,6 +6696,7 @@ impl Connection {
             self.ecn_pause,
             self.ack_deadline,
             self.sws_deadline,
+            self.cork_deadline,
             self.time_wait_deadline,
             self.keepalive_deadline,
             self.user_deadline(),
@@ -6861,6 +6977,12 @@ impl Connection {
         if expired_loss == Some(LossTimer::Zwp) {
             self.persist_deadline = None;
             self.probe_pending = true;
+        }
+        if due(self.cork_deadline, now) {
+            self.release_corked();
+            // Automatic flush supplies PUSH independently of EOR. Explicit
+            // NODELAY/uncork leave the application's existing PUSH unchanged.
+            self.send.mark_push();
         }
         if due(self.sws_deadline, now) {
             self.sws_deadline = None;

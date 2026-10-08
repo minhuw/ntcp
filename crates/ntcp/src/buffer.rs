@@ -12,8 +12,8 @@ use crate::seq::Seq;
 
 #[derive(Debug)]
 pub(crate) struct SendBuffer {
-    // One bounded push mark per byte; ACK and truncation move marks with data.
-    data: VecDeque<(u8, bool)>,
+    // Bounded PUSH/EOR bits per byte; ACK and truncation move both with data.
+    data: VecDeque<(u8, u8)>,
     capacity: usize,
 }
 
@@ -25,7 +25,7 @@ impl SendBuffer {
     }
 
     pub(crate) fn storage_bytes(&self) -> usize {
-        self.data.capacity() * core::mem::size_of::<(u8, bool)>()
+        self.data.capacity() * core::mem::size_of::<(u8, u8)>()
     }
 
     pub(crate) fn allocation_capacity(&self) -> usize {
@@ -58,27 +58,61 @@ impl SendBuffer {
     pub(crate) fn write(&mut self, input: &[u8]) -> usize {
         let count = input.len().min(self.remaining());
         self.data
-            .extend(input[..count].iter().map(|&byte| (byte, false)));
+            .extend(input[..count].iter().map(|&byte| (byte, 0)));
         count
     }
 
     pub(crate) fn mark_push(&mut self) {
         if let Some(last) = self.data.back_mut() {
-            last.1 = true;
+            last.1 |= 1;
         }
     }
 
     pub(crate) fn pushed(&self, offset: usize, count: usize) -> bool {
-        self.data.iter().skip(offset).take(count).any(|byte| byte.1)
+        self.data
+            .iter()
+            .skip(offset)
+            .take(count)
+            .any(|byte| byte.1 & 1 != 0)
     }
 
     pub(crate) fn collapse_push(&mut self, offset: usize, count: usize) {
         for byte in self.data.iter_mut().skip(offset).take(count) {
-            byte.1 = false;
+            byte.1 &= !1;
         }
         if let Some(last) = self.data.get_mut(offset + count - 1) {
-            last.1 = true;
+            last.1 |= 1;
         }
+    }
+
+    pub(crate) fn mark_end_of_record(&mut self) {
+        if let Some(last) = self.data.back_mut() {
+            last.1 |= 2;
+        }
+    }
+
+    // EOR is a local coalescing boundary, not a TCP wire flag or framing
+    // guarantee (RFC 9293 section 3.7.1). PUSH may collapse; EOR never does.
+    pub(crate) fn record_len(&self, offset: usize, limit: usize) -> usize {
+        let limit = limit.min(self.len().saturating_sub(offset));
+        self.data
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .position(|byte| byte.1 & 2 != 0)
+            .map_or(limit, |n| n + 1)
+    }
+
+    // A tail rescue must contain the highest selected byte. Start after the
+    // last intervening EOR, rather than clipping a prefix and losing the tail.
+    pub(crate) fn tail_record_offset(&self, offset: usize, count: usize) -> usize {
+        let count = count.min(self.len().saturating_sub(offset));
+        self.data
+            .iter()
+            .skip(offset)
+            .take(count.saturating_sub(1))
+            .rposition(|byte| byte.1 & 2 != 0)
+            .map_or(offset, |n| offset + n + 1)
     }
 
     pub(crate) fn truncate(&mut self, len: usize) {
@@ -100,7 +134,7 @@ impl SendBuffer {
     }
 
     pub(crate) fn copy(&self, offset: usize, out: &mut [u8]) -> usize {
-        let count = out.len().min(self.len().saturating_sub(offset));
+        let count = self.record_len(offset, out.len());
         for (dst, src) in out[..count].iter_mut().zip(self.data.iter().skip(offset)) {
             *dst = src.0;
         }
@@ -1835,5 +1869,32 @@ mod tests {
         assert!(!recv.take_push()); // Endpoint beyond FIN was trimmed.
         assert!(recv.eof());
         assert_eq!(recv.read(&mut [0; 8]), 6);
+    }
+    #[test]
+    fn eor_survives_push_collapse_resize_ack_and_truncate_without_growth() {
+        let mut send = SendBuffer::new(8).unwrap();
+        let charge = send.storage_bytes();
+        send.write(b"abc");
+        send.mark_end_of_record();
+        send.mark_push();
+        send.write(b"defgh");
+        send.mark_end_of_record();
+        send.collapse_push(0, 5); // PUSH collapse never moves EOR.
+        assert_eq!(send.record_len(0, 8), 3);
+        assert_eq!(send.tail_record_offset(0, 8), 3);
+        assert_eq!(send.tail_record_offset(0, 3), 0);
+        let mut bytes = [0; 8];
+        assert_eq!(send.copy(0, &mut bytes), 3);
+        assert_eq!(&bytes[..3], b"abc");
+        assert_eq!(send.storage_bytes(), charge);
+        let mut send = send.resized(16).unwrap();
+        send.acknowledge(2).unwrap();
+        assert_eq!(send.copy(0, &mut bytes), 1);
+        assert_eq!(bytes[0], b'c');
+        send.acknowledge(1).unwrap();
+        send.truncate(3); // Discarded EOR cannot affect later writes.
+        send.write(b"ij");
+        assert_eq!(send.copy(0, &mut bytes), 5);
+        assert_eq!(&bytes[..5], b"defij");
     }
 }

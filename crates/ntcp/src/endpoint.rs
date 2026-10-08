@@ -1696,6 +1696,30 @@ impl Endpoint {
         self.refresh(id.slot);
         Ok(count)
     }
+    /// Queue accepted bytes with per-write corking and a local coalescing boundary.
+    /// EOR is not TCP framing; the boundary is at the end of the accepted prefix.
+    pub fn write_with_options(
+        &mut self,
+        id: ConnectionId,
+        bytes: &[u8],
+        more: bool,
+        end_of_record: bool,
+    ) -> Result<usize, EndpointError> {
+        let count = self
+            .slot_mut(id)?
+            .connection
+            .write_with_options(bytes, more, end_of_record)?;
+        self.refresh(id.slot);
+        Ok(count)
+    }
+
+    /// Hold partial output until uncork, explicit NODELAY, or a 200ms timeout.
+    pub fn set_cork(&mut self, id: ConnectionId, enabled: bool) -> Result<(), EndpointError> {
+        self.slot_mut(id)?.connection.set_cork(enabled);
+        self.refresh(id.slot);
+        Ok(())
+    }
+
     pub fn flush(&mut self, id: ConnectionId) -> Result<usize, EndpointError> {
         let count = self.slot_mut(id)?.connection.flush()?;
         self.refresh(id.slot);
