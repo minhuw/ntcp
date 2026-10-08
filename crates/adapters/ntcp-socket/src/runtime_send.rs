@@ -122,7 +122,6 @@ impl Owner {
         let count = remaining.min(BYTES).min(room);
         let mut bytes = vec![0; count];
         let mut copied = 0;
-        let mut fault = None;
         let mut index = send.index;
         let mut offset = send.offset;
         while copied < count {
@@ -133,34 +132,19 @@ impl Owner {
                 offset = 0;
                 continue;
             }
-            let result = address
-                .checked_add(offset)
-                .ok_or(EFAULT)
-                .and_then(|address| read_prefix(&mut bytes[copied..copied + len], address));
-            match result {
-                Ok(n) => {
-                    copied += n;
-                    offset += n;
-                    if n != len {
-                        fault = Some(EFAULT);
-                        break;
-                    }
-                    if offset == send.sources[index].1 {
-                        index += 1;
-                        offset = 0;
-                    }
-                }
-                Err(e) => {
-                    fault = Some(e);
-                    break;
-                }
+            let address = address.checked_add(offset).ok_or(EFAULT)?;
+            // The temporary chunk is one copy transaction: a fault in any
+            // page/iovec admits none of it. Earlier owner turns remain accepted.
+            memory(bytes[copied..].as_mut_ptr(), address as *mut u8, len, false)?;
+            copied += len;
+            offset += len;
+            if offset == send.sources[index].1 {
+                index += 1;
+                offset = 0;
             }
         }
-        if copied == 0 {
-            return Err(fault.unwrap_or(EFAULT));
-        }
         let cid = cid.ok_or(ENOTCONN)?;
-        let flags = if blocking && copied < remaining && fault.is_none() {
+        let flags = if blocking && copied < remaining {
             (send.flags | MSG_MORE) & !MSG_EOR
         } else {
             send.flags
@@ -188,7 +172,7 @@ impl Owner {
             s.zc_next = s.zc_next.wrapping_add(1);
             s.zc_reserved += 1;
         }
-        fault.map_or(Ok(()), Err)
+        Ok(())
     }
     pub(super) fn finish_send(
         &mut self,
@@ -279,32 +263,4 @@ impl Owner {
         let result = self.send_step(id, &mut send, false);
         self.finish_send(id, &mut send, result)
     }
-}
-
-// Send-only partial fault reporting; receive copyout remains transactional.
-fn read_prefix(bytes: &mut [u8], address: usize) -> Result<usize> {
-    address
-        .checked_add(bytes.len())
-        .filter(|n| *n <= isize::MAX as usize)
-        .ok_or(EFAULT)?;
-    let local = iovec {
-        iov_base: bytes.as_mut_ptr().cast(),
-        iov_len: bytes.len(),
-    };
-    let remote = iovec {
-        iov_base: address as *mut c_void,
-        iov_len: bytes.len(),
-    };
-    let n = raw(unsafe {
-        syscall(
-            SYS_process_vm_readv,
-            syscall(SYS_getpid),
-            &local,
-            1usize,
-            &remote,
-            1usize,
-            0usize,
-        )
-    })?;
-    Ok(n as usize)
 }

@@ -55,6 +55,16 @@ static void phases(int fd, unsigned last) {
     struct msghdr m = { .msg_control = control, .msg_controllen = sizeof(control) };
     assert(recvmsg(fd, &m, MSG_ERRQUEUE | MSG_DONTWAIT) == -1 && errno == EAGAIN);
 }
+static unsigned peer_count(int fd) {
+    assert(!shutdown(fd, SHUT_WR));
+    uint32_t count;
+    size_t at = 0;
+    while (at < sizeof(count)) {
+        ssize_t n = read(fd, (char *)&count + at, sizeof(count) - at);
+        assert(n > 0); at += (size_t)n;
+    }
+    return ntohl(count);
+}
 static void *stop_write(void *arg) { usleep(60000); assert(!shutdown(*(int *)arg, SHUT_WR)); return NULL; }
 int main(int argc, char **argv) {
     assert(argc == 2); alarm(25); signal(SIGPIPE, broken);
@@ -86,7 +96,27 @@ int main(int argc, char **argv) {
         int fd = connection(argv[1]);
         struct iovec v[] = { {mapping, valid}, {(char *)mapping + valid, page} };
         ssize_t n = vector ? writev(fd, v, 2) : write(fd, mapping, valid + page);
-        assert(n > 0 && (size_t)n <= valid); close(fd);
+        assert(n > 0 && (size_t)n <= valid);
+        unsigned peer = peer_count(fd);
+        assert(peer == (unsigned)n);
+        printf("later %s fault: return=%zd peer=%u\n", vector ? "writev" : "write", n, peer);
+        close(fd);
+    }
+    for (int family = 0; family < 5; ++family) {
+        int fd = connection(argv[1]);
+        char *crossing = (char *)mapping + valid - 2;
+        struct iovec v[] = { {mapping, 3}, {(char *)mapping + valid, 3} };
+        struct msghdr m = { .msg_iov = v, .msg_iovlen = 2 };
+        ssize_t n = family == 0 ? write(fd, crossing, 6) :
+            family == 1 ? send(fd, crossing, 6, 0) :
+            family == 2 ? sendto(fd, crossing, 6, 0, NULL, 0) :
+            family == 3 ? writev(fd, v, 2) : sendmsg(fd, &m, 0);
+        assert(n == -1 && errno == EFAULT);
+        unsigned peer = peer_count(fd);
+        assert(peer == 0);
+        const char *names[] = {"write", "send", "sendto", "writev", "sendmsg"};
+        printf("current-chunk %s fault: EFAULT peer=%u\n", names[family], peer);
+        close(fd);
     }
     munmap(mapping, valid + page);
     int fd = connection(argv[1]), alias = dup(fd); assert(alias >= 0);

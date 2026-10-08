@@ -19,10 +19,10 @@ def run(binary, managed=False, preload=False):
         env.update(NTCP_SOCKET_ADDR='10.73.0.2', NTCP_SOCKET_TUN='ntcp0')
 
     def peer(listener):
-        for case in range(11):
+        for case in range(16):
             with listener.accept()[0] as conn:
                 conn.settimeout(5)
-                if case >= 7:
+                if case >= 12:
                     time.sleep(.65)
                     continue
                 data = bytearray()
@@ -30,8 +30,12 @@ def run(binary, managed=False, preload=False):
                     data.extend(chunk)
                 if case < 5:
                     assert data == bytes(n % 251 for n in range(150000)), (case, len(data))
-                else:
+                elif case < 7:
                     assert data and all(n == 19 for n in data), (case, len(data))
+                else:
+                    assert not data, (case, len(data))
+                if 5 <= case < 12:
+                    conn.sendall(len(data).to_bytes(4, 'big'))
 
     with socket.socket() as listener, concurrent.futures.ThreadPoolExecutor() as pool:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

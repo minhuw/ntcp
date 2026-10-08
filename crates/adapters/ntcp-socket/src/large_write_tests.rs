@@ -165,19 +165,16 @@ fn logical_fault_prefix_capacity_lowat_and_nonblocking_short_return() {
     advance(&mut a, &mut b);
     b.execute(server, Op::Read(BYTES)).unwrap();
     advance(&mut a, &mut b);
-    let n = a
-        .execute(
+    assert_eq!(
+        a.execute(
             client,
             Op::Send(vec![(bytes.as_ptr() as usize, 713), (1, 999)], MSG_EOR),
         )
-        .unwrap()
-        .value;
-    assert_eq!(n, 713);
-    advance(&mut a, &mut b);
-    assert_eq!(
-        b.execute(server, Op::Read(BYTES)).unwrap().bytes,
-        bytes[..713]
+        .unwrap_err(),
+        EFAULT
     );
+    advance(&mut a, &mut b);
+    assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap_err(), EAGAIN);
 }
 #[test]
 fn logical_later_epipe_and_close_return_prefix_without_replay() {
@@ -221,9 +218,8 @@ fn logical_max_count_and_page_fault_without_large_allocation() {
         assert_eq!(libc::mprotect(p.add(page), page, PROT_NONE), 0);
         assert_eq!(
             a.execute(client, Op::Send(vec![(p as usize, page * 2)], 0))
-                .unwrap()
-                .value,
-            page as i32
+                .unwrap_err(),
+            EFAULT
         );
         assert_eq!(libc::munmap(p, page * 2), 0);
         let huge = send::max_rw_count() + page;
@@ -294,4 +290,76 @@ fn logical_owner_stop_returns_accepted_prefix() {
     let (_tx, rx) = mpsc::sync_channel(1);
     a.run(rx, -1, &std::sync::atomic::AtomicBool::new(true));
     assert_eq!(result.recv().unwrap().unwrap().value, BYTES as i32);
+}
+
+#[test]
+fn logical_later_copy_fault_preserves_only_prior_admitted_chunk_and_metadata() {
+    for vector in [false, true] {
+        let (mut a, mut b, client, server, _) = pair();
+        timestamp_set(
+            &mut a,
+            client,
+            ts::TX_SCHED
+                | ts::TX_SOFTWARE
+                | ts::TX_ACK
+                | ts::SOFTWARE
+                | ts::OPT_ID
+                | ts::OPT_ID_TCP
+                | ts::OPT_TSONLY,
+        );
+        a.execute(client, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 1))
+            .unwrap();
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let len = BYTES + page * 2;
+        unsafe {
+            let p = libc::mmap(
+                ptr::null_mut(),
+                len,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert_ne!(p, MAP_FAILED);
+            ptr::write_bytes(p, 35, BYTES + page);
+            assert_eq!(libc::mprotect(p.add(BYTES + page), page, PROT_NONE), 0);
+            let sources = if vector {
+                vec![
+                    (p as usize, BYTES + page),
+                    (p.add(BYTES + page) as usize, page),
+                ]
+            } else {
+                vec![(p as usize, len)]
+            };
+            let (mut request, reply) =
+                logical_request(&mut a, client, Op::Send(sources, MSG_ZEROCOPY | MSG_EOR));
+            assert!(!a.service(&mut request));
+            assert_eq!(request.send.as_ref().unwrap().accepted, BYTES);
+            let cookie = a.timestamp_cookie;
+            advance(&mut a, &mut b);
+            assert_eq!(
+                b.execute(server, Op::Read(BYTES)).unwrap().bytes,
+                vec![35; BYTES]
+            );
+            advance(&mut a, &mut b);
+            assert!(a.sockets[&client].completions.is_empty());
+            assert!(a.service(&mut request));
+            assert_eq!(reply.recv().unwrap().unwrap().value, BYTES as i32);
+            assert_eq!(a.timestamp_cookie, cookie);
+            advance(&mut a, &mut b);
+            assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap_err(), EAGAIN);
+            let records = timestamp_records(&a, client);
+            assert_eq!(records.len(), 3);
+            assert!(records.iter().all(|r| r.1 == BYTES as u32 - 1));
+            assert_eq!(
+                a.sockets[&client]
+                    .completions
+                    .iter()
+                    .filter_map(Completion::range)
+                    .collect::<Vec<_>>(),
+                [(0, 0)]
+            );
+            assert_eq!(libc::munmap(p, len), 0);
+        }
+    }
 }
