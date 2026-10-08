@@ -324,8 +324,9 @@ def main():
                         row.update(status='unsupported', reasons=reasons)
                     else:
                         # Namespace isolation is required, never fall back to host.
-                        preload = ['env', 'PYTHONOPTIMIZE=0', f'LD_PRELOAD={plugin}'] if embedded_tcp_info else []
-                        row['effective_flags']['preload'] = str(plugin) if embedded_tcp_info else None
+                        # Teardown and direct libc calls must share the plugin's socket registry.
+                        preload = ['env', 'PYTHONOPTIMIZE=0', f'LD_PRELOAD={plugin}']
+                        row['effective_flags']['preload'] = str(plugin)
                         argv = ['unshare', '--user', '--map-root-user', '--net',
                                 *preload, str(runner), f'--so_filename={plugin}',
                                 f'--so_flags={so_flags}', *flags, str(execution_script)]

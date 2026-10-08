@@ -1403,7 +1403,7 @@
         "reasons": [
           "Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced.",
           "Linux CUBIC HyStart slow-start exit, tcp_min_tso_segs=4 accumulation and tcp_early_retrans=0 TLP disablement have no equivalent UpstreamCubic setup mapping.",
-          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
           "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
           "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
@@ -1411,14 +1411,14 @@
       "blocked_reasons": [
         "Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced.",
         "Linux CUBIC HyStart slow-start exit, tcp_min_tso_segs=4 accumulation and tcp_early_retrans=0 TLP disablement have no equivalent UpstreamCubic setup mapping.",
-        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
         "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
       ],
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh\ntc qdisc replace dev tun0 root fq\nsysctl -q net.ipv4.tcp_congestion_control=cubic\nsysctl -q net.ipv4.tcp_min_tso_segs=4\n# Disable TLP to avoid flakes from spurious retransmits:\nsysctl -q net.ipv4.tcp_early_retrans=0`",
           "sha256": "4d45a44e5be4d05fdad548330ecf40a64db7b3cd44a7e8154407de747951bc79",
-          "semantic_mapping": "Unavailable: Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced. Linux CUBIC HyStart slow-start exit, tcp_min_tso_segs=4 accumulation and tcp_early_retrans=0 TLP disablement have no equivalent UpstreamCubic setup mapping. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "semantic_mapping": "Unavailable: Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced. Linux CUBIC HyStart slow-start exit, tcp_min_tso_segs=4 accumulation and tcp_early_retrans=0 TLP disablement have no equivalent UpstreamCubic setup mapping. Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
         }
       ]
     },
@@ -1456,7 +1456,7 @@
         "reasons": [
           "Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced.",
           "Linux CUBIC HyStart slow-start exit, tcp_min_tso_segs=4 accumulation and tcp_early_retrans=0 TLP disablement have no equivalent UpstreamCubic setup mapping.",
-          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
           "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
           "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
@@ -1464,14 +1464,14 @@
       "blocked_reasons": [
         "Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced.",
         "Linux CUBIC HyStart slow-start exit, tcp_min_tso_segs=4 accumulation and tcp_early_retrans=0 TLP disablement have no equivalent UpstreamCubic setup mapping.",
-        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
         "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
       ],
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh\ntc qdisc replace dev tun0 root fq\nsysctl -q net.ipv4.tcp_congestion_control=cubic\nsysctl -q net.ipv4.tcp_min_tso_segs=4\n# Disable TLP to avoid flakes from spurious retransmits:\nsysctl -q net.ipv4.tcp_early_retrans=0`",
           "sha256": "4d45a44e5be4d05fdad548330ecf40a64db7b3cd44a7e8154407de747951bc79",
-          "semantic_mapping": "Unavailable: Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced. Linux CUBIC HyStart slow-start exit, tcp_min_tso_segs=4 accumulation and tcp_early_retrans=0 TLP disablement have no equivalent UpstreamCubic setup mapping. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "semantic_mapping": "Unavailable: Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced. Linux CUBIC HyStart slow-start exit, tcp_min_tso_segs=4 accumulation and tcp_early_retrans=0 TLP disablement have no equivalent UpstreamCubic setup mapping. Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
         }
       ]
     },
@@ -1508,21 +1508,21 @@
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux CUBIC HYSTART_DELAY and /sys/module/tcp_cubic/parameters/hystart_detect=3 have no ntcp adapter mapping; the RTT-sample exit assertions are not assumed to succeed.",
-          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
           "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
           "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
         "Linux CUBIC HYSTART_DELAY and /sys/module/tcp_cubic/parameters/hystart_detect=3 have no ntcp adapter mapping; the RTT-sample exit assertions are not assumed to succeed.",
-        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
         "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
       ],
       "audited_shell_commands": [
         {
           "command": "`../common/defaults.sh\necho 3 > /sys/module/tcp_cubic/parameters/hystart_detect\n`",
           "sha256": "776a60146357ee35e8957fe43b1c7d9365b06cbe5fc00407abdeb139cdedd821",
-          "semantic_mapping": "Unavailable: Linux CUBIC HYSTART_DELAY and /sys/module/tcp_cubic/parameters/hystart_detect=3 have no ntcp adapter mapping; the RTT-sample exit assertions are not assumed to succeed. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "semantic_mapping": "Unavailable: Linux CUBIC HYSTART_DELAY and /sys/module/tcp_cubic/parameters/hystart_detect=3 have no ntcp adapter mapping; the RTT-sample exit assertions are not assumed to succeed. Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
         }
       ]
     },
@@ -1559,21 +1559,21 @@
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux CUBIC HYSTART_DELAY and /sys/module/tcp_cubic/parameters/hystart_detect=3 have no ntcp adapter mapping; the RTT-sample exit assertions are not assumed to succeed.",
-          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
           "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
           "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
         "Linux CUBIC HYSTART_DELAY and /sys/module/tcp_cubic/parameters/hystart_detect=3 have no ntcp adapter mapping; the RTT-sample exit assertions are not assumed to succeed.",
-        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
         "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
       ],
       "audited_shell_commands": [
         {
           "command": "`../common/defaults.sh\necho 3 > /sys/module/tcp_cubic/parameters/hystart_detect\n`",
           "sha256": "776a60146357ee35e8957fe43b1c7d9365b06cbe5fc00407abdeb139cdedd821",
-          "semantic_mapping": "Unavailable: Linux CUBIC HYSTART_DELAY and /sys/module/tcp_cubic/parameters/hystart_detect=3 have no ntcp adapter mapping; the RTT-sample exit assertions are not assumed to succeed. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "semantic_mapping": "Unavailable: Linux CUBIC HYSTART_DELAY and /sys/module/tcp_cubic/parameters/hystart_detect=3 have no ntcp adapter mapping; the RTT-sample exit assertions are not assumed to succeed. Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
         }
       ]
     },
@@ -1668,7 +1668,7 @@
           "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
           "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
           "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged.",
-          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting. The original setsockopt remains unchanged and execution reports unsupported if reached; no socket-option success is fabricated.",
+          "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; requests exceeding the profile resource budget can fail with ENOBUFS. Linux skb memory accounting is not reproduced. The original setsockopt and packet assertions remain unchanged.",
           "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
@@ -1798,21 +1798,21 @@
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent.",
-          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
           "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
           "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
         "Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent.",
-        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
         "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
       ],
       "audited_shell_commands": [
         {
           "command": "`../common/defaults.sh\nsysctl -q net.ipv4.tcp_tso_win_divisor=100`",
           "sha256": "a8c3b8262f288b3dec8439f54bed04555def76fcf56e1c2ce7ae9074698510aa",
-          "semantic_mapping": "Unavailable: Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "semantic_mapping": "Unavailable: Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent. Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
         }
       ]
     },
@@ -1933,21 +1933,21 @@
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent.",
-          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
           "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
           "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
         "Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent.",
-        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
         "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
       ],
       "audited_shell_commands": [
         {
           "command": "`../common/defaults.sh\nsysctl -q net.ipv4.tcp_tso_win_divisor=100`",
           "sha256": "a8c3b8262f288b3dec8439f54bed04555def76fcf56e1c2ce7ae9074698510aa",
-          "semantic_mapping": "Unavailable: Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "semantic_mapping": "Unavailable: Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent. Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
         }
       ]
     },
@@ -1984,21 +1984,21 @@
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent.",
-          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
           "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
           "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
         "Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent.",
-        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
         "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
       ],
       "audited_shell_commands": [
         {
           "command": "`../common/defaults.sh\nsysctl -q net.ipv4.tcp_tso_win_divisor=100`",
           "sha256": "a8c3b8262f288b3dec8439f54bed04555def76fcf56e1c2ce7ae9074698510aa",
-          "semantic_mapping": "Unavailable: Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "semantic_mapping": "Unavailable: Linux tcp_tso_win_divisor=100 send deferral/TSO sizing has no ntcp adapter setup mapping; the unchanged aggregated packet assertions cannot be treated as setup-equivalent. Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
         }
       ]
     },
@@ -2035,26 +2035,26 @@
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted.",
-          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
           "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
           "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
         "Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted.",
-        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
         "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
       ],
       "audited_shell_commands": [
         {
           "command": "`../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_slow_start_after_idle=1 \\\n\t\t\t /proc/sys/net/ipv4/tcp_min_tso_segs=10`",
           "sha256": "b8e7a4d240cda50b47904bdf80e8d7e8a446378e010fa798135017b22c57ef3f",
-          "semantic_mapping": "Unavailable: Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "semantic_mapping": "Unavailable: Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted. Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
         },
         {
           "command": "`/tmp/sysctl_restore_${PPID}.sh`",
           "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
-          "semantic_mapping": "Unavailable: Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "semantic_mapping": "Unavailable: Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted. Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
         }
       ],
       "additional_setup_files": [
@@ -2097,26 +2097,26 @@
         "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
         "reasons": [
           "Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted.",
-          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
           "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
           "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
       "blocked_reasons": [
         "Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted.",
-        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
         "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
       ],
       "audited_shell_commands": [
         {
           "command": "`../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_slow_start_after_idle=1 \\\n\t\t\t /proc/sys/net/ipv4/tcp_min_tso_segs=10`",
           "sha256": "b8e7a4d240cda50b47904bdf80e8d7e8a446378e010fa798135017b22c57ef3f",
-          "semantic_mapping": "Unavailable: Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "semantic_mapping": "Unavailable: Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted. Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
         },
         {
           "command": "`/tmp/sysctl_restore_${PPID}.sh`",
           "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
-          "semantic_mapping": "Unavailable: Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "semantic_mapping": "Unavailable: Linux tcp_slow_start_after_idle=1 plus tcp_min_tso_segs=10 idle/window-reopen TSO behavior has no audited ntcp adapter setup mapping. set_sysctls.py and its generated restore command remain unexecuted. Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
         }
       ],
       "additional_setup_files": [
@@ -2163,7 +2163,7 @@
           "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
           "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
           "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged.",
-          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting. The original setsockopt remains unchanged and execution reports unsupported if reached; no socket-option success is fabricated.",
+          "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; requests exceeding the profile resource budget can fail with ENOBUFS. Linux skb memory accounting is not reproduced. The original setsockopt and packet assertions remain unchanged.",
           "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
@@ -2206,7 +2206,7 @@
           "TCP_INFO cwnd and ssthresh are actual transport snapshot bytes divided by negotiated MSS; no upstream expected values or substitute metrics are supplied. Linux buffer autotuning, pacing, TSO, metrics flush and qdisc defaults are not reproduced.",
           "Logical two-segment output batches hint PUSH at full batch boundaries; trailing singleton segments retain application PUSH marks. Packet sizes, recovery credit and upstream assertions remain unchanged.",
           "Only the exact defaults.sh invocation is replaced. Embedded TCP_INFO uses existing allowlisted live transport fields; every packet, syscall, assertion, option and timestamp remains unchanged.",
-          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting. The original setsockopt remains unchanged and execution reports unsupported if reached; no socket-option success is fabricated.",
+          "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; requests exceeding the profile resource budget can fail with ENOBUFS. Linux skb memory accounting is not reproduced. The original setsockopt and packet assertions remain unchanged.",
           "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
       },
@@ -2246,7 +2246,7 @@
         "reasons": [
           "Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced.",
           "Linux tcp_pacing_ss_ratio=200 and tcp_min_tso_segs=2 pacing/TSO controls have no ntcp adapter setup mapping.",
-          "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+          "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
           "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
           "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script."
         ]
@@ -2254,14 +2254,14 @@
       "blocked_reasons": [
         "Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced.",
         "Linux tcp_pacing_ss_ratio=200 and tcp_min_tso_segs=2 pacing/TSO controls have no ntcp adapter setup mapping.",
-        "UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated.",
+        "Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script.",
         "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
       ],
       "audited_shell_commands": [
         {
           "command": "`../common/defaults.sh\ntc qdisc replace dev tun0 root fq\nsysctl -q net/ipv4/tcp_pacing_ss_ratio=200\nsysctl -e -q net.ipv4.tcp_min_tso_segs=2`",
           "sha256": "69befee75ae5e68acc7fefc2761755fb0c86ca862b564dbafc909607cf9ffbb7",
-          "semantic_mapping": "Unavailable: Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced. Linux tcp_pacing_ss_ratio=200 and tcp_min_tso_segs=2 pacing/TSO controls have no ntcp adapter setup mapping. UpstreamCubic has no SO_SNDBUF mapping or Linux send-buffer doubling/accounting; the original successful setsockopt expectation is not fabricated. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "semantic_mapping": "Unavailable: Linux FQ qdisc pacing/TSQ scheduling has no ntcp adapter mapping; FQ quantum/timer behavior and resulting packet timing are not reproduced. Linux tcp_pacing_ss_ratio=200 and tcp_min_tso_segs=2 pacing/TSO controls have no ntcp adapter setup mapping. Shared ntcp-socket implements SO_SNDBUF request clamping/doubling and real send-capacity/quota updates; Linux skb memory accounting is not reproduced. The original setsockopt expectation remains unchanged; other unmapped Linux setup still blocks this script. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
         }
       ]
     },

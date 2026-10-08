@@ -344,12 +344,35 @@ class SelectionChecks(unittest.TestCase):
                         self.assertEqual(data['selection'], {'variants': [variant],
                                                             'scripts': ['basic.pkt']})
                         self.assertTrue(data['results'][0]['behavior_executed'])
-                        self.assertEqual(execute.call_args_list[1].args[0][:4],
-                                         ['unshare', '--user', '--map-root-user', '--net'])
+                        self.assertEqual(execute.call_args_list[0].args[0],
+                                         [str(runner), '--dry_run',
+                                          *data['results'][0]['effective_flags']['packetdrill'],
+                                          str(directory / 'basic.pkt')])
+                        self.assertEqual(execute.call_args_list[1].args[0],
+                                         ['unshare', '--user', '--map-root-user', '--net',
+                                          'env', 'PYTHONOPTIMIZE=0', f'LD_PRELOAD={plugin}',
+                                          str(runner), f'--so_filename={plugin}',
+                                          f"--so_flags={data['results'][0]['effective_flags']['adapter']}",
+                                          *data['results'][0]['effective_flags']['packetdrill'],
+                                          str(directory / 'basic.pkt')])
+                        self.assertEqual(data['results'][0]['effective_flags']['preload'],
+                                         str(plugin))
                     with patch.object(sys, 'argv', argv), \
-                            patch('run.invoke', return_value=(0, False, '')):
+                            patch('run.invoke', return_value=(0, False, '')) as execute:
                         self.assertEqual(main(), 0 if native else 1)
                     data = json.loads(report.read_text())
+                    for call in execute.call_args_list:
+                        invocation = call.args[0]
+                        if '--dry_run' in invocation:
+                            self.assertEqual(invocation[:2], [str(runner), '--dry_run'])
+                        else:
+                            self.assertEqual(invocation[:9],
+                                             ['unshare', '--user', '--map-root-user', '--net',
+                                              'env', 'PYTHONOPTIMIZE=0', f'LD_PRELOAD={plugin}',
+                                              str(runner), f'--so_filename={plugin}'])
+                    for row in data['results']:
+                        if row['behavior_executed']:
+                            self.assertEqual(row['effective_flags']['preload'], str(plugin))
                     self.assertEqual(data['selected_total'], data['eligible_total'])
                     self.assertEqual(data['excluded_cases'], [])
                     self.assertEqual(data['selection'], {'variants': None, 'scripts': None})
@@ -638,6 +661,26 @@ class AdaptationChecks(unittest.TestCase):
                                  command['sha256'])
                 self.assertIn('Unavailable:', command['semantic_mapping'])
 
+    def test_buffer_reasons_describe_shared_capacity_without_enabling_blocked_setup(self):
+        manifest = json.loads((HERE / 'adaptations.json').read_text())
+        self.assertNotIn('no SO_SNDBUF mapping', json.dumps(manifest))
+        for entry in manifest['scripts'].values():
+            reasons = [r for r in entry['mapping'].get('reasons', [])
+                       if 'Shared ntcp-socket implements SO_SNDBUF' in r]
+            for reason in reasons:
+                self.assertIn('request clamping/doubling', reason)
+                self.assertIn('real send-capacity/quota updates', reason)
+                self.assertIn('Linux skb memory accounting is not reproduced', reason)
+                if entry.get('blocked_reasons'):
+                    self.assertIn(reason, entry['blocked_reasons'])
+                    self.assertTrue(any('Linux' in r and 'no' in r
+                                        and 'SO_SNDBUF' not in r
+                                        for r in entry['blocked_reasons']))
+                    for command in entry['audited_shell_commands']:
+                        self.assertIn(reason, command['semantic_mapping'])
+                else:
+                    self.assertIn('ENOBUFS', reason)
+
     def test_mapping_requires_allowlist_exact_flags_count_and_replacement(self):
         with self.assertRaisesRegex(ValueError, 'allowlisted'):
             adapt_source(self.directory, 'other.pkt', self.manifest, self.flags)
@@ -699,14 +742,22 @@ class AdaptationChecks(unittest.TestCase):
             self.assertIn('generated_sha256', row['adaptation'])
             self.assertEqual(row['behavior_executed'], row['variant'] == 'ipv4')
             self.assertEqual(row['adapted'], row['variant'] == 'ipv4')
+            if row['behavior_executed']:
+                self.assertEqual(row['effective_flags']['preload'], str(plugin))
+        for invocation in calls[::2]:
+            self.assertEqual(invocation[:2], [str(runner), '--dry_run'])
+            self.assertFalse(any(arg.startswith('LD_PRELOAD=') for arg in invocation))
         for invocation in calls[1::2]:
-            self.assertEqual(invocation[:4], ['unshare', '--user', '--map-root-user', '--net'])
-            self.assertIn(f'--so_filename={plugin}', invocation)
+            self.assertEqual(invocation[:9],
+                             ['unshare', '--user', '--map-root-user', '--net',
+                              'env', 'PYTHONOPTIMIZE=0', f'LD_PRELOAD={plugin}',
+                              str(runner), f'--so_filename={plugin}'])
             entry = next(entry for name, entry in self.manifest['scripts'].items()
                          if Path(name).name == Path(invocation[-1]).name)
             embedded = entry.get('embedded_tcp_info') is True
-            self.assertEqual(f'LD_PRELOAD={plugin}' in invocation, embedded)
-            self.assertEqual('PYTHONOPTIMIZE=0' in invocation, embedded)
+            self.assertEqual([arg for arg in invocation if arg.startswith('LD_PRELOAD=')],
+                             [f'LD_PRELOAD={plugin}'])
+            self.assertIn('PYTHONOPTIMIZE=0', invocation)
             if embedded:
                 # Exercise the actual interpreter under the selected environment override.
                 with patch.dict(os.environ, {'PYTHONOPTIMIZE': '1'}):
@@ -799,7 +850,8 @@ class PublishedSelectionChecks(unittest.TestCase):
                     self.assertEqual(audit['generated_sha256'], hashlib.sha256(generated).hexdigest())
                 self.assertEqual((self.directory / name).read_bytes(), source)
                 if name in DEFAULTS_ONLY_CUBIC and b'SO_SNDBUF' in source:
-                    self.assertTrue(any('no SO_SNDBUF mapping' in r for r in entry['mapping']['reasons']))
+                    self.assertTrue(any('real send-capacity/quota updates' in r
+                                        and 'ENOBUFS' in r for r in entry['mapping']['reasons']))
 
     def test_exact_35_selection_blocks_unmapped_setup_without_execution(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -826,11 +878,10 @@ class PublishedSelectionChecks(unittest.TestCase):
                 if '--dry_run' in argv:
                     return 0, False, ''
                 executed.append(name)
-                if name in DEFAULTS_ONLY_CUBIC:
-                    self.assertIn('PYTHONOPTIMIZE=0', argv)
-                    self.assertIn(f'LD_PRELOAD={plugin}', argv)
-                if b'SO_SNDBUF' in path.read_bytes() and name in DEFAULTS_ONLY_CUBIC:
-                    return 0, False, 'NTCP_PACKETDRILL_UNSUPPORTED: SO_SNDBUF'
+                self.assertEqual(argv[:9],
+                                 ['unshare', '--user', '--map-root-user', '--net',
+                                  'env', 'PYTHONOPTIMIZE=0', f'LD_PRELOAD={plugin}',
+                                  str(runner), f'--so_filename={plugin}'])
                 return 1, False, 'packet mismatch'
 
             tracked = '\0'.join(str(Path(PIN['tcp_tests']) / name)
@@ -860,9 +911,8 @@ class PublishedSelectionChecks(unittest.TestCase):
                     self.assertIsNone(row['syntax_returncode'])
                 else:
                     self.assertTrue(row['behavior_executed'])
-                    self.assertEqual(row['status'], 'unsupported' if row['script'] in DEFAULTS_ONLY_CUBIC
-                                     and b'SO_SNDBUF' in (self.directory / row['script']).read_bytes()
-                                     else 'failed')
+                    self.assertEqual(row['effective_flags']['preload'], str(plugin))
+                    self.assertEqual(row['status'], 'failed')
 
 
 if __name__ == '__main__':
