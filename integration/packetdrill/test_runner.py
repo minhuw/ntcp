@@ -1135,7 +1135,7 @@ class PublishedSelectionChecks(unittest.TestCase):
             if name.startswith('tcp_info/'):
                 self.assertTrue(entry['embedded_tcp_info'])
                 self.assertNotIn('blocked_reasons', entry)
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir=HERE.parent.parent / 'workbench') as temporary:
             checkout = Path(temporary)
             (checkout / PIN['tcp_tests']).parent.mkdir(parents=True)
             (checkout / PIN['tcp_tests']).symlink_to(self.directory.resolve(), target_is_directory=True)
@@ -1148,7 +1148,9 @@ class PublishedSelectionChecks(unittest.TestCase):
             report = checkout / 'report.json'
             tracked = '\0'.join(str(Path(PIN['tcp_tests']) / name)
                                 for name in self.manifest['scripts'])
-            for selection, eligible in ((SOCKET43, 33), (SOCKET_FEATURE19, 13)):
+            # The candidate fixture remains runtime-gated until integration is ready.
+            sendfile_enabled = not self.manifest['scripts']['sendfile/sendfile-simple.pkt'].get('blocked_reasons')
+            for selection, eligible in ((SOCKET43, 33 + int(sendfile_enabled)), (SOCKET_FEATURE19, 13)):
                 executed = []
 
                 def execute(argv, cwd, timeout):
