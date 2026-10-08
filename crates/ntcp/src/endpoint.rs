@@ -1930,7 +1930,7 @@ impl Endpoint {
         Ok(self.slot(id)?.connection.state())
     }
     pub fn transport_info(&self, id: ConnectionId) -> Result<crate::TransportInfo, EndpointError> {
-        Ok(self.slot(id)?.connection.transport_info())
+        Ok(self.slot(id)?.connection.transport_info_at(self.now))
     }
 
     pub fn acknowledged(&self, id: ConnectionId) -> Result<u64, EndpointError> {
@@ -2188,6 +2188,44 @@ mod recovery_observation_tests {
             .unwrap();
         bytes.truncate(packet.len);
         (packet, bytes)
+    }
+
+    #[test]
+    fn transport_info_samples_endpoint_clock_for_dormant_connection_without_mutation() {
+        let cfg = EndpointConfig::default();
+        let mut endpoint = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+        let id = endpoint
+            .connect(
+                0,
+                "192.0.2.1:40000".parse().unwrap(),
+                "192.0.2.2:8080".parse().unwrap(),
+            )
+            .unwrap();
+        endpoint.write(id, b"queued during handshake").unwrap();
+        assert_eq!(
+            endpoint
+                .slot(id)
+                .unwrap()
+                .connection
+                .transport_info()
+                .busy_time_us,
+            0
+        );
+        // Servicing the endpoint need not touch this connection's timer or output.
+        endpoint.on_timeout(100_000, 0).unwrap();
+        let info = crate::allocation_tests::fail_after(0, || endpoint.transport_info(id).unwrap());
+        assert_eq!(info.busy_time_us, 100_000);
+        assert_eq!(info.last_data_recv_ms, 100);
+        assert_eq!(endpoint.transport_info(id).unwrap(), info);
+        assert_eq!(
+            endpoint
+                .slot(id)
+                .unwrap()
+                .connection
+                .transport_info()
+                .busy_time_us,
+            0
+        );
     }
 
     #[test]

@@ -322,6 +322,16 @@ pub struct TransportInfo {
     pub rtt_us: Option<u64>,
     pub rttvar_us: u64,
     pub rto_us: u64,
+    // Queued payload not yet first-transmitted; SYN/FIN and retransmissions excluded.
+    pub notsent_bytes: usize,
+    // Elapsed caller-clock milliseconds since establishment or last newly accepted
+    // payload (including out-of-order bytes); ACKs, FINs and duplicates do not reset it.
+    pub last_data_recv_ms: u32,
+    // Pending payload/FIN time, including the mutually exclusive limited intervals.
+    pub busy_time_us: u64,
+    pub rwnd_limited_us: u64,
+    // Actual byte-buffer backpressure, not Linux skb memory accounting.
+    pub sndbuf_limited_us: u64,
     pub send_used: usize,
     pub send_capacity: usize,
     pub receive_used: usize,
@@ -555,6 +565,10 @@ pub(crate) struct Connection {
     application_timeout_us: Option<u64>,
     application_progress_at: Instant,
     last_received: Instant,
+    last_data_received: Instant,
+    // Caller ticks retain sub-microsecond fractions across state transitions.
+    transport_ticks: [u64; 3],
+    send_backpressured: bool,
     // Successful data output only; ACKs and keepalives do not restart data-idle time.
     last_sent: Instant,
     retransmit_burst: Option<(Seq, u32)>,
@@ -793,6 +807,9 @@ impl Connection {
             application_timeout_us: None,
             application_progress_at: now,
             last_received: now,
+            last_data_received: now,
+            transport_ticks: [0; 3],
+            send_backpressured: false,
             last_sent: now,
             retransmit_burst: None,
             output_push_batch: None,
@@ -969,6 +986,9 @@ impl Connection {
         }
         self.send.set_limit(send);
         self.config.send_capacity = send;
+        if self.send.remaining() != 0 {
+            self.send_backpressured = false;
+        }
         self.config.receive_capacity = receive;
         if self.handshake_pending() && self.snd_nxt == self.iss {
             // No local SYN has reached the wire, including after failed output.
@@ -1057,8 +1077,15 @@ impl Connection {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn transport_info(&self) -> TransportInfo {
+        self.transport_info_at(self.now)
+    }
+
+    // Read-only sampling also covers dormant connections whose clock lags Endpoint.
+    pub(crate) fn transport_info_at(&self, now: Instant) -> TransportInfo {
         let counts = self.rack.counts();
+        let ticks = self.transport_ticks_at(now);
         TransportInfo {
             state: self.state,
             recovery: self.congestion.in_recovery(),
@@ -1078,11 +1105,64 @@ impl Connection {
                 .map(|ticks| self.config.timebase.us_from_ticks(ticks)),
             rttvar_us: self.config.timebase.us_from_ticks(self.rtt.variance()),
             rto_us: self.config.timebase.us_from_ticks(self.rto()),
+            notsent_bytes: self.notsent_bytes(),
+            last_data_recv_ms: (self
+                .config
+                .timebase
+                .us_from_ticks(now.saturating_sub(self.last_data_received))
+                / 1000)
+                .min(u32::MAX as u64) as u32,
+            busy_time_us: self.config.timebase.us_from_ticks(ticks[0]),
+            rwnd_limited_us: self.config.timebase.us_from_ticks(ticks[1]),
+            sndbuf_limited_us: self.config.timebase.us_from_ticks(ticks[2]),
             send_used: self.send.len(),
             send_capacity: self.config.send_capacity,
             receive_used: self.receive_used,
             receive_capacity: self.config.receive_capacity,
         }
+    }
+
+    fn notsent_bytes(&self) -> usize {
+        let sent = if self.handshake_pending() || !at_or_after(self.snd_nxt, self.send_base) {
+            0
+        } else {
+            (self.snd_nxt.distance_from(self.send_base) as usize).min(self.send.len())
+        };
+        self.send.len() - sent
+    }
+
+    fn transport_ticks_at(&self, now: Instant) -> [u64; 3] {
+        let mut ticks = self.transport_ticks;
+        let fin_pending = self.shutdown
+            && self
+                .fin_sequence
+                .is_none_or(|fin| !after(self.snd_una, fin));
+        if !matches!(self.state, State::Closed | State::TimeWait)
+            && (self.send.len() != 0 || fin_pending)
+        {
+            let elapsed = now.saturating_sub(self.now);
+            ticks[0] = ticks[0].saturating_add(elapsed);
+            let unsent = self.notsent_bytes();
+            let flight = self.flight();
+            // Linux chronographs prioritize sndbuf over rwnd. Here NOSPACE means
+            // an actual short/blocked core write, and ends at core writable credit.
+            let sndbuf = self.send_backpressured
+                && self.send.remaining() == 0
+                && unsent == 0
+                && matches!(self.state, State::Established | State::CloseWait)
+                && flight < self.congestion.cwnd();
+            let next_payload = unsent.min(self.mss) as u32;
+            let rwnd = self.synchronized()
+                && next_payload != 0
+                && self.congestion.cwnd().saturating_sub(flight) >= next_payload
+                && self.snd_wnd.saturating_sub(flight) < next_payload;
+            if sndbuf {
+                ticks[2] = ticks[2].saturating_add(elapsed);
+            } else if rwnd {
+                ticks[1] = ticks[1].saturating_add(elapsed);
+            }
+        }
+        ticks
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8985#section-1
@@ -1702,6 +1782,7 @@ impl Connection {
 
     pub(crate) fn update_time(&mut self, now: Instant) -> Result<(), Error> {
         self.check_time(now)?;
+        self.transport_ticks = self.transport_ticks_at(now);
         // Endpoint validates caller clock gaps. A dormant connection may lag
         // that serviced clock by more than the timestamp serial half-range.
         let granularity = if self.config.timestamps {
@@ -1963,6 +2044,9 @@ impl Connection {
         );
         self.received_total = count as u64;
         self.receive_used += outcome.new_bytes;
+        if outcome.new_bytes != 0 {
+            self.last_data_received = self.now;
+        }
         if outcome.fin {
             self.syn_window = 0;
         } else {
@@ -2063,6 +2147,7 @@ impl Connection {
 
     fn establish(&mut self) {
         self.handshake_complete = true;
+        self.last_data_received = self.now;
         if self.state == State::SynSent || self.state == State::SynReceived {
             self.state = State::Established;
         }
@@ -2368,6 +2453,7 @@ impl Connection {
         let application_idle = !self.application_timer_needed();
         let idle = !self.user_timer_needed();
         let count = self.send.write(data);
+        self.send_backpressured |= count < data.len();
         if count == 0 {
             return Err(Error::WouldBlock);
         }
@@ -2439,6 +2525,7 @@ impl Connection {
             self.snd_up = (retained != 0).then_some(end);
         }
         if discarded != 0 && self.send.remaining() != 0 {
+            self.send_backpressured = false;
             self.events.writable = true;
         }
         self.arm_work();
@@ -4106,6 +4193,9 @@ impl Connection {
             self.send
                 .acknowledge(bytes as usize)
                 .expect("ACK is bounded by sent sequence space");
+            if self.send.remaining() != 0 {
+                self.send_backpressured = false;
+            }
             self.send_base = self.send_base.wrapping_add(bytes);
             self.acknowledged = self.acknowledged.saturating_add(bytes as u64);
             self.events.acknowledged = Some(self.acknowledged);
@@ -4422,6 +4512,9 @@ impl Connection {
             flags & PSH != 0 && skip + count == payload.len(),
         );
         self.receive_used += outcome.new_bytes;
+        if outcome.new_bytes != 0 {
+            self.last_data_received = self.now;
+        }
         if outcome.sack_overflow && self.sack_send {
             self.sack_omit = true;
             self.receive.clear_dsack();
@@ -7779,6 +7872,240 @@ mod tests {
         assert!(a.take_events().connected);
         assert!(b.take_events().connected);
         (a, b)
+    }
+
+    #[test]
+    fn transport_info_notsent_tracks_original_payload_across_wrap_ack_retry_and_fin() {
+        for iss in [100, u32::MAX - 3] {
+            let mut cfg = config(64, 8);
+            cfg.nagle = false;
+            let (mut a, _) = pair(cfg, iss);
+            a.write(&[7; 16]).unwrap();
+            assert_eq!(a.transport_info().notsent_bytes, 16);
+            let before = a.transport_info();
+            assert_eq!(a.transmit(40, &mut [0; 20]), Err(Error::OutputTooSmall));
+            assert_eq!(a.transport_info(), before);
+            packet(&mut a, 40);
+            assert_eq!(a.transport_info().notsent_bytes, 8);
+            let next = a.receive.next();
+            let ack = a.send_base.wrapping_add(3);
+            inject(&mut a, 50, next, ack, ACK, 64, &[]);
+            assert_eq!(
+                (
+                    a.transport_info().send_used,
+                    a.transport_info().notsent_bytes
+                ),
+                (13, 8)
+            );
+            a.retx_pending = true;
+            let retry = packet(&mut a, 60);
+            assert_eq!(
+                wire::parse(ip(tuple()), &retry).unwrap().header.sequence,
+                ack.0
+            );
+            assert_eq!(a.transport_info().notsent_bytes, 8);
+            packet(&mut a, 70);
+            assert_eq!(a.transport_info().notsent_bytes, 0);
+            a.shutdown().unwrap();
+            packet(&mut a, 80);
+            assert_eq!(a.transport_info().notsent_bytes, 0);
+            let end = a.snd_nxt;
+            inject(&mut a, 90, next, end, ACK, 64, &[]);
+            assert_eq!(a.transport_info().send_used, 0);
+            let done = a.transport_info().busy_time_us;
+            a.update_time(100_000).unwrap();
+            assert_eq!(a.transport_info().busy_time_us, done);
+        }
+    }
+
+    #[test]
+    fn transport_info_receive_idle_clock_only_new_accepted_payload_resets() {
+        let (mut a, _) = pair(config(64, 8), 100);
+        a.update_time(1_000_020).unwrap();
+        assert_eq!(a.transport_info().last_data_recv_ms, 1000);
+        let next = a.receive.next();
+        let ack = a.snd_una;
+        inject(&mut a, 1_010_020, next, ack, ACK, 64, &[]);
+        assert_eq!(a.transport_info().last_data_recv_ms, 1010);
+        inject(&mut a, 1_020_020, next, ack, ACK, 64, b"abc");
+        assert_eq!(a.transport_info().last_data_recv_ms, 0);
+        // Duplicate and out-of-window text are not newly accepted payload.
+        inject(&mut a, 1_030_020, next, ack, ACK, 64, b"abc");
+        inject(
+            &mut a,
+            1_040_020,
+            next.wrapping_add(1000),
+            ack,
+            ACK,
+            64,
+            b"bad",
+        );
+        assert_eq!(a.transport_info().last_data_recv_ms, 20);
+        inject(
+            &mut a,
+            1_050_020,
+            next.wrapping_add(8),
+            ack,
+            ACK,
+            64,
+            b"ooo",
+        );
+        assert_eq!(a.transport_info().last_data_recv_ms, 0);
+        assert_eq!(a.readable_bytes(), 3); // INQ excludes the out-of-order tail.
+        let mut out = [0; 3];
+        assert_eq!(a.read(&mut out), Ok(3));
+        assert_eq!(a.transport_info_at(1_060_020).last_data_recv_ms, 10);
+        inject(
+            &mut a,
+            1_060_020,
+            next.wrapping_add(3),
+            ack,
+            ACK,
+            64,
+            b"defgh",
+        );
+        assert_eq!(a.read(&mut [0; 8]), Ok(8));
+        inject(
+            &mut a,
+            1_070_020,
+            next.wrapping_add(11),
+            ack,
+            ACK | FIN,
+            64,
+            &[],
+        );
+        assert_eq!(a.transport_info().last_data_recv_ms, 10);
+        assert_eq!(a.readable_bytes(), 0);
+        assert_eq!(a.read(&mut out), Ok(0));
+        assert_eq!(a.transport_info().busy_time_us, 0);
+    }
+
+    #[test]
+    fn transport_info_rwnd_and_busy_accrue_real_intervals_in_both_caller_units() {
+        for scale in [1, 1000] {
+            let mut cfg = config(4096, 1000);
+            cfg.nagle = false;
+            cfg.timebase.units_per_second = 1_000_000 * scale;
+            let (mut a, _) = pair(cfg, 100);
+            let start = 100 * scale;
+            let next = a.receive.next();
+            let ack = a.snd_una;
+            inject(&mut a, start, next, ack, ACK, 0, &[]);
+            assert_eq!(
+                a.transport_info_at(start + 50_000 * scale).rwnd_limited_us,
+                0
+            );
+            a.write(&[1; 1000]).unwrap();
+            assert_eq!(
+                a.transport_info_at(start + 100_000 * scale).rwnd_limited_us,
+                100_000
+            );
+            inject(&mut a, start + 200_000 * scale, next, ack, ACK, 2000, &[]);
+            assert_eq!(a.transport_info().rwnd_limited_us, 200_000);
+            packet(&mut a, start + 200_000 * scale);
+            let ack = a.snd_nxt;
+            inject(&mut a, start + 230_000 * scale, next, ack, ACK, 10, &[]);
+            a.write(&[2; 1000]).unwrap();
+            inject(&mut a, start + 330_000 * scale, next, ack, ACK, 2000, &[]);
+            let info = a.transport_info();
+            assert_eq!(
+                (
+                    info.rwnd_limited_us,
+                    info.busy_time_us,
+                    info.sndbuf_limited_us
+                ),
+                (300_000, 330_000, 0)
+            );
+            packet(&mut a, start + 330_000 * scale);
+            let ack = a.snd_nxt;
+            inject(&mut a, start + 350_000 * scale, next, ack, ACK, 2000, &[]);
+            assert_eq!(a.transport_info().busy_time_us, 350_000);
+            a.update_time(start + 450_000 * scale).unwrap();
+            assert_eq!(a.transport_info().busy_time_us, 350_000);
+        }
+    }
+
+    #[test]
+    fn transport_info_sndbuf_requires_application_backpressure_and_send_starvation() {
+        let mut cfg = config(16, 8);
+        cfg.nagle = false;
+        let (mut a, _) = pair(cfg, 100);
+        a.update_time(100).unwrap();
+        assert_eq!(a.write(&[1; 24]), Ok(16)); // Genuine byte-buffer short write.
+        assert_eq!(a.transport_info_at(200).sndbuf_limited_us, 0); // Still unsent.
+        packet(&mut a, 200);
+        packet(&mut a, 200);
+        assert_eq!(a.write(&[2]), Err(Error::WouldBlock));
+        let info = a.transport_info_at(20_200);
+        assert_eq!(
+            (
+                info.busy_time_us,
+                info.sndbuf_limited_us,
+                info.rwnd_limited_us
+            ),
+            (20_100, 20_000, 0)
+        );
+        let next = a.receive.next();
+        let partial = a.send_base.wrapping_add(3);
+        inject(&mut a, 20_200, next, partial, ACK, 64, &[]);
+        assert_eq!(a.transport_info_at(40_200).sndbuf_limited_us, 20_000);
+        // An exactly satisfied write is application-limited, not NOSPACE.
+        assert_eq!(a.write(&[2; 3]), Ok(3));
+        packet(&mut a, 20_200);
+        assert_eq!(a.transport_info_at(40_200).sndbuf_limited_us, 20_000);
+        let end = a.snd_nxt;
+        inject(&mut a, 40_200, next, end, ACK, 64, &[]);
+        assert_eq!(a.transport_info_at(100_000).busy_time_us, 40_100);
+    }
+
+    #[test]
+    fn transport_info_congestion_exhaustion_is_not_rwnd_or_sndbuf_limitation() {
+        let mut cfg = config(128, 8);
+        cfg.nagle = false;
+        let (mut a, _) = pair(cfg, 100);
+        a.update_time(100).unwrap();
+        assert_eq!(a.write(&[1; 129]), Ok(128));
+        let cwnd = a.congestion.cwnd();
+        while a.flight() < cwnd {
+            packet(&mut a, 100);
+        }
+        let next = a.receive.next();
+        let ack = a.snd_una;
+        inject(&mut a, 100, next, ack, ACK, 0, &[]);
+        let info = a.transport_info_at(100_100);
+        assert_eq!(
+            (
+                info.busy_time_us,
+                info.rwnd_limited_us,
+                info.sndbuf_limited_us
+            ),
+            (100_000, 0, 0)
+        );
+        assert!(info.notsent_bytes > 0);
+    }
+
+    #[test]
+    fn transport_info_sampling_is_read_only_and_preserves_fractional_caller_ticks() {
+        let mut cfg = config(64, 8);
+        cfg.timebase.units_per_second = 1_000_000_000;
+        let (mut a, _) = pair(cfg, 100);
+        a.write(&[1; 8]).unwrap();
+        let now = a.now;
+        let ticks = a.transport_ticks;
+        let events = a.events.clone();
+        let info = crate::allocation_tests::fail_after(0, || a.transport_info_at(now + 2500));
+        assert_eq!(info.busy_time_us, 2);
+        assert_eq!(a.transport_info_at(now + 2500), info);
+        assert_eq!((a.now, a.transport_ticks, &a.events), (now, ticks, &events));
+        for delta in 1..=2500 {
+            a.update_time(now + delta).unwrap();
+        }
+        assert_eq!(a.transport_info().busy_time_us, 2);
+        assert_eq!(a.transport_ticks[0], 2500);
+        a.abort();
+        a.update_time(now + 1_000_000).unwrap();
+        assert_eq!(a.transport_info().busy_time_us, 2);
+        assert_eq!(a.transport_info_at(u64::MAX).last_data_recv_ms, u32::MAX);
     }
 
     #[test]
