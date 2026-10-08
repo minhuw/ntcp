@@ -307,9 +307,11 @@ void ntcp_abi_fault_check(void *u, int fd) {
     struct msghdr msg = {.msg_iov = v, .msg_iovlen = 2};
     for (int i = 0; i < 3; i++) {
         void *ptr = i == 0 ? NULL : i == 1 ? badptr : mapping + page - 2;
-        assert(p.write(u, fd, ptr, 6) == -1 && errno == EFAULT);
-        assert(p.send(u, fd, ptr, 6, 0) == -1 && errno == EFAULT);
-        assert(p.sendto(u, fd, ptr, 6, 0, NULL, 0) == -1 && errno == EFAULT);
+        // Sends retain the readable prefix; receive copyout remains atomic.
+        ssize_t expected = i == 2 ? 2 : -1;
+        assert(p.write(u, fd, ptr, 6) == expected && (expected >= 0 || errno == EFAULT));
+        assert(p.send(u, fd, ptr, 6, 0) == expected && (expected >= 0 || errno == EFAULT));
+        assert(p.sendto(u, fd, ptr, 6, 0, NULL, 0) == expected && (expected >= 0 || errno == EFAULT));
         assert(p.read(u, fd, ptr, 6) == -1 && errno == EFAULT);
         assert(p.recv(u, fd, ptr, 6, 0) == -1 && errno == EFAULT);
         assert(p.recvfrom(u, fd, ptr, 6, 0, NULL, NULL) == -1 && errno == EFAULT);
@@ -319,8 +321,9 @@ void ntcp_abi_fault_check(void *u, int fd) {
     assert(p.sendmsg(u, fd, badptr, 0) == -1 && errno == EFAULT);
     assert(p.recvmsg(u, fd, badptr, 0) == -1 && errno == EFAULT);
     assert(p.readv(u, fd, v, 2) == -1 && errno == EFAULT);
-    assert(p.writev(u, fd, v, 2) == -1 && errno == EFAULT);
-    assert(p.sendmsg(u, fd, &msg, 0) == -1 && errno == EFAULT);
+    assert(p.writev(u, fd, v, 2) == 3);
+    assert(p.sendmsg(u, fd, &msg, 0) == 3);
+    assert(p.write(u, fd, badptr, 1) == -1 && errno == EFAULT);
     assert(p.recvmsg(u, fd, &msg, 0) == -1 && errno == EFAULT);
     assert(p.readv(u, fd, v, 1025) == -1 && errno == EINVAL);
     assert(p.read(u, fd, badptr, 0) == 0);

@@ -968,7 +968,7 @@ unsafe fn transfer(fd: i32, p: *mut c_void, n: usize, flags: i32, write: bool) -
     if n > isize::MAX as usize {
         return Err(EINVAL);
     }
-    if io_limit() < runtime::BYTES && n > io_limit() {
+    if !write && io_limit() < runtime::BYTES && n > io_limit() {
         return Err(runtime::unsupported_option(
             "scalar I/O exceeds 65535-byte adapter bound",
         ));
@@ -976,7 +976,7 @@ unsafe fn transfer(fd: i32, p: *mut c_void, n: usize, flags: i32, write: bool) -
     if !write {
         return read_to(fd, id, n, flags, vec![(p as usize, n)], Vec::new());
     }
-    let op = Op::Send(vec![(p as usize, n.min(runtime::BYTES))], flags);
+    let op = Op::Send(vec![(p as usize, n)], flags);
     let result = retry(
         id,
         op,
@@ -1289,27 +1289,19 @@ unsafe fn vectors_timestamp(
             .filter(|&n| n <= isize::MAX as usize)
             .ok_or(EINVAL)?;
     }
-    if io_limit() < runtime::BYTES && total > io_limit() {
-        return Err(if write {
-            EMSGSIZE
-        } else {
-            runtime::unsupported_option("receive I/O exceeds 65535-byte adapter bound")
-        });
+    if !write && io_limit() < runtime::BYTES && total > io_limit() {
+        return Err(runtime::unsupported_option(
+            "receive I/O exceeds 65535-byte adapter bound",
+        ));
     }
-    let bytes = vec![0u8; total.min(runtime::BYTES)];
     if write {
         if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_ZEROCOPY | MSG_MORE | MSG_EOR) != 0 {
             return Err(runtime::unsupported_option("send flags"));
         }
         let id = owned(fd)?.ok_or(EBADF)?;
-        let mut left = total.min(runtime::BYTES);
         let sources = vectors
             .iter()
-            .map(|v| {
-                let n = v.iov_len.min(left);
-                left -= n;
-                (v.iov_base as usize, n)
-            })
+            .map(|v| (v.iov_base as usize, v.iov_len))
             .collect();
         let result = retry(
             id,
@@ -1341,7 +1333,14 @@ unsafe fn vectors_timestamp(
         .iter()
         .map(|v| (v.iov_base as usize, v.iov_len))
         .collect();
-    read_to(fd, id, bytes.len(), flags, destinations, copies)
+    read_to(
+        fd,
+        id,
+        total.min(runtime::BYTES),
+        flags,
+        destinations,
+        copies,
+    )
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ntcp_managed_readv(fd: i32, v: *const iovec, n: i32) -> ssize_t {

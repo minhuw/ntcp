@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 #[path = "runtime_backend.rs"]
 mod backend;
+#[path = "runtime_send.rs"]
+mod send;
 #[path = "runtime_timestamping.rs"]
 mod timestamps;
 use crate::socket_options::{effective_notsent_lowat, notsent_writable};
@@ -11,6 +13,7 @@ use ntcp::{
 };
 use ntcp_io::{PacketIo, TxOutcome};
 use ntcp_io_tun::Tun;
+use send::LogicalSend;
 use std::{
     collections::{BTreeMap, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -86,6 +89,7 @@ struct Request {
     op: Op,
     reply: SyncSender<Result<Reply>>,
     deadline: Option<Instant>,
+    send: Option<LogicalSend>,
 }
 pub struct Runtime {
     tx: SyncSender<Request>,
@@ -233,6 +237,7 @@ impl Runtime {
             op,
             reply,
             deadline,
+            send: None,
         };
         if closing {
             // Descriptor teardown must not strand an Endpoint socket when the
@@ -317,6 +322,7 @@ struct Socket {
     discover: i32,
     zerocopy: bool,
     zc_next: u32,
+    zc_reserved: usize,
     completions: VecDeque<Completion>,
     timestamps: TimestampState,
 }
@@ -352,6 +358,7 @@ impl Socket {
             discover: IP_PMTUDISC_WANT,
             zerocopy: false,
             zc_next: 0,
+            zc_reserved: 0,
             completions: VecDeque::new(),
             timestamps: TimestampState::default(),
         }
@@ -633,12 +640,32 @@ impl Owner {
         let _ = op;
         false
     }
-    fn service(&mut self, request: &Request) -> bool {
+    fn service(&mut self, request: &mut Request) -> bool {
         let (op, wait) = if let Op::Wait(op, _) = &request.op {
-            ((**op).clone(), true)
+            (&**op, true)
         } else {
-            (request.op.clone(), false)
+            (&request.op, false)
         };
+        if matches!(op, Op::Send(..) | Op::SendTimestamp(..)) {
+            if request.send.is_none() {
+                let (sources, flags, stamp) = match op {
+                    Op::Send(sources, flags) => (sources.clone(), *flags, None),
+                    Op::SendTimestamp(sources, flags, stamp) => {
+                        (sources.clone(), *flags, Some(*stamp))
+                    }
+                    _ => unreachable!(),
+                };
+                match LogicalSend::new(self, request.id, sources, flags, stamp) {
+                    Ok(send) => request.send = Some(send),
+                    Err(e) => {
+                        let _ = request.reply.send(Err(e));
+                        return true;
+                    }
+                }
+            }
+            return self.service_send(request, wait);
+        }
+        let op = op.clone();
         let result = self.execute(request.id, op);
         if matches!(result, Err(EAGAIN))
             && wait
@@ -658,21 +685,21 @@ impl Owner {
     }
     fn run(&mut self, rx: Receiver<Request>, wake: i32, stop: &std::sync::atomic::AtomicBool) {
         let mut input = vec![0; 65535];
-        while !stop.load(Ordering::Acquire) {
+        'run: while !stop.load(Ordering::Acquire) {
             let now = self.now();
             if self.endpoint.on_timeout(now, BUDGET).is_err() {
                 break;
             }
             if self.receive_batch(&mut input).is_err() || self.poll_backend_timestamps().is_err() {
-                return;
+                break 'run;
             }
             self.events();
             let mut after_output = Vec::with_capacity(BUDGET);
             for _ in 0..self.pending.len().min(BUDGET) {
-                let request = self.pending.pop_front().unwrap();
+                let mut request = self.pending.pop_front().unwrap();
                 let early = matches!(&request.op, Op::Wait(op, _) if matches!(**op, Op::Read(_) | Op::Peek(_) | Op::ReadTo(..)))
                     && self.sockets.get(&request.id).is_some_and(|s| s.error == 0);
-                if !early || !self.service(&request) {
+                if !early || !self.service(&mut request) {
                     after_output.push((request, early));
                 }
             }
@@ -702,14 +729,14 @@ impl Owner {
                         BUDGET,
                     ) {
                         Ok(tx) => tx.packet,
-                        Err(_) => return,
+                        Err(_) => break 'run,
                     };
                     let Some(tx) = transmit else {
                         break;
                     };
                     packet = match self.frame(tx, &packet[20..20 + tx.len]) {
                         Ok(packet) => packet,
-                        Err(_) => return,
+                        Err(_) => break 'run,
                     };
                     self.timestamp_packet(tx.tx_timestamp, &packet);
                     self.drain_timestamps(pair);
@@ -727,7 +754,7 @@ impl Owner {
                         }
                         Ok(TxOutcome::WouldBlock) => break,
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
-                        Err(_) => return,
+                        Err(_) => break 'run,
                     }
                 }
                 if self.ethernet.is_some() {
@@ -738,7 +765,7 @@ impl Owner {
                         }
                         Ok(TxOutcome::WouldBlock) => break,
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
-                        Err(_) => return,
+                        Err(_) => break 'run,
                     }
                 }
                 #[cfg(feature = "packet-test")]
@@ -759,8 +786,8 @@ impl Owner {
                 }
             }
             self.events();
-            for (request, retried) in after_output {
-                if retried || !self.service(&request) {
+            for (mut request, retried) in after_output {
+                if retried || !self.service(&mut request) {
                     self.pending.push_back(request);
                 }
             }
@@ -782,10 +809,10 @@ impl Owner {
                 .unwrap_or(std::time::Duration::from_millis(1))
                 .min(std::time::Duration::from_millis(1));
             match rx.recv_timeout(wait) {
-                Ok(r) => {
+                Ok(mut r) => {
                     if self.pending.len() == self.socket_limit() && !matches!(r.op, Op::Close) {
                         let _ = r.reply.send(Err(EAGAIN));
-                    } else if !self.service(&r) {
+                    } else if !self.service(&mut r) {
                         self.pending.push_back(r);
                     }
                     #[cfg(feature = "packet-test")]
@@ -793,12 +820,12 @@ impl Owner {
                     #[cfg(not(feature = "packet-test"))]
                     let requests = BUDGET;
                     for _ in 1..requests {
-                        let Ok(r) = rx.try_recv() else {
+                        let Ok(mut r) = rx.try_recv() else {
                             break;
                         };
                         if self.pending.len() == self.socket_limit() && !matches!(r.op, Op::Close) {
                             let _ = r.reply.send(Err(EAGAIN));
-                        } else if !self.service(&r) {
+                        } else if !self.service(&mut r) {
                             self.pending.push_back(r);
                         }
                     }
@@ -808,8 +835,18 @@ impl Owner {
             }
             signal(wake);
         }
-        for request in self.pending.drain(..) {
-            let _ = request.reply.send(Err(ECANCELED));
+        let error = if stop.load(Ordering::Acquire) {
+            ECANCELED
+        } else {
+            EIO
+        };
+        while let Some(mut request) = self.pending.pop_front() {
+            let result = if let Some(mut send) = request.send.take() {
+                self.finish_send(request.id, &mut send, Err(error))
+            } else {
+                Err(error)
+            };
+            let _ = request.reply.send(result);
         }
     }
     fn prune_child_timeouts(&mut self) {
@@ -1067,6 +1104,7 @@ impl Owner {
     fn write(&mut self, id: u64, bytes: Vec<u8>, flags: i32) -> Result<i32> {
         self.write_timestamp(id, bytes, flags, None)
     }
+    #[cfg(test)]
     fn write_timestamp(
         &mut self,
         id: u64,
@@ -1501,53 +1539,7 @@ impl Owner {
                     Op::SendTimestamp(sources, flags, stamp) => (sources, flags, Some(stamp)),
                     _ => unreachable!(),
                 };
-                // Connected/terminal errors precede payload faults. Fresh and
-                // listening fds retain the adapter's foreign-input validation.
-                let connection = matches!(s.handle, Handle::Connection(_));
-                let cid = if connection {
-                    Some(self.send_state(id)?)
-                } else {
-                    None
-                };
-                let total = sources
-                    .iter()
-                    .try_fold(0usize, |n, p| n.checked_add(p.1).ok_or(EINVAL))?;
-                if total > BYTES {
-                    return Err(EMSGSIZE);
-                }
-                let accepted = if let Some(cid) = cid {
-                    let lowat = effective_notsent_lowat(self.sockets[&id].notsent_lowat);
-                    let accepted = if lowat == u32::MAX {
-                        total
-                    } else {
-                        let room = self
-                            .endpoint
-                            .send_admission_room(cid, Some(lowat))
-                            .map_err(engine)?;
-                        if room == 0 && total != 0 {
-                            return Err(EAGAIN);
-                        }
-                        total.min(room)
-                    };
-                    self.reserve_completion(id, total != 0, flags, override_flags)?;
-                    accepted
-                } else {
-                    total
-                };
-                // Inspect only the admissible prefix, but pass the original
-                // length so core observes short writes and seals partial EOR.
-                // The zeroed suffix is outside the unchanged core admission room.
-                let mut bytes = vec![0; total];
-                let mut at = 0;
-                for (address, len) in sources {
-                    let len = len.min(accepted - at);
-                    memory(bytes[at..].as_mut_ptr(), address as *mut u8, len, false)?;
-                    at += len;
-                    if at == accepted {
-                        break;
-                    }
-                }
-                out.value = self.write_timestamp(id, bytes, flags, override_flags)?;
+                return self.send_once(id, sources, flags, override_flags);
             }
             Op::RxTimestamp(count) => {
                 let Handle::Connection(cid) = s.handle else {
@@ -1651,7 +1643,16 @@ impl Owner {
                     .retain(|(_, listener, _, _, _)| *listener != id);
                 self.pending.retain(|request| {
                     if request.id == id {
-                        let _ = request.reply.send(Err(EBADF));
+                        let result = request.send.as_ref().filter(|s| s.accepted != 0).map_or(
+                            Err(EBADF),
+                            |s| {
+                                Ok(Reply {
+                                    value: s.accepted as i32,
+                                    ..Reply::default()
+                                })
+                            },
+                        );
+                        let _ = request.reply.send(result);
                         false
                     } else {
                         true
@@ -2000,6 +2001,7 @@ impl Owner {
 mod tests {
     use super::*;
     include!("timestamp_tests.rs");
+    include!("large_write_tests.rs");
     fn owner(last: u8) -> Owner {
         let local = Ipv4Addr::new(10, 73, 0, last);
         Owner::with_endpoint(local, (Ipv4Addr::new(10, 73, 0, 1), 24), [last; 32], None).unwrap()
@@ -2373,13 +2375,14 @@ mod tests {
             EINPROGRESS
         );
         let (reply, completed) = mpsc::sync_channel(1);
-        let request = Request {
+        let mut request = Request {
             id: client,
             op: Op::Wait(Box::new(Op::FinishConnect), None),
             reply,
             deadline: None,
+            send: None,
         };
-        assert!(!a.service(&request));
+        assert!(!a.service(&mut request));
         pump(&mut a, &mut b);
         let server = b.execute(listen, Op::Accept(0)).unwrap().value as u64;
         b.execute(server, Op::Shutdown(SHUT_WR)).unwrap();
@@ -2391,7 +2394,7 @@ mod tests {
         assert_eq!(a.execute(client, Op::FinishConnect).unwrap().value, 0);
         // The libc blocking connect retry and owner pending-request service
         // share FinishConnect; neither may keep waiting after the peer's FIN.
-        assert!(a.service(&request));
+        assert!(a.service(&mut request));
         assert_eq!(completed.try_recv().unwrap().unwrap().value, 0);
         assert_eq!(a.execute(client, Op::Read(8)).unwrap().value, 0);
     }
@@ -2718,6 +2721,7 @@ mod tests {
                 op: Op::Ready,
                 reply,
                 deadline: None,
+                send: None,
             })
             .unwrap();
         }

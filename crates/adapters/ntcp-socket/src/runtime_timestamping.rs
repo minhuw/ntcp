@@ -53,6 +53,8 @@ impl Completion {
         }
     }
 }
+pub(super) type Observation = (ntcp::TxTimestampEvent, ClockPair, Options, u32);
+
 #[derive(Clone)]
 struct Pending {
     cookie: u64,
@@ -62,6 +64,7 @@ struct Pending {
     software: bool,
     hardware: bool,
     payload: PacketPayload,
+    observed: Option<Vec<Observation>>,
 }
 #[derive(Clone, Default)]
 pub(super) struct TimestampState {
@@ -75,13 +78,28 @@ impl TimestampState {
     }
     pub(super) fn staging_charge(&self) -> usize {
         self.pending.len() * std::mem::size_of::<Pending>()
+            + self
+                .pending
+                .iter()
+                .map(|p| {
+                    p.observed
+                        .as_ref()
+                        .map_or(0, |v| v.capacity() * std::mem::size_of::<Observation>())
+                })
+                .sum::<usize>()
     }
     fn charge(&self) -> usize {
         self.pending.capacity() * std::mem::size_of::<Pending>()
             + self
                 .pending
                 .iter()
-                .map(|p| p.phases * RECORD + p.payload.charge())
+                .map(|p| {
+                    p.phases * RECORD
+                        + p.payload.charge()
+                        + p.observed
+                            .as_ref()
+                            .map_or(0, |v| v.capacity() * std::mem::size_of::<Observation>())
+                })
                 .sum::<usize>()
     }
 }
@@ -214,6 +232,7 @@ impl Owner {
     // One joint reservation: queued records + every outstanding native phase +
     // this send's phases + a non-coalescing zero-copy record. No completion push
     // may allocate after native acceptance.
+    #[cfg(test)]
     pub(super) fn reserve_completion(
         &mut self,
         id: u64,
@@ -226,6 +245,23 @@ impl Owner {
             .map(|f| s.timestamps.options.per_send(f))
             .transpose()?
             .unwrap_or(s.timestamps.options.flags);
+        self.reserve_send_completion(
+            id,
+            nonempty,
+            s.zerocopy && flags & MSG_ZEROCOPY != 0,
+            bits,
+            false,
+        )
+    }
+    pub(super) fn reserve_send_completion(
+        &mut self,
+        id: u64,
+        nonempty: bool,
+        completion: bool,
+        bits: u32,
+        deferred: bool,
+    ) -> Result<bool> {
+        let s = self.sockets.get(&id).ok_or(EBADF)?;
         if bits & (TX_SOFTWARE | TX_HARDWARE) == TX_SOFTWARE | TX_HARDWARE
             && bits & OPT_TX_SWHW == 0
         {
@@ -235,25 +271,31 @@ impl Owner {
             return Ok(false);
         }
         let phases = (bits & TX_RECORD).count_ones() as usize;
-        let completion = s.zerocopy && flags & MSG_ZEROCOPY != 0;
         if phases == 0 && !completion {
             return Ok(false);
         }
         let new_zc = usize::from(
             completion
-                && !s
-                    .completions
-                    .back()
-                    .and_then(Completion::range)
-                    .is_some_and(|p| extends_completion(p, s.zc_next)),
+                && (deferred
+                    || !s
+                        .completions
+                        .back()
+                        .and_then(Completion::range)
+                        .is_some_and(|p| extends_completion(p, s.zc_next))),
         );
-        let additional = s.timestamps.reserved() + phases + new_zc;
+        let additional = s.timestamps.reserved() + phases + new_zc + s.zc_reserved;
         let total = s.completions.len() + additional;
         let pending_bytes = if phases == 0 {
             0
         } else {
             (s.timestamps.pending.len() + 1) * 2 * std::mem::size_of::<Pending>() + PACKET_HANDLE
         };
+        let pending_bytes = pending_bytes
+            + if deferred && phases != 0 {
+                4 * std::mem::size_of::<Observation>()
+            } else {
+                0
+            };
         let queue_bytes = total * 2 * std::mem::size_of::<Completion>();
         if (phases != 0
             && (self.timestamp_cookie == u64::MAX || s.timestamps.pending.len() >= PHASES))
@@ -279,6 +321,7 @@ impl Owner {
             .map_err(|_| ENOBUFS)?;
         Ok(completion)
     }
+    #[cfg(test)]
     pub(super) fn timestamp_write(
         &mut self,
         id: u64,
@@ -293,6 +336,16 @@ impl Owner {
             .map(|f| options.per_send(f))
             .transpose()?
             .unwrap_or(options.flags);
+        self.timestamp_write_bits(id, cid, bytes, flags, bits)
+    }
+    pub(super) fn timestamp_write_bits(
+        &mut self,
+        id: u64,
+        cid: ConnectionId,
+        bytes: &[u8],
+        flags: i32,
+        bits: u32,
+    ) -> Result<usize> {
         let request = ntcp::TxTimestampRequest {
             cookie: self.timestamp_cookie,
             scheduled: bits & TX_SCHED != 0,
@@ -337,6 +390,7 @@ impl Owner {
                 software: request.software_transmit,
                 hardware: request.hardware_transmit,
                 payload: payload.unwrap(),
+                observed: None,
             });
             self.timestamp_cookie += 1;
         }
@@ -392,68 +446,107 @@ impl Owner {
                 let Ok(Some(event)) = self.endpoint.next_tx_timestamp(cid) else {
                     break;
                 };
-                let Some(index) = s
-                    .timestamps
-                    .pending
-                    .iter()
-                    .position(|p| p.cookie == event.cookie)
-                else {
-                    continue;
-                };
-                let flags = s.timestamps.options.flags;
-                let pending = &s.timestamps.pending[index];
-                let tsonly = flags & OPT_TSONLY != 0;
-                let payload_charge = if tsonly { 0 } else { pending.payload.charge() };
-                let value = match event.outcome {
-                    Outcome::Recorded { value, clock } => pair.convert(value, clock),
-                    Outcome::Cancelled => None,
-                };
-                let charge = s.timestamp_charge();
-                if let Some(value) = value.filter(|_| tsonly || !pending.payload.is_empty())
-                    && charge + payload_charge <= s.receive_capacity
-                    && global + payload_charge <= RUNTIME_BYTES
-                {
-                    let (sw, hw) = match event.source {
-                        Source::Software => (Some(value), None),
-                        Source::Hardware => (None, Some(value)),
-                    };
-                    let stage = match event.stage {
-                        Stage::Scheduled => 1,
-                        Stage::Transmit => 0,
-                        Stage::Acknowledged => 2,
-                    };
-                    s.completions.push_back(Completion::Timestamp {
-                        stamp: timestamps(sw, hw),
-                        error: extended_error(
-                            stage,
-                            s.timestamps
-                                .options
-                                .completion_id(pending.sequence, s.timestamps.base),
-                        ),
-                        payload: if tsonly {
-                            PacketPayload::default()
-                        } else {
-                            pending.payload.clone()
-                        },
-                    });
-                    global += payload_charge;
-                    s.readiness_generations[2] = s.readiness_generations[2].wrapping_add(1);
-                } else {
-                    global = global.saturating_sub(RECORD);
-                }
-                let pending = &mut s.timestamps.pending[index];
-                if event.stage == Stage::Transmit {
-                    match event.source {
-                        Source::Software => pending.software = false,
-                        Source::Hardware => pending.hardware = false,
-                    }
-                }
-                pending.phases -= 1;
-                if pending.phases == 0 {
-                    global = global.saturating_sub(pending.payload.charge());
-                    s.timestamps.pending.swap_remove(index);
-                }
+                Self::timestamp_event(s, event, pair, None, &mut global);
             }
+        }
+    }
+    fn timestamp_event(
+        s: &mut Socket,
+        event: ntcp::TxTimestampEvent,
+        pair: ClockPair,
+        options: Option<(Options, u32)>,
+        global: &mut usize,
+    ) {
+        let Some(index) = s
+            .timestamps
+            .pending
+            .iter()
+            .position(|p| p.cookie == event.cookie)
+        else {
+            return;
+        };
+        let pending = &mut s.timestamps.pending[index];
+        if event.stage == Stage::Transmit {
+            match event.source {
+                Source::Software => pending.software = false,
+                Source::Hardware => pending.hardware = false,
+            }
+        }
+        if let Some(observed) = &mut pending.observed {
+            debug_assert!(observed.len() < 4);
+            observed.push((event, pair, s.timestamps.options, s.timestamps.base));
+            return;
+        }
+        let (options, base) = options.unwrap_or((s.timestamps.options, s.timestamps.base));
+        let flags = options.flags;
+        let pending = &s.timestamps.pending[index];
+        let tsonly = flags & OPT_TSONLY != 0;
+        let payload_charge = if tsonly { 0 } else { pending.payload.charge() };
+        let value = match event.outcome {
+            Outcome::Recorded { value, clock } => pair.convert(value, clock),
+            Outcome::Cancelled => None,
+        };
+        let charge = s.timestamp_charge();
+        if let Some(value) = value.filter(|_| tsonly || !pending.payload.is_empty())
+            && charge + payload_charge <= s.receive_capacity
+            && *global + payload_charge <= RUNTIME_BYTES
+        {
+            let (sw, hw) = match event.source {
+                Source::Software => (Some(value), None),
+                Source::Hardware => (None, Some(value)),
+            };
+            let stage = match event.stage {
+                Stage::Scheduled => 1,
+                Stage::Transmit => 0,
+                Stage::Acknowledged => 2,
+            };
+            s.completions.push_back(Completion::Timestamp {
+                stamp: timestamps(sw, hw),
+                error: extended_error(stage, options.completion_id(pending.sequence, base)),
+                payload: if tsonly {
+                    PacketPayload::default()
+                } else {
+                    pending.payload.clone()
+                },
+            });
+            *global += payload_charge;
+            s.readiness_generations[2] = s.readiness_generations[2].wrapping_add(1);
+        } else {
+            *global = global.saturating_sub(RECORD);
+        }
+        let pending = &mut s.timestamps.pending[index];
+        pending.phases -= 1;
+        if pending.phases == 0 {
+            *global = global.saturating_sub(pending.payload.charge());
+            s.timestamps.pending.swap_remove(index);
+        }
+    }
+    pub(super) fn defer_timestamp(&mut self, id: u64, cookie: u64, observed: Vec<Observation>) {
+        if let Some(p) = self
+            .sockets
+            .get_mut(&id)
+            .and_then(|s| s.timestamps.pending.iter_mut().find(|p| p.cookie == cookie))
+        {
+            p.observed = Some(observed);
+        }
+    }
+    pub(super) fn discard_timestamp(&mut self, id: u64, cid: ConnectionId, cookie: u64) {
+        let _ = self.endpoint.discard_tx_timestamp_request(cid, cookie);
+        if let Some(s) = self.sockets.get_mut(&id) {
+            s.timestamps.pending.retain(|p| p.cookie != cookie);
+        }
+    }
+    pub(super) fn finish_timestamp(&mut self, id: u64, cookie: u64) {
+        let mut global = self.timestamp_charge();
+        let Some(s) = self.sockets.get_mut(&id) else {
+            return;
+        };
+        let Some(p) = s.timestamps.pending.iter_mut().find(|p| p.cookie == cookie) else {
+            return;
+        };
+        let observed = p.observed.take().unwrap_or_default();
+        for (event, pair, options, base) in observed {
+            Self::timestamp_event(s, event, pair, Some((options, base)), &mut global);
         }
     }
     pub(super) fn software_transmitted(
