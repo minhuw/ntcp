@@ -108,10 +108,18 @@ impl SendBuffer {
 
     // Seal every logical chunk touched by successful wire output. This also
     // survives partial ACKs that remove its start and all transmitted bytes.
-    pub(crate) fn mark_transmitted(&mut self, offset: usize, count: usize) {
-        if count == 0 || offset >= self.len() {
-            return;
-        }
+    // Return the number of bytes visited by sealing (zero for an already sealed range).
+    pub(crate) fn mark_transmitted(&mut self, offset: usize, count: usize) -> usize {
+        let mut unsealed = self.data.iter().skip(offset).take(count);
+        let Some(first) = unsealed.position(|byte| byte.1 & 8 == 0) else {
+            return 0;
+        };
+        let offset = offset + first;
+        let count = unsealed
+            .rposition(|byte| byte.1 & 8 == 0)
+            .map_or(1, |n| n + 2);
+        // Every byte of a touched chunk is sealed, including after partial ACKs
+        // remove its start. Trim sealed edges before searching chunk boundaries.
         let start = self
             .data
             .iter()
@@ -128,6 +136,7 @@ impl SendBuffer {
         for byte in self.data.iter_mut().skip(start).take(end - start) {
             byte.1 |= 8;
         }
+        end - start
     }
 
     pub(crate) fn mark_push(&mut self) {
@@ -1965,6 +1974,41 @@ mod tests {
         assert_eq!(send.copy(0, &mut bytes), 5);
         assert_eq!(&bytes[..5], b"defij");
     }
+    #[test]
+    fn transmission_sealing_skips_sealed_ranges_after_ack_and_truncate() {
+        let mut send = SendBuffer::new(65536).unwrap();
+        send.write(&[1; 20000]); // Unlimited writes still need LOWAT metadata.
+        assert_eq!(send.mark_transmitted(1000, 1000), 16384);
+        assert_eq!(send.mark_transmitted(0, 10000), 0);
+        send.acknowledge(2000).unwrap(); // Remove the start and transmitted bytes.
+        let mut send = send.resized(131072).unwrap();
+        send.truncate(15000); // Keep a sealed head and an unsealed tail chunk.
+        assert_eq!(send.mark_transmitted(0, 1000), 0);
+        assert_eq!(send.mark_transmitted(14000, 1000), 616);
+        assert!(send.data.iter().all(|byte| byte.1 & 8 != 0));
+        send.truncate(14500);
+        assert_eq!(send.admission_room(send.len(), Some(1)), 0);
+        assert_eq!(send.mark_transmitted(14000, 500), 0);
+        send.write(&[2; 100]); // Sealed tail forces a fresh chunk.
+        send.mark_end_of_record();
+        send.write(&[3; 100]);
+        assert_eq!(send.mark_transmitted(14550, 100), 200);
+        assert_eq!(send.mark_transmitted(14500, 200), 0);
+        send.truncate(0);
+        send.write(&[4; 100]);
+        send.truncate(50); // An unsealed tail must still be extensible.
+        send.write(&[5; 50]);
+        assert_eq!(send.mark_transmitted(99, 1), 100);
+        assert_eq!(send.mark_transmitted(0, 0), 0);
+        assert_eq!(send.mark_transmitted(send.len(), 1), 0);
+        assert_eq!(send.mark_transmitted(usize::MAX, 1), 0);
+        send.truncate(0);
+        send.write(&[6; 20000]);
+        assert_eq!(send.mark_transmitted(19000, 1), 3616);
+        assert_eq!(send.mark_transmitted(16000, 4000), 16384); // Sealed suffix.
+        assert!(send.data.iter().all(|byte| byte.1 & 8 != 0));
+    }
+
     #[test]
     fn lowat_chunk_metadata_stays_bounded_across_resize_discard_and_ack() {
         for capacity in [1, 6, 16384, 32768, 65536] {
