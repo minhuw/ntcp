@@ -162,6 +162,12 @@ impl SendBuffer {
         }
     }
 
+    pub(crate) fn finish_send(&mut self, offset: usize, push: bool, end_of_record: bool) {
+        if let Some(byte) = self.data.get_mut(offset) {
+            byte.1 |= u8::from(push) | (u8::from(end_of_record) << 1);
+        }
+    }
+
     pub(crate) fn mark_end_of_record(&mut self) {
         if let Some(last) = self.data.back_mut() {
             last.1 |= 2;

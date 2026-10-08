@@ -1964,6 +1964,37 @@ impl Endpoint {
         Ok(self.slot_mut(id)?.connection.tx_timestamps.next())
     }
 
+    // Caller-owned unique cookie: forget a superseded tentative target, including
+    // recorded phases. Unlike cancellation, this does not publish events.
+    pub fn discard_tx_timestamp_request(
+        &mut self,
+        id: ConnectionId,
+        cookie: u64,
+    ) -> Result<(), EndpointError> {
+        self.slot_mut(id)?
+            .connection
+            .tx_timestamps
+            .discard_request(cookie);
+        Ok(())
+    }
+
+    // Finalize an accepted stream prefix without writing or discarding bytes.
+    // force releases queued output even under MORE/CORK, not future writes.
+    pub fn finish_send(
+        &mut self,
+        id: ConnectionId,
+        end: u64,
+        more: bool,
+        end_of_record: bool,
+        force: bool,
+    ) -> Result<(), EndpointError> {
+        self.slot_mut(id)?
+            .connection
+            .finish_send(end, more, end_of_record, force);
+        self.refresh(id.slot);
+        Ok(())
+    }
+
     pub fn cancel_tx_timestamps(&mut self, id: ConnectionId) -> Result<(), EndpointError> {
         self.slot_mut(id)?.connection.tx_timestamps.cancel_from(0);
         Ok(())
@@ -2990,6 +3021,41 @@ mod recovery_observation_tests {
             .unwrap();
         assert_eq!(a.transport_info(evicted).unwrap().cwnd, 10_000);
     }
+    #[test]
+    fn logical_timestamp_discard_releases_only_selected_cookie() {
+        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
+        let id = endpoint
+            .connect(
+                0,
+                "192.0.2.1:40000".parse().unwrap(),
+                "192.0.2.2:8080".parse().unwrap(),
+            )
+            .unwrap();
+        endpoint.set_tx_timestamp_capacity(id, 2).unwrap();
+        for cookie in [1, 2] {
+            endpoint
+                .write_with_timestamp(
+                    id,
+                    b"x",
+                    true,
+                    false,
+                    None,
+                    TxTimestampRequest {
+                        cookie,
+                        acknowledged: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        endpoint.cancel_tx_timestamps(id).unwrap(); // Ready events are discarded too.
+        endpoint.discard_tx_timestamp_request(id, 1).unwrap();
+        assert_eq!(endpoint.next_tx_timestamp(id).unwrap().unwrap().cookie, 2);
+        assert_eq!(endpoint.next_tx_timestamp(id).unwrap(), None);
+        endpoint.set_tx_timestamp_capacity(id, 0).unwrap();
+        assert_eq!(endpoint.send_progress(id).unwrap().queued_end, 2);
+    }
+
     #[test]
     fn targeted_tx_cancel_preserves_other_phases_ranges_events_and_generation() {
         use crate::{TxStreamRange, TxTimestampOutcome as Outcome, TxTimestampRequest};

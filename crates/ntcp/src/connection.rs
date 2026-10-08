@@ -2969,6 +2969,24 @@ impl Connection {
         self.arm_work();
     }
 
+    pub(crate) fn finish_send(&mut self, end: u64, more: bool, end_of_record: bool, force: bool) {
+        if let Some(offset) = end
+            .checked_sub(self.acknowledged)
+            .and_then(|n| n.checked_sub(1))
+            && let Ok(offset) = usize::try_from(offset)
+        {
+            self.send.finish_send(offset, !more, end_of_record);
+        }
+        if end == self.acknowledged + self.send.len() as u64 {
+            self.more = more;
+        }
+        if force {
+            self.send_backpressured |= self.send.remaining() == 0;
+            self.release_corked();
+        }
+        self.arm_work();
+    }
+
     fn release_corked(&mut self) {
         if self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize {
             self.cork_flush = Some(self.send_base.wrapping_add(self.send.len() as u32));
@@ -26585,6 +26603,27 @@ mod tests {
     mod output_policy {
         include!("connection_output_tests.rs");
     }
+    #[test]
+    fn logical_send_finish_marks_only_selected_byte_and_releases_cork() {
+        let (mut a, _) = pair(config(32, 4), 100);
+        a.set_cork(true);
+        a.write_with_options(b"abcdef", true, false).unwrap();
+        let end = a.acknowledged + 6;
+        a.write_with_options(b"gh", true, false).unwrap();
+        a.finish_send(end, false, true, false);
+        assert_eq!(a.send.record_len(0, 8), 6);
+        assert!(a.send.pushed(5, 1));
+        assert!(!a.send.pushed(6, 2));
+        assert!(a.more); // A later write owns the current MORE state.
+        a.finish_send(end, true, false, true);
+        assert!(a.cork_flush.is_some());
+        a.send.acknowledge(6).unwrap();
+        a.acknowledged += 6;
+        a.finish_send(end, false, true, false);
+        assert_eq!(a.send.record_len(0, 2), 2);
+        assert!(!a.send.pushed(0, 2));
+    }
+
     #[test]
     fn tx_timestamp_partial_coalesced_segmented_output_failure_and_ack_crossing() {
         use crate::{TxTimestampOutcome, TxTimestampSource::Software, TxTimestampStage::*};

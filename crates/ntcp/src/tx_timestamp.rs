@@ -209,6 +209,10 @@ impl TxTimestamps {
         }
     }
 
+    pub(crate) fn discard_request(&mut self, cookie: u64) {
+        self.records.retain(|record| record.event.cookie != cookie);
+    }
+
     pub(crate) fn next(&mut self) -> Option<TxTimestampEvent> {
         let index = self.records.iter().position(|record| record.ready)?;
         Some(self.records.remove(index).event)
