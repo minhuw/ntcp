@@ -1524,16 +1524,14 @@ mod tests {
                 .value,
             2304
         );
-        let other = a
-            .endpoint
-            .connect(
+        a.endpoint
+            .connect_with_buffer_capacities(
                 a.now(),
                 "10.73.0.2:25000".parse().unwrap(),
                 "10.73.0.3:25000".parse().unwrap(),
+                2 * BUFFER_REQUEST_CAP as usize,
+                BYTES,
             )
-            .unwrap();
-        a.endpoint
-            .set_buffer_capacities(other, 2 * BUFFER_REQUEST_CAP as usize, BYTES)
             .unwrap();
         let old = a
             .execute(client, Op::Get(SOL_SOCKET, SO_SNDBUF))

@@ -971,8 +971,9 @@ impl Endpoint {
         Connection::validate_buffer_capacities(send, receive)?;
         let connection = &self.slot(id)?.connection;
         let old = connection.buffer_charge();
+        // This charge includes the original buffers plus all staged replacements.
         let charge = connection
-            .resize_charge(send, receive)
+            .resize_peak_charge(send, receive)
             .ok_or(EndpointError::LimitReached)?;
         if charge
             > self
@@ -2285,6 +2286,56 @@ mod recovery_observation_tests {
                 (first_isn, next_isn, syn, reset)
             };
             assert_eq!(trace(1), trace(1000));
+        }
+    }
+
+    #[test]
+    fn buffer_resize_admission_accounts_for_staged_peak() {
+        for (send, receive) in [(2048, 1), (1024, 2048), (2048, 2048)] {
+            let config = EndpointConfig {
+                preallocate_connections: 0,
+                max_buffer_bytes: Connection::allocation_bytes(send, receive, 64).unwrap(),
+                connection: ConnectionConfig {
+                    send_capacity: 1024,
+                    receive_capacity: 1,
+                    mss: 64,
+                    ..ConnectionConfig::default()
+                },
+                ..EndpointConfig::default()
+            };
+            let mut endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
+            let id = endpoint
+                .connect(
+                    0,
+                    "192.0.2.1:40000".parse().unwrap(),
+                    "192.0.2.2:8080".parse().unwrap(),
+                )
+                .unwrap();
+            let old = endpoint.buffer_bytes();
+            // The final replacement fits, but its staging alongside originals does not.
+            assert_eq!(
+                endpoint.set_buffer_capacities(id, send, receive),
+                Err(EndpointError::LimitReached)
+            );
+            assert_eq!(endpoint.buffer_capacities(id).unwrap(), (1024, 1));
+            assert_eq!(endpoint.buffer_bytes(), old);
+            let peak = endpoint
+                .slot(id)
+                .unwrap()
+                .connection
+                .resize_peak_charge(send, receive)
+                .unwrap();
+            endpoint.config.max_buffer_bytes = peak;
+            endpoint.set_buffer_capacities(id, send, receive).unwrap();
+            assert_eq!(endpoint.buffer_capacities(id).unwrap(), (send, receive));
+            assert_eq!(
+                endpoint.buffer_bytes(),
+                endpoint.slot(id).unwrap().connection.buffer_charge()
+            );
+            assert!(endpoint.buffer_bytes() < peak);
+            endpoint.config.max_buffer_bytes = endpoint.buffer_bytes();
+            endpoint.set_buffer_capacities(id, 1, 1).unwrap();
+            assert_eq!(endpoint.buffer_bytes(), endpoint.config.max_buffer_bytes);
         }
     }
 

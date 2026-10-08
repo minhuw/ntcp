@@ -629,9 +629,9 @@ impl Connection {
             .try_reserve_exact(config.mss as usize)
             .map_err(|_| Error::NoMemory)?;
         scratch.resize(config.mss as usize, 0);
-        // Scope: Capacity-derived exponent is fixed at construction; maximum negotiated true window bounded by receive allocation.
+        // Scope: Capacity-derived exponent is frozen after first successful SYN output; maximum negotiated true window bounded by receive allocation.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-2.1
-        //= reason=Capacity-derived exponent is fixed at construction; maximum negotiated true window bounded by receive allocation.
+        //= reason=Capacity-derived exponent is frozen after first successful SYN output; maximum negotiated true window bounded by receive allocation.
         //# The maximum receive window, and therefore the scale factor, is
         //# determined by the maximum receive buffer space.
         let local_scale = (0..=14)
@@ -883,12 +883,20 @@ impl Connection {
         )
     }
 
-    pub(crate) fn resize_charge(&self, send: usize, receive: usize) -> Option<usize> {
-        Self::allocation_bytes(
-            send.max(self.send.allocation_capacity()),
-            receive.max(self.receive.capacity()),
-            self.scratch.capacity(),
-        )
+    pub(crate) fn resize_peak_charge(&self, send: usize, receive: usize) -> Option<usize> {
+        let sender = if send > self.send.allocation_capacity() {
+            Self::allocation_bytes(send, 0, 0)?
+        } else {
+            0
+        };
+        let receiver = if receive > self.receive.capacity() {
+            receive.checked_mul(3)?
+        } else {
+            0
+        };
+        self.buffer_charge()
+            .checked_add(sender)?
+            .checked_add(receiver)
     }
 
     pub(crate) fn buffer_capacities(&self) -> (usize, usize) {
@@ -902,6 +910,13 @@ impl Connection {
         max_charge: usize,
     ) -> Result<(), Error> {
         Self::validate_buffer_capacities(send, receive)?;
+        // Originals remain live until every replacement has been staged.
+        if self
+            .resize_peak_charge(send, receive)
+            .is_none_or(|peak| peak > max_charge)
+        {
+            return Err(Error::NoMemory);
+        }
         let old_window = self.advertised_window(false);
         let grow_send = send > self.send.allocation_capacity();
         // Stage every allocation before changing any quota or live protocol state.
@@ -919,6 +934,17 @@ impl Connection {
         } else {
             None
         };
+        let staged_bytes = sender.as_ref().map_or(0, |(send, scoreboard, rack)| {
+            send.storage_bytes() + scoreboard.storage_bytes() + rack.allocation_bytes()
+        }) + receiver.as_ref().map_or(0, ReceiveBuffer::storage_bytes);
+        if self
+            .buffer_charge()
+            .checked_add(staged_bytes)
+            .is_none_or(|peak| peak > max_charge)
+        {
+            return Err(Error::NoMemory);
+        }
+        // The final retained charge is distinct from the transient peak.
         let (staged_send, staged_scoreboard, staged_rack) = sender.as_ref().map_or(
             (&self.send, &self.scoreboard, &self.rack),
             |(send, scoreboard, rack)| (send, scoreboard, rack),
@@ -944,6 +970,20 @@ impl Connection {
         self.send.set_limit(send);
         self.config.send_capacity = send;
         self.config.receive_capacity = receive;
+        if self.handshake_pending() && self.snd_nxt == self.iss {
+            // No local SYN has reached the wire, including after failed output.
+            self.local_scale = (0..=14)
+                .find(|&shift| receive <= (65535usize << shift))
+                .unwrap_or(14);
+            self.syn_window = if self.receive.eof() {
+                0
+            } else {
+                receive.min(65535).saturating_sub(self.receive_used) as u16
+            };
+            if self.irs.is_some() {
+                self.advertised_edge = self.receive.next().wrapping_add(self.syn_window as u32);
+            }
+        }
         // ponytail: retain backing on shrink until reclamation; compaction can
         // reclaim slack later, but must preserve queued bytes and promised edges.
         self.events.writable = !self.shutdown
@@ -7739,6 +7779,142 @@ mod tests {
         assert!(a.take_events().connected);
         assert!(b.take_events().connected);
         (a, b)
+    }
+
+    #[test]
+    fn resize_peak_is_checked_before_allocation_and_leaves_syn_offer_unchanged() {
+        let cfg = ConnectionConfig {
+            send_capacity: 1024,
+            receive_capacity: 1,
+            mss: 64,
+            ..ConnectionConfig::default()
+        };
+        let mut connection = Connection::active(tuple(), cfg, 100, 0).unwrap();
+        let max_charge = Connection::allocation_bytes(2048, 1, 64).unwrap();
+        let (result, allocation_failed) = crate::allocation_tests::fail_after(0, || {
+            let result = connection.set_buffer_capacities(2048, 1, max_charge);
+            // The failure injection remains armed: admission made no allocation.
+            (result, SendBuffer::new(1).is_err())
+        });
+        assert_eq!(result, Err(Error::NoMemory));
+        assert!(allocation_failed);
+        assert_eq!(connection.buffer_capacities(), (1024, 1));
+        assert_eq!(connection.syn_window, 1);
+        assert_eq!(connection.local_scale, 0);
+        for allocation in 0..3 {
+            assert_eq!(
+                crate::allocation_tests::fail_after(allocation, || {
+                    connection.set_buffer_capacities(1024, 262144, usize::MAX)
+                }),
+                Err(Error::NoMemory)
+            );
+            assert_eq!(connection.buffer_capacities(), (1024, 1));
+            assert_eq!(connection.syn_window, 1);
+            assert_eq!(connection.local_scale, 0);
+        }
+    }
+
+    #[test]
+    fn resize_before_first_syn_updates_offer_but_successful_output_freezes_it() {
+        for passive in [false, true] {
+            for failed_output in [false, true] {
+                for (receive, window, scale) in [(32, 32, 0), (262144, 65535, 3)] {
+                    let cfg = ConnectionConfig {
+                        send_capacity: 1024,
+                        receive_capacity: 1024,
+                        mss: 64,
+                        ..ConnectionConfig::default()
+                    };
+                    let mut peer =
+                        Connection::active(reverse(tuple()), cfg.clone(), 900, 0).unwrap();
+                    let bytes = packet(&mut peer, 0);
+                    let syn = wire::parse(ip(peer.tuple()), &bytes).unwrap();
+                    let mut connection = if passive {
+                        Connection::passive(tuple(), cfg, 100, 0, &syn).unwrap()
+                    } else {
+                        Connection::active(tuple(), cfg, 100, 0).unwrap()
+                    };
+                    if failed_output {
+                        connection
+                            .set_buffer_capacities(1024, 131072, usize::MAX)
+                            .unwrap();
+                        assert_eq!(connection.transmit(0, &mut []), Err(Error::OutputTooSmall));
+                        assert_eq!(connection.snd_nxt, connection.iss);
+                    }
+                    connection
+                        .set_buffer_capacities(1024, receive, usize::MAX)
+                        .unwrap();
+                    let bytes = packet(&mut connection, 0);
+                    let offer = wire::parse(ip(connection.tuple()), &bytes).unwrap();
+                    assert_eq!(offer.header.window, window);
+                    assert_eq!(offer.options.window_scale, Some(scale));
+                    let edge = connection.advertised_edge;
+                    connection
+                        .set_buffer_capacities(1024, 16, usize::MAX)
+                        .unwrap();
+                    connection
+                        .set_buffer_capacities(1024, 524288, usize::MAX)
+                        .unwrap();
+                    assert_eq!(connection.advertised_edge, edge);
+                    assert_eq!(connection.local_scale, scale);
+                    connection
+                        .timeout(connection.rto_deadline.unwrap())
+                        .unwrap();
+                    let now = connection.now;
+                    let bytes = packet(&mut connection, now);
+                    let retry = wire::parse(ip(connection.tuple()), &bytes).unwrap();
+                    assert_eq!(retry.header.window, window);
+                    assert_eq!(retry.options.window_scale, Some(scale));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pre_syn_resize_preserves_accepted_handshake_payload() {
+        for fin in [false, true] {
+            let cfg = ConnectionConfig {
+                send_capacity: 1024,
+                receive_capacity: 1024,
+                mss: 64,
+                ..ConnectionConfig::default()
+            };
+            let mut peer = Connection::active(reverse(tuple()), cfg.clone(), 900, 0).unwrap();
+            let bytes = packet(&mut peer, 0);
+            let mut syn = wire::parse(ip(peer.tuple()), &bytes).unwrap();
+            syn.payload = b"accepted handshake payload";
+            if fin {
+                syn.header.flags |= FIN;
+            }
+            let mut connection = Connection::passive(tuple(), cfg, 100, 0, &syn).unwrap();
+            let next = connection.receive.next();
+            for receive in [8, 32, 262144] {
+                connection
+                    .set_buffer_capacities(1024, receive, usize::MAX)
+                    .unwrap();
+                assert_eq!(connection.receive.next(), next);
+                assert_eq!(connection.receive_used, syn.payload.len());
+                assert_eq!(
+                    connection.syn_window as usize,
+                    if fin {
+                        0
+                    } else {
+                        receive.min(65535).saturating_sub(syn.payload.len())
+                    }
+                );
+            }
+            let bytes = packet(&mut connection, 0);
+            let offer = wire::parse(ip(connection.tuple()), &bytes).unwrap();
+            assert_eq!(
+                offer.header.window as usize,
+                if fin { 0 } else { 65535 - syn.payload.len() }
+            );
+            assert_eq!(offer.options.window_scale, Some(3));
+            inject(&mut connection, 10, next, Seq(101), ACK, 1024, b"");
+            let mut payload = [0; 64];
+            assert_eq!(connection.read(&mut payload), Ok(syn.payload.len()));
+            assert_eq!(&payload[..syn.payload.len()], syn.payload);
+        }
     }
 
     #[test]
@@ -17398,10 +17574,10 @@ mod tests {
     //# The scale factor applies only to the window field as transmitted in
     //# the TCP header; each TCP using extended windows will maintain the
     //# window values locally as 32-bit numbers.
-    // Scope: Capacity-derived exponent is fixed at construction; maximum negotiated true window bounded by receive allocation.
+    // Scope: Capacity-derived exponent is frozen after first successful SYN output; maximum negotiated true window bounded by receive allocation.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-2.1
     //= type=test
-    //= reason=Capacity-derived exponent is fixed at construction; maximum negotiated true window bounded by receive allocation.
+    //= reason=Capacity-derived exponent is frozen after first successful SYN output; maximum negotiated true window bounded by receive allocation.
     //# The maximum receive window, and therefore the scale factor, is
     //# determined by the maximum receive buffer space.
     fn window_scaling_is_negotiated_but_syn_windows_are_unscaled() {
