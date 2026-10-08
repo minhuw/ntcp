@@ -29,6 +29,7 @@ macro_rules! boundary_entry {
     };
 }
 
+mod file_transfer;
 #[cfg(feature = "packet-test")]
 pub mod packet_profile;
 #[cfg(feature = "packet-test")]
@@ -439,6 +440,22 @@ fn read_into_locked(
     deadline: &Deadline,
     output: impl FnOnce(&[u8]) -> Result<()>,
 ) -> Result<i64> {
+    read_prefix_locked(input, bytes, id, n, flags, deadline, |bytes| {
+        output(bytes)?;
+        Ok(bytes.len())
+    })
+}
+// Pipe submission may accept a prefix. Keep the rest staged and in core until
+// that exact prefix has been submitted; caller holds the shared OFD reader lock.
+fn read_prefix_locked(
+    input: &Input,
+    bytes: &mut Vec<u8>,
+    id: u64,
+    n: usize,
+    flags: i32,
+    deadline: &Deadline,
+    output: impl FnOnce(&[u8]) -> Result<usize>,
+) -> Result<i64> {
     if n == 0 {
         call(id, Op::Read(0))?;
         output(&[])?;
@@ -461,8 +478,7 @@ fn read_into_locked(
             EPOLLIN,
             deadline,
         )?;
-        output(&reply.bytes)?;
-        return Ok(reply.bytes.len() as i64);
+        return Ok(output(&reply.bytes)? as i64);
     }
     if bytes.is_empty() {
         *bytes = retry_until(
@@ -477,7 +493,11 @@ fn read_into_locked(
         input.ready.store(bytes.len(), Ordering::Release);
     }
     let n = n.min(bytes.len());
-    output(&bytes[..n])?;
+    let submitted = output(&bytes[..n])?;
+    if submitted > n {
+        return Err(EIO);
+    }
+    let n = submitted;
     if flags & MSG_PEEK == 0 {
         let pending = input.pending.load(Ordering::Acquire);
         if pending != 0 {
@@ -1576,7 +1596,16 @@ pub unsafe extern "C" fn ntcp_managed_setsockopt(
         if level == SOL_SOCKET && matches!(name, 37 | 65) && len == 8 {
             let _ = load(p.cast::<[i32; 2]>())?; // Linux copies all of so_timestamping, even without BIND_PHC.
         }
-        let value = if level == IPPROTO_IP && matches!(name, IP_TOS | IP_MTU_DISCOVER) {
+        let value = if level == IPPROTO_IP && name == IP_FREEBIND {
+            if len == 0 {
+                return Err(EINVAL);
+            }
+            if len < 4 {
+                load(p.cast::<u8>())? as i32
+            } else {
+                load(p.cast::<i32>())?
+            }
+        } else if level == IPPROTO_IP && matches!(name, IP_TOS | IP_MTU_DISCOVER) {
             if len == 1 {
                 load(p.cast::<u8>())? as i32
             } else if len == 4 {

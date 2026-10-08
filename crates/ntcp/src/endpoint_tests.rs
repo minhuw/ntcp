@@ -5359,3 +5359,41 @@ fn listener_rx_timestamp_does_not_override_simultaneous_active_open() {
     assert_eq!(a.rx_timestamp_status(client_a).unwrap().capacity, 1);
     assert_eq!(b.rx_timestamp_status(client_b).unwrap().capacity, 0);
 }
+
+#[test]
+fn checked_external_write_admission_covers_bytes_phases_and_shutdown() {
+    let (mut a, mut b, listener, client) = endpoints();
+    pump(&mut a, &mut b, 0);
+    b.accept(listener).unwrap();
+    let request = TxTimestampRequest {
+        cookie: 1,
+        scheduled: true,
+        software_transmit: true,
+        hardware_transmit: false,
+        acknowledged: true,
+    };
+    assert_eq!(
+        a.check_write_admission(client, None, request),
+        Err(EndpointError::Connection(Error::WouldBlock))
+    );
+    a.set_tx_timestamp_capacity(client, 3).unwrap();
+    a.set_buffer_capacities(client, 32, 32).unwrap();
+    let charged = a.buffer_bytes();
+    crate::allocation_tests::fail_after(0, || {
+        assert_eq!(a.check_write_admission(client, None, request), Ok(32));
+        assert_eq!(
+            a.write_with_timestamp(client, &[1; 32], false, false, None, request),
+            Ok(32)
+        );
+    });
+    assert_eq!(a.buffer_bytes(), charged);
+    assert_eq!(
+        a.check_write_admission(client, None, request),
+        Err(EndpointError::Connection(Error::WouldBlock))
+    );
+    a.shutdown(client).unwrap();
+    assert_eq!(
+        a.check_write_admission(client, None, request),
+        Err(EndpointError::Connection(Error::InvalidState))
+    );
+}

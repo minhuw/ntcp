@@ -1886,6 +1886,20 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Check byte and timestamp admission before consuming an external source.
+    /// The caller must not mutate the endpoint between this check and its write.
+    pub fn check_write_admission(
+        &self,
+        id: ConnectionId,
+        lowat: Option<u32>,
+        request: TxTimestampRequest,
+    ) -> Result<usize, EndpointError> {
+        Ok(self
+            .slot(id)?
+            .connection
+            .check_write_admission(lowat, request)?)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn write_with_timestamp(
         &mut self,

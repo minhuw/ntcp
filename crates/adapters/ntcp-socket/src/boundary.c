@@ -11,6 +11,8 @@
 #include <sys/epoll.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/sendfile.h>
+#include <fcntl.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <poll.h>
@@ -88,10 +90,19 @@ static int (*_Atomic real___poll_chk)(struct pollfd *p, nfds_t n, int timeout, s
 extern int ntcp_managed___ppoll_chk(struct pollfd *p, nfds_t n, const struct timespec *t, const sigset_t *mask, size_t size);
 static int (*_Atomic real___ppoll_chk)(struct pollfd *p, nfds_t n, const struct timespec *t, const sigset_t *mask, size_t size);
 
+extern ssize_t ntcp_managed_sendfile(int, int, off_t *, size_t);
+extern ssize_t ntcp_managed_splice(int, loff_t *, int, loff_t *, size_t, unsigned int);
+static ssize_t (*_Atomic real_sendfile)(int, int, off_t *, size_t);
+static ssize_t (*_Atomic real_sendfile64)(int, int, off64_t *, size_t);
+static ssize_t (*_Atomic real_splice)(int, loff_t *, int, loff_t *, size_t, unsigned int);
+
 static _Atomic int initialized;
 static _Thread_local int resolving;
 __attribute__((constructor)) static void resolve_boundary(void) {
     resolving = 1;
+    real_sendfile = dlsym(RTLD_NEXT, "sendfile");
+    real_sendfile64 = dlsym(RTLD_NEXT, "sendfile64");
+    real_splice = dlsym(RTLD_NEXT, "splice");
     real_socket = dlsym(RTLD_NEXT, "socket");
     real_read = dlsym(RTLD_NEXT, "read");
     real_write = dlsym(RTLD_NEXT, "write");
@@ -442,4 +453,26 @@ extern int ntcp_packet_managed_socket(int, int, int);
 int ntcp_c_packet_socket(int domain, int kind, int protocol) {
     if (!ntcp_packet_managed_socket) { errno = ENOSYS; return -1; }
     return NTCP_RUST_CALL(int, ntcp_packet_managed_socket(domain,kind,protocol));
+}
+
+ssize_t ntcp_c_sendfile(int out, int in, off_t *offset, size_t n) {
+    ensure_boundary();
+    if (internal || !real_sendfile) return syscall(SYS_sendfile,out,in,offset,n);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(out))) && !(NTCP_RUST_CALL(int, ntcp_boundary_fd(in))))
+        return real_sendfile(out,in,offset,n);
+    MANAGED(ssize_t, sendfile, (out,in,offset,n));
+}
+ssize_t ntcp_c_sendfile64(int out, int in, off64_t *offset, size_t n) {
+    ensure_boundary();
+    if (internal || !real_sendfile64) return syscall(SYS_sendfile,out,in,offset,n);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(out))) && !(NTCP_RUST_CALL(int, ntcp_boundary_fd(in))))
+        return real_sendfile64(out,in,offset,n);
+    MANAGED(ssize_t, sendfile, (out,in,(off_t *)offset,n));
+}
+ssize_t ntcp_c_splice(int in, loff_t *inoff, int out, loff_t *outoff, size_t n, unsigned int flags) {
+    ensure_boundary();
+    if (internal || !real_splice) return syscall(SYS_splice,in,inoff,out,outoff,n,flags);
+    if (!(NTCP_RUST_CALL(int, ntcp_boundary_fd(in))) && !(NTCP_RUST_CALL(int, ntcp_boundary_fd(out))))
+        return real_splice(in,inoff,out,outoff,n,flags);
+    MANAGED(ssize_t, splice, (in,inoff,out,outoff,n,flags));
 }

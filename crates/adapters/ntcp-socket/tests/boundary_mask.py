@@ -88,6 +88,9 @@ static void *worker(void *p) {
     case 7: ntcp_variadic_ioctl(-1, FIOCLEX); break;
     case 8: ntcp_c_fdopen(-1, "r"); break;
     case 9: assert(ntcp_c_epoll_pwait2(-1, &event, 1, &zero, NULL) == 17); break;
+    case 10: ntcp_c_sendfile(-1, -1, NULL, 1); break;
+    case 11: ntcp_c_sendfile64(-1, -1, NULL, 1); break;
+    case 12: ntcp_c_splice(-1, NULL, -1, NULL, 1, 0); break;
     }
     pthread_testcancel();
     assert(!"pending cancellation was lost");
@@ -113,7 +116,8 @@ int main(void) {
     // The resolver was forced to return NULL without a production test switch.
     assert(real_epoll_pwait2 == NULL);
     for (managed = 0; managed <= 1; ++managed) {
-        for (int op = 0; op <= (managed ? 9 : 8); ++op) {
+        for (int op = 0; op <= 12; ++op) {
+            if (!managed && op == 9) continue;
             pthread_t thread;
             cleaned = 0;
             assert(!pthread_create(&thread, NULL, worker, (void *)(intptr_t)op));

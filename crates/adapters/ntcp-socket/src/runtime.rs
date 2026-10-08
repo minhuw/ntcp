@@ -56,6 +56,14 @@ pub enum Op {
     #[cfg(test)]
     WriteFlags(Vec<u8>, i32),
     Send(Vec<(usize, usize)>, i32),
+    Transfer {
+        source: i32,
+        staging: [i32; 2],
+        offset: Option<usize>,
+        count: usize,
+        flags: i32,
+    },
+    UrgentRemaining,
     SendTimestamp(Vec<(usize, usize)>, i32, u32),
     RxTimestamp(usize),
     ErrorQueueTo(usize),
@@ -298,6 +306,7 @@ struct Socket {
     // Adapter bind policy: mutual REUSEADDR permits live connection-port reuse;
     // no kernel bind table or Linux TIME-WAIT option emulation.
     reuse: bool,
+    freebind: bool,
     nodelay: bool,
     cork: bool,
     inq: bool,
@@ -335,6 +344,7 @@ impl Socket {
             local: None,
             flags,
             reuse: false,
+            freebind: false,
             nodelay: false,
             cork: false,
             inq: false,
@@ -394,7 +404,7 @@ struct PacketBackend {
     profile: crate::packet_profile::Profile,
     output: VecDeque<Reply>,
 }
-type ChildOptionsSnapshot = (ConnectionId, u64, u64, u64, (bool, bool, bool, u32));
+type ChildOptionsSnapshot = (ConnectionId, u64, u64, u64, (bool, bool, bool, u32, bool));
 
 struct Owner {
     endpoint: Endpoint,
@@ -525,8 +535,9 @@ impl Owner {
         };
         let endpoint = Endpoint::new(config, secret, 0, move |r| match r {
             AddressValidation::Bind { local: bind } => {
-                (bind.is_unspecified() || bind == IpAddr::V4(local))
-                    && (bind.is_unspecified() || valid(bind))
+                // Per-socket local-address permission is checked by Op::Bind.
+                // FREEBIND does not relax Open, Incoming, or Route policy.
+                bind.is_unspecified() || valid(bind)
             }
             AddressValidation::Open {
                 local: source,
@@ -573,7 +584,7 @@ impl Owner {
             0,
             move |r| match r {
                 AddressValidation::Bind { local: addr } => {
-                    addr.is_unspecified() || addr == IpAddr::V4(local)
+                    addr.is_unspecified() || matches!(addr, IpAddr::V4(ip) if unicast(ip))
                 }
                 AddressValidation::Open { local: addr, .. } => addr == IpAddr::V4(local),
                 AddressValidation::Incoming { destination, .. } => destination == IpAddr::V4(local),
@@ -964,7 +975,7 @@ impl Owner {
                 listener,
                 s.receive_timeout_us,
                 s.send_timeout_us,
-                (s.nodelay, s.cork, s.inq, s.notsent_lowat),
+                (s.nodelay, s.cork, s.inq, s.notsent_lowat, s.freebind),
             ));
         }
         if let Some(tuple) = tuple
@@ -1259,7 +1270,8 @@ impl Owner {
                 if !matches!(s.handle, Handle::Fresh) || s.local.is_some() {
                     return Err(EINVAL);
                 }
-                if addr.ip() != IpAddr::V4(self.local) && !addr.ip().is_unspecified() {
+                if !s.freebind && addr.ip() != IpAddr::V4(self.local) && !addr.ip().is_unspecified()
+                {
                     return Err(EADDRNOTAVAIL);
                 }
                 let reuse = s.reuse;
@@ -1325,6 +1337,7 @@ impl Owner {
                 };
                 let mut child = self.fresh_socket(flags);
                 child.reuse = s.reuse;
+                child.freebind = s.freebind;
                 child.nodelay = s.nodelay;
                 child.cork = s.cork;
                 child.inq = s.inq;
@@ -1346,7 +1359,7 @@ impl Owner {
                     .iter()
                     .position(|(other, _, _, _, _)| *other == cid)
                 {
-                    let (_, _, receive, send, (nodelay, cork, inq, lowat)) =
+                    let (_, _, receive, send, (nodelay, cork, inq, lowat, freebind)) =
                         self.child_timeouts.swap_remove(index);
                     child.receive_timeout_us = receive;
                     child.send_timeout_us = send;
@@ -1354,6 +1367,7 @@ impl Owner {
                     child.cork = cork;
                     child.inq = inq;
                     child.notsent_lowat = lowat;
+                    child.freebind = freebind;
                 }
                 let tuple = match self.endpoint.tuple(cid).map_err(engine) {
                     Ok(tuple) => tuple,
@@ -1543,6 +1557,21 @@ impl Owner {
             #[cfg(test)]
             Op::WriteFlags(bytes, flags) => {
                 out.value = self.write(id, bytes, flags)?;
+            }
+            Op::Transfer {
+                source,
+                staging,
+                offset,
+                count,
+                flags,
+            } => {
+                out.value = self.transfer_once(id, source, staging, offset, count, flags)?;
+            }
+            Op::UrgentRemaining => {
+                let Handle::Connection(cid) = s.handle else {
+                    return Err(ENOTCONN);
+                };
+                out.timeout_us = self.endpoint.urgent_remaining(cid).map_err(engine)?;
             }
             Op::Send(_, _) | Op::SendTimestamp(..) => {
                 let (sources, flags, override_flags) = match op {
@@ -1771,6 +1800,7 @@ impl Owner {
                         }
                         s.zerocopy = value != 0;
                     }
+                    (IPPROTO_IP, IP_FREEBIND) => s.freebind = value != 0,
                     (IPPROTO_IP, IP_TOS) => s.tos = value as u8 & !3,
                     (IPPROTO_IP, IP_MTU_DISCOVER) => {
                         match value {
@@ -1909,6 +1939,7 @@ impl Owner {
                     (IPPROTO_TCP, TCP_INQ) => s.inq as i32,
                     (IPPROTO_TCP, TCP_NOTSENT_LOWAT) => s.notsent_lowat as i32,
                     (IPPROTO_TCP, TCP_USER_TIMEOUT) => s.user_timeout_ms,
+                    (IPPROTO_IP, IP_FREEBIND) => s.freebind as i32,
                     (IPPROTO_IP, IP_TOS) => s.tos as i32,
                     (IPPROTO_IP, IP_MTU_DISCOVER) => s.discover,
                     (SOL_SOCKET, SO_ZEROCOPY) => s.zerocopy as i32,
@@ -2014,6 +2045,7 @@ mod tests {
     use super::*;
     include!("timestamp_tests.rs");
     include!("large_write_tests.rs");
+    include!("file_transfer_tests.rs");
     fn owner(last: u8) -> Owner {
         let local = Ipv4Addr::new(10, 73, 0, last);
         Owner::with_endpoint(local, (Ipv4Addr::new(10, 73, 0, 1), 24), [last; 32], None).unwrap()

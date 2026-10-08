@@ -150,8 +150,17 @@ extern int ntcp_c_epoll_wait(int, struct epoll_event *, int, int);
 static int ep_create(void *u, int size) { if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1; return ntcp_c_epoll_create(size); }
 static int ep_ctl(void *u, int epfd, int op, int fd, struct epoll_event *ev) { if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1; return ntcp_c_epoll_ctl(epfd,op,fd,ev); }
 static int ep_wait(void *u, int epfd, struct epoll_event *ev, int max, int timeout) { if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1; return ntcp_c_epoll_wait(epfd,ev,max,timeout); }
-static int pipe_stub(void *u, int fds[2]) { return unsupported("pipe"); }
-static int splice_stub(void *u, int in, loff_t *inoff, int out, loff_t *outoff, size_t n, unsigned int flags) { return unsupported("splice"); }
+static int pipe_host(void *u, int fds[2]) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    return pipe(fds);
+}
+extern ssize_t ntcp_c_splice(int, loff_t *, int, loff_t *, size_t, unsigned int);
+static int splice_socket(void *u, int in, loff_t *inoff, int out, loff_t *outoff, size_t n, unsigned int flags) {
+    if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
+    // Stock packetdrill passes addresses of numeric zero for script NULL.
+    return ntcp_c_splice(in, inoff && *inoff ? inoff : NULL,
+                         out, outoff && *outoff ? outoff : NULL, n, flags);
+}
 void ntcp_fill(struct packetdrill_interface *p, void *u) {
     *p = (struct packetdrill_interface) {
         .userdata=u, .free=ntcp_free, .socket=sock, .bind=bind_socket, .listen=listen_socket, .accept=accept_socket, .connect=connect_socket,
@@ -159,7 +168,7 @@ void ntcp_fill(struct packetdrill_interface *p, void *u) {
         .write=write_socket, .writev=writev_socket, .send=send_socket, .sendto=sendto_socket, .sendmsg=sendmsg_socket,
         .fcntl=fcntl_socket, .ioctl=ioctl_socket, .close=close_socket, .shutdown=shutdown_socket, .getsockopt=getopt_socket, .setsockopt=setopt,
         .poll=poll_socket, .netdev_send=net_send, .netdev_receive=net_receive, .usleep=sleep_host, .gettimeofday=time_host,
-        .epoll_create=ep_create, .epoll_ctl=ep_ctl, .epoll_wait=ep_wait, .pipe=pipe_stub, .splice=splice_stub
+        .epoll_create=ep_create, .epoll_ctl=ep_ctl, .epoll_wait=ep_wait, .pipe=pipe_host, .splice=splice_socket
     };
 }
 
@@ -182,8 +191,10 @@ void ntcp_abi_check(void *u) {
     assert(p.epoll_ctl(u, epfd, EPOLL_CTL_ADD, -1, &event) == -1 && errno == EBADF);
     assert(p.epoll_wait(u, epfd, &event, 1, 0) == 0);
     assert(p.close(u, epfd) == 0);
-    assert(p.pipe(u, NULL) == -1 && errno == ENOSYS);
-    assert(p.splice(u, -1, NULL, -1, NULL, 0, 0) == -1 && errno == ENOSYS);
+    int pipefds[2];
+    assert(p.pipe(u, pipefds) == 0);
+    assert(p.close(u, pipefds[0]) == 0 && p.close(u, pipefds[1]) == 0);
+    assert(p.splice(u, -1, NULL, -1, NULL, 1, 0) == -1 && errno == EBADF);
     assert(p.readv(u, -1, NULL, 1) == -1 && errno == EBADF);
     assert(p.writev(u, -1, NULL, -1) == -1 && errno == EBADF);
     struct iovec v = { .iov_base = NULL, .iov_len = 1 };

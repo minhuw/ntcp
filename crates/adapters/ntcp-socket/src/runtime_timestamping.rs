@@ -357,6 +357,20 @@ impl Owner {
         flags: i32,
         bits: u32,
     ) -> Result<usize> {
+        self.timestamp_write_from(id, cid, bytes.len(), flags, bits, |room| Ok(&bytes[..room]))
+    }
+    // All admission/metadata allocation precedes the producer. Its own storage
+    // must be allocated before consumption, and the owner must not yield until
+    // exact-prefix TCP admission. Ordinary sends can borrow their existing copy.
+    pub(super) fn timestamp_write_from<B: AsRef<[u8]>>(
+        &mut self,
+        id: u64,
+        cid: ConnectionId,
+        capacity: usize,
+        flags: i32,
+        bits: u32,
+        produce: impl FnOnce(usize) -> Result<B>,
+    ) -> Result<usize> {
         let request = ntcp::TxTimestampRequest {
             cookie: self.timestamp_cookie,
             scheduled: bits & TX_SCHED != 0,
@@ -380,6 +394,17 @@ impl Owner {
         }
         let progress = self.endpoint.send_progress(cid).map_err(engine)?;
         let lowat = self.sockets[&id].notsent_lowat;
+        let lowat = Some(effective_notsent_lowat(lowat));
+        let room = if capacity == 0 {
+            0
+        } else {
+            self.endpoint
+                .check_write_admission(cid, lowat, request)
+                .map_err(engine)?
+        };
+        let produced = produce(capacity.min(room))?;
+        let bytes = produced.as_ref();
+        assert!(bytes.len() <= capacity.min(room));
         let n = self
             .endpoint
             .write_with_timestamp(
@@ -387,10 +412,11 @@ impl Owner {
                 bytes,
                 flags & MSG_MORE != 0,
                 flags & MSG_EOR != 0,
-                Some(effective_notsent_lowat(lowat)),
+                lowat,
                 request,
             )
             .map_err(engine)?;
+        assert_eq!(n, bytes.len());
         if n != 0 && phases != 0 {
             let s = self.sockets.get_mut(&id).unwrap();
             s.timestamps.pending.push(Pending {

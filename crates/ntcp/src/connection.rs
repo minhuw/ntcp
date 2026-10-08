@@ -2628,6 +2628,28 @@ impl Connection {
         Ok(count)
     }
 
+    pub(crate) fn check_write_admission(
+        &self,
+        lowat: Option<u32>,
+        request: TxTimestampRequest,
+    ) -> Result<usize, Error> {
+        if self.shutdown
+            || !matches!(
+                self.state,
+                State::SynSent | State::SynReceived | State::Established | State::CloseWait
+            )
+        {
+            return Err(Error::InvalidState);
+        }
+        self.tx_timestamps.admit(request)?;
+        let room = self.send_admission_room(lowat);
+        if room == 0 {
+            Err(Error::WouldBlock)
+        } else {
+            Ok(room)
+        }
+    }
+
     pub(crate) fn send_admission_room(&self, lowat: Option<u32>) -> usize {
         // Keep the u64 TCP-stream position representable, including output's
         // exclusive end. Never wrap offsets or admit bytes we cannot identify.

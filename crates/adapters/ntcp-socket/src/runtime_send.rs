@@ -267,3 +267,93 @@ impl Owner {
         self.finish_send(id, &mut send, result)
     }
 }
+
+impl Owner {
+    pub(super) fn transfer_once(
+        &mut self,
+        id: u64,
+        source: i32,
+        staging: [i32; 2],
+        offset: Option<usize>,
+        count: usize,
+        flags: i32,
+    ) -> Result<i32> {
+        if count == 0 {
+            return match offset {
+                Some(offset) => raw(unsafe {
+                    syscall(SYS_sendfile, staging[1], source, offset as *mut off_t, 0)
+                })
+                .map(|n| n as i32),
+                None => Ok(0),
+            };
+        }
+        let cid = self.send_state(id)?;
+        let bits = self.sockets[&id].timestamps.options.flags;
+        self.reserve_send_completion(id, true, false, bits, false)?;
+        let mut source_error = None;
+        let transferred = self.timestamp_write_from(
+            id,
+            cid,
+            count.min(BYTES).min(max_rw_count()),
+            flags,
+            bits,
+            |room| {
+                let mut bytes = Vec::new();
+                bytes.try_reserve_exact(room).map_err(|_| ENOBUFS)?;
+                bytes.resize(room, 0);
+                let result = raw(unsafe {
+                    match offset {
+                        Some(offset) => syscall(
+                            SYS_sendfile,
+                            staging[1],
+                            source,
+                            offset as *mut off_t,
+                            bytes.len(),
+                        ),
+                        None => syscall(
+                            SYS_splice,
+                            source,
+                            ptr::null_mut::<loff_t>(),
+                            staging[1],
+                            ptr::null_mut::<loff_t>(),
+                            bytes.len(),
+                            SPLICE_F_NONBLOCK,
+                        ),
+                    }
+                });
+                // sendfile may have moved bytes before an offset copyout EFAULT.
+                // Admit those bytes too, while preserving the native error result.
+                let mut available = 0i32;
+                raw(unsafe { syscall(SYS_ioctl, staging[0], FIONREAD, &mut available) })?;
+                if available == 0 {
+                    source_error = result.as_ref().err().copied();
+                    result?;
+                    return Ok(Vec::new());
+                }
+                source_error = result.err();
+                let n = raw(unsafe {
+                    syscall(SYS_read, staging[0], bytes.as_mut_ptr(), available as usize)
+                })?;
+                assert_eq!(n, available as i64); // Private pipe: no competing reader.
+                bytes.truncate(n as usize);
+                Ok(bytes)
+            },
+        );
+        // Distinguish empty native input from TCP admission backpressure. A
+        // nonblocking socket must not turn a blocking input pipe nonblocking.
+        if source_error == Some(EAGAIN) {
+            return Ok(-EAGAIN);
+        }
+        let n = transferred?;
+        let end = self.endpoint.send_progress(cid).map_err(engine)?.queued_end;
+        self.endpoint
+            .finish_send(cid, end, flags & MSG_MORE != 0, false, false)
+            .map_err(engine)?;
+        self.refresh_readiness(id)?;
+        if let Some(error) = source_error {
+            Err(error)
+        } else {
+            Ok(n as i32)
+        }
+    }
+}

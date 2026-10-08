@@ -328,3 +328,79 @@ fn shared_abi_inq_timestamp_gate_staging_alias_fault_and_eof() {
     }
     packet_test::stop();
 }
+
+#[test]
+fn splice_stops_at_urgent_octet_without_consuming_it() {
+    const CHILD: &str = "NTCP_TEST_SPLICE_URGENT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        assert!(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "inq_tests::splice_stops_at_urgent_octet_without_consuming_it",
+                    "--test-threads=1"
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap()
+                .success()
+        );
+        return;
+    }
+    packet_test::start((
+        Ipv4Addr::new(192, 0, 2, 1),
+        packet_profile::Profile::UpstreamBasic,
+    ))
+    .unwrap();
+    unsafe {
+        let (fd, mut h) = connected();
+        h.flags |= ntcp::wire::URG;
+        h.urgent_pointer = 100;
+        inject(h, TS, &[7; 100]);
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            syscall(SYS_pipe2, pipe.as_mut_ptr(), O_NONBLOCK | O_CLOEXEC),
+            0
+        );
+        assert_eq!(
+            crate::file_transfer::splice(fd, ptr::null_mut(), pipe[1], ptr::null_mut(), 100, 0),
+            99
+        );
+        let mut bytes = [0u8; 100];
+        assert_eq!(read(pipe[0], bytes.as_mut_ptr().cast(), 100), 99);
+        assert_eq!(&bytes[..99], &[7; 99]);
+        assert_eq!(
+            crate::file_transfer::splice(fd, ptr::null_mut(), pipe[1], ptr::null_mut(), 1, 0),
+            0
+        );
+        let mut available = 0;
+        assert_eq!(abi_ioctl(fd, FIONREAD, &mut available), 0);
+        assert_eq!(available, 1);
+        assert_eq!(read(fd, bytes.as_mut_ptr().cast(), 1), 1);
+        assert_eq!(bytes[0], 7);
+        assert_eq!(
+            crate::file_transfer::splice(
+                fd,
+                ptr::null_mut(),
+                pipe[1],
+                ptr::null_mut(),
+                1,
+                SPLICE_F_NONBLOCK
+            ),
+            -1
+        );
+        assert_eq!(errno(), EAGAIN);
+        h.sequence += 100;
+        h.flags = ntcp::wire::ACK | ntcp::wire::FIN;
+        h.urgent_pointer = 0;
+        inject(h, TS, &[]);
+        assert_eq!(
+            crate::file_transfer::splice(fd, ptr::null_mut(), pipe[1], ptr::null_mut(), 1, 0),
+            0
+        );
+        close(pipe[0]);
+        close(pipe[1]);
+        close(fd);
+    }
+    packet_test::stop();
+}
