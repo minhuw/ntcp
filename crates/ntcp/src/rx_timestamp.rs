@@ -80,6 +80,12 @@ impl RxTimestamps {
         }
     }
 
+    pub(crate) fn allocation_bytes(limit: usize) -> Option<usize> {
+        core::alloc::Layout::array::<RxReadTimestamps>(limit)
+            .ok()
+            .map(|layout| layout.size())
+    }
+
     pub(crate) fn storage_bytes(&self) -> usize {
         self.ranges.capacity() * core::mem::size_of::<RxReadTimestamps>()
     }
@@ -91,10 +97,7 @@ impl RxTimestamps {
         if limit == self.limit {
             return Ok(());
         }
-        if limit
-            .checked_mul(core::mem::size_of::<RxReadTimestamps>())
-            .is_none_or(|bytes| bytes > spare)
-        {
+        if Self::allocation_bytes(limit).is_none_or(|bytes| bytes > spare) {
             return Err(Error::NoMemory);
         }
         let mut ranges = Vec::new();

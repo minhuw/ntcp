@@ -846,13 +846,23 @@ impl Connection {
         now: Instant,
         syn: &Segment<'_>,
     ) -> Result<Self, Error> {
-        Self::passive_with_receive(tuple, config, iss, now, syn, &mut None)
+        Self::passive_with_receive(
+            tuple,
+            config,
+            iss,
+            now,
+            syn,
+            &mut None,
+            RxTimestamps::default(),
+            RxPacketTimestamps::default(),
+        )
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
     //= reason=Passive state is SYN-RECEIVED; transmit commits ISS+1 only after SYN-ACK encoding succeeds.
     //# SND.NXT is set to ISS+1 and SND.UNA to ISS. The connection state should be changed to
     //# SYN-RECEIVED.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn passive_with_receive(
         tuple: Tuple,
         config: ConnectionConfig,
@@ -860,13 +870,19 @@ impl Connection {
         now: Instant,
         syn: &Segment<'_>,
         receive: &mut Option<ReceiveBuffer>,
+        rx_timestamps: RxTimestamps,
+        timestamps: RxPacketTimestamps,
     ) -> Result<Self, Error> {
         if syn.header.flags & (SYN | ACK | RST) != SYN {
             return Err(Error::InvalidArgument);
         }
+        timestamps.validate(config.timebase)?;
         let mut connection = Self::active_with_receive(tuple, config, iss, now, receive)?;
+        connection.rx_timestamps = rx_timestamps;
+        connection.input_timestamps = timestamps;
         connection.passive_open = true;
         connection.learn_syn(syn);
+        connection.input_timestamps = RxPacketTimestamps::default();
         connection.state = State::SynReceived;
         Ok(connection)
     }

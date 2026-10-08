@@ -11,6 +11,7 @@ use crate::{
     TxTimestampEvent, TxTimestampRequest, TxTimestampSource, TxTimestampStage, TxTimestampToken,
     buffer::ReceiveBuffer,
     connection::{Connection, ConnectionConfig, ConnectionEvents, Error, Instant, State, Tuple},
+    rx_timestamp::RxTimestamps,
     schedule::{Deadlines, ReadyQueue},
     seq::Seq,
     wire::{self, ACK, Header, IpMetadata, RST, SYN},
@@ -242,6 +243,7 @@ struct Slot {
     received_ipv4_options: Option<Ipv4Options>,
 }
 struct Listener {
+    rx_timestamp_capacity: usize,
     buffer_capacities: (usize, usize),
     application_timeout_us: Option<u64>,
     address: SocketAddr,
@@ -582,6 +584,7 @@ impl Endpoint {
             .try_reserve_exact(backlog)
             .map_err(|_| Error::NoMemory)?;
         self.listeners[slot] = Some(Listener {
+            rx_timestamp_capacity: 0,
             buffer_capacities: (
                 self.config.connection.send_capacity,
                 self.config.connection.receive_capacity,
@@ -744,6 +747,8 @@ impl Endpoint {
                 self.config.connection.send_capacity,
                 self.config.connection.receive_capacity,
             ),
+            0,
+            RxPacketTimestamps::default(),
         )
     }
 
@@ -753,6 +758,8 @@ impl Endpoint {
         iss: u32,
         syn: Option<&wire::Segment<'_>>,
         capacities: (usize, usize),
+        rx_ranges: usize,
+        timestamps: RxPacketTimestamps,
     ) -> Result<Connection, Error> {
         Connection::validate_buffer_capacities(capacities.0, capacities.1)?;
         let charge = Connection::allocation_bytes(
@@ -770,15 +777,21 @@ impl Endpoint {
         } else {
             0
         };
+        let available = self
+            .config
+            .max_buffer_bytes
+            .saturating_sub(self.buffer_bytes)
+            .saturating_add(credit);
         if charge
-            > self
-                .config
-                .max_buffer_bytes
-                .saturating_sub(self.buffer_bytes)
-                .saturating_add(credit)
+            .checked_add(RxTimestamps::allocation_bytes(rx_ranges).ok_or(Error::NoMemory)?)
+            .is_none_or(|total| total > available)
         {
             return Err(Error::NoMemory);
         }
+        // Stage metadata before touching the receive pool; constructor failures
+        // drop it while returning pooled storage through the existing path.
+        let mut rx_timestamps = RxTimestamps::default();
+        rx_timestamps.resize(rx_ranges, available - charge)?;
         let mut receive = pool_index.map(|index| self.receive_pool.swap_remove(index));
         let mut connection_config = self.config.connection.clone();
         connection_config.send_capacity = capacities.0;
@@ -798,6 +811,8 @@ impl Endpoint {
                 self.now,
                 syn,
                 &mut receive,
+                rx_timestamps,
+                timestamps,
             ),
             None => Connection::active_with_receive(
                 tuple,
@@ -957,7 +972,14 @@ impl Endpoint {
         Connection::validate_buffer_capacities(send, receive)?;
         self.admission_with_buffers(tuple, (send, receive))?;
         let iss = self.isn(tuple);
-        let connection = self.new_connection_with_buffers(tuple, iss, None, (send, receive))?;
+        let connection = self.new_connection_with_buffers(
+            tuple,
+            iss,
+            None,
+            (send, receive),
+            0,
+            RxPacketTimestamps::default(),
+        )?;
         self.insert(connection, None, None)
     }
 
@@ -1004,10 +1026,51 @@ impl Endpoint {
         send: usize,
         receive: usize,
     ) -> Result<(), EndpointError> {
-        self.listener(id)?;
+        let rx_ranges = self.listener(id)?.rx_timestamp_capacity;
         Connection::validate_buffer_capacities(send, receive)?;
+        self.validate_listener_rx_capacity((send, receive), rx_ranges)?;
         self.listeners[id.slot].as_mut().unwrap().buffer_capacities = (send, receive);
         Ok(())
+    }
+
+    fn validate_listener_rx_capacity(
+        &self,
+        capacities: (usize, usize),
+        ranges: usize,
+    ) -> Result<(), EndpointError> {
+        if ranges == 0 {
+            return Ok(());
+        }
+        let metadata = RxTimestamps::allocation_bytes(ranges).ok_or(Error::NoMemory)?;
+        let total = Connection::allocation_bytes(
+            capacities.0,
+            capacities.1,
+            usize::from(self.config.connection.mss),
+        )
+        .and_then(|bytes| bytes.checked_add(metadata))
+        .ok_or(Error::NoMemory)?;
+        if total > self.config.max_buffer_bytes {
+            return Err(Error::NoMemory.into());
+        }
+        Ok(())
+    }
+
+    pub fn set_listener_rx_timestamp_capacity(
+        &mut self,
+        id: ListenerId,
+        ranges: usize,
+    ) -> Result<(), EndpointError> {
+        let capacities = self.listener(id)?.buffer_capacities;
+        self.validate_listener_rx_capacity(capacities, ranges)?;
+        self.listeners[id.slot]
+            .as_mut()
+            .unwrap()
+            .rx_timestamp_capacity = ranges;
+        Ok(())
+    }
+
+    pub fn listener_rx_timestamp_capacity(&self, id: ListenerId) -> Result<usize, EndpointError> {
+        Ok(self.listener(id)?.rx_timestamp_capacity)
     }
 
     pub fn listener_buffer_capacities(
@@ -1597,12 +1660,15 @@ impl Endpoint {
             }
             let application_timeout = record.application_timeout_us;
             let buffer_capacities = record.buffer_capacities;
+            let rx_ranges = record.rx_timestamp_capacity;
             let iss = self.isn(tuple);
             let mut connection = match self.new_connection_with_buffers(
                 tuple,
                 iss,
                 Some(&segment),
                 buffer_capacities,
+                rx_ranges,
+                timestamps,
             ) {
                 Ok(connection) => connection,
                 Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),
@@ -1666,6 +1732,7 @@ impl Endpoint {
         }
         let application_timeout = record.application_timeout_us;
         let buffer_capacities = record.buffer_capacities;
+        let rx_ranges = record.rx_timestamp_capacity;
         let candidate = self.isn(tuple);
         let iss = self.slots[index]
             .as_ref()
@@ -1674,12 +1741,18 @@ impl Endpoint {
             .reuse_iss(candidate);
         // Allocate the entire bounded child before transferring tuple ownership.
         // The old timer/record survives independently until its original expiry.
-        let mut connection =
-            match self.new_connection_with_buffers(tuple, iss, Some(syn), buffer_capacities) {
-                Ok(connection) => connection,
-                Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),
-                Err(error) => return Err(error.into()),
-            };
+        let mut connection = match self.new_connection_with_buffers(
+            tuple,
+            iss,
+            Some(syn),
+            buffer_capacities,
+            rx_ranges,
+            RxPacketTimestamps::default(),
+        ) {
+            Ok(connection) => connection,
+            Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),
+            Err(error) => return Err(error.into()),
+        };
         // Reuse keeps the old local virtual clock: peer PAWS must not see a
         // random jump. Candidate failure leaves the old offset/timer untouched.
         connection.set_timestamp_offset(
@@ -3126,5 +3199,186 @@ mod recovery_observation_tests {
             .poll_transmit(240_000_001, &mut [0; 128], 16)
             .unwrap();
         assert_eq!(endpoint.buffer_bytes(), 0);
+    }
+    #[test]
+    fn listener_rx_timestamp_budget_constructor_failures_restore_pool_and_backlog() {
+        let tuple = Tuple {
+            local: "192.0.2.2:8080".parse().unwrap(),
+            remote: "192.0.2.1:40000".parse().unwrap(),
+        };
+        let ip = IpMetadata {
+            source: tuple.remote.ip(),
+            destination: tuple.local.ip(),
+        };
+        let mut syn = [0; 128];
+        let n = wire::encode(
+            ip,
+            Header {
+                source_port: tuple.remote.port(),
+                destination_port: tuple.local.port(),
+                sequence: 100,
+                acknowledgment: 0,
+                flags: SYN,
+                window: 64,
+                urgent_pointer: 0,
+            },
+            &[],
+            b"abc",
+            &mut syn,
+        )
+        .unwrap();
+        let stamps = RxPacketTimestamps {
+            software: Some(crate::RxTimestamp {
+                value: 123,
+                clock: crate::TimestampClock::RealtimeNanoseconds,
+            }),
+            hardware: None,
+        };
+        let base = Connection::allocation_bytes(17, 17, 8).unwrap();
+        let metadata = RxTimestamps::allocation_bytes(2).unwrap();
+        for preallocate in [0, 1] {
+            let cfg = EndpointConfig {
+                max_connections: 2,
+                max_listeners: 1,
+                preallocate_connections: preallocate,
+                max_buffer_bytes: base + metadata,
+                connection: ConnectionConfig {
+                    send_capacity: 17,
+                    receive_capacity: 17,
+                    mss: 8,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let make = || {
+                let mut endpoint = Endpoint::new(cfg.clone(), [2; 32], 0, |_| true).unwrap();
+                let listener = endpoint.listen(tuple.local, 2).unwrap();
+                endpoint
+                    .set_listener_rx_timestamp_capacity(listener, 2)
+                    .unwrap();
+                (endpoint, listener)
+            };
+            let clean = |endpoint: &Endpoint, listener: ListenerId| {
+                assert_eq!(endpoint.buffer_bytes(), preallocate * base);
+                assert_eq!(endpoint.receive_pool.len(), preallocate);
+                assert_eq!(endpoint.free.len(), 2);
+                assert!(endpoint.slots.iter().all(Option::is_none));
+                let record = endpoint.listener(listener).unwrap();
+                assert!(record.children.is_empty());
+                assert!(record.pending.is_empty());
+                assert_eq!(endpoint.connection_id(tuple), None);
+            };
+            let (mut endpoint, listener) = make();
+            assert_eq!(
+                endpoint.set_listener_rx_timestamp_capacity(listener, usize::MAX),
+                Err(Error::NoMemory.into())
+            );
+            assert_eq!(
+                endpoint.set_listener_rx_timestamp_capacity(listener, 3),
+                Err(Error::NoMemory.into())
+            );
+            assert_eq!(endpoint.listener_rx_timestamp_capacity(listener), Ok(2));
+            assert_eq!(
+                endpoint.set_listener_buffer_capacities(listener, 34, 17),
+                Err(Error::NoMemory.into())
+            );
+            assert_eq!(endpoint.listener_buffer_capacities(listener), Ok((17, 17)));
+            // Base storage fits, but metadata does not. Reject before taking the pool.
+            endpoint.config.max_buffer_bytes -= 1;
+            assert_eq!(
+                endpoint.input_with_timestamps(1, ip, 0, Ipv4Options::default(), &syn[..n], stamps),
+                Ok(InputDisposition::Dropped)
+            );
+            clean(&endpoint, listener);
+            endpoint.config.max_buffer_bytes += 1;
+            // Force failure after the complete child (including SYN metadata) exists.
+            let mut occupied = tuple;
+            occupied.remote.set_port(40001);
+            endpoint.tuples.entries.fill(Entry::Occupied(occupied, 0));
+            assert_eq!(
+                endpoint.input_with_timestamps(2, ip, 0, Ipv4Options::default(), &syn[..n], stamps),
+                Ok(InputDisposition::Dropped)
+            );
+            clean(&endpoint, listener);
+            endpoint.tuples.entries.fill(Entry::Empty);
+            assert_eq!(
+                endpoint.input_with_timestamps(3, ip, 0, Ipv4Options::default(), &syn[..n], stamps),
+                Ok(InputDisposition::Processed)
+            );
+            let child = endpoint.connection_id(tuple).unwrap();
+            assert_eq!(endpoint.buffer_bytes(), base + metadata);
+            assert!(endpoint.receive_pool.is_empty());
+            assert_eq!(endpoint.rx_timestamp_status(child).unwrap().capacity, 2);
+            assert_eq!(
+                endpoint.slot(child).unwrap().connection.rx_timestamps.at(0),
+                stamps
+            );
+
+            // Walk every constructor allocation, not just the first metadata reserve.
+            let mut failures = 0;
+            let mut succeeded = false;
+            for fail_at in 0..32 {
+                let (mut endpoint, listener) = make();
+                let result = crate::allocation_tests::fail_after(fail_at, || {
+                    endpoint.input_with_timestamps(
+                        1,
+                        ip,
+                        0,
+                        Ipv4Options::default(),
+                        &syn[..n],
+                        stamps,
+                    )
+                });
+                if result == Ok(InputDisposition::Processed) {
+                    let child = endpoint.connection_id(tuple).unwrap();
+                    assert_eq!(
+                        endpoint.slot(child).unwrap().connection.rx_timestamps.at(2),
+                        stamps
+                    );
+                    assert_eq!(endpoint.buffer_bytes(), base + metadata);
+                    succeeded = true;
+                    break;
+                }
+                assert_eq!(result, Ok(InputDisposition::Dropped));
+                clean(&endpoint, listener);
+                assert_eq!(endpoint.next_event(), None);
+                assert_eq!(endpoint.next_deadline(), None);
+                assert!(!endpoint.has_pending_output());
+                failures += 1;
+            }
+            assert!(succeeded && failures > 1);
+        }
+    }
+
+    #[test]
+    fn listener_rx_timestamp_slot_reuse_defaults_and_zero_policy_preserves_legacy_limits() {
+        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
+        let address = "192.0.2.2:8080".parse().unwrap();
+        let listener = endpoint.listen(address, 1).unwrap();
+        endpoint
+            .set_listener_rx_timestamp_capacity(listener, 2)
+            .unwrap();
+        endpoint.close_listener(listener).unwrap();
+        endpoint.poll_transmit(0, &mut [0; 128], 16).unwrap();
+        let next = endpoint.listen(address, 1).unwrap();
+        assert_eq!(next.slot, listener.slot);
+        assert_ne!(next.generation, listener.generation);
+        assert_eq!(endpoint.listener_rx_timestamp_capacity(next), Ok(0));
+        assert_eq!(
+            endpoint.listener_rx_timestamp_capacity(listener),
+            Err(EndpointError::InvalidHandle)
+        );
+        // Existing buffer policy can configure future impossible admission when RX is off.
+        endpoint.config.max_buffer_bytes = 0;
+        endpoint
+            .set_listener_buffer_capacities(next, 17, 17)
+            .unwrap();
+        endpoint
+            .set_listener_rx_timestamp_capacity(next, 0)
+            .unwrap();
+        assert_eq!(
+            endpoint.set_listener_rx_timestamp_capacity(next, 1),
+            Err(Error::NoMemory.into())
+        );
     }
 }

@@ -5163,3 +5163,199 @@ fn rx_timestamp_endpoint_validation_peek_copyout_retry_and_sources() {
         a.acknowledged(client).unwrap()
     );
 }
+
+#[test]
+fn listener_rx_timestamp_snapshot_syn_third_ack_parent_change_and_reuse() {
+    let (local, remote) = addresses();
+    let mut b = Endpoint::new(config(), [2; 32], 0, test_policy).unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    assert_eq!(b.listener_rx_timestamp_capacity(listener), Ok(0));
+    let charge = b.buffer_bytes();
+    crate::allocation_tests::fail_after(0, || b.set_listener_rx_timestamp_capacity(listener, 4))
+        .unwrap();
+    assert_eq!(b.buffer_bytes(), charge); // Policy only: no storage allocated here.
+    let ip = IpMetadata {
+        source: local.ip(),
+        destination: remote.ip(),
+    };
+    let tuple = Tuple {
+        local: remote,
+        remote: local,
+    };
+    let syn_header = wire::Header {
+        source_port: local.port(),
+        destination_port: remote.port(),
+        sequence: u32::MAX - 2,
+        acknowledgment: 0,
+        flags: wire::SYN,
+        window: 64,
+        urgent_pointer: 0,
+    };
+    let mut syn = [0; 128];
+    let syn_len = wire::encode(ip, syn_header, &[], b"abc", &mut syn).unwrap();
+    let stamps = |value| RxPacketTimestamps {
+        software: Some(RxTimestamp {
+            value,
+            clock: TimestampClock::RealtimeNanoseconds,
+        }),
+        hardware: Some(RxTimestamp {
+            value: value + 10,
+            clock: TimestampClock::DeviceTicks {
+                identity: 3,
+                units_per_second: None,
+            },
+        }),
+    };
+    b.input_with_timestamps(1, ip, 0, Ipv4Options::default(), &syn[..syn_len], stamps(1))
+        .unwrap();
+    let child = b.connection_id(tuple).unwrap();
+    assert_eq!(b.state(child), Ok(State::SynReceived));
+    assert_eq!(b.rx_timestamp_status(child).unwrap().capacity, 4);
+    assert_eq!(b.rx_timestamp_status(child).unwrap().retained_ranges, 1);
+    assert_eq!(
+        b.peek_rx_timestamps(child, 3),
+        Err(EndpointError::Connection(Error::InvalidArgument))
+    ); // Hidden until handshake.
+    b.set_listener_rx_timestamp_capacity(listener, 1).unwrap();
+    let mut out = [0; 128];
+    let reply = b.poll_transmit(2, &mut out, 16).unwrap().packet.unwrap();
+    let synack = wire::parse(reply.ip, &out[..reply.len]).unwrap().header;
+    assert_eq!(synack.acknowledgment, 1); // SYN plus early payload crosses wire wrap.
+    b.input_with_timestamps(3, ip, 0, Ipv4Options::default(), &syn[..syn_len], stamps(9))
+        .unwrap();
+    assert_eq!(b.connection_id(tuple), Some(child));
+    assert_eq!(b.rx_timestamp_status(child).unwrap().capacity, 4);
+    let mut third = [0; 128];
+    let third_len = wire::encode(
+        ip,
+        wire::Header {
+            sequence: synack.acknowledgment,
+            acknowledgment: synack.sequence.wrapping_add(1),
+            flags: wire::ACK,
+            ..syn_header
+        },
+        &[],
+        b"de",
+        &mut third,
+    )
+    .unwrap();
+    b.input_with_timestamps(
+        4,
+        ip,
+        0,
+        Ipv4Options::default(),
+        &third[..third_len],
+        stamps(2),
+    )
+    .unwrap();
+    assert_eq!(b.state(child), Ok(State::Established));
+    assert_eq!(b.rx_timestamp_status(child).unwrap().retained_ranges, 2);
+    assert_eq!(
+        b.peek_rx_timestamps(child, 3).unwrap().unwrap().timestamps,
+        stamps(1)
+    );
+    assert_eq!(
+        b.peek_rx_timestamps(child, 5).unwrap().unwrap().timestamps,
+        stamps(2)
+    );
+    assert_eq!(b.accept(listener).unwrap(), child);
+    // Future children snapshot new policy, even before the adapter can see them.
+    let next_header = wire::Header {
+        source_port: local.port() + 1,
+        sequence: 10,
+        ..syn_header
+    };
+    let n = wire::encode(ip, next_header, &[], b"x", &mut syn).unwrap();
+    b.input_with_timestamps(5, ip, 0, Ipv4Options::default(), &syn[..n], stamps(3))
+        .unwrap();
+    let mut other = local;
+    other.set_port(local.port() + 1);
+    let next = b
+        .connection_id(Tuple {
+            local: remote,
+            remote: other,
+        })
+        .unwrap();
+    assert_eq!(b.rx_timestamp_status(next).unwrap().capacity, 1);
+    b.close_listener(listener).unwrap();
+    packets(&mut b, 6); // Existing cleanup handles the unaccepted second child.
+    assert_eq!(b.state(child), Ok(State::Established));
+    assert_eq!(
+        b.peek_rx_timestamps(child, 3).unwrap().unwrap().timestamps,
+        stamps(1)
+    );
+    assert_eq!(
+        b.set_listener_rx_timestamp_capacity(listener, 8),
+        Err(EndpointError::InvalidHandle)
+    );
+    let replacement = b.listen(remote, 4).unwrap();
+    assert_ne!(replacement, listener);
+    assert_eq!(b.listener_rx_timestamp_capacity(replacement), Ok(0));
+    let n = wire::encode(
+        ip,
+        wire::Header {
+            source_port: local.port() + 2,
+            ..next_header
+        },
+        &[],
+        b"z",
+        &mut syn,
+    )
+    .unwrap();
+    b.input_with_timestamps(7, ip, 0, Ipv4Options::default(), &syn[..n], stamps(4))
+        .unwrap();
+    other.set_port(local.port() + 2);
+    let fresh = b
+        .connection_id(Tuple {
+            local: remote,
+            remote: other,
+        })
+        .unwrap();
+    assert_eq!(b.rx_timestamp_status(fresh).unwrap().capacity, 0);
+    assert_eq!(b.rx_timestamp_status(fresh).unwrap().retained_ranges, 0);
+    let mut read = [0; 5];
+    assert_eq!(b.read(child, &mut read), Ok(5));
+    assert_eq!(&read, b"abcde");
+}
+
+#[test]
+fn listener_rx_timestamp_time_wait_replacement_inherits_current_limit() {
+    let (mut b, listener, old, ip, header, _) = time_wait_endpoint(config());
+    b.set_listener_rx_timestamp_capacity(listener, 3).unwrap();
+    let syn = tw_segment(
+        ip,
+        header,
+        header.acknowledgment.wrapping_add(100),
+        0,
+        wire::SYN,
+        None,
+    );
+    assert_eq!(b.input(4_000, ip, &syn), Ok(InputDisposition::Processed));
+    let child = b
+        .connection_id(Tuple {
+            local: addresses().1,
+            remote: addresses().0,
+        })
+        .unwrap();
+    assert_ne!(child, old);
+    assert_eq!(b.rx_timestamp_status(old).unwrap().capacity, 0);
+    assert_eq!(b.rx_timestamp_status(child).unwrap().capacity, 3);
+    b.set_listener_rx_timestamp_capacity(listener, 0).unwrap();
+    assert_eq!(b.rx_timestamp_status(child).unwrap().capacity, 3);
+}
+
+#[test]
+fn listener_rx_timestamp_does_not_override_simultaneous_active_open() {
+    let (local, remote) = addresses();
+    let (mut a, mut b, listener_b, client_a) = endpoints();
+    let listener_a = a.listen(local, 4).unwrap();
+    a.set_listener_rx_timestamp_capacity(listener_a, 4).unwrap();
+    b.set_listener_rx_timestamp_capacity(listener_b, 3).unwrap();
+    let client_b = b.connect(0, remote, local).unwrap();
+    a.set_rx_timestamp_capacity(client_a, 1).unwrap();
+    pump(&mut a, &mut b, 0);
+    assert_eq!(a.state(client_a), Ok(State::Established));
+    assert_eq!(b.state(client_b), Ok(State::Established));
+    assert_eq!(a.rx_timestamp_status(client_a).unwrap().capacity, 1);
+    assert_eq!(b.rx_timestamp_status(client_b).unwrap().capacity, 0);
+}
