@@ -3,12 +3,14 @@
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <rte_errno.h>
 #include <unistd.h>
 #include <rte_eal.h>
 #include <rte_ethdev.h>
 #include <rte_eth_ring.h>
 #include <rte_mbuf.h>
+#include <rte_mbuf_dyn.h>
 #include <rte_ring.h>
 
 static struct rte_ring *rx, *tx;
@@ -57,6 +59,31 @@ unsigned ntcp_test_loopback(void) {
     assert(rte_ring_enqueue(rx, m) == 0);
     return segments;
 }
+void ntcp_test_register_timestamp(void) {
+    int offset;
+    uint64_t flag;
+    assert(rte_mbuf_dyn_rx_timestamp_register(&offset, &flag) == 0);
+    int again;
+    uint64_t again_flag;
+    assert(rte_mbuf_dyn_rx_timestamp_register(&again, &again_flag) == 0);
+    assert(again == offset && again_flag == flag);
+}
+void ntcp_test_timestamp(uint64_t value, int valid, int corrupt) {
+    int offset = rte_mbuf_dynfield_lookup(RTE_MBUF_DYNFIELD_TIMESTAMP_NAME, NULL);
+    int bit = rte_mbuf_dynflag_lookup(RTE_MBUF_DYNFLAG_RX_TIMESTAMP_NAME, NULL);
+    assert(offset >= 0 && bit >= 0);
+    struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
+    assert(m);
+    void *bytes = rte_pktmbuf_append(m, 64);
+    assert(bytes);
+    memset(bytes, 0x42, 64);
+    *RTE_MBUF_DYNFIELD(m, offset, rte_mbuf_timestamp_t *) = value;
+    // Deliberately leave a stale field value when flag is absent.
+    m->ol_flags = valid ? UINT64_C(1) << bit : 0;
+    if (corrupt) m->pkt_len = 63;
+    assert(rte_ring_enqueue(rx, m) == 0);
+}
+unsigned ntcp_test_tx_count(void) { return rte_ring_count(tx); }
 void ntcp_test_transformed(unsigned kind) {
     struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
     assert(m);
