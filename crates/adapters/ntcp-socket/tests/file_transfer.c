@@ -55,6 +55,20 @@ static void *bridge(void *arg) {
     b->result = splice(b->in, NULL, b->out, NULL, 5, 0);
     return NULL;
 }
+static double now(void) {
+    struct timespec t;
+    assert(clock_gettime(CLOCK_MONOTONIC, &t) == 0);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+struct release_pipe { int fd, drain; };
+static void *release_pipe(void *arg) {
+    struct release_pipe *p = arg;
+    usleep(200000);
+    unsigned char bytes[4096];
+    if (p->drain) assert(read(p->fd, bytes, sizeof(bytes)) == sizeof(bytes));
+    else assert(write(p->fd, data, 5) == 5);
+    return NULL;
+}
 static void cancellation_check(void) {
     int p[2], s[2];
     assert(pipe(p) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, s) == 0);
@@ -73,7 +87,7 @@ int main(int argc, char **argv) {
     freebind_check(); cancellation_check();
     int file = memfd_create("ntcp-file-transfer", MFD_CLOEXEC);
     assert(file >= 0 && write(file, data, sizeof(data)) == sizeof(data));
-    for (int test = 0; test < 15; ++test) {
+    for (int test = 0; test < 26; ++test) {
         fprintf(stderr, "transfer case %d\n", test);
         int fd = connect_to(argv[1]);
         if (test == 0) assert(ftruncate(file, 5) == 0);
@@ -200,14 +214,12 @@ int main(int argc, char **argv) {
             int p[2]; assert(pipe(p) == 0);
             struct timeval timeout = {.tv_usec = 60000};
             assert(setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0);
-            if (getenv("NTCP_SOCKET_TUN")) {
-                struct timespec begin, end;
-                assert(clock_gettime(CLOCK_MONOTONIC, &begin) == 0);
-                assert(splice(p[0], NULL, fd, NULL, 5, 0) == -1 && errno == EAGAIN);
-                assert(clock_gettime(CLOCK_MONOTONIC, &end) == 0);
-                double elapsed = end.tv_sec - begin.tv_sec + (end.tv_nsec - begin.tv_nsec) / 1e9;
-                assert(elapsed >= .04 && elapsed < 1);
-            }
+            struct release_pipe release = {p[1], 0}; pthread_t thread;
+            assert(pthread_create(&thread, NULL, release_pipe, &release) == 0);
+            double begin = now();
+            assert(splice(p[0], NULL, fd, NULL, 5, 0) == 5);
+            assert(now() - begin >= .15);
+            assert(pthread_join(thread, NULL) == 0);
             assert(splice(p[0], NULL, fd, NULL, 5, SPLICE_F_NONBLOCK) == -1 && errno == EAGAIN);
             assert(shutdown(fd, SHUT_WR) == 0);
             assert(write(p[1], data, 5) == 5);
@@ -254,6 +266,65 @@ int main(int argc, char **argv) {
             while (fill) { n = read(p[0], marker, fill < sizeof(marker) ? fill : sizeof(marker)); assert(n > 0); fill -= n; }
             assert(read(p[0], marker, 5) == 5 && memcmp(marker, data, 5) == 0);
             assert(fcntl(p[1], F_GETFL) == O_WRONLY);
+            close(p[0]); close(p[1]);
+        }
+        if (test == 15 || test == 16) {
+            // Fill both TCP queues while the peer deliberately does not read.
+            unsigned char ready; assert(read(fd, &ready, 1) == 1);
+            int value = 4096;
+            assert(setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &value, sizeof(value)) == 0);
+            unsigned char zeros[4096] = {0};
+            double begin = now();
+            do {
+                ssize_t n = send(fd, zeros, sizeof(zeros), MSG_DONTWAIT);
+                if (n < 0) { assert(errno == EAGAIN); usleep(1000); }
+            } while (now() - begin < .3);
+            assert(send(fd, zeros, sizeof(zeros), MSG_DONTWAIT) == -1 && errno == EAGAIN);
+            int p[2]; assert(pipe2(p, test == 16 ? O_NONBLOCK : 0) == 0);
+            assert(write(p[1], data, 5) == 5);
+            begin = now();
+            ssize_t sent = splice(p[0], NULL, fd, NULL, 5, test == 15 ? SPLICE_F_NONBLOCK : 0);
+            fprintf(stderr, "saturated case %d: result %zd errno %d elapsed %.3f\n", test, sent, errno, now() - begin);
+            assert(sent == 5);
+            assert(now() - begin >= .1);
+            close(p[0]); close(p[1]);
+        }
+        if (test == 17) {
+            // Pipe wait exceeds SO_RCVTIMEO; data then arrives within a fresh
+            // socket budget, but after the original budget would have expired.
+            int p[2]; assert(pipe2(p, O_NONBLOCK) == 0);
+            unsigned char marker[4096] = {0}; ssize_t n; size_t fill = 0;
+            while ((n = write(p[1], marker, sizeof(marker))) > 0) fill += n;
+            assert(errno == EAGAIN && fill >= sizeof(marker));
+            assert(fcntl(p[1], F_SETFL, 0) == 0);
+            struct timeval timeout = {.tv_usec = 120000};
+            assert(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+            struct release_pipe release = {p[0], 1}; pthread_t thread;
+            assert(pthread_create(&thread, NULL, release_pipe, &release) == 0);
+            double begin = now();
+            assert(splice(fd, NULL, p[1], NULL, 5, 0) == 5);
+            assert(now() - begin >= .2);
+            assert(pthread_join(thread, NULL) == 0);
+            fill -= sizeof(marker);
+            while (fill) { n = read(p[0], marker, sizeof(marker)); assert(n > 0); fill -= n; }
+            assert(read(p[0], marker, 5) == 5 && memcmp(marker, data, 5) == 0);
+            close(p[0]); close(p[1]);
+        }
+        if (test >= 18) {
+            // Empty TCP source, available pipe: only socket O_NONBLOCK decides
+            // whether to wait, regardless of pipe flags or SPLICE_F_NONBLOCK.
+            int combo = test - 18, p[2];
+            assert(pipe2(p, combo & 2 ? O_NONBLOCK : 0) == 0);
+            if (combo & 4) assert(fcntl(fd, F_SETFL, O_NONBLOCK) == 0);
+            double begin = now();
+            ssize_t n = splice(fd, NULL, p[1], NULL, 5, combo & 1 ? SPLICE_F_NONBLOCK : 0);
+            if (combo & 4) {
+                assert(n == -1 && errno == EAGAIN && now() - begin < .15);
+                assert(fcntl(fd, F_SETFL, 0) == 0);
+                assert(splice(fd, NULL, p[1], NULL, 5, 0) == 5);
+            } else assert(n == 5 && now() - begin >= .15);
+            unsigned char bytes[5];
+            assert(read(p[0], bytes, 5) == 5 && memcmp(bytes, data, 5) == 0);
             close(p[0]); close(p[1]);
         }
         if (test != 11) assert(shutdown(fd, SHUT_WR) == 0);

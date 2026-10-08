@@ -20,9 +20,16 @@ def run(binary, managed=False, preload=False):
     pattern = bytes(n % 251 for n in range(150000))
 
     def peer(listener):
-        for case in range(15):
+        for case in range(26):
             with listener.accept()[0] as conn:
                 conn.settimeout(8)
+                if case in (15, 16):
+                    conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                    conn.sendall(b'R')
+                    time.sleep(.8)
+                if case >= 17:
+                    time.sleep(.27)
+                    conn.sendall(pattern[:5])
                 if case in (6, 7, 10):
                     time.sleep(.4)
                 if case in (8, 10, 13, 14):
@@ -30,8 +37,12 @@ def run(binary, managed=False, preload=False):
                 received = bytearray()
                 while chunk := conn.recv(65536):
                     received.extend(chunk)
-                expected = (pattern[:5] if case in (0, 1, 4, 9, 12) else
+                expected = (pattern[:5] if case in (0, 1, 4, 9, 11, 12) else
                             pattern if case in (2, 3, 5, 6, 7) else b'')
+                if case in (15, 16):
+                    assert len(received) > 5 and received[-5:] == pattern[:5]
+                    assert not any(received[:-5])
+                    continue
                 assert received == expected, (case, len(received), len(expected))
 
     with socket.socket() as listener, concurrent.futures.ThreadPoolExecutor() as pool:

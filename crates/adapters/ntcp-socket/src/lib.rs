@@ -1819,6 +1819,10 @@ fn live_id(id: u64) -> Result<bool> {
         .any(|(&fd, t)| t.id == id && t.matches(fd)))
 }
 fn duplicate(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Result<i64> {
+    duplicate_registered(fd, new, cmd, arg).map(|(fd, _)| fd)
+}
+// Return alias registration from the same admission that pins the source.
+fn duplicate_registered(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Result<(i64, bool)> {
     let kernel = || unsafe {
         match new {
             Some(n) if cmd == SYS_dup3 as i32 => syscall(SYS_dup3, fd, n, arg),
@@ -1833,7 +1837,7 @@ fn duplicate(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Result<i64> {
         && !readiness::tracked_epoll(fd)
         && new.is_none_or(|n| !inherited(&SOCKET_FDS, n) && !readiness::tracked_epoll(n))
     {
-        return raw(kernel());
+        return raw(kernel()).map(|fd| (fd, false));
     }
     mutation_context()?;
     #[cfg(test)]
@@ -1842,7 +1846,7 @@ fn duplicate(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Result<i64> {
             hook();
         }
     });
-    let (result, last) = {
+    let (result, last, registered) = {
         let mut tokens = TOKENS.lock().map_err(|_| EIO)?;
         let _mutation = Mutation::enter();
         #[cfg(test)]
@@ -1855,7 +1859,8 @@ fn duplicate(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Result<i64> {
             return Err(EOPNOTSUPP);
         }
         if new == Some(fd) {
-            return raw(kernel());
+            let registered = tokens.get(&fd).is_some_and(|t| t.matches(fd));
+            return raw(kernel()).map(|fd| (fd, registered));
         }
         if cmd == SYS_dup3 as i32 && arg & !(O_CLOEXEC as c_ulong) != 0 {
             return Err(EINVAL);
@@ -1924,11 +1929,15 @@ fn duplicate(fd: i32, new: Option<i32>, cmd: i32, arg: c_ulong) -> Result<i64> {
             readiness::close_epoll(n)?;
         }
         // Replacing another alias of the source cannot end its OFD lifetime.
-        (result, last.filter(|id| Some(*id) != source))
+        (
+            result,
+            last.filter(|id| Some(*id) != source),
+            source.is_some(),
+        )
     };
     // dup2/dup3 ignore errors from the target's implicit close.
     let _ = finish_close(last);
-    Ok(result)
+    Ok((result, registered))
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ntcp_managed_dup(fd: i32) -> i32 {
@@ -2334,7 +2343,7 @@ mod tests {
                         resume.wait();
                     }))
                 });
-                duplicate(native, Some(target), SYS_dup2 as i32, 0)
+                duplicate_registered(native, Some(target), SYS_dup2 as i32, 0)
             })
         };
         entered.wait();
@@ -2343,7 +2352,7 @@ mod tests {
             Ok(native as i64)
         );
         resume.wait();
-        assert_eq!(worker.join().unwrap(), Ok(target as i64));
+        assert_eq!(worker.join().unwrap(), Ok((target as i64, true)));
         assert_eq!(owned(target), Ok(Some(980)));
         assert_eq!(owned(native), Ok(Some(980)));
         let mut tokens = TOKENS.lock().unwrap();
@@ -2447,6 +2456,11 @@ mod tests {
             unsafe { readiness::epoll_ctl(epfd, EPOLL_CTL_ADD, source, &mut event) },
             0
         );
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { syscall(SYS_pipe2, pipe.as_mut_ptr(), O_CLOEXEC) },
+            0
+        );
         let entered = Arc::new(std::sync::Barrier::new(2));
         let resume = Arc::new(std::sync::Barrier::new(2));
         let worker = {
@@ -2476,6 +2490,19 @@ mod tests {
                 && unsafe { dup3(target, alias, O_CLOEXEC) } == alias
                 && fcntl_alias >= 0
                 && unsafe { close(fcntl_alias) } == 0;
+            // The native input pin is constructed before the inherited output
+            // fails. Its destructor must not acquire the vanished writer's locks.
+            let mixed_transfer = unsafe {
+                file_transfer::ntcp_managed_splice(
+                    pipe[0],
+                    ptr::null_mut(),
+                    source,
+                    ptr::null_mut(),
+                    1,
+                    0,
+                )
+            } == -1
+                && errno() == EOWNERDEAD;
             let managed = unsafe { dup(source) } == -1 && errno() == EOWNERDEAD;
             let managed_target = unsafe { dup2(alias, source) } == -1 && errno() == EOWNERDEAD;
             let epoll_target = unsafe { dup2(alias, epfd) } == -1 && errno() == EOWNERDEAD;
@@ -2491,6 +2518,7 @@ mod tests {
             unsafe {
                 libc::_exit(
                     if native
+                        && mixed_transfer
                         && gate_untouched
                         && managed
                         && managed_target
@@ -2518,7 +2546,7 @@ mod tests {
         assert_eq!(worker.join().unwrap(), Ok(target as i64));
         readiness::close_epoll(epfd).unwrap();
         let mut tokens = TOKENS.lock().unwrap();
-        for fd in [source, target, epfd] {
+        for fd in [source, target, epfd, pipe[0], pipe[1]] {
             tokens.remove(&fd);
             unsafe { syscall(SYS_close, fd) };
         }
@@ -2544,7 +2572,9 @@ mod tests {
     fn native_duplicate_bypasses_locked_tokens() {
         let fd = unsafe { syscall(SYS_eventfd2, 0, EFD_CLOEXEC) as i32 };
         let _tokens = TOKENS.lock().unwrap();
-        let alias = duplicate(fd, None, SYS_dup as i32, 0).unwrap() as i32;
+        let (alias, registered) = duplicate_registered(fd, None, SYS_dup as i32, 0).unwrap();
+        assert!(!registered);
+        let alias = alias as i32;
         assert_eq!(unsafe { close(alias) }, 0);
         assert_eq!(unsafe { close(fd) }, 0);
     }

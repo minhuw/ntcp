@@ -3,14 +3,19 @@ use super::*;
 
 // Registered private aliases pin the logical socket, not just its eventfd.
 // Native duplicates pin the open file description across close/dup replacement.
-struct PinnedFd(i32);
+struct PinnedFd(i32, bool);
 impl PinnedFd {
     fn new(fd: i32) -> Result<Self> {
-        Ok(Self(duplicate(fd, None, F_DUPFD_CLOEXEC, 0)? as i32))
+        let (fd, registered) = duplicate_registered(fd, None, F_DUPFD_CLOEXEC, 0)?;
+        Ok(Self(fd as i32, registered))
     }
 }
 impl Drop for PinnedFd {
     fn drop(&mut self) {
+        if !self.1 {
+            unsafe { syscall(SYS_close, self.0) };
+            return;
+        }
         let last = if let Ok(mut tokens) = TOKENS.lock() {
             let _mutation = Mutation::enter();
             unsafe { syscall(SYS_close, self.0) };
@@ -68,19 +73,22 @@ fn broken_pipe() -> Result<i64> {
     };
     Err(EPIPE)
 }
-fn pipe_wait(fd: i32, events: i16, deadline: &Deadline) -> Result<()> {
+fn pipe_wait(fd: i32, events: i16, deadline: &mut Deadline) -> Result<()> {
     let mut p = pollfd {
         fd,
         events,
         revents: 0,
     };
-    raw(unsafe { syscall(SYS_poll, &mut p, 1, deadline.poll_ms()?) })?;
+    // Native pipe availability is independent of the socket timeout. Start
+    // a fresh socket budget only after the pipe has become ready.
+    raw(unsafe { syscall(SYS_poll, &mut p, 1, -1) })?;
+    deadline.start = std::time::Instant::now();
     Ok(())
 }
 fn send_source(id: u64, source: i32, offset: Option<usize>, n: usize, flags: u32) -> Result<i64> {
     let pipe_nonblock = offset.is_none() && pipe_nonblock(source, false, flags)?;
-    let dontwait = pipe_nonblock || !blocking(id)?;
-    let deadline = Deadline::socket(id, true, false)?;
+    let dontwait = !blocking(id)?;
+    let mut deadline = Deadline::socket(id, true, false)?;
     let pipe = Pipe::new()?;
     loop {
         if offset.is_none() {
@@ -92,7 +100,7 @@ fn send_source(id: u64, source: i32, offset: Option<usize>, n: usize, flags: u32
                 if pipe_nonblock {
                     return Err(EAGAIN);
                 }
-                pipe_wait(source, POLLIN, &deadline)?;
+                pipe_wait(source, POLLIN, &mut deadline)?;
                 continue;
             }
         }
@@ -115,7 +123,7 @@ fn send_source(id: u64, source: i32, offset: Option<usize>, n: usize, flags: u32
                 if pipe_nonblock || offset.is_some() {
                     return Err(EAGAIN);
                 }
-                pipe_wait(source, POLLIN, &deadline)?;
+                pipe_wait(source, POLLIN, &mut deadline)?;
             }
             Err(EAGAIN) if !dontwait => wait_until(id, EPOLLOUT, &deadline)?,
             Err(EPIPE) => return broken_pipe(),
@@ -125,8 +133,8 @@ fn send_source(id: u64, source: i32, offset: Option<usize>, n: usize, flags: u32
 }
 fn receive_pipe(fd: i32, id: u64, output: i32, n: usize, flags: u32) -> Result<i64> {
     let pipe_nonblock = pipe_nonblock(output, true, flags)?;
-    let dontwait = pipe_nonblock || !blocking(id)?;
-    let deadline = Deadline::socket(id, false, false)?;
+    let dontwait = !blocking(id)?;
+    let mut deadline = Deadline::socket(id, false, false)?;
     let input = TOKENS
         .lock()
         .map_err(|_| EIO)?
@@ -154,7 +162,7 @@ fn receive_pipe(fd: i32, id: u64, output: i32, n: usize, flags: u32) -> Result<i
             if pipe_nonblock {
                 return Err(EAGAIN);
             }
-            pipe_wait(output, POLLOUT, &deadline)?;
+            pipe_wait(output, POLLOUT, &mut deadline)?;
             continue;
         }
         let urgent = call(id, Op::UrgentRemaining)?.timeout_us;
@@ -201,7 +209,9 @@ fn receive_pipe(fd: i32, id: u64, output: i32, n: usize, flags: u32) -> Result<i
             },
         );
         match result {
-            Err(EAGAIN) if pipe_blocked && !pipe_nonblock => pipe_wait(output, POLLOUT, &deadline)?,
+            Err(EAGAIN) if pipe_blocked && !pipe_nonblock => {
+                pipe_wait(output, POLLOUT, &mut deadline)?
+            }
             Err(EAGAIN) if !pipe_blocked && !dontwait => wait_until(id, EPOLLIN, &deadline)?,
             other => return other,
         }
