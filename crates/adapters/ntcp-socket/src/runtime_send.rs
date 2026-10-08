@@ -102,6 +102,9 @@ impl Owner {
             BYTES
         };
         if room == 0 {
+            self.endpoint
+                .record_send_backpressure(cid.unwrap())
+                .map_err(engine)?;
             return Err(EAGAIN);
         }
         let completion = if cid.is_some() {

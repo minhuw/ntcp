@@ -466,13 +466,13 @@ fn timestamp_runtime_generation_reporting_and_syn_id_bases() {
 mod timestamp_allocator {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
-    std::thread_local! { static FAIL: Cell<bool> = const { Cell::new(false) }; }
+    std::thread_local! { static FAIL: Cell<Option<usize>> = const { Cell::new(None) }; }
     struct Allocator;
     #[global_allocator]
     static ALLOCATOR: Allocator = Allocator;
     unsafe impl GlobalAlloc for Allocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            if FAIL.try_with(Cell::get).unwrap_or(false) {
+            if should_fail() {
                 std::ptr::null_mut()
             } else {
                 unsafe { System.alloc(layout) }
@@ -482,21 +482,35 @@ mod timestamp_allocator {
             unsafe { System.dealloc(ptr, layout) }
         }
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-            if FAIL.try_with(Cell::get).unwrap_or(false) {
+            if should_fail() {
                 std::ptr::null_mut()
             } else {
                 unsafe { System.realloc(ptr, layout, size) }
             }
         }
     }
+    fn should_fail() -> bool {
+        FAIL.try_with(|remaining| match remaining.get() {
+            None => false,
+            Some(0) => true,
+            Some(n) => {
+                remaining.set(Some(n - 1));
+                false
+            }
+        })
+        .unwrap_or(false)
+    }
     pub(super) fn failing<T>(f: impl FnOnce() -> T) -> T {
+        fail_after(0, f)
+    }
+    pub(super) fn fail_after<T>(count: usize, f: impl FnOnce() -> T) -> T {
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
-                FAIL.set(false);
+                FAIL.set(None);
             }
         }
-        FAIL.set(true);
+        FAIL.set(Some(count));
         let _reset = Reset;
         f()
     }

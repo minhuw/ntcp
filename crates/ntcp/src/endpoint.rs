@@ -1978,6 +1978,13 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Record a blocked adapter admission without changing send boundaries.
+    /// LOWAT-only exhaustion is not byte-buffer backpressure.
+    pub fn record_send_backpressure(&mut self, id: ConnectionId) -> Result<(), EndpointError> {
+        self.slot_mut(id)?.connection.record_send_backpressure();
+        Ok(())
+    }
+
     // Finalize an accepted stream prefix without writing or discarding bytes.
     // force releases queued output even under MORE/CORK, not future writes.
     pub fn finish_send(

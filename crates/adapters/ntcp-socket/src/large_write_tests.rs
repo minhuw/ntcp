@@ -363,3 +363,161 @@ fn logical_later_copy_fault_preserves_only_prior_admitted_chunk_and_metadata() {
         }
     }
 }
+
+#[test]
+fn logical_option_change_preserves_deferred_completion_reservations() {
+    let (mut a, mut b, client, _, _) = pair();
+    a.execute(client, Op::Set(SOL_SOCKET, SO_SNDBUF, 1000))
+        .unwrap();
+    a.execute(client, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 1))
+        .unwrap();
+    let flags = ts::TX_SCHED | ts::TX_SOFTWARE | ts::TX_ACK | ts::SOFTWARE | ts::OPT_TSONLY;
+    timestamp_set(&mut a, client, flags);
+    // A queued non-coalescing completion makes the joint reservation five
+    // slots; reserving only three timestamp phases after cloning leaves four.
+    a.sockets
+        .get_mut(&client)
+        .unwrap()
+        .completions
+        .push_back(Completion::ZeroCopy(10, 10));
+    let bytes = vec![1; 150000];
+    let (mut request, reply) = logical_request(
+        &mut a,
+        client,
+        Op::Send(vec![(bytes.as_ptr() as usize, bytes.len())], MSG_ZEROCOPY),
+    );
+    assert!(!a.service(&mut request));
+    let Handle::Connection(cid) = a.sockets[&client].handle else {
+        unreachable!()
+    };
+    let progress = a.endpoint.send_progress(cid).unwrap();
+    let charge = a.timestamp_charge();
+    let capacity = a.sockets[&client].completions.capacity();
+    // Readiness, queue and pending clones allocate first. Fail restoration of
+    // empty observations, then the joint queue, leaving the original untouched.
+    for after in [3, 4] {
+        assert_eq!(
+            timestamp_allocator::fail_after(after, || a
+                .execute(client, Op::Set(IPPROTO_TCP, TCP_INQ, 1)))
+            .unwrap_err(),
+            ENOBUFS
+        );
+        assert!(!a.sockets[&client].inq);
+        assert_eq!(a.sockets[&client].completions.len(), 1);
+        assert_eq!(a.sockets[&client].completions[0].range(), Some((10, 10)));
+        assert_eq!(a.timestamp_charge(), charge);
+        assert_eq!(a.sockets[&client].completions.capacity(), capacity);
+        assert_eq!(a.sockets[&client].timestamps.reserved(), 3);
+        assert_eq!(a.sockets[&client].zc_reserved, 1);
+        assert_eq!(a.endpoint.send_progress(cid).unwrap(), progress);
+    }
+    a.execute(client, Op::Set(IPPROTO_TCP, TCP_INQ, 1)).unwrap();
+    assert!(a.sockets[&client].completions.capacity() >= 5);
+    // Timestamp options mutate in place and must preserve the same reservations.
+    timestamp_set(&mut a, client, flags);
+    let capacity = a.sockets[&client].completions.capacity();
+    assert_eq!(a.timestamp_charge(), charge);
+    advance(&mut a, &mut b);
+    // Also restore a partially filled observation vector, whose clone has len
+    // capacity rather than the four slots reserved before acceptance.
+    let charge = a.timestamp_charge();
+    a.execute(client, Op::Set(IPPROTO_TCP, TCP_INQ, 0)).unwrap();
+    assert_eq!(a.timestamp_charge(), charge);
+    let mut send = request.send.take().unwrap();
+    let result = timestamp_allocator::failing(|| a.finish_send(client, &mut send, Err(EAGAIN)));
+    assert_eq!(result.unwrap().value, 4608);
+    assert_eq!(timestamp_records(&a, client).len(), 3);
+    drop(reply);
+    assert_eq!(a.sockets[&client].completions.capacity(), capacity);
+    assert_eq!(a.sockets[&client].zc_reserved, 0);
+    assert!(
+        a.sockets[&client]
+            .completions
+            .iter()
+            .any(|c| c.range() == Some((0, 0)))
+    );
+}
+
+#[test]
+fn logical_zero_progress_backpressure_counts_byte_capacity_not_lowat() {
+    for lowat in [false, true] {
+        let (mut a, mut b, client, server, _) = pair();
+        // Grow cwnd before measuring application starvation, without holding ACKs
+        // during setup. The measured phase below withholds all ACKs.
+        a.execute(client, Op::Write(vec![0; 20000])).unwrap();
+        advance(&mut a, &mut b);
+        advance(&mut a, &mut b);
+        assert_eq!(
+            b.execute(server, Op::Read(BYTES)).unwrap().bytes.len(),
+            20000
+        );
+        advance(&mut a, &mut b);
+        a.execute(client, Op::Set(SOL_SOCKET, SO_SNDBUF, 1000))
+            .unwrap();
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
+            .unwrap();
+        if lowat {
+            a.execute(client, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, 4608))
+                .unwrap();
+            // LOWAT blocks first, but subsequently filling exactly must not
+            // retroactively turn that LOWAT-only rejection into NOSPACE.
+            a.execute(client, Op::Set(SOL_SOCKET, SO_SNDBUF, 4608))
+                .unwrap();
+        }
+        let bytes = vec![1; 4608];
+        assert_eq!(
+            a.execute(
+                client,
+                Op::Send(vec![(bytes.as_ptr() as usize, bytes.len())], MSG_EOR)
+            )
+            .unwrap()
+            .value,
+            4608
+        );
+        assert_eq!(
+            a.execute(client, Op::Send(vec![(1, 1)], MSG_MORE | MSG_EOR))
+                .unwrap_err(),
+            EAGAIN
+        );
+        let Handle::Connection(cid) = a.sockets[&client].handle else {
+            unreachable!()
+        };
+        if lowat {
+            // Keep LOWAT unchanged: output frees unsent credit, not byte capacity.
+            let mut packet = [0; 1480];
+            while a
+                .endpoint
+                .poll_transmit(a.now(), &mut packet, 32)
+                .unwrap()
+                .packet
+                .is_some()
+            {}
+            assert_eq!(
+                a.execute(
+                    client,
+                    Op::Send(vec![(bytes.as_ptr() as usize, bytes.len())], 0)
+                )
+                .unwrap()
+                .value,
+                4608
+            );
+        }
+        let mut packet = [0; 1480];
+        while a
+            .endpoint
+            .poll_transmit(a.now(), &mut packet, 32)
+            .unwrap()
+            .packet
+            .is_some()
+        {}
+        assert_eq!(a.endpoint.transport_info(cid).unwrap().notsent_bytes, 0);
+        a.epoch -= std::time::Duration::from_millis(20);
+        a.endpoint.on_timeout(a.now(), BUDGET).unwrap();
+        let limited = a.endpoint.transport_info(cid).unwrap().sndbuf_limited_us;
+        if lowat {
+            assert_eq!(limited, 0);
+        } else {
+            assert!(limited >= 20_000, "{limited}");
+        }
+    }
+}

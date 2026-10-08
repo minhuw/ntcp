@@ -77,6 +77,7 @@ impl TimestampState {
         self.pending.iter().map(|p| p.phases).sum()
     }
     pub(super) fn staging_charge(&self) -> usize {
+        // Clone storage plus replacement observation storage can coexist.
         self.pending.len() * std::mem::size_of::<Pending>()
             + self
                 .pending
@@ -84,9 +85,19 @@ impl TimestampState {
                 .map(|p| {
                     p.observed
                         .as_ref()
-                        .map_or(0, |v| v.capacity() * std::mem::size_of::<Observation>())
+                        .map_or(0, |v| (v.len() + 4) * std::mem::size_of::<Observation>())
                 })
                 .sum::<usize>()
+    }
+    pub(super) fn restore_reservations(&mut self) -> Result<()> {
+        for pending in &mut self.pending {
+            if let Some(observed) = &mut pending.observed {
+                observed
+                    .try_reserve_exact(4 - observed.len())
+                    .map_err(|_| ENOBUFS)?;
+            }
+        }
+        Ok(())
     }
     fn charge(&self) -> usize {
         self.pending.capacity() * std::mem::size_of::<Pending>()

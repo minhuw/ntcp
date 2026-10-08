@@ -2969,6 +2969,10 @@ impl Connection {
         self.arm_work();
     }
 
+    pub(crate) fn record_send_backpressure(&mut self) {
+        self.send_backpressured |= self.send.remaining() == 0;
+    }
+
     pub(crate) fn finish_send(&mut self, end: u64, more: bool, end_of_record: bool, force: bool) {
         if let Some(offset) = end
             .checked_sub(self.acknowledged)
@@ -2981,7 +2985,7 @@ impl Connection {
             self.more = more;
         }
         if force {
-            self.send_backpressured |= self.send.remaining() == 0;
+            self.record_send_backpressure();
             self.release_corked();
         }
         self.arm_work();

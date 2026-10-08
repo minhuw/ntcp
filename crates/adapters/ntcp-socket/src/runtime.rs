@@ -1736,7 +1736,7 @@ impl Owner {
                 // queue capacity; cloning Arc packet references copies no payload.
                 if self.timestamp_charge()
                     + s.timestamps.staging_charge()
-                    + (s.completions.len() + s.timestamps.reserved())
+                    + (s.completions.len() + s.timestamps.reserved() + s.zc_reserved)
                         * 2
                         * std::mem::size_of::<Completion>()
                     > timestamps::RUNTIME_BYTES
@@ -1744,9 +1744,10 @@ impl Owner {
                     return Err(ENOBUFS);
                 }
                 let mut candidate = s.clone();
+                candidate.timestamps.restore_reservations()?;
                 candidate
                     .completions
-                    .try_reserve(candidate.timestamps.reserved())
+                    .try_reserve_exact(candidate.timestamps.reserved() + candidate.zc_reserved)
                     .map_err(|_| ENOBUFS)?;
                 let s = &mut candidate;
                 match (level, name) {
