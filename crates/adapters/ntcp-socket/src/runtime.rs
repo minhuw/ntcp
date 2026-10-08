@@ -777,9 +777,19 @@ impl Owner {
                 })
                 .map(|s| (s.tos, s.discover, s.zerocopy))
         });
+        // Reserve only for checked passive SYNs: LISTEN ACKs need stateless
+        // resets, and existing TIME-WAIT traffic still needs core processing.
+        // TIME-WAIT reopening accepts only a pure SYN (plus ECN), no payload.
         if listener_options.is_some()
             && before
                 .is_none_or(|id| matches!(self.endpoint.state(id), Ok(State::TimeWait) | Err(_)))
+            && ntcp::wire::parse(ip, bytes).is_ok_and(|segment| {
+                let flags = segment.header.flags;
+                flags & (ntcp::wire::SYN | ntcp::wire::ACK | ntcp::wire::RST) == ntcp::wire::SYN
+                    && (before.is_none()
+                        || (flags & !(ntcp::wire::ECE | ntcp::wire::CWR) == ntcp::wire::SYN
+                            && segment.payload.is_empty()))
+            })
         {
             self.connection_options
                 .retain(|p| self.endpoint.connection_exists(p.0));
@@ -1607,7 +1617,7 @@ impl Owner {
                     return Err(e);
                 }
                 match self.endpoint.state(cid).map_err(engine)? {
-                    State::Established => (),
+                    State::Established | State::CloseWait => (),
                     State::Closed => return Err(ECONNREFUSED),
                     _ => return Err(EAGAIN),
                 }
@@ -1680,6 +1690,39 @@ mod tests {
         let server = b.execute(listen, Op::Accept(SOCK_NONBLOCK)).unwrap().value as u64;
         (a, b, client, server, listen)
     }
+    #[test]
+    fn finish_connect_after_handshake_and_immediate_fin() {
+        let (mut a, mut b, _, _, listen) = pair();
+        let client = new(&mut a, 0);
+        assert_eq!(
+            a.execute(client, Op::Connect("10.73.0.3:16379".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        let (reply, completed) = mpsc::sync_channel(1);
+        let request = Request {
+            id: client,
+            op: Op::Wait(Box::new(Op::FinishConnect), None),
+            reply,
+            deadline: None,
+        };
+        assert!(!a.service(&request));
+        pump(&mut a, &mut b);
+        let server = b.execute(listen, Op::Accept(0)).unwrap().value as u64;
+        b.execute(server, Op::Shutdown(SHUT_WR)).unwrap();
+        pump(&mut a, &mut b);
+        let Handle::Connection(cid) = a.sockets[&client].handle else {
+            panic!()
+        };
+        assert_eq!(a.endpoint.state(cid), Ok(State::CloseWait));
+        assert_eq!(a.execute(client, Op::FinishConnect).unwrap().value, 0);
+        // The libc blocking connect retry and owner pending-request service
+        // share FinishConnect; neither may keep waiting after the peer's FIN.
+        assert!(a.service(&request));
+        assert_eq!(completed.try_recv().unwrap().unwrap().value, 0);
+        assert_eq!(a.execute(client, Op::Read(8)).unwrap().value, 0);
+    }
+
     #[test]
     fn peek_dispatch_and_timeout_inheritance() {
         let (mut a, mut b, client, server, listen) = pair();

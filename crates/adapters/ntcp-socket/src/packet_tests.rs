@@ -2632,6 +2632,110 @@ fn ip_options_listener_snapshot_accept_detached_fin_and_fd_reuse() {
 }
 
 #[test]
+fn saturated_options_preserve_time_wait_ack_and_listener_reset() {
+    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let mut config = crate::packet_profile::config(Profile::Baseline);
+    config.max_connections = LIMIT + 1; // Core still has room when metadata fills.
+    config.connection.receive_capacity = 128;
+    config.connection.send_capacity = 128;
+    owner.inner.endpoint = Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+    let listener = owner.alloc(Socket::new(0)).unwrap();
+    owner.sockets.get_mut(&listener).unwrap().receive_capacity = 128;
+    owner.sockets.get_mut(&listener).unwrap().send_capacity = 128;
+    owner
+        .inner
+        .execute(listener, Op::Bind(SocketAddr::new(local().into(), 8080)))
+        .unwrap();
+    owner
+        .inner
+        .execute(listener, Op::Listen(LIMIT as i32))
+        .unwrap();
+    owner.inner.execute(0, Op::Inject(syn(100, 8080))).unwrap();
+    let (tx, bytes) = poll_frame(&mut owner).unwrap();
+    let sent = packet_header(&bytes);
+    let (ip, ack) = reverse_ack(tx, sent, sent.sequence.wrapping_add(1));
+    input_packet(&mut owner, ip, ack, &[]);
+    let fd = owner.inner.execute(listener, Op::Accept(0)).unwrap().value as u64;
+    let id = owner.connection(fd).unwrap();
+    owner.inner.execute(fd, Op::Close).unwrap();
+    let (tx, bytes) = poll_frame(&mut owner).unwrap();
+    let fin = packet_header(&bytes);
+    assert_ne!(fin.flags & ntcp::wire::FIN, 0);
+    let (ip, mut peer_fin) = reverse_ack(tx, fin, fin.sequence.wrapping_add(1));
+    peer_fin.flags |= ntcp::wire::FIN;
+    input_packet(&mut owner, ip, peer_fin, &[]);
+    assert_eq!(owner.inner.endpoint.state(id), Ok(State::TimeWait));
+    assert_eq!(
+        packet_header(&poll_frame(&mut owner).unwrap().1).flags,
+        ntcp::wire::ACK
+    );
+
+    let (_, tcp) = parse_frame(&syn(100, 8080))
+        .map(|(ip, tcp)| (ip, tcp.to_vec()))
+        .unwrap();
+    let mut incoming = ntcp::wire::parse(ip, &tcp).unwrap().header;
+    for port in 50001..50000 + LIMIT as u16 {
+        incoming.source_port = port;
+        input_packet(&mut owner, ip, incoming, &[]);
+        assert_ne!(
+            packet_header(&poll_frame(&mut owner).unwrap().1).flags & ntcp::wire::SYN,
+            0
+        );
+    }
+    assert_eq!(owner.connection_options.len(), LIMIT);
+    let retained_bytes = owner.inner.endpoint.buffer_bytes();
+    for released in [false, true] {
+        if released {
+            owner.inner.endpoint.release(id).unwrap();
+        }
+        input_packet(&mut owner, ip, peer_fin, &[]);
+        let (tx, bytes) = poll_frame(&mut owner).unwrap();
+        assert_eq!(tx.connection, Some(id));
+        assert_eq!(packet_header(&bytes).flags, ntcp::wire::ACK);
+        incoming.source_port = 51000;
+        incoming.flags = ntcp::wire::ACK;
+        incoming.acknowledgment = 1234;
+        input_packet(&mut owner, ip, incoming, &[]);
+        let (tx, bytes) = poll_frame(&mut owner).unwrap();
+        assert_eq!(tx.connection, None);
+        let reset = packet_header(&bytes);
+        assert_eq!(reset.flags, ntcp::wire::RST);
+        assert_eq!(reset.sequence, 1234);
+        assert_eq!(owner.connection_options.len(), LIMIT);
+        assert_eq!(owner.inner.endpoint.buffer_bytes(), retained_bytes);
+    }
+    incoming.flags = ntcp::wire::SYN;
+    let mut bytes = [0; 64];
+    let len = ntcp::wire::encode(ip, incoming, &[], &[], &mut bytes).unwrap();
+    assert_eq!(
+        owner.inner.input(owner.inner.now(), ip, 0, &bytes[..len]),
+        Err(EndpointError::LimitReached)
+    );
+    let packet = frame(
+        ntcp::Transmit {
+            connection: None,
+            ip,
+            len,
+            ..tx
+        },
+        &bytes[..len],
+    )
+    .unwrap();
+    assert_eq!(
+        owner.inner.execute(0, Op::Inject(packet)).unwrap_err(),
+        ENOBUFS
+    );
+    bytes[16] ^= 1; // Invalid SYN must reach core validation, not reservation.
+    assert_eq!(
+        owner.inner.input(owner.inner.now(), ip, 0, &bytes[..len]),
+        Ok(ntcp::InputDisposition::Dropped)
+    );
+    assert_eq!(owner.connection_options.len(), LIMIT);
+    assert_eq!(owner.inner.endpoint.buffer_bytes(), retained_bytes);
+    assert!(poll_frame(&mut owner).is_none());
+}
+
+#[test]
 fn pending_accept_does_not_block_packets_and_stop_joins() {
     let adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
     let fd = call(&adapter, 1, 0, 0, vec![], 0).unwrap().value as u64;
