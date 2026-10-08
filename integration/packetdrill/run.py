@@ -120,6 +120,29 @@ def invoke(argv, cwd, timeout):
         return code, expired, log
 
 
+def check_plugin_hash(plugin, expected):
+    if hashlib.sha256(plugin.read_bytes()).hexdigest() != expected:
+        raise ValueError('packetdrill plugin changed after backend verification')
+
+
+def verify_backend(plugin, timeout):
+    # An interposer must never be loaded into this runner's own Python process.
+    digest = hashlib.sha256(plugin.read_bytes()).hexdigest()
+    helper = ('import ctypes, sys; '
+              'library = ctypes.CDLL(sys.argv[1]); '
+              'identity = library.ntcp_packetdrill_backend; '
+              'identity.argtypes = []; identity.restype = ctypes.c_char_p; '
+              'print(identity().decode("ascii"))')
+    code, expired, log = invoke([sys.executable, '-I', '-c', helper, str(plugin)],
+                                plugin.parent, min(timeout, 5))
+    if expired or code != 0 or log.strip() != 'ntcp-socket':
+        raise ValueError('packetdrill plugin backend verification failed '
+                         f'(expected ntcp-socket, returncode={code}, timeout={expired}): '
+                         + log.strip())
+    check_plugin_hash(plugin, digest)
+    return 'ntcp-socket', digest
+
+
 def outcome(code, expired, log):
     if expired:
         return 'timeout'
@@ -220,6 +243,10 @@ def main():
         parser.error(f'build the pinned external runner first: {runner}')
     if not plugin.is_file():
         parser.error(f'build ntcp-packetdrill first: {plugin}')
+    try:
+        socket_backend, plugin_sha256 = verify_backend(plugin, args.timeout)
+    except (ValueError, OSError) as error:
+        parser.error(str(error))
     manifest_bytes = (HERE / 'adaptations.json').read_bytes() if args.suite == 'adapted' else None
     manifest = json.loads(manifest_bytes) if manifest_bytes is not None else None
     upstream = args.suite in ('upstream', 'adapted')
@@ -260,6 +287,8 @@ def main():
             if manifest is not None and so_flags is None:
                 so_flags = manifest['scripts'][row['script']]['adapter_flags']
             row['effective_flags']['adapter'] = so_flags
+            profiles = [flag for flag in so_flags.split(',') if not flag.startswith('local=')]
+            row['effective_flags']['profile'] = profiles[0] if len(profiles) == 1 else None
             execution_script = script
             if manifest is not None:
                 try:
@@ -300,11 +329,20 @@ def main():
                         argv = ['unshare', '--user', '--map-root-user', '--net',
                                 *preload, str(runner), f'--so_filename={plugin}',
                                 f'--so_flags={so_flags}', *flags, str(execution_script)]
-                        code, expired, log = invoke(argv, execution_script.parent, args.timeout)
+                        try:
+                            check_plugin_hash(plugin, plugin_sha256)
+                            code, expired, log = invoke(argv, execution_script.parent, args.timeout)
+                            check_plugin_hash(plugin, plugin_sha256)
+                        except (ValueError, OSError) as error:
+                            parser.error(str(error))
                         row.update(status=outcome(code, expired, log), returncode=code,
                                    behavior_executed=True, log=log)
             results.append(row)
             print(f'{row["status"]}: {row["script"]} ({variant}, {args.suite})', flush=True)
+    try:
+        check_plugin_hash(plugin, plugin_sha256)
+    except (ValueError, OSError) as error:
+        parser.error(str(error))
     counts = dict(collections.Counter(row['status'] for row in results))
     report = {'upstream_revision': revision, 'suite': args.suite,
               'adapter_flags': args.so_flags, 'script_files': selected_script_files,
@@ -318,7 +356,8 @@ def main():
               'runner_path': str(runner),
               'runner_sha256': hashlib.sha256(runner.read_bytes()).hexdigest(),
               'plugin_path': str(plugin),
-              'plugin_sha256': hashlib.sha256(plugin.read_bytes()).hexdigest(),
+              'plugin_sha256': plugin_sha256,
+              'socket_backend': socket_backend,
               'counts': counts, 'total': len(results), 'results': results,
               'all_passed': bool(results) and len(results) == len(cases) and all(
                   row['status'] == 'passed' and row['behavior_executed']

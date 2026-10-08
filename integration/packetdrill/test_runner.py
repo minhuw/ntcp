@@ -4,13 +4,24 @@ import json
 import os
 import re
 import signal
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from run import HERE, PIN, adapt_source, invoke, main, outcome, preflight, select_cases, variants
+from run import (HERE, PIN, adapt_source, check_plugin_hash, invoke, main, outcome,
+                 preflight, select_cases, variants, verify_backend)
+
+
+def mock_backend(test):
+    # Main-flow fixtures mock executable boundaries, not behavioral passes.
+    patcher = patch('run.verify_backend', side_effect=lambda plugin, timeout:
+                    ('ntcp-socket', hashlib.sha256(plugin.read_bytes()).hexdigest()))
+    patcher.start()
+    test.addCleanup(patcher.stop)
 
 
 BASIC17 = (
@@ -123,7 +134,109 @@ class RunnerChecks(unittest.TestCase):
             self.assertFalse(expired)
 
 
+class BackendChecks(unittest.TestCase):
+    def test_isolated_identity_rejects_stale_wrong_null_and_absent_libraries(self):
+        compiler = shutil.which('cc')
+        if compiler is None:
+            self.skipTest('C compiler unavailable for identity-only shared-library fixtures')
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            plugin = directory / 'plugin.so'
+            with self.assertRaises(OSError):
+                verify_backend(plugin, 5)
+            for source, valid in (
+                ('int legacy_backend(void) { return 0; }', False),
+                ('const char *ntcp_packetdrill_backend(void) { return "legacy"; }', False),
+                ('const char *ntcp_packetdrill_backend(void) { return 0; }', False),
+                ('const char *ntcp_packetdrill_backend(void) { return "ntcp-socket"; }', True),
+            ):
+                with self.subTest(source=source):
+                    subprocess.run([compiler, '-shared', '-fPIC', '-x', 'c', '-',
+                                    '-o', str(plugin)], input=source, text=True, check=True,
+                                   capture_output=True)
+                    if valid:
+                        backend, digest = verify_backend(plugin, 5)
+                        self.assertEqual(backend, 'ntcp-socket')
+                        self.assertEqual(digest, hashlib.sha256(plugin.read_bytes()).hexdigest())
+                        check_plugin_hash(plugin, digest)
+                        plugin.write_bytes(b'changed')
+                        with self.assertRaisesRegex(ValueError, 'changed after backend verification'):
+                            check_plugin_hash(plugin, digest)
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'backend verification failed'):
+                            verify_backend(plugin, 5)
+
+    def test_identity_helper_is_bounded_and_hash_bound(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            plugin = Path(temporary) / 'plugin.so'
+            plugin.write_bytes(b'identity fixture')
+            with patch('run.invoke', return_value=(0, False, 'ntcp-socket\n')) as execute:
+                verify_backend(plugin, 30)
+            argv, cwd, timeout = execute.call_args.args
+            self.assertEqual(argv[:3], [sys.executable, '-I', '-c'])
+            self.assertEqual(argv[-1], str(plugin))
+            self.assertEqual((cwd, timeout), (plugin.parent, 5))
+            for result in ((-9, True, ''), (-11, False, ''),
+                           (0, False, 'ntcp-socket\nNTCP_PACKETDRILL_FAILURE: error')):
+                with patch('run.invoke', return_value=result):
+                    with self.assertRaisesRegex(ValueError, 'backend verification failed'):
+                        verify_backend(plugin, 0.1)
+
+            def replace_library(*args):
+                plugin.write_bytes(b'replacement')
+                return 0, False, 'ntcp-socket\n'
+
+            with patch('run.invoke', side_effect=replace_library):
+                with self.assertRaisesRegex(ValueError, 'changed after backend verification'):
+                    verify_backend(plugin, 5)
+
+
 class SelectionChecks(unittest.TestCase):
+    def setUp(self):
+        mock_backend(self)
+
+    def test_main_rejects_unverified_and_replaced_plugins_without_passing_report(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            runner = checkout / PIN['runner']
+            runner.parent.mkdir(parents=True)
+            runner.write_text('runner')
+            runner.chmod(0o700)
+            plugin = checkout / 'plugin.so'
+            tests = checkout / 'tests'
+            tests.mkdir()
+            (tests / 'basic.pkt').write_text('0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3')
+            report = checkout / 'report.json'
+            argv = ['run.py', '--checkout', str(checkout), '--plugin', str(plugin),
+                    '--report', str(report)]
+            with patch('run.HERE', checkout), \
+                    patch('run.check_checkout', return_value=PIN['revision']), \
+                    patch.object(sys, 'argv', argv):
+                plugin.write_bytes(b'plugin')
+                with patch('run.verify_backend', side_effect=ValueError('wrong backend')), \
+                        patch('run.invoke') as execute:
+                    with self.assertRaises(SystemExit) as error:
+                        main()
+                    self.assertEqual(error.exception.code, 2)
+                    execute.assert_not_called()
+                    self.assertFalse(report.exists())
+                for replace_on_call in (1, 2):
+                    plugin.write_bytes(b'plugin')
+                    calls = []
+
+                    def execute(*args):
+                        calls.append(args)
+                        if len(calls) == replace_on_call:
+                            plugin.write_bytes(b'replaced')
+                        return 0, False, ''
+
+                    with patch('run.invoke', side_effect=execute):
+                        with self.assertRaises(SystemExit) as error:
+                            main()
+                    self.assertEqual(error.exception.code, 2)
+                    self.assertEqual(len(calls), replace_on_call)
+                    self.assertFalse(report.exists())
+
     def test_selection_combinations_and_exclusion_reasons(self):
         directory = Path('/tests')
         scripts = [directory / name for name in ('basic.pkt', 'only-v4.pkt', 'only-v6.pkt')]
@@ -212,6 +325,10 @@ class SelectionChecks(unittest.TestCase):
                                 side_effect=[(0, False, ''), (code, expired, log)]) as execute:
                             self.assertEqual(main(), 0 if status == 'passed' else 1)
                         data = json.loads(report.read_text())
+                        self.assertEqual(data['socket_backend'], 'ntcp-socket')
+                        self.assertEqual(data['plugin_sha256'], hashlib.sha256(plugin.read_bytes()).hexdigest())
+                        self.assertEqual(data['results'][0]['effective_flags']['profile'],
+                                         'sack' if suite == 'sack' else 'baseline')
                         self.assertEqual(data['all_passed'], status == 'passed')
                         self.assertEqual(data['counts'], {status: 1})
                         self.assertEqual(data['eligible_script_files'], 2)
@@ -259,6 +376,7 @@ class SelectionChecks(unittest.TestCase):
 
 class AdaptationChecks(unittest.TestCase):
     def setUp(self):
+        mock_backend(self)
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name) / PIN['tcp_tests']
@@ -576,6 +694,8 @@ class AdaptationChecks(unittest.TestCase):
             self.assertEqual(row['suite'], 'adapted')
             self.assertEqual(row['effective_flags']['adapter'],
                              self.manifest['scripts'][row['script']]['adapter_flags'])
+            self.assertEqual(row['effective_flags']['profile'],
+                             row['effective_flags']['adapter'].split(',')[0])
             self.assertIn('generated_sha256', row['adaptation'])
             self.assertEqual(row['behavior_executed'], row['variant'] == 'ipv4')
             self.assertEqual(row['adapted'], row['variant'] == 'ipv4')
@@ -643,6 +763,7 @@ class AdaptationChecks(unittest.TestCase):
 
 class PublishedSelectionChecks(unittest.TestCase):
     def setUp(self):
+        mock_backend(self)
         # Optional pinned upstream checkout, as used by the runner itself.
         self.checkout = Path(os.environ.get('NTCP_PACKETDRILL_CHECKOUT',
                             HERE.parent.parent / 'workbench/packetdrill-upstream'))
