@@ -151,6 +151,7 @@ mod linux {
             packet,
             ntcp::Transmit {
                 connection: None,
+                tx_timestamp: None,
                 ip,
                 len: tcp_len,
                 hop_limit,
@@ -1001,6 +1002,7 @@ mod linux {
         fn v6_transmit(len: usize) -> ntcp::Transmit {
             ntcp::Transmit {
                 connection: None,
+                tx_timestamp: None,
                 ip: IpMetadata {
                     source: "2001:db8::1".parse().unwrap(),
                     destination: "2001:db8::2".parse().unwrap(),
@@ -1337,6 +1339,7 @@ mod linux {
             let mut bytes = [0xa5; MTU];
             let mut transmit = ntcp::Transmit {
                 connection: None,
+                tx_timestamp: None,
                 ip,
                 len: 1440,
                 hop_limit: 64,

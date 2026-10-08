@@ -24,6 +24,7 @@ mod recovery;
 mod sack;
 mod schedule;
 mod seq;
+mod tx_timestamp;
 pub mod wire;
 
 pub use connection::{
@@ -39,3 +40,8 @@ pub use ipv4_options::{
 };
 pub use recovery::{CongestionAlgorithm, InitialWindow, PrrAlgorithm, RecoveryAlgorithm};
 pub use wire::{IpMetadata, WireError};
+
+pub use tx_timestamp::{
+    TxStreamRange, TxTimestampClock, TxTimestampEvent, TxTimestampOutcome, TxTimestampRequest,
+    TxTimestampSource, TxTimestampStage, TxTimestampToken,
+};

@@ -4680,3 +4680,326 @@ fn endpoint_lowat_partial_eor_and_unlimited_admission_preserve_heap_quota() {
     );
     assert_eq!(a.buffer_bytes(), charge);
 }
+
+#[test]
+fn tx_timestamp_backend_backpressure_coalesced_callbacks_and_late_hardware() {
+    let (mut a, mut b, listener, client) = endpoints();
+    pump(&mut a, &mut b, 0);
+    let _server = b.accept(listener).unwrap();
+    let request = |cookie| TxTimestampRequest {
+        cookie,
+        scheduled: true,
+        software_transmit: true,
+        hardware_transmit: true,
+        acknowledged: true,
+    };
+    assert_eq!(
+        a.write_with_timestamp(client, b"ab", true, false, None, request(1)),
+        Err(EndpointError::Connection(Error::WouldBlock))
+    );
+    a.set_tx_timestamp_capacity(client, 8).unwrap();
+    for (cookie, bytes, more) in [(1, &b"ab"[..], true), (2, &b"cd"[..], false)] {
+        crate::allocation_tests::fail_after(0, || {
+            assert_eq!(
+                a.write_with_timestamp(client, bytes, more, false, None, request(cookie)),
+                Ok(2)
+            );
+        });
+    }
+    let mut out = [0; 2048];
+    let tx = a.poll_transmit(100, &mut out, 16).unwrap().packet.unwrap();
+    let token = tx.tx_timestamp.unwrap();
+    assert_eq!(token.connection(), client);
+    assert_eq!(token.stream_range(), TxStreamRange { start: 0, end: 4 });
+    for cookie in [1, 2] {
+        let event = a.next_tx_timestamp(client).unwrap().unwrap();
+        assert_eq!(
+            (event.cookie, event.target, event.stage),
+            (cookie, cookie * 2 - 1, TxTimestampStage::Scheduled)
+        );
+        assert_eq!(
+            event.outcome,
+            TxTimestampOutcome::Recorded {
+                value: 100,
+                clock: TxTimestampClock::CallerTicks(CallerTimebase::default()),
+            }
+        );
+    }
+    // A backend WouldBlock retains bytes/token externally and makes no report.
+    // Core output-ready alone must not invent backend success.
+    assert_eq!(a.next_tx_timestamp(client).unwrap(), None);
+    assert!(
+        a.poll_transmit(101, &mut [0; 2048], 16)
+            .unwrap()
+            .packet
+            .is_none()
+    );
+    assert_eq!(a.next_tx_timestamp(client).unwrap(), None);
+    b.input(102, tx.ip, &out[..tx.len]).unwrap();
+    tick(&mut a, &mut b, 300_000);
+    assert_eq!(a.acknowledged(client).unwrap(), 4);
+    for cookie in [1, 2] {
+        let event = a.next_tx_timestamp(client).unwrap().unwrap();
+        assert_eq!(
+            (event.cookie, event.stage),
+            (cookie, TxTimestampStage::Acknowledged)
+        );
+        assert_eq!(
+            event.outcome,
+            TxTimestampOutcome::Recorded {
+                value: 300_000,
+                clock: TxTimestampClock::CallerTicks(CallerTimebase::default()),
+            }
+        );
+    }
+    assert_eq!(a.next_tx_timestamp(client).unwrap(), None);
+    let deadline = a.next_deadline();
+    let info = a.transport_info(client).unwrap();
+    assert_eq!(
+        a.report_tx_timestamp(
+            token,
+            TxTimestampSource::Hardware,
+            1,
+            TxTimestampClock::DeviceTicks {
+                identity: 42,
+                units_per_second: Some(0)
+            }
+        ),
+        Err(EndpointError::Connection(Error::InvalidArgument))
+    );
+    assert_eq!(
+        a.report_tx_timestamp(
+            token,
+            TxTimestampSource::Software,
+            1,
+            TxTimestampClock::CallerTicks(CallerTimebase::default())
+        ),
+        Err(EndpointError::Connection(Error::InvalidArgument))
+    );
+    for (source, clock, value) in [
+        (
+            TxTimestampSource::Software,
+            TxTimestampClock::RealtimeNanoseconds,
+            7,
+        ),
+        (
+            TxTimestampSource::Hardware,
+            TxTimestampClock::DeviceTicks {
+                identity: 42,
+                units_per_second: None,
+            },
+            u64::MAX,
+        ),
+    ] {
+        crate::allocation_tests::fail_after(0, || {
+            a.report_tx_timestamp(token, source, value, clock)
+        })
+        .unwrap();
+        // Duplicate before and after drain must not produce additional events.
+        a.report_tx_timestamp(token, source, value - 1, clock)
+            .unwrap();
+        for cookie in [1, 2] {
+            let event = a.next_tx_timestamp(client).unwrap().unwrap();
+            assert_eq!(
+                (event.cookie, event.stage, event.source),
+                (cookie, TxTimestampStage::Transmit, source)
+            );
+            assert_eq!(event.outcome, TxTimestampOutcome::Recorded { value, clock });
+        }
+        a.report_tx_timestamp(token, source, value, clock).unwrap();
+        assert_eq!(a.next_tx_timestamp(client).unwrap(), None);
+    }
+    assert_eq!(a.next_deadline(), deadline);
+    assert_eq!(a.transport_info(client).unwrap(), info); // No observation clock drives TCP.
+    a.set_tx_timestamp_capacity(client, 0).unwrap();
+}
+
+#[test]
+fn tx_timestamp_terminal_cancellation_release_and_reused_generation() {
+    for drain in [false, true] {
+        let (mut a, mut b, listener, client) = endpoints();
+        pump(&mut a, &mut b, 0);
+        b.accept(listener).unwrap();
+        let base_charge = a.buffer_bytes();
+        a.set_tx_timestamp_capacity(client, 3).unwrap();
+        let request = TxTimestampRequest {
+            cookie: 99,
+            software_transmit: true,
+            hardware_transmit: true,
+            acknowledged: true,
+            ..Default::default()
+        };
+        a.write_with_timestamp(client, b"abc", false, false, None, request)
+            .unwrap();
+        let token = a
+            .poll_transmit(1, &mut [0; 2048], 16)
+            .unwrap()
+            .packet
+            .unwrap()
+            .tx_timestamp
+            .unwrap();
+        a.abort(client).unwrap();
+        if drain {
+            for _ in 0..3 {
+                let event = a.next_tx_timestamp(client).unwrap().unwrap();
+                assert_eq!(event.cookie, 99);
+                assert_eq!(event.outcome, TxTimestampOutcome::Cancelled);
+            }
+        }
+        a.release(client).unwrap();
+        assert_eq!(a.buffer_bytes(), base_charge); // Release frees even undrained records.
+        assert_eq!(
+            a.next_tx_timestamp(client),
+            Err(EndpointError::InvalidHandle)
+        );
+        assert_eq!(
+            a.report_tx_timestamp(
+                token,
+                TxTimestampSource::Hardware,
+                99,
+                TxTimestampClock::RealtimeNanoseconds
+            ),
+            Err(EndpointError::InvalidHandle)
+        );
+        let tx = a
+            .poll_transmit(2, &mut [0; 2048], 16)
+            .unwrap()
+            .packet
+            .unwrap();
+        assert_eq!(tx.tx_timestamp, None); // Final RST carries no payload range.
+        a.on_timeout(240_000_002, 16).unwrap();
+        a.poll_transmit(240_000_002, &mut [0; 2048], 16).unwrap();
+        let (local, remote) = addresses();
+        let replacement = a.connect(240_000_002, local, remote).unwrap();
+        assert_ne!(replacement, client);
+        a.set_tx_timestamp_capacity(replacement, 1).unwrap();
+        a.write_with_timestamp(
+            replacement,
+            b"abc",
+            false,
+            false,
+            None,
+            TxTimestampRequest {
+                cookie: 100,
+                hardware_transmit: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            a.report_tx_timestamp(
+                token,
+                TxTimestampSource::Hardware,
+                100,
+                TxTimestampClock::RealtimeNanoseconds
+            ),
+            Err(EndpointError::InvalidHandle)
+        );
+        assert_eq!(a.next_tx_timestamp(replacement).unwrap(), None);
+        a.cancel_tx_timestamps(replacement).unwrap();
+        assert_eq!(
+            a.next_tx_timestamp(replacement).unwrap().unwrap().cookie,
+            100
+        );
+        assert_eq!(a.next_tx_timestamp(replacement).unwrap(), None);
+    }
+}
+
+#[test]
+fn tx_timestamp_retransmit_stable_range_preserves_first_observation_and_timewait_cancels() {
+    for units_per_second in [1_000_000, 1_000_000_000] {
+        let scale = units_per_second / 1_000_000;
+        let mut cfg = config();
+        cfg.connection.timebase.units_per_second = units_per_second;
+        let (local, remote) = addresses();
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+        let mut b = Endpoint::new(cfg.clone(), [2; 32], 0, test_policy).unwrap();
+        let listener = b.listen(remote, 4).unwrap();
+        let client = a.connect(0, local, remote).unwrap();
+        pump(&mut a, &mut b, 0);
+        let server = b.accept(listener).unwrap();
+        a.set_tx_timestamp_capacity(client, 3).unwrap();
+        a.write_with_timestamp(
+            client,
+            b"abcd",
+            false,
+            false,
+            None,
+            TxTimestampRequest {
+                cookie: 1,
+                scheduled: true,
+                hardware_transmit: true,
+                acknowledged: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let first = a
+            .poll_transmit(100 * scale, &mut [0; 2048], 16)
+            .unwrap()
+            .packet
+            .unwrap();
+        let first_token = first.tx_timestamp.unwrap();
+        // Drop first packet, then allow the RTO's retransmission to reach peer.
+        let retry_at = a.next_deadline().unwrap();
+        a.on_timeout(retry_at, 16).unwrap();
+        let mut bytes = [0; 2048];
+        let retry = a
+            .poll_transmit(retry_at, &mut bytes, 16)
+            .unwrap()
+            .packet
+            .unwrap();
+        let retry_token = retry.tx_timestamp.unwrap();
+        assert_eq!(first_token, retry_token);
+        assert_eq!(
+            retry_token.stream_range(),
+            TxStreamRange { start: 0, end: 4 }
+        );
+        let event = a.next_tx_timestamp(client).unwrap().unwrap();
+        assert_eq!(
+            event.outcome,
+            TxTimestampOutcome::Recorded {
+                value: 100 * scale,
+                clock: TxTimestampClock::CallerTicks(cfg.connection.timebase),
+            }
+        );
+        assert_eq!(a.next_tx_timestamp(client).unwrap(), None);
+        b.input(retry_at, retry.ip, &bytes[..retry.len]).unwrap();
+        let ack_at = retry_at + 300_000 * scale;
+        tick(&mut a, &mut b, ack_at);
+        assert_eq!(
+            a.next_tx_timestamp(client).unwrap().unwrap().stage,
+            TxTimestampStage::Acknowledged
+        );
+        a.shutdown(client).unwrap();
+        pump(&mut a, &mut b, ack_at);
+        assert_eq!(a.state(client).unwrap(), State::FinWait2);
+        assert_eq!(a.next_tx_timestamp(client).unwrap(), None); // Half-close keeps HW pending.
+        let mut read = [0; 4];
+        assert_eq!(b.read(server, &mut read), Ok(4));
+        b.shutdown(server).unwrap();
+        pump(&mut a, &mut b, ack_at);
+        assert_eq!(a.state(client).unwrap(), State::TimeWait);
+        let event = a.next_tx_timestamp(client).unwrap().unwrap();
+        assert_eq!(
+            (event.stage, event.source, event.outcome),
+            (
+                TxTimestampStage::Transmit,
+                TxTimestampSource::Hardware,
+                TxTimestampOutcome::Cancelled
+            )
+        );
+        a.report_tx_timestamp(
+            retry_token,
+            TxTimestampSource::Hardware,
+            10,
+            TxTimestampClock::DeviceTicks {
+                identity: 7,
+                units_per_second: Some(100),
+            },
+        )
+        .unwrap();
+        assert_eq!(a.next_tx_timestamp(client).unwrap(), None);
+        a.set_tx_timestamp_capacity(client, 0).unwrap();
+    }
+}

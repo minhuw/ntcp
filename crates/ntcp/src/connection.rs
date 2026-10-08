@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 use core::{cmp::Ordering, net::SocketAddr};
 
 use crate::{
+    TxStreamRange, TxTimestampClock, TxTimestampRequest, TxTimestampSource, TxTimestampStage,
     buffer::{ReceiveBuffer, SendBuffer},
     rack::Rack,
     recovery::{
@@ -12,6 +13,7 @@ use crate::{
     },
     sack::Scoreboard,
     seq::Seq,
+    tx_timestamp::TxTimestamps,
     wire::{self, ACK, CWR, ECE, FIN, Header, IpMetadata, PSH, RST, SYN, Segment, URG},
 };
 
@@ -502,6 +504,8 @@ pub(crate) struct Connection {
     advertised_edge: Seq,
     syn_window: u16,
     acknowledged: u64,
+    pub(crate) tx_timestamps: TxTimestamps,
+    pub(crate) last_output_range: Option<TxStreamRange>,
     received_read: u64,
     received_total: u64,
     snd_up: Option<Seq>,
@@ -752,6 +756,8 @@ impl Connection {
             advertised_edge: Seq(0),
             syn_window,
             acknowledged: 0,
+            tx_timestamps: TxTimestamps::default(),
+            last_output_range: None,
             received_read: 0,
             received_total: 0,
             snd_up: None,
@@ -905,7 +911,7 @@ impl Connection {
             &self.scoreboard,
             &self.rack,
             self.scratch.capacity(),
-        )
+        ) + self.tx_timestamps.storage_bytes()
     }
 
     pub(crate) fn resize_peak_charge(&self, send: usize, receive: usize) -> Option<usize> {
@@ -980,7 +986,8 @@ impl Connection {
             staged_scoreboard,
             staged_rack,
             self.scratch.capacity(),
-        ) > max_charge
+        ) + self.tx_timestamps.storage_bytes()
+            > max_charge
         {
             return Err(Error::NoMemory);
         }
@@ -2211,6 +2218,7 @@ impl Connection {
     //# When a TCP host enters TIME-WAIT or CLOSED state, it should ignore any previous state about the negotiation of ECN for that connection.
     fn terminal(&mut self, reason: CloseReason) {
         self.state = State::Closed;
+        self.tx_timestamps.cancel_from(0);
         self.pacing_deadline = None;
         self.reset_tlp();
         self.rack.deadline = None;
@@ -2502,8 +2510,34 @@ impl Connection {
         self.queue_write(data, !more && !data.is_empty(), more, end_of_record, lowat)
     }
 
+    pub(crate) fn write_with_timestamp(
+        &mut self,
+        data: &[u8],
+        more: bool,
+        end_of_record: bool,
+        lowat: Option<u32>,
+        request: TxTimestampRequest,
+    ) -> Result<usize, Error> {
+        if !data.is_empty() {
+            // No fallible operation follows write acceptance: these slots are
+            // already allocated, and this exclusive borrow reserves admission.
+            self.tx_timestamps.admit(request)?;
+        }
+        let count = self.write_with_options_and_notsent_lowat(data, more, end_of_record, lowat)?;
+        if count != 0 {
+            let target = self.acknowledged + self.send.len() as u64 - 1;
+            self.tx_timestamps.insert(request, target);
+        }
+        Ok(count)
+    }
+
     pub(crate) fn send_admission_room(&self, lowat: Option<u32>) -> usize {
-        self.send.admission_room(self.notsent_bytes(), lowat)
+        // Keep the u64 TCP-stream position representable, including output's
+        // exclusive end. Never wrap offsets or admit bytes we cannot identify.
+        let cursor_room = u64::MAX - self.acknowledged - self.send.len() as u64;
+        self.send
+            .admission_room(self.notsent_bytes(), lowat)
+            .min(usize::try_from(cursor_room).unwrap_or(usize::MAX))
     }
 
     fn queue_write(
@@ -2604,6 +2638,8 @@ impl Connection {
         let retained = sent.max(advertised).max(window_prefix).min(self.send.len());
         let discarded = self.send.len() - retained;
         self.output_push_batch = None;
+        self.tx_timestamps
+            .cancel_from(self.acknowledged + retained as u64);
         self.send.truncate(retained);
         let end = self.send_base.wrapping_add(retained as u32);
         if self.cork_flush.is_some_and(|flush| after(flush, end)) {
@@ -4314,6 +4350,16 @@ impl Connection {
             self.send_base = self.send_base.wrapping_add(bytes);
             self.acknowledged = self.acknowledged.saturating_add(bytes as u64);
             self.events.acknowledged = Some(self.acknowledged);
+            self.tx_timestamps.observe(
+                TxStreamRange {
+                    start: 0,
+                    end: self.acknowledged,
+                },
+                TxTimestampStage::Acknowledged,
+                TxTimestampSource::Software,
+                self.now,
+                TxTimestampClock::CallerTicks(self.config.timebase),
+            );
             if !self.shutdown && self.send.remaining() != 0 {
                 self.events.writable = true;
             }
@@ -6270,6 +6316,23 @@ impl Connection {
                 Error::Wire(error)
             }
         })?;
+        self.last_output_range = if count != 0 && !syn && !keepalive {
+            let start = self.acknowledged + u64::from(seq.distance_from(self.send_base));
+            let range = TxStreamRange {
+                start,
+                end: start + count as u64,
+            };
+            self.tx_timestamps.observe(
+                range,
+                TxTimestampStage::Scheduled,
+                TxTimestampSource::Software,
+                now,
+                TxTimestampClock::CallerTicks(self.config.timebase),
+            );
+            Some(range)
+        } else {
+            None
+        };
         if syn && retransmitted {
             self.syn_retransmissions = self.syn_retransmissions.saturating_add(1);
             if self.config.initial_window == InitialWindow::Iw10 && self.syn_retransmissions > 1 {
@@ -26422,5 +26485,241 @@ mod tests {
 
     mod output_policy {
         include!("connection_output_tests.rs");
+    }
+    #[test]
+    fn tx_timestamp_partial_coalesced_segmented_output_failure_and_ack_crossing() {
+        use crate::{TxTimestampOutcome, TxTimestampSource::Software, TxTimestampStage::*};
+        for iss in [100, u32::MAX - 3] {
+            let mut cfg = config(8, 4);
+            cfg.nagle = false;
+            let (mut a, _) = pair(cfg, iss);
+            a.tx_timestamps.resize(4, usize::MAX).unwrap();
+            let request = |cookie| TxTimestampRequest {
+                cookie,
+                scheduled: true,
+                acknowledged: true,
+                ..Default::default()
+            };
+            assert_eq!(
+                a.write_with_timestamp(b"abc", true, false, None, request(1)),
+                Ok(3)
+            );
+            assert_eq!(
+                a.write_with_timestamp(b"defghijkl", false, false, None, request(2)),
+                Ok(5)
+            );
+            assert_eq!(
+                a.write_with_timestamp(b"x", false, false, None, request(3)),
+                Err(Error::WouldBlock)
+            );
+            assert_eq!(
+                a.write_with_timestamp(b"", false, false, None, request(4)),
+                Ok(0)
+            );
+            assert_eq!(a.transmit(40, &mut []), Err(Error::OutputTooSmall));
+            assert_eq!(a.tx_timestamps.next(), None);
+            let bytes = packet(&mut a, 41);
+            assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, b"abcd");
+            assert_eq!(
+                a.last_output_range,
+                Some(TxStreamRange { start: 0, end: 4 })
+            );
+            let first = a.tx_timestamps.next().unwrap();
+            assert_eq!(
+                (first.cookie, first.target, first.stage, first.source),
+                (1, 2, Scheduled, Software)
+            );
+            assert_eq!(
+                first.outcome,
+                TxTimestampOutcome::Recorded {
+                    value: 41,
+                    clock: TxTimestampClock::CallerTicks(a.config.timebase)
+                }
+            );
+            assert_eq!(a.tx_timestamps.next(), None); // Earlier fragment cannot complete target 7.
+            let bytes = packet(&mut a, 42);
+            assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, b"efgh");
+            let second = a.tx_timestamps.next().unwrap();
+            assert_eq!(
+                (second.cookie, second.target, second.stage),
+                (2, 7, Scheduled)
+            );
+            assert_eq!(
+                second.outcome,
+                TxTimestampOutcome::Recorded {
+                    value: 42,
+                    clock: TxTimestampClock::CallerTicks(a.config.timebase)
+                }
+            );
+            let base = Seq(iss).wrapping_add(1);
+            let next = a.receive.next();
+            inject_sack(
+                &mut a,
+                50,
+                next,
+                base,
+                ACK,
+                8,
+                &[],
+                &[(base.wrapping_add(4).0, base.wrapping_add(8).0)],
+            );
+            inject(&mut a, 51, next, base.wrapping_add(2), ACK, 8, &[]);
+            assert_eq!(a.tx_timestamps.next(), None);
+            inject(&mut a, 52, next, base.wrapping_add(3), ACK, 8, &[]);
+            inject(&mut a, 53, next, base.wrapping_add(8), ACK, 8, &[]);
+            inject(&mut a, 54, next, base.wrapping_add(8), ACK, 8, &[]);
+            // Drain much later: retain each exact cumulative crossing time.
+            a.update_time(100).unwrap();
+            for (cookie, target, value) in [(1, 2, 52), (2, 7, 53)] {
+                let event = a.tx_timestamps.next().unwrap();
+                assert_eq!(
+                    (event.cookie, event.target, event.stage),
+                    (cookie, target, Acknowledged)
+                );
+                assert_eq!(
+                    event.outcome,
+                    TxTimestampOutcome::Recorded {
+                        value,
+                        clock: TxTimestampClock::CallerTicks(a.config.timebase)
+                    }
+                );
+            }
+            assert_eq!(a.tx_timestamps.next(), None);
+            a.tx_timestamps.resize(0, 0).unwrap();
+            assert_eq!(a.tx_timestamps.storage_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn tx_timestamp_flush_cancels_tail_reuses_offsets_not_reservations_across_wrap() {
+        use crate::{TxTimestampOutcome, TxTimestampSource::Hardware, TxTimestampStage::*};
+        for iss in [100, u32::MAX - 3] {
+            let mut cfg = config(16, 8);
+            cfg.nagle = false;
+            let (mut a, _) = pair(cfg, iss);
+            a.tx_timestamps.resize(6, usize::MAX).unwrap();
+            let request = |cookie| TxTimestampRequest {
+                cookie,
+                scheduled: true,
+                hardware_transmit: true,
+                acknowledged: true,
+                ..Default::default()
+            };
+            a.write_with_timestamp(b"abcdefgh", false, false, None, request(10))
+                .unwrap();
+            a.write_with_timestamp(b"ijklmnop", false, false, None, request(20))
+                .unwrap();
+            packet(&mut a, 40);
+            let original_range = a.last_output_range.unwrap();
+            assert_eq!(original_range, TxStreamRange { start: 0, end: 8 });
+            let base = Seq(iss).wrapping_add(1);
+            let next = a.receive.next();
+            inject(&mut a, 41, next, base, ACK, 8, &[]);
+            assert_eq!(a.flush(), Ok(8));
+            assert_eq!(a.send.len(), 8);
+            assert_eq!(
+                a.write_with_timestamp(b"QRSTUVWX", false, false, None, request(30)),
+                Err(Error::WouldBlock)
+            );
+            let event = a.tx_timestamps.next().unwrap();
+            assert_eq!((event.cookie, event.stage), (10, Scheduled));
+            for stage in [Scheduled, Transmit, Acknowledged] {
+                let event = a.tx_timestamps.next().unwrap();
+                assert_eq!(
+                    (event.cookie, event.target, event.stage, event.outcome),
+                    (20, 15, stage, TxTimestampOutcome::Cancelled)
+                );
+            }
+            assert_eq!(a.tx_timestamps.next(), None); // Retained byte phases still pending.
+            assert_eq!(
+                a.write_with_timestamp(b"QRSTUVWX", false, false, None, request(30)),
+                Ok(8)
+            );
+            let clock = TxTimestampClock::DeviceTicks {
+                identity: 7,
+                units_per_second: None,
+            };
+            a.tx_timestamps
+                .observe(original_range, Transmit, Hardware, 123, clock);
+            let event = a.tx_timestamps.next().unwrap();
+            assert_eq!((event.cookie, event.target, event.stage), (10, 7, Transmit));
+            assert_eq!(a.tx_timestamps.next(), None); // Old token cannot hit reused tail.
+            inject(&mut a, 50, next, base.wrapping_add(8), ACK, 16, &[]);
+            assert_eq!(a.tx_timestamps.next().unwrap().cookie, 10);
+            let bytes = packet(&mut a, 60);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.header.sequence, base.wrapping_add(8).0);
+            assert_eq!(segment.payload, b"QRSTUVWX");
+            let replacement_range = a.last_output_range.unwrap();
+            assert_eq!(replacement_range, TxStreamRange { start: 8, end: 16 });
+            let event = a.tx_timestamps.next().unwrap();
+            assert_eq!(
+                (event.cookie, event.target, event.stage),
+                (30, 15, Scheduled)
+            );
+            inject(&mut a, 70, next, base.wrapping_add(16), ACK, 16, &[]);
+            assert_eq!(a.tx_timestamps.next().unwrap().cookie, 30);
+            a.tx_timestamps
+                .observe(original_range, Transmit, Hardware, 124, clock);
+            assert_eq!(a.tx_timestamps.next(), None);
+            a.tx_timestamps
+                .observe(replacement_range, Transmit, Hardware, 125, clock);
+            assert_eq!(a.tx_timestamps.next().unwrap().cookie, 30);
+            assert_eq!(a.tx_timestamps.next(), None);
+            assert_eq!(a.acknowledged(), 16);
+            a.tx_timestamps.resize(0, 0).unwrap();
+        }
+    }
+
+    #[test]
+    fn tx_timestamp_write_error_lowat_eor_and_cursor_exhaustion_rollback() {
+        let mut cfg = config(16, 8);
+        cfg.nagle = false;
+        let (mut a, _) = pair(cfg, 100);
+        let request = TxTimestampRequest {
+            cookie: 1,
+            scheduled: true,
+            ..Default::default()
+        };
+        a.tx_timestamps.resize(2, usize::MAX).unwrap();
+        assert_eq!(
+            a.write_with_timestamp(b"", true, true, Some(0), request),
+            Ok(0)
+        );
+        assert_eq!(
+            a.write_with_timestamp(b"abc", true, true, Some(1), request),
+            Ok(3)
+        );
+        // EOR seals the admission chunk, so LOWAT rejects opening another.
+        assert_eq!(
+            a.write_with_timestamp(b"xyz", false, false, Some(1), request),
+            Err(Error::WouldBlock)
+        );
+        a.tx_timestamps.resize(1, usize::MAX).unwrap(); // Only successful write reserved.
+        a.tx_timestamps.cancel_from(0);
+        a.tx_timestamps.next().unwrap();
+        a.shutdown().unwrap();
+        assert_eq!(
+            a.write_with_timestamp(b"x", false, false, None, request),
+            Err(Error::InvalidState)
+        );
+        a.tx_timestamps.resize(0, 0).unwrap();
+
+        let (mut a, _) = pair(config(8, 4), 100);
+        a.tx_timestamps.resize(1, usize::MAX).unwrap();
+        a.acknowledged = u64::MAX - 2;
+        assert_eq!(
+            a.write_with_timestamp(b"abc", false, false, None, request),
+            Ok(2)
+        );
+        packet(&mut a, 40);
+        let event = a.tx_timestamps.next().unwrap();
+        assert_eq!(event.target, u64::MAX - 1);
+        assert_eq!(a.last_output_range.unwrap().end, u64::MAX);
+        assert_eq!(
+            a.write_with_timestamp(b"x", false, false, None, request),
+            Err(Error::WouldBlock)
+        );
+        a.tx_timestamps.resize(0, 0).unwrap();
     }
 }

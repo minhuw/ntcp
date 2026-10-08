@@ -7,6 +7,8 @@ use sha2::Sha256;
 
 use crate::{
     Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options, SourceRoute, TimestampRequest,
+    TxTimestampClock, TxTimestampEvent, TxTimestampRequest, TxTimestampSource, TxTimestampStage,
+    TxTimestampToken,
     buffer::ReceiveBuffer,
     connection::{Connection, ConnectionConfig, ConnectionEvents, Error, Instant, State, Tuple},
     schedule::{Deadlines, ReadyQueue},
@@ -115,6 +117,7 @@ pub enum Event {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Transmit {
+    pub tx_timestamp: Option<TxTimestampToken>,
     // Stable owner, including connection-associated final resets.
     pub connection: Option<ConnectionId>,
     pub ipv4_options: OutgoingIpv4Options,
@@ -1732,6 +1735,92 @@ impl Endpoint {
         Ok(count)
     }
 
+    pub fn set_tx_timestamp_capacity(
+        &mut self,
+        id: ConnectionId,
+        phases: usize,
+    ) -> Result<(), EndpointError> {
+        let old = self.slot(id)?.connection.tx_timestamps.storage_bytes();
+        let spare = self
+            .config
+            .max_buffer_bytes
+            .saturating_sub(self.buffer_bytes);
+        self.slot_mut(id)?
+            .connection
+            .tx_timestamps
+            .resize(phases, spare)?;
+        self.buffer_bytes =
+            self.buffer_bytes - old + self.slot(id)?.connection.tx_timestamps.storage_bytes();
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_with_timestamp(
+        &mut self,
+        id: ConnectionId,
+        bytes: &[u8],
+        more: bool,
+        end_of_record: bool,
+        lowat: Option<u32>,
+        request: TxTimestampRequest,
+    ) -> Result<usize, EndpointError> {
+        let count = self.slot_mut(id)?.connection.write_with_timestamp(
+            bytes,
+            more,
+            end_of_record,
+            lowat,
+            request,
+        )?;
+        self.refresh(id.slot);
+        Ok(count)
+    }
+
+    pub fn report_tx_timestamp(
+        &mut self,
+        token: TxTimestampToken,
+        source: TxTimestampSource,
+        value: u64,
+        clock: TxTimestampClock,
+    ) -> Result<(), EndpointError> {
+        // Observations are never fed into update_time or protocol timers.
+        self.slot(token.connection())?;
+        if matches!(
+            clock,
+            TxTimestampClock::CallerTicks(_)
+                | TxTimestampClock::DeviceTicks {
+                    units_per_second: Some(0),
+                    ..
+                }
+        ) {
+            return Err(Error::InvalidArgument.into());
+        }
+        self.slots[token.connection().slot]
+            .as_mut()
+            .unwrap()
+            .connection
+            .tx_timestamps
+            .observe(
+                token.stream_range(),
+                TxTimestampStage::Transmit,
+                source,
+                value,
+                clock,
+            );
+        Ok(())
+    }
+
+    pub fn next_tx_timestamp(
+        &mut self,
+        id: ConnectionId,
+    ) -> Result<Option<TxTimestampEvent>, EndpointError> {
+        Ok(self.slot_mut(id)?.connection.tx_timestamps.next())
+    }
+
+    pub fn cancel_tx_timestamps(&mut self, id: ConnectionId) -> Result<(), EndpointError> {
+        self.slot_mut(id)?.connection.tx_timestamps.cancel_from(0);
+        Ok(())
+    }
+
     /// Read-only byte admission budget under the same policy as the write API.
     pub fn send_admission_room(
         &self,
@@ -1993,7 +2082,11 @@ impl Endpoint {
         if !matches!(state, State::Closed | State::TimeWait) {
             return Err(Error::InvalidState.into());
         }
-        self.slot_mut(id)?.released = true;
+        let slot = self.slot_mut(id)?;
+        let charge = slot.connection.tx_timestamps.storage_bytes();
+        slot.connection.tx_timestamps = Default::default();
+        slot.released = true;
+        self.buffer_bytes -= charge;
         self.events.remove(id.slot);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5
         //# Delete the
@@ -2125,6 +2218,7 @@ impl Endpoint {
                 return Ok(PollTransmit {
                     packet: Some(Transmit {
                         connection: None,
+                        tx_timestamp: None,
                         ecn: 0,
                         ipv4_options,
                         ip,
@@ -2169,11 +2263,16 @@ impl Endpoint {
                     let dscp = slot.dscp;
                     let ecn = slot.connection.last_output_ecn();
                     let ipv4_options = slot.ipv4_options;
+                    let tx_timestamp = slot
+                        .connection
+                        .last_output_range
+                        .map(|range| TxTimestampToken::new(connection, range));
                     self.control_turn = true;
                     self.refresh(index);
                     return Ok(PollTransmit {
                         packet: Some(Transmit {
                             connection: Some(connection),
+                            tx_timestamp,
                             ecn,
                             ipv4_options,
                             ip: IpMetadata {
@@ -2740,5 +2839,124 @@ mod recovery_observation_tests {
             )
             .unwrap();
         assert_eq!(a.transport_info(evicted).unwrap().cwnd, 10_000);
+    }
+    #[test]
+    fn tx_timestamp_capacity_peak_budget_allocation_failure_and_buffer_resize() {
+        let mut endpoint = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
+        let id = endpoint
+            .connect(
+                0,
+                "192.0.2.1:40000".parse().unwrap(),
+                "192.0.2.2:8080".parse().unwrap(),
+            )
+            .unwrap();
+        let baseline = endpoint.buffer_bytes();
+        endpoint.config.max_buffer_bytes = baseline;
+        assert_eq!(
+            endpoint.set_tx_timestamp_capacity(id, 1),
+            Err(Error::NoMemory.into())
+        );
+        assert_eq!(endpoint.buffer_bytes(), baseline);
+        endpoint.config.max_buffer_bytes = usize::MAX;
+        assert_eq!(
+            crate::allocation_tests::fail_after(0, || endpoint.set_tx_timestamp_capacity(id, 4)),
+            Err(Error::NoMemory.into())
+        );
+        assert_eq!(endpoint.buffer_bytes(), baseline);
+        endpoint.set_tx_timestamp_capacity(id, 4).unwrap();
+        let charge = endpoint.buffer_bytes() - baseline;
+        assert!(charge > 0);
+        endpoint.config.max_buffer_bytes = baseline + 2 * charge; // Final size fits, staging does not.
+        assert_eq!(
+            endpoint.set_tx_timestamp_capacity(id, 8),
+            Err(Error::NoMemory.into())
+        );
+        assert_eq!(endpoint.buffer_bytes(), baseline + charge);
+        endpoint.config.max_buffer_bytes = baseline + 3 * charge;
+        endpoint.set_tx_timestamp_capacity(id, 8).unwrap();
+        assert_eq!(endpoint.buffer_bytes(), baseline + 2 * charge);
+        assert_eq!(
+            crate::allocation_tests::fail_after(0, || endpoint.set_tx_timestamp_capacity(id, 4)),
+            Err(Error::NoMemory.into())
+        );
+        assert_eq!(endpoint.buffer_bytes(), baseline + 2 * charge);
+        endpoint.set_tx_timestamp_capacity(id, 4).unwrap();
+        assert_eq!(endpoint.buffer_bytes(), baseline + charge);
+        let request = crate::TxTimestampRequest {
+            cookie: 7,
+            scheduled: true,
+            software_transmit: true,
+            hardware_transmit: true,
+            acknowledged: true,
+        };
+        endpoint
+            .write_with_timestamp(id, b"x", false, false, None, request)
+            .unwrap();
+        assert_eq!(
+            endpoint.set_tx_timestamp_capacity(id, 3),
+            Err(Error::WouldBlock.into())
+        );
+        assert_eq!(
+            crate::allocation_tests::fail_after(0, || endpoint.set_tx_timestamp_capacity(id, 8)),
+            Err(Error::NoMemory.into())
+        );
+        endpoint.set_tx_timestamp_capacity(id, 8).unwrap(); // Preserve pending phases.
+        endpoint.cancel_tx_timestamps(id).unwrap();
+        endpoint.set_tx_timestamp_capacity(id, 4).unwrap(); // Preserve ready events.
+        assert_eq!(
+            endpoint.set_tx_timestamp_capacity(id, 0),
+            Err(Error::WouldBlock.into())
+        );
+        for _ in 0..4 {
+            assert_eq!(
+                endpoint.next_tx_timestamp(id).unwrap().unwrap().outcome,
+                crate::TxTimestampOutcome::Cancelled
+            );
+        }
+        // Timestamp allocation also remains charged during ordinary buffer resize.
+        let (send, receive) = endpoint.buffer_capacities(id).unwrap();
+        let peak = endpoint
+            .slot(id)
+            .unwrap()
+            .connection
+            .resize_peak_charge(send * 2, receive)
+            .unwrap();
+        endpoint.config.max_buffer_bytes = peak - 1;
+        assert_eq!(
+            endpoint.set_buffer_capacities(id, send * 2, receive),
+            Err(EndpointError::LimitReached)
+        );
+        endpoint.config.max_buffer_bytes = peak;
+        endpoint
+            .set_buffer_capacities(id, send * 2, receive)
+            .unwrap();
+        assert_eq!(
+            endpoint.buffer_bytes(),
+            endpoint.slot(id).unwrap().connection.buffer_charge()
+        );
+        let retained = endpoint.buffer_bytes();
+        endpoint.set_tx_timestamp_capacity(id, 0).unwrap();
+        assert_eq!(endpoint.buffer_bytes(), retained - charge);
+        endpoint.abort(id).unwrap();
+        endpoint.release(id).unwrap();
+        endpoint.poll_transmit(1, &mut [0; 128], 16).unwrap();
+        endpoint.on_timeout(240_000_001, 16).unwrap();
+        endpoint
+            .poll_transmit(240_000_001, &mut [0; 128], 16)
+            .unwrap();
+        assert_eq!(endpoint.buffer_bytes(), 0);
+        let replacement = endpoint
+            .connect(
+                240_000_001,
+                "192.0.2.1:40000".parse().unwrap(),
+                "192.0.2.2:8080".parse().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(replacement.slot, id.slot);
+        assert_ne!(replacement.generation, id.generation);
+        assert_eq!(
+            endpoint.write_with_timestamp(replacement, b"x", false, false, None, request),
+            Err(Error::WouldBlock.into())
+        );
     }
 }
