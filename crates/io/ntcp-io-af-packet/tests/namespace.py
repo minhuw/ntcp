@@ -16,8 +16,9 @@ if '--in-namespace' in sys.argv:
     parent = int(env['NTCP_IO_PARENT_NETNS'])
     if os.stat('/proc/self/ns/net').st_ino == parent:
         raise RuntimeError('refusing to run in the parent network namespace')
+    # Both fixtures configure the same namespace; do not race link activation.
     command = ['cargo', 'test', '-p', 'ntcp-io-af-packet', '--test', 'namespace', '--',
-               '--ignored', '--nocapture']
+               '--ignored', '--nocapture', '--test-threads=1']
 else:
     env['NTCP_IO_PARENT_NETNS'] = str(os.stat('/proc/self/ns/net').st_ino)
     command = ['unshare', '--user', '--map-root-user', '--net',

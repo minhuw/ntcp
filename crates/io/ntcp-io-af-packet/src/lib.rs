@@ -1,13 +1,20 @@
 #![cfg(target_os = "linux")]
 
-use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
+mod timestamp;
+use ntcp_io::{
+    PacketIo, PacketLayer, ReceivedPacket, TimestampCapabilities, TxOutcome, TxTimestampCompletion,
+    TxTimestampRequest,
+};
 use std::{
     io,
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
 };
+pub use timestamp::TimestampConfig;
+use timestamp::{Control, State};
 
 pub struct AfPacket {
     fd: OwnedFd,
+    timestamps: Option<State>,
 }
 
 impl AfPacket {
@@ -28,7 +35,7 @@ impl AfPacket {
         }
         let probe = socket(libc::AF_INET, libc::SOCK_DGRAM, 0)?;
         // SAFETY: live socket and writable ifreq with a terminated interface name.
-        if unsafe { libc::ioctl(probe.as_raw_fd(), libc::SIOCGIFHWADDR, &mut request) } < 0 {
+        if unsafe { libc::ioctl(probe.as_raw_fd(), libc::SIOCGIFHWADDR as _, &mut request) } < 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: SIOCGIFHWADDR initialized this union member.
@@ -131,7 +138,39 @@ impl AfPacket {
         {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { fd })
+        Ok(Self {
+            fd,
+            timestamps: None,
+        })
+    }
+
+    // One-time opt-in; the host owns NIC timestamp configuration. Explicit TX
+    // IDs require Linux 6.13+. An older kernel rejects the send's cmsg before
+    // accepting a packet (Unsupported), never guessed counter correlation.
+    pub fn enable_timestamps(&mut self, config: TimestampConfig) -> io::Result<()> {
+        if self.timestamps.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "timestamps already configured",
+            ));
+        }
+        let flags = config.flags()?;
+        let state = State::new(config)?;
+        // SAFETY: flags is a live socket-option integer; no NIC ioctl is used.
+        if unsafe {
+            libc::setsockopt(
+                self.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_TIMESTAMPING,
+                (&flags as *const libc::c_int).cast(),
+                std::mem::size_of_val(&flags) as libc::socklen_t,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        self.timestamps = Some(state);
+        Ok(())
     }
 }
 
@@ -188,75 +227,36 @@ pub(crate) fn transmitted(count: isize, length: usize) -> io::Result<TxOutcome> 
     Ok(TxOutcome::Submitted)
 }
 
-// Only called with a msghdr backed by live, aligned control storage.
-fn check_auxdata(message: &libc::msghdr) -> io::Result<()> {
-    if message.msg_flags & libc::MSG_CTRUNC != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "truncated packet ancillary data",
-        ));
-    }
-    // SAFETY: recvmsg initialized the bounded control buffer and its length.
-    unsafe {
-        let mut header = libc::CMSG_FIRSTHDR(message);
-        while !header.is_null() {
-            let base = libc::CMSG_LEN(0) as usize;
-            let length = (*header).cmsg_len;
-            let offset = header as usize - message.msg_control as usize;
-            if length < base || length > message.msg_controllen - offset {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid packet ancillary data",
-                ));
-            }
-            if (*header).cmsg_level == libc::SOL_PACKET
-                && (*header).cmsg_type == libc::PACKET_AUXDATA
-            {
-                if length
-                    < libc::CMSG_LEN(std::mem::size_of::<libc::tpacket_auxdata>() as u32) as usize
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "short PACKET_AUXDATA",
-                    ));
-                }
-                let aux = libc::CMSG_DATA(header)
-                    .cast::<libc::tpacket_auxdata>()
-                    .read_unaligned();
-                if aux.tp_status & libc::TP_STATUS_VLAN_VALID != 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "VLAN-stripped packet discarded",
-                    ));
-                }
-            }
-            header = libc::CMSG_NXTHDR(message, header);
-        }
-    }
-    Ok(())
-}
-
 impl PacketIo for AfPacket {
     fn layer(&self) -> PacketLayer {
         PacketLayer::Ethernet
     }
 
     fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
-        // MSG_TRUNC reports the full packet length in this single consuming
-        // syscall. AUXDATA tells us whether Linux stripped a VLAN header.
+        self.receive_with_metadata(out)
+            .map(|packet| packet.map(|packet| packet.len))
+    }
+
+    fn timestamp_capabilities(&self) -> TimestampCapabilities {
+        self.timestamps
+            .as_ref()
+            .map_or_else(TimestampCapabilities::default, |s| s.config.capabilities())
+    }
+
+    #[allow(clippy::unnecessary_cast)] // msghdr lengths differ on musl/glibc
+    fn receive_with_metadata(&mut self, out: &mut [u8]) -> io::Result<Option<ReceivedPacket>> {
+        // MSG_TRUNC reports full packet length; AUXDATA still rejects VLAN loss.
         let mut vector = libc::iovec {
             iov_base: out.as_mut_ptr().cast(),
             iov_len: out.len(),
         };
-        // usize provides cmsghdr alignment; enough room for PACKET_AUXDATA.
-        let mut control = [0usize; 8];
-        // SAFETY: zero is valid for msghdr; all pointers below stay live.
+        let mut control = Control::new();
+        // SAFETY: zero is valid; all pointers below stay live through recvmsg.
         let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
         message.msg_iov = &mut vector;
         message.msg_iovlen = 1;
-        message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen = std::mem::size_of_val(&control);
-        // SAFETY: message references writable stack buffers; no pointer retained.
+        control.attach(&mut message);
+        // SAFETY: message references writable stack buffers, none retained.
         let count = unsafe {
             libc::recvmsg(
                 self.as_raw_fd(),
@@ -264,11 +264,134 @@ impl PacketIo for AfPacket {
                 libc::MSG_TRUNC | libc::MSG_DONTWAIT,
             )
         };
-        let length = received(count, out.len())?;
-        if length.is_some() {
-            check_auxdata(&message)?;
+        let Some(len) = received(count, out.len())? else {
+            return Ok(None);
+        };
+        if message.msg_flags & libc::MSG_TRUNC != 0 {
+            return Err(timestamp::invalid("truncated packet"));
         }
-        Ok(length)
+        let config = self
+            .timestamps
+            .as_ref()
+            .map(|s| s.config)
+            .unwrap_or_default();
+        let mut timestamps = control
+            .parse(
+                message.msg_controllen as usize,
+                message.msg_flags,
+                config.device_clock,
+                false,
+            )?
+            .timestamps;
+        if !config.rx_software {
+            timestamps.software = None;
+        }
+        if !config.rx_hardware {
+            timestamps.hardware = None;
+        }
+        Ok(Some(ReceivedPacket { len, timestamps }))
+    }
+
+    fn transmit_with_timestamp(
+        &mut self,
+        packet: &[u8],
+        request: TxTimestampRequest,
+    ) -> io::Result<TxOutcome> {
+        if !request.software && !request.hardware {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty timestamp request",
+            ));
+        }
+        let state = self
+            .timestamps
+            .as_ref()
+            .ok_or_else(timestamp::unsupported)?;
+        let Some(id) = state.prepare(request)? else {
+            return Ok(TxOutcome::WouldBlock);
+        };
+        let (mut control, length) = Control::tx(request, id);
+        let mut vector = libc::iovec {
+            iov_base: packet.as_ptr().cast_mut().cast(),
+            iov_len: packet.len(),
+        };
+        // SAFETY: pointers remain live through sendmsg; send does not mutate iov.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut vector;
+        message.msg_iovlen = 1;
+        control.attach(&mut message);
+        message.msg_controllen = length as _;
+        // SAFETY: message and its readable packet/control buffers are live.
+        let count = unsafe {
+            libc::sendmsg(
+                self.as_raw_fd(),
+                &message,
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if count < 0
+            && matches!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINVAL | libc::ENOPROTOOPT | libc::EOPNOTSUPP)
+            )
+        {
+            return Err(timestamp::unsupported());
+        }
+        let outcome = transmitted(count, packet.len())?;
+        if outcome == TxOutcome::Submitted {
+            self.timestamps.as_mut().unwrap().submitted(id, request);
+        }
+        Ok(outcome)
+    }
+
+    fn cancel_tx_timestamp(&mut self, cookie: u64) -> io::Result<bool> {
+        let state = self
+            .timestamps
+            .as_mut()
+            .ok_or_else(timestamp::unsupported)?;
+        if !state.config.tx_software && !state.config.tx_hardware {
+            return Err(timestamp::unsupported());
+        }
+        Ok(state.cancel(cookie))
+    }
+
+    #[allow(clippy::unnecessary_cast)] // msghdr lengths differ on musl/glibc
+    fn poll_tx_timestamp(&mut self) -> io::Result<Option<TxTimestampCompletion>> {
+        let fd = self.as_raw_fd();
+        let state = self
+            .timestamps
+            .as_mut()
+            .ok_or_else(timestamp::unsupported)?;
+        if !state.config.tx_software && !state.config.tx_hardware {
+            return Err(timestamp::unsupported());
+        }
+        if let Some(event) = state.pop() {
+            return Ok(Some(event));
+        }
+        // Consume at most ONE error-queue record, including unrelated records.
+        let mut control = Control::new();
+        // SAFETY: zero msghdr with no packet iov is valid for MSG_ERRQUEUE;
+        // OPT_TSONLY means the timestamp does not need a payload buffer.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        control.attach(&mut message);
+        // SAFETY: writable control storage is live through recvmsg.
+        let count =
+            unsafe { libc::recvmsg(fd, &mut message, libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT) };
+        if count < 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::WouldBlock {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        state.complete(control.parse(
+            message.msg_controllen as usize,
+            message.msg_flags,
+            state.config.device_clock,
+            true,
+        )?);
+        Ok(state.pop())
     }
 
     fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
@@ -299,58 +422,6 @@ impl AsRawFd for AfPacket {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-
-    #[test]
-    fn ancillary_validation() {
-        let mut control = [0usize; 8];
-        // SAFETY: zero is valid for msghdr, cmsghdr and tpacket_auxdata.
-        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-        message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen =
-            unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::tpacket_auxdata>() as u32) }
-                as usize;
-        let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
-        let length =
-            unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::tpacket_auxdata>() as u32) } as usize;
-        // SAFETY: the aligned control buffer has room for this header and payload.
-        unsafe {
-            (*header).cmsg_level = libc::SOL_PACKET;
-            (*header).cmsg_type = libc::PACKET_AUXDATA;
-            (*header).cmsg_len = length;
-            let mut aux: libc::tpacket_auxdata = std::mem::zeroed();
-            libc::CMSG_DATA(header)
-                .cast::<libc::tpacket_auxdata>()
-                .write_unaligned(aux);
-            check_auxdata(&message).unwrap();
-            // VLAN_VALID is authoritative even for priority-only VLAN (TCI 0).
-            aux.tp_status = libc::TP_STATUS_VLAN_VALID;
-            libc::CMSG_DATA(header)
-                .cast::<libc::tpacket_auxdata>()
-                .write_unaligned(aux);
-            assert_eq!(
-                check_auxdata(&message).unwrap_err().kind(),
-                io::ErrorKind::Unsupported
-            );
-            message.msg_flags = libc::MSG_CTRUNC;
-            assert_eq!(
-                check_auxdata(&message).unwrap_err().kind(),
-                io::ErrorKind::InvalidData
-            );
-            message.msg_flags = 0;
-            for short in [
-                0,
-                libc::CMSG_LEN(0) as usize,
-                length - 1,
-                message.msg_controllen + 1,
-            ] {
-                (*header).cmsg_len = short;
-                assert_eq!(
-                    check_auxdata(&message).unwrap_err().kind(),
-                    io::ErrorKind::InvalidData
-                );
-            }
-        }
-    }
 
     pub(crate) fn backpressure(a: &mut impl PacketIo, b: &mut impl PacketIo) {
         let mut out = [0; 1024];
@@ -439,8 +510,14 @@ pub(crate) mod tests {
     #[test]
     fn packets_and_ownership() {
         let (a, b) = pair();
-        let mut a = AfPacket { fd: a };
-        let mut b = AfPacket { fd: b };
+        let mut a = AfPacket {
+            fd: a,
+            timestamps: None,
+        };
+        let mut b = AfPacket {
+            fd: b,
+            timestamps: None,
+        };
         flags(a.as_raw_fd());
         assert_eq!(a.layer(), PacketLayer::Ethernet);
         assert_eq!(a.receive(&mut [0; 8]).unwrap(), None);

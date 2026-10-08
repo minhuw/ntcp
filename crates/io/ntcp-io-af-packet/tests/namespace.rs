@@ -15,6 +15,7 @@ fn index(name: &str) -> u32 {
     unsafe { libc::if_nametoindex(name.as_ptr()) }
 }
 
+#[track_caller]
 fn ready(fd: i32) {
     let mut pfd = libc::pollfd {
         fd,
@@ -246,4 +247,223 @@ fn isolated_roundtrips() {
     assert_ne!(index("nio-tun"), 0); // preconfigured persistent interface stays caller-owned
     ip(&["tuntap", "del", "dev", "nio-tun", "mode", "tun"]);
     assert_eq!(index("nio-tun"), 0);
+}
+
+#[test]
+#[ignore = "run via tests/namespace.py in an isolated user+net namespace"]
+fn isolated_software_timestamps() {
+    use ntcp_io::{
+        ClockDomain, TimestampPoint, TimestampSource, TimestampUnit, TxTimestampRequest,
+    };
+    use ntcp_io_af_packet::TimestampConfig;
+    use std::{os::unix::fs::MetadataExt, time::Instant};
+    let parent: u64 = std::env::var("NTCP_IO_PARENT_NETNS")
+        .expect("namespace launcher required")
+        .parse()
+        .unwrap();
+    assert_ne!(
+        std::fs::metadata("/proc/self/ns/net").unwrap().ino(),
+        parent,
+        "refusing host interface changes"
+    );
+    ip(&[
+        "link", "add", "nio-ts-a", "type", "veth", "peer", "name", "nio-ts-b",
+    ]);
+    ip(&["link", "set", "nio-ts-a", "up"]);
+    ip(&["link", "set", "nio-ts-b", "up"]);
+    let mut a = AfPacket::bind(index("nio-ts-a"), 0x88b5).unwrap();
+    let mut b = AfPacket::bind(index("nio-ts-b"), 0x88b5).unwrap();
+    let mut frame = [0x5a; 64];
+    frame[..6].fill(0xff);
+    frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 1]);
+    frame[12..14].copy_from_slice(&0x88b5u16.to_be_bytes());
+    let mut out = [0; 2048];
+    let disabled = TxTimestampRequest {
+        cookie: 1,
+        software: true,
+        hardware: false,
+    };
+    assert_eq!(
+        a.transmit_with_timestamp(&frame, disabled)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert_eq!(b.receive(&mut out).unwrap(), None); // no submission
+    a.enable_timestamps(TimestampConfig {
+        tx_software: true,
+        tx_hardware: true,
+        device_clock: Some(77),
+        tx_completion_capacity: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    b.enable_timestamps(TimestampConfig {
+        rx_software: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(a.timestamp_capabilities().tx_completion_capacity, 2);
+    assert!(b.timestamp_capabilities().rx_software);
+    for (software, hardware, kind) in [
+        (false, false, io::ErrorKind::InvalidInput),
+        (true, false, io::ErrorKind::Unsupported),
+        (true, true, io::ErrorKind::Unsupported),
+    ] {
+        assert_eq!(
+            b.transmit_with_timestamp(
+                &frame,
+                TxTimestampRequest {
+                    cookie: 5,
+                    software,
+                    hardware
+                }
+            )
+            .unwrap_err()
+            .kind(),
+            kind
+        );
+        assert_eq!(a.receive(&mut out).unwrap(), None);
+    }
+    // net_enable_timestamp() schedules a work item to enable the RX static
+    // key. Especially on a freshly booted VM, initial frames can have no stamp.
+    // Require a real observation within a deadline, never invent a fallback.
+    // Plain TX with reporting enabled must not request TX events.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let sw = loop {
+        assert_eq!(a.transmit(&frame).unwrap(), TxOutcome::Submitted);
+        ready(b.as_raw_fd());
+        let received = b.receive_with_metadata(&mut out).unwrap().unwrap();
+        assert_eq!(received.len, frame.len());
+        assert_eq!(&out[..received.len], frame);
+        assert!(received.timestamps.hardware.is_none());
+        if let Some(sw) = received.timestamps.software {
+            break sw;
+        }
+        assert!(Instant::now() < deadline, "missing SOFTWARE RX timestamp");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert!(sw.value > 0);
+    assert_eq!(sw.source, TimestampSource::Software);
+    assert_eq!(sw.point, TimestampPoint::KernelReceive);
+    assert_eq!(sw.clock.domain, ClockDomain::Realtime);
+    assert_eq!(sw.clock.unit, TimestampUnit::Nanoseconds);
+    assert!(a.poll_tx_timestamp().unwrap().is_none());
+    assert!(b.receive_with_metadata(&mut out).unwrap().is_none());
+
+    // A failed syscall must not retain the cookie or reserve completions.
+    assert!(a.transmit_with_timestamp(&[], disabled).is_err());
+    assert!(!a.cancel_tx_timestamp(disabled.cookie).unwrap());
+    assert_eq!(b.receive(&mut out).unwrap(), None);
+
+    let mut supported = true;
+    for cookie in [u64::MAX, 0, 0x1234_5678_9abc_def0] {
+        let request = TxTimestampRequest {
+            cookie,
+            software: true,
+            hardware: true,
+        };
+        match a.transmit_with_timestamp(&frame, request) {
+            Ok(TxOutcome::Submitted) => {}
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                // Pre-6.13 kernels reject unknown SCM_TS_OPT_ID in sock_cmsg_send,
+                // before AF_PACKET queues the frame. No fallback ID guessing.
+                assert_eq!(b.receive(&mut out).unwrap(), None);
+                assert!(!a.cancel_tx_timestamp(cookie).unwrap());
+                assert!(a.poll_tx_timestamp().unwrap().is_none());
+                assert!(
+                    std::env::var_os("NTCP_AF_PACKET_REQUIRE_TX").is_none(),
+                    "explicit-ID TX required by this run: {error}"
+                );
+                eprintln!("SCM_TS_OPT_ID unsupported; verified rejection before packet acceptance");
+                supported = false;
+                break;
+            }
+            other => panic!("unexpected timestamp send: {other:?}"),
+        }
+        assert_eq!(
+            a.transmit_with_timestamp(&frame, request)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            a.transmit_with_timestamp(
+                &frame,
+                TxTimestampRequest {
+                    cookie: 13,
+                    ..request
+                }
+            )
+            .unwrap(),
+            TxOutcome::WouldBlock
+        );
+        ready(b.as_raw_fd());
+        assert_eq!(
+            b.receive_with_metadata(&mut out).unwrap().unwrap().len,
+            frame.len()
+        );
+        assert_eq!(&out[..frame.len()], frame);
+        assert_eq!(b.receive(&mut out).unwrap(), None); // rejected sends have no side effects
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let completion = loop {
+            if let Some(completion) = a.poll_tx_timestamp().unwrap() {
+                break completion;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing SOFTWARE TX completion (kernel-ID mismatch?)"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(completion.cookie, cookie);
+        assert_eq!(completion.timestamp.source, TimestampSource::Software);
+        assert_eq!(completion.timestamp.point, TimestampPoint::KernelTransmit);
+        assert_eq!(completion.timestamp.clock.domain, ClockDomain::Realtime);
+        assert!(completion.timestamp.value > 0);
+        assert!(a.poll_tx_timestamp().unwrap().is_none());
+        // veth has no HW completion: the missing source remains reserved.
+        assert_eq!(
+            a.transmit_with_timestamp(
+                &frame,
+                TxTimestampRequest {
+                    cookie: 13,
+                    ..request
+                }
+            )
+            .unwrap(),
+            TxOutcome::WouldBlock
+        );
+        assert!(a.cancel_tx_timestamp(cookie).unwrap());
+        assert!(!a.cancel_tx_timestamp(cookie).unwrap());
+        assert_eq!(a.transmit(&frame).unwrap(), TxOutcome::Submitted);
+        ready(b.as_raw_fd());
+        assert_eq!(b.receive(&mut out).unwrap(), Some(frame.len()));
+        assert!(a.poll_tx_timestamp().unwrap().is_none());
+    }
+    if supported {
+        eprintln!(
+            "SOCK_RAW SOFTWARE RX/TX: arbitrary cookies correlated through explicit kernel IDs, separate source reservations verified"
+        );
+    }
+
+    // Reporting metadata must not weaken truncation or VLAN rejection.
+    a.transmit(&frame).unwrap();
+    ready(b.as_raw_fd());
+    assert_eq!(
+        b.receive_with_metadata(&mut [0; 8]).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+    let mut tagged = Vec::from(&frame[..12]);
+    tagged.extend_from_slice(&[0x81, 0, 0, 0]);
+    tagged.extend_from_slice(&frame[12..]);
+    a.transmit(&tagged).unwrap();
+    ready(b.as_raw_fd());
+    assert_eq!(
+        b.receive_with_metadata(&mut out).unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert!(b.receive_with_metadata(&mut out).unwrap().is_none());
+    drop((a, b));
+    ip(&["link", "del", "nio-ts-a"]);
 }
