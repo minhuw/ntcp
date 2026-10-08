@@ -2032,17 +2032,29 @@ fn cubic_fast_convergence_config_forwarded_active_and_passive() {
             100,
         );
         for endpoint in [&mut a, &mut b] {
-            assert!(alloc::format!("{:?}", endpoint.congestion)
-                .contains(&alloc::format!("fast_convergence: {enabled}")));
+            assert!(
+                alloc::format!("{:?}", endpoint.congestion)
+                    .contains(&alloc::format!("fast_convergence: {enabled}"))
+            );
             // Exercise the constructed controller rather than the config field:
             // first event remembers 10k; second smaller event optionally takes
             // the additional 17/20 reduction before the beta threshold.
             let base = endpoint.snd_una;
-            assert!(endpoint.congestion.on_ecn(base, 10_000, base.wrapping_add(10_000)));
-            assert!(endpoint.congestion.on_ecn(base.wrapping_add(10_001), 7000, base.wrapping_add(17_001)));
+            assert!(
+                endpoint
+                    .congestion
+                    .on_ecn(base, 10_000, base.wrapping_add(10_000))
+            );
+            assert!(endpoint.congestion.on_ecn(
+                base.wrapping_add(10_001),
+                7000,
+                base.wrapping_add(17_001)
+            ));
             let expected = if enabled { 5950 } else { 7000 };
-            assert!(alloc::format!("{:?}", endpoint.congestion)
-                .contains(&alloc::format!("w_max: {expected},")));
+            assert!(
+                alloc::format!("{:?}", endpoint.congestion)
+                    .contains(&alloc::format!("w_max: {expected},"))
+            );
             assert_eq!(endpoint.congestion.ssthresh(), 4900);
         }
     }
@@ -2073,8 +2085,13 @@ fn hystart_ordinary_wire_minimum_window_bound() {
             inject(&mut a, 90_000, next, base, ACK, window, &[]);
             a.write(&[0x55; 20_000]).unwrap();
             let budget = u32::from(window).min(a.congestion.cwnd());
-            assert_eq!(outputs(&mut a, 100_000, base),
-                (0..budget).step_by(1000).map(|n| (n, 1000)).collect::<Vec<_>>());
+            assert_eq!(
+                outputs(&mut a, 100_000, base),
+                (0..budget)
+                    .step_by(1000)
+                    .map(|n| (n, 1000))
+                    .collect::<Vec<_>>()
+            );
             assert_eq!(a.snd_nxt, base.wrapping_add(budget));
             assert_eq!(a.transmit(100_000, &mut [0; 1500]), Ok(None));
         }
@@ -2085,14 +2102,17 @@ fn hystart_ordinary_wire_minimum_window_bound() {
 fn more_cork_timeout_uses_caller_units_and_commits_only_successful_output() {
     for scale in [1, 1000] {
         for socket_cork in [false, true] {
-            let (mut a, _) = pair(ConnectionConfig {
-                nagle: false,
-                timebase: CallerTimebase {
-                    units_per_second: 1_000_000 * scale,
-                    ..CallerTimebase::default()
+            let (mut a, _) = pair(
+                ConnectionConfig {
+                    nagle: false,
+                    timebase: CallerTimebase {
+                        units_per_second: 1_000_000 * scale,
+                        ..CallerTimebase::default()
+                    },
+                    ..config(64, 8)
                 },
-                ..config(64, 8)
-            }, u32::MAX - 3);
+                u32::MAX - 3,
+            );
             a.set_cork(socket_cork);
             a.write_with_options(b"ab", !socket_cork, false).unwrap();
             let deadline = 30 + 200_000 * scale;
@@ -2105,9 +2125,25 @@ fn more_cork_timeout_uses_caller_units_and_commits_only_successful_output() {
             a.timeout(deadline - 1).unwrap();
             assert_eq!(a.transmit(deadline - 1, &mut [0; 64]), Ok(None));
             a.timeout(deadline).unwrap();
-            let before = (a.snd_nxt, a.cork_flush, a.next_deadline(), a.rack.counts().retransmitted);
-            assert_eq!(a.transmit(deadline, &mut [0; 23]), Err(Error::OutputTooSmall));
-            assert_eq!((a.snd_nxt, a.cork_flush, a.next_deadline(), a.rack.counts().retransmitted), before);
+            let before = (
+                a.snd_nxt,
+                a.cork_flush,
+                a.next_deadline(),
+                a.rack.counts().retransmitted,
+            );
+            assert_eq!(
+                a.transmit(deadline, &mut [0; 23]),
+                Err(Error::OutputTooSmall)
+            );
+            assert_eq!(
+                (
+                    a.snd_nxt,
+                    a.cork_flush,
+                    a.next_deadline(),
+                    a.rack.counts().retransmitted
+                ),
+                before
+            );
             let bytes = packet(&mut a, deadline);
             let segment = wire::parse(ip(tuple()), &bytes).unwrap();
             assert_eq!(segment.payload, b"abcd");
@@ -2179,7 +2215,12 @@ fn cork_nodelay_flush_is_one_queued_prefix_not_a_persistent_override() {
         assert!(a.cork);
         assert_eq!(a.transmit(42, &mut [0; 64]), Ok(None));
         a.set_nagle(false); // Setting NODELAY again also explicitly flushes.
-        assert_eq!(wire::parse(ip(tuple()), &packet(&mut a, 43)).unwrap().payload, b"cd");
+        assert_eq!(
+            wire::parse(ip(tuple()), &packet(&mut a, 43))
+                .unwrap()
+                .payload,
+            b"cd"
+        );
         a.write_with_options(b"ef", true, false).unwrap();
         assert_eq!(a.transmit(44, &mut [0; 64]), Ok(None));
         a.set_cork(false);
@@ -2211,7 +2252,10 @@ fn eor_coalesces_preceding_bytes_but_never_subsequent_or_retransmitted_bytes() {
         a.retx_pending = true;
         let before = (a.snd_nxt, a.rack.counts().retransmitted, a.next_deadline());
         assert_eq!(a.transmit(60, &mut [0; 22]), Err(Error::OutputTooSmall));
-        assert_eq!((a.snd_nxt, a.rack.counts().retransmitted, a.next_deadline()), before);
+        assert_eq!(
+            (a.snd_nxt, a.rack.counts().retransmitted, a.next_deadline()),
+            before
+        );
         let bytes = packet(&mut a, 60);
         let segment = wire::parse(ip(tuple()), &bytes).unwrap();
         assert_eq!(segment.payload, b"bcd");
@@ -2220,10 +2264,20 @@ fn eor_coalesces_preceding_bytes_but_never_subsequent_or_retransmitted_bytes() {
         inject(&mut a, 70, next, base.wrapping_add(4), ACK, 64, &[]);
         a.lower_mss(5).unwrap();
         a.retx_pending = true;
-        assert_eq!(wire::parse(ip(tuple()), &packet(&mut a, 71)).unwrap().payload, b"efghi");
+        assert_eq!(
+            wire::parse(ip(tuple()), &packet(&mut a, 71))
+                .unwrap()
+                .payload,
+            b"efghi"
+        );
         inject(&mut a, 72, next, base.wrapping_add(9), ACK, 64, &[]);
         a.retx_pending = true;
-        assert_eq!(wire::parse(ip(tuple()), &packet(&mut a, 73)).unwrap().payload, b"jk");
+        assert_eq!(
+            wire::parse(ip(tuple()), &packet(&mut a, 73))
+                .unwrap()
+                .payload,
+            b"jk"
+        );
     }
 }
 
@@ -2434,7 +2488,10 @@ fn eor_partial_write_failure_resize_and_window_limits() {
     a.set_nagle(false);
     assert_eq!(a.write_with_options(b"abcdefgh", true, true), Ok(6));
     let deadline = a.cork_deadline;
-    assert_eq!(a.write_with_options(b"z", false, true), Err(Error::WouldBlock));
+    assert_eq!(
+        a.write_with_options(b"z", false, true),
+        Err(Error::WouldBlock)
+    );
     assert!(a.more);
     assert_eq!(a.cork_deadline, deadline);
     a.set_buffer_capacities(32, 6, usize::MAX).unwrap();
@@ -2469,7 +2526,10 @@ fn cork_zero_window_probe_reopen_shutdown_and_rto_stay_live() {
         assert_eq!(a.transmit(deadline, &mut [0; 64]), Ok(None));
         let persist = a.persist_deadline.unwrap();
         a.timeout(persist).unwrap();
-        assert_eq!(a.transmit(persist, &mut [0; 20]), Err(Error::OutputTooSmall));
+        assert_eq!(
+            a.transmit(persist, &mut [0; 20]),
+            Err(Error::OutputTooSmall)
+        );
         let bytes = packet(&mut a, persist);
         let segment = wire::parse(ip(tuple()), &bytes).unwrap();
         assert_eq!(segment.payload, b"a");
@@ -2503,21 +2563,36 @@ fn eor_cork_flush_does_not_bypass_cwnd_or_prr_credit_and_tlp_respects_boundary()
     a.set_nagle(false);
     let base = a.send_base;
     let cwnd = a.congestion.cwnd();
-    assert_eq!(outputs(&mut a, 40, base).iter().map(|&(_, n)| n).sum::<usize>(), cwnd as usize);
+    assert_eq!(
+        outputs(&mut a, 40, base)
+            .iter()
+            .map(|&(_, n)| n)
+            .sum::<usize>(),
+        cwnd as usize
+    );
     assert_eq!(a.transmit(40, &mut [0; 64]), Ok(None));
 
-    let (mut a, _) = primed_pair(ConnectionConfig {
-        sack: true,
-        prr: true,
-        initial_window: InitialWindow::Iw10,
-        nagle: false,
-        ..config(32_000, 1000)
-    }, u32::MAX - 4999);
+    let (mut a, _) = primed_pair(
+        ConnectionConfig {
+            sack: true,
+            prr: true,
+            initial_window: InitialWindow::Iw10,
+            nagle: false,
+            ..config(32_000, 1000)
+        },
+        u32::MAX - 4999,
+    );
     a.write_with_options(&[0x55; 300], false, true).unwrap();
     a.write_with_options(&[0x55; 700], false, true).unwrap();
     a.write(&[0x55; 9000]).unwrap();
     let base = a.send_base;
-    assert_eq!(outputs(&mut a, 100_000, base).iter().map(|&(_, n)| n).sum::<usize>(), 10_000);
+    assert_eq!(
+        outputs(&mut a, 100_000, base)
+            .iter()
+            .map(|&(_, n)| n)
+            .sum::<usize>(),
+        10_000
+    );
     a.set_cork(true);
     for _ in 0..3 {
         strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
@@ -2525,14 +2600,20 @@ fn eor_cork_flush_does_not_bypass_cwnd_or_prr_credit_and_tlp_respects_boundary()
     a.set_nagle(false);
     let credit = a.prr.unwrap().credit();
     let before = a.prr.unwrap().counters();
-    assert_eq!(a.transmit(200_000, &mut [0; 20]), Err(Error::OutputTooSmall));
+    assert_eq!(
+        a.transmit(200_000, &mut [0; 20]),
+        Err(Error::OutputTooSmall)
+    );
     assert_eq!(a.prr.unwrap().counters(), before);
     let base = a.send_base;
     let ranges = outputs(&mut a, 200_000, base);
     assert_eq!(ranges[0], (0, 300));
-    assert!(ranges.iter().all(|&(offset, len)|
-        !(offset < 300 && offset + len as u32 > 300
-            || offset < 1000 && offset + len as u32 > 1000)));
+    assert!(
+        ranges
+            .iter()
+            .all(|&(offset, len)| !(offset < 300 && offset + len as u32 > 300
+                || offset < 1000 && offset + len as u32 > 1000))
+    );
     assert!(ranges.iter().map(|&(_, n)| n).sum::<usize>() <= credit as usize);
     assert_eq!(a.transmit(200_000, &mut [0; 1500]), Ok(None));
 
@@ -2552,12 +2633,15 @@ fn eor_cork_flush_does_not_bypass_cwnd_or_prr_credit_and_tlp_respects_boundary()
 
 #[test]
 fn cork_timestamp_credit_does_not_make_partial_payload_a_full_mss() {
-    let (mut a, _) = pair(ConnectionConfig {
-        timestamps: true,
-        timestamp_bytes_per_tick: 4,
-        nagle: false,
-        ..config(128, 64)
-    }, 100);
+    let (mut a, _) = pair(
+        ConnectionConfig {
+            timestamps: true,
+            timestamp_bytes_per_tick: 4,
+            nagle: false,
+            ..config(128, 64)
+        },
+        100,
+    );
     a.set_cork(true);
     a.write_with_options(b"abcdefghij", true, false).unwrap();
     assert_eq!(a.transmit(40, &mut [0; 64]), Ok(None));
@@ -2565,7 +2649,10 @@ fn cork_timestamp_credit_does_not_make_partial_payload_a_full_mss() {
     let bytes = packet(&mut a, 40);
     let segment = wire::parse(ip(tuple()), &bytes).unwrap();
     assert_eq!(segment.payload.len(), 3); // SYN used one unit of the same tick.
-    assert_eq!(a.transmit(40, &mut [0; 64]), Err(Error::TimestampBudgetExceeded));
+    assert_eq!(
+        a.transmit(40, &mut [0; 64]),
+        Err(Error::TimestampBudgetExceeded)
+    );
     a.timeout(1000).unwrap();
     let bytes = packet(&mut a, 1000);
     assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 4);
@@ -2614,7 +2701,13 @@ fn eor_sack_rescue_selects_final_record_not_a_clipped_prefix() {
     let base = a.send_base;
     a.write_with_options(&[2; 960], false, true).unwrap();
     a.write(&[3; 64]).unwrap();
-    assert_eq!(outputs(&mut a, 100, base).iter().map(|&(_, n)| n).sum::<usize>(), 1024);
+    assert_eq!(
+        outputs(&mut a, 100, base)
+            .iter()
+            .map(|&(_, n)| n)
+            .sum::<usize>(),
+        1024
+    );
     let blocks = [
         (base.wrapping_add(128).0, base.wrapping_add(256).0),
         (base.wrapping_add(384).0, base.wrapping_add(768).0),
@@ -2631,7 +2724,10 @@ fn eor_sack_rescue_selects_final_record_not_a_clipped_prefix() {
     let segment = wire::parse(ip(tuple()), &bytes).unwrap();
     assert_eq!(segment.header.sequence, base.wrapping_add(960).0);
     assert_eq!(segment.payload, &[3; 64]);
-    assert_eq!(a.sack_recovery.unwrap().rescue_rxt, Some(base.wrapping_add(1024)));
+    assert_eq!(
+        a.sack_recovery.unwrap().rescue_rxt,
+        Some(base.wrapping_add(1024))
+    );
 }
 
 #[test]
@@ -2640,18 +2736,33 @@ fn lowat_chunk_admission_transmission_ack_resize_flush_and_wrap() {
         let (mut a, _) = pair(config(32768, 1000), iss);
         a.set_cork(true);
         let charge = a.send.storage_bytes();
-        assert_eq!(a.write_with_options_and_notsent_lowat(&[1; 8000], true, false, Some(4000)), Ok(8000));
-        assert_eq!(a.write_with_options_and_notsent_lowat(&[2], true, false, Some(4000)), Ok(1));
+        assert_eq!(
+            a.write_with_options_and_notsent_lowat(&[1; 8000], true, false, Some(4000)),
+            Ok(8000)
+        );
+        assert_eq!(
+            a.write_with_options_and_notsent_lowat(&[2], true, false, Some(4000)),
+            Ok(1)
+        );
         assert_eq!(a.transport_info().notsent_bytes, 8001);
         assert_eq!(a.send_admission_room(Some(4000)), 8383);
-        assert_eq!(a.write_with_options_and_notsent_lowat(&[3; 9000], true, true, Some(4000)), Ok(8383));
-        assert_eq!(a.write_with_options_and_notsent_lowat(b"x", false, false, Some(4000)), Err(Error::WouldBlock));
+        assert_eq!(
+            a.write_with_options_and_notsent_lowat(&[3; 9000], true, true, Some(4000)),
+            Ok(8383)
+        );
+        assert_eq!(
+            a.write_with_options_and_notsent_lowat(b"x", false, false, Some(4000)),
+            Err(Error::WouldBlock)
+        );
         assert!(a.more);
         assert_eq!(a.send.storage_bytes(), charge);
         a.set_cork(false);
         let base = a.send_base;
         let bytes = packet(&mut a, 40);
-        assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 1000);
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes).unwrap().payload.len(),
+            1000
+        );
         // A transmitted chunk cannot be appended to, including after a partial
         // ACK removes all bytes actually transmitted from that chunk.
         let next = a.receive.next();
@@ -2665,7 +2776,10 @@ fn lowat_chunk_admission_transmission_ack_resize_flush_and_wrap() {
         let now = a.rto_deadline.unwrap();
         a.timeout(now).unwrap();
         let bytes = packet(&mut a, now);
-        assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().header.sequence, sequence);
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+            sequence
+        );
         assert_eq!(a.send_admission_room(Some(4000)), 0);
         // FLUSH discards the unoffered tail; it must not leave stale boundaries.
         let una = a.snd_una;
@@ -2673,31 +2787,47 @@ fn lowat_chunk_admission_transmission_ack_resize_flush_and_wrap() {
         a.flush().unwrap();
         assert_eq!(a.transport_info().notsent_bytes, 0);
         assert_eq!(a.send_admission_room(Some(4000)), 16384);
-        assert_eq!(a.write_with_options_and_notsent_lowat(b"abc", true, true, Some(1)), Ok(3));
+        assert_eq!(
+            a.write_with_options_and_notsent_lowat(b"abc", true, true, Some(1)),
+            Ok(3)
+        );
         assert_eq!(a.send_admission_room(Some(1)), 0);
         a.close().unwrap();
-        assert_eq!(a.write_with_options_and_notsent_lowat(b"x", true, false, Some(4000)), Err(Error::InvalidState));
+        assert_eq!(
+            a.write_with_options_and_notsent_lowat(b"x", true, false, Some(4000)),
+            Err(Error::InvalidState)
+        );
     }
 }
 
 #[test]
 fn lowat_seals_partial_transmission_without_eor() {
     let (mut a, _) = pair(config(32768, 1000), 0);
-    a.write_with_options_and_notsent_lowat(&[1; 8000], true, false, Some(4000)).unwrap();
+    a.write_with_options_and_notsent_lowat(&[1; 8000], true, false, Some(4000))
+        .unwrap();
     let base = a.send_base;
     let bytes = packet(&mut a, 40);
-    assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 1000);
+    assert_eq!(
+        wire::parse(ip(tuple()), &bytes).unwrap().payload.len(),
+        1000
+    );
     assert_eq!(a.send_admission_room(Some(4000)), 0);
     let next = a.receive.next();
     inject(&mut a, 41, next, base.wrapping_add(1000), ACK, 32768, &[]);
     assert_eq!(a.send_admission_room(Some(4000)), 0);
-    assert_eq!(a.write_with_options_and_notsent_lowat(b"x", true, false, Some(4000)), Err(Error::WouldBlock));
+    assert_eq!(
+        a.write_with_options_and_notsent_lowat(b"x", true, false, Some(4000)),
+        Err(Error::WouldBlock)
+    );
     outputs(&mut a, 41, base);
     let unsent = a.transport_info().notsent_bytes;
     assert!(unsent < 4000);
     // Actual transmission, not ACK/storage credit, opens the next full chunk.
     assert_eq!(a.send_admission_room(Some(4000)), 16384);
-    assert_eq!(a.write_with_options_and_notsent_lowat(&[2; 20000], true, false, Some(4000)), Ok(16384));
+    assert_eq!(
+        a.write_with_options_and_notsent_lowat(&[2; 20000], true, false, Some(4000)),
+        Ok(16384)
+    );
     assert_eq!(a.transport_info().notsent_bytes, unsent + 16384);
     assert_eq!(a.send_admission_room(Some(4000)), 0);
 }

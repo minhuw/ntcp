@@ -128,9 +128,16 @@ int main(int argc, char **argv) {
     assert(munmap(bad, page) == 0);
     if (managed) {
         assert(dup(ep) == -1 && errno == EOPNOTSUPP);
-        event.events = EPOLLOUT | EPOLLET;
-        assert(epoll_ctl(ep, EPOLL_CTL_MOD, fd, &event) == -1 && errno == EOPNOTSUPP);
     }
+    control(ep, EPOLL_CTL_MOD, fd, EPOLLOUT | EPOLLET, 13);
+    events(ep, 1u << 13, 1); // MOD reports an already-writable socket once.
+    assert(epoll_wait(ep, out, 8, 0) == 0); // No new edge while still writable.
+    control(ep, EPOLL_CTL_MOD, fd, EPOLLOUT | EPOLLET, 14);
+    events(ep, 1u << 14, 1); // MOD resets edge state and replaces user data.
+    assert(epoll_wait(ep, out, 8, 0) == 0);
+    control(ep, EPOLL_CTL_MOD, fd, EPOLLOUT, 6);
+    events(ep, 1u << 6, 1);
+    events(ep, 1u << 6, 1); // Restore LT and data for mixed/lifetime checks.
 
     int native = eventfd(0, EFD_CLOEXEC);
     assert(native >= 0);
