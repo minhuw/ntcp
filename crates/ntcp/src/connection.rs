@@ -834,6 +834,128 @@ impl Connection {
         Ok(connection)
     }
 
+    pub(crate) fn validate_buffer_capacities(send: usize, receive: usize) -> Result<(), Error> {
+        if send == 0 || send >= 1 << 30 || receive == 0 || receive > (65535usize << 14) {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn allocation_bytes(send: usize, receive: usize, mss: usize) -> Option<usize> {
+        receive
+            .checked_mul(3)?
+            .checked_add(send.checked_mul(2)?)?
+            .checked_add(Scoreboard::allocation_bytes(send)?)?
+            .checked_add(Rack::storage_bytes(send)?)?
+            .checked_add(mss)
+    }
+
+    pub(crate) fn receive_allocation_capacity(&self) -> usize {
+        self.receive.capacity()
+    }
+
+    fn retained_charge(
+        send: &SendBuffer,
+        receive: &ReceiveBuffer,
+        scoreboard: &Scoreboard,
+        rack: &Rack,
+        scratch: usize,
+    ) -> usize {
+        // Keep the endpoint's conservative admission charge, but never charge
+        // less than actual retained allocations (including allocator rounding).
+        let actual = send.storage_bytes()
+            + receive.storage_bytes()
+            + scoreboard.storage_bytes()
+            + rack.allocation_bytes()
+            + scratch;
+        Self::allocation_bytes(send.allocation_capacity(), receive.capacity(), scratch)
+            .unwrap()
+            .max(actual)
+    }
+
+    pub(crate) fn buffer_charge(&self) -> usize {
+        Self::retained_charge(
+            &self.send,
+            &self.receive,
+            &self.scoreboard,
+            &self.rack,
+            self.scratch.capacity(),
+        )
+    }
+
+    pub(crate) fn resize_charge(&self, send: usize, receive: usize) -> Option<usize> {
+        Self::allocation_bytes(
+            send.max(self.send.allocation_capacity()),
+            receive.max(self.receive.capacity()),
+            self.scratch.capacity(),
+        )
+    }
+
+    pub(crate) fn buffer_capacities(&self) -> (usize, usize) {
+        (self.send.capacity(), self.config.receive_capacity)
+    }
+
+    pub(crate) fn set_buffer_capacities(
+        &mut self,
+        send: usize,
+        receive: usize,
+        max_charge: usize,
+    ) -> Result<(), Error> {
+        Self::validate_buffer_capacities(send, receive)?;
+        let old_window = self.advertised_window(false);
+        let grow_send = send > self.send.allocation_capacity();
+        // Stage every allocation before changing any quota or live protocol state.
+        let sender = if grow_send {
+            Some((
+                self.send.resized(send).map_err(|_| Error::NoMemory)?,
+                self.scoreboard.grown(send).map_err(|_| Error::NoMemory)?,
+                self.rack.grown(send).map_err(|_| Error::NoMemory)?,
+            ))
+        } else {
+            None
+        };
+        let receiver = if receive > self.receive.capacity() {
+            Some(self.receive.grown(receive).map_err(|_| Error::NoMemory)?)
+        } else {
+            None
+        };
+        let (staged_send, staged_scoreboard, staged_rack) = sender.as_ref().map_or(
+            (&self.send, &self.scoreboard, &self.rack),
+            |(send, scoreboard, rack)| (send, scoreboard, rack),
+        );
+        if Self::retained_charge(
+            staged_send,
+            receiver.as_ref().unwrap_or(&self.receive),
+            staged_scoreboard,
+            staged_rack,
+            self.scratch.capacity(),
+        ) > max_charge
+        {
+            return Err(Error::NoMemory);
+        }
+        if let Some((buffer, scoreboard, rack)) = sender {
+            self.send = buffer;
+            self.scoreboard = scoreboard;
+            self.rack = rack;
+        }
+        if let Some(buffer) = receiver {
+            self.receive = buffer;
+        }
+        self.send.set_limit(send);
+        self.config.send_capacity = send;
+        self.config.receive_capacity = receive;
+        // ponytail: retain backing on shrink until reclamation; compaction can
+        // reclaim slack later, but must preserve queued bytes and promised edges.
+        self.events.writable = !self.shutdown
+            && !self.read_closed
+            && matches!(self.state, State::Established | State::CloseWait)
+            && self.send.remaining() != 0;
+        if self.synchronized() && self.advertised_window(false) > old_window {
+            self.immediate_ack();
+        }
+        Ok(())
+    }
+
     pub(crate) fn into_receive(self) -> ReceiveBuffer {
         self.receive
     }
@@ -2276,7 +2398,7 @@ impl Connection {
         if self.snd_up.is_some_and(|up| after(up, end)) {
             self.snd_up = (retained != 0).then_some(end);
         }
-        if discarded != 0 {
+        if discarded != 0 && self.send.remaining() != 0 {
             self.events.writable = true;
         }
         self.arm_work();
@@ -3947,7 +4069,7 @@ impl Connection {
             self.send_base = self.send_base.wrapping_add(bytes);
             self.acknowledged = self.acknowledged.saturating_add(bytes as u64);
             self.events.acknowledged = Some(self.acknowledged);
-            if !self.shutdown {
+            if !self.shutdown && self.send.remaining() != 0 {
                 self.events.writable = true;
             }
         }
@@ -4431,7 +4553,13 @@ impl Connection {
         }
         let shift = if self.scaling { self.local_scale } else { 0 };
         let unit = 1u32 << shift;
-        let available = self.receive.right_edge().distance_from(self.receive.next());
+        let backing = self.receive.right_edge().distance_from(self.receive.next());
+        let quota = self
+            .config
+            .receive_capacity
+            .saturating_sub(self.receive.readable()) as u32;
+        // Never retract credit already offered to the peer on shrink.
+        let available = backing.min(quota.max(self.receive_window()));
         let old = self.receive_window();
         // Apply both wire limits before SWS avoidance, not just at encoding.
         let candidate = (available / unit).min(u32::from(u16::MAX));
@@ -7611,6 +7739,108 @@ mod tests {
         assert!(a.take_events().connected);
         assert!(b.take_events().connected);
         (a, b)
+    }
+
+    #[test]
+    fn live_buffer_resize_is_atomic_and_preserves_recovery_and_window_promises() {
+        let cfg = ConnectionConfig {
+            send_capacity: 128,
+            receive_capacity: 128,
+            mss: 32,
+            nagle: false,
+            rack: true,
+            sack: true,
+            ..ConnectionConfig::default()
+        };
+        let (mut a, mut b) = pair(cfg, u32::MAX - 40);
+        a.write(b"abcdefghijklmnopqrstuvwxyz").unwrap();
+        deliver(&mut a, &mut b, 40);
+        let scale = b.local_scale;
+        let promised = b.advertised_edge;
+        let next = b.receive.next();
+        let before_rack = alloc::format!("{:?}", a.rack);
+        a.scoreboard.update(
+            a.snd_una,
+            a.data_high(),
+            &[
+                Some((a.send_base.0 + 2, a.send_base.0 + 4)),
+                None,
+                None,
+                None,
+            ],
+        );
+        let before_sack = a.scoreboard.ranges().to_vec();
+        for allocation in 0..6 {
+            let result = crate::allocation_tests::fail_after(allocation, || {
+                a.set_buffer_capacities(256, 256, usize::MAX)
+            });
+            assert_eq!(result, Err(Error::NoMemory));
+            assert_eq!(a.buffer_capacities(), (128, 128));
+            assert_eq!(a.send.len(), 26);
+            assert_eq!(alloc::format!("{:?}", a.rack), before_rack);
+            assert_eq!(a.scoreboard.ranges(), &before_sack);
+        }
+        a.set_buffer_capacities(256, 256, usize::MAX).unwrap();
+        assert_eq!(a.scoreboard.ranges(), &before_sack);
+        let mut rack_debug = alloc::format!("{:?}", a.rack);
+        rack_debug = rack_debug.replace("capacity: 258", "capacity: 130");
+        assert_eq!(rack_debug, before_rack);
+        a.set_buffer_capacities(4, 4, usize::MAX).unwrap();
+        assert_eq!(a.write(b"!"), Err(Error::WouldBlock));
+        assert!(!a.take_events().writable);
+        a.accept_ack(a.send_base.wrapping_add(10), false, None, a.snd_wnd);
+        assert_eq!(a.send.len(), 16);
+        assert!(!a.take_events().writable);
+        a.accept_ack(a.send_base.wrapping_add(13), false, None, a.snd_wnd);
+        assert_eq!(a.send.len(), 3);
+        assert!(a.take_events().writable);
+        b.set_buffer_capacities(4, 4, usize::MAX).unwrap();
+        assert_eq!(b.advertised_edge, promised);
+        assert_eq!(b.receive.next(), next);
+        assert_eq!(b.receive_window(), promised.distance_from(next));
+        b.set_buffer_capacities(256, 262144, usize::MAX).unwrap();
+        assert_eq!(b.local_scale, scale);
+        let mut out = [0; 32];
+        assert_eq!(b.read(&mut out), Ok(26));
+        assert_eq!(&out[..26], b"abcdefghijklmnopqrstuvwxyz");
+        assert_eq!(b.local_scale, scale);
+        let window = b.advertised_window(false);
+        // Large backing growth cannot renegotiate a scale of zero.
+        assert_eq!(window, u16::MAX);
+    }
+
+    #[test]
+    fn resizing_scaled_receive_credit_keeps_negotiated_scale_and_old_edge() {
+        let cfg = ConnectionConfig {
+            send_capacity: 1024,
+            receive_capacity: 131072,
+            mss: 32,
+            nagle: false,
+            ..ConnectionConfig::default()
+        };
+        let (mut a, mut b) = pair(cfg, u32::MAX - 12);
+        assert_eq!(b.local_scale, 2);
+        a.write(b"abcdefghijklmnopqrstuvwxyz").unwrap();
+        deliver(&mut a, &mut b, 40);
+        let edge = b.advertised_edge;
+        b.set_buffer_capacities(1024, 4, usize::MAX).unwrap();
+        b.immediate_ack();
+        let shrunk = packet(&mut b, 50);
+        let shrunk = wire::parse(ip(b.tuple()), &shrunk).unwrap();
+        assert_eq!(b.advertised_edge, edge);
+        assert!(at_or_after(b.receive.right_edge(), b.advertised_edge));
+        assert_eq!(b.local_scale, 2);
+        assert!(u32::from(shrunk.header.window) << 2 <= b.receive_window());
+        let mut out = [0; 32];
+        assert_eq!(b.read(&mut out), Ok(26));
+        assert_eq!(&out[..26], b"abcdefghijklmnopqrstuvwxyz");
+        b.set_buffer_capacities(1024, 262144, usize::MAX).unwrap();
+        assert_eq!(b.local_scale, 2); // not the scale=3 a fresh buffer would select
+        let grown = packet(&mut b, 60);
+        let grown = wire::parse(ip(b.tuple()), &grown).unwrap();
+        assert_eq!(grown.header.window, u16::MAX);
+        assert!(after(b.advertised_edge, edge));
+        assert!(at_or_after(b.receive.right_edge(), b.advertised_edge));
     }
 
     // Exact physical-time traces in both caller units, independently of wire TS units.

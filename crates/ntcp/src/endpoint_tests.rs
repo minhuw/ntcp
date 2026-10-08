@@ -4470,3 +4470,121 @@ fn pacing_endpoint_budget_and_halfclose() {
         assert_eq!(b.state(server).unwrap(), State::Closed);
     }
 }
+
+#[test]
+fn buffer_quotas_live_resize_retention_failure_and_reclamation() {
+    let (mut a, mut b, listener, client) = endpoints();
+    pump(&mut a, &mut b, 0);
+    let server = b.accept(listener).unwrap();
+    let original_charge = a.buffer_bytes();
+    let payload = vec![42; 512];
+    assert_eq!(a.write(client, &payload), Ok(512));
+    a.set_buffer_capacities(client, 128, 128).unwrap();
+    assert_eq!(a.buffer_capacities(client), Ok((128, 128)));
+    assert_eq!(a.buffer_bytes(), original_charge);
+    assert_eq!(a.write(client, b"!"), Err(Error::WouldBlock.into()));
+    a.set_buffer_capacities(client, 2048, 2048).unwrap();
+    let grown_charge = a.buffer_bytes();
+    assert!(grown_charge > original_charge);
+    assert!(
+        matches!(a.next_event(), Some(Event::Connection(id, events)) if id == client && events.writable)
+    );
+    a.set_buffer_capacities(client, 128, 128).unwrap();
+    assert_eq!(a.buffer_bytes(), grown_charge);
+    for allocation in 0..6 {
+        assert_eq!(
+            crate::allocation_tests::fail_after(allocation, || a
+                .set_buffer_capacities(client, 4096, 4096)),
+            Err(Error::NoMemory.into())
+        );
+        assert_eq!(a.buffer_capacities(client), Ok((128, 128)));
+        assert_eq!(a.buffer_bytes(), grown_charge);
+        assert_eq!(a.transport_info(client).unwrap().send_used, 512);
+    }
+    assert_eq!(
+        a.set_buffer_capacities(client, 1 << 30, 1),
+        Err(Error::InvalidArgument.into())
+    );
+    assert_eq!(
+        a.set_buffer_capacities(client, 1 << 29, 1 << 29),
+        Err(EndpointError::LimitReached)
+    );
+    assert_eq!(a.buffer_capacities(client), Ok((128, 128)));
+    assert_eq!(a.buffer_bytes(), grown_charge);
+    pump(&mut a, &mut b, 0);
+    let mut bytes = [0; 512];
+    assert_eq!(b.read(server, &mut bytes), Ok(512));
+    assert_eq!(&bytes, payload.as_slice());
+    // Quarantine continues charging retained allocations until reset expiry.
+    a.abort(client).unwrap();
+    a.release(client).unwrap();
+    packets(&mut a, 0);
+    assert_eq!(a.buffer_bytes(), grown_charge);
+    a.on_timeout(240_000_000, 64).unwrap();
+    assert!(!a.connection_exists(client));
+    assert_eq!(a.buffer_bytes(), 0);
+}
+
+#[test]
+fn buffer_capacities_prehandshake_inheritance_and_pool_mismatch() {
+    let (local, remote) = addresses();
+    let mut cfg = config();
+    cfg.preallocate_connections = 1;
+    let reserved = connection_charge(&cfg);
+    cfg.max_buffer_bytes = reserved;
+    let mut limited = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    for allocation in 0..4 {
+        assert_eq!(
+            crate::allocation_tests::fail_after(allocation, || limited.connect(0, local, remote)),
+            Err(Error::NoMemory.into())
+        );
+        assert_eq!(limited.buffer_bytes(), reserved);
+        assert_eq!(limited.connection_id(Tuple { local, remote }), None);
+    }
+    // Incompatible pooled storage is neither reused nor silently enlarged.
+    assert_eq!(
+        limited.connect_with_buffer_capacities(0, local, remote, 32, 32),
+        Err(EndpointError::LimitReached)
+    );
+    assert_eq!(limited.buffer_bytes(), reserved);
+    let id = limited
+        .connect_with_buffer_capacities(0, local, remote, 32, 1024)
+        .unwrap();
+    assert_eq!(limited.buffer_capacities(id), Ok((32, 1024)));
+    assert!(limited.buffer_bytes() < reserved);
+
+    cfg.max_buffer_bytes = 16 * reserved;
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    let listener = b.listen(remote, 2).unwrap();
+    b.set_listener_buffer_capacities(listener, 4096, 131072)
+        .unwrap();
+    assert_eq!(b.listener_buffer_capacities(listener), Ok((4096, 131072)));
+    let client = a
+        .connect_with_buffer_capacities(0, local, remote, 2048, 262144)
+        .unwrap();
+    let syn = packets(&mut a, 0);
+    let parsed = wire::parse(syn[0].0, &syn[0].1).unwrap();
+    assert_eq!(parsed.options.window_scale, Some(3));
+    deliver(&mut b, 0, syn);
+    let child = b
+        .connection_id(Tuple {
+            local: remote,
+            remote: local,
+        })
+        .unwrap();
+    assert_eq!(b.buffer_capacities(child), Ok((4096, 131072)));
+    // A later listener edit affects only subsequently constructed children.
+    b.set_listener_buffer_capacities(listener, 8192, 4096)
+        .unwrap();
+    let synack = packets(&mut b, 0);
+    let parsed = wire::parse(synack[0].0, &synack[0].1).unwrap();
+    assert_eq!(parsed.options.window_scale, Some(2));
+    deliver(&mut a, 0, synack);
+    pump(&mut a, &mut b, 0);
+    assert_eq!(b.accept(listener), Ok(child));
+    assert_eq!(b.buffer_capacities(child), Ok((4096, 131072)));
+    assert_eq!(a.buffer_capacities(client), Ok((2048, 262144)));
+    // A mismatched pool remains charged alongside the new child.
+    assert!(b.buffer_bytes() > reserved);
+}

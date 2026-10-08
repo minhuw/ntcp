@@ -1182,6 +1182,9 @@ pub unsafe extern "C" fn ntcp_managed_setsockopt(
         let Some(id) = owned(fd)? else {
             return raw(unsafe { syscall(SYS_setsockopt, fd, level, name, p, len) });
         };
+        if matches!((level, name), (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF)) && (len as i32) < 4 {
+            return Err(EINVAL);
+        }
         if p.is_null() {
             return Err(EFAULT);
         }
@@ -1213,6 +1216,17 @@ pub unsafe extern "C" fn ntcp_managed_getsockopt(
         let Some(id) = owned(fd)? else {
             return raw(unsafe { syscall(SYS_getsockopt, fd, level, name, p, len) });
         };
+        if matches!((level, name), (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF)) {
+            let requested = load(len)?;
+            if (requested as i32) < 0 {
+                return Err(EINVAL);
+            }
+            let value = call(id, Op::Get(level, name))?.value.to_ne_bytes();
+            let n = (requested as usize).min(4);
+            copy_out(p.cast(), &value[..n])?;
+            store(len, &(n as u32))?;
+            return Ok(0);
+        }
         if p.is_null() || len.is_null() {
             return Err(EFAULT);
         }
@@ -1478,6 +1492,148 @@ pub unsafe extern "C" fn ntcp_managed_dup3(fd: i32, new: i32, flags: i32) -> i32
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn socket_buffer_abi_native_differential_and_shared_aliases() {
+        const CHILD: &str = "NTCP_TEST_BUFFER_ABI_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::socket_buffer_abi_native_differential_and_shared_aliases",
+                        "--test-threads=1"
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            return;
+        }
+        assert!(RUNTIME.set(Ok(Runtime::in_memory_test())).is_ok());
+        let id = call(0, Op::New(SOCK_NONBLOCK)).unwrap().value as u64;
+        let (fd, token) = token(SOCK_CLOEXEC).unwrap();
+        install(fd, token, id).unwrap();
+        let alias = unsafe { dup(fd) };
+        assert!(alias >= 0);
+        let native = unsafe { syscall(SYS_socket, AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0) as i32 };
+        assert!(native >= 0);
+        for (name, minimum) in [(SO_SNDBUF, 4608), (SO_RCVBUF, 2304)] {
+            for request in [0i32, 1, 1024, 65536, -1, i32::MAX] {
+                assert_eq!(
+                    unsafe {
+                        ntcp_managed_setsockopt(
+                            fd,
+                            SOL_SOCKET,
+                            name,
+                            (&request as *const i32).cast(),
+                            4,
+                        )
+                    },
+                    0
+                );
+                let mut value = 0i32;
+                let mut len = 8u32;
+                assert_eq!(
+                    unsafe {
+                        ntcp_managed_getsockopt(
+                            alias,
+                            SOL_SOCKET,
+                            name,
+                            (&mut value as *mut i32).cast(),
+                            &mut len,
+                        )
+                    },
+                    0
+                );
+                assert_eq!(len, 4);
+                assert_eq!(
+                    value,
+                    ((request as u32).min(1024 * 1024) * 2).max(minimum) as i32
+                );
+                if (0..=65536).contains(&request) {
+                    let mut native_value = 0i32;
+                    let mut native_len = 4u32;
+                    assert_eq!(
+                        unsafe { syscall(SYS_setsockopt, native, SOL_SOCKET, name, &request, 4) },
+                        0
+                    );
+                    assert_eq!(
+                        unsafe {
+                            syscall(
+                                SYS_getsockopt,
+                                native,
+                                SOL_SOCKET,
+                                name,
+                                &mut native_value,
+                                &mut native_len,
+                            )
+                        },
+                        0
+                    );
+                    // Host sysctl clamps may be lower; compare only unclamped requests.
+                    if native_value == (request * 2).max(minimum as i32) {
+                        assert_eq!(value, native_value);
+                    }
+                }
+                for requested in 0..=3u32 {
+                    let mut short = [0xa5; 4];
+                    let mut len = requested;
+                    assert_eq!(
+                        unsafe {
+                            ntcp_managed_getsockopt(
+                                alias,
+                                SOL_SOCKET,
+                                name,
+                                short.as_mut_ptr().cast(),
+                                &mut len,
+                            )
+                        },
+                        0
+                    );
+                    assert_eq!(len, requested);
+                    assert_eq!(
+                        &short[..requested as usize],
+                        &value.to_ne_bytes()[..requested as usize]
+                    );
+                    assert!(short[requested as usize..].iter().all(|&byte| byte == 0xa5));
+                }
+            }
+            for len in [0u32, 1, 3, u32::MAX, 1 << 31] {
+                assert_eq!(
+                    unsafe { ntcp_managed_setsockopt(fd, SOL_SOCKET, name, ptr::null(), len) },
+                    -1
+                );
+                assert_eq!(errno(), EINVAL);
+            }
+            assert_eq!(
+                unsafe { ntcp_managed_setsockopt(fd, SOL_SOCKET, name, ptr::null(), 4) },
+                -1
+            );
+            assert_eq!(errno(), EFAULT);
+            let mut len = 0u32;
+            assert_eq!(
+                unsafe { ntcp_managed_getsockopt(fd, SOL_SOCKET, name, ptr::null_mut(), &mut len) },
+                0
+            );
+            len = u32::MAX;
+            assert_eq!(
+                unsafe { ntcp_managed_getsockopt(fd, SOL_SOCKET, name, ptr::null_mut(), &mut len) },
+                -1
+            );
+            assert_eq!(errno(), EINVAL);
+            len = 4;
+            assert_eq!(
+                unsafe { ntcp_managed_getsockopt(fd, SOL_SOCKET, name, ptr::null_mut(), &mut len) },
+                -1
+            );
+            assert_eq!(errno(), EFAULT);
+        }
+        assert_eq!(unsafe { close(alias) }, 0);
+        assert_eq!(unsafe { close(fd) }, 0);
+        assert_eq!(unsafe { syscall(SYS_close, native) }, 0);
+    }
+
     use super::*;
     static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
     static SIGNAL_SOCKET: AtomicI32 = AtomicI32::new(-1);

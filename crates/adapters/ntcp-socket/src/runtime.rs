@@ -15,6 +15,13 @@ use std::{
 pub const LIMIT: usize = 512;
 pub const BYTES: usize = 65536;
 const BUDGET: usize = 32;
+// Linux sock_setsockopt clamps the unsigned request before doubling. Fixed
+// project cap, not host sysctls: RACK's per-byte ledger also consumes the budget.
+const BUFFER_REQUEST_CAP: u32 = 1024 * 1024;
+fn socket_buffer_value(name: i32, value: i32) -> usize {
+    let minimum = if name == SO_SNDBUF { 4608 } else { 2304 };
+    ((value as u32).min(BUFFER_REQUEST_CAP) as usize * 2).max(minimum)
+}
 #[derive(Clone)]
 pub enum Op {
     New(i32),
@@ -54,6 +61,29 @@ pub struct Runtime {
     pub family: i32,
 }
 impl Runtime {
+    #[cfg(test)]
+    pub(crate) fn in_memory_test() -> Self {
+        let wake = unsafe { syscall(SYS_eventfd2, 0, EFD_NONBLOCK | EFD_CLOEXEC) as i32 };
+        assert!(wake >= 0);
+        let (tx, rx) = mpsc::sync_channel::<Request>(LIMIT);
+        std::thread::spawn(move || {
+            set_internal(true);
+            let local = Ipv4Addr::new(10, 73, 0, 2);
+            let mut owner =
+                Owner::with_endpoint(local, (Ipv4Addr::new(10, 73, 0, 1), 24), [2; 32], None)
+                    .unwrap();
+            while let Ok(request) = rx.recv() {
+                let result = owner.execute(request.id, request.op);
+                let _ = request.reply.send(result);
+            }
+        });
+        Self {
+            tx,
+            wake,
+            family: AF_INET,
+        }
+    }
+
     pub fn start() -> Result<Self> {
         let name = env("NTCP_SOCKET_TUN").ok_or(EINVAL)?;
         let local: Ipv4Addr = env("NTCP_SOCKET_ADDR")
@@ -147,6 +177,8 @@ enum Handle {
 }
 #[derive(Clone)]
 struct Socket {
+    send_capacity: usize,
+    receive_capacity: usize,
     handle: Handle,
     local: Option<SocketAddr>,
     flags: i32,
@@ -169,6 +201,8 @@ struct Socket {
 impl Socket {
     fn new(flags: i32) -> Self {
         Self {
+            send_capacity: BYTES,
+            receive_capacity: BYTES,
             handle: Handle::Fresh,
             local: None,
             flags,
@@ -570,6 +604,7 @@ impl Owner {
                 if !matches!(s.handle, Handle::Fresh) {
                     return Err(EOPNOTSUPP);
                 }
+                let capacities = (s.send_capacity, s.receive_capacity);
                 let local = match s.local {
                     Some(a) => a,
                     None => SocketAddr::new(self.local.into(), self.port()?),
@@ -578,6 +613,14 @@ impl Owner {
                     .endpoint
                     .listen(local, backlog.clamp(1, LIMIT as i32) as usize)
                     .map_err(engine)?;
+                if let Err(e) = self.endpoint.set_listener_buffer_capacities(
+                    listener,
+                    capacities.0,
+                    capacities.1,
+                ) {
+                    let _ = self.endpoint.close_listener(listener);
+                    return Err(engine(e));
+                }
                 let s = self.sockets.get_mut(&id).unwrap();
                 s.local = Some(local);
                 s.handle = Handle::Listener(listener);
@@ -601,6 +644,8 @@ impl Owner {
                     self.sockets.get_mut(&id).unwrap().acceptable = false;
                 }
                 let cid = accepted.map_err(engine)?;
+                (child.send_capacity, child.receive_capacity) =
+                    self.endpoint.buffer_capacities(cid).map_err(engine)?;
                 if let Some(index) = self
                     .child_timeouts
                     .iter()
@@ -664,7 +709,13 @@ impl Owner {
                 }
                 let cid = self
                     .endpoint
-                    .connect(self.now(), local, remote)
+                    .connect_with_buffer_capacities(
+                        self.now(),
+                        local,
+                        remote,
+                        options.send_capacity,
+                        options.receive_capacity,
+                    )
                     .map_err(engine)?;
                 if let Err(e) = self.apply_options(cid, &options) {
                     self.rollback_connection(cid);
@@ -819,6 +870,10 @@ impl Owner {
                 match (level, name) {
                     (SOL_SOCKET, SO_REUSEADDR) => s.reuse = value != 0,
                     (SOL_SOCKET, SO_KEEPALIVE) => s.keepalive = value != 0,
+                    (SOL_SOCKET, SO_SNDBUF) => s.send_capacity = socket_buffer_value(name, value),
+                    (SOL_SOCKET, SO_RCVBUF) => {
+                        s.receive_capacity = socket_buffer_value(name, value)
+                    }
                     (IPPROTO_TCP, TCP_NODELAY) => s.nodelay = value != 0,
                     (IPPROTO_TCP, TCP_KEEPIDLE) if value > 0 && value <= 32767 => s.idle = value,
                     (IPPROTO_TCP, TCP_KEEPINTVL) if value > 0 && value <= 32767 => {
@@ -830,7 +885,23 @@ impl Owner {
                     }
                     _ => return Err(ENOPROTOOPT),
                 }
-                if let Handle::Connection(cid) = s.handle {
+                if matches!((level, name), (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF)) {
+                    match s.handle {
+                        Handle::Connection(cid) => self
+                            .endpoint
+                            .set_buffer_capacities(cid, s.send_capacity, s.receive_capacity)
+                            .map_err(engine)?,
+                        Handle::Listener(listener) => self
+                            .endpoint
+                            .set_listener_buffer_capacities(
+                                listener,
+                                s.send_capacity,
+                                s.receive_capacity,
+                            )
+                            .map_err(engine)?,
+                        Handle::Fresh => (),
+                    }
+                } else if let Handle::Connection(cid) = s.handle {
                     self.apply_options(cid, s)?;
                 }
                 self.sockets.insert(id, candidate);
@@ -851,7 +922,8 @@ impl Owner {
                     }
                     (SOL_SOCKET, SO_REUSEADDR) => s.reuse as i32,
                     (SOL_SOCKET, SO_KEEPALIVE) => s.keepalive as i32,
-                    (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => BYTES as i32,
+                    (SOL_SOCKET, SO_SNDBUF) => s.send_capacity as i32,
+                    (SOL_SOCKET, SO_RCVBUF) => s.receive_capacity as i32,
                     (IPPROTO_TCP, TCP_NODELAY) => s.nodelay as i32,
                     (IPPROTO_TCP, TCP_KEEPIDLE) => s.idle,
                     (IPPROTO_TCP, TCP_KEEPINTVL) => s.interval,
@@ -1370,6 +1442,114 @@ mod tests {
         closer.join().unwrap();
         assert!(open_at_exit.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(unsafe { syscall(SYS_fcntl, wake, F_GETFD) }, -1);
+    }
+
+    #[test]
+    fn socket_buffer_semantics_inherit_at_syn_and_resize_readiness() {
+        for (name, minimum) in [(SO_SNDBUF, 4608), (SO_RCVBUF, 2304)] {
+            for (request, expected) in [
+                (0, minimum),
+                (1, minimum),
+                (65536, 131072),
+                (-1, 2097152),
+                (i32::MAX, 2097152),
+            ] {
+                assert_eq!(socket_buffer_value(name, request), expected);
+            }
+        }
+        let mut a = owner(2);
+        let mut b = owner(3);
+        let listener = new(&mut b, SOCK_NONBLOCK);
+        b.execute(listener, Op::Set(SOL_SOCKET, SO_SNDBUF, 8192))
+            .unwrap();
+        b.execute(listener, Op::Set(SOL_SOCKET, SO_RCVBUF, 131072))
+            .unwrap();
+        b.execute(listener, Op::Bind("10.73.0.3:16379".parse().unwrap()))
+            .unwrap();
+        b.execute(listener, Op::Listen(4)).unwrap();
+        let client = new(&mut a, SOCK_NONBLOCK);
+        a.execute(client, Op::Set(SOL_SOCKET, SO_SNDBUF, 4096))
+            .unwrap();
+        a.execute(client, Op::Set(SOL_SOCKET, SO_RCVBUF, 262144))
+            .unwrap();
+        assert_eq!(
+            a.execute(client, Op::Connect("10.73.0.3:16379".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        pump(&mut a, &mut b);
+        b.execute(listener, Op::Set(SOL_SOCKET, SO_SNDBUF, 0))
+            .unwrap();
+        b.execute(listener, Op::Set(SOL_SOCKET, SO_RCVBUF, 0))
+            .unwrap();
+        let server = b
+            .execute(listener, Op::Accept(SOCK_NONBLOCK))
+            .unwrap()
+            .value as u64;
+        assert_eq!(
+            b.execute(server, Op::Get(SOL_SOCKET, SO_SNDBUF))
+                .unwrap()
+                .value,
+            16384
+        );
+        assert_eq!(
+            b.execute(server, Op::Get(SOL_SOCKET, SO_RCVBUF))
+                .unwrap()
+                .value,
+            262144
+        );
+        assert_eq!(
+            a.execute(client, Op::Write(vec![42; 8192])).unwrap().value,
+            8192
+        );
+        assert_eq!(a.execute(client, Op::Ready).unwrap().value & EPOLLOUT, 0);
+        a.execute(client, Op::Set(SOL_SOCKET, SO_SNDBUF, 0))
+            .unwrap();
+        assert_eq!(a.execute(client, Op::Write(vec![0])).unwrap_err(), EAGAIN);
+        a.execute(client, Op::Set(SOL_SOCKET, SO_SNDBUF, 8192))
+            .unwrap();
+        assert_ne!(a.execute(client, Op::Ready).unwrap().value & EPOLLOUT, 0);
+        b.execute(server, Op::Set(SOL_SOCKET, SO_RCVBUF, 0))
+            .unwrap();
+        pump(&mut a, &mut b);
+        assert_ne!(b.execute(server, Op::Ready).unwrap().value & EPOLLIN, 0);
+        // The pre-shrink promised window accepts and retains all queued bytes.
+        assert_eq!(
+            b.execute(server, Op::Read(8192)).unwrap().bytes,
+            vec![42; 8192]
+        );
+        assert_eq!(
+            b.execute(server, Op::Get(SOL_SOCKET, SO_RCVBUF))
+                .unwrap()
+                .value,
+            2304
+        );
+        let other = a
+            .endpoint
+            .connect(
+                a.now(),
+                "10.73.0.2:25000".parse().unwrap(),
+                "10.73.0.3:25000".parse().unwrap(),
+            )
+            .unwrap();
+        a.endpoint
+            .set_buffer_capacities(other, 2 * BUFFER_REQUEST_CAP as usize, BYTES)
+            .unwrap();
+        let old = a
+            .execute(client, Op::Get(SOL_SOCKET, SO_SNDBUF))
+            .unwrap()
+            .value;
+        assert_eq!(
+            a.execute(client, Op::Set(SOL_SOCKET, SO_SNDBUF, i32::MAX))
+                .unwrap_err(),
+            ENOBUFS
+        );
+        assert_eq!(
+            a.execute(client, Op::Get(SOL_SOCKET, SO_SNDBUF))
+                .unwrap()
+                .value,
+            old
+        );
     }
 
     #[test]

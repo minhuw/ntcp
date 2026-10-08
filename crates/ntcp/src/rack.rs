@@ -101,6 +101,22 @@ impl Rack {
 
     // One interval per outstanding octet is the worst case after arbitrary
     // retransmission/SACK splits; reserve control space as well.
+    pub(crate) fn allocation_bytes(&self) -> usize {
+        self.intervals.capacity() * core::mem::size_of::<Interval>()
+    }
+
+    pub(crate) fn grown(&self, send_capacity: usize) -> Result<Self, ()> {
+        let capacity = send_capacity.checked_add(2).ok_or(())?;
+        let mut intervals = Vec::new();
+        intervals.try_reserve_exact(capacity).map_err(|_| ())?;
+        intervals.extend_from_slice(&self.intervals);
+        Ok(Self {
+            intervals,
+            capacity,
+            ..*self
+        })
+    }
+
     pub(crate) fn storage_bytes(send_capacity: usize) -> Option<usize> {
         send_capacity
             .checked_add(2)?

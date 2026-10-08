@@ -9,6 +9,8 @@
 
 extern crate alloc;
 
+#[cfg(test)]
+mod allocation_tests;
 mod buffer;
 mod connection;
 mod cubic;

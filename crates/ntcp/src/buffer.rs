@@ -24,17 +24,35 @@ impl SendBuffer {
         Ok(Self { data, capacity })
     }
 
+    pub(crate) fn storage_bytes(&self) -> usize {
+        self.data.capacity() * core::mem::size_of::<(u8, bool)>()
+    }
+
+    pub(crate) fn allocation_capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    pub(crate) fn resized(&self, capacity: usize) -> Result<Self, ()> {
+        let mut result = Self::new(capacity.max(self.data.capacity()))?;
+        result.data.extend(self.data.iter().copied());
+        result.capacity = capacity;
+        Ok(result)
+    }
+
+    pub(crate) fn set_limit(&mut self, capacity: usize) {
+        self.capacity = capacity;
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.data.len()
     }
 
-    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
 
     pub(crate) fn remaining(&self) -> usize {
-        self.capacity - self.len()
+        self.capacity.saturating_sub(self.len())
     }
 
     pub(crate) fn write(&mut self, input: &[u8]) -> usize {
@@ -168,6 +186,36 @@ impl ReceiveBuffer {
             report_debt: 0,
             pending_first: None,
             dsack: None,
+        })
+    }
+
+    pub(crate) fn storage_bytes(&self) -> usize {
+        self.data.capacity() + self.metadata.capacity() + self.report_pending.capacity()
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.data.len()
+    }
+
+    // Rebase the physical ring, not sequence/reporting state. Uninitialized slots
+    // are copied only as MaybeUninit; payload reads still require presence.
+    pub(crate) fn grown(&self, capacity: usize) -> Result<Self, ()> {
+        let mut result = Self::new(self.read_base, capacity)?;
+        for offset in 0..self.data.len() {
+            let index = self.index(offset);
+            result.data[offset] = self.data[index];
+            result.set_present(offset, self.is_present(index));
+            result.set_push(offset, self.is_push(index));
+            if self.report_pending[index / 8] & (1 << (index % 8)) != 0 {
+                result.report_pending[offset / 8] |= 1 << (offset % 8);
+            }
+        }
+        Ok(Self {
+            data: result.data,
+            metadata: result.metadata,
+            report_pending: result.report_pending,
+            head: 0,
+            ..*self
         })
     }
 
@@ -760,6 +808,80 @@ impl ReceiveBuffer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resizing_wrapped_ring_preserves_holes_push_fin_and_reporting() {
+        let start = Seq(u32::MAX - 5);
+        let mut recv = ReceiveBuffer::new(start, 9).unwrap();
+        recv.insert_with_push(start, b"abc", false, true);
+        let mut out = [0; 3];
+        assert_eq!(recv.read(&mut out), 3); // physical head no longer zero
+        let base = recv.read_base;
+        recv.insert_with_push(base.wrapping_add(2), b"fghi", true, true);
+        recv.record_duplicate(base.wrapping_add(2), 2);
+        let before = (
+            recv.next(),
+            recv.fin_sequence,
+            recv.latest,
+            recv.reported,
+            recv.report_debt,
+            recv.pending_first,
+            recv.dsack,
+            recv.pushed,
+        );
+        let mut grown = recv.grown(17).unwrap();
+        assert_eq!(
+            (
+                grown.next(),
+                grown.fin_sequence,
+                grown.latest,
+                grown.reported,
+                grown.report_debt,
+                grown.pending_first,
+                grown.dsack,
+                grown.pushed
+            ),
+            before
+        );
+        for offset in 0..9 {
+            let seq = base.wrapping_add(offset as u32);
+            assert_eq!(grown.pending(seq), recv.pending(seq));
+            assert_eq!(
+                grown.is_present(grown.index(offset)),
+                recv.is_present(recv.index(offset))
+            );
+            assert_eq!(
+                grown.is_push(grown.index(offset)),
+                recv.is_push(recv.index(offset))
+            );
+        }
+        grown.insert(base, b"de", false);
+        assert!(grown.eof());
+        let mut out = [0; 16];
+        assert_eq!(grown.read(&mut out), 6);
+        assert_eq!(&out[..6], b"defghi");
+        assert!(grown.take_push());
+        assert_eq!(grown.next(), base.wrapping_add(7));
+    }
+
+    #[test]
+    fn send_shrink_saturates_and_failed_growth_preserves_data() {
+        let mut send = SendBuffer::new(8).unwrap();
+        send.write(b"abcdef");
+        send.mark_push();
+        send.set_limit(2);
+        assert_eq!(send.remaining(), 0);
+        assert_eq!(send.write(b"!"), 0);
+        assert!(send.resized(usize::MAX).is_err());
+        let mut grown = send.resized(16).unwrap();
+        let mut out = [0; 6];
+        assert_eq!(grown.copy(0, &mut out), 6);
+        assert_eq!(&out, b"abcdef");
+        assert!(grown.pushed(0, 6));
+        grown.acknowledge(5).unwrap();
+        grown.set_limit(2);
+        assert_eq!(grown.write(b"xy"), 1);
+    }
+
     use super::*;
 
     #[test]

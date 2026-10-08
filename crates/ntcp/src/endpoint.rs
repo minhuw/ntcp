@@ -239,6 +239,7 @@ struct Slot {
     received_ipv4_options: Option<Ipv4Options>,
 }
 struct Listener {
+    buffer_capacities: (usize, usize),
     application_timeout_us: Option<u64>,
     address: SocketAddr,
     backlog: usize,
@@ -349,28 +350,12 @@ impl Endpoint {
         // The existing conservative 3*receive charge covers payload, the
         // 2-bit presence/PUSH map and the new 1-bit pending-report map.
         // Sender interval storage is a separate additive admission charge.
-        let per_connection_bytes = config
-            .connection
-            .receive_capacity
-            .checked_mul(3)
-            .and_then(|n| {
-                config
-                    .connection
-                    .send_capacity
-                    .checked_mul(2)
-                    .and_then(|send| n.checked_add(send))
-            })
-            .and_then(|n| {
-                crate::sack::Scoreboard::allocation_bytes(config.connection.send_capacity)
-                    .and_then(|sack| n.checked_add(sack))
-            })
-            .and_then(|n| n.checked_add(usize::from(config.connection.mss)))
-            .and_then(|n| {
-                n.checked_add(crate::rack::Rack::storage_bytes(
-                    config.connection.send_capacity,
-                )?)
-            })
-            .ok_or(EndpointError::LimitReached)?;
+        let per_connection_bytes = Connection::allocation_bytes(
+            config.connection.send_capacity,
+            config.connection.receive_capacity,
+            usize::from(config.connection.mss),
+        )
+        .ok_or(EndpointError::LimitReached)?;
         if config.preallocate_connections > count {
             return Err(EndpointError::LimitReached);
         }
@@ -594,6 +579,10 @@ impl Endpoint {
             .try_reserve_exact(backlog)
             .map_err(|_| Error::NoMemory)?;
         self.listeners[slot] = Some(Listener {
+            buffer_capacities: (
+                self.config.connection.send_capacity,
+                self.config.connection.receive_capacity,
+            ),
             application_timeout_us: None,
             address,
             backlog,
@@ -643,6 +632,20 @@ impl Endpoint {
 
     // Scoped to the embedding policy's bound network; base invalid addresses cannot be allowed.
     fn admission(&self, tuple: Tuple) -> Result<(), EndpointError> {
+        self.admission_with_buffers(
+            tuple,
+            (
+                self.config.connection.send_capacity,
+                self.config.connection.receive_capacity,
+            ),
+        )
+    }
+
+    fn admission_with_buffers(
+        &self,
+        tuple: Tuple,
+        capacities: (usize, usize),
+    ) -> Result<(), EndpointError> {
         if !supported_socket(tuple.local)
             || !supported_socket(tuple.remote)
             || tuple.local.port() == 0
@@ -657,13 +660,17 @@ impl Endpoint {
         {
             return Err(EndpointError::InvalidAddress);
         }
-        self.resource_admission(tuple)
+        self.resource_admission(tuple, capacities)
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.1
     //= reason=Duplicate tuple admission fails without replacing the existing record; independent listener remains legal.
     //# Return "error: connection already exists".
-    fn resource_admission(&self, tuple: Tuple) -> Result<(), EndpointError> {
+    fn resource_admission(
+        &self,
+        tuple: Tuple,
+        capacities: (usize, usize),
+    ) -> Result<(), EndpointError> {
         if tuple.local.port() == 0 || tuple.remote.port() == 0 {
             return Err(EndpointError::InvalidAddress);
         }
@@ -674,20 +681,36 @@ impl Endpoint {
         //# If there is
         //# no room to create a new connection, return "error: insufficient
         //# resources".
-        if !self.has_capacity() {
+        if !self.has_capacity(capacities) {
             return Err(EndpointError::LimitReached);
         }
         Ok(())
     }
 
-    fn has_capacity(&self) -> bool {
+    fn has_capacity(&self, capacities: (usize, usize)) -> bool {
+        let credit = if self
+            .receive_pool
+            .iter()
+            .any(|r| r.capacity() == capacities.1)
+        {
+            self.per_connection_bytes
+        } else {
+            0
+        };
         !self.free.is_empty()
-            && (!self.receive_pool.is_empty()
-                || self.per_connection_bytes
+            && Connection::allocation_bytes(
+                capacities.0,
+                capacities.1,
+                usize::from(self.config.connection.mss),
+            )
+            .is_some_and(|charge| {
+                charge
                     <= self
                         .config
                         .max_buffer_bytes
-                        .saturating_sub(self.buffer_bytes))
+                        .saturating_sub(self.buffer_bytes)
+                        .saturating_add(credit)
+            })
     }
 
     //= https://www.rfc-editor.org/rfc/rfc7323#section-7.1
@@ -710,9 +733,53 @@ impl Endpoint {
         iss: u32,
         syn: Option<&wire::Segment<'_>>,
     ) -> Result<Connection, Error> {
-        let mut receive = self.receive_pool.pop();
-        let pooled = receive.is_some();
+        self.new_connection_with_buffers(
+            tuple,
+            iss,
+            syn,
+            (
+                self.config.connection.send_capacity,
+                self.config.connection.receive_capacity,
+            ),
+        )
+    }
+
+    fn new_connection_with_buffers(
+        &mut self,
+        tuple: Tuple,
+        iss: u32,
+        syn: Option<&wire::Segment<'_>>,
+        capacities: (usize, usize),
+    ) -> Result<Connection, Error> {
+        Connection::validate_buffer_capacities(capacities.0, capacities.1)?;
+        let charge = Connection::allocation_bytes(
+            capacities.0,
+            capacities.1,
+            usize::from(self.config.connection.mss),
+        )
+        .ok_or(Error::NoMemory)?;
+        let pool_index = self
+            .receive_pool
+            .iter()
+            .position(|r| r.capacity() == capacities.1);
+        let credit = if pool_index.is_some() {
+            self.per_connection_bytes
+        } else {
+            0
+        };
+        if charge
+            > self
+                .config
+                .max_buffer_bytes
+                .saturating_sub(self.buffer_bytes)
+                .saturating_add(credit)
+        {
+            return Err(Error::NoMemory);
+        }
+        let mut receive = pool_index.map(|index| self.receive_pool.swap_remove(index));
         let mut connection_config = self.config.connection.clone();
+        connection_config.send_capacity = capacities.0;
+        connection_config.receive_capacity = capacities.1;
         if connection_config.initial_window == crate::InitialWindow::Iw10
             && self
                 .setup_loss_cache
@@ -737,6 +804,22 @@ impl Endpoint {
                 &mut receive,
             ),
         };
+        if result.as_ref().is_ok_and(|connection| {
+            connection.buffer_charge()
+                > self
+                    .config
+                    .max_buffer_bytes
+                    .saturating_sub(self.buffer_bytes)
+                    .saturating_add(credit)
+        }) {
+            let connection = result.unwrap();
+            if credit != 0 {
+                let mut storage = connection.into_receive();
+                storage.clear();
+                self.receive_pool.push(storage);
+            }
+            return Err(Error::NoMemory);
+        }
         if let Ok(connection) = &mut result {
             let mut domain = *b"ntcp timestamp offset\0\0\0\0";
             let len = domain.len();
@@ -747,19 +830,27 @@ impl Endpoint {
         if let Some(receive) = receive {
             self.receive_pool.push(receive);
         }
-        if result.is_ok() && !pooled {
-            self.buffer_bytes += self.per_connection_bytes;
+        if let Ok(connection) = &result {
+            self.buffer_bytes = self.buffer_bytes - credit + connection.buffer_charge();
         }
         result
     }
 
     fn recycle_connection(&mut self, connection: Connection) {
-        if self.receive_pool.len() < self.config.preallocate_connections {
+        let charge = connection.buffer_charge();
+        self.buffer_bytes -= charge;
+        if self.receive_pool.len() < self.config.preallocate_connections
+            && connection.receive_allocation_capacity() == self.config.connection.receive_capacity
+            && self.per_connection_bytes
+                <= self
+                    .config
+                    .max_buffer_bytes
+                    .saturating_sub(self.buffer_bytes)
+        {
             let mut receive = connection.into_receive();
             receive.clear();
             self.receive_pool.push(receive);
-        } else {
-            self.buffer_bytes -= self.per_connection_bytes;
+            self.buffer_bytes += self.per_connection_bytes;
         }
     }
 
@@ -848,6 +939,78 @@ impl Endpoint {
         let iss = self.isn(tuple);
         let connection = self.new_connection(tuple, iss, None)?;
         self.insert(connection, None, None)
+    }
+
+    pub fn connect_with_buffer_capacities(
+        &mut self,
+        now: Instant,
+        local: SocketAddr,
+        remote: SocketAddr,
+        send: usize,
+        receive: usize,
+    ) -> Result<ConnectionId, EndpointError> {
+        self.clock(now)?;
+        let tuple = Tuple { local, remote };
+        Connection::validate_buffer_capacities(send, receive)?;
+        self.admission_with_buffers(tuple, (send, receive))?;
+        let iss = self.isn(tuple);
+        let connection = self.new_connection_with_buffers(tuple, iss, None, (send, receive))?;
+        self.insert(connection, None, None)
+    }
+
+    pub fn buffer_capacities(&self, id: ConnectionId) -> Result<(usize, usize), EndpointError> {
+        Ok(self.slot(id)?.connection.buffer_capacities())
+    }
+
+    pub fn set_buffer_capacities(
+        &mut self,
+        id: ConnectionId,
+        send: usize,
+        receive: usize,
+    ) -> Result<(), EndpointError> {
+        Connection::validate_buffer_capacities(send, receive)?;
+        let connection = &self.slot(id)?.connection;
+        let old = connection.buffer_charge();
+        let charge = connection
+            .resize_charge(send, receive)
+            .ok_or(EndpointError::LimitReached)?;
+        if charge
+            > self
+                .config
+                .max_buffer_bytes
+                .saturating_sub(self.buffer_bytes - old)
+        {
+            return Err(EndpointError::LimitReached);
+        }
+        let max_charge = self
+            .config
+            .max_buffer_bytes
+            .saturating_sub(self.buffer_bytes - old);
+        self.slot_mut(id)?
+            .connection
+            .set_buffer_capacities(send, receive, max_charge)?;
+        self.buffer_bytes = self.buffer_bytes - old + self.slot(id)?.connection.buffer_charge();
+        self.refresh(id.slot);
+        Ok(())
+    }
+
+    pub fn set_listener_buffer_capacities(
+        &mut self,
+        id: ListenerId,
+        send: usize,
+        receive: usize,
+    ) -> Result<(), EndpointError> {
+        self.listener(id)?;
+        Connection::validate_buffer_capacities(send, receive)?;
+        self.listeners[id.slot].as_mut().unwrap().buffer_capacities = (send, receive);
+        Ok(())
+    }
+
+    pub fn listener_buffer_capacities(
+        &self,
+        id: ListenerId,
+    ) -> Result<(usize, usize), EndpointError> {
+        Ok(self.listener(id)?.buffer_capacities)
     }
 
     fn validate_ipv4_options(
@@ -1400,12 +1563,22 @@ impl Endpoint {
                 return Ok(InputDisposition::Dropped);
             }
             let record = self.listeners[listener.slot].as_ref().unwrap();
-            if record.children.len() >= record.backlog || self.resource_admission(tuple).is_err() {
+            if record.children.len() >= record.backlog
+                || self
+                    .resource_admission(tuple, record.buffer_capacities)
+                    .is_err()
+            {
                 return Ok(InputDisposition::Dropped);
             }
             let application_timeout = record.application_timeout_us;
+            let buffer_capacities = record.buffer_capacities;
             let iss = self.isn(tuple);
-            let mut connection = match self.new_connection(tuple, iss, Some(&segment)) {
+            let mut connection = match self.new_connection_with_buffers(
+                tuple,
+                iss,
+                Some(&segment),
+                buffer_capacities,
+            ) {
                 Ok(connection) => connection,
                 Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),
                 Err(error) => return Err(error.into()),
@@ -1457,7 +1630,7 @@ impl Endpoint {
         };
         let record = self.listeners[listener.slot].as_ref().unwrap();
         if record.children.len() >= record.backlog
-            || !self.has_capacity()
+            || !self.has_capacity(record.buffer_capacities)
             || !self.slots[index].as_ref().unwrap().connection.reuse_syn(
                 self.now,
                 syn,
@@ -1467,6 +1640,7 @@ impl Endpoint {
             return Ok(InputDisposition::Dropped);
         }
         let application_timeout = record.application_timeout_us;
+        let buffer_capacities = record.buffer_capacities;
         let candidate = self.isn(tuple);
         let iss = self.slots[index]
             .as_ref()
@@ -1475,11 +1649,12 @@ impl Endpoint {
             .reuse_iss(candidate);
         // Allocate the entire bounded child before transferring tuple ownership.
         // The old timer/record survives independently until its original expiry.
-        let mut connection = match self.new_connection(tuple, iss, Some(syn)) {
-            Ok(connection) => connection,
-            Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),
-            Err(error) => return Err(error.into()),
-        };
+        let mut connection =
+            match self.new_connection_with_buffers(tuple, iss, Some(syn), buffer_capacities) {
+                Ok(connection) => connection,
+                Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),
+                Err(error) => return Err(error.into()),
+            };
         // Reuse keeps the old local virtual clock: peer PAWS must not see a
         // random jump. Candidate failure leaves the old offset/timer untouched.
         connection.set_timestamp_offset(

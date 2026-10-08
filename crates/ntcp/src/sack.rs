@@ -49,6 +49,18 @@ impl Scoreboard {
         })
     }
 
+    pub(crate) fn storage_bytes(&self) -> usize {
+        self.ranges.capacity() * core::mem::size_of::<(Seq, Seq)>()
+    }
+
+    pub(crate) fn grown(&self, send_capacity: usize) -> Result<Self, ()> {
+        let mut result = Self::with_capacity(send_capacity)?;
+        result.ranges[..self.len].copy_from_slice(&self.ranges[..self.len]);
+        result.len = self.len;
+        result.ack = self.ack;
+        Ok(result)
+    }
+
     pub(crate) fn allocation_bytes(send_capacity: usize) -> Option<usize> {
         send_capacity
             .div_ceil(2)
