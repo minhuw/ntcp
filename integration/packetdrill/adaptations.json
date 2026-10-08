@@ -2645,7 +2645,7 @@
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
           "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
           "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
-          "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+          "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are implemented; Linux memory/wakeup equivalence is not claimed."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -2670,13 +2670,13 @@
         "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
       },
       "blocked_reasons": [
-        "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+        "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are implemented; Linux memory/wakeup equivalence is not claimed."
       ],
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_wmem=\"4096 50000 4194304\"\n`",
           "sha256": "cb94e4b9d3983743fb43d323333d3aede977cbd840eb9764563e5802ede26b12",
-          "semantic_mapping": "Unavailable: Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+          "semantic_mapping": "Unavailable: Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are implemented; Linux memory/wakeup equivalence is not claimed."
         }
       ],
       "additional_setup_files": [
@@ -2705,7 +2705,7 @@
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
           "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
           "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
-          "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+          "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are implemented; Linux memory/wakeup equivalence is not claimed."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -2730,13 +2730,13 @@
         "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
       },
       "blocked_reasons": [
-        "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+        "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are implemented; Linux memory/wakeup equivalence is not claimed."
       ],
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_wmem=\"4096 50000 4194304\"\n`",
           "sha256": "cb94e4b9d3983743fb43d323333d3aede977cbd840eb9764563e5802ede26b12",
-          "semantic_mapping": "Unavailable: Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+          "semantic_mapping": "Unavailable: Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are implemented; Linux memory/wakeup equivalence is not claimed."
         }
       ],
       "additional_setup_files": [
@@ -2765,7 +2765,7 @@
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
           "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
           "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
-          "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+          "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are implemented; Linux memory/wakeup equivalence is not claimed."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -2790,13 +2790,13 @@
         "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
       },
       "blocked_reasons": [
-        "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+        "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are implemented; Linux memory/wakeup equivalence is not claimed."
       ],
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_wmem=\"4096 50000 4194304\"\n`",
           "sha256": "cb94e4b9d3983743fb43d323333d3aede977cbd840eb9764563e5802ede26b12",
-          "semantic_mapping": "Unavailable: Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are also unavailable."
+          "semantic_mapping": "Unavailable: Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are implemented; Linux memory/wakeup equivalence is not claimed."
         }
       ],
       "additional_setup_files": [
@@ -3062,7 +3062,7 @@
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
           "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
           "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
-          "Linux tcp_wmem=\"4096 50000 4194304\", tcp_min_tso_segs=10 and skb write-wakeup accounting have no audited adapter-profile equivalent; setup and restore remain unexecuted. TCP_NOTSENT_LOWAT is also unavailable."
+          "Linux tcp_wmem=\"4096 50000 4194304\", tcp_min_tso_segs=10 and skb write-wakeup accounting have no audited adapter-profile equivalent; setup and restore remain unexecuted. Per-socket TCP_NOTSENT_LOWAT is implemented; Linux memory/wakeup equivalence is not claimed."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -3087,18 +3087,18 @@
         "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
       },
       "blocked_reasons": [
-        "Linux tcp_wmem=\"4096 50000 4194304\", tcp_min_tso_segs=10 and skb write-wakeup accounting have no audited adapter-profile equivalent; setup and restore remain unexecuted. TCP_NOTSENT_LOWAT is also unavailable."
+        "Linux tcp_wmem=\"4096 50000 4194304\", tcp_min_tso_segs=10 and skb write-wakeup accounting have no audited adapter-profile equivalent; setup and restore remain unexecuted. Per-socket TCP_NOTSENT_LOWAT is implemented; Linux memory/wakeup equivalence is not claimed."
       ],
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_wmem=\"4096 50000 4194304\" \\\n                         /proc/sys/net/ipv4/tcp_min_tso_segs=10\n`",
           "sha256": "37cb637ee255a451c2bf8b69c3b49d461ab9471b833848f7e299fad84d0bc194",
-          "semantic_mapping": "Unavailable: Linux tcp_wmem=\"4096 50000 4194304\", tcp_min_tso_segs=10 and skb write-wakeup accounting have no audited adapter-profile equivalent; setup and restore remain unexecuted. TCP_NOTSENT_LOWAT is also unavailable."
+          "semantic_mapping": "Unavailable: Linux tcp_wmem=\"4096 50000 4194304\", tcp_min_tso_segs=10 and skb write-wakeup accounting have no audited adapter-profile equivalent; setup and restore remain unexecuted. Per-socket TCP_NOTSENT_LOWAT is implemented; Linux memory/wakeup equivalence is not claimed."
         },
         {
           "command": "`/tmp/sysctl_restore_${PPID}.sh`",
           "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
-          "semantic_mapping": "Unavailable: Linux tcp_wmem=\"4096 50000 4194304\", tcp_min_tso_segs=10 and skb write-wakeup accounting have no audited adapter-profile equivalent; setup and restore remain unexecuted. TCP_NOTSENT_LOWAT is also unavailable."
+          "semantic_mapping": "Unavailable: Linux tcp_wmem=\"4096 50000 4194304\", tcp_min_tso_segs=10 and skb write-wakeup accounting have no audited adapter-profile equivalent; setup and restore remain unexecuted. Per-socket TCP_NOTSENT_LOWAT is implemented; Linux memory/wakeup equivalence is not claimed."
         }
       ],
       "additional_setup_files": [
@@ -3321,7 +3321,7 @@
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
           "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
           "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
-          "Unsupported TCP_INFO metrics: tcpi_last_data_recv. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
+          "Live core TransportInfo metrics are encoded by transport::transport_option: tcpi_last_data_recv is milliseconds; tcpi_busy_time, tcpi_rwnd_limited and tcpi_sndbuf_limited are microseconds. The owner uses elapsed monotonic Instant time, not a synthetic packetdrill clock; original timing bounds remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -3345,16 +3345,7 @@
         },
         "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
       },
-      "blocked_reasons": [
-        "Unsupported TCP_INFO metrics: tcpi_last_data_recv. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
-      ],
-      "audited_shell_commands": [
-        {
-          "command": "`../../common/defaults.sh`",
-          "sha256": "db987cbec339a8140034dc0a76556fcd8346c3b83c75c17b92ce643980e7c17b",
-          "semantic_mapping": "Unavailable: Unsupported TCP_INFO metrics: tcpi_last_data_recv. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
-        }
-      ]
+      "embedded_tcp_info": true
     },
     "tcp_info/tcp-info-rwnd-limited.pkt": {
       "source_sha256": "21a528da9d97b69da4e4c33b2614c5ecb39f4c1c7de9660d58bbaf9770dd5531",
@@ -3375,7 +3366,7 @@
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
           "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
           "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
-          "Unsupported TCP_INFO metrics: tcpi_busy_time, tcpi_rwnd_limited. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
+          "Live core TransportInfo metrics are encoded by transport::transport_option: tcpi_last_data_recv is milliseconds; tcpi_busy_time, tcpi_rwnd_limited and tcpi_sndbuf_limited are microseconds. The owner uses elapsed monotonic Instant time, not a synthetic packetdrill clock; original timing bounds remain unchanged."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -3399,16 +3390,7 @@
         },
         "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
       },
-      "blocked_reasons": [
-        "Unsupported TCP_INFO metrics: tcpi_busy_time, tcpi_rwnd_limited. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
-      ],
-      "audited_shell_commands": [
-        {
-          "command": "`../../common/defaults.sh`",
-          "sha256": "db987cbec339a8140034dc0a76556fcd8346c3b83c75c17b92ce643980e7c17b",
-          "semantic_mapping": "Unavailable: Unsupported TCP_INFO metrics: tcpi_busy_time, tcpi_rwnd_limited. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
-        }
-      ]
+      "embedded_tcp_info": true
     },
     "tcp_info/tcp-info-sndbuf-limited.pkt": {
       "source_sha256": "b210842cadfbc6d0ce1fee19afb3790dc9b9fe8c1fe02673288a646e3239e644",
@@ -3429,7 +3411,8 @@
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
           "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
           "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
-          "Unsupported TCP_INFO metrics: tcpi_busy_time, tcpi_rwnd_limited, tcpi_sndbuf_limited. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
+          "Live core TransportInfo metrics are encoded by transport::transport_option: tcpi_last_data_recv is milliseconds; tcpi_busy_time, tcpi_rwnd_limited and tcpi_sndbuf_limited are microseconds. The owner uses elapsed monotonic Instant time, not a synthetic packetdrill clock; original timing bounds remain unchanged.",
+          "SO_SNDBUF updates real core send capacity, but Linux skb memory accounting, SOCK_NOSPACE clearing and its exact send-buffer-limited intervals are not reproduced. This defaults-only case remains an executable diagnostic, not a Linux memory-behavior equivalence claim."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -3453,16 +3436,7 @@
         },
         "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
       },
-      "blocked_reasons": [
-        "Unsupported TCP_INFO metrics: tcpi_busy_time, tcpi_rwnd_limited, tcpi_sndbuf_limited. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
-      ],
-      "audited_shell_commands": [
-        {
-          "command": "`../../common/defaults.sh`",
-          "sha256": "db987cbec339a8140034dc0a76556fcd8346c3b83c75c17b92ce643980e7c17b",
-          "semantic_mapping": "Unavailable: Unsupported TCP_INFO metrics: tcpi_busy_time, tcpi_rwnd_limited, tcpi_sndbuf_limited. transport::transport_option leaves these fields reserved zero, not measured values; embedded assertions must not execute against placeholders."
-        }
-      ]
+      "embedded_tcp_info": true
     },
     "timestamping/client-only-last-byte.pkt": {
       "source_sha256": "286067559d5f054d7240de8b904305e5b498368eaa528e4e1049d2eec341bc4f",

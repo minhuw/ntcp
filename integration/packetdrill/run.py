@@ -19,7 +19,9 @@ PIN = json.loads((HERE / 'upstream.json').read_text())
 
 TCP_INFO_FIELDS = {'tcpi_ca_state', 'tcpi_unacked', 'tcpi_sacked',
                    'tcpi_lost', 'tcpi_retrans', 'tcpi_reordering',
-                   'tcpi_snd_cwnd', 'tcpi_snd_ssthresh', 'tcpi_rtt'}
+                   'tcpi_snd_cwnd', 'tcpi_snd_ssthresh', 'tcpi_rtt',
+                   'tcpi_notsent_bytes', 'tcpi_last_data_recv', 'tcpi_busy_time',
+                   'tcpi_rwnd_limited', 'tcpi_sndbuf_limited'}
 
 
 def preflight(text, embedded_tcp_info=False):
@@ -289,7 +291,17 @@ def main():
                 so_flags = manifest['scripts'][row['script']]['adapter_flags']
             row['effective_flags']['adapter'] = so_flags
             profiles = [flag for flag in so_flags.split(',') if not flag.startswith('local=')]
-            row['effective_flags']['profile'] = profiles[0] if len(profiles) == 1 else None
+            profile = profiles[0] if len(profiles) == 1 else None
+            row['effective_flags']['profile'] = profile
+            # ntcp-socket packet-test owner policy, not measured timing or a pass claim.
+            row['effective_flags']['transport_clock'] = 'monotonic Instant elapsed microseconds'
+            row['effective_flags']['prr_pacing'] = (
+                profile != 'upstream-cubic' if profile in {
+                    'baseline', 'sack', 'upstream-window8', 'upstream-sack',
+                    'upstream-ecn', 'upstream-basic', 'upstream-cubic'} else None)
+            row['effective_flags']['transmit_batch_clock'] = (
+                'one monotonic sample per owner output batch' if profile == 'upstream-cubic'
+                else 'monotonic sample per transmit')
             execution_script = script
             if manifest is not None:
                 try:

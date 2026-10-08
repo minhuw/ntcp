@@ -72,6 +72,30 @@ DEFAULTS_ONLY_CUBIC = {
     'slow_start/slow-start-app-limited.pkt',
 }
 
+SOCKET_FEATURE19 = (
+    'epoll/epoll_in_edge.pkt',
+    'epoll/epoll_out_edge.pkt',
+    'epoll/epoll_out_edge_default_notsent_lowat.pkt',
+    'epoll/epoll_out_edge_notsent_lowat.pkt',
+    'inq/client.pkt', 'inq/server.pkt',
+    'notsent_lowat/notsent-lowat-default.pkt',
+    'notsent_lowat/notsent-lowat-setsockopt.pkt',
+    'notsent_lowat/notsent-lowat-sysctl.pkt',
+    'eor/no-coalesce-large.pkt', 'eor/no-coalesce-retrans.pkt',
+    'eor/no-coalesce-small.pkt', 'eor/no-coalesce-subsequent.pkt',
+    'nagle/https_client.pkt', 'nagle/sendmsg_msg_more.pkt',
+    'nagle/sockopt_cork_nodelay.pkt',
+    'tcp_info/tcp-info-last_data_recv.pkt',
+    'tcp_info/tcp-info-rwnd-limited.pkt',
+    'tcp_info/tcp-info-sndbuf-limited.pkt',
+)
+SOCKET43 = BASIC17 + SOCKET_FEATURE19 + (
+    'sendfile/sendfile-simple.pkt', 'splice/tcp_splice_loop_test.pkt',
+    'timestamping/client-only-last-byte.pkt', 'timestamping/partial.pkt',
+    'timestamping/server.pkt', 'user_timeout/user-timeout-probe.pkt',
+    'user_timeout/user_timeout.pkt',
+)
+
 
 class RunnerChecks(unittest.TestCase):
     def test_preflight_does_not_ignore_kernel_setup_or_change_packet_expectations(self):
@@ -92,7 +116,11 @@ class RunnerChecks(unittest.TestCase):
         self.assertEqual(preflight('0 %{ assert tcpi_snd_cwnd == 7\n'
                                    'assert tcpi_snd_ssthresh == 7 }%', True), [])
         self.assertEqual(preflight('0 %{ assert tcpi_rtt > 0 }%', True), [])
-        self.assertTrue(preflight('0 %{ assert tcpi_last_data_recv == 0 }%', True))
+        for field in ('tcpi_notsent_bytes', 'tcpi_last_data_recv', 'tcpi_busy_time',
+                      'tcpi_rwnd_limited', 'tcpi_sndbuf_limited'):
+            text = f'0 %{{ assert {field} > 0 }}%'
+            self.assertTrue(preflight(text))  # Still requires a hash-audited mapping.
+            self.assertEqual(preflight(text, True), [])
         self.assertTrue(preflight('0 %{ assert tcpi_pacing_rate == 0 }%', True))
         self.assertTrue(preflight('`sysctl something`\n' + text, True))
 
@@ -764,6 +792,13 @@ class AdaptationChecks(unittest.TestCase):
             self.assertEqual(row['effective_flags']['profile'],
                              row['effective_flags']['adapter'].split(',')[0])
             self.assertIn('generated_sha256', row['adaptation'])
+            cubic = row['effective_flags']['profile'] == 'upstream-cubic'
+            self.assertEqual(row['effective_flags']['prr_pacing'], not cubic)
+            self.assertEqual(row['effective_flags']['transport_clock'],
+                             'monotonic Instant elapsed microseconds')
+            self.assertEqual(row['effective_flags']['transmit_batch_clock'],
+                             'one monotonic sample per owner output batch' if cubic
+                             else 'monotonic sample per transmit')
             self.assertEqual(row['behavior_executed'], row['variant'] == 'ipv4')
             self.assertEqual(row['adapted'], row['variant'] == 'ipv4')
             if row['behavior_executed']:
@@ -901,6 +936,73 @@ class PublishedSelectionChecks(unittest.TestCase):
                                                        entry['command_line'].encode(), 1), source)
                     self.assertIn('generated_sha256', audit)
                 self.assertFalse(entry['mapping']['linux_defaults_reproduced'])
+
+    def test_socket43_and_focused_selection_execute_only_genuine_mappings(self):
+        self.assertEqual(len(set(SOCKET43)), 43)
+        self.assertEqual(len(set(SOCKET_FEATURE19)), 19)
+        stale = json.dumps(self.manifest)
+        self.assertNotIn('TCP_NOTSENT_LOWAT and EPOLLET are also unavailable', stale)
+        self.assertNotIn('TCP_NOTSENT_LOWAT is also unavailable', stale)
+        for name in SOCKET_FEATURE19:
+            entry = self.manifest['scripts'][name]
+            self.assertEqual(entry['adapter_flags'], 'upstream-basic,local=192.168.0.1')
+            self.assertEqual(entry['mapping']['ntcp_settings']['prr'], 'LegacyInitialCredit')
+            if name.startswith('tcp_info/'):
+                self.assertTrue(entry['embedded_tcp_info'])
+                self.assertNotIn('blocked_reasons', entry)
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            (checkout / PIN['tcp_tests']).parent.mkdir(parents=True)
+            (checkout / PIN['tcp_tests']).symlink_to(self.directory.resolve(), target_is_directory=True)
+            runner = checkout / PIN['runner']
+            runner.parent.mkdir(parents=True)
+            runner.write_text('unused')
+            runner.chmod(0o700)
+            plugin = checkout / 'plugin.so'
+            plugin.write_text('unused')
+            report = checkout / 'report.json'
+            tracked = '\0'.join(str(Path(PIN['tcp_tests']) / name)
+                                for name in self.manifest['scripts'])
+            for selection, eligible in ((SOCKET43, 33), (SOCKET_FEATURE19, 13)):
+                executed = []
+
+                def execute(argv, cwd, timeout):
+                    path = Path(argv[-1])
+                    name = next(n for n in selection
+                                if not self.manifest['scripts'][n].get('blocked_reasons')
+                                and adapt_source(self.directory, n, self.manifest,
+                                    self.manifest['scripts'][n]['adapter_flags'])[0] == path.read_bytes())
+                    entry = self.manifest['scripts'][name]
+                    self.assertFalse(entry.get('blocked_reasons'), name)
+                    self.assertEqual(preflight(path.read_text(), entry.get('embedded_tcp_info') is True), [])
+                    if '--dry_run' not in argv:
+                        executed.append(name)
+                    return 1 if '--dry_run' not in argv else 0, False, 'diagnostic mismatch'
+
+                argv = ['run.py', '--checkout', str(checkout), '--plugin', str(plugin),
+                        '--suite', 'adapted', '--variant', 'ipv4', '--report', str(report)]
+                for name in selection:
+                    argv.extend(['--script', name])
+                with patch('run.check_checkout', return_value=PIN['revision']), \
+                        patch('run.subprocess.check_output', return_value=tracked), \
+                        patch('run.invoke', side_effect=execute) as invoke_mock, \
+                        patch.object(sys, 'argv', argv):
+                    self.assertEqual(main(), 1)
+                data = json.loads(report.read_text())
+                self.assertEqual(data['counts'], {'failed': eligible, 'unsupported': len(selection) - eligible})
+                self.assertEqual(invoke_mock.call_count, 2 * eligible)
+                self.assertEqual(len(executed), eligible)
+                self.assertFalse(data['all_passed'])
+                for row in data['results']:
+                    flags = row['effective_flags']
+                    self.assertEqual(flags['profile'], 'upstream-basic' if row['script'] in SOCKET_FEATURE19
+                                     else self.manifest['scripts'][row['script']]['adapter_flags'].split(',')[0])
+                    self.assertTrue(flags['prr_pacing'])
+                    self.assertEqual(flags['transport_clock'], 'monotonic Instant elapsed microseconds')
+                    self.assertEqual(flags['transmit_batch_clock'], 'monotonic sample per transmit')
+                    if row['status'] == 'unsupported':
+                        self.assertFalse(row['behavior_executed'])
+                        self.assertIsNone(row['syntax_returncode'])
 
     def test_exact_35_selection_blocks_unmapped_setup_without_execution(self):
         with tempfile.TemporaryDirectory() as temporary:
