@@ -11714,6 +11714,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cubic_two_rtt_samples_cap_pto_before_rto() {
+        for peer_delay in [0, 200_000, 499_999] {
+            let cfg = ConnectionConfig {
+                sack: true,
+                rack: true,
+                prr: true,
+                tlp: true,
+                timestamps: true,
+                initial_window: InitialWindow::Iw10,
+                congestion_algorithm: CongestionAlgorithm::Cubic,
+                peer_max_ack_delay_us: peer_delay,
+                rto_min_us: 200_000,
+                ..config(65_536, 1000)
+            };
+            // Match packetdrill: passive sender, no peer timestamp offer.
+            let mut peer_cfg = cfg.clone();
+            peer_cfg.timestamps = false;
+            let mut peer = Connection::active(tuple(), peer_cfg, 0, 0).unwrap();
+            let syn_bytes = packet(&mut peer, 0);
+            let syn = wire::parse(ip(tuple()), &syn_bytes).unwrap();
+            let mut sender = Connection::passive(reverse(tuple()), cfg, 0, 0, &syn).unwrap();
+            let synack_bytes = packet(&mut sender, 0);
+            let synack = wire::parse(ip(sender.tuple()), &synack_bytes).unwrap();
+            peer.input(100_000, &synack).unwrap();
+            deliver(&mut peer, &mut sender, 100_000);
+            assert!(!sender.timestamps);
+            assert_eq!(sender.rtt.updates, 1);
+            assert_eq!(
+                (sender.rtt.srtt(), sender.rtt.variance(), sender.rto()),
+                (Some(100_000), 50_000, 300_000)
+            );
+
+            sender.write(&[0x55; 1000]).unwrap();
+            packet(&mut sender, 100_000);
+            rack_sack(&mut sender, 200_000, 1000, &[]);
+            // Ordinary and RACK candidates on the same ACK count only once.
+            assert_eq!(sender.rtt.updates, 2);
+            assert_eq!(
+                (sender.rtt.srtt(), sender.rtt.variance(), sender.rto()),
+                (Some(100_000), 37_500, 250_000)
+            );
+            assert_eq!(sender.congestion.cwnd(), 10_000);
+            sender.write(&[0x66; 1000]).unwrap();
+            packet(&mut sender, 200_000);
+            let pto = 200_000 + (200_000 + peer_delay).min(250_000);
+            assert_eq!(sender.rto_deadline, Some(450_000));
+            assert_eq!(sender.loss_timer, Some((LossTimer::Pto, pto)));
+            sender.timeout(pto - 1).unwrap();
+            assert!(!sender.tlp_pending);
+            sender.timeout(pto).unwrap();
+            assert!(sender.tlp_pending);
+            assert!(!sender.retx_pending);
+            let probe_bytes = packet(&mut sender, pto);
+            let probe = wire::parse(ip(sender.tuple()), &probe_bytes).unwrap();
+            assert_eq!((probe.header.sequence, probe.payload.len()), (1001, 1000));
+            assert_eq!(sender.congestion.cwnd(), 10_000);
+            assert_eq!(sender.rto(), 250_000);
+            assert_eq!(sender.loss_timer, Some((LossTimer::Rto, pto + 250_000)));
+            sender.timeout(pto + 250_000).unwrap();
+            assert!(sender.retx_pending);
+            assert_eq!(sender.congestion.cwnd(), 1000);
+            assert_eq!(sender.rto(), 500_000);
+            let retry_bytes = packet(&mut sender, pto + 250_000);
+            let retry = wire::parse(ip(sender.tuple()), &retry_bytes).unwrap();
+            assert_eq!((retry.header.sequence, retry.payload.len()), (1001, 1000));
+            assert_eq!(sender.rtt.updates, 2);
+        }
+    }
+
     fn tlp_pair(iss: u32) -> (Connection, Connection) {
         let cfg = ConnectionConfig {
             sack: true,
