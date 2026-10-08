@@ -1152,10 +1152,26 @@ impl Connection {
                 && matches!(self.state, State::Established | State::CloseWait)
                 && flight < self.congestion.cwnd();
             let next_payload = unsent.min(self.mss) as u32;
+            // Standalone FIN needs one peer-window sequence unit, but no
+            // payload cwnd credit. Match transmit's PRR/recovery admission.
+            let standalone_fin = unsent == 0
+                && self.shutdown
+                && self.fin_sequence.is_none()
+                && matches!(self.state, State::Established | State::CloseWait)
+                && self.prr.is_none_or(|prr| {
+                    self.sack_recovery.map_or_else(
+                        || prr.credit() != 0,
+                        |recovery| {
+                            !recovery.entry_pending
+                                && self.recovery_credit(recovery) >= self.mss as u32
+                        },
+                    )
+                });
             let rwnd = self.synchronized()
-                && next_payload != 0
-                && self.congestion.cwnd().saturating_sub(flight) >= next_payload
-                && self.snd_wnd.saturating_sub(flight) < next_payload;
+                && (next_payload != 0
+                    && self.congestion.cwnd().saturating_sub(flight) >= next_payload
+                    && self.snd_wnd.saturating_sub(flight) < next_payload
+                    || standalone_fin && self.snd_wnd.saturating_sub(flight) == 0);
             if sndbuf {
                 ticks[2] = ticks[2].saturating_add(elapsed);
             } else if rwnd {
@@ -8022,6 +8038,114 @@ mod tests {
             assert_eq!(a.transport_info().busy_time_us, 350_000);
             a.update_time(start + 450_000 * scale).unwrap();
             assert_eq!(a.transport_info().busy_time_us, 350_000);
+        }
+    }
+
+    #[test]
+    fn transport_info_zero_window_standalone_fin_accrues_until_window_opens() {
+        for iss in [100, u32::MAX] {
+            for scale in [1, 1000] {
+                let mut cfg = config(64, 8);
+                cfg.timebase.units_per_second = 1_000_000 * scale;
+                let (mut a, _) = pair(cfg, iss);
+                let start = 100 * scale;
+                let next = a.receive.next();
+                let ack = a.snd_una;
+                inject(&mut a, start, next, ack, ACK, 0, &[]);
+                a.shutdown().unwrap();
+                assert_eq!(a.send.len(), 0);
+                let now = a.now;
+                let ticks = a.transport_ticks;
+                let events = a.events.clone();
+                let open = start + 100_000 * scale;
+                let info = a.transport_info_at(open);
+                assert_eq!(
+                    (info.busy_time_us, info.rwnd_limited_us, info.notsent_bytes),
+                    (100_000, 100_000, 0)
+                );
+                assert_eq!(info.sndbuf_limited_us, 0);
+                assert_eq!(a.transport_info_at(open), info);
+                assert_eq!((a.now, a.transport_ticks, &a.events), (now, ticks, &events));
+                a.update_time(open).unwrap();
+                assert_eq!(a.transport_info(), info);
+                inject(&mut a, open, next, ack, ACK, 1, &[]);
+                let bytes = packet(&mut a, open);
+                let fin = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(fin.header.flags, ACK | FIN);
+                assert!(fin.payload.is_empty());
+                let end = a.snd_nxt;
+                assert_eq!(end, ack.wrapping_add(1));
+                // In-flight FIN stays busy, but is not an unsent window demand.
+                assert_eq!(
+                    a.transport_info_at(open + 10_000 * scale).rwnd_limited_us,
+                    100_000
+                );
+                inject(&mut a, open + 10_000 * scale, next, end, ACK, 1, &[]);
+                let done = a.transport_info();
+                assert_eq!(
+                    (done.busy_time_us, done.rwnd_limited_us, done.notsent_bytes),
+                    (110_000, 100_000, 0)
+                );
+                a.update_time(open + 110_000 * scale).unwrap();
+                assert_eq!(a.transport_info().busy_time_us, done.busy_time_us);
+                assert_eq!(a.transport_info().rwnd_limited_us, done.rwnd_limited_us);
+            }
+        }
+    }
+
+    #[test]
+    fn transport_info_standalone_fin_window_limitation_matches_recovery_gates() {
+        for iss in [100, u32::MAX - 5_000] {
+            let cfg = ConnectionConfig {
+                initial_window: InitialWindow::Iw10,
+                nagle: false,
+                ..config(32_768, 1_000)
+            };
+            let (mut a, _) = pair(cfg, iss);
+            a.write(&[1; 10_000]).unwrap();
+            for _ in 0..10 {
+                packet(&mut a, 40);
+            }
+            assert_eq!(a.flight(), a.congestion.cwnd());
+            a.shutdown().unwrap();
+            a.snd_wnd = a.flight();
+            let info = a.transport_info_at(100_040);
+            assert_eq!(
+                (info.busy_time_us, info.rwnd_limited_us, info.notsent_bytes),
+                (100_010, 100_000, 0)
+            );
+            a.prr = Some(Prr::new(a.flight(), a.mss as u32, PrrAlgorithm::Rfc9937));
+            assert_eq!(a.transport_info_at(100_040).rwnd_limited_us, 0);
+            a.snd_wnd += 1;
+            assert_eq!(a.transmit(40, &mut [0; 64]), Ok(None));
+            a.snd_wnd -= 1;
+            a.prr.as_mut().unwrap().acknowledge(1, 0, 5_000, false);
+            assert_eq!(a.prr.unwrap().credit(), 1);
+            assert_eq!(a.transport_info_at(100_040).rwnd_limited_us, 100_000);
+            a.sack_recovery = Some(SackRecovery {
+                recovery_point: a.snd_nxt,
+                high_rxt: a.snd_una,
+                rescue_rxt: None,
+                entry_pending: false,
+                pipe: a.flight(),
+            });
+            // SACK recovery requires a full MSS of credit, even for FIN.
+            assert_eq!(a.transport_info_at(100_040).rwnd_limited_us, 0);
+            a.prr.as_mut().unwrap().acknowledge(999, 0, 5_000, false);
+            assert_eq!(a.prr.unwrap().credit(), 1_000);
+            assert_eq!(a.transport_info_at(100_040).rwnd_limited_us, 100_000);
+            a.sack_recovery.as_mut().unwrap().entry_pending = true;
+            assert_eq!(a.transport_info_at(100_040).rwnd_limited_us, 0);
+            // Without PRR, standalone FIN bypasses congestion/recovery credit.
+            a.prr = None;
+            assert_eq!(a.transport_info_at(100_040).rwnd_limited_us, 100_000);
+            a.sack_recovery = None;
+            a.snd_wnd += 1;
+            let bytes = packet(&mut a, 40);
+            let fin = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(fin.header.flags, ACK | FIN);
+            assert!(fin.payload.is_empty());
+            assert_eq!(a.transport_info_at(100_040).rwnd_limited_us, 0);
         }
     }
 
