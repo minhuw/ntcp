@@ -5863,6 +5863,17 @@ impl Connection {
             //# However, a TCP implementation SHOULD send a maximum-sized segment
             //# whenever possible (SHLD-28) to improve performance (see Section
             //# 3.8.6.2.1).
+            // Plan FIN admission before Nagle so an admissible final short
+            // payload can close immediately, as in Linux's final-FIN exemption.
+            // FIN occupies sequence space, not data space (RFC 9293
+            // section 3.4). RFC 5681 section 2 and RFC 9937 section 3
+            // constrain data: a standalone FIN need not wait for cwnd.
+            // Keep peer-window admission and the existing PRR gate.
+            let fin_admissible = self.shutdown
+                && self.fin_sequence.is_none()
+                && self.snd_wnd.saturating_sub(self.flight()) as usize > unsent
+                && (usable > unsent || unsent == 0 && self.prr.is_none())
+                && matches!(self.state, State::Established | State::CloseWait);
             let record = self.send.record_len(offset, unsent.min(wire_mss));
             count = record.min(packet_mss).min(usable);
             let flush_credit = self
@@ -5878,7 +5889,9 @@ impl Connection {
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.4
                 //# A TCP implementation SHOULD implement the Nagle algorithm to
                 //# coalesce short segments (SHLD-7).
-                let nagle = !flushing && self.config.nagle && self.flight() != 0;
+                let final_fin =
+                    fin_admissible && count == unsent && (count as u32) < timestamp_credit;
+                let nagle = !flushing && !final_fin && self.config.nagle && self.flight() != 0;
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.2.1
                 //# A TCP implementation MUST include a SWS avoidance algorithm in the
                 //# sender (MUST-38).
@@ -5918,17 +5931,7 @@ impl Connection {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
             //# Queue this until all preceding SENDs have been segmentized, then form a
             //# FIN segment and send it.
-            if self.shutdown
-                && self.fin_sequence.is_none()
-                && count == unsent
-                // FIN occupies sequence space, not data space (RFC 9293
-                // section 3.4). RFC 5681 section 2 and RFC 9937 section 3
-                // constrain data: a standalone FIN need not wait for cwnd.
-                // Keep peer-window admission and the existing PRR gate.
-                && self.snd_wnd.saturating_sub(self.flight()) as usize > count
-                && (usable > count || count == 0 && self.prr.is_none())
-                && matches!(self.state, State::Established | State::CloseWait)
-            {
+            if fin_admissible && count == unsent {
                 flags |= FIN;
                 new_fin = true;
             }

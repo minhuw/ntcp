@@ -2228,6 +2228,207 @@ fn eor_coalesces_preceding_bytes_but_never_subsequent_or_retransmitted_bytes() {
 }
 
 #[test]
+fn eor_final_payload_fin_is_not_nagle_blocked_and_commits_only_on_success() {
+    for iss in [100, u32::MAX - 3] {
+        let (mut a, _) = pair(config(64, 8), iss);
+        assert!(a.config.nagle);
+        a.write_with_options(b"abcd", false, true).unwrap();
+        a.write(b"efgh").unwrap();
+        a.shutdown().unwrap();
+        let base = a.send_base;
+        let bytes = packet(&mut a, 40);
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(segment.payload, b"abcd");
+        assert_eq!(segment.header.flags & FIN, 0);
+        let before = (
+            a.snd_nxt,
+            a.fin_sequence,
+            a.state,
+            a.now,
+            a.next_deadline(),
+            a.rack.pipe(),
+        );
+        assert_eq!(a.transmit(41, &mut [0; 23]), Err(Error::OutputTooSmall));
+        assert_eq!(
+            (
+                a.snd_nxt,
+                a.fin_sequence,
+                a.state,
+                a.now,
+                a.next_deadline(),
+                a.rack.pipe()
+            ),
+            before
+        );
+        let bytes = packet(&mut a, 41);
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(segment.header.sequence, base.wrapping_add(4).0);
+        assert_eq!(segment.payload, b"efgh");
+        assert_ne!(segment.header.flags & FIN, 0);
+        assert_eq!(a.fin_sequence, Some(base.wrapping_add(8)));
+        assert_eq!(a.snd_nxt, base.wrapping_add(9));
+        assert_eq!(a.state, State::FinWait1);
+        assert_eq!(a.transmit(41, &mut [0; 64]), Ok(None));
+    }
+}
+
+#[test]
+fn eor_final_payload_fin_respects_window_cwnd_and_prr_admission() {
+    for (window, reduce_cwnd, prr_credit) in [
+        (4, false, None), // No remaining peer-window credit.
+        (6, false, None), // Only a prefix fits.
+        (8, false, None), // Payload fits but FIN does not.
+        (64, true, None), // Reduced cwnd admits payload, not payload + FIN.
+        (64, false, Some(0)),
+        (64, false, Some(2)),
+        (64, false, Some(4)),
+    ] {
+        let (mut a, _) = pair(config(64, 8), 100);
+        a.write_with_options(b"abcd", false, true).unwrap();
+        a.write(b"efgh").unwrap();
+        a.shutdown().unwrap();
+        packet(&mut a, 40);
+        a.snd_wnd = window;
+        if reduce_cwnd {
+            a.congestion.on_timeout(a.flight(), a.snd_nxt);
+            assert_eq!(a.congestion.cwnd(), 8);
+        }
+        if let Some(credit) = prr_credit {
+            let mut prr = Prr::new(a.flight(), a.mss as u32, PrrAlgorithm::Rfc9937);
+            prr.acknowledge(credit, 0, 8, false);
+            assert_eq!(prr.credit(), credit);
+            a.prr = Some(prr);
+        }
+        let before = (
+            a.snd_nxt,
+            a.fin_sequence,
+            a.state,
+            a.rack.pipe(),
+            a.prr.map(|prr| (prr.counters(), prr.credit())),
+        );
+        assert_eq!(a.transmit(41, &mut [0; 64]), Ok(None));
+        assert_eq!(
+            (
+                a.snd_nxt,
+                a.fin_sequence,
+                a.state,
+                a.rack.pipe(),
+                a.prr.map(|prr| (prr.counters(), prr.credit()))
+            ),
+            before
+        );
+        // Ordinary ACK/window progress releases the tail without an override.
+        a.prr = None;
+        let next = a.receive.next();
+        let ack = a.snd_nxt;
+        inject(&mut a, 42, next, ack, ACK, 64, &[]);
+        let bytes = packet(&mut a, 43);
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(segment.payload, b"efgh");
+        assert_ne!(segment.header.flags & FIN, 0);
+    }
+}
+
+#[test]
+fn eor_final_payload_fin_respects_pacing() {
+    let (mut a, _) = pair(
+        ConnectionConfig {
+            prr: true,
+            prr_pacing: true,
+            ..config(64, 8)
+        },
+        100,
+    );
+    a.write_with_options(b"abcd", false, true).unwrap();
+    a.write(b"efgh").unwrap();
+    a.shutdown().unwrap();
+    packet(&mut a, 40);
+    let deadline = a.pacing_deadline.unwrap();
+    let before = (
+        a.snd_nxt,
+        a.fin_sequence,
+        a.state,
+        a.pacing_deadline,
+        a.rack.pipe(),
+    );
+    assert_eq!(a.transmit(deadline - 1, &mut [0; 64]), Ok(None));
+    assert_eq!(
+        (
+            a.snd_nxt,
+            a.fin_sequence,
+            a.state,
+            a.pacing_deadline,
+            a.rack.pipe()
+        ),
+        before
+    );
+    let bytes = packet(&mut a, deadline);
+    let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+    assert_eq!(segment.payload, b"efgh");
+    assert_ne!(segment.header.flags & FIN, 0);
+}
+
+#[test]
+fn eor_final_payload_fin_respects_timestamp_credit() {
+    for budget in [6, 8, 9] {
+        let (mut a, _) = pair(
+            ConnectionConfig {
+                timestamps: true,
+                timestamp_bytes_per_tick: budget,
+                ..config(64, 20) // Timestamp option leaves eight payload bytes.
+            },
+            100,
+        );
+        assert_eq!(a.mss, 8);
+        a.write_with_options(b"abcd", false, true).unwrap();
+        a.write(b"efgh").unwrap();
+        a.shutdown().unwrap();
+        packet(&mut a, 1000);
+        assert_eq!(a.timestamp_bytes, 4);
+        let before = (
+            a.snd_nxt,
+            a.fin_sequence,
+            a.state,
+            a.timestamp_tick,
+            a.timestamp_bytes,
+            a.now,
+        );
+        assert_eq!(a.transmit(1001, &mut [0; 33]), Err(Error::OutputTooSmall));
+        assert_eq!(
+            (
+                a.snd_nxt,
+                a.fin_sequence,
+                a.state,
+                a.timestamp_tick,
+                a.timestamp_bytes,
+                a.now
+            ),
+            before
+        );
+        let bytes = packet(&mut a, 1001);
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(segment.payload, &b"efgh"[..(budget - 4).min(4) as usize]);
+        assert_eq!(segment.header.flags & FIN != 0, budget == 9);
+        assert!(a.timestamp_bytes <= budget);
+        if budget < 9 {
+            assert_eq!(a.fin_sequence, None);
+            assert_eq!(
+                a.transmit(1001, &mut [0; 64]),
+                if budget == 6 {
+                    Ok(None) // The remaining tiny payload has no FIN credit exemption.
+                } else {
+                    Err(Error::TimestampBudgetExceeded) // Standalone FIN still costs a unit.
+                }
+            );
+            let bytes = packet(&mut a, 2000);
+            let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(segment.payload, if budget == 6 { &b"gh"[..] } else { &[] });
+            assert_ne!(segment.header.flags & FIN, 0);
+        }
+    }
+}
+
+#[test]
 fn eor_partial_write_failure_resize_and_window_limits() {
     let (mut a, _) = pair(config(6, 8), u32::MAX - 2);
     a.set_nagle(false);
