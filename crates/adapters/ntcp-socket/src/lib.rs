@@ -38,6 +38,9 @@ mod runtime;
 mod socket_options;
 mod stdio;
 mod transport;
+// ABI preparation is tested, not advertised before native timestamp integration.
+#[cfg(test)]
+mod timestamping;
 use runtime::{Op, Reply, Runtime};
 type Result<T> = std::result::Result<T, i32>;
 thread_local! {
@@ -1106,31 +1109,20 @@ fn error_queue(id: u64, p: *mut msghdr, m: msghdr) -> Result<i64> {
 }
 // SPDX-License-Identifier: GPL-2.0-or-later
 fn copy_completion(p: *mut msghdr, mut m: msghdr, (lo, hi): (u32, u32)) -> Result<()> {
-    let cmsg_size = std::mem::size_of::<cmsghdr>();
-    let full = cmsg_size + 16 + std::mem::size_of::<sockaddr_in>();
-    let mut used = 0;
-    m.msg_flags = MSG_ERRQUEUE;
-    if m.msg_control.is_null() || m.msg_controllen < cmsg_size {
-        m.msg_flags |= MSG_CTRUNC;
-    } else {
-        used = m.msg_controllen.min(full);
-        if used < full {
-            m.msg_flags |= MSG_CTRUNC;
-        }
-        let mut control = vec![0u8; used];
-        control[..std::mem::size_of::<usize>()].copy_from_slice(&used.to_ne_bytes());
-        let level = std::mem::offset_of!(cmsghdr, cmsg_level);
-        let kind = std::mem::offset_of!(cmsghdr, cmsg_type);
-        control[level..level + 4].copy_from_slice(&SOL_IP.to_ne_bytes());
-        control[kind..kind + 4].copy_from_slice(&IP_RECVERR.to_ne_bytes());
-        let mut extended = [0u8; 32];
-        extended[4] = 5;
-        extended[6] = 1;
-        extended[8..12].copy_from_slice(&lo.to_ne_bytes());
-        extended[12..16].copy_from_slice(&hi.to_ne_bytes());
-        control[cmsg_size..].copy_from_slice(&extended[..used - cmsg_size]);
-        copy_out(m.msg_control.cast(), &control)?;
-    }
+    let mut extended = [0u8; 32]; // sock_extended_err + sockaddr_in offender
+    extended[4] = 5; // SO_EE_ORIGIN_ZEROCOPY
+    extended[6] = 1; // SO_EE_CODE_ZEROCOPY_COPIED
+    extended[8..12].copy_from_slice(&lo.to_ne_bytes());
+    extended[12..16].copy_from_slice(&hi.to_ne_bytes());
+    let (control, used, truncated) = socket_options::cmsg_control(
+        m.msg_controllen,
+        !m.msg_control.is_null(),
+        SOL_IP,
+        IP_RECVERR,
+        &extended,
+    );
+    m.msg_flags = MSG_ERRQUEUE | if truncated { MSG_CTRUNC } else { 0 };
+    copy_out(m.msg_control.cast(), &control)?;
     m.msg_namelen = 0;
     m.msg_controllen = used;
     store(p, &m)?;

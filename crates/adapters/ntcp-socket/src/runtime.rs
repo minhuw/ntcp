@@ -1873,6 +1873,64 @@ mod tests {
         (a, b, client, server, listen)
     }
     #[test]
+    fn errorqueue_fault_preserves_entry_and_short_control_consumes() {
+        let (mut owner, _peer, client, _, _) = pair();
+        owner
+            .execute(client, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 1))
+            .unwrap();
+        for capacity in 0..=56 {
+            let before = owner
+                .execute(client, Op::Ready)
+                .unwrap()
+                .readiness_generations[2];
+            owner
+                .execute(client, Op::WriteFlags(vec![1], MSG_ZEROCOPY))
+                .unwrap();
+            let ready = owner.execute(client, Op::Ready).unwrap();
+            assert_ne!(ready.value & EPOLLERR, 0);
+            assert_ne!(ready.readiness_generations[2], before);
+            let mut header: msghdr = unsafe { std::mem::zeroed() };
+            header.msg_control = 1usize as *mut c_void;
+            header.msg_controllen = 48;
+            let address = (&mut header as *mut msghdr) as usize;
+            assert_eq!(
+                owner
+                    .execute(client, Op::ErrorQueueTo(address))
+                    .unwrap_err(),
+                EFAULT
+            );
+            assert_eq!(owner.sockets[&client].completions.len(), 1);
+            assert_ne!(
+                owner.execute(client, Op::Ready).unwrap().value & EPOLLERR,
+                0
+            );
+            let mut control = [0xa5u8; 64];
+            header.msg_control = control.as_mut_ptr().cast();
+            header.msg_controllen = capacity;
+            owner.execute(client, Op::ErrorQueueTo(address)).unwrap();
+            assert_eq!(
+                header.msg_flags,
+                MSG_ERRQUEUE | if capacity < 48 { MSG_CTRUNC } else { 0 }
+            );
+            assert_eq!(
+                header.msg_controllen,
+                if capacity < 16 { 0 } else { capacity.min(48) }
+            );
+            assert!(control[capacity..].iter().all(|b| *b == 0xa5));
+            assert!(owner.sockets[&client].completions.is_empty());
+            assert_eq!(
+                owner.execute(client, Op::Ready).unwrap().value & EPOLLERR,
+                0
+            );
+            assert_eq!(
+                owner
+                    .execute(client, Op::ErrorQueueTo(address))
+                    .unwrap_err(),
+                EAGAIN
+            );
+        }
+    }
+    #[test]
     fn new_data_generations_and_post_read_inq_fin() {
         let (mut a, mut b, client, server, _) = pair();
         a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))

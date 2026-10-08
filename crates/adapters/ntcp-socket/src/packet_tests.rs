@@ -401,6 +401,7 @@ fn syn_with_options(sequence: u32, destination_port: u16, options: &[u8]) -> Vec
     let n = ntcp::wire::encode(ip, header, options, &[], &mut tcp).unwrap();
     frame(
         ntcp::Transmit {
+            tx_timestamp: None,
             connection: None,
             ip,
             len: n,
@@ -425,6 +426,7 @@ fn input_packet(owner: &mut Owner, ip: IpMetadata, header: ntcp::wire::Header, o
     let len = ntcp::wire::encode(ip, header, options, &[], &mut tcp).unwrap();
     let packet = frame(
         ntcp::Transmit {
+            tx_timestamp: None,
             connection: None,
             ip,
             len,
@@ -770,6 +772,7 @@ fn window8_acks_third_2000_byte_packet_before_application_read() {
             let len = ntcp::wire::encode(ip, header, &[], &vec![0; 2000], &mut tcp).unwrap();
             let bytes = frame(
                 ntcp::Transmit {
+                    tx_timestamp: None,
                     connection: None,
                     ip,
                     len,
@@ -1121,6 +1124,7 @@ fn listener_timeout_inheritance_and_queued_payload_gap_urgent_fin() {
         let n = ntcp::wire::encode(ip, header, &[], payload, &mut out).unwrap();
         let packet = frame(
             ntcp::Transmit {
+                tx_timestamp: None,
                 connection: None,
                 ip,
                 len: n,
@@ -1990,6 +1994,7 @@ fn owner_loop_emits_pure_handshake_ack_before_pending_send_data() {
         let len = ntcp::wire::encode(ip, header, &[], &[], &mut tcp).unwrap();
         let bytes = frame(
             ntcp::Transmit {
+                tx_timestamp: None,
                 connection: None,
                 ip,
                 len,
@@ -2098,6 +2103,7 @@ fn owner_loop_coalesces_queued_reads_with_immediate_ack_window_credit() {
         let len = ntcp::wire::encode(ip, header, &[], payload, &mut tcp).unwrap();
         let bytes = frame(
             ntcp::Transmit {
+                tx_timestamp: None,
                 connection: None,
                 ip,
                 len,
@@ -2286,6 +2292,7 @@ fn owner_loop_cubic_initial_push_pairs_and_other_profiles_legacy_push() {
         let len = ntcp::wire::encode(ip, header, &[], &[], &mut tcp).unwrap();
         let ack = frame(
             ntcp::Transmit {
+                tx_timestamp: None,
                 connection: None,
                 ip,
                 len,
@@ -2761,6 +2768,7 @@ fn saturated_options_preserve_time_wait_ack_and_listener_reset() {
     );
     let packet = frame(
         ntcp::Transmit {
+            tx_timestamp: None,
             connection: None,
             ip,
             len,
@@ -2943,6 +2951,7 @@ fn owner_loop_preserves_pending_send_read_fifo_on_refused_handshake() {
         0,
         frame(
             ntcp::Transmit {
+                tx_timestamp: None,
                 connection: None,
                 ip,
                 len,

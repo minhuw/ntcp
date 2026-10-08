@@ -32,6 +32,7 @@ fn inject(h: ntcp::wire::Header, options: &[u8], payload: &[u8]) {
     ntcp_ip::encode(
         &mut bytes,
         ntcp::Transmit {
+            tx_timestamp: None,
             connection: None,
             ip,
             len,

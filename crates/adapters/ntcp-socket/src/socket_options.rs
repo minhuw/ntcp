@@ -29,8 +29,20 @@ pub(crate) fn edge_changed(ready: u32, seen: Option<[u64; 5]>, observed: [u64; 5
 // size_t followed by two ints, size_t alignment, and SOL_TCP/TCP_CM_INQ=6/36.
 // Padding is reported but not written, just as in Linux.
 pub(crate) fn inq_control(capacity: usize, has_control: bool, inq: i32) -> (Vec<u8>, usize, bool) {
+    cmsg_control(capacity, has_control, 6, 36, &inq.to_ne_bytes())
+}
+
+// One Linux put_cmsg operation. Return copied bytes separately from space
+// consumed so callers do not overwrite ABI padding, including on truncation.
+pub(crate) fn cmsg_control(
+    capacity: usize,
+    has_control: bool,
+    level: i32,
+    kind: i32,
+    payload: &[u8],
+) -> (Vec<u8>, usize, bool) {
     let header = std::mem::size_of::<usize>() + 8;
-    let len = header + 4;
+    let len = header + payload.len();
     let space = len.next_multiple_of(std::mem::align_of::<usize>());
     if !has_control || capacity < header {
         return (Vec::new(), 0, true);
@@ -38,9 +50,9 @@ pub(crate) fn inq_control(capacity: usize, has_control: bool, inq: i32) -> (Vec<
     let written = capacity.min(len);
     let mut control = vec![0; written];
     control[..std::mem::size_of::<usize>()].copy_from_slice(&written.to_ne_bytes());
-    control[header - 8..header - 4].copy_from_slice(&6i32.to_ne_bytes());
-    control[header - 4..header].copy_from_slice(&36i32.to_ne_bytes());
-    control[header..].copy_from_slice(&inq.to_ne_bytes()[..written - header]);
+    control[header - 8..header - 4].copy_from_slice(&level.to_ne_bytes());
+    control[header - 4..header].copy_from_slice(&kind.to_ne_bytes());
+    control[header..].copy_from_slice(&payload[..written - header]);
     (control, capacity.min(space), written < len)
 }
 
