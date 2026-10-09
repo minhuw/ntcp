@@ -464,3 +464,38 @@ fn layering_order_defaults_and_adapter_constraints() {
     assert!(ethernet.validate().is_ok());
     assert_eq!(format!("{:?}", ethernet.tcp), format!("{:?}", base.tcp));
 }
+
+#[test]
+fn reservation_timeout_parser_and_typed_bounds() {
+    assert_eq!(
+        SocketConfig::parse(BASE)
+            .unwrap()
+            .io
+            .output_reservation_timeout_ms,
+        1000
+    );
+    for value in ["1", "1000", "4294967295"] {
+        let c = SocketConfig::parse(&format!("{BASE}io.output_reservation_timeout_ms={value}"))
+            .unwrap();
+        assert_eq!(
+            c.io.output_reservation_timeout_ms,
+            value.parse::<u32>().unwrap()
+        );
+    }
+    for value in ["0", "-1", "+1", "1.5", "4294967296", "", "1 # ms"] {
+        assert!(
+            SocketConfig::parse(&format!("{BASE}io.output_reservation_timeout_ms={value}"))
+                .is_err()
+        );
+    }
+    assert!(SocketConfig::parse(&format!("{BASE}output_reservation_timeout_ms=1")).is_err());
+    assert!(
+        SocketConfig::parse(&format!(
+            "{BASE}io.output_reservation_timeout_ms=1\nio.output_reservation_timeout_ms=2"
+        ))
+        .is_err()
+    );
+    let mut c = SocketConfig::parse(BASE).unwrap();
+    c.io.output_reservation_timeout_ms = 0;
+    assert!(c.validate().is_err());
+}

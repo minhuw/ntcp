@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 #[path = "runtime_backend.rs"]
 mod backend;
+#[path = "runtime_output.rs"]
+mod output;
 #[path = "runtime_send.rs"]
 mod send;
 #[path = "runtime_timestamping.rs"]
@@ -420,6 +422,12 @@ struct Owner {
     detached: Vec<ConnectionId>,
     pending_packet: Option<Vec<u8>>,
     pending_token: Option<ntcp::TxTimestampToken>,
+    reservations: bool,
+    reservation: Option<ntcp::TransmitAttempt>,
+    reservation_deadline: Option<u64>,
+    reservation_timeout_us: u64,
+    waiting_mtu: bool,
+    mtu_refresh: Option<output::MtuRefresh>,
     timestamp_cookie: u64,
     child_timestamps: Vec<(ConnectionId, crate::timestamping::Options)>,
     pending: VecDeque<Request>,
@@ -486,6 +494,11 @@ impl Owner {
         let name = &config.io.interface;
         let local = config.io.address;
         let tun = Tun::open(name).map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
+        let ifname = std::ffi::CString::new(name.as_str()).map_err(|_| EINVAL)?;
+        let index = unsafe { libc::if_nametoindex(ifname.as_ptr()) };
+        if index == 0 {
+            return Err(errno());
+        }
         let subnet = context(&config.io)?;
         let mut secret = [0u8; 32];
         let mut offset = 0;
@@ -510,7 +523,9 @@ impl Owner {
             offset += n as usize;
         }
         let tcp = backend::backend_config(config.tcp.clone(), &tun)?;
-        Self::with_config(local, subnet, secret, Some(tun), tcp)
+        let mut owner = Self::with_config(local, subnet, secret, Some(tun), tcp)?;
+        owner.enable_reservations(&config.io, index)?;
+        Ok(owner)
     }
     fn with_config(
         local: Ipv4Addr,
@@ -556,6 +571,12 @@ impl Owner {
             detached: Vec::new(),
             pending_packet: None,
             pending_token: None,
+            reservations: false,
+            reservation: None,
+            reservation_deadline: None,
+            reservation_timeout_us: 1_000_000,
+            waiting_mtu: false,
+            mtu_refresh: None,
             timestamp_cookie: 1,
             child_timestamps: Vec::new(),
             pending: VecDeque::new(),
@@ -671,6 +692,10 @@ impl Owner {
         false
     }
     fn service(&mut self, request: &mut Request) -> bool {
+        // Defer before inspecting foreign buffers or consuming file/pipe producers.
+        if self.reservation.is_some() {
+            return false;
+        }
         let (op, wait) = if let Op::Wait(op, _) = &request.op {
             (&**op, true)
         } else {
@@ -723,11 +748,14 @@ impl Owner {
             .min(usize::from(self.defaults.connection.mss) + 60)
             .min(65515)
     }
-    // Encoding commits core accounting at actual now, never at a future pacing deadline.
-    // Retain a blocked backend packet before asking the core for another segment.
+    // Select at current time, never at a future pacing deadline. Reserved departure
+    // commits only at backend acceptance; retain the same bytes through WouldBlock.
     fn prepare_packet(&mut self, transmit_now: Option<u64>) -> Result<bool> {
         if self.pending_packet.is_some() {
             return Ok(true);
+        }
+        if self.waiting_mtu {
+            return Ok(false);
         }
         #[cfg(feature = "packet-test")]
         if self
@@ -739,15 +767,30 @@ impl Owner {
         }
         let mut packet = vec![0; self.output_packet_len()];
         let pair = ClockPair::sample(self);
-        let tx = self
-            .endpoint
-            .poll_transmit(
-                transmit_now.unwrap_or_else(|| self.now()),
-                &mut packet[20..],
-                BUDGET,
-            )
-            .map_err(engine)?
-            .packet;
+        let now = transmit_now.unwrap_or_else(|| self.now());
+        let tx = if self.reservations {
+            match self
+                .endpoint
+                .poll_reserved_transmit(now, &mut packet[20..], BUDGET)
+            {
+                Ok((output, attempt)) => {
+                    if let Some(attempt) = attempt {
+                        self.reservation = Some(attempt);
+                    }
+                    output.packet
+                }
+                Err(EndpointError::ReservationMtuTooSmall) => {
+                    self.abandon_reservation()?;
+                    return Ok(false);
+                }
+                Err(e) => return Err(engine(e)),
+            }
+        } else {
+            self.endpoint
+                .poll_transmit(now, &mut packet[20..], BUDGET)
+                .map_err(engine)?
+                .packet
+        };
         let Some(tx) = tx else {
             return Ok(false);
         };
@@ -763,8 +806,12 @@ impl Owner {
         // Keep in-flight batches owned through every output/backend exit.
         let mut after_output = Vec::with_capacity(BUDGET);
         'run: while !stop.load(Ordering::Acquire) {
+            self.poll_mtu_refresh();
+            if self.expire_reservation(self.now()).is_err() {
+                break;
+            }
             let now = self.now();
-            if self.endpoint.on_timeout(now, BUDGET).is_err() {
+            if self.reservation.is_none() && self.endpoint.on_timeout(now, BUDGET).is_err() {
                 break;
             }
             if self.receive_batch(&mut input).is_err() || self.poll_backend_timestamps().is_err() {
@@ -786,27 +833,11 @@ impl Owner {
                     Ok(false) => break,
                     Err(_) => break 'run,
                 }
-                // Never poll another TCP segment until this complete packet is submitted.
-                if let Some(tun) = self.tun.as_mut() {
-                    match submit_packet(tun, &mut self.pending_packet) {
-                        Ok(TxOutcome::Submitted) => {
-                            let stamp = timestamps::realtime();
-                            let token = self.pending_token.take();
-                            self.software_transmitted(token, stamp);
-                        }
+                // Backend acceptance is the only success boundary, including late accepts.
+                if self.tun.is_some() || self.ethernet.is_some() {
+                    match self.submit_reserved_packet() {
+                        Ok(TxOutcome::Submitted) => (),
                         Ok(TxOutcome::WouldBlock) => break,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
-                        Err(_) => break 'run,
-                    }
-                }
-                if self.ethernet.is_some() {
-                    match self.transmit_ethernet() {
-                        Ok(TxOutcome::Submitted) => {
-                            self.pending_packet = None;
-                            self.pending_token = None;
-                        }
-                        Ok(TxOutcome::WouldBlock) => break,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
                         Err(_) => break 'run,
                     }
                 }
@@ -835,21 +866,24 @@ impl Owner {
             }
             self.connection_options
                 .retain(|p| self.endpoint.connection_exists(p.0));
-            self.detached.retain(|&id| {
-                if matches!(self.endpoint.state(id), Ok(State::Closed | State::TimeWait)) {
-                    let _ = self.endpoint.release(id);
-                    false
-                } else {
-                    true
-                }
-            });
+            if self.reservation.is_none() {
+                self.detached.retain(|&id| {
+                    if matches!(self.endpoint.state(id), Ok(State::Closed | State::TimeWait)) {
+                        let _ = self.endpoint.release(id);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
             // Bounded owner work and a 1ms ceiling also cover shared wakefd consumers.
-            let wait = self
-                .endpoint
-                .next_deadline()
-                .map(|d| std::time::Duration::from_micros(d.saturating_sub(self.now())))
-                .unwrap_or(std::time::Duration::from_millis(1))
-                .min(std::time::Duration::from_millis(1));
+            let wait = self.output_wait();
+            // Leave excess commands in the bounded channel, including Close. Never
+            // grow the deferred queue or leak OutputReserved to unrelated sockets.
+            if self.reservation.is_some() && self.pending.len() >= self.socket_limit() {
+                std::thread::sleep(wait);
+                continue;
+            }
             match rx.recv_timeout(wait) {
                 Ok(mut r) => {
                     if self.pending.len() == self.socket_limit() && !matches!(r.op, Op::Close) {
@@ -862,6 +896,9 @@ impl Owner {
                     #[cfg(not(feature = "packet-test"))]
                     let requests = BUDGET;
                     for _ in 1..requests {
+                        if self.reservation.is_some() && self.pending.len() >= self.socket_limit() {
+                            break;
+                        }
                         let Ok(mut r) = rx.try_recv() else {
                             break;
                         };
@@ -1035,6 +1072,9 @@ impl Owner {
         result
     }
     fn events(&mut self) {
+        if self.reservation.is_some() {
+            return;
+        }
         for _ in 0..BUDGET {
             let Some(event) = self.endpoint.next_event() else {
                 break;
@@ -1251,6 +1291,9 @@ impl Owner {
         Ok(bits)
     }
     fn execute(&mut self, id: u64, op: Op) -> Result<Reply> {
+        if self.reservation.is_some() {
+            return Err(EAGAIN);
+        }
         self.endpoint.on_timeout(self.now(), 0).map_err(engine)?;
         let result = self.dispatch(id, op);
         let _ = self.refresh_readiness(id);

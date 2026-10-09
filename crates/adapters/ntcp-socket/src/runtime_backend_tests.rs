@@ -11,6 +11,7 @@ use std::{
 #[derive(Default)]
 struct State {
     mtu: Option<u32>,
+    enforce_mtu: bool,
     mtu_error: Option<i32>,
     mtu_queries: usize,
     max_packet_len: Option<usize>,
@@ -63,6 +64,9 @@ impl PacketIo for Fixture {
     fn transmit(&mut self, bytes: &[u8]) -> io::Result<TxOutcome> {
         let mut state = self.0.lock().unwrap();
         state.output_calls += 1;
+        if state.enforce_mtu && state.mtu.is_some_and(|mtu| bytes.len() > mtu as usize + 14) {
+            return Err(io::Error::from_raw_os_error(EMSGSIZE));
+        }
         if let Some(error) = state.output_error {
             return Err(error.into());
         }
@@ -88,6 +92,9 @@ impl PacketIo for Fixture {
     ) -> io::Result<TxOutcome> {
         let mut state = self.0.lock().unwrap();
         state.calls += 1;
+        if state.enforce_mtu && state.mtu.is_some_and(|mtu| bytes.len() > mtu as usize + 14) {
+            return Err(io::Error::from_raw_os_error(EMSGSIZE));
+        }
         if let Some(error) = state.error {
             return Err(error.into());
         }
@@ -644,7 +651,12 @@ fn pmtud_startup_uses_real_mtu_and_separate_adapter_capacity() {
     }
 }
 
-fn pmtud_owner(last: u8, mtu: u32, capacity: Option<usize>) -> (Owner, Arc<Mutex<State>>) {
+fn pmtud_owner(
+    last: u8,
+    mtu: u32,
+    capacity: Option<usize>,
+    pacing: Option<ntcp::PacingConfig>,
+) -> (Owner, Arc<Mutex<State>>) {
     let state = Arc::new(Mutex::new(State {
         mtu: Some(mtu),
         max_packet_len: capacity,
@@ -653,10 +665,12 @@ fn pmtud_owner(last: u8, mtu: u32, capacity: Option<usize>) -> (Owner, Arc<Mutex
     let io = Fixture(state.clone());
     let local = Ipv4Addr::new(10, 73, 0, last);
     let mut config = SocketConfig::new("test", local).tcp;
+    config.connection.pacing = pacing;
     config.connection.mss = 8960;
     config.connection.send_ip_payload_limit = 8980;
     let config = backend_config(config, &io).unwrap();
     let mut owner = Owner::with_config(local, (local, 24), [last; 32], None, config).unwrap();
+    owner.test_now = Some(1000);
     owner.ethernet = Some(EthernetBackend {
         io: Box::new(io),
         local: [2; 6],
@@ -668,8 +682,14 @@ fn pmtud_owner(last: u8, mtu: u32, capacity: Option<usize>) -> (Owner, Arc<Mutex
 }
 
 fn pmtud_pair(capacity: Option<usize>) -> (Owner, Owner, u64, u64, Arc<Mutex<State>>) {
-    let (mut a, state) = pmtud_owner(2, 9000, capacity);
-    let (mut b, _) = pmtud_owner(3, 9000, None);
+    pmtud_paced_pair(capacity, None)
+}
+fn pmtud_paced_pair(
+    capacity: Option<usize>,
+    pacing: Option<ntcp::PacingConfig>,
+) -> (Owner, Owner, u64, u64, Arc<Mutex<State>>) {
+    let (mut a, state) = pmtud_owner(2, 9000, capacity, pacing);
+    let (mut b, _) = pmtud_owner(3, 9000, None, None);
     let listen = new(&mut b, SOCK_NONBLOCK);
     assert_eq!(
         b.execute(listen, Op::Get(IPPROTO_IP, IP_MTU)).unwrap_err(),
@@ -797,5 +817,566 @@ fn pmtud_zero_mtu_and_ipv4_floor_are_dispatched_without_clamping() {
     assert_eq!(
         a.execute(client, Op::Get(IPPROTO_IP, IP_MTU)).unwrap_err(),
         EOPNOTSUPP
+    );
+}
+
+// The legacy fixtures above deliberately retain their direct poll/submit API.
+// These tests opt into exactly the production reservation path after handshake.
+fn reserve(owner: &mut Owner) -> (Receiver<()>, SyncSender<io::Result<Option<u32>>>) {
+    owner.endpoint.enable_output_reservations().unwrap();
+    owner.reservations = true;
+    owner.test_now = Some(owner.now());
+    let (refresh, request, result) = super::super::output::MtuRefresh::fixture();
+    owner.mtu_refresh = Some(refresh);
+    (request, result)
+}
+fn connection(owner: &Owner, id: u64) -> ConnectionId {
+    let Handle::Connection(cid) = owner.sockets[&id].handle else {
+        panic!()
+    };
+    cid
+}
+fn advance(owner: &mut Owner, delta: u64) {
+    owner.test_now = Some(owner.now() + delta);
+}
+fn refresh(owner: &mut Owner, result: &SyncSender<io::Result<Option<u32>>>, mtu: u32) {
+    result.send(Ok(Some(mtu))).unwrap();
+    owner.poll_mtu_refresh();
+}
+fn drain_reservation(owner: &mut Owner) {
+    for _ in 0..64 {
+        if owner.reservation.is_none() {
+            return;
+        }
+        if owner.prepare_packet(None).unwrap() {
+            assert_eq!(owner.submit_reserved_packet(), Ok(TxOutcome::Submitted));
+        } else {
+            owner.test_now = Some(
+                owner
+                    .endpoint
+                    .next_deadline()
+                    .expect("repair pacing deadline"),
+            );
+        }
+    }
+    panic!("reservation did not drain");
+}
+
+#[test]
+fn reserved_mtu_drop_split_backpressure_late_accept_and_prefix() {
+    let (mut a, mut b, client, server, state) = pmtud_pair(None);
+    a.execute(client, Op::Write(vec![7; 8000])).unwrap();
+    let (requests, results) = reserve(&mut a);
+    let cid = connection(&a, client);
+    assert!(a.prepare_packet(None).unwrap());
+    let original = a.pending_packet.clone().unwrap();
+    let selected = ntcp_ip::parse(&original, false).unwrap();
+    let selected = ntcp::wire::parse(selected.ip, selected.payload).unwrap();
+    let selected_len = selected.payload.len();
+    let start = selected.header.sequence;
+    assert!(original.len() > 1500);
+    assert_eq!(a.reservation_deadline, None);
+    let token = a.reservation;
+    state.lock().unwrap().block = true;
+    advance(&mut a, 100);
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
+    let deadline = a.reservation_deadline.unwrap();
+    assert_eq!(deadline, a.now() + 1_000_000);
+    for _ in 0..3 {
+        advance(&mut a, 100);
+        assert!(a.prepare_packet(None).unwrap());
+        assert_eq!(a.reservation, token);
+        assert_eq!(a.pending_packet.as_ref(), Some(&original));
+        assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
+        assert_eq!(a.reservation_deadline, Some(deadline));
+    }
+    {
+        let mut state = state.lock().unwrap();
+        state.block = false;
+        state.enforce_mtu = true;
+        state.mtu = Some(1400);
+    }
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
+    requests.try_recv().unwrap();
+    assert!(a.pending_packet.is_none());
+    assert!(!a.prepare_packet(None).unwrap());
+    refresh(&mut a, &results, 1400);
+    assert_eq!(
+        a.endpoint
+            .path_mtu_info(cid)
+            .unwrap()
+            .unwrap()
+            .first_hop_mtu,
+        1400
+    );
+    assert_eq!(a.defaults.connection.send_ip_payload_limit, 8980); // Not a capacity resize.
+    assert!(a.prepare_packet(None).unwrap());
+    advance(&mut a, 10_000); // Physical departure later than selection.
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::Submitted));
+    assert!(a.reservation.is_some()); // Accepted prefix does not free the barrier.
+    assert_eq!(a.reservation_deadline, Some(deadline));
+    assert!(a.prepare_packet(None).unwrap());
+    state.lock().unwrap().mtu = Some(600);
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
+    requests.try_recv().unwrap();
+    refresh(&mut a, &results, 600);
+    assert_eq!(a.reservation_deadline, Some(deadline));
+    drain_reservation(&mut a);
+    assert_eq!(a.reservation_deadline, None);
+    let mut seq = start;
+    let mut count = 0;
+    for (index, frame) in state.lock().unwrap().sent.iter().enumerate() {
+        let ethernet = ntcp_ip::parse_ethernet(frame).unwrap();
+        assert!(ethernet.payload.len() <= if index == 0 { 1400 } else { 600 });
+        let ip = ntcp_ip::parse(ethernet.payload, false).unwrap();
+        let tcp = ntcp::wire::parse(ip.ip, ip.payload).unwrap();
+        assert_eq!(tcp.header.sequence, seq);
+        assert!(tcp.payload.iter().all(|b| *b == 7));
+        seq = seq.wrapping_add(tcp.payload.len() as u32);
+        count += tcp.payload.len();
+        b.input(b.now(), ip.ip, ip.traffic_class, ip.payload)
+            .unwrap();
+    }
+    assert_eq!(count, selected_len);
+    assert_eq!(
+        b.execute(server, Op::Read(8000)).unwrap().bytes,
+        vec![7; selected_len]
+    );
+    assert_eq!(a.endpoint.transport_info(cid).unwrap().send_used, 8000);
+    assert!(a.endpoint.on_timeout(a.now(), 0).is_ok());
+    assert!(requests.try_recv().is_err());
+}
+
+#[test]
+fn reserved_refresh_failure_nochange_stall_expires_only_owner_and_allows_progress() {
+    for response in [Some(Err(ENODEV)), Some(Ok(9000)), Some(Ok(67)), None] {
+        let (mut a, mut b, client, _, state) = pmtud_pair(None);
+        let listener = new(&mut b, SOCK_NONBLOCK);
+        b.execute(listener, Op::Bind("10.73.0.3:16380".parse().unwrap()))
+            .unwrap();
+        b.execute(listener, Op::Listen(4)).unwrap();
+        let healthy = new(&mut a, SOCK_NONBLOCK);
+        assert_eq!(
+            a.execute(healthy, Op::Connect("10.73.0.3:16380".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        pump(&mut a, &mut b);
+        b.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap();
+        a.execute(client, Op::Write(vec![5; 8000])).unwrap();
+        let (requests, results) = reserve(&mut a);
+        assert!(a.prepare_packet(None).unwrap());
+        {
+            let mut s = state.lock().unwrap();
+            s.enforce_mtu = true;
+            s.mtu = Some(1400);
+        }
+        assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
+        requests.try_recv().unwrap();
+        let deadline = a.reservation_deadline.unwrap();
+        assert_eq!(deadline, a.now() + 1_000_000);
+        if let Some(response) = response {
+            results
+                .send(response.map(Some).map_err(io::Error::from_raw_os_error))
+                .unwrap();
+        }
+        for _ in 0..4 {
+            a.poll_mtu_refresh();
+            assert!(!a.prepare_packet(None).unwrap());
+            assert_eq!(a.reservation_deadline, Some(deadline));
+            assert_eq!(a.output_wait(), std::time::Duration::from_millis(1));
+            assert!(requests.try_recv().is_err());
+            advance(&mut a, 100);
+        }
+        a.expire_reservation(deadline - 1).unwrap();
+        assert!(a.reservation.is_some());
+        a.test_now = Some(deadline);
+        a.expire_reservation(deadline).unwrap();
+        assert_eq!(
+            a.endpoint.state(connection(&a, client)).unwrap(),
+            ntcp::State::Closed
+        );
+        assert_eq!(
+            a.endpoint.state(connection(&a, healthy)).unwrap(),
+            ntcp::State::Established
+        );
+        assert!(state.lock().unwrap().sent.is_empty()); // No fabricated reset.
+        a.events();
+        assert_eq!(a.sockets[&client].error, ECONNABORTED);
+        a.execute(healthy, Op::Write(vec![9; 100])).unwrap();
+        assert!(a.prepare_packet(None).unwrap());
+        assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::Submitted));
+        assert_eq!(state.lock().unwrap().sent.len(), 1);
+        assert!(a.reservation.is_none());
+        if response.is_none() {
+            a.execute(healthy, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
+                .unwrap();
+            a.execute(healthy, Op::Write(vec![3; 8000])).unwrap();
+            assert!(a.prepare_packet(None).unwrap());
+            assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
+            assert!(requests.try_recv().is_err()); // Still only the first stalled query.
+            assert_eq!(a.reservation_deadline, Some(a.now() + 1_000_000));
+        }
+    }
+}
+
+#[test]
+fn reserved_commands_producers_and_rx_are_deferred_before_admission() {
+    let (mut a, mut b, client, server, state) = pmtud_pair(None);
+    let fresh = new(&mut a, SOCK_NONBLOCK);
+    a.execute(client, Op::Write(vec![1; 100])).unwrap();
+    reserve(&mut a);
+    assert!(a.prepare_packet(None).unwrap());
+    let mut commands = Vec::new();
+    for (id, op) in [
+        (0, Op::New(SOCK_NONBLOCK)),
+        (client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1)),
+        (fresh, Op::Close),
+    ] {
+        let (reply, response) = mpsc::sync_channel(1);
+        let mut request = Request {
+            id,
+            op,
+            reply,
+            deadline: None,
+            send: None,
+        };
+        assert!(!a.service(&mut request));
+        assert!(response.try_recv().is_err());
+        commands.push((request, response));
+    }
+    let mut pipe = [0; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), O_NONBLOCK | O_CLOEXEC) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::write(pipe[1], b"pipe".as_ptr().cast(), 4) },
+        4
+    );
+    let mut staging = [0; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(staging.as_mut_ptr(), O_NONBLOCK | O_CLOEXEC) },
+        0
+    );
+    let _fds: Vec<_> = pipe
+        .into_iter()
+        .chain(staging)
+        .map(crate::Retained)
+        .collect();
+    let (reply, response) = mpsc::sync_channel(1);
+    let mut request = Request {
+        id: client,
+        op: Op::Transfer {
+            source: pipe[0],
+            staging,
+            offset: None,
+            count: 4,
+            flags: 0,
+        },
+        reply,
+        deadline: None,
+        send: None,
+    };
+    assert!(!a.service(&mut request));
+    assert!(response.try_recv().is_err());
+    let mut available = 0;
+    assert_eq!(unsafe { libc::ioctl(pipe[0], FIONREAD, &mut available) }, 0);
+    assert_eq!(available, 4);
+    let file = unsafe { libc::memfd_create(c"reservation-producer".as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(file >= 0);
+    let _file = crate::Retained(file);
+    assert_eq!(unsafe { libc::write(file, b"file".as_ptr().cast(), 4) }, 4);
+    let mut offset: libc::off_t = 0;
+    let (reply, file_response) = mpsc::sync_channel(1);
+    let mut file_request = Request {
+        id: client,
+        op: Op::Transfer {
+            source: file,
+            staging,
+            offset: Some((&mut offset as *mut libc::off_t) as usize),
+            count: 4,
+            flags: 0,
+        },
+        reply,
+        deadline: None,
+        send: None,
+    };
+    assert!(!a.service(&mut file_request));
+    assert!(file_response.try_recv().is_err());
+    assert_eq!(offset, 0);
+    b.execute(server, Op::Write(vec![2; 20])).unwrap();
+    assert!(b.prepare_packet(None).unwrap());
+    let packet = b.pending_packet.take().unwrap();
+    ingress(&mut a, &state, &packet);
+    assert_eq!(state.lock().unwrap().incoming.len(), 1);
+    assert_eq!(state.lock().unwrap().receives, 0);
+    assert_eq!(
+        a.endpoint.on_timeout(a.now(), 0),
+        Err(EndpointError::OutputReserved)
+    );
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::Submitted));
+    a.receive_batch(&mut vec![0; 65549]).unwrap();
+    assert!(state.lock().unwrap().incoming.is_empty());
+    assert_eq!(a.execute(client, Op::Read(20)).unwrap().bytes, vec![2; 20]);
+    // A producer request is now admitted, not rejected with OutputReserved/EINVAL.
+    assert!(a.service(&mut request));
+    assert_eq!(response.recv().unwrap().unwrap().value, 4);
+    assert_eq!(unsafe { libc::ioctl(pipe[0], FIONREAD, &mut available) }, 0);
+    assert_eq!(available, 0);
+    assert!(a.service(&mut file_request));
+    assert_eq!(file_response.recv().unwrap().unwrap().value, 4);
+    assert_eq!(offset, 4);
+    for (mut request, response) in commands {
+        assert!(a.service(&mut request));
+        assert!(response.recv().unwrap().is_ok());
+    }
+}
+
+#[test]
+fn reserved_pacing_alone_has_no_deadline_and_late_accept_debits_once() {
+    let (mut a, mut b, client, _, state) = pmtud_paced_pair(
+        None,
+        Some(ntcp::PacingConfig {
+            max_burst_segments: 1,
+            max_bytes_per_second: Some(1_000_000),
+            ..Default::default()
+        }),
+    );
+    a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
+        .unwrap();
+    a.execute(client, Op::Write(vec![1; 24000])).unwrap();
+    reserve(&mut a);
+    assert!(a.prepare_packet(None).unwrap());
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::Submitted));
+    assert!(!a.prepare_packet(None).unwrap());
+    assert!(a.reservation.is_none());
+    assert_eq!(a.reservation_deadline, None);
+    let deadline = a.endpoint.next_deadline().unwrap();
+    assert!(deadline > a.now());
+    a.test_now = Some(deadline);
+    a.endpoint.on_timeout(a.now(), BUDGET).unwrap();
+    assert!(a.prepare_packet(None).unwrap());
+    assert_eq!(a.reservation_deadline, None);
+    state.lock().unwrap().block = true;
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
+    let first = a.reservation_deadline.unwrap();
+    advance(&mut a, 50_000);
+    state.lock().unwrap().block = false;
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::Submitted));
+    assert!(a.reservation_deadline.is_none());
+    assert!(!a.prepare_packet(None).unwrap()); // No catch-up credit after late accept.
+    // Free the two-packet initial congestion window, without selecting new output.
+    for frame in state.lock().unwrap().sent.drain(..) {
+        let frame = ntcp_ip::parse_ethernet(&frame).unwrap();
+        let ip = ntcp_ip::parse(frame.payload, false).unwrap();
+        b.input(b.now(), ip.ip, ip.traffic_class, ip.payload)
+            .unwrap();
+    }
+    b.test_now = Some(b.now() + 250_000);
+    b.endpoint.on_timeout(b.now(), BUDGET).unwrap();
+    let mut bytes = [0; 2048];
+    let ack = b
+        .endpoint
+        .poll_transmit(b.now(), &mut bytes, BUDGET)
+        .unwrap()
+        .packet
+        .unwrap();
+    a.input(a.now(), ack.ip, 0, &bytes[..ack.len]).unwrap();
+    let deadline = a.endpoint.next_deadline().unwrap();
+    assert!(deadline > a.now());
+    a.test_now = Some(deadline);
+    a.endpoint.on_timeout(a.now(), BUDGET).unwrap();
+    assert!(
+        a.prepare_packet(None).unwrap(),
+        "now {} next {:?} info {:?}",
+        a.now(),
+        a.endpoint.next_deadline(),
+        a.endpoint.transport_info(connection(&a, client))
+    );
+    state.lock().unwrap().block = true;
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
+    assert!(a.reservation_deadline.unwrap() > first); // New obligation, new deadline.
+}
+
+#[test]
+fn reserved_timestamp_rejection_preserves_scheduled_and_services_completions_while_blocked() {
+    let (mut a, _, client, _, state) = pmtud_pair(None);
+    state.lock().unwrap().capacity = 4;
+    a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
+        .unwrap();
+    flags(
+        &mut a,
+        client,
+        ts::TX_SCHED | ts::TX_SOFTWARE | ts::TX_HARDWARE,
+    );
+    a.execute(client, Op::Write(vec![1; 100])).unwrap();
+    reserve(&mut a);
+    assert!(a.prepare_packet(None).unwrap());
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::Submitted));
+    assert_eq!(state.lock().unwrap().requests.len(), 1);
+    assert_eq!(stage_count(&a, client, 1), 1);
+    a.execute(client, Op::Write(vec![2; 8000])).unwrap();
+    assert!(a.prepare_packet(None).unwrap());
+    state.lock().unwrap().block = true;
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
+    state
+        .lock()
+        .unwrap()
+        .completions
+        .push_back(completion(1, TimestampSource::Software));
+    a.poll_backend_timestamps().unwrap();
+    assert_eq!(stage_count(&a, client, 0), 1);
+    assert_eq!(stage_count(&a, client, 1), 2);
+    {
+        let mut s = state.lock().unwrap();
+        s.enforce_mtu = true;
+        s.mtu = Some(1400);
+        s.block = false;
+    }
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
+    assert_eq!(stage_count(&a, client, 1), 2); // Scheduled is never rolled back.
+    assert_eq!(a.sockets[&client].timestamps.reserved(), 1); // Only earlier HW remains.
+    a.test_now = a.reservation_deadline;
+    a.expire_reservation(a.now()).unwrap();
+    assert_eq!(a.sockets[&client].timestamps.reserved(), 0);
+    assert_eq!(stage_count(&a, client, 0), 1); // No fabricated transmit observation.
+}
+
+#[test]
+fn reserved_stateless_rejection_is_best_effort_and_impossible_headers_abandon() {
+    let (mut a, _, client, _, state) = pmtud_pair(None);
+    reserve(&mut a);
+    // A valid ACK to an unbound port generates an endpoint-owned stateless RST.
+    let ip = ntcp::IpMetadata {
+        source: "10.73.0.3".parse().unwrap(),
+        destination: "10.73.0.2".parse().unwrap(),
+    };
+    let mut tcp = [0; 64];
+    let len = ntcp::wire::encode(
+        ip,
+        ntcp::wire::Header {
+            source_port: 6550,
+            destination_port: 6551,
+            sequence: 1,
+            acknowledgment: 1,
+            flags: ntcp::wire::ACK,
+            window: 100,
+            urgent_pointer: 0,
+        },
+        &[],
+        &[],
+        &mut tcp,
+    )
+    .unwrap();
+    a.input(a.now(), ip, 0, &tcp[..len]).unwrap();
+    assert!(a.prepare_packet(None).unwrap());
+    state.lock().unwrap().enforce_mtu = true;
+    state.lock().unwrap().mtu = Some(20); // Force synchronous rejection, even of a RST.
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
+    assert!(a.reservation.is_none());
+    assert!(a.reservation_deadline.is_none());
+    assert_eq!(
+        a.endpoint.state(connection(&a, client)).unwrap(),
+        ntcp::State::Established
+    );
+
+    // Native socket policy forbids source routes. Exercise the fail-closed
+    // runtime branch with a core fixture that can retain impossible IP headers.
+    let mut config = a.defaults.clone();
+    config.ipv4_options_enabled = true;
+    a.endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
+    a.endpoint.enable_output_reservations().unwrap();
+    let id = a
+        .endpoint
+        .connect_with_ipv4_options(
+            a.now(),
+            "10.73.0.2:1".parse().unwrap(),
+            "10.73.0.3:2".parse().unwrap(),
+            ntcp::OutgoingIpv4Options {
+                source_route: Some(
+                    ntcp::SourceRoute::new(&["10.73.0.4".parse().unwrap(); 9], false).unwrap(),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let (_, attempt) = a
+        .endpoint
+        .poll_reserved_transmit(a.now(), &mut [0; 2048], BUDGET)
+        .unwrap();
+    a.reservation = attempt;
+    a.endpoint.set_endpoint_first_hop_mtu(a.now(), 68).unwrap();
+    a.endpoint.reject_unsubmitted(attempt.unwrap()).unwrap();
+    assert!(!a.prepare_packet(None).unwrap());
+    assert!(a.reservation.is_none());
+    assert_eq!(
+        a.endpoint.close_reason(id).unwrap(),
+        Some(CloseReason::Aborted)
+    );
+}
+
+#[test]
+fn reserved_late_direct_accept_and_prefix_expiry_keep_accepted_bytes() {
+    let (mut a, mut b, client, server, state) = pmtud_pair(None);
+    a.execute(client, Op::Write(vec![6; 8000])).unwrap();
+    let (requests, results) = reserve(&mut a);
+    a.reservation_timeout_us = 2_000_000;
+    assert!(a.prepare_packet(None).unwrap());
+    state.lock().unwrap().block = true;
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
+    let cid = connection(&a, client);
+    let before = a.endpoint.transport_info(cid).unwrap();
+    advance(&mut a, before.rto_us + 1);
+    a.expire_reservation(a.now()).unwrap();
+    state.lock().unwrap().block = false;
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::Submitted));
+    assert!(a.reservation_deadline.is_none());
+    a.endpoint.on_timeout(a.now(), BUDGET).unwrap();
+    assert_eq!(a.endpoint.transport_info(cid).unwrap().cwnd, before.cwnd);
+    assert!(requests.try_recv().is_err());
+    // ACK the first send and then retain a physically submitted repair prefix.
+    deliver(&mut a, &mut b, &state);
+    b.test_now = Some(b.now() + 250_000);
+    b.endpoint.on_timeout(b.now(), BUDGET).unwrap();
+    pump(&mut b, &mut a);
+    assert_eq!(
+        b.execute(server, Op::Read(8000)).unwrap().bytes,
+        vec![6; 8000]
+    );
+    a.execute(client, Op::Write(vec![7; 8000])).unwrap();
+    assert!(a.prepare_packet(None).unwrap());
+    {
+        let mut s = state.lock().unwrap();
+        s.enforce_mtu = true;
+        s.mtu = Some(1400);
+    }
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
+    requests.try_recv().unwrap();
+    refresh(&mut a, &results, 1400);
+    assert!(a.prepare_packet(None).unwrap());
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::Submitted));
+    assert!(a.reservation.is_some());
+    let frame = state.lock().unwrap().sent.pop_front().unwrap();
+    let frame = ntcp_ip::parse_ethernet(&frame).unwrap();
+    let ip = ntcp_ip::parse(frame.payload, false).unwrap();
+    let accepted = ntcp::wire::parse(ip.ip, ip.payload).unwrap().payload.len();
+    b.input(b.now(), ip.ip, ip.traffic_class, ip.payload)
+        .unwrap();
+    assert_eq!(
+        b.execute(server, Op::Read(8000)).unwrap().bytes,
+        vec![7; accepted]
+    );
+    assert!(a.prepare_packet(None).unwrap());
+    state.lock().unwrap().block = true;
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
+    a.test_now = a.reservation_deadline;
+    a.expire_reservation(a.now()).unwrap();
+    assert_eq!(a.endpoint.state(cid).unwrap(), ntcp::State::Closed);
+    assert!(state.lock().unwrap().sent.is_empty());
+    assert_eq!(b.execute(server, Op::Read(8000)).unwrap_err(), EAGAIN);
+    assert_eq!(
+        b.endpoint.state(connection(&b, server)).unwrap(),
+        ntcp::State::Established
     );
 }

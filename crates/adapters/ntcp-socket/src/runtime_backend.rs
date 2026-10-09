@@ -165,6 +165,7 @@ impl Owner {
             None,
             backend_config(config.tcp.clone(), &io)?,
         )?;
+        owner.enable_reservations(&config.io, index)?;
         owner.ethernet = Some(EthernetBackend {
             io: Box::new(io),
             local: hardware,
@@ -206,6 +207,10 @@ impl Owner {
     }
     // Each rejected frame consumes one iteration, just like an accepted frame.
     pub(super) fn receive_batch(&mut self, input: &mut [u8]) -> std::io::Result<()> {
+        // Keep RX in the backend's bounded queue while the endpoint is reserved.
+        if self.reservation.is_some() {
+            return Ok(());
+        }
         for _ in 0..BUDGET {
             match self.receive_backend(input) {
                 Ok(Some(received)) => {
@@ -399,7 +404,9 @@ impl EthernetBackend {
                 + requested
                 > capacity
             {
-                self.cancel_oldest(endpoint)?;
+                // Cancellation errors are not synchronous packet rejection.
+                self.cancel_oldest(endpoint)
+                    .map_err(std::io::Error::other)?;
             }
             let cookie = self.next_cookie;
             match self.io.transmit_with_timestamp(

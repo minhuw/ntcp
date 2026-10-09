@@ -31,6 +31,7 @@ pub struct IoConfig {
     pub address: Ipv4Addr,
     pub prefix: Option<u8>,
     pub next_hop_mac: Option<[u8; 6]>,
+    pub output_reservation_timeout_ms: u32,
 }
 
 fn invalid() -> io::Error {
@@ -59,12 +60,14 @@ impl SocketConfig {
                 address,
                 prefix: None,
                 next_hop_mac: None,
+                output_reservation_timeout_ms: 1000,
             },
         }
     }
 
     pub fn validate(&self) -> io::Result<()> {
-        if self.io.interface.is_empty()
+        if self.io.output_reservation_timeout_ms == 0
+            || self.io.interface.is_empty()
             || self.io.interface.len() >= libc::IFNAMSIZ
             || self.io.interface.bytes().any(|b| {
                 b == 0
@@ -140,6 +143,9 @@ impl SocketConfig {
                 "io.interface" => config.io.interface = value.into(),
                 "io.address" => config.io.address = value.parse().map_err(|_| invalid())?,
                 "io.prefix" => config.io.prefix = Some(number(value)?),
+                "io.output_reservation_timeout_ms" => {
+                    config.io.output_reservation_timeout_ms = number(value)?;
+                }
                 "io.next_hop_mac" => {
                     let mut mac = [0; 6];
                     let fields: Vec<_> = value.split(':').collect();
