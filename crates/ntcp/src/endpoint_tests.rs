@@ -5465,3 +5465,54 @@ fn checked_external_write_admission_covers_bytes_phases_and_shutdown() {
         Err(EndpointError::Connection(Error::InvalidState))
     );
 }
+
+#[test]
+fn pmtud_endpoint_opt_in_tuple_dispatch_path_query_and_link_update() {
+    let (local, remote) = addresses();
+    let mut cfg = config();
+    cfg.connection.mss = 1460;
+    cfg.connection.send_capacity = 32_768;
+    cfg.connection.receive_capacity = 32_768;
+    cfg.connection.pmtud = Some(PmtudConfig::new(1500));
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
+    b.listen(remote, 4).unwrap();
+    let id = a.connect(0, local, remote).unwrap();
+    pump(&mut a, &mut b, 1);
+    assert_eq!(a.path_mtu_info(id).unwrap().unwrap().current_mtu, 1500);
+    a.write(id, &[1; 1460]).unwrap();
+    let output = packets(&mut a, 2);
+    let (ip, bytes) = &output[0];
+    let seq = wire::parse(*ip, bytes).unwrap().header.sequence;
+    let tuple = Tuple { local, remote };
+    assert!(
+        !a.pmtu_feedback(
+            3,
+            Tuple {
+                local: remote,
+                remote: local
+            },
+            seq,
+            bytes.len() as u32 + 20,
+            20,
+            508
+        )
+        .unwrap()
+    );
+    assert!(
+        a.pmtu_feedback(3, tuple, seq, bytes.len() as u32 + 20, 20, 508)
+            .unwrap()
+    );
+    assert_eq!(a.path_mtu_info(id).unwrap().unwrap().current_mtu, 508);
+    a.set_first_hop_mtu(4, id, 9000).unwrap();
+    assert_eq!(a.path_mtu_info(id).unwrap().unwrap().current_mtu, 508);
+    assert_eq!(a.path_mtu_info(id).unwrap().unwrap().first_hop_mtu, 9000);
+    assert!(a.set_first_hop_mtu(4, id, 67).is_err());
+    assert!(
+        packets(&mut a, 5)
+            .iter()
+            .all(|(_, bytes)| bytes.len() + 20 <= 508)
+    );
+    let (a, _, _, id) = endpoints();
+    assert_eq!(a.path_mtu_info(id).unwrap(), None);
+}

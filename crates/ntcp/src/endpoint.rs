@@ -68,6 +68,7 @@ pub struct EndpointConfig {
 impl EndpointConfig {
     pub fn validate(&self) -> Result<(), EndpointError> {
         if !(1..=1_024).contains(&self.max_setup_cache_entries)
+            || self.connection.pmtud.is_some_and(|p| p.first_hop_mtu < 68)
             || !self.connection.valid_timestamp_timebase()
             || !self.connection.valid_pacing()
             || self.connection.time_wait_us < 240_000_000
@@ -1154,6 +1155,7 @@ impl Endpoint {
         let id = self.connect(now, local, remote)?;
         let slot = self.slots[id.slot].as_mut().unwrap();
         slot.ipv4_options = options;
+        Self::sync_ip_header_len(slot);
         slot.explicit_route = options.source_route.is_some();
         Ok(id)
     }
@@ -1176,6 +1178,19 @@ impl Endpoint {
         slot.received_ipv4_options = Some(options);
         if !slot.explicit_route && route.is_some() {
             slot.ipv4_options.source_route = route;
+        }
+        Self::sync_ip_header_len(slot);
+    }
+
+    fn sync_ip_header_len(slot: &mut Slot) {
+        let tuple = slot.connection.tuple();
+        if let (IpAddr::V4(source), IpAddr::V4(destination)) = (tuple.local.ip(), tuple.remote.ip())
+        {
+            let len = slot
+                .ipv4_options
+                .encode(source, destination, 0, &mut [0; 40])
+                .map_or(40, |(_, len)| len);
+            slot.connection.set_ip_header_len(20 + len as u16);
         }
     }
 
@@ -2156,6 +2171,53 @@ impl Endpoint {
         self.refresh(index);
         Ok(accepted)
     }
+    pub fn pmtu_feedback(
+        &mut self,
+        now: Instant,
+        tuple: Tuple,
+        quoted_sequence: u32,
+        ip_packet_len: u32,
+        ip_header_len: u16,
+        candidate_mtu: u32,
+    ) -> Result<bool, EndpointError> {
+        self.clock(now)?;
+        let Some(index) = self.tuples.find(self.hash(tuple), tuple) else {
+            return Ok(false);
+        };
+        let accepted = self.slots[index]
+            .as_mut()
+            .unwrap()
+            .connection
+            .pmtu_feedback(
+                now,
+                quoted_sequence,
+                ip_packet_len,
+                ip_header_len,
+                candidate_mtu,
+            )?;
+        self.refresh(index);
+        Ok(accepted)
+    }
+
+    pub fn set_first_hop_mtu(
+        &mut self,
+        now: Instant,
+        id: ConnectionId,
+        mtu: u32,
+    ) -> Result<(), EndpointError> {
+        self.clock(now)?;
+        self.slot_mut(id)?.connection.set_first_hop_mtu(now, mtu)?;
+        self.refresh(id.slot);
+        Ok(())
+    }
+
+    pub fn path_mtu_info(
+        &self,
+        id: ConnectionId,
+    ) -> Result<Option<crate::PathMtuInfo>, EndpointError> {
+        Ok(self.slot(id)?.connection.path_mtu_info())
+    }
+
     pub fn lower_mss(&mut self, id: ConnectionId, mss: u16) -> Result<(), EndpointError> {
         self.slot_mut(id)?.connection.lower_mss(mss)?;
         self.refresh(id.slot);
@@ -2420,7 +2482,24 @@ impl Endpoint {
                 self.cleanup_one();
             }
             if !self.control.is_empty() && (self.control_turn || self.output.is_empty()) {
-                let (ip, header, ipv4_options, echo) = *self.control.front().unwrap();
+                let (ip, header, ipv4_options, mut echo) = *self.control.front().unwrap();
+                if let Some(policy) = self.config.connection.pmtud {
+                    let ip_len = match (ip.source, ip.destination) {
+                        (IpAddr::V4(source), IpAddr::V4(destination)) => {
+                            20 + ipv4_options.encode(source, destination, 0, &mut [0; 40])?.1 as u32
+                        }
+                        _ => 40,
+                    };
+                    let budget = policy.first_hop_mtu.saturating_sub(ip_len);
+                    if budget < 20 {
+                        // Stateless replies cannot fragment or drop a required source route.
+                        self.control.pop_front();
+                        continue;
+                    }
+                    if budget < 32 {
+                        echo = None;
+                    }
+                }
                 let mut options = [1, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0];
                 if let Some(echo) = echo {
                     options[8..].copy_from_slice(&echo.to_be_bytes());

@@ -20,6 +20,8 @@ mod endpoint_tests;
 mod hystart;
 mod ipv4_options;
 mod pacing;
+mod pmtud;
+pub use pmtud::{PathMtuInfo, PmtudConfig};
 mod rack;
 mod recovery;
 mod rx_timestamp;

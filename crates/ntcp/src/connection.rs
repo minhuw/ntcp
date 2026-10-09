@@ -122,6 +122,7 @@ pub struct ConnectionConfig {
     pub send_capacity: usize,
     pub receive_capacity: usize,
     pub mss: u16,
+    pub pmtud: Option<crate::PmtudConfig>,
     // Maximum TCP segment bytes after IP headers/extensions are subtracted from
     // the reassembly bound; use the smallest bound if it varies.
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.3
@@ -234,7 +235,8 @@ impl Default for KeepaliveConfig {
 
 impl ConnectionConfig {
     pub fn validate(&self, ipv4: bool) -> Result<(), Error> {
-        if !self.valid_timestamp_timebase()
+        if self.pmtud.is_some_and(|p| p.first_hop_mtu < if ipv4 { 68 } else { 1280 })
+            || !self.valid_timestamp_timebase()
             || !self.valid_pacing()
             || self.timestamp_bytes_per_tick == 0
             || self.timestamp_bytes_per_tick >= 1 << 31
@@ -302,6 +304,7 @@ impl Default for ConnectionConfig {
             send_capacity: 65536,
             receive_capacity: 65536,
             mss: 1460,
+            pmtud: None,
             receive_ip_payload_limit: u16::MAX,
             send_ip_payload_limit: u16::MAX,
             nagle: true,
@@ -578,6 +581,10 @@ pub(crate) struct Connection {
     reset_reply: bool,
     last_timestamp_sent_at: Option<Instant>,
     mss: usize,
+    peer_mss: u16,
+    send_mss_limit: u16,
+    ip_header_len: u16,
+    pmtud: Option<crate::pmtud::Pmtud>,
     advertised_edge: Seq,
     syn_window: u16,
     acknowledged: u64,
@@ -710,7 +717,32 @@ impl Connection {
             .find(|&shift| config.receive_capacity <= (65535usize << shift))
             .unwrap_or(14);
         let syn_window = config.receive_capacity.min(65535) as u16;
+        let ip_header_len = if tuple.local.is_ipv4() { 20 } else { 40 };
+        let pmtud = config.pmtud.map(|p| {
+            crate::pmtud::Pmtud::new(
+                p,
+                p.first_hop_mtu
+                    .min(
+                        (u32::from(config.send_ip_payload_limit) + u32::from(ip_header_len))
+                            .max(if tuple.local.is_ipv4() { 68 } else { 1280 }),
+                    )
+                    .min(
+                        (u32::from(config.mss) + u32::from(ip_header_len) + 20)
+                            .max(if tuple.local.is_ipv4() { 68 } else { 1280 }),
+                    ),
+                tuple.local.is_ipv4(),
+                config.timebase.ticks_from_us(600_000_000),
+            )
+        });
         let mss = config.mss.min(config.send_ip_payload_limit - 20) as usize;
+        let mss = pmtud.as_ref().map_or(mss, |p| {
+            mss.min(
+                p.info
+                    .current_mtu
+                    .saturating_sub(u32::from(ip_header_len) + 20)
+                    .max(1) as usize,
+            )
+        });
         let congestion = Congestion::new(
             mss as u32,
             config.recovery_algorithm,
@@ -742,6 +774,10 @@ impl Connection {
         let timestamp_tick = config.timestamp_granularity.tick_in(now, config.timebase);
         Ok(Self {
             tuple,
+            peer_mss: config.mss,
+            send_mss_limit: config.mss,
+            ip_header_len,
+            pmtud,
             config,
             state: State::SynSent,
             reason: None,
@@ -1912,6 +1948,9 @@ impl Connection {
         //# TCP implementation MUST NOT abort the connection (MUST-56), and it
         //# SHOULD make the information available to the application (SHLD-25).
         self.events.network_error = Some(error);
+        if let Some(p) = &mut self.pmtud {
+            p.network_error();
+        }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2
         //# These are hard error conditions, so TCP implementations SHOULD abort the
         //# connection (SHLD-26).
@@ -1919,6 +1958,112 @@ impl Connection {
             self.terminal(CloseReason::NetworkError);
         }
         Ok(true)
+    }
+
+    fn path_bound(&self, link: u32) -> u32 {
+        let base = if self.tuple.local.is_ipv4() { 20 } else { 40 };
+        let floor = if self.tuple.local.is_ipv4() { 68 } else { 1280 };
+        // A tiny peer/allocation ceiling limits packetization, not the IP
+        // family's minimum legal path estimate. Such flows cannot size-probe.
+        link.min(
+            (u32::from(self.config.send_ip_payload_limit) + u32::from(self.ip_header_len))
+                .max(floor),
+        )
+        .min((u32::from(self.peer_mss.min(self.send_mss_limit)) + base + 20).max(floor))
+        .min((self.scratch.len() as u32 + base + 20).max(floor))
+    }
+
+    fn refresh_path_mss(&mut self) {
+        let Some(link) = self.pmtud.as_ref().map(|p| p.info.first_hop_mtu) else {
+            return;
+        };
+        let bound = self.path_bound(link);
+        let p = self.pmtud.as_mut().unwrap();
+        p.constrain(bound);
+        let mss = p
+            .info
+            .current_mtu
+            .saturating_sub(
+                u32::from(self.ip_header_len) + 20 + if self.timestamps { 12 } else { 0 },
+            )
+            .max(1) as usize;
+        let base = if self.tuple.local.is_ipv4() { 20 } else { 40 };
+        let options = usize::from(self.ip_header_len - base) + if self.timestamps { 12 } else { 0 };
+        let ceiling = usize::from(self.peer_mss.min(self.send_mss_limit))
+            .min(self.scratch.len())
+            .saturating_sub(options)
+            .max(1);
+        let budget = (self.config.send_ip_payload_limit as usize)
+            .saturating_sub(20 + if self.timestamps { 12 } else { 0 })
+            .max(1);
+        self.set_path_mss(mss.min(ceiling).min(budget));
+    }
+
+    fn path_payload_limit(&self) -> usize {
+        self.pmtud
+            .as_ref()
+            .map_or(self.config.send_ip_payload_limit as usize, |p| {
+                (self.config.send_ip_payload_limit as usize).min(
+                    p.info
+                        .current_mtu
+                        .saturating_sub(u32::from(self.ip_header_len)) as usize,
+                )
+            })
+    }
+
+    pub(crate) fn set_ip_header_len(&mut self, len: u16) {
+        if self.ip_header_len != len {
+            self.ip_header_len = len;
+            self.refresh_path_mss();
+        }
+    }
+
+    pub(crate) fn path_mtu_info(&self) -> Option<crate::PathMtuInfo> {
+        self.pmtud.as_ref().map(|p| p.info)
+    }
+
+    pub(crate) fn set_first_hop_mtu(&mut self, now: Instant, mtu: u32) -> Result<(), Error> {
+        self.check_time(now)?;
+        if mtu < if self.tuple.local.is_ipv4() { 68 } else { 1280 } || self.pmtud.is_none() {
+            return Err(Error::InvalidArgument);
+        }
+        let bound = self.path_bound(mtu);
+        self.update_time(now)?;
+        self.pmtud.as_mut().unwrap().link(mtu, bound, now);
+        self.refresh_path_mss();
+        self.arm_work();
+        Ok(())
+    }
+
+    pub(crate) fn pmtu_feedback(
+        &mut self,
+        now: Instant,
+        seq: u32,
+        size: u32,
+        header: u16,
+        mtu: u32,
+    ) -> Result<bool, Error> {
+        self.update_time(now)?;
+        if matches!(self.state, State::Closed | State::TimeWait)
+            || Seq(seq).in_window(self.snd_una, self.flight()) != Some(true)
+        {
+            return Ok(false);
+        }
+        let accepted = self
+            .pmtud
+            .as_mut()
+            .is_some_and(|p| p.feedback(now, Seq(seq), size, header, mtu));
+        if accepted {
+            self.refresh_path_mss();
+            self.arm_work();
+        }
+        Ok(accepted)
+    }
+
+    fn pmtu_cooldown(&self) -> u64 {
+        (u64::from(self.congestion.cwnd()) / self.mss.max(1) as u64 + 1)
+            .saturating_mul(self.rtt.srtt().unwrap_or(1).max(1))
+            .max(self.rto())
     }
 
     pub(crate) fn lower_mss(&mut self, mss: u16) -> Result<(), Error> {
@@ -1931,11 +2076,25 @@ impl Connection {
         if effective as usize == self.mss {
             return Ok(());
         }
+        if self.pmtud.is_none() {
+            // Legacy explicit MSS override retains its original SYN behavior.
+            self.config.mss = self.config.mss.min(mss);
+        }
+        self.send_mss_limit = self.send_mss_limit.min(mss);
+        if self.pmtud.is_some() {
+            self.refresh_path_mss();
+        } else {
+            self.set_path_mss(effective as usize);
+        }
+        Ok(())
+    }
+
+    fn set_path_mss(&mut self, effective: usize) {
+        if effective == self.mss {
+            return;
+        }
         self.output_push_batch = None;
-        self.mss = effective as usize;
-        // Also constrain future SYN offers and negotiation if this occurs
-        // before the peer's SYN; the scratch allocation never changes.
-        self.config.mss = self.config.mss.min(mss);
+        self.mss = effective;
         self.congestion.set_mss(effective as u32);
         if let Some(prr) = &mut self.prr {
             prr.set_mss(effective as u32);
@@ -1952,7 +2111,6 @@ impl Connection {
             }
         }
         self.arm_work();
-        Ok(())
     }
 
     pub(crate) fn update_time(&mut self, now: Instant) -> Result<(), Error> {
@@ -2190,6 +2348,7 @@ impl Connection {
         //# (that reflects the available reassembly buffer size at the remote
         //# host, the EMTU_R [19]) and the largest transmission size permitted by
         //# the IP layer (EMTU_S [19]):
+        self.peer_mss = syn.options.mss.unwrap_or(default_mss).max(1);
         self.mss = syn
             .options
             .mss
@@ -2200,6 +2359,7 @@ impl Connection {
             .max(1)
             .min(self.config.send_ip_payload_limit - 20 - if self.timestamps { 12 } else { 0 })
             as usize;
+        self.refresh_path_mss();
         self.congestion
             .set_initial_mss(self.mss as u32, self.syn_loss_detected);
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
@@ -4490,6 +4650,15 @@ impl Connection {
     //= reason=IW10 divided/delayed new ACKs with outstanding flight restart at ACKtime+current RTO after estimator update; duplicate ACK does not restart, last new ACK cancels. RFC6298 universal timing audit remains separate.
     //# To minimize spurious retransmissions, implementations MUST follow RFC 6298 [RFC6298] to restart the retransmission timer with the current value of RTO for each ACK received that acknowledges new data.
     fn accept_ack(&mut self, ack: Seq, ece: bool, echo: Option<u32>, send_window: u32) {
+        if self.pmtud.is_some() {
+            let cooldown = self.pmtu_cooldown();
+            let rto = self.rto();
+            self.pmtud
+                .as_mut()
+                .unwrap()
+                .ack(ack, self.now, cooldown, rto);
+            self.refresh_path_mss();
+        }
         // When the ledger is available, only its newly delivered complete
         // original qualifies. A scalar RTTM pending across a SACK must not
         // count that same transmission again on its later cumulative ACK.
@@ -5583,7 +5752,7 @@ impl Connection {
             None
         };
         if let Some((value, echo)) =
-            timestamp.filter(|_| reset.is_none() || self.config.send_ip_payload_limit >= 32)
+            timestamp.filter(|_| reset.is_none() || self.path_payload_limit() >= 32)
         {
             // SACK-permitted replaces timestamp padding on SYN, as in Linux.
             options[option_len..option_len + 4].copy_from_slice(if sack_offer {
@@ -5663,10 +5832,7 @@ impl Connection {
                 probe || keepalive && self.config.keepalive.is_some_and(|k| k.send_garbage),
             );
             let available = (40 - option_len)
-                .min(
-                    (self.config.send_ip_payload_limit as usize)
-                        .saturating_sub(20 + option_len + control_payload),
-                )
+                .min((self.path_payload_limit()).saturating_sub(20 + option_len + control_payload))
                 // Pure ACK options are independent of MSS. Once reported, limit
                 // piggybacked SACKs to leave room for data on the next poll.
                 .min(if self.ack_pending && !self.sack_data_turn {
@@ -5674,8 +5840,8 @@ impl Connection {
                 } else {
                     self.mss.saturating_sub(1)
                 });
-            let full_available = (40 - option_len)
-                .min((self.config.send_ip_payload_limit as usize).saturating_sub(20 + option_len));
+            let full_available =
+                (40 - option_len).min((self.path_payload_limit()).saturating_sub(20 + option_len));
             let max_blocks = available.saturating_sub(4) / 8;
             sack_limited = self
                 .receive
@@ -5720,10 +5886,25 @@ impl Connection {
         } else {
             u32::MAX
         };
-        let wire_mss = self
-            .mss
+        let retry_mss = self
+            .pmtud
+            .as_ref()
+            .filter(|p| p.probe.is_some())
+            .map_or(self.mss, |p| {
+                self.mss.min(
+                    p.info
+                        .search_low
+                        .saturating_sub(
+                            u32::from(self.ip_header_len)
+                                + 20
+                                + (option_len - sack_option_len) as u32,
+                        )
+                        .max(1) as usize,
+                )
+            });
+        let wire_mss = retry_mss
             .saturating_sub(sack_option_len)
-            .min((self.config.send_ip_payload_limit as usize).saturating_sub(20 + option_len));
+            .min((self.path_payload_limit()).saturating_sub(20 + option_len));
         let packet_mss = wire_mss
             // With zero credit, retain a plan so the transactional gate reports
             // exhaustion instead of consuming the pending output obligation.
@@ -5863,6 +6044,7 @@ impl Connection {
         let mut seq = self.snd_nxt;
         let mut flags = ACK;
         let mut count = 0usize;
+        let mut pmtu_probe = None;
         let mut new_fin = false;
         let mut retransmitted = false;
         if let Some((reset_seq, with_ack)) = reset {
@@ -6122,8 +6304,58 @@ impl Connection {
                 && self.snd_wnd.saturating_sub(self.flight()) as usize > unsent
                 && (usable > unsent || unsent == 0 && self.prr.is_none())
                 && matches!(self.state, State::Established | State::CloseWait);
+            //= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
+            //# It has no outstanding probes or losses.
+            // Leading/trailing retransmissions are tracked through cumulative
+            // delivery, so an isolated loss is never inferred prematurely.
+            let candidate = self.pmtud.as_ref().and_then(|p| p.target()).filter(|_| {
+                self.rtt.srtt().is_some()
+                    && !pacing_blocked
+                    && !self.congestion.in_recovery()
+                    && self.sack_recovery.is_none()
+                    && self.sack_post_rto.is_none()
+                    && self.prr.is_none()
+                    && self.consecutive_timeouts == 0
+                    && self.rack.counts().lost == 0
+                    && !self.retx_pending
+                    && !self.limited_pending
+                    && !self.shutdown
+                    && self.ecn_pause.is_none()
+                    && !self.cork
+                    && !self.more
+            });
+            let candidate = candidate.and_then(|size| {
+                let payload = size
+                    .checked_sub(u32::from(self.ip_header_len) + 20 + option_len as u32)?
+                    as usize;
+                let trailing = self.mss.checked_mul(3)?;
+                let needed = payload.checked_add(trailing)?;
+                let paced = self.config.pacing.is_none_or(|p| {
+                    let burst = p.max_burst_segments * self.mss as u32;
+                    self.pacer
+                        .deadline(now, burst, payload.min(burst as usize))
+                        .is_none()
+                });
+                let base = if self.tuple.local.is_ipv4() { 20 } else { 40 };
+                let ceiling = u32::from(self.peer_mss.min(self.send_mss_limit)) + base + 20;
+                (size <= ceiling
+                    && size
+                        <= u32::from(self.config.send_ip_payload_limit)
+                            + u32::from(self.ip_header_len)
+                    && payload > 0
+                    && payload <= self.scratch.len()
+                    && usable >= needed
+                    && paced
+                    && unsent >= needed
+                    && timestamp_credit as usize >= payload
+                    && self.send.record_len(offset, payload) == payload)
+                    .then_some((size, payload, trailing))
+            });
+            let wire_mss = candidate.map_or(wire_mss, |(_, payload, _)| payload);
+            let packet_mss = candidate.map_or(packet_mss, |(_, payload, _)| payload);
             let record = self.send.record_len(offset, unsent.min(wire_mss));
             count = record.min(packet_mss).min(usable);
+            pmtu_probe = candidate;
             let flush_credit = self
                 .cork_flush
                 .filter(|&end| after(end, self.snd_nxt))
@@ -6188,8 +6420,8 @@ impl Connection {
         // never a budget-reduced empty packet that can perpetuate ACK work.
         if count == 0 && sack_limited && self.ack_pending {
             option_len -= sack_option_len;
-            let available = (40 - option_len)
-                .min((self.config.send_ip_payload_limit as usize).saturating_sub(20 + option_len));
+            let available =
+                (40 - option_len).min((self.path_payload_limit()).saturating_sub(20 + option_len));
             let blocks = self.receive.sack_blocks(available.saturating_sub(4) / 8);
             let n = blocks.iter().flatten().count();
             sack_first = blocks[0];
@@ -6489,7 +6721,11 @@ impl Connection {
             destination: self.tuple.remote.ip(),
         };
         // Include TCP options on every output path, before committing any state.
-        if 20 + option_len + count > self.config.send_ip_payload_limit as usize {
+        let pmtu_probe = pmtu_probe.filter(|&(_, payload, _)| count == payload && !retransmitted);
+        let path_limit = pmtu_probe.map_or(self.path_payload_limit(), |(size, _, _)| {
+            size.saturating_sub(u32::from(self.ip_header_len)) as usize
+        });
+        if 20 + option_len + count > path_limit {
             return Err(Error::InvalidArgument);
         }
         let timestamp_cost =
@@ -6511,6 +6747,21 @@ impl Connection {
                 Error::Wire(error)
             }
         })?;
+        if let Some(p) = &mut self.pmtud {
+            if let Some((size, payload, trailing)) = pmtu_probe {
+                p.start_probe(seq, payload as u32, trailing as u32, size);
+            }
+            let length = count as u32 + u32::from(flags & SYN != 0) + u32::from(flags & FIN != 0);
+            if length != 0 && !keepalive {
+                p.sent(
+                    seq,
+                    seq.wrapping_add(length),
+                    size as u32 + u32::from(self.ip_header_len),
+                    self.ip_header_len,
+                    retransmitted,
+                );
+            }
+        }
         self.last_output_range = if count != 0 && !syn && !keepalive {
             let start = self.acknowledged + u64::from(seq.distance_from(self.send_base));
             let range = TxStreamRange {
@@ -6993,6 +7244,10 @@ impl Connection {
                 self.pacing_deadline
             },
             timestamp_wakeup,
+            self.pmtud
+                .as_ref()
+                .and_then(|p| p.deadline)
+                .filter(|&d| d > self.now),
             self.loss_timer.map(|(_, deadline)| deadline),
             self.ecn_pause,
             self.ack_deadline,
@@ -7123,6 +7378,9 @@ impl Connection {
     //# recorded in the variable recover.
     pub(crate) fn timeout(&mut self, now: Instant) -> Result<(), Error> {
         self.update_time(now)?;
+        if let Some(p) = &mut self.pmtud {
+            p.tick(now);
+        }
         if due(self.pacing_deadline, now) {
             self.pacing_deadline = None;
         }
@@ -7232,6 +7490,11 @@ impl Connection {
             self.sample = None;
             self.rtt.backoff();
             self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
+            let cooldown = self.pmtu_cooldown();
+            if let Some(p) = &mut self.pmtud {
+                p.timeout(now, self.snd_una, self.consecutive_timeouts, cooldown);
+            }
+            self.refresh_path_mss();
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
             //# (e) TCP implementations SHOULD inform the application of the delivery
             //# problem (unless such information has been disabled by the application;
@@ -26710,6 +26973,9 @@ mod tests {
 
     mod output_policy {
         include!("connection_output_tests.rs");
+    }
+    mod pmtud_policy {
+        include!("pmtud_tests.rs");
     }
     #[test]
     fn logical_send_finish_marks_only_selected_byte_and_releases_cork() {
