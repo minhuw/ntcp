@@ -2123,13 +2123,19 @@ mod tests {
     include!("file_transfer_tests.rs");
     include!("runtime_pacing_tests.rs");
     fn owner(last: u8) -> Owner {
+        owner_with_config(
+            last,
+            SocketConfig::new("test", Ipv4Addr::new(10, 73, 0, last)).tcp,
+        )
+    }
+    fn owner_with_config(last: u8, config: EndpointConfig) -> Owner {
         let local = Ipv4Addr::new(10, 73, 0, last);
         Owner::with_config(
             local,
             (Ipv4Addr::new(10, 73, 0, 1), 24),
             [last; 32],
             None,
-            SocketConfig::new("test", local).tcp,
+            config,
         )
         .unwrap()
     }
@@ -2922,7 +2928,10 @@ mod tests {
                 assert_eq!(socket_buffer_value(name, request), expected);
             }
         }
-        let mut a = owner(2);
+        let mut config = SocketConfig::new("test", Ipv4Addr::new(10, 73, 0, 2)).tcp;
+        // Budget for actual per-byte ledger storage: admit 2 MiB, but reject later growth.
+        config.max_buffer_bytes = 160 * 1024 * 1024;
+        let mut a = owner_with_config(2, config);
         let mut b = owner(3);
         let listener = new(&mut b, SOCK_NONBLOCK);
         b.execute(listener, Op::Set(SOL_SOCKET, SO_SNDBUF, 8192))
