@@ -2874,6 +2874,9 @@ impl Connection {
     //# When a TCP host enters TIME-WAIT or CLOSED state, it should ignore any previous state about the negotiation of ECN for that connection.
     fn terminal(&mut self, reason: CloseReason) {
         self.state = State::Closed;
+        if let Some(p) = &mut self.pmtud {
+            p.terminal();
+        }
         self.tx_timestamps.cancel_from(0);
         self.pacing_deadline = None;
         self.pacer = Pacer::default();
@@ -5628,19 +5631,12 @@ impl Connection {
     //# SND.UNA and rwnd.
     fn retry_limit(&self, seq: Seq, proposed: u32) -> u32 {
         let proposed = proposed.min(self.data_high().distance_from(seq));
-        // Repair the probe gap without resending already-delivered trailing
-        // bytes, which would falsely count as a second PMTU loss.
+        // Keep probe repairs within the original gap even after PTB cancels
+        // the probe's search result; trailing bytes may already be delivered.
         let proposed = self
             .pmtud
             .as_ref()
-            .and_then(|p| p.probe)
-            .map_or(proposed, |p| {
-                if seq.in_window(p.start, p.end.distance_from(p.start)) == Some(true) {
-                    proposed.min(p.end.distance_from(seq))
-                } else {
-                    proposed
-                }
-            });
+            .map_or(proposed, |p| p.repair_limit(seq, proposed));
         let window = self.snd_wnd.saturating_sub(seq.distance_from(self.snd_una));
         if self.snd_wnd == 0 {
             return 0;

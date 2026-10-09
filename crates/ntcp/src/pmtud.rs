@@ -48,6 +48,8 @@ pub(crate) struct Pmtud {
     pub deadline: Option<Instant>,
     reset_search: bool,
     pub probe: Option<Probe>,
+    // Packetization boundary survives cancellation of the probe's search result.
+    repair_range: Option<(Seq, Seq)>,
     pending: Option<(Seq, u32)>,
     icmp_since_progress: bool,
     max_sent: u32,
@@ -119,6 +121,7 @@ impl Pmtud {
             deadline: None,
             reset_search: false,
             probe: None,
+            repair_range: None,
             pending: None,
             icmp_since_progress: false,
             max_sent: 0,
@@ -186,6 +189,7 @@ impl Pmtud {
     pub fn target(&self) -> Option<u32> {
         if self.deadline.is_some()
             || self.probe.is_some()
+            || self.repair_range.is_some()
             || self.info.search_low >= self.info.search_high
         {
             return None;
@@ -194,6 +198,7 @@ impl Pmtud {
     }
 
     pub fn start_probe(&mut self, start: Seq, payload: u32, trailing: u32, size: u32) {
+        self.repair_range = Some((start, start.wrapping_add(payload)));
         self.probe = Some(Probe {
             start,
             end: start.wrapping_add(payload),
@@ -257,7 +262,8 @@ impl Pmtud {
                 if overlaps(start, end, p.start, p.end) {
                     p.retried = true;
                 }
-                if !covered(start, p.start) || !covered(p.end, end) {
+                // Overlap past the gap is not evidence of another lost packet.
+                if start.in_window(p.start, p.end.distance_from(p.start)) != Some(true) {
                     p.other_loss = true;
                 }
             }
@@ -583,6 +589,7 @@ impl Pmtud {
         self.info.current_mtu = mtu.min(self.info.current_mtu);
         self.info.search_high = self.info.search_high.min(mtu);
         self.info.search_low = self.info.search_low.min(mtu);
+        // Cancel classification, not the outstanding data's repair boundary.
         self.probe = None;
         self.verification = None;
         self.deadline = Some(now.saturating_add(self.hold));
@@ -671,6 +678,9 @@ impl Pmtud {
     //# will be greater than eff_pmtu.
 
     pub fn ack(&mut self, ack: Seq, now: Instant, cooldown: u64, rto: u64) {
+        if self.repair_range.is_some_and(|(_, end)| covered(ack, end)) {
+            self.repair_range = None;
+        }
         self.pending = None;
         self.icmp_since_progress = false;
         for entry in &mut self.sent {
@@ -762,6 +772,20 @@ impl Pmtud {
         }
     }
 
+    pub fn repair_limit(&self, seq: Seq, proposed: u32) -> u32 {
+        match self.repair_range {
+            Some((start, end)) if seq.in_window(start, end.distance_from(start)) == Some(true) => {
+                proposed.min(end.distance_from(seq))
+            }
+            _ => proposed,
+        }
+    }
+
+    pub fn terminal(&mut self) {
+        self.probe = None;
+        self.repair_range = None;
+    }
+
     fn delay(&mut self, now: Instant, interval: u64) {
         self.deadline = Some(self.deadline.unwrap_or(0).max(now.saturating_add(interval)));
     }
@@ -824,6 +848,78 @@ mod tests {
 
     fn state(ipv4: bool) -> Pmtud {
         Pmtud::new(PmtudConfig::new(1500), 1500, ipv4, 600_000_000)
+    }
+
+    #[test]
+    fn ptb_cancelled_probe_retains_only_repair_boundary() {
+        for start in [Seq(1), Seq(u32::MAX - 499)] {
+            let mut p = state(false);
+            let end = start.wrapping_add(1330);
+            p.start_probe(start, 1330, 3660, 1390);
+            p.sent(start, end, 1390, 40, false);
+            assert!(p.feedback(10, start, 1390, 40, 1389));
+            assert!(p.feedback(11, start, 1390, 40, 1280));
+            let info = p.info;
+            let deadline = p.deadline;
+            assert!(p.probe.is_none());
+            assert!(!p.feedback(12, start, 1390, 40, 1280));
+            assert!(!p.feedback(13, start, 1390, 40, 1389));
+            assert_eq!(p.deadline, deadline);
+            assert_eq!(p.repair_limit(start, 1220), 1220);
+            let partial = start.wrapping_add(1220);
+            p.sent(start, partial, 1280, 40, true);
+            p.ack(partial, 20, 1000, 1000);
+            p.ack(partial, 21, 1000, 1000); // duplicate progress cannot clear the tail
+            assert_eq!(p.repair_limit(partial, 1220), 110);
+            assert_eq!(p.repair_limit(end, 1220), 1220);
+            assert_eq!(p.info, info);
+            assert_eq!(p.deadline, deadline);
+            p.tick(deadline.unwrap());
+            assert!(p.target().is_none()); // no replacement while repair is outstanding
+            p.sent(partial, end, 170, 40, true);
+            p.ack(end, deadline.unwrap() + 1, 1000, 1000);
+            assert!(p.repair_range.is_none());
+            assert!(p.probe.is_none());
+            assert!(p.verification.is_none());
+            assert_eq!(p.info.current_mtu, 1280);
+            assert_eq!(p.info.search_low, 1280);
+            assert_eq!(p.info.search_high, 1500); // no cancelled-probe loss result
+            let next_size = p.target().unwrap();
+            p.start_probe(end, next_size - 60, 3660, next_size);
+            assert_eq!(p.repair_limit(end, 2000), next_size - 60);
+            let next_end = end.wrapping_add(next_size - 60);
+            p.sent(end, next_end, next_size, 40, false);
+            p.ack(next_end, deadline.unwrap() + 2, 1000, 1000);
+            assert_eq!(p.info.current_mtu, next_size); // fresh probe still classifies
+            assert!(p.repair_range.is_none());
+            assert!(!p.feedback(deadline.unwrap() + 3, start, 1390, 40, 1280)); // stale quote
+            p.start_probe(next_end, 1330, 3660, 1390);
+            p.apply_ptb(1280, deadline.unwrap() + 3);
+            p.terminal();
+            assert!(p.repair_range.is_none());
+            assert!(p.probe.is_none());
+            assert_eq!(p.repair_limit(next_end, 2000), 2000);
+        }
+    }
+
+    #[test]
+    fn probe_repair_overlap_is_not_another_loss() {
+        for start in [Seq(1), Seq(u32::MAX - 499)] {
+            let mut p = state(false);
+            p.start_probe(start, 1330, 3660, 1390);
+            let end = start.wrapping_add(1330);
+            p.sent(
+                start.wrapping_add(1220),
+                end.wrapping_add(1110),
+                1280,
+                40,
+                true,
+            );
+            assert!(p.probe.unwrap().retried);
+            assert!(!p.probe.unwrap().other_loss);
+            p.sent(end, end.wrapping_add(1220), 1280, 40, true);
+            assert!(p.probe.unwrap().other_loss); // a distinct trailing repair is evidence
+        }
     }
 
     #[test]
