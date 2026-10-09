@@ -49,20 +49,6 @@ quote = '''
 An optional verification process can be used to detect situations where raising the MTU raises the packet loss rate. For example, if a link is striped across multiple physical channels with inconsistent MTUs, it is possible that a probe will be delivered even if it is too large for some of the physical channels. In such cases, raising the Path MTU to the probe size can cause severe packet loss and abysmal performance. After raising the MTU, the new MTU size can be verified by monitoring the loss rate.
 '''
 
-# 4821-016
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
-quote = '''
-Packetization Layer PMTUD (PLPMTUD) introduces some flexibility in the implementation of classical Path MTU Discovery. It can be configured to perform just ICMP black hole recovery to increase the robustness of classical Path MTU Discovery, or at the other extreme, all ICMP processing can be disabled and PLPMTUD can completely replace classical Path MTU Discovery.
-'''
-
-# 4821-017
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
-quote = '''
-Classical Path MTU Discovery is subject to protocol failures (connection hangs) if ICMP Packet Too Big (PTB) messages are not delivered or processed for some reason [RFC2923]. With PLPMTUD, classical Path MTU Discovery can be modified to include additional consistency checks without increasing the risk of connection hangs due to spurious failures of the additional checks. Such changes to classical Path MTU Discovery are beyond the scope of this document.
-'''
-
 # 4821-018
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
@@ -196,13 +182,6 @@ quote = '''
 Alternatively, PLPMTUD could be implemented such that its complete state is associated with the path representations. Such an implementation could use multiple connections or sessions for each probe sequence. This approach is likely to converge much more quickly in some environments, such as where an application uses many small connections, each of which is too short to complete the Path MTU Discovery process.
 '''
 
-# 4821-078
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
-quote = '''
-Within a single implementation, different protocols can use either of these two approaches. Due to protocol specific differences in constraints on generating probes (Section 6.2) and the MTU searching algorithm (Section 7.3), it may not be feasible for different Packetization Layer protocols to share PLPMTUD state. This suggests that it may be possible for some protocols to share probing state, but other protocols can only share observed PMTU. In this case, the different protocols will have different PMTU convergence properties.
-'''
-
 # 4821-079
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
@@ -322,27 +301,6 @@ quote = '''
 In a few cases, there may be no reasonable mechanisms to generate probes within the Packetization Layer protocol itself. As a last resort, it may be possible to rely on an adjunct protocol, such as ICMP ECHO ("ping"), to send probe packets. See Section 10.3 for further discussion of this approach.
 '''
 
-# 4821-101
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.1"
-quote = '''
-search_low: The smallest useful probe size, minus one. The network is expected to be able to deliver packets of size search_low.
-'''
-
-# 4821-102
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.1"
-quote = '''
-search_high: The greatest useful probe size. Packets of size search_high are expected to be too large for the network to deliver.
-'''
-
-# 4821-103
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.1"
-quote = '''
-eff_pmtu: The effective PMTU for this flow. This is the largest non-probe packet permitted by PLPMTUD for the path.
-'''
-
 # 4821-107
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.1"
@@ -392,13 +350,6 @@ quote = '''
 It is RECOMMENDED that search_low be initially set to an MTU size that is likely to work over a very wide range of environments. Given today's technologies, a value of 1024 bytes is probably safe enough. The initial value for search_low SHOULD be configurable.
 '''
 
-# 4821-115
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
-quote = '''
-A conservative configuration would be to set eff_pmtu to search_high, and rely on ICMP PTB messages to set the eff_pmtu down as appropriate. In this configuration, classical PMTUD is fully functional and PLPMTUD is only invoked to recover from ICMP black holes through the procedure described in Section 7.7.
-'''
-
 # 4821-116
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
@@ -425,13 +376,6 @@ Since the cost of PLPMTUD is dominated by the protocol specific overheads of gen
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
 quote = '''
 There SHOULD be per-protocol and per-route configuration options to override initial values for eff_pmtu and other PLPMTUD state variables.
-'''
-
-# 4821-120
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.3"
-quote = '''
-The probe may have a size anywhere in the "probe size range" described above. However, a number of factors affect the selection of an appropriate size. A simple strategy might be to do a binary search halving the probe size range with each probe. However, for some protocols, such as TCP, failed probes are more expensive than successful ones, since data in a failed probe will need to be retransmitted. For such protocols, a strategy that raises the probe size in smaller increments might have lower overhead. For many protocols, both at and above the Packetization Layer, the benefit of increasing MTU sizes may follow a step function such that it is not advantageous to probe within certain regions at all.
 '''
 
 # 4821-121
@@ -509,34 +453,6 @@ Protocols MAY delay sending non-probes in order to accumulate enough data to mee
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.5"
 quote = '''
 Once a probe size in the appropriate range has been selected, and the above preconditions have been met, the Packetization Layer MAY conduct a probe. To do so, it creates a probe packet such that its size, including the outermost IP headers, is equal to the probe size. After sending the probe it awaits a response, which will have one of the following results:
-'''
-
-# 4821-132
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.5"
-quote = '''
-Success: The probe is acknowledged as having been received by the remote host.
-'''
-
-# 4821-133
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.5"
-quote = '''
-Failure: A protocol mechanism indicates that the probe was lost, but no packets in the leading or trailing window were lost.
-'''
-
-# 4821-134
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.5"
-quote = '''
-Timeout failure: A protocol mechanism indicates that the probe was lost, and no packets in the leading window were lost, but is unable to determine whether any packets in the trailing window were lost. For example, loss is detected by a timeout, and go-back-n retransmission is used.
-'''
-
-# 4821-135
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.5"
-quote = '''
-Inconclusive: The probe was lost in addition to other packets in the leading or trailing windows.
 '''
 
 # 4821-136
@@ -672,13 +588,6 @@ quote = '''
 Since protocols that do not implement PLPMTUD are still subject to problems due to ICMP black holes, it may be desirable to limit to these protocols to "safe" MTUs likely to work on any path (e.g., 1280 bytes). Allow any protocol implementing PLPMTUD to operate over the full range supported by the lower layer.
 '''
 
-# 4821-157
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-8"
-quote = '''
-Note that IP fragmentation divides data into packets, so it is minimally a Packetization Layer. However, it does not have a mechanism to detect lost packets, so it cannot support a native implementation of PLPMTUD. Fragmentation-based PLPMTUD requires an adjunct protocol as described in Section 10.3.
-'''
-
 # 4821-158
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-9"
@@ -698,13 +607,6 @@ At this time, most operating systems support two modes for sending datagrams: on
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-9"
 quote = '''
 Implementing PLPMTUD in an application also requires a mechanism where the application can inform the operating system about the outcome of the probe as described in Section 7.6, or directly update search_low, search_high, and eff_pmtu, described in Section 7.1.
-'''
-
-# 4821-162
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-10"
-quote = '''
-All Packetization Layer protocols must consider all of the issues discussed in Section 6. For many protocols, it is straightforward to address these issues. This section discusses specific details for implementing PLPMTUD with a couple of protocols. It is hoped that the descriptions here will be sufficient illustration for implementers to adapt to additional protocols.
 '''
 
 # 4821-163

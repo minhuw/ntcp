@@ -585,6 +585,11 @@ pub(crate) struct Connection {
     peer_mss: u16,
     send_mss_limit: u16,
     ip_header_len: u16,
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-5.2
+    //= reason=Pmtud is stored on the individual Connection, not indexed by remote network or subnet number. A paired connection test leaves the peer PMTUD-disabled while updating only the sender; no route-mask representation is used.
+    //# Network or subnet numbers MUST NOT be used as representations of a path, because
+    //# there is not a general mechanism to determine the network mask at the remote host.
+
     pmtud: Option<crate::pmtud::Pmtud>,
     advertised_edge: Seq,
     syn_window: u16,
@@ -1936,6 +1941,14 @@ impl Connection {
         self.application_timeout_us
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc5927#section-5.2
+    //= reason=Selected connection-local policy: network_error mutates only the matched Connection and PMTU feedback has no cross-connection cache. The existing validation test checks live-sequence rejection and error processing on that instance.
+    //# Additionally, they do not extrapolate ICMP errors across TCP connections. This
+    //# policy is based on the premise that TCP should be as robust as possible. Aborting
+    //# the connection would be to ignore the valuable feature of the Internet -- that for
+    //# many internal failures, it reconstructs its function without any disruption of the
+    //# endpoints [RFC0816].
+
     pub(crate) fn network_error(
         &mut self,
         now: Instant,
@@ -2295,6 +2308,10 @@ impl Connection {
     //# Instead, implementation of Path MTU Discovery (PMTUD) and Packetization Layer Path
     //# MTU Discovery (PLPMTUD) is strongly recommended in order for TCP to improve
     //# segmentation decisions.
+    //= https://www.rfc-editor.org/rfc/rfc5927#section-7.4
+    //= reason=Selected live-sequence check uses serial arithmetic for SND.UNA<=seq<SND.NXT; the same stale/idle/wrapped quote test supports 044. Unrelated initialization and reset deviations do not invalidate this branch.
+    //# if (claimedtcpseq < SND.UNA || claimedtcpseq >= SND.NXT) drop_message();
+
     pub(crate) fn pmtu_feedback(
         &mut self,
         now: Instant,
@@ -7064,11 +7081,48 @@ impl Connection {
         //# "probe gap" will be a full probe size minus headers. Data in the probe gap will
         //# need to be retransmitted with multiple smaller segments.
 
+        //= https://www.rfc-editor.org/rfc/rfc4821#section-10.1
+        //= reason=Non-overlapping segmentation is the selected simple TCP method; the real-receiver lifecycle test already demonstrates bounded multiple gap repairs (164). No additional receiver-evidence gap exists in this choice statement.
+        //# The choice of which segmentation method to use should be based on what is simplest
+        //# and most efficient for a given TCP implementation.
+
         let pmtu_probe = pmtu_probe.filter(|&(_, payload, _)| count == payload && !retransmitted);
         //= https://www.rfc-editor.org/rfc/rfc4821#section-7.1
         //= reason=Every non-probe output checks final TCP header/options/data against path payload budget before commit; floor68 retry includes timestamps and SACK within budget.
         //# When transmitting non-probes, the Packetization Layer SHOULD create packets of a
         //# size less than or equal to eff_pmtu.
+
+        //= https://www.rfc-editor.org/rfc/rfc4821#section-5.1
+        //= reason=Supported non-probe accounting subtracts actual IP header length and TCP options. The IPv4 options test rejects a mismatched quote header and bounds repair including those headers; unsupported IPsec/IPv6 extension headers are not emitted.
+        //# The way in which PLPMTUD operates across multiple layers requires a mechanism for
+        //# accounting header sizes at all layers between IP and the Packetization Layer
+        //# (inclusive). When transmitting non-probe packets, it is sufficient for the
+        //# Packetization Layer to ensure an upper bound on final IP packet size, so as not to
+        //# exceed the current
+
+        //= https://www.rfc-editor.org/rfc/rfc4821#section-5.1
+        //= reason=The selected probe size includes IP and TCP headers. The wire test asserts final IPv4/IPv6 probe length equals the recorded size and failed encoding cannot commit probe state; no unsupported extension-header emission is claimed.
+        //# effective Path MTU. All Packetization Layers participating in classical Path MTU
+        //# Discovery have this requirement already. When conducting a probe, the
+        //# Packetization Layer MUST determine the probe packet's final size including IP
+        //# headers. This requirement is specific to PLPMTUD, and satisfying it may require
+        //# additional inter- layer communication in existing implementations.
+
+        //= https://www.rfc-editor.org/rfc/rfc4821#section-7.5
+        //= reason=Probe is committed only after successful encoding; final IP length equals the selected size in IPv4 and IPv6. Outcome-specific response requirements are separate, not prerequisites for this size/commit clause.
+        //# Once a probe size in the appropriate range has been selected, and the above
+        //# preconditions have been met, the Packetization Layer MAY conduct a probe. To do
+        //# so, it creates a probe packet such that its size, including the outermost IP
+        //# headers, is equal to the probe size. After sending the probe it awaits a response,
+        //# which will have one of the following results:
+
+        //= https://www.rfc-editor.org/rfc/rfc4821#section-8
+        //= reason=TCP avoids fragmentation by respecting the current complete-IP non-probe budget; the floor/options repair test checks the emitted size. The UDP example does not require a host datagram fragmentation service.
+        //# Packetization Layers SHOULD avoid sending messages that will require fragmentation
+        //# [Kent87] [frag-errors]. However, entirely preventing fragmentation is not always
+        //# possible. Some Packetization Layers, such as a UDP application outside the kernel,
+        //# may be unable to change the size of messages it sends, resulting in datagram sizes
+        //# that exceed the Path MTU.
 
         let path_limit = pmtu_probe.map_or(self.path_payload_limit(), |(size, _, _)| {
             size.saturating_sub(u32::from(self.ip_header_len)) as usize
@@ -19578,6 +19632,15 @@ mod tests {
     //= type=test
     //# These are hard error conditions, so TCP implementations SHOULD abort the
     //# connection (SHLD-26).
+    //= https://www.rfc-editor.org/rfc/rfc5927#section-5.2
+    //= type=test
+    //= reason=Selected connection-local policy: network_error mutates only the matched Connection and PMTU feedback has no cross-connection cache. The existing validation test checks live-sequence rejection and error processing on that instance.
+    //# Additionally, they do not extrapolate ICMP errors across TCP connections. This
+    //# policy is based on the premise that TCP should be as robust as possible. Aborting
+    //# the connection would be to ignore the valuable feature of the Internet -- that for
+    //# many internal failures, it reconstructs its function without any disruption of the
+    //# endpoints [RFC0816].
+
     fn network_errors_validate_quote_and_mss_reduction_repacketizes() {
         let (mut a, mut b) = pair(config(64, 8), 100);
         a.write(b"abcdefgh").unwrap();

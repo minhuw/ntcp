@@ -74,6 +74,13 @@ impl Pmtud {
     //# The basic idea is that a source host initially assumes that the PMTU
     //# of a path is the (known) MTU of its first hop, and sends all
     //# datagrams on that path with the DF bit set.
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.1
+    //= reason=Pmtud::new initializes search_low to min(bound,1024) for IPv4 or min(bound,1280) for IPv6. The full-stop test checks both family starting lows through the first fallback; independent configurability remains TODO at 113.
+    //# For initial conditions when there is no information about the path, eff_pmtu may
+    //# be greater than search_low. The initial value of search_low SHOULD be
+    //# conservatively low, but performance may be better if eff_pmtu starts at a higher,
+    //# less conservative, value. See Section 7.2.
+
     pub fn new(config: PmtudConfig, bound: u32, ipv4: bool, hold: u64) -> Self {
         let low = bound.min(if ipv4 { 1024 } else { 1280 });
         Self {
@@ -168,6 +175,26 @@ impl Pmtud {
         });
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-4
+    //= reason=TCP duplicate-ACK recovery reports probe loss; real receiver ACKs distinguish an isolated loss from a second hole beyond the minimum trailing window. This covers a loss-reporting mechanism, not suppression of congestion control.
+    //# To use PLPMTUD, a Packetization Layer MUST have a loss reporting mechanism that
+    //# provides the sender with timely and accurate indications of which packets were
+    //# lost in the network.
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-6.1
+    //= reason=The allowed implicit TCP duplicate-ACK mechanism is used in this non-SACK fixture: actual receiver ACKs trigger repairs and distinguish the second hole. SACK is not mandatory in this paragraph.
+    //# It is best if Packetization Protocols use an explicit loss detection mechanism
+    //# such as a Selective Acknowledgment (SACK) scoreboard [RFC3517] or ACK Vector
+    //# [RFC4340] to distinguish real losses from reordered data, although implicit
+    //# mechanisms such as TCP Reno style duplicate acknowledgments counting are
+    //# sufficient.
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-6.1
+    //= reason=Timeout is not the primary loss detector: real receiver duplicate ACKs trigger probe repair before any timeout in the non-SACK lifecycle test.
+    //# PLPMTUD can also be implemented in protocols that rely on timeouts as their
+    //# primary mechanism for loss recovery; however, timeouts SHOULD NOT be used as the
+    //# primary mechanism for loss indication unless there are no other alternatives.
+
     pub fn loss(&mut self, start: Seq, multiple: bool) {
         if let Some(p) = &mut self.probe
             && (multiple || start.in_window(p.start, p.end.distance_from(p.start)) != Some(true))
@@ -175,6 +202,10 @@ impl Pmtud {
             p.other_loss = true;
         }
     }
+
+    //= https://www.rfc-editor.org/rfc/rfc5927#section-7.4
+    //= reason=Selected max-sent update is implemented exactly as max_sent.max(size) in sent(). Exact-evidence tests send real sizes and exercise acceptance/rejection against their recorded upper bound; initialization/reset choices are separate clauses.
+    //# if (packet_size > maxsizesent) maxsizesent = packet_size;
 
     pub fn sent(&mut self, start: Seq, end: Seq, size: u32, header: u16, retry: bool) {
         self.max_sent = self.max_sent.max(size);
@@ -309,7 +340,7 @@ impl Pmtud {
     //# Big message.
 
     //= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
-    //= reason=Informational policy: reject impossible larger candidates, defer below proven delivery, clear on progress; test contrasts progress with quoted-head RTO. Additional any-progress clearing is conservative, not literal full pseudocode conformance.
+    //= reason=Selected plausibility gate rejects a candidate larger than max_sent and also requires it to be smaller than the exact recently sent packet. The security test rejects equal/larger reported sizes; this does not authenticate ICMP.
     //# Upon receipt of an ICMP "Packet Too Big" error message, the Next-Hop MTU claimed by
     //# the ICMP message (henceforth "claimedmtu") is compared with maxsizesent. If
     //# claimedmtu is larger than maxsizesent, then the ICMP error message is silently
@@ -318,17 +349,29 @@ impl Pmtud {
     //# packet we have so far sent for this connection.
 
     //= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
-    //= reason=Informational policy: reject impossible larger candidates, defer below proven delivery, clear on progress; test contrasts progress with quoted-head RTO. Additional any-progress clearing is conservative, not literal full pseudocode conformance.
+    //= reason=Selected below-proven-size update policy records a pending report without lowering PMTU; the wire test asserts PMTU remains 1500 until matching-head timeout.
     //# On the other hand, if claimedmtu is smaller than maxsizeacked, TCP is supposed to be
     //# in the Path-MTU Update stage. At this stage, these implementations are more cautious
     //# with the errors being reported by the network, and therefore just record the
     //# received error message, and delay the update of the assumed Path-MTU.
 
     //= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
-    //= reason=Informational policy: reject impossible larger candidates, defer below proven delivery, clear on progress; test contrasts progress with quoted-head RTO. Additional any-progress clearing is conservative, not literal full pseudocode conformance.
+    //= reason=Selected policy clears pending when the quoted sequence is acknowledged; the security test exercises advancing partial ACK and proves a later timeout does not apply the report. Additional clearing on any other progress is a deliberate deviation, not literal algorithm equivalence.
     //# If, while there is a pending ICMP "Packet Too Big" error message, the TCP SEQ
     //# claimed by the pending message is acknowledged (i.e., an ACK that acknowledges that
     //# sequence number is received), then the "pending error" condition is cleared.
+
+    //= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
+    //= reason=Selected cautious-update behavior defers a candidate below proven delivery; existing wire test contrasts progress clearing with quoted-head timeout. Historical variable resets are not claimed.
+    //# The Path-MTU Update stage is when TCP tries to send segments that are equal to or
+    //# smaller than the ones that have already been sent and acknowledged for this
+    //# connection. During the Path-MTU Update stage, TCP already has knowledge of the
+    //# estimated Path-MTU for the given connection. Thus, in this case, these
+    //# implementations are more cautious with the errors being reported by the network.
+
+    //= https://www.rfc-editor.org/rfc/rfc5927#section-7.4
+    //= reason=Selected gate rejects candidate>=current_mtu or >=max_sent, and additionally requires a smaller value than the exact quoted sent size. The security wire test rejects equal and larger reports; stricter rejection is not a missing historical branch.
+    //# else { if (claimedmtu > maxsizesent || claimedmtu >= current_mtu) drop_message();
 
     pub fn feedback(
         &mut self,
@@ -481,6 +524,47 @@ impl Pmtud {
     //# considered incorrect. The saved value of eff_pmtu SHOULD be restored, and
     //# search_high reduced in the same manner as in a probe failure. PLPMTUD
     //# implementations SHOULD implement MTU verification.
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-2
+    //= reason=Explicit probe ACK raises effective PMTU and search_low; the wire test checks both families and the next larger probe.
+    //# The general strategy is for the Packetization Layer to find an appropriate Path
+    //# MTU by probing the path with progressively larger packets. If a probe packet is
+    //# successfully delivered, then the effective Path MTU is raised to the probe size.
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-2
+    //= reason=Selected MTU verification observes retry/original loss ratio and restores the prior baseline after repeated increases; no physical multipath experiment is claimed.
+    //# An optional verification process can be used to detect situations where raising
+    //# the MTU raises the packet loss rate. For example, if a link is striped across
+    //# multiple physical channels with inconsistent MTUs, it is possible that a probe
+    //# will be delivered even if it is too large for some of the physical channels. In
+    //# such cases, raising the Path MTU to the probe size can cause severe packet loss
+    //# and abysmal performance. After raising the MTU, the new MTU size can be verified
+    //# by monitoring the loss rate.
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.1
+    //= reason=MTU verification is implemented and the multi-increase lifecycle test restores the original verified baseline after sustained loss; the same evidence supports 150-152. No size-below-eff test is needed for this verification recommendation.
+    //# Note that if a flow's packets are routed via multiple paths, or over a path with a
+    //# non-deterministic MTU, delivery of a single probe packet does not indicate that
+    //# all packets of that size will be delivered. To be robust in such a case, the
+    //# Packetization Layer SHOULD conduct MTU verification as described in Section 7.8.
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-2
+    //= reason=Bound updates are implemented in ack(): explicit success raises low, isolated failure lowers high, and low>=high stops search and schedules reset. The convergence test exercises stop/reset; failure-side executable evidence is separately linked at 140. No single combined trace is required by this overview.
+    //# PLPMTUD uses a searching technique to find the Path MTU. Each conclusive probe
+    //# narrows the MTU search range, either by raising the lower limit on a successful
+    //# probe or lowering the upper limit on a failed probe, converging toward the true
+    //# Path MTU. For most transport layers, the search should be stopped once the range
+    //# is narrow enough that the benefit of a larger effective Path MTU is smaller than
+    //# the search overhead of finding it.
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.1
+    //= reason=State relationship is retained as operative: upward probe success sets low and effective PMTU together; the wire test checks both values and the next upward probe. Initial eff>low is permitted and does not imply an implicit-ACK update here; that distinct SHOULD remains TODO at 111.
+    //# When probing upward, eff_pmtu always equals search_low. In other states, such as
+    //# initial conditions, after ICMP PTB message processing or following PLPMTUD on
+    //# another flow sharing the same path representation, eff_pmtu may be different from
+    //# search_low. Normally, eff_pmtu will be greater than or equal to search_low and
+    //# less than search_high. It is generally expected but not required that probe size
+    //# will be greater than eff_pmtu.
 
     pub fn ack(&mut self, ack: Seq, now: Instant, cooldown: u64, rto: u64) {
         self.pending = None;
@@ -660,6 +744,11 @@ mod tests {
     //# plateau value that is less than the returned Total Length field (corrected, if
     //# necessary, according to the Note above).
 
+    //= https://www.rfc-editor.org/rfc/rfc5927#section-7.4
+    //= type=test
+    //= reason=Selected max-sent update is implemented exactly as max_sent.max(size) in sent(). Exact-evidence tests send real sizes and exercise acceptance/rejection against their recorded upper bound; initialization/reset choices are separate clauses.
+    //# if (packet_size > maxsizesent) maxsizesent = packet_size;
+
     fn pmtud_exact_evidence_eviction_legacy_header_correction_and_floor() {
         for (reported, expected) in [(1500, 1006), (1520, 1492)] {
             let mut p = state(true);
@@ -766,6 +855,16 @@ mod tests {
     //# can resume. Thus, if the path changes, increasing the Path MTU, then the flow will
     //# eventually take advantage of it. The value for this timer MUST NOT be less than 5
     //# minutes and is recommended to be 10 minutes, per RFC 1981.
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-2
+    //= type=test
+    //= reason=Bound updates are implemented in ack(): explicit success raises low, isolated failure lowers high, and low>=high stops search and schedules reset. The convergence test exercises stop/reset; failure-side executable evidence is separately linked at 140. No single combined trace is required by this overview.
+    //# PLPMTUD uses a searching technique to find the Path MTU. Each conclusive probe
+    //# narrows the MTU search range, either by raising the lower limit on a successful
+    //# probe or lowering the upper limit on a failed probe, converging toward the true
+    //# Path MTU. For most transport layers, the search should be stopped once the range
+    //# is narrow enough that the benefit of a larger effective Path MTU is smaller than
+    //# the search overhead of finding it.
 
     fn pmtud_convergence_hold_and_link_growth_require_ack_proof() {
         let mut p = state(true);

@@ -97,11 +97,19 @@ class PmtudInventory(unittest.TestCase):
             for fragment in fragments:
                 self.assertTrue(any(fragment in q for q in spans), (n, fragment))
         # Known implementation gaps must not silently become scope exceptions.
-        for n, numbers in {1191: (69,), 8201: (76,), 4821: (67, 111, 113, 119),
-                           5927: (103, 104, 106, 108, 109)}.items():
+        for n, numbers in {1191: (69,), 8201: (76,),
+                           4821: (67, 111, 113, 119)}.items():
             rows = {p["id"]: p for p in self.inventory(n)["paragraphs"]}
             for i in numbers:
                 self.assertEqual(rows[f"{n}-{i:03}"]["status"], "TODO")
+        # RFC5927 documents nonstandard mitigations, not a mandatory historical
+        # algorithm. Keep each selected policy deviation explicit and quoted.
+        rows = {p["id"]: p for p in self.inventory(5927)["paragraphs"]}
+        for i in (103, 104, 106, 108, 109):
+            row = rows[f"5927-{i:03}"]
+            self.assertEqual(row["status"], "exception")
+            self.assertIn("Selected Informational policy deviation:", row["reason"])
+            self.assertIn("historical algorithm is deliberately not selected", row["reason"])
 
     def test_all_inventory_quotes_match_official_text_when_cached(self):
         for n in RFCS:

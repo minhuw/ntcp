@@ -251,7 +251,7 @@ fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
 
 //= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
 //= type=test
-//= reason=Informational policy: reject impossible larger candidates, defer below proven delivery, clear on progress; test contrasts progress with quoted-head RTO. Additional any-progress clearing is conservative, not literal full pseudocode conformance.
+//= reason=Selected plausibility gate rejects a candidate larger than max_sent and also requires it to be smaller than the exact recently sent packet. The security test rejects equal/larger reported sizes; this does not authenticate ICMP.
 //# Upon receipt of an ICMP "Packet Too Big" error message, the Next-Hop MTU claimed by the
 //# ICMP message (henceforth "claimedmtu") is compared with maxsizesent. If claimedmtu is
 //# larger than maxsizesent, then the ICMP error message is silently discarded. The
@@ -261,7 +261,7 @@ fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
 
 //= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
 //= type=test
-//= reason=Informational policy: reject impossible larger candidates, defer below proven delivery, clear on progress; test contrasts progress with quoted-head RTO. Additional any-progress clearing is conservative, not literal full pseudocode conformance.
+//= reason=Selected below-proven-size update policy records a pending report without lowering PMTU; the wire test asserts PMTU remains 1500 until matching-head timeout.
 //# On the other hand, if claimedmtu is smaller than maxsizeacked, TCP is supposed to be in
 //# the Path-MTU Update stage. At this stage, these implementations are more cautious with
 //# the errors being reported by the network, and therefore just record the received error
@@ -269,7 +269,7 @@ fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
 
 //= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
 //= type=test
-//= reason=Informational policy: reject impossible larger candidates, defer below proven delivery, clear on progress; test contrasts progress with quoted-head RTO. Additional any-progress clearing is conservative, not literal full pseudocode conformance.
+//= reason=Selected policy clears pending when the quoted sequence is acknowledged; the security test exercises advancing partial ACK and proves a later timeout does not apply the report. Additional clearing on any other progress is a deliberate deviation, not literal algorithm equivalence.
 //# If, while there is a pending ICMP "Packet Too Big" error message, the TCP SEQ claimed by
 //# the pending message is acknowledged (i.e., an ACK that acknowledges that sequence number
 //# is received), then the "pending error" condition is cleared.
@@ -279,6 +279,25 @@ fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
 //= reason=Informational serial-arithmetic guidance: Seq::in_window and wrapping comparisons, exercised across u32 wrap; exact-match sent evidence is an additional policy gate.
 //# Notes: All comparisons between sequence numbers must be performed using sequence number
 //# arithmetic.
+
+//= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
+//= type=test
+//= reason=Selected cautious-update behavior defers a candidate below proven delivery; existing wire test contrasts progress clearing with quoted-head timeout. Historical variable resets are not claimed.
+//# The Path-MTU Update stage is when TCP tries to send segments that are equal to or
+//# smaller than the ones that have already been sent and acknowledged for this
+//# connection. During the Path-MTU Update stage, TCP already has knowledge of the
+//# estimated Path-MTU for the given connection. Thus, in this case, these
+//# implementations are more cautious with the errors being reported by the network.
+
+//= https://www.rfc-editor.org/rfc/rfc5927#section-7.4
+//= type=test
+//= reason=Selected live-sequence check uses serial arithmetic for SND.UNA<=seq<SND.NXT; the same stale/idle/wrapped quote test supports 044. Unrelated initialization and reset deviations do not invalidate this branch.
+//# if (claimedtcpseq < SND.UNA || claimedtcpseq >= SND.NXT) drop_message();
+
+//= https://www.rfc-editor.org/rfc/rfc5927#section-7.4
+//= type=test
+//= reason=Selected gate rejects candidate>=current_mtu or >=max_sent, and additionally requires a smaller value than the exact quoted sent size. The security wire test rejects equal and larger reports; stricter rejection is not a missing historical branch.
+//# else { if (claimedmtu > maxsizesent || claimedmtu >= current_mtu) drop_message();
 
 fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate() {
     for iss in [0, u32::MAX - 100] {
@@ -335,6 +354,15 @@ fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc4821#section-5.1
+//= type=test
+//= reason=Supported non-probe accounting subtracts actual IP header length and TCP options. The IPv4 options test rejects a mismatched quote header and bounds repair including those headers; unsupported IPsec/IPv6 extension headers are not emitted.
+//# The way in which PLPMTUD operates across multiple layers requires a mechanism for
+//# accounting header sizes at all layers between IP and the Packetization Layer
+//# (inclusive). When transmitting non-probe packets, it is sufficient for the
+//# Packetization Layer to ensure an upper bound on final IP packet size, so as not to
+//# exceed the current
+
 fn pmtud_ipv4_header_options_exact_quote_and_retransmit_budget() {
     let (mut a, _) = family_pair(cfg(1500), true, 0);
     let options = OutgoingIpv4Options {
@@ -397,6 +425,47 @@ fn pmtud_ipv4_header_options_exact_quote_and_retransmit_budget() {
 //# Instead, implementation of Path MTU Discovery (PMTUD) and Packetization Layer Path MTU
 //# Discovery (PLPMTUD) is strongly recommended in order for TCP to improve segmentation
 //# decisions.
+//= https://www.rfc-editor.org/rfc/rfc4821#section-2
+//= type=test
+//= reason=Explicit probe ACK raises effective PMTU and search_low; the wire test checks both families and the next larger probe.
+//# The general strategy is for the Packetization Layer to find an appropriate Path
+//# MTU by probing the path with progressively larger packets. If a probe packet is
+//# successfully delivered, then the effective Path MTU is raised to the probe size.
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-5.1
+//= type=test
+//= reason=The selected probe size includes IP and TCP headers. The wire test asserts final IPv4/IPv6 probe length equals the recorded size and failed encoding cannot commit probe state; no unsupported extension-header emission is claimed.
+//# effective Path MTU. All Packetization Layers participating in classical Path MTU
+//# Discovery have this requirement already. When conducting a probe, the
+//# Packetization Layer MUST determine the probe packet's final size including IP
+//# headers. This requirement is specific to PLPMTUD, and satisfying it may require
+//# additional inter- layer communication in existing implementations.
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-5.2
+//= type=test
+//= reason=Pmtud is stored on the individual Connection, not indexed by remote network or subnet number. A paired connection test leaves the peer PMTUD-disabled while updating only the sender; no route-mask representation is used.
+//# Network or subnet numbers MUST NOT be used as representations of a path, because
+//# there is not a general mechanism to determine the network mask at the remote host.
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.5
+//= type=test
+//= reason=Probe is committed only after successful encoding; final IP length equals the selected size in IPv4 and IPv6. Outcome-specific response requirements are separate, not prerequisites for this size/commit clause.
+//# Once a probe size in the appropriate range has been selected, and the above
+//# preconditions have been met, the Packetization Layer MAY conduct a probe. To do
+//# so, it creates a probe packet such that its size, including the outermost IP
+//# headers, is equal to the probe size. After sending the probe it awaits a response,
+//# which will have one of the following results:
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.1
+//= type=test
+//= reason=State relationship is retained as operative: upward probe success sets low and effective PMTU together; the wire test checks both values and the next upward probe. Initial eff>low is permitted and does not imply an implicit-ACK update here; that distinct SHOULD remains TODO at 111.
+//# When probing upward, eff_pmtu always equals search_low. In other states, such as
+//# initial conditions, after ICMP PTB message processing or following PLPMTUD on
+//# another flow sharing the same path representation, eff_pmtu may be different from
+//# search_low. Normally, eff_pmtu will be greater than or equal to search_low and
+//# less than search_high. It is generally expected but not required that probe size
+//# will be greater than eff_pmtu.
+
 fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry() {
     for ipv4 in [true, false] {
         let (mut a, _) = family_pair(cfg(1500), ipv4, u32::MAX - 4000);
@@ -469,6 +538,14 @@ fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry() {
 //# Instead, implementation of Path MTU Discovery (PMTUD) and Packetization Layer Path MTU
 //# Discovery (PLPMTUD) is strongly recommended in order for TCP to improve segmentation
 //# decisions.
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.1
+//= type=test
+//= reason=Pmtud::new initializes search_low to min(bound,1024) for IPv4 or min(bound,1280) for IPv6. The full-stop test checks both family starting lows through the first fallback; independent configurability remains TODO at 113.
+//# For initial conditions when there is no information about the path, eff_pmtu may
+//# be greater than search_low. The initial value of search_low SHOULD be
+//# conservatively low, but performance may be better if eff_pmtu starts at a higher,
+//# less conservative, value. See Section 7.2.
+
 fn pmtud_full_stop_r1_halving_and_normal_congestion_response() {
     for ipv4 in [true, false] {
         let (mut a, _) = family_pair(cfg(1500), ipv4, 0);
@@ -753,6 +830,15 @@ fn pmtud_eor_and_allocation_free_probe_feedback_retry() {
 //= reason=Every non-probe output checks final TCP header/options/data against path payload budget before commit; floor68 retry includes timestamps and SACK within budget.
 //# When transmitting non-probes, the Packetization Layer SHOULD create packets of a size
 //# less than or equal to eff_pmtu.
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-8
+//= type=test
+//= reason=TCP avoids fragmentation by respecting the current complete-IP non-probe budget; the floor/options repair test checks the emitted size. The UDP example does not require a host datagram fragmentation service.
+//# Packetization Layers SHOULD avoid sending messages that will require fragmentation
+//# [Kent87] [frag-errors]. However, entirely preventing fragmentation is not always
+//# possible. Some Packetization Layers, such as a UDP application outside the kernel,
+//# may be unable to change the size of messages it sends, resulting in datagram sizes
+//# that exceed the Path MTU.
 
 fn pmtud_floor_clips_timestamp_and_sack_options_on_retry_and_ack() {
     let (mut a, mut b) = family_pair(cfg(1500), true, 0);

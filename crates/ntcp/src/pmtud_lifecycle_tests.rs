@@ -47,6 +47,35 @@ fn unscaled_pair(iss: u32) -> (Connection, Connection) {
 //# full probe size minus headers. Data in the probe gap will need to be retransmitted with
 //# multiple smaller segments.
 
+//= https://www.rfc-editor.org/rfc/rfc4821#section-4
+//= type=test
+//= reason=TCP duplicate-ACK recovery reports probe loss; real receiver ACKs distinguish an isolated loss from a second hole beyond the minimum trailing window. This covers a loss-reporting mechanism, not suppression of congestion control.
+//# To use PLPMTUD, a Packetization Layer MUST have a loss reporting mechanism that
+//# provides the sender with timely and accurate indications of which packets were
+//# lost in the network.
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-6.1
+//= type=test
+//= reason=The allowed implicit TCP duplicate-ACK mechanism is used in this non-SACK fixture: actual receiver ACKs trigger repairs and distinguish the second hole. SACK is not mandatory in this paragraph.
+//# It is best if Packetization Protocols use an explicit loss detection mechanism
+//# such as a Selective Acknowledgment (SACK) scoreboard [RFC3517] or ACK Vector
+//# [RFC4340] to distinguish real losses from reordered data, although implicit
+//# mechanisms such as TCP Reno style duplicate acknowledgments counting are
+//# sufficient.
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-6.1
+//= type=test
+//= reason=Timeout is not the primary loss detector: real receiver duplicate ACKs trigger probe repair before any timeout in the non-SACK lifecycle test.
+//# PLPMTUD can also be implemented in protocols that rely on timeouts as their
+//# primary mechanism for loss recovery; however, timeouts SHOULD NOT be used as the
+//# primary mechanism for loss indication unless there are no other alternatives.
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-10.1
+//= type=test
+//= reason=Non-overlapping segmentation is the selected simple TCP method; the real-receiver lifecycle test already demonstrates bounded multiple gap repairs (164). No additional receiver-evidence gap exists in this choice statement.
+//# The choice of which segmentation method to use should be based on what is simplest
+//# and most efficient for a given TCP implementation.
+
 fn pmtud_lifecycle_real_repairs_isolated_and_second_hole_beyond_three_mss() {
     for second_hole in [false, true] {
         for iss in [0, u32::MAX - 4000] {
@@ -141,6 +170,25 @@ fn pmtud_lifecycle_real_repairs_isolated_and_second_hole_beyond_three_mss() {
 //# considered incorrect. The saved value of eff_pmtu SHOULD be restored, and search_high
 //# reduced in the same manner as in a probe failure. PLPMTUD implementations SHOULD
 //# implement MTU verification.
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-2
+//= type=test
+//= reason=Selected MTU verification observes retry/original loss ratio and restores the prior baseline after repeated increases; no physical multipath experiment is claimed.
+//# An optional verification process can be used to detect situations where raising
+//# the MTU raises the packet loss rate. For example, if a link is striped across
+//# multiple physical channels with inconsistent MTUs, it is possible that a probe
+//# will be delivered even if it is too large for some of the physical channels. In
+//# such cases, raising the Path MTU to the probe size can cause severe packet loss
+//# and abysmal performance. After raising the MTU, the new MTU size can be verified
+//# by monitoring the loss rate.
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.1
+//= type=test
+//= reason=MTU verification is implemented and the multi-increase lifecycle test restores the original verified baseline after sustained loss; the same evidence supports 150-152. No size-below-eff test is needed for this verification recommendation.
+//# Note that if a flow's packets are routed via multiple paths, or over a path with a
+//# non-deterministic MTU, delivery of a single probe packet does not indicate that
+//# all packets of that size will be delivered. To be robust in such a case, the
+//# Packetization Layer SHOULD conduct MTU verification as described in Section 7.8.
 
 fn pmtud_lifecycle_multi_increase_keeps_verification_baseline_and_loss_evidence() {
     let mut p = crate::pmtud::Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000);
