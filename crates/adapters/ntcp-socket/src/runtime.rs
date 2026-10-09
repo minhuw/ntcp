@@ -116,9 +116,14 @@ impl Runtime {
         std::thread::spawn(move || {
             set_internal(true);
             let local = Ipv4Addr::new(10, 73, 0, 2);
-            let mut owner =
-                Owner::with_endpoint(local, (Ipv4Addr::new(10, 73, 0, 1), 24), [2; 32], None)
-                    .unwrap();
+            let mut owner = Owner::with_pacing(
+                local,
+                (Ipv4Addr::new(10, 73, 0, 1), 24),
+                [2; 32],
+                None,
+                None,
+            )
+            .unwrap();
             while let Ok(request) = rx.recv() {
                 let result = owner.execute(request.id, request.op);
                 let _ = request.reply.send(result);
@@ -135,6 +140,7 @@ impl Runtime {
     }
 
     pub fn start() -> Result<Self> {
+        socket_pacing(env("NTCP_SOCKET_PACING").as_deref())?;
         let backend = env("NTCP_SOCKET_BACKEND").unwrap_or_else(|| "tun".into());
         if !matches!(backend.as_str(), "tun" | "af-packet") {
             return Err(EINVAL);
@@ -382,6 +388,23 @@ impl Socket {
         })
     }
 }
+fn submit_packet(
+    io: &mut impl PacketIo,
+    packet: &mut Option<Vec<u8>>,
+) -> std::io::Result<TxOutcome> {
+    let outcome = io.transmit(packet.as_ref().unwrap())?;
+    if outcome == TxOutcome::Submitted {
+        *packet = None;
+    }
+    Ok(outcome)
+}
+fn socket_pacing(value: Option<&str>) -> Result<Option<ntcp::PacingConfig>> {
+    match value {
+        None | Some("0") => Ok(None),
+        Some("1") => Ok(Some(ntcp::PacingConfig::default())),
+        Some(_) => Err(EINVAL),
+    }
+}
 fn user_timeout_us(milliseconds: i32) -> Result<Option<u64>> {
     let ms = u64::try_from(milliseconds).map_err(|_| EINVAL)?;
     Ok((ms != 0).then_some(ms * 1000))
@@ -517,6 +540,21 @@ impl Owner {
         secret: [u8; 32],
         tun: Option<Tun>,
     ) -> Result<Self> {
+        Self::with_pacing(
+            local,
+            (address, prefix),
+            secret,
+            tun,
+            socket_pacing(env("NTCP_SOCKET_PACING").as_deref())?,
+        )
+    }
+    fn with_pacing(
+        local: Ipv4Addr,
+        (address, prefix): (Ipv4Addr, u8),
+        secret: [u8; 32],
+        tun: Option<Tun>,
+        pacing: Option<ntcp::PacingConfig>,
+    ) -> Result<Self> {
         let mut config = EndpointConfig {
             max_connections: LIMIT,
             max_listeners: LIMIT,
@@ -524,6 +562,7 @@ impl Owner {
             max_buffer_bytes: 128 * 1024 * 1024,
             ..EndpointConfig::default()
         };
+        config.connection.pacing = pacing;
         config.connection.receive_capacity = BYTES;
         config.connection.send_capacity = BYTES;
         config.connection.mss = 1460;
@@ -577,7 +616,7 @@ impl Owner {
     fn packet((local, profile): (Ipv4Addr, crate::packet_profile::Profile)) -> Result<Self> {
         // Deterministic key and synthetic address policy are explicit test-only
         // settings, never a production entropy source or TUN routing policy.
-        let mut owner = Self::with_endpoint(local, (local, 32), [42; 32], None)?;
+        let mut owner = Self::with_pacing(local, (local, 32), [42; 32], None, None)?;
         owner.endpoint = Endpoint::new(
             crate::packet_profile::config(profile),
             [42; 32],
@@ -702,6 +741,48 @@ impl Owner {
         let _ = request.reply.send(result);
         true
     }
+    // Encoding commits core accounting at actual now, never at a future pacing deadline.
+    // Retain a blocked backend packet before asking the core for another segment.
+    fn prepare_packet(&mut self, transmit_now: Option<u64>) -> Result<bool> {
+        if self.pending_packet.is_some() {
+            return Ok(true);
+        }
+        #[cfg(feature = "packet-test")]
+        if self
+            .packets
+            .as_ref()
+            .is_some_and(|p| p.output.len() == crate::packet_profile::LIMIT)
+        {
+            return Ok(false);
+        }
+        let mut packet = vec![
+            0;
+            if self.tun.is_some() || self.ethernet.is_some() {
+                1500
+            } else {
+                65535
+            }
+        ];
+        let pair = ClockPair::sample(self);
+        let tx = self
+            .endpoint
+            .poll_transmit(
+                transmit_now.unwrap_or_else(|| self.now()),
+                &mut packet[20..],
+                BUDGET,
+            )
+            .map_err(engine)?
+            .packet;
+        let Some(tx) = tx else {
+            return Ok(false);
+        };
+        packet = self.frame(tx, &packet[20..20 + tx.len])?;
+        self.timestamp_packet(tx.tx_timestamp, &packet);
+        self.drain_timestamps(pair);
+        self.pending_token = tx.tx_timestamp;
+        self.pending_packet = Some(packet);
+        Ok(true)
+    }
     fn run(&mut self, rx: Receiver<Request>, wake: i32, stop: &std::sync::atomic::AtomicBool) {
         let mut input = vec![0; 65535];
         // Keep in-flight batches owned through every output/backend exit.
@@ -725,52 +806,18 @@ impl Owner {
             }
             let transmit_now = self.batch_time();
             for _ in 0..BUDGET {
-                if self.pending_packet.is_none() {
-                    #[cfg(feature = "packet-test")]
-                    if self
-                        .packets
-                        .as_ref()
-                        .is_some_and(|p| p.output.len() == crate::packet_profile::LIMIT)
-                    {
-                        break;
-                    }
-                    let mut packet = vec![
-                        0;
-                        if self.tun.is_some() || self.ethernet.is_some() {
-                            1500
-                        } else {
-                            65535
-                        }
-                    ];
-                    let pair = ClockPair::sample(self);
-                    let transmit = match self.endpoint.poll_transmit(
-                        transmit_now.unwrap_or_else(|| self.now()),
-                        &mut packet[20..],
-                        BUDGET,
-                    ) {
-                        Ok(tx) => tx.packet,
-                        Err(_) => break 'run,
-                    };
-                    let Some(tx) = transmit else {
-                        break;
-                    };
-                    packet = match self.frame(tx, &packet[20..20 + tx.len]) {
-                        Ok(packet) => packet,
-                        Err(_) => break 'run,
-                    };
-                    self.timestamp_packet(tx.tx_timestamp, &packet);
-                    self.drain_timestamps(pair);
-                    self.pending_token = tx.tx_timestamp;
-                    self.pending_packet = Some(packet);
+                match self.prepare_packet(transmit_now) {
+                    Ok(true) => (),
+                    Ok(false) => break,
+                    Err(_) => break 'run,
                 }
                 // Never poll another TCP segment until this complete packet is submitted.
                 if let Some(tun) = self.tun.as_mut() {
-                    match tun.transmit(self.pending_packet.as_ref().unwrap()) {
+                    match submit_packet(tun, &mut self.pending_packet) {
                         Ok(TxOutcome::Submitted) => {
                             let stamp = timestamps::realtime();
                             let token = self.pending_token.take();
                             self.software_transmitted(token, stamp);
-                            self.pending_packet = None;
                         }
                         Ok(TxOutcome::WouldBlock) => break,
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
@@ -2046,9 +2093,17 @@ mod tests {
     include!("timestamp_tests.rs");
     include!("large_write_tests.rs");
     include!("file_transfer_tests.rs");
+    include!("runtime_pacing_tests.rs");
     fn owner(last: u8) -> Owner {
         let local = Ipv4Addr::new(10, 73, 0, last);
-        Owner::with_endpoint(local, (Ipv4Addr::new(10, 73, 0, 1), 24), [last; 32], None).unwrap()
+        Owner::with_pacing(
+            local,
+            (Ipv4Addr::new(10, 73, 0, 1), 24),
+            [last; 32],
+            None,
+            None,
+        )
+        .unwrap()
     }
     pub(super) fn new(o: &mut Owner, flags: i32) -> u64 {
         o.execute(0, Op::New(flags)).unwrap().value as u64
