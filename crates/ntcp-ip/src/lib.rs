@@ -1,4 +1,5 @@
 #![no_std]
+pub mod path_mtu;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use ntcp::{IpMetadata, Ipv4Options, Transmit};
 
