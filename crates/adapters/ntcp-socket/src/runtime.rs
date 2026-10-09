@@ -509,7 +509,8 @@ impl Owner {
             }
             offset += n as usize;
         }
-        Self::with_config(local, subnet, secret, Some(tun), config.tcp.clone())
+        let tcp = backend::backend_config(config.tcp.clone(), &tun)?;
+        Self::with_config(local, subnet, secret, Some(tun), tcp)
     }
     fn with_config(
         local: Ipv4Addr,
@@ -712,6 +713,16 @@ impl Owner {
         let _ = request.reply.send(result);
         true
     }
+    fn output_packet_len(&self) -> usize {
+        #[cfg(feature = "packet-test")]
+        if self.packets.is_some() {
+            return 65535;
+        }
+        // Include the largest TCP option header, not just the data MSS.
+        20 + usize::from(self.defaults.connection.send_ip_payload_limit)
+            .min(usize::from(self.defaults.connection.mss) + 60)
+            .min(65515)
+    }
     // Encoding commits core accounting at actual now, never at a future pacing deadline.
     // Retain a blocked backend packet before asking the core for another segment.
     fn prepare_packet(&mut self, transmit_now: Option<u64>) -> Result<bool> {
@@ -726,14 +737,7 @@ impl Owner {
         {
             return Ok(false);
         }
-        let mut packet = vec![
-            0;
-            if self.tun.is_some() || self.ethernet.is_some() {
-                1500
-            } else {
-                65535
-            }
-        ];
+        let mut packet = vec![0; self.output_packet_len()];
         let pair = ClockPair::sample(self);
         let tx = self
             .endpoint
@@ -755,7 +759,7 @@ impl Owner {
         Ok(true)
     }
     fn run(&mut self, rx: Receiver<Request>, wake: i32, stop: &std::sync::atomic::AtomicBool) {
-        let mut input = vec![0; 65535];
+        let mut input = vec![0; 65535 + if self.ethernet.is_some() { 14 } else { 0 }];
         // Keep in-flight batches owned through every output/backend exit.
         let mut after_output = Vec::with_capacity(BUDGET);
         'run: while !stop.load(Ordering::Acquire) {
@@ -1960,6 +1964,16 @@ impl Owner {
                     (IPPROTO_IP, IP_FREEBIND) => s.freebind as i32,
                     (IPPROTO_IP, IP_TOS) => s.tos as i32,
                     (IPPROTO_IP, IP_MTU_DISCOVER) => s.discover,
+                    (IPPROTO_IP, IP_MTU) => {
+                        let Handle::Connection(cid) = s.handle else {
+                            return Err(ENOTCONN);
+                        };
+                        self.endpoint
+                            .path_mtu_info(cid)
+                            .map_err(engine)?
+                            .ok_or(EOPNOTSUPP)?
+                            .current_mtu as i32
+                    }
                     (SOL_SOCKET, SO_ZEROCOPY) => s.zerocopy as i32,
                     (IPPROTO_TCP, TCP_KEEPIDLE) => s.idle,
                     (IPPROTO_TCP, TCP_KEEPINTVL) => s.interval,

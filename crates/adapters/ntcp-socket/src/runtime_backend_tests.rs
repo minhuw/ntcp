@@ -10,6 +10,11 @@ use std::{
 
 #[derive(Default)]
 struct State {
+    mtu: Option<u32>,
+    mtu_error: Option<i32>,
+    mtu_queries: usize,
+    max_packet_len: Option<usize>,
+    layer: Option<ntcp_io::PacketLayer>,
     incoming: VecDeque<io::Result<Vec<u8>>>,
     sent: VecDeque<Vec<u8>>,
     requests: Vec<TxTimestampRequest>,
@@ -27,8 +32,23 @@ struct State {
 }
 struct Fixture(Arc<Mutex<State>>);
 impl PacketIo for Fixture {
+    fn local_ip_mtu(&self) -> io::Result<Option<u32>> {
+        let mut state = self.0.lock().unwrap();
+        state.mtu_queries += 1;
+        if let Some(errno) = state.mtu_error {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        Ok(state.mtu)
+    }
+    fn max_packet_len(&self) -> Option<usize> {
+        self.0.lock().unwrap().max_packet_len
+    }
     fn layer(&self) -> ntcp_io::PacketLayer {
-        ntcp_io::PacketLayer::Ethernet
+        self.0
+            .lock()
+            .unwrap()
+            .layer
+            .unwrap_or(ntcp_io::PacketLayer::Ethernet)
     }
     fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
         let mut state = self.0.lock().unwrap();
@@ -564,4 +584,218 @@ fn output_error_finalizes_logical_send_parked_after_output_once() {
         [(0, 0)]
     );
     assert_eq!(stage_count(&a, client, 1), 0);
+}
+
+#[test]
+fn pmtud_startup_uses_real_mtu_and_separate_adapter_capacity() {
+    let state = Arc::new(Mutex::new(State {
+        mtu: Some(9000),
+        max_packet_len: Some(3514),
+        ..Default::default()
+    }));
+    let io = Fixture(state.clone());
+    let mut config = SocketConfig::new("test", Ipv4Addr::new(10, 73, 0, 2));
+    config.tcp.connection.mss = 8960;
+    config.tcp.connection.send_ip_payload_limit = 8980;
+    assert!(config.validate().is_ok());
+    let tcp = backend_config(config.tcp.clone(), &io).unwrap();
+    assert_eq!(tcp.connection.pmtud.unwrap().first_hop_mtu, 9000);
+    assert_eq!(tcp.connection.send_ip_payload_limit, 3480);
+    assert_eq!(tcp.connection.mss, 8960);
+    state.lock().unwrap().layer = Some(ntcp_io::PacketLayer::Ip);
+    state.lock().unwrap().max_packet_len = Some(3500);
+    assert_eq!(
+        backend_config(config.tcp.clone(), &io)
+            .unwrap()
+            .connection
+            .send_ip_payload_limit,
+        3480
+    );
+    state.lock().unwrap().layer = None;
+    state.lock().unwrap().max_packet_len = Some(3514);
+    config.tcp.connection.send_ip_payload_limit = 1000;
+    config.tcp.connection.mss = 500;
+    let tcp = backend_config(config.tcp.clone(), &io).unwrap();
+    assert_eq!(tcp.connection.send_ip_payload_limit, 1000);
+    assert_eq!(tcp.connection.mss, 500);
+    let owner = Owner::with_config(
+        config.io.address,
+        (config.io.address, 24),
+        [2; 32],
+        None,
+        tcp,
+    )
+    .unwrap();
+    assert_eq!(owner.output_packet_len(), 580); // MSS plus maximum TCP and IPv4 headers.
+    state.lock().unwrap().mtu = None;
+    assert_eq!(
+        backend_config(config.tcp.clone(), &io).unwrap_err(),
+        EOPNOTSUPP
+    );
+    state.lock().unwrap().mtu_error = Some(ENODEV);
+    assert_eq!(backend_config(config.tcp.clone(), &io).unwrap_err(), ENODEV);
+    state.lock().unwrap().mtu_error = None;
+    state.lock().unwrap().mtu = Some(67);
+    assert_eq!(backend_config(config.tcp.clone(), &io).unwrap_err(), EINVAL);
+    state.lock().unwrap().mtu = Some(9000);
+    for capacity in [0, 14, 81] {
+        state.lock().unwrap().max_packet_len = Some(capacity);
+        assert_eq!(backend_config(config.tcp.clone(), &io).unwrap_err(), EINVAL);
+    }
+}
+
+fn pmtud_owner(last: u8, mtu: u32, capacity: Option<usize>) -> (Owner, Arc<Mutex<State>>) {
+    let state = Arc::new(Mutex::new(State {
+        mtu: Some(mtu),
+        max_packet_len: capacity,
+        ..Default::default()
+    }));
+    let io = Fixture(state.clone());
+    let local = Ipv4Addr::new(10, 73, 0, last);
+    let mut config = SocketConfig::new("test", local).tcp;
+    config.connection.mss = 8960;
+    config.connection.send_ip_payload_limit = 8980;
+    let config = backend_config(config, &io).unwrap();
+    let mut owner = Owner::with_config(local, (local, 24), [last; 32], None, config).unwrap();
+    owner.ethernet = Some(EthernetBackend {
+        io: Box::new(io),
+        local: [2; 6],
+        next_hop: [4; 6],
+        next_cookie: 1,
+        pending: Vec::new(),
+    });
+    (owner, state)
+}
+
+fn pmtud_pair(capacity: Option<usize>) -> (Owner, Owner, u64, u64, Arc<Mutex<State>>) {
+    let (mut a, state) = pmtud_owner(2, 9000, capacity);
+    let (mut b, _) = pmtud_owner(3, 9000, None);
+    let listen = new(&mut b, SOCK_NONBLOCK);
+    assert_eq!(
+        b.execute(listen, Op::Get(IPPROTO_IP, IP_MTU)).unwrap_err(),
+        ENOTCONN
+    );
+    b.execute(listen, Op::Bind("10.73.0.3:16379".parse().unwrap()))
+        .unwrap();
+    b.execute(listen, Op::Listen(16)).unwrap();
+    assert_eq!(
+        b.execute(listen, Op::Get(IPPROTO_IP, IP_MTU)).unwrap_err(),
+        ENOTCONN
+    );
+    let client = new(&mut a, SOCK_NONBLOCK);
+    assert_eq!(
+        a.execute(client, Op::Connect("10.73.0.3:16379".parse().unwrap()))
+            .unwrap_err(),
+        EINPROGRESS
+    );
+    pump(&mut a, &mut b);
+    let server = b.execute(listen, Op::Accept(SOCK_NONBLOCK)).unwrap().value as u64;
+    (a, b, client, server, state)
+}
+
+fn ptb(packet: &[u8], mtu: u16) -> Vec<u8> {
+    let mut ip = vec![0; 56];
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&56u16.to_be_bytes());
+    ip[8] = 64;
+    ip[9] = 1;
+    ip[12..16].copy_from_slice(&[10, 73, 0, 1]); // Router, not TCP peer.
+    ip[16..20].copy_from_slice(&packet[12..16]);
+    ip[20] = 3;
+    ip[21] = 4;
+    ip[26..28].copy_from_slice(&mtu.to_be_bytes());
+    ip[28..].copy_from_slice(&packet[..28]);
+    fix_ptb_checksum(&mut ip);
+    let checksum = ntcp_ip::checksum(&ip[..20]);
+    ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+    ip
+}
+fn fix_ptb_checksum(ip: &mut [u8]) {
+    ip[22..24].fill(0);
+    let checksum = ntcp_ip::checksum(&ip[20..]);
+    ip[22..24].copy_from_slice(&checksum.to_be_bytes());
+}
+fn ingress(owner: &mut Owner, state: &Arc<Mutex<State>>, ip: &[u8]) {
+    let mut frame = vec![0; (14 + ip.len()).max(60)];
+    ntcp_ip::encode_ethernet(&mut frame, [4; 6], [2; 6], ntcp_ip::ETHERTYPE_IPV4, ip).unwrap();
+    state.lock().unwrap().incoming.push_back(Ok(frame));
+    owner.receive_batch(&mut vec![0; 65549]).unwrap();
+}
+fn mtu(owner: &mut Owner, socket: u64) -> i32 {
+    owner
+        .execute(socket, Op::Get(IPPROTO_IP, IP_MTU))
+        .unwrap()
+        .value
+}
+
+#[test]
+fn pmtud_jumbo_allocation_capacity_and_validated_ingress() {
+    for capacity in [None, Some(3514)] {
+        let (mut a, mut b, client, server, state) = pmtud_pair(capacity);
+        assert_eq!(mtu(&mut b, server), 9000); // Passive initialization too.
+        let bound = capacity.map_or(9000, |n| n - 14);
+        assert_eq!(mtu(&mut a, client), bound as i32);
+        a.execute(client, Op::Write(vec![7; 16000])).unwrap();
+        assert!(a.prepare_packet(None).unwrap());
+        let packet = a.pending_packet.as_ref().unwrap().clone();
+        assert!(packet.len() > 1500);
+        assert!(packet.len() <= bound);
+        submit(&mut a);
+        let sent = state.lock().unwrap().sent.pop_front().unwrap();
+        assert_eq!(sent.len(), packet.len() + 14);
+        assert!(capacity.is_none_or(|cap| sent.len() <= cap));
+        let valid = ptb(&packet, 1400);
+        let mut bad = valid.clone();
+        bad[22] ^= 1;
+        ingress(&mut a, &state, &bad); // Invalid checksum.
+        assert_eq!(mtu(&mut a, client), bound as i32);
+        let mut bad = valid.clone();
+        bad[48..50].copy_from_slice(&1u16.to_be_bytes()); // Wrong local port.
+        fix_ptb_checksum(&mut bad);
+        ingress(&mut a, &state, &bad);
+        assert_eq!(mtu(&mut a, client), bound as i32);
+        let mut bad = valid.clone();
+        let seq = u32::from_be_bytes(packet[24..28].try_into().unwrap());
+        bad[52..56].copy_from_slice(&seq.wrapping_sub(1).to_be_bytes());
+        fix_ptb_checksum(&mut bad);
+        ingress(&mut a, &state, &bad); // Not in the live send window.
+        assert_eq!(mtu(&mut a, client), bound as i32);
+        let mut bad = valid.clone();
+        bad[19] = 99; // Valid checksums but addressed to another local IP.
+        bad[10..12].fill(0);
+        let checksum = ntcp_ip::checksum(&bad[..20]);
+        bad[10..12].copy_from_slice(&checksum.to_be_bytes());
+        ingress(&mut a, &state, &bad);
+        assert_eq!(mtu(&mut a, client), bound as i32);
+        let mut bad = valid.clone();
+        bad[21] = 1; // Other unreachable errors are not MTU reports.
+        fix_ptb_checksum(&mut bad);
+        ingress(&mut a, &state, &bad);
+        assert_eq!(mtu(&mut a, client), bound as i32);
+        ingress(&mut a, &state, &valid);
+        assert_eq!(mtu(&mut a, client), 1400);
+        ingress(&mut a, &state, &ptb(&packet, 2000)); // No ICMP-driven increase.
+        assert_eq!(mtu(&mut a, client), 1400);
+        assert!(a.prepare_packet(None).unwrap());
+        assert!(a.pending_packet.as_ref().unwrap().len() <= 1400);
+        assert_eq!(state.lock().unwrap().mtu_queries, 1); // Never query in owner service.
+    }
+}
+
+#[test]
+fn pmtud_zero_mtu_and_ipv4_floor_are_dispatched_without_clamping() {
+    for candidate in [0, 68] {
+        let (mut a, _, client, _, state) = pmtud_pair(None);
+        a.execute(client, Op::Write(vec![7; 16000])).unwrap();
+        assert!(a.prepare_packet(None).unwrap());
+        let packet = a.pending_packet.as_ref().unwrap().clone();
+        submit(&mut a);
+        ingress(&mut a, &state, &ptb(&packet, candidate));
+        assert_eq!(mtu(&mut a, client), if candidate == 0 { 8166 } else { 68 });
+    }
+    let (mut a, _, client, _, _) = pair();
+    assert_eq!(
+        a.execute(client, Op::Get(IPPROTO_IP, IP_MTU)).unwrap_err(),
+        EOPNOTSUPP
+    );
 }

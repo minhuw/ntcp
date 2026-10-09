@@ -54,6 +54,41 @@ pub(super) fn core_stamps(stamps: PacketTimestamps) -> ntcp::RxPacketTimestamps 
         hardware: stamps.hardware.and_then(core_stamp),
     }
 }
+// Startup only: local_ip_mtu may block on the backend's control plane.
+pub(super) fn backend_config(
+    mut config: EndpointConfig,
+    io: &dyn PacketIo,
+) -> Result<EndpointConfig> {
+    let mtu = io
+        .local_ip_mtu()
+        .map_err(|e| e.raw_os_error().unwrap_or(EIO))?
+        .ok_or(EOPNOTSUPP)?;
+    if mtu < 68 {
+        return Err(EINVAL);
+    }
+    let overhead = if io.layer() == ntcp_io::PacketLayer::Ethernet {
+        14
+    } else {
+        0
+    };
+    let ip_capacity = io
+        .max_packet_len()
+        .unwrap_or(65535 + overhead)
+        .checked_sub(overhead)
+        .ok_or(EINVAL)?
+        .min(65535);
+    if ip_capacity < 68 {
+        return Err(EINVAL);
+    }
+    config.connection.send_ip_payload_limit = config
+        .connection
+        .send_ip_payload_limit
+        .min((ip_capacity - 20) as u16);
+    config.connection.pmtud = Some(ntcp::PmtudConfig::new(mtu));
+    config.validate().map_err(engine)?;
+    Ok(config)
+}
+
 impl Owner {
     pub(super) fn af_packet(config: &SocketConfig) -> Result<Self> {
         let name = &config.io.interface;
@@ -123,7 +158,13 @@ impl Owner {
             }
             at += n as usize;
         }
-        let mut owner = Self::with_config(local, subnet, secret, None, config.tcp.clone())?;
+        let mut owner = Self::with_config(
+            local,
+            subnet,
+            secret,
+            None,
+            backend_config(config.tcp.clone(), &io)?,
+        )?;
         owner.ethernet = Some(EthernetBackend {
             io: Box::new(io),
             local: hardware,
@@ -177,17 +218,7 @@ impl Owner {
                     } else {
                         bytes
                     };
-                    if let Ok(p) = ntcp_ip::parse(bytes, false)
-                        && p.protocol == 6
-                    {
-                        let _ = self.input_stamped(
-                            self.now(),
-                            p.ip,
-                            p.traffic_class,
-                            p.payload,
-                            core_stamps(received.timestamps),
-                        );
-                    }
+                    self.input_ip(bytes, core_stamps(received.timestamps));
                 }
                 Ok(None) => break,
                 Err(e)
@@ -201,6 +232,32 @@ impl Owner {
             }
         }
         Ok(())
+    }
+    fn input_ip(&mut self, bytes: &[u8], stamps: ntcp::RxPacketTimestamps) {
+        let Ok(p) = ntcp_ip::parse(bytes, false) else {
+            return;
+        };
+        if p.ip.destination != IpAddr::V4(self.local) {
+            return;
+        }
+        if p.protocol == 6 {
+            let _ = self.input_stamped(self.now(), p.ip, p.traffic_class, p.payload, stamps);
+        } else if let Ok(feedback) = ntcp_ip::decode_icmp(bytes)
+            && feedback.kind == ntcp_ip::FeedbackKind::PacketTooBig
+        {
+            let q = feedback.quoted;
+            let _ = self.endpoint.pmtu_feedback(
+                self.now(),
+                ntcp::Tuple {
+                    local: SocketAddr::new(q.ip.source, q.source_port),
+                    remote: SocketAddr::new(q.ip.destination, q.destination_port),
+                },
+                q.sequence,
+                q.ip_packet_len,
+                q.ip_header_len,
+                feedback.candidate_mtu.unwrap_or(0),
+            );
+        }
     }
     pub(super) fn transmit_ethernet(&mut self) -> std::io::Result<TxOutcome> {
         let sources = self

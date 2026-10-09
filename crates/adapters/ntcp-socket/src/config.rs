@@ -91,10 +91,10 @@ impl SocketConfig {
         self.tcp.validate().map_err(|_| invalid())?;
         let c = &self.tcp.connection;
         c.validate(true).map_err(|_| invalid())?;
-        // The owner clock, fixed frame size and descriptor registry are adapter constraints.
+        // The owner clock, IPv4 packet size and descriptor registry are adapter constraints.
         if self.tcp.ipv4_options_enabled // Native input strips/rejects IPv4 options.
             || c.timebase.units_per_second != 1_000_000
-            || c.send_ip_payload_limit > 1480
+            || c.send_ip_payload_limit > 65515
             || c.receive_ip_payload_limit > 65515
             || self.tcp.max_connections > crate::runtime::LIMIT
             || self.tcp.max_listeners > crate::runtime::LIMIT

@@ -426,7 +426,7 @@ fn layering_order_defaults_and_adapter_constraints() {
     }
     let invalid: &[fn(&mut SocketConfig)] = &[
         |c| c.tcp.connection.timebase.units_per_second = 1_000_000_000,
-        |c| c.tcp.connection.send_ip_payload_limit = 1481,
+        |c| c.tcp.connection.send_ip_payload_limit = 65516,
         |c| c.tcp.connection.receive_ip_payload_limit = 65516,
         |c| c.tcp.ipv4_options_enabled = true,
         |c| c.tcp.max_connections = 513,
