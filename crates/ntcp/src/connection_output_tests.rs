@@ -2762,7 +2762,10 @@ fn lowat_byte_admission_transmission_ack_resize_flush_and_wrap() {
         assert_eq!(a.transport_info().notsent_bytes, 4000);
         assert_eq!(a.send_admission_room(Some(4000)), 0);
         let bytes = packet(&mut a, 40);
-        assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 1000);
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes).unwrap().payload.len(),
+            1000
+        );
         // Output opens exactly its byte count; ACK and capacity growth do not.
         assert_eq!(a.send_admission_room(Some(4000)), 1000);
         let next = a.receive.next();
@@ -2776,7 +2779,10 @@ fn lowat_byte_admission_transmission_ack_resize_flush_and_wrap() {
         let now = a.rto_deadline.unwrap();
         a.timeout(now).unwrap();
         let bytes = packet(&mut a, now);
-        assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().header.sequence, sequence);
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes).unwrap().header.sequence,
+            sequence
+        );
         // Retransmission must not count the same bytes as new output.
         assert_eq!(a.send_admission_room(Some(4000)), 2000);
         let una = a.snd_una;

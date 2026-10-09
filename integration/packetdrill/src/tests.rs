@@ -542,7 +542,10 @@ int main(int argc, char **argv) {
         if preloaded {
             command.env("LD_PRELOAD", &library);
         }
-        let mut child = command.stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let mut child = command
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(status) = child.try_wait().unwrap() {
