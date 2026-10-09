@@ -54,26 +54,17 @@ pub(super) fn core_stamps(stamps: PacketTimestamps) -> ntcp::RxPacketTimestamps 
         hardware: stamps.hardware.and_then(core_stamp),
     }
 }
-fn mac(value: &str) -> Result<[u8; 6]> {
-    let mut bytes = [0; 6];
-    let mut fields = value.split(':');
-    for byte in &mut bytes {
-        *byte = u8::from_str_radix(fields.next().ok_or(EINVAL)?, 16).map_err(|_| EINVAL)?;
-    }
-    if fields.next().is_some() || bytes == [0; 6] || bytes[0] & 1 != 0 {
-        return Err(EINVAL);
-    }
-    Ok(bytes)
-}
 impl Owner {
-    pub(super) fn af_packet(name: &str, local: Ipv4Addr) -> Result<Self> {
-        let subnet = context(name, local)?; // Identical address ownership and prefix policy to TUN.
-        let name = CString::new(name).map_err(|_| EINVAL)?;
+    pub(super) fn af_packet(config: &SocketConfig) -> Result<Self> {
+        let name = &config.interface;
+        let local = config.address;
+        let subnet = context(name, local, config.prefix)?; // Identical address ownership and prefix policy to TUN.
+        let name = CString::new(name.as_str()).map_err(|_| EINVAL)?;
         let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
         if index == 0 {
             return Err(errno());
         }
-        let next_hop = mac(&env("NTCP_SOCKET_NEXT_HOP_MAC").ok_or(EINVAL)?)?;
+        let next_hop = config.next_hop_mac.ok_or(EINVAL)?;
         let mut io = AfPacket::bind(index, ntcp_ip::ETHERTYPE_IPV4)
             .map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
         let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
@@ -132,7 +123,7 @@ impl Owner {
             }
             at += n as usize;
         }
-        let mut owner = Self::with_endpoint(local, subnet, secret, None)?;
+        let mut owner = Self::with_pacing(local, subnet, secret, None, config.pacing_config())?;
         owner.ethernet = Some(EthernetBackend {
             io: Box::new(io),
             local: hardware,

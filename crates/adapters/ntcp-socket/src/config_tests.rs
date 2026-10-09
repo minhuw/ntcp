@@ -1,0 +1,368 @@
+// SPDX-License-Identifier: MIT AND GPL-2.0-or-later
+use super::*;
+
+const BASE: &str = "interface=ntcp0\naddress=10.73.0.2\n";
+
+#[test]
+fn parser_and_typed_validation() {
+    let default = SocketConfig::new("ntcp0", "10.73.0.2".parse().unwrap());
+    assert_eq!(SocketConfig::parse(BASE).unwrap(), default);
+    assert_eq!(
+        SocketConfig::parse(&format!(" # comment\n\n {BASE}prefix = 24\n"))
+            .unwrap()
+            .prefix,
+        Some(24)
+    );
+    let config = SocketConfig::parse(&format!("{BASE}backend=af-packet\nnext_hop_mac=02:00:00:00:00:01\npacing=true\npacing_gain_percent=150\npacing_max_bytes_per_second=18446744073709551615\npacing_burst_segments=3")).unwrap();
+    assert_eq!(
+        config.pacing_config().unwrap(),
+        ntcp::PacingConfig {
+            rate_gain_percent: 150,
+            max_bytes_per_second: Some(u64::MAX),
+            max_burst_segments: 3,
+        }
+    );
+    for suffix in [
+        "unknown=x",
+        "interface=other",
+        "address=10.0.0.1",
+        "prefix=33",
+        "prefix=-1",
+        "prefix=+1",
+        "pacing=1",
+        "pacing=true # inline",
+        "[section]",
+        "backend=native",
+        "backend=af-packet",
+        "next_hop_mac=02:00:00:00:00:01",
+        "pacing_gain_percent=125",
+        "pacing_burst_segments=2",
+        "pacing_max_bytes_per_second=1",
+        "pacing=true\npacing_gain_percent=0",
+        "pacing=true\npacing_gain_percent=65536",
+        "pacing=true\npacing_max_bytes_per_second=0",
+        "pacing=true\npacing_max_bytes_per_second=18446744073709551616",
+        "pacing=true\npacing_burst_segments=0",
+        "pacing=true\npacing_burst_segments=4294967295",
+        "backend=af-packet\nnext_hop_mac=00:00:00:00:00:00",
+        "backend=af-packet\nnext_hop_mac=01:00:00:00:00:01",
+        "backend=af-packet\nnext_hop_mac=2:00:00:00:00:01",
+        "backend=af-packet\nnext_hop_mac=02:00:00:00:00:gg",
+    ] {
+        assert_eq!(
+            SocketConfig::parse(&format!("{BASE}{suffix}"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput,
+            "{suffix}"
+        );
+    }
+    for text in [
+        "interface=ntcp0",
+        "address=10.73.0.2",
+        "interface=\"ntcp0\"\naddress=10.73.0.2",
+        "interface=ntcp0\naddress=::1",
+        "interface=ntcp0\naddress=127.0.0.1",
+        "interface=ntcp0\naddress=224.0.0.1",
+    ] {
+        assert!(SocketConfig::parse(text).is_err());
+    }
+    let mut typed = default;
+    typed.pacing_burst_segments = Some(2);
+    assert!(typed.validate().is_err());
+    typed.pacing = true;
+    assert!(typed.validate().is_ok());
+    typed.pacing_burst_segments = Some(u32::MAX);
+    assert!(typed.validate().is_err());
+}
+
+#[test]
+fn bounded_regular_utf8_file() {
+    let path = std::env::temp_dir().join(format!("ntcp-config-{}", std::process::id()));
+    std::fs::write(&path, BASE).unwrap();
+    assert_eq!(
+        SocketConfig::from_file(&path).unwrap(),
+        SocketConfig::parse(BASE).unwrap()
+    );
+    std::fs::write(&path, [0xff]).unwrap();
+    assert_eq!(
+        SocketConfig::from_file(&path).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    let mut exact = BASE.to_owned();
+    exact.push('#');
+    exact.push_str(&"x".repeat(MAX_FILE_BYTES - exact.len()));
+    std::fs::write(&path, &exact).unwrap();
+    assert!(SocketConfig::from_file(&path).is_ok());
+    exact.push('x');
+    std::fs::write(&path, &exact).unwrap();
+    assert!(SocketConfig::from_file(&path).is_err());
+    assert!(SocketConfig::parse(&exact).is_err());
+    std::fs::remove_file(&path).unwrap();
+    let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    assert_eq!(
+        SocketConfig::from_file(&path).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    std::fs::remove_file(&path).unwrap();
+    assert!(SocketConfig::from_file(std::env::temp_dir()).is_err());
+    assert_eq!(
+        SocketConfig::from_file(&path).unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+}
+
+#[test]
+fn selection_subprocess() {
+    const CHILD: &str = "NTCP_CONFIG_TEST_CHILD";
+    let Ok(scenario) = std::env::var(CHILD) else {
+        for scenario in [
+            "native",
+            "typed",
+            "invalid",
+            "missing",
+            "malformed",
+            "file",
+            "race",
+            "configure-race",
+            "fork",
+            "reentrant",
+        ] {
+            let path = std::env::temp_dir().join(format!("ntcp-selection-{}", std::process::id()));
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args([
+                "--exact",
+                "config::tests::selection_subprocess",
+                "--nocapture",
+            ])
+            .env(CHILD, scenario)
+            .env_remove("NTCP_SOCKET_CONFIG");
+            if matches!(scenario, "missing" | "malformed" | "file") {
+                if scenario != "missing" {
+                    std::fs::write(&path, if scenario == "file" { BASE } else { "invalid" })
+                        .unwrap();
+                }
+                cmd.env("NTCP_SOCKET_CONFIG", &path);
+            }
+            // Legacy settings must have no influence, even when invalid.
+            for key in [
+                "BACKEND",
+                "TUN",
+                "IFACE",
+                "ADDR",
+                "PREFIX",
+                "NEXT_HOP_MAC",
+                "PACING",
+            ] {
+                cmd.env(format!("NTCP_SOCKET_{key}"), "invalid");
+            }
+            assert!(cmd.status().unwrap().success(), "{scenario}");
+            if scenario == "malformed" || scenario == "file" {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+        return;
+    };
+    let config = SocketConfig::parse(BASE).unwrap();
+    let classify = || crate::ntcp_boundary_socket(libc::AF_INET, libc::SOCK_STREAM);
+    match scenario.as_str() {
+        "native" => {
+            assert_eq!(classify(), 0);
+            let fd = unsafe { crate::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            assert!(fd >= 0);
+            assert_eq!(crate::ntcp_boundary_fd(fd), 0);
+            unsafe {
+                libc::syscall(libc::SYS_close, fd);
+            }
+            assert_eq!(
+                crate::configure(config).unwrap_err().raw_os_error(),
+                Some(libc::EALREADY)
+            );
+        }
+        "file" => {
+            assert_eq!(classify(), 1);
+            assert_eq!(
+                crate::CONFIG
+                    .get()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap(),
+                &config
+            );
+            assert_eq!(
+                crate::configure(config).unwrap_err().raw_os_error(),
+                Some(libc::EALREADY)
+            );
+        }
+        "configure-race" => {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    let config = config.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        crate::configure(config)
+                    })
+                })
+                .collect();
+            let mut winners = 0;
+            for thread in threads {
+                match thread.join().unwrap() {
+                    Ok(()) => winners += 1,
+                    Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EALREADY)),
+                }
+            }
+            assert_eq!(winners, 1);
+            assert_eq!(classify(), 1);
+        }
+        "fork" => {
+            // Fork while another thread owns selection's OnceLock: the child
+            // must reject before waiting on a thread which no longer exists.
+            crate::PID.store(
+                std::process::id() as i32,
+                std::sync::atomic::Ordering::Release,
+            );
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                crate::CONFIG.get_or_init(|| {
+                    ready_tx.send(()).unwrap();
+                    done_rx.recv().unwrap();
+                    Ok(Some(config))
+                });
+            });
+            ready_rx.recv().unwrap();
+            let pid = unsafe { libc::syscall(libc::SYS_fork) };
+            assert!(pid >= 0);
+            if pid == 0 {
+                let good = classify() == -1 && crate::errno() == libc::EOWNERDEAD;
+                unsafe {
+                    libc::syscall(libc::SYS_exit_group, if good { 0 } else { 1 });
+                }
+                unreachable!();
+            }
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid as i32, &mut status, 0) },
+                pid as i32
+            );
+            assert_eq!(status, 0);
+            done_tx.send(()).unwrap();
+            thread.join().unwrap();
+        }
+        "reentrant" => {
+            crate::DEPTH.with(|depth| depth.set(1));
+            assert_eq!(classify(), -1);
+            assert_eq!(crate::errno(), libc::EDEADLK);
+            crate::DEPTH.with(|depth| depth.set(0));
+            let old = crate::set_internal(true);
+            assert_eq!(
+                crate::configure(config.clone()).unwrap_err().raw_os_error(),
+                Some(libc::EDEADLK)
+            );
+            crate::set_internal(old);
+            assert!(crate::CONFIG.get().is_none());
+            crate::configure(config).unwrap();
+        }
+        "typed" => {
+            crate::configure(config.clone()).unwrap();
+            assert_eq!(classify(), 1);
+            assert_eq!(
+                crate::configure(config).unwrap_err().raw_os_error(),
+                Some(libc::EALREADY)
+            );
+        }
+        "invalid" => {
+            let mut bad = config.clone();
+            bad.pacing_gain_percent = Some(0);
+            assert_eq!(
+                crate::configure(bad).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(classify(), -1);
+            assert_eq!(
+                unsafe { crate::socket(libc::AF_INET, libc::SOCK_STREAM, 0) },
+                -1
+            );
+            assert_eq!(crate::errno(), libc::EINVAL);
+            assert_eq!(
+                crate::configure(config).unwrap_err().raw_os_error(),
+                Some(libc::EALREADY)
+            );
+        }
+        "missing" | "malformed" => {
+            for _ in 0..2 {
+                assert_eq!(
+                    unsafe { crate::socket(libc::AF_INET, libc::SOCK_STREAM, 0) },
+                    -1
+                );
+                assert_eq!(
+                    crate::errno(),
+                    if scenario == "missing" {
+                        libc::ENOENT
+                    } else {
+                        libc::EINVAL
+                    }
+                );
+            }
+            assert_eq!(
+                crate::configure(config).unwrap_err().raw_os_error(),
+                Some(libc::EALREADY)
+            );
+        }
+        "race" => {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let other = barrier.clone();
+            let thread = std::thread::spawn(move || {
+                other.wait();
+                crate::configure(config)
+            });
+            barrier.wait();
+            let managed = classify();
+            let configured = thread.join().unwrap();
+            match managed {
+                0 => assert_eq!(configured.unwrap_err().raw_os_error(), Some(libc::EALREADY)),
+                1 => configured.unwrap(),
+                _ => panic!("selection failed"),
+            }
+            assert_eq!(classify(), managed);
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(feature = "packet-test")]
+#[test]
+fn packet_profile_ignores_production_configuration() {
+    const CHILD: &str = "NTCP_CONFIG_PACKET_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        assert!(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "config::tests::packet_profile_ignores_production_configuration"
+                ])
+                .env(CHILD, "1")
+                .env("NTCP_SOCKET_CONFIG", "/nonexistent/ntcp-config")
+                .status()
+                .unwrap()
+                .success()
+        );
+        return;
+    }
+    crate::packet_test::start((
+        "192.0.2.1".parse().unwrap(),
+        crate::packet_profile::Profile::Baseline,
+    ))
+    .unwrap();
+    let fd = unsafe { crate::packet_test::packet_socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    assert!(fd >= 0);
+    assert_eq!(crate::ntcp_boundary_fd(fd), 1);
+    assert!(crate::CONFIG.get().is_none());
+    assert_eq!(unsafe { crate::close(fd) }, 0);
+    crate::packet_test::stop();
+}

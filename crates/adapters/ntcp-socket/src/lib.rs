@@ -29,6 +29,8 @@ macro_rules! boundary_entry {
     };
 }
 
+mod config;
+pub use config::{Backend, SocketConfig};
 mod file_transfer;
 #[cfg(feature = "packet-test")]
 pub mod packet_profile;
@@ -204,23 +206,66 @@ impl Drop for Token {
 fn errno() -> i32 {
     unsafe { *__errno_location() }
 }
-fn env(name: &str) -> Option<String> {
-    let name = std::ffi::CString::new(name).ok()?;
-    unsafe {
-        let p = getenv(name.as_ptr());
-        (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned())
-    }
-}
 fn io_limit() -> usize {
     RUNTIME
         .get()
         .and_then(|r| r.as_ref().ok())
         .map_or(runtime::BYTES, |r| r.io_limit)
 }
-fn configured() -> bool {
-    env("NTCP_SOCKET_TUN").is_some()
-        || env("NTCP_SOCKET_ADDR").is_some()
-        || env("NTCP_SOCKET_BACKEND").is_some()
+static CONFIG: OnceLock<Result<Option<SocketConfig>>> = OnceLock::new();
+
+// Also used for file selection: failures are immutable, never native fallback.
+fn select_config(explicit: Option<SocketConfig>) -> Result<&'static Option<SocketConfig>> {
+    if explicit.is_none() && matches!(CONFIG.get(), Some(Ok(None))) {
+        return Ok(CONFIG.get().unwrap().as_ref().unwrap());
+    }
+    mutation_context()?;
+    PID.compare_exchange(
+        0,
+        unsafe { syscall(SYS_getpid) as i32 },
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    )
+    .ok();
+    let configuring = explicit.is_some();
+    let mut selected = false;
+    // Mask recursion before OnceLock can acquire its initializing state, including
+    // native configure() calls which do not have an ffi depth guard.
+    let old = set_internal(true);
+    let result = CONFIG.get_or_init(|| {
+        selected = true;
+        catch_unwind(|| {
+            if let Some(config) = explicit {
+                config.validate().map_err(|_| EINVAL)?;
+                Ok(Some(config))
+            } else {
+                // Preserve non-UTF8 filesystem paths; only file contents are UTF8.
+                std::env::var_os("NTCP_SOCKET_CONFIG")
+                    .map(SocketConfig::from_file)
+                    .transpose()
+                    .map_err(|e| e.raw_os_error().unwrap_or(EINVAL))
+            }
+        })
+        .unwrap_or(Err(EIO))
+    });
+    set_internal(old);
+    if configuring && !selected {
+        return Err(EALREADY);
+    }
+    result.as_ref().map_err(|e| *e)
+}
+
+pub fn configure(config: SocketConfig) -> std::io::Result<()> {
+    if DEPTH.with(Cell::get) != 0 {
+        return Err(std::io::Error::from_raw_os_error(EDEADLK));
+    }
+    select_config(Some(config))
+        .map(|_| ())
+        .map_err(std::io::Error::from_raw_os_error)
+}
+
+fn configured() -> Result<bool> {
+    select_config(None).map(Option::is_some)
 }
 fn child() -> bool {
     let pid = PID.load(Ordering::Acquire);
@@ -240,7 +285,11 @@ fn runtime() -> Result<&'static Runtime> {
     RUNTIME
         .get_or_init(|| {
             let old = set_internal(true);
-            let result = catch_unwind(Runtime::start).unwrap_or(Err(EIO));
+            let result = catch_unwind(|| {
+                let config = CONFIG.get().ok_or(EINVAL)?.as_ref().map_err(|e| *e)?;
+                Runtime::start(config.clone().ok_or(EINVAL)?)
+            })
+            .unwrap_or(Err(EIO));
             set_internal(old);
             result
         })
@@ -758,9 +807,9 @@ unsafe fn output_addr(addr: SocketAddr, p: *mut sockaddr, len: *mut socklen_t) -
 pub unsafe extern "C" fn ntcp_managed_socket(domain: i32, kind: i32, protocol: i32) -> i32 {
     ffi(|| {
         if INTERNAL.with(Cell::get)
-            || !(configured() || PACKET_SOCKET.with(Cell::get))
             || ![AF_INET, AF_INET6].contains(&domain)
             || kind & 0xf != SOCK_STREAM
+            || !(PACKET_SOCKET.with(Cell::get) || configured()?)
         {
             return raw(unsafe { syscall(SYS_socket, domain, kind, protocol) });
         }
@@ -2796,7 +2845,7 @@ pub extern "C" fn ntcp_stdio_valid(fd: i32, id: u64) -> i32 {
 pub extern "C" fn ntcp_boundary_socket(domain: i32, kind: i32) -> i32 {
     ffi(|| {
         Ok(
-            (configured() && [AF_INET, AF_INET6].contains(&domain) && kind & 0xf == SOCK_STREAM)
+            ([AF_INET, AF_INET6].contains(&domain) && kind & 0xf == SOCK_STREAM && configured()?)
                 as i64,
         )
     }) as i32

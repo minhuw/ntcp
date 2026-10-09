@@ -139,29 +139,12 @@ impl Runtime {
         }
     }
 
-    pub fn start() -> Result<Self> {
-        socket_pacing(env("NTCP_SOCKET_PACING").as_deref())?;
-        let backend = env("NTCP_SOCKET_BACKEND").unwrap_or_else(|| "tun".into());
-        if !matches!(backend.as_str(), "tun" | "af-packet") {
-            return Err(EINVAL);
-        }
-        let name = env(if backend == "tun" {
-            "NTCP_SOCKET_TUN"
-        } else {
-            "NTCP_SOCKET_IFACE"
-        })
-        .ok_or(EINVAL)?;
-        let local: Ipv4Addr = env("NTCP_SOCKET_ADDR")
-            .ok_or(EINVAL)?
-            .parse()
-            .map_err(|_| EAFNOSUPPORT)?;
+    pub fn start(config: SocketConfig) -> Result<Self> {
+        config.validate().map_err(|_| EINVAL)?;
         Self::spawn(
-            move || {
-                if backend == "af-packet" {
-                    Owner::af_packet(&name, local)
-                } else {
-                    Owner::new(&name, local)
-                }
+            move || match config.backend {
+                Backend::Tun => Owner::new(&config),
+                Backend::AfPacket => Owner::af_packet(&config),
             },
             false,
         )
@@ -398,13 +381,6 @@ fn submit_packet(
     }
     Ok(outcome)
 }
-fn socket_pacing(value: Option<&str>) -> Result<Option<ntcp::PacingConfig>> {
-    match value {
-        None | Some("0") => Ok(None),
-        Some("1") => Ok(Some(ntcp::PacingConfig::default())),
-        Some(_) => Err(EINVAL),
-    }
-}
 fn user_timeout_us(milliseconds: i32) -> Result<Option<u64>> {
     let ms = u64::try_from(milliseconds).map_err(|_| EINVAL)?;
     Ok((ms != 0).then_some(ms * 1000))
@@ -454,10 +430,7 @@ struct Owner {
 fn unicast(ip: Ipv4Addr) -> bool {
     ip.octets()[0] != 0 && ip.octets()[0] < 224 && !ip.is_loopback()
 }
-fn context(name: &str, local: Ipv4Addr) -> Result<(Ipv4Addr, u8)> {
-    let requested = env("NTCP_SOCKET_PREFIX")
-        .map(|p| p.parse::<u8>().map_err(|_| EINVAL))
-        .transpose()?;
+fn context(name: &str, local: Ipv4Addr, requested: Option<u8>) -> Result<(Ipv4Addr, u8)> {
     let mut list = ptr::null_mut();
     if unsafe { libc::getifaddrs(&mut list) } < 0 {
         return Err(errno());
@@ -507,9 +480,11 @@ fn context(name: &str, local: Ipv4Addr) -> Result<(Ipv4Addr, u8)> {
     Ok((ip, prefix))
 }
 impl Owner {
-    fn new(name: &str, local: Ipv4Addr) -> Result<Self> {
+    fn new(config: &SocketConfig) -> Result<Self> {
+        let name = &config.interface;
+        let local = config.address;
         let tun = Tun::open(name).map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
-        let subnet = context(name, local)?;
+        let subnet = context(name, local, config.prefix)?;
         let mut secret = [0u8; 32];
         let mut offset = 0;
         while offset < secret.len() {
@@ -532,21 +507,7 @@ impl Owner {
             }
             offset += n as usize;
         }
-        Self::with_endpoint(local, subnet, secret, Some(tun))
-    }
-    fn with_endpoint(
-        local: Ipv4Addr,
-        (address, prefix): (Ipv4Addr, u8),
-        secret: [u8; 32],
-        tun: Option<Tun>,
-    ) -> Result<Self> {
-        Self::with_pacing(
-            local,
-            (address, prefix),
-            secret,
-            tun,
-            socket_pacing(env("NTCP_SOCKET_PACING").as_deref())?,
-        )
+        Self::with_pacing(local, subnet, secret, Some(tun), config.pacing_config())
     }
     fn with_pacing(
         local: Ipv4Addr,
@@ -565,7 +526,7 @@ impl Owner {
         config.connection.pacing = pacing;
         config.connection.receive_capacity = BYTES;
         config.connection.send_capacity = BYTES;
-        config.connection.mss = 1460;
+        config.connection.mss = crate::config::MSS;
         config.connection.send_ip_payload_limit = 1480;
         config.connection.receive_ip_payload_limit = 65515;
         let valid = move |ip: IpAddr| {

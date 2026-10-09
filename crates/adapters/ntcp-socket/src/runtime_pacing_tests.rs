@@ -1,17 +1,4 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
-#[test]
-fn pacing_option_is_strict_and_legacy_by_default() {
-    assert_eq!(socket_pacing(None), Ok(None));
-    assert_eq!(socket_pacing(Some("0")), Ok(None));
-    assert_eq!(
-        socket_pacing(Some("1")),
-        Ok(Some(ntcp::PacingConfig::default()))
-    );
-    for value in ["", "true", "false", "2", "01", " 1", "1\n", "-1", "１"] {
-        assert_eq!(socket_pacing(Some(value)), Err(EINVAL), "{value:?}");
-    }
-}
-
 fn paced_owner(last: u8) -> Owner {
     let local = Ipv4Addr::new(10, 73, 0, last);
     let mut owner = Owner::with_pacing(
@@ -19,7 +6,7 @@ fn paced_owner(last: u8) -> Owner {
         (Ipv4Addr::new(10, 73, 0, 1), 24),
         [last; 32],
         None,
-        socket_pacing(Some("1")).unwrap(),
+        Some(ntcp::PacingConfig::default()),
     )
     .unwrap();
     owner.test_now = Some(1_000);
