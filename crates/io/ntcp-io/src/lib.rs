@@ -1,5 +1,9 @@
 use std::io;
 
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub mod linux;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PacketLayer {
     Ip,
@@ -113,7 +117,7 @@ pub struct TimestampCapabilities {
     pub tx_completion_capacity: usize,
 }
 
-// Each call does bounded, nonblocking work on one complete packet. The caller
+// Packet operations do bounded, nonblocking work on one complete packet. The caller
 // owns its buffers: receive copies into out, transmit retains no borrow.
 // Submitted transfers a copy to the backend; it implies neither wire delivery
 // nor a TCP acknowledgement. Backend DMA buffers are reclaimed internally.
@@ -121,7 +125,24 @@ pub struct TimestampCapabilities {
 // truncated packet as valid. Drivers, threads and scheduling belong to callers.
 pub trait PacketIo {
     fn layer(&self) -> PacketLayer;
+
+    // Current interface IP MTU, including IP header, excluding L2/FCS.
+    // Read-only, bounded query; unknown is distinct from a failed query.
+    // Linux queries may wait up to 100ms and use the caller's network namespace.
+    fn local_ip_mtu(&self) -> io::Result<Option<u32>> {
+        Ok(None)
+    }
+
+    // Independent adapter buffer limit in layer() bytes, not a path/link MTU.
+    // Ethernet includes its 14-byte header, not FCS. None means unknown.
+    fn max_packet_len(&self) -> Option<usize> {
+        None
+    }
+
     fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>>;
+    // Synchronous TX EMSGSIZE rejects this packet before submission, including
+    // timestamp/scheduled TX. Other errors do NOT imply non-submission; async
+    // scheduling errors are observations, not synchronous TX rejections.
     fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome>;
 
     fn tx_scheduling_capabilities(&self) -> Option<TxSchedulingCapabilities> {
@@ -244,6 +265,8 @@ mod tests {
             received: false,
         };
         let io: &mut dyn PacketIo = &mut mock;
+        assert_eq!(io.local_ip_mtu().unwrap(), None);
+        assert_eq!(io.max_packet_len(), None);
         assert_eq!(
             io.timestamp_capabilities(),
             TimestampCapabilities::default()

@@ -16,6 +16,7 @@ use timestamp::{Control, State};
 
 pub struct AfPacket {
     fd: OwnedFd,
+    ifindex: u32,
     timestamps: Option<State>,
     scheduling: Option<TxSchedulingConfig>,
     scheduling_error: Option<TxSchedulingError>,
@@ -143,6 +144,7 @@ impl AfPacket {
             return Err(io::Error::last_os_error());
         }
         Ok(Self {
+            ifindex,
             fd,
             timestamps: None,
             scheduling: None,
@@ -384,6 +386,11 @@ pub(crate) fn transmitted(count: isize, length: usize) -> io::Result<TxOutcome> 
 }
 
 impl PacketIo for AfPacket {
+    fn local_ip_mtu(&self) -> io::Result<Option<u32>> {
+        ntcp_io::linux::local_ip_mtu(self.ifindex)
+    }
+    // The socket has no independent fixed copy-buffer cap; live MTU is separate.
+
     fn layer(&self) -> PacketLayer {
         PacketLayer::Ethernet
     }
@@ -574,12 +581,14 @@ pub(crate) mod tests {
             max_future_ns: 1_000_000_000,
         };
         let mut a = AfPacket {
+            ifindex: 0,
             fd,
             timestamps: None,
             scheduling: None,
             scheduling_error: None,
         };
         let mut b = AfPacket {
+            ifindex: 0,
             fd: peer,
             timestamps: None,
             scheduling: None,
@@ -762,12 +771,14 @@ pub(crate) mod tests {
     fn packets_and_ownership() {
         let (a, b) = pair();
         let mut a = AfPacket {
+            ifindex: 0,
             fd: a,
             timestamps: None,
             scheduling: None,
             scheduling_error: None,
         };
         let mut b = AfPacket {
+            ifindex: 0,
             fd: b,
             timestamps: None,
             scheduling: None,

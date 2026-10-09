@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <assert.h>
+#include <errno.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -160,3 +161,11 @@ void ntcp_test_check_scheduled(uint64_t value, unsigned length) {
     }
     rte_pktmbuf_free(m);
 }
+
+// Read-only independent observation of the real borrowed ring port.
+int ntcp_test_mtu(uint16_t port) {
+    uint16_t mtu;
+    int result = rte_eth_dev_get_mtu(port, &mtu);
+    return result < 0 ? result : mtu;
+}
+int ntcp_test_emsgsize(void) { return EMSGSIZE; }

@@ -7,6 +7,8 @@ use ntcp_io_dpdk::{Dpdk, MAX_PACKET_LEN};
 use std::ffi::c_void;
 
 unsafe extern "C" {
+    fn ntcp_test_mtu(port: u16) -> i32;
+    fn ntcp_test_emsgsize() -> i32;
     fn ntcp_test_init() -> i32;
     fn ntcp_test_pool() -> *mut c_void;
     fn ntcp_test_available() -> u32;
@@ -42,9 +44,20 @@ fn real_ring_pmd_copy_and_ownership() {
         {
             let mut io = Dpdk::from_borrowed(port as u16, 0, 0, pool).unwrap();
             assert_eq!(io.layer(), PacketLayer::Ethernet);
+            assert_eq!(io.max_packet_len(), Some(MAX_PACKET_LEN));
+            let mtu = ntcp_test_mtu(port as u16);
+            assert!(mtu > 0);
+            assert_eq!(io.local_ip_mtu().unwrap(), Some(mtu as u32));
+            assert_ne!(mtu as usize, MAX_PACKET_LEN);
             assert_eq!(io.receive(&mut out).unwrap(), None);
             assert!(io.transmit(&[]).is_err());
-            assert!(io.transmit(&vec![0; MAX_PACKET_LEN + 1]).is_err());
+            assert_eq!(
+                io.transmit(&vec![0; MAX_PACKET_LEN + 1])
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(ntcp_test_emsgsize())
+            );
+            assert_eq!(ntcp_test_tx_count(), 0);
             assert_eq!(ntcp_test_available(), 1023);
 
             let clock = ClockDescriptor {

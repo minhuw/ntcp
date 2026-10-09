@@ -7,6 +7,10 @@
 #include <rte_mbuf_dyn.h>
 #include <rte_errno.h>
 
+int ntcp_dpdk_get_mtu(uint16_t port, uint16_t *mtu) {
+    return rte_eth_dev_get_mtu(port, mtu);
+}
+
 int ntcp_dpdk_valid_port(uint16_t port) {
     return rte_eth_dev_is_valid_port(port);
 }

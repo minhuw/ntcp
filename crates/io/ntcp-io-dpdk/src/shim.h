@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #define NTCP_DPDK_MAX_PACKET_LEN 65535u
+int ntcp_dpdk_get_mtu(uint16_t port, uint16_t *mtu);
 int ntcp_dpdk_valid_port(uint16_t port);
 int ntcp_dpdk_tx_timestamp_lookup(int *offset, uint64_t *flag);
 int ntcp_dpdk_tx_scheduling_check(uint16_t port, uint16_t queue);

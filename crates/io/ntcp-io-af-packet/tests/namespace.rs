@@ -107,11 +107,33 @@ fn isolated_roundtrips() {
     ip(&["link", "set", "nio-b", "up"]);
     let mut a = AfPacket::bind(index("nio-a"), 0x88b5).unwrap();
     let mut b = AfPacket::bind(index("nio-b"), 0x88b5).unwrap();
+    assert_eq!(a.local_ip_mtu().unwrap(), Some(1500));
+    assert_eq!(a.max_packet_len(), None);
+    ip(&["link", "set", "nio-a", "mtu", "1400"]);
+    assert_eq!(a.local_ip_mtu().unwrap(), Some(1400));
+    ip(&["link", "set", "nio-a", "name", "nio-renamed"]);
+    assert_eq!(a.local_ip_mtu().unwrap(), Some(1400));
+    ip(&["link", "set", "nio-renamed", "name", "nio-a"]);
+    ip(&["link", "set", "nio-a", "mtu", "1500"]);
+    assert_eq!(a.local_ip_mtu().unwrap(), Some(1500));
     let mut frame = [0x5a; 64];
     frame[..6].fill(0xff);
     frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 1]);
     frame[12..14].copy_from_slice(&0x88b5u16.to_be_bytes());
     let mut out = [0; 2048];
+    // Live MTU counts IP bytes; untagged frame allowance adds exactly 14.
+    ip(&["link", "set", "nio-a", "mtu", "1400"]);
+    let mut large = vec![0; 1415];
+    large[..frame.len()].copy_from_slice(&frame);
+    assert_eq!(
+        a.transmit(&large).unwrap_err().raw_os_error(),
+        Some(libc::EMSGSIZE)
+    );
+    assert_eq!(b.receive(&mut out).unwrap(), None);
+    assert_eq!(a.transmit(&large[..1414]).unwrap(), TxOutcome::Submitted);
+    ready(b.as_raw_fd());
+    assert_eq!(b.receive(&mut out).unwrap(), Some(1414));
+    ip(&["link", "set", "nio-a", "mtu", "1500"]);
     assert_eq!(a.transmit(&frame).unwrap(), TxOutcome::Submitted);
     ready(b.as_raw_fd());
     assert_eq!(b.receive(&mut out).unwrap(), Some(frame.len()));
@@ -185,10 +207,26 @@ fn isolated_roundtrips() {
         incompatible_tun(name, flags as libc::c_short);
     }
 
+    ip(&["link", "add", "nio-gone", "type", "dummy"]);
+    let gone = AfPacket::bind(index("nio-gone"), 0x88b5).unwrap();
+    assert!(gone.local_ip_mtu().unwrap().is_some());
+    ip(&["link", "del", "nio-gone"]);
+    assert_eq!(
+        gone.local_ip_mtu().unwrap_err().raw_os_error(),
+        Some(libc::ENODEV)
+    );
+
     assert!(Tun::open("nio-missing").is_err());
     assert_eq!(index("nio-missing"), 0);
     assert!(Tun::open("nio-a").is_err()); // reject an existing non-TUN interface
     let created = Tun::create("nio-new").unwrap();
+    assert_eq!(created.max_packet_len(), None);
+    ip(&["link", "set", "nio-new", "mtu", "1400"]);
+    assert_eq!(created.local_ip_mtu().unwrap(), Some(1400));
+    ip(&["link", "set", "nio-new", "name", "nio-renamed"]);
+    ip(&["link", "set", "nio-renamed", "mtu", "9000"]);
+    assert_eq!(created.local_ip_mtu().unwrap(), Some(9000));
+    ip(&["link", "set", "nio-renamed", "name", "nio-new"]);
     assert_eq!(created.name(), "nio-new");
     drop(created);
     assert_eq!(index("nio-new"), 0);

@@ -9,6 +9,7 @@ use std::{ffi::c_void, io, marker::PhantomData, ptr::NonNull, rc::Rc};
 pub const MAX_PACKET_LEN: usize = 65_535;
 
 unsafe extern "C" {
+    fn ntcp_dpdk_get_mtu(port: u16, mtu: *mut u16) -> i32;
     fn ntcp_dpdk_tx_scheduling_check(port: u16, queue: u16) -> i32;
     fn ntcp_dpdk_tx_timestamp_lookup(offset: *mut i32, flag: *mut u64) -> i32;
     fn ntcp_dpdk_valid_port(port: u16) -> i32;
@@ -221,6 +222,22 @@ impl Dpdk {
 // Keep the default Unsupported TX timestamp methods: SEND_ON_TIMESTAMP is
 // launch scheduling, and timesync TX targets PTP, not ordinary TCP completion.
 impl PacketIo for Dpdk {
+    fn local_ip_mtu(&self) -> io::Result<Option<u32>> {
+        let mut mtu = 0;
+        // SAFETY: borrowed port remains live; output is writable. No reconfiguration.
+        let result = unsafe { ntcp_dpdk_get_mtu(self.port, &mut mtu) };
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(-result));
+        }
+        if mtu == 0 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(Some(u32::from(mtu)))
+    }
+    fn max_packet_len(&self) -> Option<usize> {
+        Some(MAX_PACKET_LEN)
+    }
+
     fn layer(&self) -> PacketLayer {
         PacketLayer::Ethernet
     }

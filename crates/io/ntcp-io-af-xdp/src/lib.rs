@@ -24,6 +24,8 @@ pub struct Config {
     pub frame_count: u32,
     pub ring_size: u32,
     pub headroom: u32,
+    // Configured IP-sized copy budget, NOT the live interface MTU.
+    // The adapter frame cap adds 14 bytes; validation includes UMEM headroom.
     pub mtu: u32,
 }
 
@@ -554,7 +556,10 @@ impl AfXdp {
         result
     }
     fn transmit_one(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
-        if packet.is_empty() || packet.len() > (self.config.mtu + 14) as usize {
+        if packet.len() > self.max_packet_len().unwrap() {
+            return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
+        }
+        if packet.is_empty() {
             return Err(invalid("invalid transmit length"));
         }
         if !self.tx.has_space()? {
@@ -598,6 +603,14 @@ impl AsRawFd for AfXdp {
     }
 }
 impl PacketIo for AfXdp {
+    fn local_ip_mtu(&self) -> io::Result<Option<u32>> {
+        ntcp_io::linux::local_ip_mtu(self.config.ifindex)
+    }
+    fn max_packet_len(&self) -> Option<usize> {
+        // Config validation includes Ethernet header and UMEM/kernel headroom.
+        Some((self.config.mtu + 14) as usize)
+    }
+
     fn layer(&self) -> PacketLayer {
         PacketLayer::Ethernet
     }
@@ -613,6 +626,10 @@ impl PacketIo for AfXdp {
         result
     }
     fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
+        // Reject before service/kick or any descriptor publication.
+        if packet.len() > self.max_packet_len().unwrap() {
+            return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
+        }
         self.service()?;
         let result = self.transmit_one(packet);
         if result
@@ -717,6 +734,35 @@ mod tests {
             .unwrap()
         );
     }
+    #[test]
+    fn capacity_is_not_live_mtu_and_oversize_never_publishes() {
+        let mut a = adapter();
+        // Model rings/UMEM, but query a real loopback interface, not config.mtu.
+        a.config.ifindex = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
+        assert_ne!(a.config.ifindex, 0);
+        assert_eq!(
+            a.local_ip_mtu().unwrap(),
+            ntcp_io::linux::local_ip_mtu(a.config.ifindex).unwrap()
+        );
+        assert_eq!(a.max_packet_len(), Some(1514));
+        let before = a.tx.indices().unwrap();
+        let free = a.free.clone();
+        assert_eq!(
+            a.transmit(&[0; 1515]).unwrap_err().raw_os_error(),
+            Some(libc::EMSGSIZE)
+        );
+        assert_eq!(a.tx.indices().unwrap(), before);
+        assert_eq!(a.free, free);
+        assert!(!a.poisoned);
+        // Validated jumbo UMEM capacity remains a frame limit, including L2.
+        let jumbo = adapter_with_config(Config {
+            frame_size: 4096,
+            mtu: 3500,
+            ..config()
+        });
+        assert_eq!(jumbo.max_packet_len(), Some(3514));
+    }
+
     #[test]
     fn configuration_and_offset_validation() {
         assert!(config().validate().is_ok());

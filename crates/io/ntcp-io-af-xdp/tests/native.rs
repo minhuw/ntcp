@@ -79,6 +79,23 @@ fn copy_mode_roundtrip() {
         mtu: 1500,
     })
     .unwrap();
+    assert_eq!(xsk.local_ip_mtu().unwrap(), Some(1500));
+    assert_eq!(xsk.max_packet_len(), Some(1514));
+    for mtu in [1400, 1500] {
+        assert!(
+            std::process::Command::new("ip")
+                .args(["link", "set", "xdp-a", "mtu", &mtu.to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(xsk.local_ip_mtu().unwrap(), Some(mtu));
+        assert_eq!(xsk.max_packet_len(), Some(1514));
+    }
+    assert_eq!(
+        xsk.transmit(&[0; 1515]).unwrap_err().raw_os_error(),
+        Some(libc::EMSGSIZE)
+    );
     let key = 0u32;
     let fd = xsk.as_raw_fd();
     let attr = MapAttr {
