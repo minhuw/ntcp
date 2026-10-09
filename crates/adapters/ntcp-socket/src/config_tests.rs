@@ -1,21 +1,25 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 use super::*;
 
-const BASE: &str = "interface=ntcp0\naddress=10.73.0.2\n";
+const BASE: &str = "io.interface=ntcp0\nio.address=10.73.0.2\n";
 
 #[test]
 fn parser_and_typed_validation() {
     let default = SocketConfig::new("ntcp0", "10.73.0.2".parse().unwrap());
-    assert_eq!(SocketConfig::parse(BASE).unwrap(), default);
     assert_eq!(
-        SocketConfig::parse(&format!(" # comment\n\n {BASE}prefix = 24\n"))
+        format!("{:?}", SocketConfig::parse(BASE).unwrap()),
+        format!("{default:?}")
+    );
+    assert_eq!(
+        SocketConfig::parse(&format!(" # comment\n\n {BASE}io.prefix = 24\n"))
             .unwrap()
+            .io
             .prefix,
         Some(24)
     );
-    let config = SocketConfig::parse(&format!("{BASE}backend=af-packet\nnext_hop_mac=02:00:00:00:00:01\npacing=true\npacing_gain_percent=150\npacing_max_bytes_per_second=18446744073709551615\npacing_burst_segments=3")).unwrap();
+    let config = SocketConfig::parse(&format!("{BASE}io.backend=af-packet\nio.next_hop_mac=02:00:00:00:00:01\ntcp.pacing=true\ntcp.pacing_gain_percent=150\ntcp.pacing_max_bytes_per_second=18446744073709551615\ntcp.pacing_burst_segments=3")).unwrap();
     assert_eq!(
-        config.pacing_config().unwrap(),
+        config.tcp.connection.pacing.unwrap(),
         ntcp::PacingConfig {
             rate_gain_percent: 150,
             max_bytes_per_second: Some(u64::MAX),
@@ -24,30 +28,30 @@ fn parser_and_typed_validation() {
     );
     for suffix in [
         "unknown=x",
-        "interface=other",
-        "address=10.0.0.1",
-        "prefix=33",
-        "prefix=-1",
-        "prefix=+1",
-        "pacing=1",
-        "pacing=true # inline",
+        "io.interface=other",
+        "io.address=10.0.0.1",
+        "io.prefix=33",
+        "io.prefix=-1",
+        "io.prefix=+1",
+        "tcp.pacing=1",
+        "tcp.pacing=true # inline",
         "[section]",
-        "backend=native",
-        "backend=af-packet",
-        "next_hop_mac=02:00:00:00:00:01",
-        "pacing_gain_percent=125",
-        "pacing_burst_segments=2",
-        "pacing_max_bytes_per_second=1",
-        "pacing=true\npacing_gain_percent=0",
-        "pacing=true\npacing_gain_percent=65536",
-        "pacing=true\npacing_max_bytes_per_second=0",
-        "pacing=true\npacing_max_bytes_per_second=18446744073709551616",
-        "pacing=true\npacing_burst_segments=0",
-        "pacing=true\npacing_burst_segments=4294967295",
-        "backend=af-packet\nnext_hop_mac=00:00:00:00:00:00",
-        "backend=af-packet\nnext_hop_mac=01:00:00:00:00:01",
-        "backend=af-packet\nnext_hop_mac=2:00:00:00:00:01",
-        "backend=af-packet\nnext_hop_mac=02:00:00:00:00:gg",
+        "io.backend=native",
+        "io.backend=af-packet",
+        "io.next_hop_mac=02:00:00:00:00:01",
+        "tcp.pacing_gain_percent=125",
+        "tcp.pacing_burst_segments=2",
+        "tcp.pacing_max_bytes_per_second=1",
+        "tcp.pacing=true\ntcp.pacing_gain_percent=0",
+        "tcp.pacing=true\ntcp.pacing_gain_percent=65536",
+        "tcp.pacing=true\ntcp.pacing_max_bytes_per_second=0",
+        "tcp.pacing=true\ntcp.pacing_max_bytes_per_second=18446744073709551616",
+        "tcp.pacing=true\ntcp.pacing_burst_segments=0",
+        "tcp.pacing=true\ntcp.pacing_burst_segments=4294967295",
+        "io.backend=af-packet\nio.next_hop_mac=00:00:00:00:00:00",
+        "io.backend=af-packet\nio.next_hop_mac=01:00:00:00:00:01",
+        "io.backend=af-packet\nio.next_hop_mac=2:00:00:00:00:01",
+        "io.backend=af-packet\nio.next_hop_mac=02:00:00:00:00:gg",
     ] {
         assert_eq!(
             SocketConfig::parse(&format!("{BASE}{suffix}"))
@@ -58,21 +62,25 @@ fn parser_and_typed_validation() {
         );
     }
     for text in [
-        "interface=ntcp0",
-        "address=10.73.0.2",
-        "interface=\"ntcp0\"\naddress=10.73.0.2",
-        "interface=ntcp0\naddress=::1",
-        "interface=ntcp0\naddress=127.0.0.1",
-        "interface=ntcp0\naddress=224.0.0.1",
+        "io.interface=ntcp0",
+        "io.address=10.73.0.2",
+        "io.interface=\"ntcp0\"\nio.address=10.73.0.2",
+        "io.interface=ntcp0\nio.address=::1",
+        "io.interface=ntcp0\nio.address=127.0.0.1",
+        "io.interface=ntcp0\nio.address=224.0.0.1",
     ] {
         assert!(SocketConfig::parse(text).is_err());
     }
     let mut typed = default;
-    typed.pacing_burst_segments = Some(2);
-    assert!(typed.validate().is_err());
-    typed.pacing = true;
+    typed.tcp.connection.pacing = Some(ntcp::PacingConfig::default());
     assert!(typed.validate().is_ok());
-    typed.pacing_burst_segments = Some(u32::MAX);
+    typed
+        .tcp
+        .connection
+        .pacing
+        .as_mut()
+        .unwrap()
+        .max_burst_segments = u32::MAX;
     assert!(typed.validate().is_err());
 }
 
@@ -81,8 +89,8 @@ fn bounded_regular_utf8_file() {
     let path = std::env::temp_dir().join(format!("ntcp-config-{}", std::process::id()));
     std::fs::write(&path, BASE).unwrap();
     assert_eq!(
-        SocketConfig::from_file(&path).unwrap(),
-        SocketConfig::parse(BASE).unwrap()
+        format!("{:?}", SocketConfig::from_file(&path).unwrap()),
+        format!("{:?}", SocketConfig::parse(BASE).unwrap())
     );
     std::fs::write(&path, [0xff]).unwrap();
     assert_eq!(
@@ -183,14 +191,17 @@ fn selection_subprocess() {
         "file" => {
             assert_eq!(classify(), 1);
             assert_eq!(
-                crate::CONFIG
-                    .get()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap(),
-                &config
+                format!(
+                    "{:?}",
+                    crate::CONFIG
+                        .get()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                ),
+                format!("{config:?}")
             );
             assert_eq!(
                 crate::configure(config).unwrap_err().raw_os_error(),
@@ -278,7 +289,10 @@ fn selection_subprocess() {
         }
         "invalid" => {
             let mut bad = config.clone();
-            bad.pacing_gain_percent = Some(0);
+            bad.tcp.connection.pacing = Some(ntcp::PacingConfig {
+                rate_gain_percent: 0,
+                ..Default::default()
+            });
             assert_eq!(
                 crate::configure(bad).unwrap_err().kind(),
                 io::ErrorKind::InvalidInput
@@ -365,4 +379,88 @@ fn packet_profile_ignores_production_configuration() {
     assert!(crate::CONFIG.get().is_none());
     assert_eq!(unsafe { crate::close(fd) }, 0);
     crate::packet_test::stop();
+}
+
+#[test]
+fn layering_order_defaults_and_adapter_constraints() {
+    let base = SocketConfig::parse(BASE).unwrap();
+    assert_eq!(base.tcp.max_connections, 512);
+    assert_eq!(base.tcp.max_listeners, 512);
+    assert_eq!(base.tcp.max_control_packets, 512);
+    assert_eq!(base.tcp.max_buffer_bytes, 128 * 1024 * 1024);
+    assert_eq!(base.tcp.connection.send_capacity, 65536);
+    assert_eq!(base.tcp.connection.receive_capacity, 65536);
+    assert_eq!(base.tcp.connection.mss, 1460);
+    assert_eq!(base.tcp.connection.send_ip_payload_limit, 1480);
+    assert_eq!(base.tcp.connection.receive_ip_payload_limit, 65515);
+    assert_eq!(base.tcp.connection.pacing, None);
+    for tuning in [
+        "tcp.pacing_gain_percent=150",
+        "tcp.pacing_burst_segments=3",
+        "tcp.pacing_max_bytes_per_second=4000",
+    ] {
+        for enabled in ["true", "false"] {
+            for suffix in [
+                format!("{tuning}\ntcp.pacing={enabled}"),
+                format!("tcp.pacing={enabled}\n{tuning}"),
+            ] {
+                assert_eq!(
+                    SocketConfig::parse(&format!("{BASE}{suffix}")).is_ok(),
+                    enabled == "true"
+                );
+            }
+        }
+    }
+    for key in [
+        "backend",
+        "interface",
+        "address",
+        "prefix",
+        "next_hop_mac",
+        "pacing",
+        "pacing_gain_percent",
+        "pacing_burst_segments",
+        "pacing_max_bytes_per_second",
+    ] {
+        assert!(SocketConfig::parse(&format!("{BASE}{key}=1")).is_err());
+    }
+    let invalid: &[fn(&mut SocketConfig)] = &[
+        |c| c.tcp.connection.timebase.units_per_second = 1_000_000_000,
+        |c| c.tcp.connection.send_ip_payload_limit = 1481,
+        |c| c.tcp.connection.receive_ip_payload_limit = 65516,
+        |c| c.tcp.ipv4_options_enabled = true,
+        |c| c.tcp.max_connections = 513,
+        |c| c.tcp.max_listeners = 513,
+        |c| c.tcp.preallocate_connections = 513,
+        |c| {
+            c.tcp.preallocate_connections = 1;
+            c.tcp.max_buffer_bytes = 1;
+        },
+        |c| c.tcp.connection.send_capacity = 0,
+        |c| c.tcp.connection.rto_min_us = 0,
+        |c| c.tcp.connection.tlp = true,
+        |c| c.tcp.dscp = 64,
+        |c| {
+            c.tcp.connection.keepalive = Some(ntcp::KeepaliveConfig {
+                idle_us: 1,
+                ..Default::default()
+            })
+        },
+        |c| {
+            c.tcp.connection.keepalive = Some(ntcp::KeepaliveConfig {
+                send_garbage: true,
+                ..Default::default()
+            })
+        },
+    ];
+    for mutate in invalid {
+        let mut c = base.clone();
+        mutate(&mut c);
+        assert!(c.validate().is_err(), "{c:?}");
+    }
+    let mut ethernet = base.clone();
+    ethernet.io.backend = Backend::AfPacket;
+    ethernet.io.next_hop_mac = Some([2, 0, 0, 0, 0, 1]);
+    assert!(ethernet.validate().is_ok());
+    assert_eq!(format!("{:?}", ethernet.tcp), format!("{:?}", base.tcp));
 }

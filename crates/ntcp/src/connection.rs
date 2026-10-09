@@ -233,6 +233,43 @@ impl Default for KeepaliveConfig {
 }
 
 impl ConnectionConfig {
+    pub fn validate(&self, ipv4: bool) -> Result<(), Error> {
+        if !self.valid_timestamp_timebase()
+            || !self.valid_pacing()
+            || self.timestamp_bytes_per_tick == 0
+            || self.timestamp_bytes_per_tick >= 1 << 31
+            || (self.tlp && (!self.rack || !self.sack))
+            || !(1..=60_000_000).contains(&self.rto_min_us)
+            || self.send_capacity == 0
+            || self.send_capacity >= 1 << 30
+            || self.receive_capacity == 0
+            || self.receive_capacity > (65535usize << 14)
+            || self.receive_ip_payload_limit < 21
+            || self.send_ip_payload_limit < self.minimum_send_budget()
+            || self.mss == 0
+            || self.mss > if ipv4 { 65495 } else { 65515 }
+            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.3
+            //= reason=Configuration rejects delays of 500 ms or more; the driver must service deadlines.
+            //# A TCP endpoint SHOULD implement a delayed ACK (SHLD-18), but an ACK
+            //# should not be excessively delayed; in particular, the delay MUST be less
+            //# than 0.5 seconds (MUST-40).
+            || self.delayed_ack_us >= 500_000
+            || self.challenge_ack_limit == 0
+            || self.challenge_ack_interval_us == 0
+            || self.user_timeout_us == 0
+            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.2
+            //# For this specification the MSL is taken to be 2 minutes.
+            || self.time_wait_us < 240_000_000
+            || self.time_wait_us < 2 * self.timebase.max_segment_lifetime_us
+            || self
+                .keepalive
+                .is_some_and(|k| k.idle_us == 0 || k.interval_us == 0 || k.probes < 2)
+        {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
+    }
+
     pub(crate) fn valid_pacing(&self) -> bool {
         self.pacing.is_none_or(|p| {
             p.rate_gain_percent != 0
@@ -650,38 +687,8 @@ impl Connection {
         now: Instant,
         receive: &mut Option<ReceiveBuffer>,
     ) -> Result<Self, Error> {
-        if !config.valid_timestamp_timebase()
-            || !config.valid_pacing()
-            || config.timestamp_bytes_per_tick == 0
-            || config.timestamp_bytes_per_tick >= 1 << 31
-            || (config.tlp && (!config.rack || !config.sack))
-            || !(1..=60_000_000).contains(&config.rto_min_us)
-            || config.send_capacity == 0
-            || config.send_capacity >= 1 << 30
-            || config.receive_capacity == 0
-            || config.receive_capacity > (65535usize << 14)
-            || config.receive_ip_payload_limit < 21
-            || config.send_ip_payload_limit < config.minimum_send_budget()
-            || config.mss == 0
-            || config.mss > if tuple.local.is_ipv4() { 65495 } else { 65515 }
-            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.3
-            //= reason=Configuration rejects delays of 500 ms or more; the driver must service deadlines.
-            //# A TCP endpoint SHOULD implement a delayed ACK (SHLD-18), but an ACK
-            //# should not be excessively delayed; in particular, the delay MUST be less
-            //# than 0.5 seconds (MUST-40).
-            || config.delayed_ack_us >= 500_000
-            || config.challenge_ack_limit == 0
-            || config.challenge_ack_interval_us == 0
-            || config.user_timeout_us == 0
-            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4.2
-            //# For this specification the MSL is taken to be 2 minutes.
-            || config.time_wait_us < 240_000_000
-            || config.time_wait_us < 2 * config.timebase.max_segment_lifetime_us
-            || tuple.local.is_ipv4() != tuple.remote.is_ipv4()
-            || config
-                .keepalive
-                .is_some_and(|k| k.idle_us == 0 || k.interval_us == 0 || k.probes < 2)
-        {
+        config.validate(tuple.local.is_ipv4())?;
+        if tuple.local.is_ipv4() != tuple.remote.is_ipv4() {
             return Err(Error::InvalidArgument);
         }
         // Non-jumbo family limits include the TCP header, not the IP header.

@@ -65,6 +65,51 @@ pub struct EndpointConfig {
     pub connection: ConnectionConfig,
 }
 
+impl EndpointConfig {
+    pub fn validate(&self) -> Result<(), EndpointError> {
+        if !(1..=1_024).contains(&self.max_setup_cache_entries)
+            || !self.connection.valid_timestamp_timebase()
+            || !self.connection.valid_pacing()
+            || self.connection.time_wait_us < 240_000_000
+            || self.connection.time_wait_us < 2 * self.connection.timebase.max_segment_lifetime_us
+            || self.connection.timestamp_bytes_per_tick == 0
+            || self.connection.timestamp_bytes_per_tick >= 1 << 31
+            || self.connection.challenge_ack_limit == 0
+            || self.connection.challenge_ack_interval_us == 0
+            || self.max_connections == 0
+            || self.connection.send_ip_payload_limit < self.connection.minimum_send_budget()
+            || self.max_listeners == 0
+            || self.hop_limit == 0
+            || self.dscp > 63
+        {
+            return Err(Error::InvalidArgument.into());
+        }
+        self.preallocation_bytes()?;
+        Ok(())
+    }
+
+    fn preallocation_bytes(&self) -> Result<(usize, usize), EndpointError> {
+        // The existing conservative 3*receive charge covers payload, the
+        // 2-bit presence/PUSH map and the new 1-bit pending-report map.
+        // Sender interval storage is a separate additive admission charge.
+        let per_connection_bytes = Connection::allocation_bytes(
+            self.connection.send_capacity,
+            self.connection.receive_capacity,
+            usize::from(self.connection.mss),
+        )
+        .ok_or(EndpointError::LimitReached)?;
+        if self.preallocate_connections > self.max_connections {
+            return Err(EndpointError::LimitReached);
+        }
+        let buffer_bytes = self
+            .preallocate_connections
+            .checked_mul(per_connection_bytes)
+            .filter(|&bytes| bytes <= self.max_buffer_bytes)
+            .ok_or(EndpointError::LimitReached)?;
+        Ok((per_connection_bytes, buffer_bytes))
+    }
+}
+
 impl Default for EndpointConfig {
     fn default() -> Self {
         Self {
@@ -316,24 +361,7 @@ impl Endpoint {
         now: Instant,
         address_policy: F,
     ) -> Result<Self, EndpointError> {
-        if !(1..=1_024).contains(&config.max_setup_cache_entries)
-            || !config.connection.valid_timestamp_timebase()
-            || !config.connection.valid_pacing()
-            || config.connection.time_wait_us < 240_000_000
-            || config.connection.time_wait_us
-                < 2 * config.connection.timebase.max_segment_lifetime_us
-            || config.connection.timestamp_bytes_per_tick == 0
-            || config.connection.timestamp_bytes_per_tick >= 1 << 31
-            || config.connection.challenge_ack_limit == 0
-            || config.connection.challenge_ack_interval_us == 0
-            || config.max_connections == 0
-            || config.connection.send_ip_payload_limit < config.connection.minimum_send_budget()
-            || config.max_listeners == 0
-            || config.hop_limit == 0
-            || config.dscp > 63
-        {
-            return Err(Error::InvalidArgument.into());
-        }
+        config.validate()?;
         if config.ipv4_options_enabled {
             // ponytail: reserve all 40 IPv4 option bytes; per-packet budgeting can reclaim slack later.
             config.connection.send_ip_payload_limit = config
@@ -353,23 +381,7 @@ impl Endpoint {
         let event_capacity = count
             .checked_add(listeners_count)
             .ok_or(EndpointError::LimitReached)?;
-        // The existing conservative 3*receive charge covers payload, the
-        // 2-bit presence/PUSH map and the new 1-bit pending-report map.
-        // Sender interval storage is a separate additive admission charge.
-        let per_connection_bytes = Connection::allocation_bytes(
-            config.connection.send_capacity,
-            config.connection.receive_capacity,
-            usize::from(config.connection.mss),
-        )
-        .ok_or(EndpointError::LimitReached)?;
-        if config.preallocate_connections > count {
-            return Err(EndpointError::LimitReached);
-        }
-        let buffer_bytes = config
-            .preallocate_connections
-            .checked_mul(per_connection_bytes)
-            .filter(|&bytes| bytes <= config.max_buffer_bytes)
-            .ok_or(EndpointError::LimitReached)?;
+        let (per_connection_bytes, buffer_bytes) = config.preallocation_bytes()?;
         let mut receive_pool = reserved_vec(config.preallocate_connections)?;
         for _ in 0..config.preallocate_connections {
             receive_pool.push(

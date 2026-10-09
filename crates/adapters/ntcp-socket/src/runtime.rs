@@ -116,12 +116,12 @@ impl Runtime {
         std::thread::spawn(move || {
             set_internal(true);
             let local = Ipv4Addr::new(10, 73, 0, 2);
-            let mut owner = Owner::with_pacing(
+            let mut owner = Owner::with_config(
                 local,
                 (Ipv4Addr::new(10, 73, 0, 1), 24),
                 [2; 32],
                 None,
-                None,
+                SocketConfig::new("test", local).tcp,
             )
             .unwrap();
             while let Ok(request) = rx.recv() {
@@ -142,7 +142,7 @@ impl Runtime {
     pub fn start(config: SocketConfig) -> Result<Self> {
         config.validate().map_err(|_| EINVAL)?;
         Self::spawn(
-            move || match config.backend {
+            move || match config.io.backend {
                 Backend::Tun => Owner::new(&config),
                 Backend::AfPacket => Owner::af_packet(&config),
             },
@@ -407,6 +407,7 @@ type ChildOptionsSnapshot = (ConnectionId, u64, u64, u64, (bool, bool, bool, u32
 
 struct Owner {
     endpoint: Endpoint,
+    defaults: EndpointConfig,
     tun: Option<Tun>,
     ethernet: Option<backend::EthernetBackend>,
     sockets: BTreeMap<u64, Socket>,
@@ -430,7 +431,8 @@ struct Owner {
 fn unicast(ip: Ipv4Addr) -> bool {
     ip.octets()[0] != 0 && ip.octets()[0] < 224 && !ip.is_loopback()
 }
-fn context(name: &str, local: Ipv4Addr, requested: Option<u8>) -> Result<(Ipv4Addr, u8)> {
+fn context(io: &crate::IoConfig) -> Result<(Ipv4Addr, u8)> {
+    let (name, local, requested) = (&io.interface, io.address, io.prefix);
     let mut list = ptr::null_mut();
     if unsafe { libc::getifaddrs(&mut list) } < 0 {
         return Err(errno());
@@ -481,10 +483,10 @@ fn context(name: &str, local: Ipv4Addr, requested: Option<u8>) -> Result<(Ipv4Ad
 }
 impl Owner {
     fn new(config: &SocketConfig) -> Result<Self> {
-        let name = &config.interface;
-        let local = config.address;
+        let name = &config.io.interface;
+        let local = config.io.address;
         let tun = Tun::open(name).map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
-        let subnet = context(name, local, config.prefix)?;
+        let subnet = context(&config.io)?;
         let mut secret = [0u8; 32];
         let mut offset = 0;
         while offset < secret.len() {
@@ -507,28 +509,16 @@ impl Owner {
             }
             offset += n as usize;
         }
-        Self::with_pacing(local, subnet, secret, Some(tun), config.pacing_config())
+        Self::with_config(local, subnet, secret, Some(tun), config.tcp.clone())
     }
-    fn with_pacing(
+    fn with_config(
         local: Ipv4Addr,
         (address, prefix): (Ipv4Addr, u8),
         secret: [u8; 32],
         tun: Option<Tun>,
-        pacing: Option<ntcp::PacingConfig>,
+        config: EndpointConfig,
     ) -> Result<Self> {
-        let mut config = EndpointConfig {
-            max_connections: LIMIT,
-            max_listeners: LIMIT,
-            max_control_packets: LIMIT,
-            max_buffer_bytes: 128 * 1024 * 1024,
-            ..EndpointConfig::default()
-        };
-        config.connection.pacing = pacing;
-        config.connection.receive_capacity = BYTES;
-        config.connection.send_capacity = BYTES;
-        config.connection.mss = crate::config::MSS;
-        config.connection.send_ip_payload_limit = 1480;
-        config.connection.receive_ip_payload_limit = 65515;
+        let defaults = config.clone();
         let valid = move |ip: IpAddr| {
             matches!(ip, IpAddr::V4(ip) if unicast(ip)
             && (prefix > 30 || u32::from(ip) != u32::from(address) | (u32::MAX.checked_shr(prefix as u32).unwrap_or(0))))
@@ -552,6 +542,7 @@ impl Owner {
         .map_err(engine)?;
         Ok(Self {
             endpoint,
+            defaults,
             tun,
             ethernet: None,
             sockets: BTreeMap::new(),
@@ -577,7 +568,13 @@ impl Owner {
     fn packet((local, profile): (Ipv4Addr, crate::packet_profile::Profile)) -> Result<Self> {
         // Deterministic key and synthetic address policy are explicit test-only
         // settings, never a production entropy source or TUN routing policy.
-        let mut owner = Self::with_pacing(local, (local, 32), [42; 32], None, None)?;
+        let mut owner = Self::with_config(
+            local,
+            (local, 32),
+            [42; 32],
+            None,
+            SocketConfig::new("test", local).tcp,
+        )?;
         owner.endpoint = Endpoint::new(
             crate::packet_profile::config(profile),
             [42; 32],
@@ -614,7 +611,20 @@ impl Owner {
             socket.send_capacity = config.connection.send_capacity;
             return socket;
         }
-        Socket::new(flags)
+        let mut socket = Socket::new(flags);
+        let c = &self.defaults.connection;
+        socket.send_capacity = c.send_capacity;
+        socket.receive_capacity = c.receive_capacity;
+        socket.nodelay = !c.nagle;
+        socket.tos = self.defaults.dscp << 2;
+        if let Some(k) = c.keepalive {
+            socket.keepalive = true;
+            socket.idle = (k.idle_us / 1_000_000) as i32;
+            socket.interval = (k.interval_us / 1_000_000) as i32;
+            socket.probes = k.probes as i32;
+        }
+        // TCP_USER_TIMEOUT is a separate application override, not core user_timeout_us.
+        socket
     }
     fn batch_time(&self) -> Option<u64> {
         #[cfg(feature = "packet-test")]
@@ -2057,12 +2067,12 @@ mod tests {
     include!("runtime_pacing_tests.rs");
     fn owner(last: u8) -> Owner {
         let local = Ipv4Addr::new(10, 73, 0, last);
-        Owner::with_pacing(
+        Owner::with_config(
             local,
             (Ipv4Addr::new(10, 73, 0, 1), 24),
             [last; 32],
             None,
-            None,
+            SocketConfig::new("test", local).tcp,
         )
         .unwrap()
     }

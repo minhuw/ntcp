@@ -56,15 +56,15 @@ pub(super) fn core_stamps(stamps: PacketTimestamps) -> ntcp::RxPacketTimestamps 
 }
 impl Owner {
     pub(super) fn af_packet(config: &SocketConfig) -> Result<Self> {
-        let name = &config.interface;
-        let local = config.address;
-        let subnet = context(name, local, config.prefix)?; // Identical address ownership and prefix policy to TUN.
+        let name = &config.io.interface;
+        let local = config.io.address;
+        let subnet = context(&config.io)?; // Identical address ownership and prefix policy to TUN.
         let name = CString::new(name.as_str()).map_err(|_| EINVAL)?;
         let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
         if index == 0 {
             return Err(errno());
         }
-        let next_hop = config.next_hop_mac.ok_or(EINVAL)?;
+        let next_hop = config.io.next_hop_mac.ok_or(EINVAL)?;
         let mut io = AfPacket::bind(index, ntcp_ip::ETHERTYPE_IPV4)
             .map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
         let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
@@ -123,7 +123,7 @@ impl Owner {
             }
             at += n as usize;
         }
-        let mut owner = Self::with_pacing(local, subnet, secret, None, config.pacing_config())?;
+        let mut owner = Self::with_config(local, subnet, secret, None, config.tcp.clone())?;
         owner.ethernet = Some(EthernetBackend {
             io: Box::new(io),
             local: hardware,

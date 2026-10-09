@@ -18,17 +18,19 @@ pub enum Backend {
     AfPacket,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct SocketConfig {
+    pub tcp: ntcp::EndpointConfig,
+    pub io: IoConfig,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IoConfig {
     pub backend: Backend,
     pub interface: String,
     pub address: Ipv4Addr,
     pub prefix: Option<u8>,
     pub next_hop_mac: Option<[u8; 6]>,
-    pub pacing: bool,
-    pub pacing_gain_percent: Option<u16>,
-    pub pacing_max_bytes_per_second: Option<u64>,
-    pub pacing_burst_segments: Option<u32>,
 }
 
 fn invalid() -> io::Error {
@@ -37,23 +39,34 @@ fn invalid() -> io::Error {
 
 impl SocketConfig {
     pub fn new(interface: impl Into<String>, address: Ipv4Addr) -> Self {
+        let mut tcp = ntcp::EndpointConfig {
+            max_connections: crate::runtime::LIMIT,
+            max_listeners: crate::runtime::LIMIT,
+            max_control_packets: crate::runtime::LIMIT,
+            max_buffer_bytes: 128 * 1024 * 1024,
+            ..ntcp::EndpointConfig::default()
+        };
+        tcp.connection.receive_capacity = crate::runtime::BYTES;
+        tcp.connection.send_capacity = crate::runtime::BYTES;
+        tcp.connection.mss = MSS;
+        tcp.connection.send_ip_payload_limit = 1480;
+        tcp.connection.receive_ip_payload_limit = 65515;
         Self {
-            backend: Backend::Tun,
-            interface: interface.into(),
-            address,
-            prefix: None,
-            next_hop_mac: None,
-            pacing: false,
-            pacing_gain_percent: None,
-            pacing_max_bytes_per_second: None,
-            pacing_burst_segments: None,
+            tcp,
+            io: IoConfig {
+                backend: Backend::Tun,
+                interface: interface.into(),
+                address,
+                prefix: None,
+                next_hop_mac: None,
+            },
         }
     }
 
     pub fn validate(&self) -> io::Result<()> {
-        if self.interface.is_empty()
-            || self.interface.len() >= libc::IFNAMSIZ
-            || self.interface.bytes().any(|b| {
+        if self.io.interface.is_empty()
+            || self.io.interface.len() >= libc::IFNAMSIZ
+            || self.io.interface.bytes().any(|b| {
                 b == 0
                     || b.is_ascii_whitespace()
                     || b == b'/'
@@ -62,47 +75,40 @@ impl SocketConfig {
                     || b == b'\''
                     || b == b'\\'
             })
-            || matches!(self.interface.as_str(), "." | "..")
-            || self.address.octets()[0] == 0
-            || self.address.octets()[0] >= 224
-            || self.address.is_loopback()
-            || self.prefix.is_some_and(|p| p > 32)
+            || matches!(self.io.interface.as_str(), "." | "..")
+            || self.io.address.octets()[0] == 0
+            || self.io.address.octets()[0] >= 224
+            || self.io.address.is_loopback()
+            || self.io.prefix.is_some_and(|p| p > 32)
         {
             return Err(invalid());
         }
-        match (self.backend, self.next_hop_mac) {
+        match (self.io.backend, self.io.next_hop_mac) {
             (Backend::Tun, None) => {}
             (Backend::AfPacket, Some(mac)) if mac != [0; 6] && mac[0] & 1 == 0 => {}
             _ => return Err(invalid()),
         }
-        if (!self.pacing
-            && (self.pacing_gain_percent.is_some()
-                || self.pacing_max_bytes_per_second.is_some()
-                || self.pacing_burst_segments.is_some()))
-            || self.pacing_gain_percent == Some(0)
-            || self.pacing_max_bytes_per_second == Some(0)
-            || self
-                .pacing_burst_segments
-                .is_some_and(|n| n == 0 || n.checked_mul(u32::from(MSS)).is_none())
+        self.tcp.validate().map_err(|_| invalid())?;
+        let c = &self.tcp.connection;
+        c.validate(true).map_err(|_| invalid())?;
+        // The owner clock, fixed frame size and descriptor registry are adapter constraints.
+        if self.tcp.ipv4_options_enabled // Native input strips/rejects IPv4 options.
+            || c.timebase.units_per_second != 1_000_000
+            || c.send_ip_payload_limit > 1480
+            || c.receive_ip_payload_limit > 65515
+            || self.tcp.max_connections > crate::runtime::LIMIT
+            || self.tcp.max_listeners > crate::runtime::LIMIT
+            || c.keepalive.is_some_and(|k| {
+                k.send_garbage || k.idle_us % 1_000_000 != 0
+                    || k.interval_us % 1_000_000 != 0
+                    || !(1..=32767).contains(&(k.idle_us / 1_000_000))
+                    || !(1..=32767).contains(&(k.interval_us / 1_000_000))
+                    || !(2..=127).contains(&k.probes)
+            })
         {
             return Err(invalid());
         }
         Ok(())
-    }
-
-    pub(crate) fn pacing_config(&self) -> Option<ntcp::PacingConfig> {
-        self.pacing.then(|| {
-            let defaults = ntcp::PacingConfig::default();
-            ntcp::PacingConfig {
-                rate_gain_percent: self
-                    .pacing_gain_percent
-                    .unwrap_or(defaults.rate_gain_percent),
-                max_bytes_per_second: self.pacing_max_bytes_per_second,
-                max_burst_segments: self
-                    .pacing_burst_segments
-                    .unwrap_or(defaults.max_burst_segments),
-            }
-        })
     }
 
     pub fn parse(text: &str) -> io::Result<Self> {
@@ -110,6 +116,9 @@ impl SocketConfig {
             return Err(invalid());
         }
         let mut config = Self::new("", Ipv4Addr::UNSPECIFIED);
+        let mut pacing_enabled = false;
+        let mut pacing = ntcp::PacingConfig::default();
+        let mut tuned = false;
         let mut seen = BTreeSet::new();
         for line in text.lines().map(str::trim) {
             if line.is_empty() || line.starts_with('#') {
@@ -121,17 +130,17 @@ impl SocketConfig {
                 return Err(invalid());
             }
             match key {
-                "backend" => {
-                    config.backend = match value {
+                "io.backend" => {
+                    config.io.backend = match value {
                         "tun" => Backend::Tun,
                         "af-packet" => Backend::AfPacket,
                         _ => return Err(invalid()),
                     }
                 }
-                "interface" => config.interface = value.into(),
-                "address" => config.address = value.parse().map_err(|_| invalid())?,
-                "prefix" => config.prefix = Some(number(value)?),
-                "next_hop_mac" => {
+                "io.interface" => config.io.interface = value.into(),
+                "io.address" => config.io.address = value.parse().map_err(|_| invalid())?,
+                "io.prefix" => config.io.prefix = Some(number(value)?),
+                "io.next_hop_mac" => {
                     let mut mac = [0; 6];
                     let fields: Vec<_> = value.split(':').collect();
                     if fields.len() != 6 {
@@ -143,23 +152,34 @@ impl SocketConfig {
                         }
                         *byte = u8::from_str_radix(field, 16).map_err(|_| invalid())?;
                     }
-                    config.next_hop_mac = Some(mac);
+                    config.io.next_hop_mac = Some(mac);
                 }
-                "pacing" => {
-                    config.pacing = match value {
+                "tcp.pacing" => {
+                    pacing_enabled = match value {
                         "true" => true,
                         "false" => false,
                         _ => return Err(invalid()),
                     }
                 }
-                "pacing_gain_percent" => config.pacing_gain_percent = Some(number(value)?),
-                "pacing_max_bytes_per_second" => {
-                    config.pacing_max_bytes_per_second = Some(number(value)?)
+                "tcp.pacing_gain_percent" => {
+                    pacing.rate_gain_percent = number(value)?;
+                    tuned = true;
                 }
-                "pacing_burst_segments" => config.pacing_burst_segments = Some(number(value)?),
+                "tcp.pacing_max_bytes_per_second" => {
+                    pacing.max_bytes_per_second = Some(number(value)?);
+                    tuned = true;
+                }
+                "tcp.pacing_burst_segments" => {
+                    pacing.max_burst_segments = number(value)?;
+                    tuned = true;
+                }
                 _ => return Err(invalid()),
             }
         }
+        if tuned && !pacing_enabled {
+            return Err(invalid());
+        }
+        config.tcp.connection.pacing = pacing_enabled.then_some(pacing);
         config.validate()?;
         Ok(config)
     }
