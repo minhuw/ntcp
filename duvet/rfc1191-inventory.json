@@ -61,7 +61,7 @@
       "reason": "The IPv4 codec always sets DF; its ECN/DSCP matrix asserts 0x4000 with no fragment offset. Keeping DF is the selected TCP behavior, not optional clear-DF termination.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2",
       "evidence": [
-        "crates/ntcp-ip/src/lib.rs::fn encode_ipv4(",
+        "crates/ntcp-ip/src/ipv4.rs::pub(super) fn encode_ipv4(",
         "crates/ntcp/examples/tun_echo.rs::        fn ipv4_dscp_and_ecn_are_independent()"
       ]
     },
