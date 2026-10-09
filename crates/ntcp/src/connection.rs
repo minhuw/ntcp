@@ -7,6 +7,7 @@ use crate::{
     RxPacketTimestamps, RxReadTimestamps, SendProgress, TxStreamRange, TxTimestampClock,
     TxTimestampRequest, TxTimestampSource, TxTimestampStage,
     buffer::{ReceiveBuffer, SendBuffer},
+    output_reservation::Departure,
     pacing::Pacer,
     rack::Rack,
     recovery::{
@@ -590,6 +591,7 @@ pub(crate) struct Connection {
     acknowledged: u64,
     pub(crate) tx_timestamps: TxTimestamps,
     pub(crate) last_output_range: Option<TxStreamRange>,
+    pub(crate) last_departure: Option<Departure>,
     last_pmtu_output: Option<(Seq, Seq)>,
     pub(crate) rx_timestamps: RxTimestamps,
     input_timestamps: RxPacketTimestamps,
@@ -846,6 +848,7 @@ impl Connection {
             acknowledged: 0,
             tx_timestamps: TxTimestamps::default(),
             last_output_range: None,
+            last_departure: None,
             last_pmtu_output: None,
             rx_timestamps: RxTimestamps::default(),
             input_timestamps: RxPacketTimestamps::default(),
@@ -2004,6 +2007,102 @@ impl Connection {
         self.set_path_mss(mss.min(ceiling).min(budget));
     }
 
+    pub(crate) fn reserved_pacing_deadline(&self, now: Instant, d: &Departure) -> Option<Instant> {
+        if d.bypass || !d.stream {
+            return None;
+        }
+        if d.interval.is_some() {
+            self.general_pacing_deadline(now)
+        } else if d.legacy_rate.is_some() {
+            self.pacing_deadline.filter(|&deadline| now < deadline)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn accept_reserved_output(
+        &mut self,
+        now: Instant,
+        d: &mut Departure,
+        offset: usize,
+        count: usize,
+        finished: bool,
+    ) -> Result<(), Error> {
+        self.check_time(now)?;
+        if now < d.selected_at {
+            return Err(Error::TimeWentBackwards);
+        }
+        if d.stream && count != 0 && let Some(selection) = d.ledger {
+            let start = Seq(d.start).wrapping_add(offset as u32);
+            if !self.rack.commit_departure(selection, start, start.wrapping_add(count as u32), now) {
+                return Err(Error::InvalidArgument);
+            }
+        }
+        self.update_time(now)?;
+        // The encoded TSval names selection, not departure. A scalar covering
+        // this output is unsuitable even when it shares a tick with other output.
+        let end = Seq(d.start).wrapping_add(d.payload as u32 + u32::from(d.syn) + u32::from(d.fin));
+        if self.sample.is_some_and(|(edge, _)| edge == end) {
+            self.sample = None;
+        }
+        let sequence = count != 0 || d.syn || (d.fin && finished);
+        if d.stream && count != 0 {
+            self.last_sent = now;
+            if let Some(interval) = d.interval {
+                self.pacer.sent(now, count, interval);
+                self.pacing_deadline = self.general_pacing_deadline(now);
+            } else if let Some((rtt, cwnd)) = d.legacy_rate {
+                let spacing = (count as u128 * rtt as u128)
+                    .div_ceil(cwnd as u128).clamp(1, u64::MAX as u128) as u64;
+                // Bypass probes cannot erase debt belonging to earlier output.
+                self.pacing_deadline = Some(self.pacing_deadline.unwrap_or(now).max(now).saturating_add(spacing));
+            }
+        }
+        if d.fin && finished {
+            self.fin_sent_at = Some(now);
+        }
+        if sequence && d.rto {
+            let head = self.rack.head_transmission(self.snd_una).map(|(_, sent)| sent)
+                .or_else(|| (self.fin_sequence == Some(self.snd_una)).then_some(self.fin_sent_at).flatten());
+            self.rto_deadline = Some(head.unwrap_or(now).saturating_add(self.rto()));
+            // The first accepted sequence-bearing fragment owns this restart;
+            // later siblings must not defer that prefix's RTO.
+            d.rto = false;
+        }
+        if sequence && d.shrink {
+            self.shrink_unanswered_since = Some(now);
+            d.shrink = false;
+        }
+        if sequence && d.persist {
+            if d.unanswered {
+                self.persist_unanswered_since = Some(now);
+                d.unanswered = false;
+            }
+            if self.flight() != 0 {
+                self.rto_deadline = Some(now.saturating_add(self.persist_interval));
+            } else {
+                self.persist_deadline = Some(now.saturating_add(self.persist_interval));
+            }
+            d.persist = false;
+        }
+        if d.keepalive {
+            self.keepalive_deadline = self.config.keepalive
+                .map(|k| now.saturating_add(self.config.timebase.ticks_from_us(k.interval_us)));
+            d.keepalive = false;
+        }
+        if sequence && d.tlp {
+            if self.rto_deadline.is_some_and(|deadline| deadline <= now) {
+                // Local waiting cannot insert a new PTO ahead of an already
+                // expired older flight's RTO (PTO wins capped ties otherwise).
+                self.tlp_deadline = None;
+            } else {
+                self.schedule_tlp();
+            }
+        }
+        self.select_loss_timer();
+        Ok(())
+    }
+
     pub(crate) fn abandon_reserved_output(&mut self) {
         self.reject_reserved_output();
         self.pending_rst = None;
@@ -2201,7 +2300,7 @@ impl Connection {
     //= reason=Every input/transmit checks nondecreasing Instant, TSval derived by fixed selected local tick scaling (default milliseconds) modulo2^32; repeated Instant intentionally repeats TSval. Physical rate/precision remain caller obligations; endpoint timestamp half-range gap checks are separate.
     //# The PAWS mechanism also puts a strong monotonicity requirement on the
     //# sender's timestamp clock.
-    fn check_time(&self, now: Instant) -> Result<(), Error> {
+    pub(crate) fn check_time(&self, now: Instant) -> Result<(), Error> {
         if now < self.now {
             Err(Error::TimeWentBackwards)
         } else {
@@ -5674,6 +5773,15 @@ impl Connection {
         now: Instant,
         out: &mut [u8],
     ) -> Result<Option<usize>, Error> {
+        self.transmit_selected(now, out, false)
+    }
+
+    pub(crate) fn transmit_selected(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        reserve: bool,
+    ) -> Result<Option<usize>, Error> {
         self.check_time(now)?;
         // Plan entirely before encode. Even timer/clock/accounting changes
         // are committed only once the adapter has sufficient output space.
@@ -6817,6 +6925,25 @@ impl Connection {
                 Error::Wire(error)
             }
         })?;
+        self.last_departure = reserve.then_some(Departure {
+            selected_at: now,
+            start: seq.0,
+            payload: count,
+            stream: count != 0 && !syn && !keepalive,
+            syn,
+            fin: flags & FIN != 0,
+            rto: !keepalive && !probe && (count != 0 || syn || flags & FIN != 0)
+                && (self.rto_deadline.is_none() || retransmitted || tlp),
+            tlp: (fresh_data || new_fin) && !tlp,
+            persist: probe,
+            keepalive,
+            shrink: retransmit && self.shrink_unanswered_since.is_none()
+                && self.snd_wnd != 0 && self.flight() > self.snd_wnd,
+            unanswered: probe && self.persist_unanswered_since.is_none(),
+            bypass: probe || tlp || keepalive || syn
+                || (retransmit && self.consecutive_timeouts != 0 && self.prr.is_none()),
+            ..Departure::default()
+        });
         self.last_pmtu_output = None;
         if let Some(p) = &mut self.pmtud {
             if let Some((size, payload, trailing)) = pmtu_probe {
@@ -6959,6 +7086,9 @@ impl Connection {
                         && seq.distance_from(self.snd_una) < self.snd_wnd
                         && end.distance_from(self.snd_una) <= self.snd_wnd,
                 );
+            }
+            if let Some(departure) = &mut self.last_departure {
+                departure.ledger = self.rack.departure_selection();
             }
             if !self.rack.valid() {
                 self.prr = None;
@@ -7209,8 +7339,12 @@ impl Connection {
                 pacing.max_bytes_per_second,
                 self.config.timebase.units_per_second,
             );
-            self.pacer.sent(now, count, interval);
-            self.pacing_deadline = self.general_pacing_deadline(now);
+            if let Some(departure) = &mut self.last_departure {
+                departure.interval = Some(interval);
+            } else {
+                self.pacer.sent(now, count, interval);
+                self.pacing_deadline = self.general_pacing_deadline(now);
+            }
         } else if count != 0 && !syn && !keepalive && self.pacing_enabled() {
             // Commit after encode and congestion/idle accounting. Schedule from
             // this output, never from an expired deadline (no catch-up bursts).
@@ -7218,7 +7352,11 @@ impl Connection {
             let spacing = (count as u128 * rtt as u128)
                 .div_ceil(self.congestion.cwnd().max(1) as u128)
                 .clamp(1, u64::MAX as u128) as u64;
-            self.pacing_deadline = Some(now.saturating_add(spacing));
+            if let Some(departure) = &mut self.last_departure {
+                departure.legacy_rate = Some((rtt, self.congestion.cwnd().max(1)));
+            } else {
+                self.pacing_deadline = Some(now.saturating_add(spacing));
+            }
         }
         Ok(Some(size))
     }

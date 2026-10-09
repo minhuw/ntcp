@@ -23,8 +23,22 @@ fn endpoint() -> Endpoint {
 }
 
 fn pair() -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
+    paced_pair(None)
+}
+
+fn paced_pair(pacing: Option<bool>) -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
     let mut a = endpoint();
     let mut b = endpoint();
+    if let Some(general) = pacing {
+        a.config.connection.prr = !general;
+        a.config.connection.prr_algorithm = crate::PrrAlgorithm::Rfc9937;
+        if general {
+            a.config.connection.pacing = Some(crate::PacingConfig {
+                max_burst_segments: 1,
+                ..Default::default()
+            });
+        }
+    }
     let local = "192.0.2.1:40000".parse().unwrap();
     let remote = "192.0.2.2:8080".parse().unwrap();
     let listener = b.listen(remote, 4).unwrap();
@@ -82,7 +96,7 @@ fn reserved_data_fin_partial_acceptance_and_mutation_barrier() {
         a.set_endpoint_first_hop_mtu(3, 100).unwrap();
         assert!(a.reject_unsubmitted(attempt).unwrap());
         assert!(!a.reject_unsubmitted(attempt).unwrap());
-        assert!(!a.accept_transmit(attempt).unwrap());
+        assert!(!a.accept_transmit(a.now, attempt).unwrap());
         let mut total = 0;
         let mut n = 0;
         while a.reservation.current.is_some() {
@@ -99,11 +113,11 @@ fn reserved_data_fin_partial_acceptance_and_mutation_barrier() {
                 // Reject a later fragment after an accepted prefix, then lower again.
                 a.set_first_hop_mtu(3, id, 68).unwrap();
                 assert!(a.reject_unsubmitted(token).unwrap());
-                assert!(!a.accept_transmit(token).unwrap());
+                assert!(!a.accept_transmit(a.now, token).unwrap());
             } else {
                 b.input(3, p.ip, &bytes[..p.len]).unwrap();
-                assert!(a.accept_transmit(token).unwrap());
-                assert!(!a.accept_transmit(token).unwrap());
+                assert!(a.accept_transmit(a.now, token).unwrap());
+                assert!(!a.accept_transmit(a.now, token).unwrap());
                 total += count;
             }
             n += 1;
@@ -141,7 +155,7 @@ fn reserved_syn_reset_and_timestamp_cancellation() {
         wire::parse(p.ip, &bytes[..p.len]).unwrap().header.flags & (wire::ECE | wire::CWR),
         wire::ECE | wire::CWR,
     );
-    a.accept_transmit(token.unwrap()).unwrap();
+    a.accept_transmit(a.now, token.unwrap()).unwrap();
     assert!(a.poll_transmit(0, &mut bytes, 16).unwrap().packet.is_none());
 
     let (mut a, _, id, _) = pair();
@@ -175,7 +189,7 @@ fn reserved_syn_reset_and_timestamp_cancellation() {
     }
     let (out, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
     assert!(out.packet.unwrap().tx_timestamp.is_none());
-    a.accept_transmit(token.unwrap()).unwrap();
+    a.accept_transmit(a.now, token.unwrap()).unwrap();
     a.abort(id).unwrap();
     let (_, token) = a.poll_reserved_transmit(3, &mut bytes, 16).unwrap();
     a.reject_unsubmitted(token.unwrap()).unwrap();
@@ -187,7 +201,7 @@ fn reserved_syn_reset_and_timestamp_cancellation() {
         wire::parse(p.ip, &bytes[..p.len]).unwrap().header.flags & RST,
         0
     );
-    a.accept_transmit(token.unwrap()).unwrap();
+    a.accept_transmit(a.now, token.unwrap()).unwrap();
 }
 
 #[test]
@@ -240,7 +254,7 @@ fn reserved_ack_dsack_option_splitting_wrap_and_ordinal_exhaustion() {
         blocks.extend(s.options.sack_blocks.into_iter().flatten());
         total += s.payload.len() as u32;
         assert_eq!(s.header.flags & wire::FIN != 0, total == 20);
-        a.accept_transmit(token.unwrap()).unwrap();
+        a.accept_transmit(a.now, token.unwrap()).unwrap();
     }
     assert_eq!(blocks, [(10, 15), (20, 25), (30, 35), (40, 45)]);
     assert_eq!(total, 20);
@@ -277,7 +291,7 @@ fn reserved_real_ack_keeps_consumed_dsack() {
             .sack_blocks,
         blocks
     );
-    a.accept_transmit(token.unwrap()).unwrap();
+    a.accept_transmit(a.now, token.unwrap()).unwrap();
 }
 
 #[test]
@@ -333,7 +347,7 @@ fn reserved_above_ack_dsack_pair_packs_without_padding_at_ipv4_floor() {
         s.options.sack_blocks[..2],
         [Some((110, 120)), Some((105, 130))]
     );
-    a.accept_transmit(token.unwrap()).unwrap();
+    a.accept_transmit(a.now, token.unwrap()).unwrap();
 }
 
 #[test]
@@ -409,7 +423,7 @@ fn reserved_options_only_fragment_defers_ecn_and_cwr_until_actual_data() {
             cwr_packets += usize::from(s.header.flags & wire::CWR != 0);
             total += s.payload.len() as u32;
         }
-        a.accept_transmit(token).unwrap();
+        a.accept_transmit(a.now, token).unwrap();
     }
     assert_eq!((pure_acks, cwr_packets, total), (1, 1, 40));
 }
@@ -429,7 +443,7 @@ fn reserved_released_reset_owner_and_listener_cleanup_can_repair() {
         wire::parse(p.ip, &bytes[..p.len]).unwrap().header.flags & RST,
         0
     );
-    assert!(a.accept_transmit(token.unwrap()).unwrap());
+    assert!(a.accept_transmit(a.now, token.unwrap()).unwrap());
     assert!(a.connection_exists(id)); // Retained for reset tuple protection.
 
     let mut a = endpoint();
@@ -458,7 +472,7 @@ fn reserved_released_reset_owner_and_listener_cleanup_can_repair() {
         wire::parse(p.ip, &bytes[..p.len]).unwrap().header.flags & RST,
         0
     );
-    b.accept_transmit(token.unwrap()).unwrap();
+    b.accept_transmit(b.now, token.unwrap()).unwrap();
 }
 
 #[test]
@@ -557,7 +571,7 @@ fn reserved_abandon_accepted_prefix_encode_error_and_stateless_discard() {
     let p = out.packet.unwrap();
     let prefix = prefix.unwrap();
     b.input(2, p.ip, &bytes[..p.len]).unwrap();
-    a.accept_transmit(prefix).unwrap();
+    a.accept_transmit(a.now, prefix).unwrap();
     assert_eq!(b.readable_bytes(peer).unwrap(), 28);
     assert!(a.poll_reserved_transmit(2, &mut [], 16).is_err());
     assert!(!a.abandon_transmit(first).unwrap());
@@ -585,4 +599,95 @@ fn reserved_abandon_accepted_prefix_encode_error_and_stateless_discard() {
     assert!(b.abandon_transmit(token).unwrap());
     assert!(!b.abandon_transmit(token).unwrap());
     assert!(!b.has_pending_output());
+}
+
+#[test]
+fn review_repro_delayed_acceptance_must_not_timeout() {
+    let (mut a, _, id, _) = pair();
+    a.write(id, &[1; 100]).unwrap();
+    let mut bytes = [0; 2048];
+    let (_, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
+    a.reject_unsubmitted(token.unwrap()).unwrap();
+    let (_, token) = a.poll_reserved_transmit(2_000_002, &mut bytes, 16).unwrap();
+    a.accept_transmit(2_000_002, token.unwrap()).unwrap();
+    let cwnd = a.transport_info(id).unwrap().cwnd;
+    a.on_timeout(2_000_002, 16).unwrap();
+    assert_eq!(a.transport_info(id).unwrap().cwnd, cwnd, "local wait must not cause congestion response");
+    assert!(a.poll_transmit(2_000_002, &mut bytes, 16).unwrap().packet.is_none());
+}
+
+#[test]
+fn review_repro_delayed_acceptance_must_charge_actual_departure() {
+    for general in [false, true] {
+        let (mut a, _, id, _) = paced_pair(Some(general));
+        let mut bytes = [0; 2048];
+        a.write(id, &[1; 2000]).unwrap();
+        let (_, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
+        a.reject_unsubmitted(token.unwrap()).unwrap();
+        let (_, token) = a.poll_reserved_transmit(2_000_002, &mut bytes, 16).unwrap();
+        a.accept_transmit(2_000_002, token.unwrap()).unwrap();
+        assert!(a.poll_transmit(2_000_002, &mut bytes, 16).unwrap().packet.is_none(), "general={general}: local repair must leave departure pacing debt");
+    }
+}
+
+#[test]
+fn reserved_acceptance_time_validation_is_atomic_and_tokens_are_single_use() {
+    for late in [2, 2_000_002] {
+        let (mut a, _, id, _) = pair();
+        a.write(id, &[1; 100]).unwrap();
+        let mut bytes = [0; 2048];
+        let (_, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
+        let token = token.unwrap();
+        let progress = a.send_progress(id).unwrap();
+        assert_eq!(a.accept_transmit(1, token), Err(Error::TimeWentBackwards.into()));
+        assert_eq!(a.now, 2);
+        assert_eq!(a.send_progress(id).unwrap(), progress);
+        assert_eq!(a.reservation.current.as_ref().unwrap().attempt, Some(token));
+        a.config.connection.timestamps = true;
+        assert_eq!(a.accept_transmit(u64::MAX, token), Err(Error::AmbiguousTimeJump.into()));
+        assert_eq!(a.now, 2);
+        assert_eq!(a.reservation.current.as_ref().unwrap().attempt, Some(token));
+        assert!(a.accept_transmit(late, token).unwrap());
+        assert!(!a.accept_transmit(u64::MAX, token).unwrap());
+        assert!(!a.reject_unsubmitted(token).unwrap());
+        assert_eq!(a.now, late);
+        let cwnd = a.transport_info(id).unwrap().cwnd;
+        a.on_timeout(late, 16).unwrap();
+        assert_eq!(a.transport_info(id).unwrap().cwnd, cwnd);
+        assert!(a.poll_transmit(late, &mut bytes, 16).unwrap().packet.is_none());
+    }
+}
+
+#[test]
+fn reserved_pacing_gates_each_fragment_and_late_acceptance_has_no_catchup() {
+    for general in [false, true] {
+        let (mut a, _, id, _) = paced_pair(Some(general));
+        a.write(id, &[1; 2000]).unwrap();
+        let mut bytes = [0; 2048];
+        let (_, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
+        a.set_first_hop_mtu(3, id, 200).unwrap();
+        a.reject_unsubmitted(token.unwrap()).unwrap();
+        let mut now = 2_000_002;
+        let mut total = 0;
+        while a.reservation.current.is_some() {
+            let (out, token) = a.poll_reserved_transmit(now, &mut bytes, 16).unwrap();
+            let p = out.packet.unwrap();
+            let n = wire::parse(p.ip, &bytes[..p.len]).unwrap().payload.len();
+            assert!(n > 0 && n <= 160);
+            total += n;
+            // Backend wait is not idle pacing credit for the accepted bytes.
+            now += 2_000_000;
+            a.accept_transmit(now, token.unwrap()).unwrap();
+            if a.reservation.current.is_some() {
+                let (out, token) = a.poll_reserved_transmit(now, &mut bytes, 16).unwrap();
+                assert!(out.packet.is_none() && token.is_none(), "general={general}");
+                let deadline = a.next_deadline().unwrap();
+                assert!(deadline > now);
+                assert!(a.poll_reserved_transmit(deadline - 1, &mut bytes, 16).unwrap().0.packet.is_none());
+                now = deadline;
+            }
+        }
+        assert_eq!(total, 1000);
+        assert!(a.poll_transmit(now, &mut bytes, 16).unwrap().packet.is_none(), "general={general}");
+    }
 }

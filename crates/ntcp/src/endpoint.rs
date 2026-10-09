@@ -2637,6 +2637,14 @@ impl Endpoint {
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
+        if let Some(r) = &self.reservation.current {
+            if r.attempt.is_some() {
+                return None;
+            }
+            let d = r.departure.as_ref()?;
+            return self.retained_slot(r.packet.connection?).ok()?.connection
+                .reserved_pacing_deadline(self.now, d);
+        }
         self.deadlines.first().map(|(time, _)| time)
     }
     pub fn has_pending_output(&self) -> bool {
@@ -2723,8 +2731,16 @@ impl Endpoint {
                 .connection
                 .path_payload_limit();
             self.clock(now)?;
-            let attempt = self.reservation.token(connection)?;
             let packet = self.reservation.fragment(limit, out)?;
+            let r = self.reservation.current.as_ref().unwrap();
+            if r.emitted_bytes != 0
+                && let Some(d) = &r.departure
+                && self.retained_slot(connection.unwrap())?.connection
+                    .reserved_pacing_deadline(now, d).is_some()
+            {
+                return Ok((PollTransmit { packet: None, more_work: true }, None));
+            }
+            let attempt = self.reservation.token(connection)?;
             let r = self.reservation.current.as_mut().unwrap();
             r.attempt = Some(attempt);
             r.abandon_attempt = attempt;
@@ -2739,10 +2755,14 @@ impl Endpoint {
         // Reserve identity before selection: exhaustion must not consume output.
         let mut attempt = self.reservation.token(None)?;
         let capacity = out.len().min(self.reservation.bytes.len());
-        let output = self.poll_transmit(now, &mut out[..capacity], budget)?;
+        let output = self.poll_transmit_inner(now, &mut out[..capacity], budget, true)?;
         if let Some(packet) = output.packet {
             attempt.connection = packet.connection;
             self.reservation.capture(packet, out, attempt);
+            if let Some(id) = packet.connection {
+                let departure = self.retained_slot(id)?.connection.last_departure;
+                self.reservation.current.as_mut().unwrap().departure = departure;
+            }
             Ok((output, Some(attempt)))
         } else {
             Ok((output, None))
@@ -2751,20 +2771,39 @@ impl Endpoint {
 
     pub fn accept_transmit(
         &mut self,
+        now: Instant,
         attempt: crate::TransmitAttempt,
     ) -> Result<bool, EndpointError> {
-        let Some(r) = &mut self.reservation.current else {
+        let Some(r) = &self.reservation.current else {
             return Ok(false);
         };
         if r.attempt != Some(attempt) {
             return Ok(false);
         }
-        if r.finished {
+        let connection = r.packet.connection;
+        let (mut departure, offset, count, finished) = (
+            r.departure, r.offset,
+            if r.repaired { r.emitted_bytes } else { r.departure.map_or(0, |d| d.payload) },
+            r.finished,
+        );
+        if let Some(id) = connection {
+            self.retained_slot(id)?.connection.check_time(now)?;
+        }
+        self.clock(now)?;
+        if let Some(id) = connection && let Some(d) = &mut departure {
+            self.retained_slot_mut(id)?.connection.accept_reserved_output(now, d, offset, count, finished)?;
+        }
+        let r = self.reservation.current.as_mut().unwrap();
+        if finished {
             self.reservation.current = None;
         } else {
+            r.departure = departure;
             r.offset += r.emitted_bytes;
             r.sacks += r.emitted_sacks;
             r.attempt = None;
+        }
+        if let Some(id) = connection {
+            self.refresh(id.slot);
         }
         Ok(true)
     }
@@ -2834,6 +2873,16 @@ impl Endpoint {
         out: &mut [u8],
         budget: usize,
     ) -> Result<PollTransmit, EndpointError> {
+        self.poll_transmit_inner(now, out, budget, false)
+    }
+
+    fn poll_transmit_inner(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        budget: usize,
+        reserve: bool,
+    ) -> Result<PollTransmit, EndpointError> {
         if self.reservation.current.is_some() {
             return Err(EndpointError::OutputReserved);
         }
@@ -2890,7 +2939,12 @@ impl Endpoint {
             let slot = self.slots[index].as_mut().unwrap();
             let tuple = slot.connection.tuple();
             let terminal_reset = slot.connection.reset_pending();
-            match slot.connection.transmit(now, out) {
+            let output = if reserve {
+                slot.connection.transmit_selected(now, out, true)
+            } else {
+                slot.connection.transmit(now, out)
+            };
+            match output {
                 Ok(Some(len)) => {
                     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.5.2
                     //= reason=Terminal local reset reserves the tuple for 2MSL independently of immediate application CLOSED; only successful RST generation starts the timer.

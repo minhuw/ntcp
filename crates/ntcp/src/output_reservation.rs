@@ -1,6 +1,28 @@
 use alloc::vec::Vec;
 
-use crate::{ConnectionId, EndpointError, Error, Transmit, wire};
+use crate::{ConnectionId, EndpointError, Error, Instant, Transmit, wire};
+
+// Only physical-departure work; sequence, recovery and PRR charges stay selected.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Departure {
+    pub selected_at: Instant,
+    pub ledger: Option<crate::rack::DepartureSelection>,
+    pub start: u32,
+    pub payload: usize,
+    pub stream: bool,
+    pub syn: bool,
+    pub fin: bool,
+    pub rto: bool,
+    pub tlp: bool,
+    pub persist: bool,
+    pub keepalive: bool,
+    pub shrink: bool,
+    pub unanswered: bool,
+    pub bypass: bool,
+    pub interval: Option<u128>,
+    pub legacy_rate: Option<(u64, u32)>,
+}
+
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransmitAttempt {
@@ -24,6 +46,7 @@ pub(crate) struct ReservedOutput {
     pub emitted_sacks: usize,
     pub finished: bool,
     pub repaired: bool,
+    pub departure: Option<Departure>,
 }
 
 impl OutputReservation {
@@ -55,6 +78,7 @@ impl OutputReservation {
             emitted_sacks: 0,
             finished: true,
             repaired: false,
+            departure: None,
         });
     }
 
