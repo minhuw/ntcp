@@ -483,6 +483,37 @@ impl Pmtud {
     //= reason=Exact PTB half of the two-timer recommendation in parent 1191-013: accepted PTB holds upward probing for the recommended 600 seconds. The separate 2-minute post-success half is unselected, not covered by this evidence.
     //# 10 minutes
 
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-4
+    //= reason=IPv6 base-header wire test from 819b8f2 covers decode_icmp checksum, truncation, impossible quoted payload length and outer-destination rejection, then exact sent-ledger sequence/size validation and stale quotes after real receiver ACKs, idle or with new flight, including wrap. A valid minimal quote is accepted. Plausibility validation is not authentication against a knowledgeable attacker; no native IPv6 socket or extension-header claim.
+    //# Nodes should appropriately validate the payload of ICMPv6 PTB messages to ensure
+    //# these are received in response to transmitted traffic (i.e., a reported error
+    //# condition that corresponds to an IPv6 packet actually sent by the application)
+    //# per [ICMPv6].
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-4
+    //= reason=Enabled IPv6 core applies validated initial decreases and deliberately defers below-proven-delivery reports under the selected security policy. Test from 819b8f2 establishes proof with a real 1500-byte packet/receiver ACK, contrasts progress clearing with quoted-head RTO applying 1280, and verifies bounded wire repair and receiver ACK progress through wrap. No unconditional trust of PTB or native IPv6 socket claim.
+    //# the dropped packets they respond to) consume network resources, nodes using Path
+    //# MTU Discovery must detect decreases in PMTU as fast as possible.
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-4
+    //= reason=Pmtud::feedback rejects nondecreasing candidates. IPv6 base-header wire test from 819b8f2 supplies exact emitted-packet quotes with equal/larger MTUs (1500, 2000, UINT32_MAX), then repeats 1400/1500/2000 after an accepted 1400 decrease; estimates never increase, including wrapped sequence ranges. No native IPv6 socket or extension-header claim.
+    //# A node must not increase its estimate of the Path MTU in response to the
+    //# contents of a Packet Too Big message. A message purporting to announce an
+    //# increase in the Path MTU might be a stale packet that has been floating around
+    //# in the network, a false packet injected as part of a denial-of-service (DoS)
+    //# attack, or the result of having multiple paths to the destination, each with a
+    //# different PMTU.
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-6
+    //= reason=The strictly-decreasing feedback guard prevents the described increase attack. IPv6 base-header wire test from 819b8f2 rejects equal/larger MTUs before and after a valid decrease, including wrap. The hypothetical router round-trip is not claimed as a separate implemented behavior; no native IPv6 socket or extension-header claim.
+    //# In the second attack, the false message indicates a PMTU larger than reality. If
+    //# believed, this could cause temporary blockage as the victim sends packets that
+    //# will be dropped by some router. Within one round-trip time, the node would
+    //# discover its mistake (receiving Packet Too Big messages from that router), but
+    //# frequent repetition of this attack could cause lots of packets to be dropped. A
+    //# node, however, must not raise its estimate of the PMTU based on a Packet Too Big
+    //# message, so it should not be vulnerable to this attack.
+
     pub fn feedback(
         &mut self,
         now: Instant,
@@ -676,6 +707,16 @@ impl Pmtud {
     //# search_low. Normally, eff_pmtu will be greater than or equal to search_low and
     //# less than search_high. It is generally expected but not required that probe size
     //# will be greater than eff_pmtu.
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.1
+    //= reason=Pmtud::ack raises search_low only from fully cumulatively acknowledged, unambiguous ordinary sent packets within effective MTU, search_high and path bounds; explicit-probe overlap retains separate timeout/verification rules. Tests from 742e320 cover real ordinary ACKs in both families/wrap, retry ambiguity, partial ACK, local rejection, PTB/link ceilings, stale quotes, holdoff and probe timeout. Ordinary loss does not enter explicit probe-failure handling; mixed ordinary/explicit success preserves larger ordinary proof.
+    //# If eff_pmtu is larger than search_low, it is explicitly permitted to send
+    //# non-probe packets larger than search_low. When such a packet is acknowledged, it
+    //# is effectively an "implicit probe" and search_low SHOULD be raised to the size
+    //# of the acknowledged packet. However, if an "implicit probe" is lost, it MUST NOT
+    //# be treated as a probe failure as a true probe would be. If eff_pmtu is too
+    //# large, this condition will only be detected with ICMP PTB messages or black hole
+    //# discovery (see Section 7.7).
 
     pub fn ack(&mut self, ack: Seq, now: Instant, cooldown: u64, rto: u64) {
         if self.repair_range.is_some_and(|(_, end)| covered(ack, end)) {

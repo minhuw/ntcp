@@ -80,14 +80,6 @@ quote = '''
 Suppressed congestion control MUST be rate limited such that it occurs less frequently than the worst-case loss rate for TCP congestion control at a comparable data rate over the same path (i.e., less than the "TCP-friendly" loss rate [tcp-friendly]). This SHOULD be enforced by requiring a minimum headway between a suppressed congestion adjustment (due to a failed probe) and the next attempted probe, which is equal to one round-trip time for each packet permitted by the congestion window. This is discussed further in Section 7.6.2.
 '''
 
-# 4821-067
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
-reason = "Evidence gap / unproven reachability hazard: Congestion::set_mss clamps cwnd to new MSS and ssthresh to twice new MSS. No reachable PLPMTUD trace demonstrates an MTU-only byte-window increase; probe admission and ACK-driven growth must be accounted for before calling this an observed defect. The upward-rescale MUST remains open."
-quote = '''
-Whenever the MTU is raised, the congestion state variables MUST be rescaled so as not to raise the window size in bytes (or data rate in bytes per seconds).
-'''
-
 # 4821-069
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
@@ -230,14 +222,6 @@ target = "https://www.rfc-editor.org/rfc/rfc4821#section-6.2"
 reason = "Non-TCP padding/control/adjunct-protocol alternatives are not selected. TCP has only real-data probes; its segmentation obligations remain audited."
 quote = '''
 In a few cases, there may be no reasonable mechanisms to generate probes within the Packetization Layer protocol itself. As a last resort, it may be possible to rely on an adjunct protocol, such as ICMP ECHO ("ping"), to send probe packets. See Section 10.3 for further discussion of this approach.
-'''
-
-# 4821-111
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.1"
-reason = "Pmtud::ack updates max_acked for an unambiguous ordinary packet but never raises search_low from it. Only an explicit Probe changes search_low. The implicit-probe SHOULD is unmet; normal losses are not treated as explicit probe failures."
-quote = '''
-If eff_pmtu is larger than search_low, it is explicitly permitted to send non-probe packets larger than search_low. When such a packet is acknowledged, it is effectively an "implicit probe" and search_low SHOULD be raised to the size of the acknowledged packet. However, if an "implicit probe" is lost, it MUST NOT be treated as a probe failure as a true probe would be. If eff_pmtu is too large, this condition will only be detected with ICMP PTB messages or black hole discovery (see Section 7.7).
 '''
 
 # 4821-113

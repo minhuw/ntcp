@@ -515,9 +515,13 @@
       "id": "4821-067",
       "section": "4",
       "quote": "Whenever the MTU is raised, the congestion state variables MUST be rescaled so as not to raise the window size in bytes (or data rate in bytes per seconds).",
-      "status": "TODO",
-      "reason": "Evidence gap / unproven reachability hazard: Congestion::set_mss clamps cwnd to new MSS and ssthresh to twice new MSS. No reachable PLPMTUD trace demonstrates an MTU-only byte-window increase; probe admission and ACK-driven growth must be accounted for before calling this an observed defect. The upward-rescale MUST remains open.",
-      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4"
+      "status": "covered",
+      "reason": "Enabled PMTUD uses Congestion::set_path_mss: generic MSS unit bookkeeping is retained, but upward changes restore byte cwnd/ssthresh without changing pacing. Tests from 742e320 assert exact no-ACK header-budget growth after real data RTO for Reno and CUBIC, plus a real RTO/recovery/ordinary-ACK/upward-probe trace separating allowed ACK growth from MTU-only threshold inflation. This is not full CUBIC trajectory evidence or closure of unrelated ACK/MSS obligations.",
+      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+      "evidence": [
+        "crates/ntcp/src/recovery.rs::    pub(crate) fn set_path_mss(&mut self, mss: u32) {",
+        "crates/ntcp/src/pmtud_growth_tests.rs::fn pmtud_growth_header_budget_does_not_inflate_post_rto_byte_windows()"
+      ]
     },
     {
       "id": "4821-068",
@@ -897,9 +901,13 @@
       "id": "4821-111",
       "section": "7.1",
       "quote": "If eff_pmtu is larger than search_low, it is explicitly permitted to send non-probe packets larger than search_low. When such a packet is acknowledged, it is effectively an \"implicit probe\" and search_low SHOULD be raised to the size of the acknowledged packet. However, if an \"implicit probe\" is lost, it MUST NOT be treated as a probe failure as a true probe would be. If eff_pmtu is too large, this condition will only be detected with ICMP PTB messages or black hole discovery (see Section 7.7).",
-      "status": "TODO",
-      "reason": "Pmtud::ack updates max_acked for an unambiguous ordinary packet but never raises search_low from it. Only an explicit Probe changes search_low. The implicit-probe SHOULD is unmet; normal losses are not treated as explicit probe failures.",
-      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.1"
+      "status": "covered",
+      "reason": "Pmtud::ack raises search_low only from fully cumulatively acknowledged, unambiguous ordinary sent packets within effective MTU, search_high and path bounds; explicit-probe overlap retains separate timeout/verification rules. Tests from 742e320 cover real ordinary ACKs in both families/wrap, retry ambiguity, partial ACK, local rejection, PTB/link ceilings, stale quotes, holdoff and probe timeout. Ordinary loss does not enter explicit probe-failure handling; mixed ordinary/explicit success preserves larger ordinary proof.",
+      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.1",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn ack(&mut self, ack: Seq, now: Instant, cooldown: u64, rto: u64) {",
+        "crates/ntcp/src/pmtud_growth_tests.rs::fn pmtud_growth_ordinary_wire_ack_with_trailing_flight_and_legacy()"
+      ]
     },
     {
       "id": "4821-112",

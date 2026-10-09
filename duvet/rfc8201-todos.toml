@@ -56,30 +56,6 @@ quote = '''
 Note that Path MTU Discovery must be performed even in cases where a node "thinks" a destination is attached to the same link as itself, as it might have a PMTU lower than the link MTU. In a situation such as when a neighboring router acts as proxy [ND] for some destination, the destination can appear to be directly connected, but it is in fact more than one hop away.
 '''
 
-# 8201-033
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-4"
-reason = "Core checks exact recent sent packet evidence and live sequence/tuple identity; IPv6 tests establish floor handling, but the malformed/stale/forged-quote rejection matrix is currently IPv4-focused. Missing IPv6-specific validation evidence remains; native sockets are not the scope criterion."
-quote = '''
-Nodes should appropriately validate the payload of ICMPv6 PTB messages to ensure these are received in response to transmitted traffic (i.e., a reported error condition that corresponds to an IPv6 packet actually sent by the application) per [ICMPv6].
-'''
-
-# 8201-037
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-4"
-reason = "Continuation of the decrease-speed requirement in 8201-036. Initial decrease is tested for IPv6; exact IPv6 deferred-below-proven-delivery versus progress/RTO behavior is not yet exercised (the detailed security deferral test is IPv4). No native-socket requirement is inferred."
-quote = '''
-the dropped packets they respond to) consume network resources, nodes using Path MTU Discovery must detect decreases in PMTU as fast as possible.
-'''
-
-# 8201-039
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-4"
-reason = "Pmtud::feedback has a shared strictly-decreasing guard, but an exact IPv6 equal/larger-MTU rejection test is not recorded; existing nonincrease attack inputs are IPv4. Retain this narrow family-specific evidence gap, not a native-socket or unrelated shared-cache obligation."
-quote = '''
-A node must not increase its estimate of the Path MTU in response to the contents of a Packet Too Big message. A message purporting to announce an increase in the Path MTU might be a stale packet that has been floating around in the network, a false packet injected as part of a denial-of-service (DoS) attack, or the result of having multiple paths to the destination, each with a different PMTU.
-'''
-
 # 8201-049
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.1"
@@ -142,14 +118,6 @@ target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
 reason = "Alternative global/destination/flow-label/source-route cache keys are not selected; Connection-local tuple is the path representation. Shared-cache and IPv6 routing-header recommendations retain TODOs."
 quote = '''
 For source-routed packets (i.e. packets containing an IPv6 Routing header [RFC8200]), the source route may further qualify the local representation of a path.
-'''
-
-# 8201-059
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
-reason = "Endpoint dispatch and Connection validation use the quoted tuple, but no exact IPv6 wrong-destination/wrong-tuple dispatch test is recorded. Routing Header interpretation is the separate 8201-060 gap, not a prerequisite for supported base-header paths."
-quote = '''
-When a Packet Too Big message is received, the node determines which path the message applies to based on the contents of the Packet Too Big message. For example, if the destination address is used as the local representation of a path, the destination address from the original packet would be used to determine which path the message applies to.
 '''
 
 # 8201-060
@@ -286,12 +254,4 @@ target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
 reason = "No API configures the fixed 600-second aging/search-reset interval."
 quote = '''
 The implementation should also provide a way to change the timeout period for aging stale PMTU information.
-'''
-
-# 8201-087
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-6"
-reason = "Pmtud::feedback has a shared strictly-decreasing guard, but an exact IPv6 equal/larger-MTU rejection test is not recorded; existing nonincrease attack inputs are IPv4. Retain this narrow family-specific evidence gap, not a native-socket or unrelated shared-cache obligation."
-quote = '''
-In the second attack, the false message indicates a PMTU larger than reality. If believed, this could cause temporary blockage as the victim sends packets that will be dropped by some router. Within one round-trip time, the node would discover its mistake (receiving Packet Too Big messages from that router), but frequent repetition of this attack could cause lots of packets to be dropped. A node, however, must not raise its estimate of the PMTU based on a Packet Too Big message, so it should not be vulnerable to this attack.
 '''

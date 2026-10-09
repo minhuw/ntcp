@@ -480,6 +480,11 @@ impl Congestion {
     //# congestion state variable SHOULD be rescaled so as not to raise the window size in
     //# packets.
 
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-4
+    //= reason=Enabled PMTUD uses Congestion::set_path_mss: generic MSS unit bookkeeping is retained, but upward changes restore byte cwnd/ssthresh without changing pacing. Tests from 742e320 assert exact no-ACK header-budget growth after real data RTO for Reno and CUBIC, plus a real RTO/recovery/ordinary-ACK/upward-probe trace separating allowed ACK growth from MTU-only threshold inflation. This is not full CUBIC trajectory evidence or closure of unrelated ACK/MSS obligations.
+    //# Whenever the MTU is raised, the congestion state variables MUST be rescaled so
+    //# as not to raise the window size in bytes (or data rate in bytes per seconds).
+
     pub(crate) fn set_path_mss(&mut self, mss: u32) {
         let increasing = mss > self.mss;
         let (cwnd, ssthresh) = (self.cwnd, self.ssthresh);

@@ -724,9 +724,13 @@
       "id": "1191-069",
       "section": "6.3",
       "quote": "An upper layer MUST not retransmit datagrams in response to an increase in the PMTU estimate, since this increase never comes in response to an indication of a dropped datagram.",
-      "status": "TODO",
-      "reason": "Connection::refresh_path_mss invokes set_path_mss on upward probe success. set_path_mss rearms retx_pending for synchronized non-SACK-recovery flows with remaining flight, regardless of increase versus decrease. Existing tests do not prove no extra retransmission with trailing outstanding data; retain this concrete MUST gap.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.3"
+      "status": "covered",
+      "reason": "Connection::set_path_mss creates retx_pending/SYN retry work only on decreases; growth leaves legitimate pending work and timers intact. Tests from 742e320 exercise MSS-only growth with remaining flight and no output, actual RTO retry preservation, SYN work, and real upward-probe ACKs followed by new data rather than trailing-byte retransmission (both families and wrap).",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.3",
+      "evidence": [
+        "crates/ntcp/src/connection.rs::    fn set_path_mss(&mut self, effective: usize) {",
+        "crates/ntcp/src/pmtud_growth_tests.rs::fn pmtud_growth_mss_changes_preserve_existing_retry_and_syn_work()"
+      ]
     },
     {
       "id": "1191-070",

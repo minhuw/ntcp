@@ -2301,6 +2301,14 @@ impl Endpoint {
     //= reason=Endpoint routes the quoted outbound tuple to its connection-local path. IPv6-capable core dispatch only; no IPv6 native socket or shared route-cache claim.
     //# When a Packet Too Big message is received, the node determines which path the
     //# message applies to based on the contents of the Packet Too Big message.
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.2
+    //= reason=Endpoint::pmtu_feedback dispatches the decoded quoted outbound tuple to its connection-local path. IPv6 base-header test from 819b8f2 rejects wrong quoted source/destination addresses and ports and isolates accepted 1280/1400 updates across two distinct local addresses. This does not establish same-address per-interface isolation, Routing Header interpretation or native IPv6 sockets.
+    //# When a Packet Too Big message is received, the node determines which path the
+    //# message applies to based on the contents of the Packet Too Big message. For
+    //# example, if the destination address is used as the local representation of a
+    //# path, the destination address from the original packet would be used to
+    //# determine which path the message applies to.
+
     pub fn pmtu_feedback(
         &mut self,
         now: Instant,

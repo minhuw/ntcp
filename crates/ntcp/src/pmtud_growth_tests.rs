@@ -30,6 +30,17 @@ fn growth_pair(ipv4: bool, iss: u32, mtu: Option<u32>) -> (Connection, Connectio
     (a, b)
 }
 
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.1
+//= type=test
+//= reason=Pmtud::ack raises search_low only from fully cumulatively acknowledged, unambiguous ordinary sent packets within effective MTU, search_high and path bounds; explicit-probe overlap retains separate timeout/verification rules. Tests from 742e320 cover real ordinary ACKs in both families/wrap, retry ambiguity, partial ACK, local rejection, PTB/link ceilings, stale quotes, holdoff and probe timeout. Ordinary loss does not enter explicit probe-failure handling; mixed ordinary/explicit success preserves larger ordinary proof.
+//# If eff_pmtu is larger than search_low, it is explicitly permitted to send
+//# non-probe packets larger than search_low. When such a packet is acknowledged, it
+//# is effectively an "implicit probe" and search_low SHOULD be raised to the size
+//# of the acknowledged packet. However, if an "implicit probe" is lost, it MUST NOT
+//# be treated as a probe failure as a true probe would be. If eff_pmtu is too
+//# large, this condition will only be detected with ICMP PTB messages or black hole
+//# discovery (see Section 7.7).
+
 #[test]
 fn pmtud_growth_ordinary_wire_ack_with_trailing_flight_and_legacy() {
     for ipv4 in [true, false] {
@@ -74,6 +85,13 @@ fn pmtud_growth_ordinary_wire_ack_with_trailing_flight_and_legacy() {
     }
 }
 
+//= https://www.rfc-editor.org/rfc/rfc1191#section-6.3
+//= type=test
+//= reason=Connection::set_path_mss creates retx_pending/SYN retry work only on decreases; growth leaves legitimate pending work and timers intact. Tests from 742e320 exercise MSS-only growth with remaining flight and no output, actual RTO retry preservation, SYN work, and real upward-probe ACKs followed by new data rather than trailing-byte retransmission (both families and wrap).
+//# An upper layer MUST not retransmit datagrams in response to an increase in the
+//# PMTU estimate, since this increase never comes in response to an indication of a
+//# dropped datagram.
+
 #[test]
 fn pmtud_growth_real_probe_ack_does_not_retry_trailing_bytes() {
     for ipv4 in [true, false] {
@@ -112,6 +130,13 @@ fn pmtud_growth_real_probe_ack_does_not_retry_trailing_bytes() {
         }
     }
 }
+
+//= https://www.rfc-editor.org/rfc/rfc1191#section-6.3
+//= type=test
+//= reason=Connection::set_path_mss creates retx_pending/SYN retry work only on decreases; growth leaves legitimate pending work and timers intact. Tests from 742e320 exercise MSS-only growth with remaining flight and no output, actual RTO retry preservation, SYN work, and real upward-probe ACKs followed by new data rather than trailing-byte retransmission (both families and wrap).
+//# An upper layer MUST not retransmit datagrams in response to an increase in the
+//# PMTU estimate, since this increase never comes in response to an indication of a
+//# dropped datagram.
 
 #[test]
 fn pmtud_growth_mss_changes_preserve_existing_retry_and_syn_work() {
@@ -163,6 +188,17 @@ fn pmtud_growth_mss_changes_preserve_existing_retry_and_syn_work() {
     syn.set_path_mss(1460);
     assert!(syn.syn_pending);
 }
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.1
+//= type=test
+//= reason=Pmtud::ack raises search_low only from fully cumulatively acknowledged, unambiguous ordinary sent packets within effective MTU, search_high and path bounds; explicit-probe overlap retains separate timeout/verification rules. Tests from 742e320 cover real ordinary ACKs in both families/wrap, retry ambiguity, partial ACK, local rejection, PTB/link ceilings, stale quotes, holdoff and probe timeout. Ordinary loss does not enter explicit probe-failure handling; mixed ordinary/explicit success preserves larger ordinary proof.
+//# If eff_pmtu is larger than search_low, it is explicitly permitted to send
+//# non-probe packets larger than search_low. When such a packet is acknowledged, it
+//# is effectively an "implicit probe" and search_low SHOULD be raised to the size
+//# of the acknowledged packet. However, if an "implicit probe" is lost, it MUST NOT
+//# be treated as a probe failure as a true probe would be. If eff_pmtu is too
+//# large, this condition will only be detected with ICMP PTB messages or black hole
+//# discovery (see Section 7.7).
 
 #[test]
 fn pmtud_growth_evidence_security_bounds_holdoff_and_probe_timeout() {
@@ -227,6 +263,12 @@ fn pmtud_growth_evidence_security_bounds_holdoff_and_probe_timeout() {
     }
 }
 
+//= https://www.rfc-editor.org/rfc/rfc4821#section-4
+//= type=test
+//= reason=Enabled PMTUD uses Congestion::set_path_mss: generic MSS unit bookkeeping is retained, but upward changes restore byte cwnd/ssthresh without changing pacing. Tests from 742e320 assert exact no-ACK header-budget growth after real data RTO for Reno and CUBIC, plus a real RTO/recovery/ordinary-ACK/upward-probe trace separating allowed ACK growth from MTU-only threshold inflation. This is not full CUBIC trajectory evidence or closure of unrelated ACK/MSS obligations.
+//# Whenever the MTU is raised, the congestion state variables MUST be rescaled so
+//# as not to raise the window size in bytes (or data rate in bytes per seconds).
+
 #[test]
 fn pmtud_growth_after_loss_preserves_byte_threshold_not_ack_growth() {
     let (mut a, mut b) = growth_pair(true, 100, Some(1100));
@@ -277,6 +319,12 @@ fn pmtud_growth_after_loss_preserves_byte_threshold_not_ack_growth() {
     assert_eq!(a.congestion.cwnd(), ack_only.cwnd());
     assert!(!a.retx_pending);
 }
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-4
+//= type=test
+//= reason=Enabled PMTUD uses Congestion::set_path_mss: generic MSS unit bookkeeping is retained, but upward changes restore byte cwnd/ssthresh without changing pacing. Tests from 742e320 assert exact no-ACK header-budget growth after real data RTO for Reno and CUBIC, plus a real RTO/recovery/ordinary-ACK/upward-probe trace separating allowed ACK growth from MTU-only threshold inflation. This is not full CUBIC trajectory evidence or closure of unrelated ACK/MSS obligations.
+//# Whenever the MTU is raised, the congestion state variables MUST be rescaled so
+//# as not to raise the window size in bytes (or data rate in bytes per seconds).
 
 #[test]
 fn pmtud_growth_header_budget_does_not_inflate_post_rto_byte_windows() {

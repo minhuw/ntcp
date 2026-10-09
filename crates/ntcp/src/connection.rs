@@ -2431,6 +2431,12 @@ impl Connection {
         Ok(())
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-6.3
+    //= reason=Connection::set_path_mss creates retx_pending/SYN retry work only on decreases; growth leaves legitimate pending work and timers intact. Tests from 742e320 exercise MSS-only growth with remaining flight and no output, actual RTO retry preservation, SYN work, and real upward-probe ACKs followed by new data rather than trailing-byte retransmission (both families and wrap).
+    //# An upper layer MUST not retransmit datagrams in response to an increase in the
+    //# PMTU estimate, since this increase never comes in response to an indication of a
+    //# dropped datagram.
+
     fn set_path_mss(&mut self, effective: usize) {
         if effective == self.mss {
             return;

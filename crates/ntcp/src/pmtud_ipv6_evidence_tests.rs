@@ -72,6 +72,35 @@ fn receive(b: &mut Connection, now: u64, frame: &[u8]) {
     .unwrap();
 }
 
+//= https://www.rfc-editor.org/rfc/rfc8201#section-4
+//= type=test
+//= reason=IPv6 base-header wire test from 819b8f2 covers decode_icmp checksum, truncation, impossible quoted payload length and outer-destination rejection, then exact sent-ledger sequence/size validation and stale quotes after real receiver ACKs, idle or with new flight, including wrap. A valid minimal quote is accepted. Plausibility validation is not authentication against a knowledgeable attacker; no native IPv6 socket or extension-header claim.
+//# Nodes should appropriately validate the payload of ICMPv6 PTB messages to ensure
+//# these are received in response to transmitted traffic (i.e., a reported error
+//# condition that corresponds to an IPv6 packet actually sent by the application)
+//# per [ICMPv6].
+
+//= https://www.rfc-editor.org/rfc/rfc8201#section-4
+//= type=test
+//= reason=Pmtud::feedback rejects nondecreasing candidates. IPv6 base-header wire test from 819b8f2 supplies exact emitted-packet quotes with equal/larger MTUs (1500, 2000, UINT32_MAX), then repeats 1400/1500/2000 after an accepted 1400 decrease; estimates never increase, including wrapped sequence ranges. No native IPv6 socket or extension-header claim.
+//# A node must not increase its estimate of the Path MTU in response to the
+//# contents of a Packet Too Big message. A message purporting to announce an
+//# increase in the Path MTU might be a stale packet that has been floating around
+//# in the network, a false packet injected as part of a denial-of-service (DoS)
+//# attack, or the result of having multiple paths to the destination, each with a
+//# different PMTU.
+
+//= https://www.rfc-editor.org/rfc/rfc8201#section-6
+//= type=test
+//= reason=The strictly-decreasing feedback guard prevents the described increase attack. IPv6 base-header wire test from 819b8f2 rejects equal/larger MTUs before and after a valid decrease, including wrap. The hypothetical router round-trip is not claimed as a separate implemented behavior; no native IPv6 socket or extension-header claim.
+//# In the second attack, the false message indicates a PMTU larger than reality. If
+//# believed, this could cause temporary blockage as the victim sends packets that
+//# will be dropped by some router. Within one round-trip time, the node would
+//# discover its mistake (receiving Packet Too Big messages from that router), but
+//# frequent repetition of this attack could cause lots of packets to be dropped. A
+//# node, however, must not raise its estimate of the PMTU based on a Packet Too Big
+//# message, so it should not be vulnerable to this attack.
+
 #[test]
 fn ipv6_ptb_malformed_forged_stale_and_nonincreasing_wire_quotes() {
     for iss in [0, u32::MAX - 100] {
@@ -129,6 +158,12 @@ fn ipv6_ptb_malformed_forged_stale_and_nonincreasing_wire_quotes() {
         assert_eq!(a.path_mtu_info().unwrap().current_mtu, 1400);
     }
 }
+
+//= https://www.rfc-editor.org/rfc/rfc8201#section-4
+//= type=test
+//= reason=Enabled IPv6 core applies validated initial decreases and deliberately defers below-proven-delivery reports under the selected security policy. Test from 819b8f2 establishes proof with a real 1500-byte packet/receiver ACK, contrasts progress clearing with quoted-head RTO applying 1280, and verifies bounded wire repair and receiver ACK progress through wrap. No unconditional trust of PTB or native IPv6 socket claim.
+//# the dropped packets they respond to) consume network resources, nodes using Path
+//# MTU Discovery must detect decreases in PMTU as fast as possible.
 
 #[test]
 fn ipv6_below_proven_ptb_progress_clears_but_head_rto_applies() {
@@ -201,6 +236,15 @@ fn endpoint_feedback(a: &mut Endpoint, now: u64, bytes: &[u8]) -> bool {
     )
     .unwrap()
 }
+
+//= https://www.rfc-editor.org/rfc/rfc8201#section-5.2
+//= type=test
+//= reason=Endpoint::pmtu_feedback dispatches the decoded quoted outbound tuple to its connection-local path. IPv6 base-header test from 819b8f2 rejects wrong quoted source/destination addresses and ports and isolates accepted 1280/1400 updates across two distinct local addresses. This does not establish same-address per-interface isolation, Routing Header interpretation or native IPv6 sockets.
+//# When a Packet Too Big message is received, the node determines which path the
+//# message applies to based on the contents of the Packet Too Big message. For
+//# example, if the destination address is used as the local representation of a
+//# path, the destination address from the original packet would be used to
+//# determine which path the message applies to.
 
 #[test]
 fn ipv6_endpoint_quoted_tuple_dispatch_and_distinct_local_identity_isolation() {

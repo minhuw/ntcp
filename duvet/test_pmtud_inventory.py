@@ -103,8 +103,7 @@ class PmtudInventory(unittest.TestCase):
             for fragment in fragments:
                 self.assertTrue(any(fragment in q for q in spans), (n, fragment))
         # Known implementation gaps must not silently become scope exceptions.
-        for n, numbers in {1191: (69,), 8201: (76,),
-                           4821: (67, 111, 113, 119)}.items():
+        for n, numbers in {8201: (76,), 4821: (113, 119)}.items():
             rows = {p["id"]: p for p in self.inventory(n)["paragraphs"]}
             for i in numbers:
                 self.assertEqual(rows[f"{n}-{i:03}"]["status"], "TODO")
@@ -125,13 +124,13 @@ class PmtudInventory(unittest.TestCase):
             "covered": ("1191-005a", "1191-005b", "1191-005d", "1191-006b",
                         "1191-014a", "1191-013a", "1191-013c", "1191-013e",
                         "8201-003", "8201-035", "8201-051", "8201-058",
-                        "8201-068", "8201-086"),
+                        "8201-068", "8201-086", "1191-069"),
             "context": ("1191-015", "1191-029", "1191-060", "1191-066"),
             "exception": ("1191-005c", "1191-006a", "1191-007", "1191-013d",
                           "1191-013f", "1191-063", "8201-025b", "8201-065",
                           *alternatives),
             # These are open obligations/evidence gaps, not expected runtime failures.
-            "TODO": ("1191-068", "1191-069", "8201-004", "8201-060",
+            "TODO": ("1191-068", "8201-004", "8201-060",
                      "8201-069", "8201-076"),
         }
         for status, ids in expected.items():
@@ -142,6 +141,32 @@ class PmtudInventory(unittest.TestCase):
             self.assertIn("RFC4821 section1", rows[id]["reason"], id)
         for fragment in ("set_path_mss", "retx_pending", "remaining flight"):
             self.assertIn(fragment, rows["1191-069"]["reason"])
+
+    def test_reviewed_growth_and_ipv6_evidence_closures(self):
+        rows = {p["id"]: p for n in RFCS for p in self.inventory(n)["paragraphs"]}
+        scopes = {
+            "1191-069": ("742e320", "only on decreases", "remaining flight", "timers"),
+            "4821-111": ("742e320", "unambiguous", "path bounds", "partial ACK",
+                         "Ordinary loss", "probe timeout"),
+            "4821-067": ("742e320", "no-ACK", "real data RTO", "Reno and CUBIC",
+                         "not full CUBIC trajectory", "allowed ACK growth"),
+            "8201-033": ("819b8f2", "checksum", "stale quotes", "not authentication"),
+            "8201-037": ("819b8f2", "selected security policy", "progress clearing",
+                         "quoted-head RTO", "receiver ACK"),
+            "8201-039": ("819b8f2", "equal/larger", "accepted 1400 decrease"),
+            "8201-059": ("819b8f2", "quoted outbound tuple", "distinct local addresses",
+                         "does not establish same-address per-interface isolation"),
+            "8201-087": ("819b8f2", "strictly-decreasing", "before and after"),
+        }
+        for id, fragments in scopes.items():
+            with self.subTest(id=id):
+                self.assertEqual(rows[id]["status"], "covered")
+                for fragment in fragments:
+                    self.assertIn(fragment, rows[id]["reason"])
+        # The simulation does not establish an actual on-link/ND decision;
+        # per-interface identity and congestion-policy review remain separate.
+        for id in ("8201-031", "8201-052", "8201-075"):
+            self.assertEqual(rows[id]["status"], "TODO")
 
     def test_paws_discovery_gap_names_concrete_supplied_embedding(self):
         todos = tomllib.loads((ROOT / "duvet/rfc7323-todos.toml").read_text())["TODO"]
