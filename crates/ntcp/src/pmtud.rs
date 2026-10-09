@@ -1,14 +1,4 @@
-use crate::{Instant, seq::Seq};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PmtudConfig {
-    pub first_hop_mtu: u32,
-}
-impl PmtudConfig {
-    pub const fn new(first_hop_mtu: u32) -> Self {
-        Self { first_hop_mtu }
-    }
-}
+use crate::{Instant, Ipv4Plateaus, PmtudConfig, PmtudPolicy, seq::Seq};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PathMtuInfo {
@@ -52,7 +42,14 @@ pub(crate) struct Pmtud {
     pub bound: u32,
     floor: u32,
     initial_low: u32,
+    // Fixed 600-second PTB hold in caller ticks, independent of periodic aging.
     hold: u64,
+    aging: Option<u64>,
+    periodic_deadline: Option<Instant>,
+    high_limit: Option<u32>,
+    low_limit: Option<u32>,
+    plateaus: Ipv4Plateaus,
+    // PTB hold / failed-probe suppression; Infinity never disables this timer.
     pub deadline: Option<Instant>,
     reset_search: bool,
     pub probe: Option<Probe>,
@@ -115,18 +112,27 @@ impl Pmtud {
     //# first-hop link.
 
     pub fn new(config: PmtudConfig, bound: u32, ipv4: bool, hold: u64) -> Self {
-        let low = bound.min(if ipv4 { 1024 } else { 1280 });
+        let (mtu, low, high) = config.initial_values(bound, ipv4).expect("validated PMTUD bounds");
         Self {
             info: PathMtuInfo {
                 first_hop_mtu: config.first_hop_mtu,
-                current_mtu: bound,
+                current_mtu: mtu,
                 search_low: low,
-                search_high: bound,
+                search_high: high,
             },
             bound,
             floor: if ipv4 { 68 } else { 1280 },
             initial_low: low,
             hold,
+            aging: config
+                .policy
+                .search_aging
+                .ticks(hold / 600)
+                .expect("validated PMTUD aging"),
+            periodic_deadline: None,
+            high_limit: config.initial_search_high,
+            low_limit: config.initial_search_low,
+            plateaus: config.policy.ipv4_plateaus,
             deadline: None,
             reset_search: false,
             probe: None,
@@ -144,10 +150,11 @@ impl Pmtud {
 
     pub fn constrain(&mut self, bound: u32) {
         self.bound = bound;
-        self.initial_low = bound.min(if self.floor == 68 { 1024 } else { 1280 });
+        self.initial_low =
+            bound.min(self.low_limit.unwrap_or(if self.floor == 68 { 1024 } else { 1280 }));
         self.info.current_mtu = self.info.current_mtu.min(bound);
         self.info.search_low = self.info.search_low.min(bound);
-        self.info.search_high = self.info.search_high.min(bound);
+        self.info.search_high = self.info.search_high.min(self.search_ceiling());
         if self.probe.is_some_and(|p| p.size > bound) {
             self.probe = None;
         }
@@ -157,9 +164,8 @@ impl Pmtud {
         self.info.first_hop_mtu = mtu;
         self.constrain(bound);
         // A local link increase is a new search bound, not proof about the path.
-        if self.info.search_high < bound && self.deadline.is_none() {
-            self.deadline = Some(now.saturating_add(self.hold));
-            self.reset_search = true;
+        if self.info.search_high < self.search_ceiling() {
+            self.schedule_aging(now);
         }
     }
 
@@ -185,9 +191,16 @@ impl Pmtud {
         if self.deadline.is_some_and(|d| d <= now) {
             self.deadline = None;
             if self.reset_search {
-                self.info.search_high = self.bound;
+                self.info.search_high = self.search_ceiling();
             }
             self.reset_search = false;
+            if self.info.search_low >= self.info.search_high {
+                self.schedule_aging(now);
+            }
+        }
+        if self.periodic_deadline.is_some_and(|d| d <= now) {
+            self.periodic_deadline = None;
+            self.info.search_high = self.search_ceiling();
         }
     }
 
@@ -198,6 +211,7 @@ impl Pmtud {
 
     pub fn target(&self) -> Option<u32> {
         if self.deadline.is_some()
+            || self.periodic_deadline.is_some()
             || self.probe.is_some()
             || self.repair_range.is_some()
             || self.info.search_low >= self.info.search_high
@@ -593,12 +607,16 @@ impl Pmtud {
             } else {
                 size
             };
-            [
-                65535, 32000, 17914, 8166, 4352, 2002, 1492, 1006, 508, 296, 68,
-            ]
-            .into_iter()
-            .find(|&p| p < corrected.min(sent_size))
-            .unwrap_or(68)
+            let Some(mtu) = self
+                .plateaus
+                .as_slice()
+                .iter()
+                .copied()
+                .find(|&p| p < corrected.min(sent_size))
+            else {
+                return false;
+            };
+            mtu
         } else {
             //= https://www.rfc-editor.org/rfc/rfc1191#section-3
             //# A host MUST never reduce its estimate of the Path MTU below 68
@@ -622,7 +640,8 @@ impl Pmtud {
         // until the quoted data times out; any cumulative progress clears it.
         if mtu < self.max_acked {
             // Even deferred validated PTB feedback inhibits new upward probes.
-            self.deadline = Some(now.saturating_add(self.hold));
+            self.delay(now, self.hold);
+            self.periodic_deadline = None;
             self.reset_search = true;
             self.pending = Some((
                 seq,
@@ -658,7 +677,8 @@ impl Pmtud {
         // Cancel classification, not the outstanding data's repair boundary.
         self.probe = None;
         self.verification = None;
-        self.deadline = Some(now.saturating_add(self.hold));
+        self.delay(now, self.hold);
+        self.periodic_deadline = None;
         self.reset_search = true;
     }
 
@@ -847,9 +867,38 @@ impl Pmtud {
         //# The value for this timer
         //# MUST NOT be less than 5 minutes and is recommended to be 10 minutes,
         //# per RFC 1981.
-        if self.info.search_low >= self.info.search_high && self.deadline.is_none() {
-            self.deadline = Some(now.saturating_add(self.hold));
-            self.reset_search = true;
+        if self.info.search_low >= self.info.search_high {
+            self.schedule_aging(now);
+        }
+    }
+
+    fn search_ceiling(&self) -> u32 {
+        self.bound.min(self.high_limit.unwrap_or(self.bound))
+    }
+
+    fn schedule_aging(&mut self, now: Instant) {
+        if self.deadline.is_none() && self.periodic_deadline.is_none() {
+            self.periodic_deadline = self
+                .aging
+                .map(|interval| now.saturating_add(interval))
+                .filter(|&d| d > now);
+        }
+    }
+
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.deadline.into_iter().chain(self.periodic_deadline).min()
+    }
+
+    pub fn set_policy(&mut self, now: Instant, policy: PmtudPolicy, aging: Option<u64>) {
+        self.plateaus = policy.ipv4_plateaus;
+        if self.aging != aging {
+            self.aging = aging;
+            self.periodic_deadline = None;
+            if self.info.search_low >= self.info.search_high
+                || self.info.search_high < self.search_ceiling()
+            {
+                self.schedule_aging(now);
+            }
         }
     }
 
@@ -1171,7 +1220,7 @@ mod tests {
         let mut p = state(true);
         p.info.search_low = 1500;
         p.ack(Seq(1), 100, 1000, 1000);
-        assert_eq!(p.deadline, Some(600_000_100));
+        assert_eq!(p.next_deadline(), Some(600_000_100));
         p.link(9000, 2000, 101);
         assert_eq!(p.info.current_mtu, 1500);
         p.tick(600_000_099);

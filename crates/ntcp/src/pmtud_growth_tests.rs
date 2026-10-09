@@ -69,7 +69,7 @@ fn pmtud_growth_ordinary_wire_ack_with_trailing_flight_and_legacy() {
                     assert!(info.search_low > before.unwrap().search_low);
                     assert_eq!(info.current_mtu, before.unwrap().current_mtu);
                     assert_eq!(info.search_high, before.unwrap().search_high);
-                    assert!(a.pmtud.as_ref().unwrap().deadline.is_some());
+                    assert!(a.pmtud.as_ref().unwrap().next_deadline().is_some());
                 } else {
                     assert_eq!(a.path_mtu_info(), None);
                 }
@@ -99,7 +99,7 @@ fn pmtud_growth_real_probe_ack_does_not_retry_trailing_bytes() {
             let initial = if ipv4 { 1100 } else { 1280 };
             let (mut a, mut b) = growth_pair(ipv4, iss, Some(initial));
             a.set_first_hop_mtu(31, 1500).unwrap();
-            let now = a.pmtud.as_ref().unwrap().deadline.unwrap();
+            let now = a.pmtud.as_ref().unwrap().next_deadline().unwrap();
             a.timeout(now).unwrap();
             a.write(&[7; 20_000]).unwrap();
             let first = packet(&mut a, now + 1);
@@ -290,7 +290,7 @@ fn pmtud_growth_after_loss_preserves_byte_threshold_not_ack_growth() {
     }
     assert!(a.congestion.cwnd() > 5000);
     assert_eq!(a.congestion.ssthresh(), 2120);
-    now = a.pmtud.as_ref().unwrap().deadline.unwrap();
+    now = a.pmtud.as_ref().unwrap().next_deadline().unwrap();
     a.timeout(now).unwrap();
     a.write(&[7; 20_000]).unwrap();
     let bytes = packet(&mut a, now + 1);

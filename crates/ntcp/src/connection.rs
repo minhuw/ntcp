@@ -236,8 +236,11 @@ impl Default for KeepaliveConfig {
 
 impl ConnectionConfig {
     pub fn validate(&self, ipv4: bool) -> Result<(), Error> {
-        if self.pmtud.is_some_and(|p| p.first_hop_mtu < if ipv4 { 68 } else { 1280 })
-            || !self.valid_timestamp_timebase()
+        if let Some(p) = self.pmtud {
+            p.policy.search_aging.ticks(self.timebase.units_per_second)?;
+            p.initial_values(self.initial_path_bound(p.first_hop_mtu, ipv4), ipv4)?;
+        }
+        if !self.valid_timestamp_timebase()
             || !self.valid_pacing()
             || self.timestamp_bytes_per_tick == 0
             || self.timestamp_bytes_per_tick >= 1 << 31
@@ -271,6 +274,13 @@ impl ConnectionConfig {
             return Err(Error::InvalidArgument);
         }
         Ok(())
+    }
+
+    fn initial_path_bound(&self, mtu: u32, ipv4: bool) -> u32 {
+        let header = if ipv4 { 20 } else { 40 };
+        let floor = if ipv4 { 68 } else { 1280 };
+        mtu.min((u32::from(self.send_ip_payload_limit) + header).max(floor))
+            .min((u32::from(self.mss) + header + 20).max(floor))
     }
 
     pub(crate) fn valid_pacing(&self) -> bool {
@@ -730,15 +740,7 @@ impl Connection {
         let pmtud = config.pmtud.map(|p| {
             crate::pmtud::Pmtud::new(
                 p,
-                p.first_hop_mtu
-                    .min(
-                        (u32::from(config.send_ip_payload_limit) + u32::from(ip_header_len))
-                            .max(if tuple.local.is_ipv4() { 68 } else { 1280 }),
-                    )
-                    .min(
-                        (u32::from(config.mss) + u32::from(ip_header_len) + 20)
-                            .max(if tuple.local.is_ipv4() { 68 } else { 1280 }),
-                    ),
+                config.initial_path_bound(p.first_hop_mtu, tuple.local.is_ipv4()),
                 tuple.local.is_ipv4(),
                 config.timebase.ticks_from_us(600_000_000),
             )
@@ -2293,9 +2295,41 @@ impl Connection {
         self.pmtud.as_ref().map(|p| p.info)
     }
 
+    pub(crate) fn validate_pmtud_policy(
+        &self,
+        now: Instant,
+        policy: crate::PmtudPolicy,
+    ) -> Result<(), Error> {
+        self.check_time(now)?;
+        if self.pmtud.is_none() {
+            return Err(Error::InvalidArgument);
+        }
+        policy
+            .search_aging
+            .ticks(self.config.timebase.units_per_second)?;
+        Ok(())
+    }
+
+    pub(crate) fn set_pmtud_policy(
+        &mut self,
+        now: Instant,
+        policy: crate::PmtudPolicy,
+    ) -> Result<(), Error> {
+        self.validate_pmtud_policy(now, policy)?;
+        let aging = policy
+            .search_aging
+            .ticks(self.config.timebase.units_per_second)?;
+        self.update_time(now)?;
+        self.pmtud.as_mut().unwrap().set_policy(now, policy, aging);
+        self.config.pmtud.as_mut().unwrap().policy = policy;
+        self.arm_work();
+        Ok(())
+    }
+
     pub(crate) fn validate_first_hop_mtu(&self, now: Instant, mtu: u32) -> Result<(), Error> {
         self.check_time(now)?;
-        if mtu < if self.tuple.local.is_ipv4() { 68 } else { 1280 } || self.pmtud.is_none() {
+        let range = if self.tuple.local.is_ipv4() { 68..=65535 } else { 1280..=65575 };
+        if !range.contains(&mtu) || self.pmtud.is_none() {
             return Err(Error::InvalidArgument);
         }
         Ok(())
@@ -7806,7 +7840,7 @@ impl Connection {
                 .as_ref()
                 // Unlike pacing, tick consumes even a saturated due deadline.
                 // Input may advance now before Endpoint services that timer.
-                .and_then(|p| p.deadline),
+                .and_then(|p| p.next_deadline()),
             self.loss_timer.map(|(_, deadline)| deadline),
             self.ecn_pause,
             self.ack_deadline,
@@ -27556,6 +27590,9 @@ mod tests {
     }
     mod pmtud_lifecycle {
         include!("pmtud_lifecycle_tests.rs");
+    }
+    mod pmtud_config {
+        include!("pmtud_config_tests.rs");
     }
     mod pmtud_growth {
         include!("pmtud_growth_tests.rs");

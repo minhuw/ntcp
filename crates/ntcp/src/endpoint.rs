@@ -85,6 +85,14 @@ impl EndpointConfig {
         {
             return Err(Error::InvalidArgument.into());
         }
+        if let Some(p) = self.connection.pmtud {
+            p.policy
+                .search_aging
+                .ticks(self.connection.timebase.units_per_second)?;
+            if self.connection.validate(true).is_err() && self.connection.validate(false).is_err() {
+                return Err(Error::InvalidArgument.into());
+            }
+        }
         self.preallocation_bytes()?;
         Ok(())
     }
@@ -2340,6 +2348,19 @@ impl Endpoint {
         Ok(accepted)
     }
 
+    pub fn set_pmtud_policy(
+        &mut self,
+        now: Instant,
+        id: ConnectionId,
+        policy: crate::PmtudPolicy,
+    ) -> Result<(), EndpointError> {
+        self.slot(id)?.connection.validate_pmtud_policy(now, policy)?;
+        self.clock(now)?;
+        self.slot_mut(id)?.connection.set_pmtud_policy(now, policy)?;
+        self.refresh(id.slot);
+        Ok(())
+    }
+
     pub fn set_first_hop_mtu(
         &mut self,
         now: Instant,
@@ -2370,11 +2391,19 @@ impl Endpoint {
         mtu: u32,
     ) -> Result<(), EndpointError> {
         if self.config.connection.pmtud.is_none()
-            || mtu < 68
+            || !(68..=65575).contains(&mtu)
+            || mtu > 65535
+                && (self.listeners.iter().flatten().any(|l| l.address.is_ipv4())
+                    || self.control.iter().any(|(ip, _, _, _)| ip.source.is_ipv4()))
             || mtu < 1280
                 && (self.listeners.iter().flatten().any(|l| l.address.is_ipv6())
                     || self.control.iter().any(|(ip, _, _, _)| ip.source.is_ipv6()))
         {
+            return Err(Error::InvalidArgument.into());
+        }
+        let mut template = self.config.connection.clone();
+        template.pmtud.as_mut().unwrap().first_hop_mtu = mtu;
+        if template.validate(true).is_err() && template.validate(false).is_err() {
             return Err(Error::InvalidArgument.into());
         }
         // Validate the whole occupied set before any clock/path mutation. This
@@ -2400,7 +2429,7 @@ impl Endpoint {
         }
         // This template also supplies the stateless reply budget. Do not change
         // MSS/scratch/send limits: a link increase never grows allocations.
-        self.config.connection.pmtud = Some(crate::PmtudConfig::new(mtu));
+        self.config.connection.pmtud.as_mut().unwrap().first_hop_mtu = mtu;
         Ok(())
     }
 
