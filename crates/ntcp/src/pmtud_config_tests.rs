@@ -296,9 +296,17 @@ fn pmtud_config_plateaus_bounded_validated_and_strictly_decreasing_feedback() {
         assert_eq!(accepted, size == 1500);
         assert!(p.info.current_mtu <= before.current_mtu);
     }
-    let mut p = Pmtud::new(PmtudConfig::new(68), 68, true, 600_000_000);
-    p.sent(Seq(0), Seq(28), 68, 20, false);
-    assert!(!p.feedback(1, Seq(0), 68, 20, 0)); // No legal lower plateau.
+    for plateaus in [Ipv4Plateaus::default(), custom] {
+        for size in [68, 80] {
+            let mut cfg = PmtudConfig::new(size);
+            cfg.policy.ipv4_plateaus = plateaus;
+            let mut p = Pmtud::new(cfg, size, true, 600_000_000);
+            p.sent(Seq(0), Seq(size - 40), size, 20, false);
+            // Exact quotes correct below 68; only 80 can legally decrease to 68.
+            assert_eq!(p.feedback(1, Seq(0), size, 20, 0), size > 68);
+            assert_eq!(p.info.current_mtu, 68);
+        }
+    }
 }
 
 #[test]

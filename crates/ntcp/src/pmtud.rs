@@ -614,16 +614,12 @@ impl Pmtud {
             } else {
                 size
             };
-            let Some(mtu) = self
-                .plateaus
+            self.plateaus
                 .as_slice()
                 .iter()
                 .copied()
                 .find(|&p| p < corrected.min(sent_size))
-            else {
-                return false;
-            };
-            mtu
+                .unwrap_or(68)
         } else {
             //= https://www.rfc-editor.org/rfc/rfc1191#section-3
             //# A host MUST never reduce its estimate of the Path MTU below 68
