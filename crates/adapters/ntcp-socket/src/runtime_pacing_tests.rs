@@ -250,7 +250,8 @@ fn typed_core_settings_reach_native_connections() {
     let mut b = owner(3);
     b.test_now = Some(1000);
     let listener = new(&mut b, SOCK_NONBLOCK);
-    b.execute(listener, Op::Bind("10.73.0.3:16379".parse().unwrap())).unwrap();
+    b.execute(listener, Op::Bind("10.73.0.3:16379".parse().unwrap()))
+        .unwrap();
     b.execute(listener, Op::Listen(4)).unwrap();
     let client = new(&mut a, SOCK_NONBLOCK);
     for (level, option, expected) in [
@@ -264,27 +265,50 @@ fn typed_core_settings_reach_native_connections() {
         (IPPROTO_IP, IP_TOS, 44),
         (IPPROTO_TCP, TCP_USER_TIMEOUT, 0),
     ] {
-        assert_eq!(a.execute(client, Op::Get(level, option)).unwrap().value, expected);
+        assert_eq!(
+            a.execute(client, Op::Get(level, option)).unwrap().value,
+            expected
+        );
     }
-    assert_eq!(a.execute(client, Op::Connect("10.73.0.3:16379".parse().unwrap())).unwrap_err(), EINPROGRESS);
+    assert_eq!(
+        a.execute(client, Op::Connect("10.73.0.3:16379".parse().unwrap()))
+            .unwrap_err(),
+        EINPROGRESS
+    );
     let mut bytes = [0; 1480];
-    let syn = a.endpoint.poll_transmit(a.now(), &mut bytes, BUDGET).unwrap().packet.unwrap();
+    let syn = a
+        .endpoint
+        .poll_transmit(a.now(), &mut bytes, BUDGET)
+        .unwrap()
+        .packet
+        .unwrap();
     assert_eq!((syn.dscp, syn.hop_limit), (11, 33));
-    b.input(b.now(), syn.ip, syn.dscp << 2 | syn.ecn, &bytes[..syn.len]).unwrap();
+    b.input(b.now(), syn.ip, syn.dscp << 2 | syn.ecn, &bytes[..syn.len])
+        .unwrap();
     pump(&mut a, &mut b);
     let server = b.execute(listener, Op::Accept(0)).unwrap().value as u64;
-    let Handle::Connection(cid) = a.sockets[&client].handle else { panic!() };
+    let Handle::Connection(cid) = a.sockets[&client].handle else {
+        panic!()
+    };
     let info = a.endpoint.transport_info(cid).unwrap();
-    assert_eq!((info.send_capacity, info.receive_capacity, info.mss), (32768, 16384, 1200));
+    assert_eq!(
+        (info.send_capacity, info.receive_capacity, info.mss),
+        (32768, 16384, 1200)
+    );
     a.execute(client, Op::Write(vec![42; 3600])).unwrap();
     pump(&mut a, &mut b);
     assert!(a.endpoint.transport_info(cid).unwrap().notsent_bytes > 0);
     for _ in 0..20 {
-        if a.endpoint.transport_info(cid).unwrap().send_used == 0 { break; }
+        if a.endpoint.transport_info(cid).unwrap().send_used == 0 {
+            break;
+        }
         pacing_tick(&mut a, &mut b);
     }
     assert_eq!(a.endpoint.transport_info(cid).unwrap().send_used, 0);
-    assert_eq!(b.execute(server, Op::Read(3600)).unwrap().bytes, vec![42; 3600]);
+    assert_eq!(
+        b.execute(server, Op::Read(3600)).unwrap().bytes,
+        vec![42; 3600]
+    );
 }
 
 #[cfg(feature = "packet-test")]
@@ -301,7 +325,10 @@ fn packet_profiles_ignore_native_socket_defaults() {
         let socket = owner.fresh_socket(0);
         let expected = crate::packet_profile::config(profile);
         assert_eq!(socket.send_capacity, expected.connection.send_capacity);
-        assert_eq!(socket.receive_capacity, expected.connection.receive_capacity);
+        assert_eq!(
+            socket.receive_capacity,
+            expected.connection.receive_capacity
+        );
         assert!(!socket.nodelay);
         assert_eq!(socket.tos, 0);
     }
