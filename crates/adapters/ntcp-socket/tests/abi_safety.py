@@ -9,13 +9,15 @@ import tempfile
 import threading
 import time
 
+from socket_config import config_env
+
 ROOT = Path(__file__).resolve().parents[4]
 LIBRARY = ROOT / 'target/debug/libntcp_socket.so'
 
 
 def clean_env():
     return {k: v for k, v in os.environ.items()
-            if k != 'LD_PRELOAD' and not k.startswith('NTCP_SOCKET_')}
+            if k not in ('LD_PRELOAD', 'NTCP_SOCKET_CONFIG')}
 
 
 def isolated(executable):
@@ -54,8 +56,8 @@ def isolated(executable):
         fault_task = pool.submit(accepted_fault)
         try:
             subprocess.run([executable, '--virtual'], env=env | {
-                'LD_PRELOAD': str(LIBRARY), 'NTCP_SOCKET_TUN': 'ntcp0',
-                'NTCP_SOCKET_ADDR': '10.73.0.2'}, check=True, timeout=25)
+                'LD_PRELOAD': str(LIBRARY), **config_env(
+                    Path(executable).parent, interface='ntcp0', address='10.73.0.2')}, check=True, timeout=25)
         finally:
             done.set()
         server_task.result(timeout=5)

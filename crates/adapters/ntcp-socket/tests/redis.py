@@ -14,6 +14,8 @@ import sys
 import tempfile
 import time
 
+from socket_config import config_env
+
 ROOT = pathlib.Path(__file__).resolve().parents[4]
 LIBRARY = ROOT / 'target/debug/libntcp_socket.so'
 KERNEL, ENGINE, PORT = '10.73.0.1', '10.73.0.2', 16379
@@ -23,7 +25,7 @@ TUN = 'ntcp0'
 def clean_env():
     env = os.environ.copy()
     for key in list(env):
-        if key == 'LD_PRELOAD' or key.startswith('NTCP_SOCKET_'):
+        if key in ('LD_PRELOAD', 'NTCP_SOCKET_CONFIG'):
             del env[key]
     return env
 
@@ -228,9 +230,9 @@ def isolated(parent_namespace, artifact_dir):
     run([ip, 'addr', 'add', f'{KERNEL}/24', 'dev', TUN])
     run([ip, 'link', 'set', TUN, 'mtu', '1500', 'up'])
     assert_engine_unassigned()
-    preload = clean_env() | {'LD_PRELOAD': str(LIBRARY), 'NTCP_SOCKET_TUN': TUN,
-                            'NTCP_SOCKET_ADDR': ENGINE, 'NTCP_SOCKET_PREFIX': '24'}
     with tempfile.TemporaryDirectory(prefix='redis-data-', dir=artifact_dir) as data:
+        preload = clean_env() | {'LD_PRELOAD': str(LIBRARY)} | config_env(
+            data, interface=TUN, address=ENGINE, prefix='24')
         before = counters()
         with redis(ENGINE, preload, data, artifact_dir / 'preloaded-server.log') as server:
             assert str(LIBRARY) in pathlib.Path(f'/proc/{server.pid}/maps').read_text(), 'preload not mapped'
@@ -248,9 +250,9 @@ def isolated(parent_namespace, artifact_dir):
             before = counters()
             args = [tool('redis-cli'), '-h', KERNEL, '-p', PORT]
             # A reachable kernel server makes accidental native fallback detectable.
-            missing = preload.copy()
-            del missing['NTCP_SOCKET_ADDR']
-            invalid = preload | {'NTCP_SOCKET_ADDR': 'not-an-ip-address'}
+            missing = preload | config_env(data, interface=TUN, prefix='24')
+            invalid = preload | config_env(
+                data, interface=TUN, address='not-an-ip-address', prefix='24')
             with open(artifact_dir / 'invalid-config.log', 'wb') as log:
                 for label, env in [('missing address', missing), ('invalid address', invalid)]:
                     rejected = subprocess.run([str(arg) for arg in args + ['PING']], env=env,

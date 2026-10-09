@@ -5,20 +5,21 @@ import sys
 import tempfile
 from pathlib import Path
 
+from socket_config import config_env
 from timestamping import ROOT, LIBRARY, environment
 
 
 def isolated(binary, backend, pacing):
     env = environment()
     commands = [['ip', 'link', 'set', 'lo', 'up']]
-    settings = {'NTCP_SOCKET_ADDR': '10.73.0.2', 'LD_PRELOAD': str(LIBRARY)}
+    settings = {'address': '10.73.0.2'}
     if pacing != 'unset':
-        settings['NTCP_SOCKET_PACING'] = pacing
+        settings['pacing'] = pacing
     if backend == 'tun':
         commands += [['ip', 'tuntap', 'add', 'dev', 'ntcp0', 'mode', 'tun'],
                      ['ip', 'addr', 'add', '10.73.0.1/24', 'dev', 'ntcp0'],
                      ['ip', 'link', 'set', 'ntcp0', 'up']]
-        settings['NTCP_SOCKET_TUN'] = 'ntcp0'
+        settings['interface'] = 'ntcp0'
         server_env = env
     else:
         commands += [['ip', 'link', 'add', 'engine0', 'type', 'veth', 'peer', 'name', 'peer0'],
@@ -28,12 +29,12 @@ def isolated(binary, backend, pacing):
                      ['ip', 'addr', 'add', '10.73.0.253/24', 'dev', 'peer0'],
                      ['ip', 'link', 'set', 'engine0', 'up'],
                      ['ip', 'link', 'set', 'peer0', 'up']]
-        settings |= {'NTCP_SOCKET_BACKEND': 'af-packet', 'NTCP_SOCKET_IFACE': 'engine0',
-                     'NTCP_SOCKET_NEXT_HOP_MAC': '02:00:00:00:00:01'}
+        settings |= {'backend': 'af-packet', 'interface': 'engine0',
+                     'next_hop_mac': '02:00:00:00:00:01'}
         # Two userspace endpoints avoid kernel CHECKSUM_PARTIAL frames on veth.
-        server_env = env | settings | {'NTCP_SOCKET_ADDR': '10.73.0.1',
-                     'NTCP_SOCKET_IFACE': 'peer0',
-                     'NTCP_SOCKET_NEXT_HOP_MAC': '02:00:00:00:00:02'}
+        server_env = env | {'LD_PRELOAD': str(LIBRARY)} | config_env(
+            Path(binary).parent, **(settings | {'address': '10.73.0.1',
+                'interface': 'peer0', 'next_hop_mac': '02:00:00:00:00:02'}))
     for command in commands:
         subprocess.run(command, env=env, check=True, timeout=10)
     with subprocess.Popen([binary, '--server'], env=server_env,
@@ -41,7 +42,8 @@ def isolated(binary, backend, pacing):
         try:
             assert select.select([server.stdout], [], [], 10)[0], 'server startup timeout'
             assert server.stdout.readline().strip() == 'READY'
-            subprocess.run([binary], env=env | settings, check=True, timeout=30)
+            subprocess.run([binary], env=env | {'LD_PRELOAD': str(LIBRARY)} | config_env(
+                               Path(binary).parent, **settings), check=True, timeout=30)
             assert server.wait(timeout=10) == 0
         finally:
             if server.poll() is None:
@@ -60,12 +62,12 @@ def main():
         subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-O2',
                         str(Path(__file__).with_suffix('.c')), '-o', binary],
                        env=env, check=True, timeout=30)
-        for value in ['', 'true', '01', '2']:
+        for value in ['', 'TRUE', '01', '2']:
             subprocess.run([binary, '--invalid'], env=env | {
-                'LD_PRELOAD': str(LIBRARY), 'NTCP_SOCKET_ADDR': '10.73.0.2',
-                'NTCP_SOCKET_PACING': value}, check=True, timeout=10)
+                'LD_PRELOAD': str(LIBRARY), **config_env(
+                    directory, interface='ntcp0', address='10.73.0.2', pacing=value)}, check=True, timeout=10)
         for backend in ['tun', 'af-packet']:
-            for pacing in ['unset', '0', '1']:
+            for pacing in ['unset', 'false', 'true']:
                 subprocess.run(['unshare', '--user', '--map-root-user', '--net',
                                 sys.executable, str(Path(__file__).resolve()),
                                 '--isolated', binary, backend, pacing],

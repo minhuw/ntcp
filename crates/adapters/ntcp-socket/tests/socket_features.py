@@ -9,13 +9,15 @@ import sys
 import tempfile
 import threading
 
+from socket_config import config_env
+
 ROOT = Path(__file__).resolve().parents[4]
 LIBRARY = ROOT / 'target/debug/libntcp_socket.so'
 
 
 def clean_env():
     return {k: v for k, v in os.environ.items()
-            if k != 'LD_PRELOAD' and not k.startswith('NTCP_SOCKET_')}
+            if k not in ('LD_PRELOAD', 'NTCP_SOCKET_CONFIG')}
 
 
 def run(executable, virtual=False, preload=False):
@@ -24,7 +26,7 @@ def run(executable, virtual=False, preload=False):
     if virtual or preload:
         env['LD_PRELOAD'] = str(LIBRARY)
     if virtual:
-        env.update(NTCP_SOCKET_TUN='ntcp0', NTCP_SOCKET_ADDR='10.73.0.2')
+        env.update(config_env(Path(executable).parent, interface='ntcp0', address='10.73.0.2'))
 
     def peer(listener):
         listener.settimeout(15)

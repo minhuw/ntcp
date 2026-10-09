@@ -7,6 +7,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from socket_config import config_env
 import timestamping
 
 
@@ -16,7 +17,7 @@ def run(binary, managed=False, preload=False):
     if preload or managed:
         env['LD_PRELOAD'] = str(timestamping.LIBRARY)
     if managed:
-        env.update(NTCP_SOCKET_ADDR='10.73.0.2', NTCP_SOCKET_TUN='ntcp0')
+        env.update(config_env(Path(binary).parent, interface='ntcp0', address='10.73.0.2'))
 
     def peer(listener):
         for case in range(16):
@@ -54,19 +55,21 @@ def main():
                         ['ip', 'tuntap', 'add', 'dev', 'ntcp0', 'mode', 'tun'],
                         ['ip', 'addr', 'add', '10.73.0.1/24', 'dev', 'ntcp0'],
                         ['ip', 'link', 'set', 'ntcp0', 'up']):
-            subprocess.run(command, check=True, timeout=10)
+            subprocess.run(command, env=timestamping.environment(), check=True, timeout=10)
         run(sys.argv[2], managed=True)
         return
     subprocess.run(['cargo', 'build', '-p', 'ntcp-socket'], cwd=timestamping.ROOT,
-                   check=True, timeout=180)
+                   env=timestamping.environment(), check=True, timeout=180)
     with tempfile.TemporaryDirectory(prefix='ntcp-large-write-') as directory:
         binary = str(Path(directory) / 'large-write')
         subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-pthread',
-                        str(Path(__file__).with_suffix('.c')), '-o', binary], check=True)
+                        str(Path(__file__).with_suffix('.c')), '-o', binary],
+                       env=timestamping.environment(), check=True)
         run(binary)
         run(binary, preload=True)
         subprocess.run(['unshare', '--user', '--map-root-user', '--net', sys.executable,
-                        str(Path(__file__).resolve()), '--isolated', binary], check=True, timeout=35)
+                        str(Path(__file__).resolve()), '--isolated', binary],
+                       env=timestamping.environment(), check=True, timeout=35)
 
 
 if __name__ == '__main__':

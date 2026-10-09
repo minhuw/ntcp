@@ -8,13 +8,15 @@ import subprocess
 import sys
 import tempfile
 
+from socket_config import config_env
+
 ROOT = Path(__file__).resolve().parents[4]
 LIBRARY = ROOT / 'target/debug/libntcp_socket.so'
 
 
 def clean_env():
     return {k: v for k, v in os.environ.items()
-            if k != 'LD_PRELOAD' and not k.startswith('NTCP_SOCKET_')}
+            if k not in ('LD_PRELOAD', 'NTCP_SOCKET_CONFIG')}
 
 
 def run(args, env=None, timeout=30):
@@ -28,8 +30,8 @@ def isolated(directory):
                  ['ip', 'addr', 'add', '10.73.0.1/24', 'dev', 'ntcp0'],
                  ['ip', 'link', 'set', 'ntcp0', 'up']):
         run(args)
-    preload = env | {'LD_PRELOAD': str(LIBRARY), 'NTCP_SOCKET_TUN': 'ntcp0',
-                     'NTCP_SOCKET_ADDR': '10.73.0.2'}
+    preload = env | {'LD_PRELOAD': str(LIBRARY)} | config_env(
+        directory, interface='ntcp0', address='10.73.0.2')
     run([str(directory / 'cancellation'), '--coexist'], env=preload)
 
     def serve(listener, loaded):
