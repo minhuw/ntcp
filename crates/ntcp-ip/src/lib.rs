@@ -335,6 +335,8 @@ pub enum FeedbackKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TcpQuote {
     pub ip: IpMetadata,
+    pub ip_packet_len: u32,
+    pub ip_header_len: u16,
     pub source_port: u16,
     pub destination_port: u16,
     pub sequence: u32,
@@ -489,6 +491,8 @@ fn quote(b: &[u8], ipv6: bool) -> Result<TcpQuote, Error> {
     }
     Ok(TcpQuote {
         ip,
+        ip_packet_len: total as u32,
+        ip_header_len: header as u16,
         source_port,
         destination_port,
         sequence: u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]),

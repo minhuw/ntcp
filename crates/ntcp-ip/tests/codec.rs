@@ -262,6 +262,8 @@ fn icmp_checked_quotes_and_ptb() {
             assert_eq!(p.quoted.source_port, 1234);
             assert_eq!(p.quoted.destination_port, 8080);
             assert_eq!(p.quoted.sequence, 0x12345678);
+            assert_eq!(p.quoted.ip_packet_len, tcp.len() as u32);
+            assert_eq!(p.quoted.ip_header_len, header as u16);
             let mut bad = b.clone();
             bad[header + 2] ^= 1;
             assert_eq!(decode_icmp(&bad).unwrap_err(), Error::Checksum);
@@ -308,6 +310,100 @@ fn icmp_checked_quotes_and_ptb() {
         );
     }
 }
+#[test]
+fn ptb_zero_mtu_and_original_lengths() {
+    for v6 in [false, true] {
+        let header = if v6 { 40 } else { 20 };
+        let mut tcp = tcp_packet(v6, OutgoingIpv4Options::default());
+        // A minimal quote of a maximum-sized original packet, not an ICMP-sized packet.
+        if v6 {
+            tcp[4..6].copy_from_slice(&u16::MAX.to_be_bytes());
+        } else {
+            tcp[2..4].copy_from_slice(&u16::MAX.to_be_bytes());
+            seal(&mut tcp);
+        }
+        for quote_len in [header + 8, tcp.len()] {
+            let mut b = error_packet(v6, &tcp[..quote_len]);
+            let ip = parse(&b, false).unwrap().ip;
+            let icmp = &mut b[header..];
+            icmp[4..8].fill(0);
+            icmp[2..4].fill(0);
+            let sum = if v6 {
+                icmpv6_checksum(ip, icmp).unwrap()
+            } else {
+                checksum(icmp)
+            };
+            icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+            let p = decode_icmp(&b).unwrap();
+            assert_eq!(p.kind, FeedbackKind::PacketTooBig);
+            assert_eq!(p.candidate_mtu, if v6 { Some(0) } else { None });
+            assert_eq!(p.quoted.ip_packet_len, 65535 + if v6 { 40 } else { 0 });
+            assert_eq!(p.quoted.ip_header_len, header as u16);
+        }
+    }
+}
+
+#[test]
+fn quote_lengths_and_validation() {
+    for v6 in [false, true] {
+        let header = if v6 { 40 } else { 20 };
+        let tcp = tcp_packet(v6, OutgoingIpv4Options::default());
+        for payload in [8u16, 19] {
+            let mut bad = tcp.clone();
+            if v6 {
+                bad[4..6].copy_from_slice(&payload.to_be_bytes());
+            } else {
+                bad[2..4].copy_from_slice(&(20 + payload).to_be_bytes());
+                seal(&mut bad);
+            }
+            assert_eq!(
+                decode_icmp(&error_packet(v6, &bad[..header + 8])).unwrap_err(),
+                Error::Quote
+            );
+        }
+        let mut bad = tcp.clone();
+        bad.push(0); // Quote cannot exceed the declared original length.
+        assert_eq!(
+            decode_icmp(&error_packet(v6, &bad)).unwrap_err(),
+            Error::Quote
+        );
+        let mut bad = tcp.clone();
+        bad[if v6 { 8 } else { 12 }] ^= 1; // Quoted sender must match outer destination.
+        if !v6 {
+            seal(&mut bad);
+        }
+        assert_eq!(
+            decode_icmp(&error_packet(v6, &bad)).unwrap_err(),
+            Error::Quote
+        );
+        let mut bad = tcp.clone();
+        bad[6] = if v6 { 44 } else { 0x20 };
+        if !v6 {
+            seal(&mut bad);
+        }
+        assert_eq!(
+            decode_icmp(&error_packet(v6, &bad)).unwrap_err(),
+            Error::FragmentationUnsupported
+        );
+        if v6 {
+            for next in [0, 43, 50, 51, 60, 135, 139, 140] {
+                bad[6] = next;
+                assert_eq!(
+                    decode_icmp(&error_packet(true, &bad)).unwrap_err(),
+                    Error::ExtensionsUnsupported
+                );
+            }
+        } else {
+            let mut bad = tcp;
+            bad[8] ^= 1;
+            assert_eq!(
+                decode_icmp(&error_packet(false, &bad)).unwrap_err(),
+                Error::Checksum
+            );
+        }
+    }
+}
+
 #[test]
 fn time_exceeded_quotes_allow_expired_inner_packets() {
     for v6 in [false, true] {
@@ -357,6 +453,19 @@ fn source_route_logical_checksum_and_quote() {
     assert!(ntcp::wire::parse(tx(false, 0).ip, &tcp[header..]).is_ok());
     let p = decode_icmp(&error_packet(false, &tcp[..header + 8])).unwrap();
     assert_eq!(p.quoted.ip, tx(false, 0).ip);
+    assert_eq!(p.quoted.ip_packet_len, tcp.len() as u32);
+    assert_eq!(p.quoted.ip_header_len, header as u16);
+    assert!(header > 20);
+    for cut in 20..header + 8 {
+        assert!(decode_icmp(&error_packet(false, &tcp[..cut])).is_err());
+    }
+    let mut bad = tcp.clone();
+    bad[21] = 2; // Source-route option is too short.
+    seal(&mut bad);
+    assert_eq!(
+        decode_icmp(&error_packet(false, &bad)).unwrap_err(),
+        Error::Options
+    );
     let mut arrived = tcp.clone();
     arrived[16..20].copy_from_slice(&[192, 0, 2, 2]);
     arrived[23..27].copy_from_slice(&hop.octets());
