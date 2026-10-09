@@ -34,6 +34,8 @@ struct Interval {
     transmission_start: Seq,
     transmission_end: Seq,
     sent: u64,
+    // Retained wire TSval must still name this copy's departure time.
+    timestamp_eligible: bool,
     retransmitted: bool,
     departure_committed: bool,
     // Any retransmission of the original packet makes its untouched pieces
@@ -418,6 +420,8 @@ impl Rack {
         for r in &mut self.intervals {
             if !after(start, r.start) && !after(r.end, end) {
                 r.sent = now;
+                // Even a sub-TS-tick delay separates encoding from departure.
+                r.timestamp_eligible &= now == selection.selected;
                 r.transmission_start = start;
                 r.transmission_end = end;
                 r.departure_committed = true;
@@ -486,6 +490,7 @@ impl Rack {
                     r.transmission_start = start;
                     r.transmission_end = end;
                     r.sent = now;
+                    r.timestamp_eligible = true;
                     r.departure_committed = false;
                     r.retransmitted = true;
                     r.loss_response_pending = true;
@@ -507,6 +512,7 @@ impl Rack {
                 transmission_start: start,
                 transmission_end: end,
                 sent: now,
+                timestamp_eligible: true,
                 retransmitted: false,
                 departure_committed: false,
                 original_retransmitted: false,
@@ -667,7 +673,9 @@ impl Rack {
                     && (!r.retransmitted
                         || (rtt >= self.min_rtt.unwrap_or(u64::MAX)
                             && timestamps.is_none_or(|granularity| {
-                                echo == Some(granularity.tick_in(r.sent, self.timebase) as u32)
+                                r.timestamp_eligible
+                                    && echo
+                                        == Some(granularity.tick_in(r.sent, self.timebase) as u32)
                             })));
                 if eligible
                     && newest
@@ -976,6 +984,144 @@ mod tests {
     }
 
     #[test]
+    fn departure_timestamp_evidence_requires_unchanged_encoding_time() {
+        for scale in [1, 1000] {
+            let timebase = CallerTimebase {
+                units_per_second: 1_000_000 * scale,
+                ..CallerTimebase::default()
+            };
+            for granularity in [
+                TimestampGranularity::Milliseconds,
+                TimestampGranularity::Microseconds,
+            ] {
+                let tick = timebase.ticks_from_us(granularity.tick_us());
+                let selected = 300_000 * scale;
+                // One caller tick includes sub-wire-tick delays where supported.
+                for delay in [0, 1, tick] {
+                    let accepted = selected + delay;
+                    for echo_time in [selected, accepted] {
+                        for retransmit in [false, true] {
+                            for timestamps in [None, Some(granularity)] {
+                                let mut rack = Rack::with_timebase(4, timebase).unwrap();
+                                rack.sample(100_000 * scale, 0);
+                                if retransmit {
+                                    rack.transmit(Seq(0), Seq(8), 100_000 * scale, false);
+                                }
+                                rack.transmit(Seq(0), Seq(8), selected, retransmit);
+                                let token = rack.departure_selection().unwrap();
+                                assert!(rack.commit_departure(token, Seq(0), Seq(8), accepted));
+                                assert_eq!(rack.intervals[0].timestamp_eligible, delay == 0);
+                                assert_eq!(
+                                    rack.acknowledge(
+                                        Seq(8),
+                                        Seq(8),
+                                        &Scoreboard::new(),
+                                        accepted + 100_000 * scale,
+                                        Some(granularity.tick_in(echo_time, timebase) as u32),
+                                        timestamps,
+                                        1000,
+                                        false,
+                                    ),
+                                    8
+                                );
+                                let eligible = !retransmit || timestamps.is_none() || delay == 0;
+                                assert_eq!(rack.latest, eligible.then_some((accepted, Seq(8))));
+                                assert_eq!(
+                                    rack.ack_sample,
+                                    (!retransmit).then_some(100_000 * scale)
+                                );
+                                assert_eq!(rack.min_rtt, Some(100_000 * scale));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn departure_timestamp_eligibility_survives_splits_and_renews_only_on_transmit() {
+        let mut rack = Rack::with_capacity(24).unwrap();
+        rack.sample(100_000, 0);
+        rack.transmit(Seq(0), Seq(24), 100_000, false);
+        rack.transmit(Seq(0), Seq(24), 300_000, true);
+        let token = rack.departure_selection().unwrap();
+        // Accept a delayed middle first, then independently accept its siblings.
+        assert!(rack.commit_departure(token, Seq(8), Seq(16), 300_001));
+        assert!(rack.commit_departure(token, Seq(0), Seq(8), 300_000));
+        assert!(rack.commit_departure(token, Seq(16), Seq(24), 301_000));
+        assert_eq!(
+            rack.intervals
+                .iter()
+                .map(|r| r.timestamp_eligible)
+                .collect::<Vec<_>>(),
+            [true, false, false]
+        );
+        let mut scoreboard = Scoreboard::new();
+        scoreboard.update(Seq(0), Seq(24), &[Some((10, 14)), None, None, None]);
+        assert_eq!(
+            rack.acknowledge(
+                Seq(0),
+                Seq(24),
+                &scoreboard,
+                401_000,
+                Some(300),
+                Some(TimestampGranularity::Milliseconds),
+                1000,
+                false,
+            ),
+            4
+        );
+        assert_eq!(rack.latest, None);
+        assert!(
+            rack.intervals
+                .iter()
+                .filter(|r| r.start != Seq(0))
+                .all(|r| !r.timestamp_eligible)
+        );
+        // The on-time sibling qualifies despite both delayed siblings.
+        assert_eq!(
+            rack.acknowledge(
+                Seq(8),
+                Seq(24),
+                &scoreboard,
+                401_000,
+                Some(300),
+                Some(TimestampGranularity::Milliseconds),
+                1000,
+                false,
+            ),
+            8
+        );
+        assert_eq!(rack.latest, Some((300_000, Seq(8))));
+        // Newly encoded network retransmission renews only its exact byte span,
+        // including pieces created by the earlier SACK split.
+        rack.transmit(Seq(8), Seq(16), 500_000, true);
+        let token = rack.departure_selection().unwrap();
+        assert!(rack.commit_departure(token, Seq(8), Seq(16), 500_000));
+        assert!(
+            rack.intervals
+                .iter()
+                .all(|r| r.timestamp_eligible == (r.end.0 <= 16))
+        );
+        assert_eq!(
+            rack.acknowledge(
+                Seq(24),
+                Seq(24),
+                &Scoreboard::new(),
+                600_000,
+                Some(500),
+                Some(TimestampGranularity::Milliseconds),
+                1000,
+                false,
+            ),
+            12
+        );
+        assert_eq!(rack.latest, Some((500_000, Seq(16))));
+        assert_eq!(rack.ack_sample, None);
+    }
+
+    #[test]
     fn departure_fresh_fragments_preserve_logical_coverage_and_wrap() {
         for base in [Seq(100), Seq(u32::MAX - 9)] {
             let seq = |n| base.wrapping_add(n);
@@ -1070,6 +1216,7 @@ mod tests {
                 start: seq(8),
                 end: seq(16),
                 sent: 100,
+                timestamp_eligible: false,
                 transmission_start: seq(8),
                 transmission_end: seq(16),
                 departure_committed: true,
