@@ -18,13 +18,16 @@ const MIN_RTT_BUCKET: u64 = MIN_RTT_WINDOW / 3;
 // Even a one-caller-tick minimum can reach any u64 SRTT with this multiplier.
 const MAX_MULTIPLIER: u128 = 4 * u64::MAX as u128;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Interval {
     start: Seq,
     end: Seq,
-    // Splits retain the original logical segment identity.
+    // Splits retain the original logical admission/window identity.
     original_start: Seq,
     original_end: Seq,
+    // Physical originals may be smaller than the logical admission/window span.
+    original_wire_start: Seq,
+    original_wire_end: Seq,
     original_sent: u64,
     originally_in_window: bool,
     successful_retries: u32,
@@ -32,6 +35,7 @@ struct Interval {
     transmission_end: Seq,
     sent: u64,
     retransmitted: bool,
+    departure_committed: bool,
     // Any retransmission of the original packet makes its untouched pieces
     // ambiguous too; their ACK may have been solicited by that retransmission.
     original_retransmitted: bool,
@@ -43,6 +47,17 @@ struct Interval {
     // This committed retransmission copy has not shared an extra loss response.
     // Splits copy the marker; only successful retransmit commits renew it.
     loss_response_pending: bool,
+}
+
+// Scoped to one Rack instance by the owning connection's generation. Never
+// compare only sequence/time: two selections may have exactly the same values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DepartureSelection {
+    generation: u64,
+    start: Seq,
+    end: Seq,
+    selected: u64,
+    retransmit: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,6 +84,8 @@ pub(crate) struct Rack {
     // pushes/inserts stay inside the fallibly reserved admission capacity.
     intervals: Vec<Interval>,
     capacity: usize,
+    selection_generation: u64,
+    departure_selection: Option<DepartureSelection>,
     timebase: CallerTimebase,
     fallback: Option<Seq>,
     latest: Option<(u64, Seq)>,
@@ -134,6 +151,8 @@ impl Rack {
         Ok(Self {
             intervals,
             capacity,
+            selection_generation: 0,
+            departure_selection: None,
             timebase,
             fallback: None,
             latest: None,
@@ -152,7 +171,7 @@ impl Rack {
         })
     }
 
-    // Immutable original wire span/time plus whether any of that original
+    // Original physical wire span/time plus whether any of that original
     // packet has been retransmitted. Used by scaled-window first-retry policy.
     #[allow(dead_code)] // Consumer is the parallel TCP-options integration.
     pub(crate) fn original_transmission(&self, start: Seq) -> Option<(Seq, Seq, u64, bool)> {
@@ -161,8 +180,8 @@ impl Rack {
             .find(|r| !after(r.start, start) && after(r.end, start))
             .map(|r| {
                 (
-                    r.original_start,
-                    r.original_end,
+                    r.original_wire_start,
+                    r.original_wire_end,
                     r.original_sent,
                     r.original_retransmitted,
                 )
@@ -310,6 +329,7 @@ impl Rack {
 
     pub(crate) fn abandon(&mut self, boundary: Seq) {
         self.intervals.clear();
+        self.departure_selection = None;
         self.fallback = Some(boundary);
         self.latest = None;
         self.deadline = None;
@@ -333,6 +353,84 @@ impl Rack {
         true
     }
 
+    // Capture only when this output actually called transmit, not for pure ACKs.
+    // The caller binds the token to its connection generation and freezes input
+    // and timeout processing until the reserved output has been resolved.
+    #[allow(dead_code)] // Consumer: reserved-output timing integration.
+    pub(crate) fn departure_selection(&self) -> Option<DepartureSelection> {
+        self.departure_selection.filter(|_| self.valid())
+    }
+
+    // Re-age an already charged copy, not a retransmission. Validate all edges,
+    // coverage and capacity before any split so failure leaves the ledger intact.
+    #[allow(dead_code)] // Consumer: reserved-output timing integration.
+    pub(crate) fn commit_departure(
+        &mut self,
+        selection: DepartureSelection,
+        start: Seq,
+        end: Seq,
+        now: u64,
+    ) -> bool {
+        if !self.valid()
+            || self.departure_selection != Some(selection)
+            || !after(end, start)
+            || start.distance_from(selection.start) >= selection.end.distance_from(selection.start)
+            || end.distance_from(selection.start) > selection.end.distance_from(selection.start)
+            || now < selection.selected
+        {
+            return false;
+        }
+        let mut covered = start;
+        for r in self
+            .intervals
+            .iter()
+            .filter(|r| after(end, r.start) && after(r.end, start))
+        {
+            if after(r.start, covered)
+                || r.departure_committed
+                || r.sent != selection.selected
+                || r.transmission_start != selection.start
+                || r.transmission_end != selection.end
+                || r.retransmitted != selection.retransmit
+            {
+                return false;
+            }
+            covered = if after(r.end, end) { end } else { r.end };
+        }
+        if covered != end {
+            return false;
+        }
+        let splits = [start, end]
+            .iter()
+            .filter(|&&edge| {
+                self.intervals
+                    .iter()
+                    .any(|r| after(edge, r.start) && after(r.end, edge))
+            })
+            .count();
+        if splits > self.capacity.saturating_sub(self.intervals.len()) {
+            return false;
+        }
+        // Preflight above guarantees these cannot fail or allocate.
+        let left = self.split(start);
+        let right = self.split(end);
+        debug_assert!(left && right);
+        for r in &mut self.intervals {
+            if !after(start, r.start) && !after(r.end, end) {
+                r.sent = now;
+                r.transmission_start = start;
+                r.transmission_end = end;
+                r.departure_committed = true;
+                if !selection.retransmit {
+                    r.original_wire_start = start;
+                    r.original_wire_end = end;
+                    r.original_sent = now;
+                }
+            }
+        }
+        true
+    }
+
     // Called only after encoding succeeds. Production reserves one interval
     // per send-buffer byte plus control space; byte-edge splits cannot exhaust
     // that backing. Undersized synthetic ledgers retain a defensive fallback.
@@ -347,7 +445,18 @@ impl Rack {
     //# record the time in Segment.xmit_ts and set Segment.lost to FALSE.
     //# Upon retransmitting a segment, set Segment.retransmitted to TRUE.
     pub(crate) fn transmit(&mut self, start: Seq, end: Seq, now: u64, retransmit: bool) {
+        self.departure_selection = self.selection_generation.checked_add(1).map(|generation| {
+            self.selection_generation = generation;
+            DepartureSelection {
+                generation,
+                start,
+                end,
+                selected: now,
+                retransmit,
+            }
+        });
         if let Some(boundary) = self.fallback {
+            self.departure_selection = None;
             if after(end, boundary) {
                 self.fallback = Some(end);
             }
@@ -359,10 +468,10 @@ impl Rack {
                 self.abandon(boundary);
                 return;
             }
-            for segment in self
-                .intervals
-                .chunk_by_mut(|a, b| a.original_end == b.original_end)
-            {
+            for segment in self.intervals.chunk_by_mut(|a, b| {
+                a.original_wire_start == b.original_wire_start
+                    && a.original_wire_end == b.original_wire_end
+            }) {
                 if segment
                     .iter()
                     .any(|r| after(end, r.start) && after(r.end, start))
@@ -377,6 +486,7 @@ impl Rack {
                     r.transmission_start = start;
                     r.transmission_end = end;
                     r.sent = now;
+                    r.departure_committed = false;
                     r.retransmitted = true;
                     r.loss_response_pending = true;
                     r.needs_retransmit = false;
@@ -389,6 +499,8 @@ impl Rack {
                 end,
                 original_start: start,
                 original_end: end,
+                original_wire_start: start,
+                original_wire_end: end,
                 original_sent: now,
                 originally_in_window: false,
                 successful_retries: 0,
@@ -396,6 +508,7 @@ impl Rack {
                 transmission_end: end,
                 sent: now,
                 retransmitted: false,
+                departure_committed: false,
                 original_retransmitted: false,
                 delivered: false,
                 sacked: false,
@@ -728,11 +841,11 @@ impl Rack {
     // Ordinary fast retransmit / NewReno partial ACK marks the missing head.
     // Retain the original packet edge across short retries and ledger splits.
     pub(crate) fn mark_head_lost(&mut self) {
-        if let Some(end) = self.intervals.first().map(|r| r.original_end) {
+        if let Some(end) = self.intervals.first().map(|r| r.original_wire_end) {
             for r in self
                 .intervals
                 .iter_mut()
-                .take_while(|r| r.original_end == end)
+                .take_while(|r| r.original_wire_end == end)
             {
                 if !r.sacked {
                     r.original_lost = true;
@@ -770,7 +883,7 @@ impl Rack {
             .intervals
             .iter()
             .rev()
-            .take_while(|r| r.original_end == tail.original_end)
+            .take_while(|r| r.original_wire_end == tail.original_wire_end)
             .last()?;
         let size = tail.end.distance_from(first.start).min(mss);
         Some((tail.end.wrapping_add(0u32.wrapping_sub(size)), tail.end))
@@ -785,7 +898,7 @@ impl Rack {
         // §5.1 leaves post-RTO packetization unspecified. Keep RACK's original
         // packet boundary: SACK splits account bytes, not new packets (RFC 2018 §5).
         // A redundant suffix is allowed, but never include the next packet.
-        let size = first.original_end.distance_from(first.start).min(mss);
+        let size = first.original_wire_end.distance_from(first.start).min(mss);
         Some((first.start, first.start.wrapping_add(size)))
     }
 
@@ -812,6 +925,8 @@ impl Rack {
             .any(|r| r.transmission_end.distance_from(r.transmission_start) < mss)
     }
 
+    // Diagnostic/accounting identity remains the logical selection, not local
+    // repair packetization (which must not manufacture new loss/retry counts).
     pub(crate) fn counts(&self) -> Counts {
         let mut counts = Counts::default();
         for segment in self
@@ -858,6 +973,254 @@ mod tests {
             1000,
             update.dsack,
         )
+    }
+
+    #[test]
+    fn departure_fresh_fragments_preserve_logical_coverage_and_wrap() {
+        for base in [Seq(100), Seq(u32::MAX - 9)] {
+            let seq = |n| base.wrapping_add(n);
+            let mut rack = Rack::with_capacity(24).unwrap();
+            rack.transmit(base, seq(24), 10, false);
+            rack.commit_original_window(base, seq(24), true);
+            let token = rack.departure_selection().unwrap();
+            let span = rack.original_retry_span(base, seq(24)).unwrap();
+            let counts = rack.counts();
+            assert!(rack.commit_departure(token, seq(4), seq(12), 100));
+            assert!(rack.commit_departure(token, base, seq(4), 200));
+            assert_eq!(rack.head_transmission(base), Some((seq(4), 200)));
+            assert_eq!(rack.head_transmission(seq(4)), Some((seq(12), 100)));
+            assert_eq!(rack.head_transmission(seq(12)), Some((seq(24), 10)));
+            assert_eq!(
+                rack.original_transmission(base),
+                Some((base, seq(4), 200, false))
+            );
+            assert_eq!(
+                rack.original_transmission(seq(4)),
+                Some((seq(4), seq(12), 100, false))
+            );
+            assert_eq!(rack.original_retry_span(base, seq(24)), Some(span));
+            assert!(rack.commit_departure(token, seq(12), seq(24), 300));
+            assert_eq!(rack.head_transmission(base), Some((seq(4), 200)));
+            assert_eq!(
+                rack.original_transmission(seq(12)),
+                Some((seq(12), seq(24), 300, false))
+            );
+            assert_eq!(rack.counts().unacked, counts.unacked);
+            assert_eq!(rack.counts().lost, 0);
+            assert_eq!(rack.counts().retransmitted, 0);
+            assert_eq!(rack.pipe(), 24);
+            assert!(rack.intervals.iter().all(|r| !r.delivered
+                && !r.sacked
+                && !r.retransmitted
+                && !r.loss_response_pending
+                && r.successful_retries == 0));
+
+            assert_eq!(rack.tail_segment(100), Some((seq(12), seq(24))));
+            rack.mark_head_lost();
+            assert_eq!(rack.lowest_lost(100), Some((base, seq(4))));
+            assert!(
+                !rack
+                    .intervals
+                    .iter()
+                    .find(|r| r.start == seq(4))
+                    .unwrap()
+                    .needs_retransmit
+            );
+
+            // A real retry now makes only its physical original ambiguous,
+            // without splitting the original window/first-retry permission.
+            rack.transmit(base, seq(2), 400, true);
+            rack.commit_retry_span(base, seq(2));
+            assert!(rack.original_transmission(seq(3)).unwrap().3);
+            assert!(!rack.original_transmission(seq(4)).unwrap().3);
+            assert_eq!(
+                rack.original_retry_span(seq(4), seq(24))
+                    .unwrap()
+                    .successful_retries,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn departure_retry_preserves_history_and_one_shot_delivery() {
+        for base in [Seq(100), Seq(u32::MAX - 9)] {
+            let seq = |n| base.wrapping_add(n);
+            let mut rack = Rack::with_capacity(24).unwrap();
+            rack.transmit(base, seq(24), 10, false);
+            rack.commit_original_window(base, seq(24), true);
+            rack.mark_head_lost();
+            rack.transmit(base, seq(24), 20, true);
+            rack.commit_retry_span(base, seq(24));
+            rack.transmit(seq(4), seq(20), 30, true);
+            rack.commit_retry_span(seq(4), seq(20));
+            let token = rack.departure_selection().unwrap();
+            // Existing delivery, SACK and loss state is not reset by departure.
+            let r = &mut rack.intervals[1];
+            r.delivered = true;
+            r.sacked = true;
+            r.needs_retransmit = true;
+            let before = *r;
+            let counts = rack.counts();
+            let pipe = rack.pipe();
+            let original = rack.original_transmission(seq(4));
+            assert!(rack.commit_departure(token, seq(8), seq(16), 100));
+            let accepted = rack.intervals.iter().find(|r| r.start == seq(8)).unwrap();
+            let expected = Interval {
+                start: seq(8),
+                end: seq(16),
+                sent: 100,
+                transmission_start: seq(8),
+                transmission_end: seq(16),
+                departure_committed: true,
+                ..before
+            };
+            assert_eq!(*accepted, expected);
+            assert_eq!(rack.head_transmission(seq(4)), Some((seq(8), 30)));
+            assert_eq!(rack.head_transmission(seq(16)), Some((seq(20), 30)));
+            assert_eq!(rack.original_transmission(seq(8)), original);
+            assert_eq!(rack.counts().unacked, counts.unacked);
+            assert_eq!(rack.counts().sacked, counts.sacked);
+            assert_eq!(rack.counts().lost, counts.lost);
+            assert_eq!(rack.counts().retransmitted, counts.retransmitted);
+            assert_eq!(rack.pipe(), pipe);
+            assert!(rack.commit_departure(token, seq(4), seq(8), 110));
+            assert!(rack.commit_departure(token, seq(16), seq(20), 120));
+            assert_eq!(rack.head_transmission(seq(8)), Some((seq(16), 100)));
+            let mut scoreboard = Scoreboard::new();
+            assert_eq!(
+                sack(&mut rack, &mut scoreboard, seq(24).0, seq(24).0, 500, &[]),
+                8
+            );
+            assert_eq!(rack.ack_sample, None); // Karn still applies.
+            assert_eq!(
+                sack(&mut rack, &mut scoreboard, seq(24).0, seq(24).0, 600, &[]),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn departure_retry_crosses_physical_originals_without_rewriting_history() {
+        let mut rack = Rack::with_capacity(24).unwrap();
+        rack.transmit(Seq(0), Seq(24), 10, false);
+        let fresh = rack.departure_selection().unwrap();
+        assert!(rack.commit_departure(fresh, Seq(0), Seq(8), 20));
+        assert!(rack.commit_departure(fresh, Seq(8), Seq(24), 30));
+        rack.transmit(Seq(4), Seq(20), 40, true);
+        rack.commit_retry_span(Seq(4), Seq(20));
+        let retry = rack.departure_selection().unwrap();
+        assert!(rack.commit_departure(retry, Seq(6), Seq(16), 50));
+        assert_eq!(
+            rack.original_transmission(Seq(6)),
+            Some((Seq(0), Seq(8), 20, true))
+        );
+        assert_eq!(
+            rack.original_transmission(Seq(8)),
+            Some((Seq(8), Seq(24), 30, true))
+        );
+        assert_eq!(rack.head_transmission(Seq(6)), Some((Seq(16), 50)));
+        assert!(
+            rack.intervals
+                .iter()
+                .filter(|r| !after(Seq(4), r.start) && !after(r.end, Seq(20)))
+                .all(|r| r.successful_retries == 1 && r.retransmitted && r.loss_response_pending)
+        );
+        rack.abandon(Seq(24));
+        let before = alloc::format!("{rack:?}");
+        assert!(!rack.commit_departure(retry, Seq(4), Seq(6), 60));
+        assert_eq!(alloc::format!("{rack:?}"), before);
+        assert_eq!(rack.departure_selection(), None);
+    }
+
+    #[test]
+    fn departure_capacity_no_allocation_and_failure_atomicity() {
+        let mut rack = Rack::with_capacity(256).unwrap();
+        rack.transmit(Seq(0), Seq(256), 10, false);
+        let token = rack.departure_selection().unwrap();
+        let bytes = rack.allocation_bytes();
+        let ptr = rack.intervals.as_ptr();
+        crate::allocation_tests::fail_after(0, || {
+            for n in 0..256 {
+                assert!(rack.commit_departure(token, Seq(n), Seq(n + 1), 100 + u64::from(n)));
+            }
+            assert_eq!(rack.intervals.len(), rack.capacity);
+            assert_eq!(rack.intervals.as_ptr(), ptr);
+            assert_eq!(rack.allocation_bytes(), bytes);
+        });
+        for (n, r) in rack.intervals.iter().enumerate() {
+            assert_eq!(r.sent, 100 + n as u64);
+            assert_eq!(r.original_sent, r.sent);
+            assert_eq!(r.successful_retries, 0);
+        }
+        // Two edges need two slots: do not apply the first split on failure.
+        let mut rack = Rack::with_capacity(2).unwrap();
+        rack.transmit(Seq(0), Seq(8), 10, false);
+        let token = rack.departure_selection().unwrap();
+        let before = alloc::format!("{rack:?}");
+        assert!(!rack.commit_departure(token, Seq(2), Seq(6), 20));
+        assert_eq!(alloc::format!("{rack:?}"), before);
+        assert!(rack.commit_departure(token, Seq(0), Seq(4), 20));
+        // A full ledger still accepts an already aligned suffix without a slot.
+        crate::allocation_tests::fail_after(0, || {
+            assert!(rack.commit_departure(token, Seq(4), Seq(8), 30));
+        });
+    }
+
+    #[test]
+    fn departure_rejects_stale_duplicate_invalid_and_exhausted_tokens() {
+        let mut rack = Rack::with_capacity(24).unwrap();
+        rack.transmit(Seq(0), Seq(24), 10, false);
+        let old = rack.departure_selection().unwrap();
+        rack.transmit(Seq(0), Seq(24), 10, true);
+        let older_retry = rack.departure_selection().unwrap();
+        rack.transmit(Seq(0), Seq(24), 10, true);
+        let token = rack.departure_selection().unwrap();
+        for (t, start, end, now) in [
+            (old, 0, 24, 20),
+            (older_retry, 0, 24, 20),
+            (token, 0, 24, 9),
+            (token, 0, 25, 20),
+            (token, u32::MAX, 10, 20),
+            (token, 4, 4, 20),
+            (token, 10, 4, 20),
+        ] {
+            let before = alloc::format!("{rack:?}");
+            assert!(!rack.commit_departure(t, Seq(start), Seq(end), now));
+            assert_eq!(alloc::format!("{rack:?}"), before);
+        }
+        assert!(rack.commit_departure(token, Seq(0), Seq(8), 10));
+        let before = alloc::format!("{rack:?}");
+        assert!(!rack.commit_departure(token, Seq(0), Seq(8), 10));
+        assert!(!rack.commit_departure(token, Seq(4), Seq(12), 20));
+        assert_eq!(alloc::format!("{rack:?}"), before);
+        // A removed byte cannot be silently covered by a departure commit.
+        rack.intervals[1].start = Seq(9);
+        let before = alloc::format!("{rack:?}");
+        assert!(!rack.commit_departure(token, Seq(8), Seq(24), 20));
+        assert_eq!(alloc::format!("{rack:?}"), before);
+        rack.selection_generation = u64::MAX;
+        rack.transmit(Seq(0), Seq(24), 10, true);
+        assert_eq!(rack.departure_selection(), None);
+        assert!(!rack.commit_departure(token, Seq(8), Seq(24), 20));
+        rack.transmit(Seq(0), Seq(24), 10, true);
+        assert_eq!(rack.departure_selection(), None);
+    }
+
+    #[test]
+    fn departure_fresh_ack_uses_physical_packet_boundary_and_age() {
+        let mut rack = Rack::with_capacity(24).unwrap();
+        rack.transmit(Seq(0), Seq(24), 10, false);
+        let token = rack.departure_selection().unwrap();
+        assert!(rack.commit_departure(token, Seq(0), Seq(8), 100));
+        assert!(rack.commit_departure(token, Seq(8), Seq(24), 200));
+        let mut scoreboard = Scoreboard::new();
+        assert_eq!(sack(&mut rack, &mut scoreboard, 8, 24, 210, &[]), 8);
+        assert_eq!(rack.latest, Some((100, Seq(8))));
+        assert_eq!(rack.ack_sample, Some(110));
+        assert_eq!(rack.head_transmission(Seq(8)), Some((Seq(24), 200)));
+        assert_eq!(sack(&mut rack, &mut scoreboard, 24, 24, 220, &[]), 16);
+        assert_eq!(rack.ack_sample, Some(20));
     }
 
     #[test]
