@@ -15,6 +15,8 @@ mod buffer;
 mod connection;
 mod cubic;
 mod endpoint;
+mod output_reservation;
+pub use output_reservation::TransmitAttempt;
 #[cfg(test)]
 mod endpoint_tests;
 mod hystart;

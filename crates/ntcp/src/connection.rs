@@ -590,6 +590,7 @@ pub(crate) struct Connection {
     acknowledged: u64,
     pub(crate) tx_timestamps: TxTimestamps,
     pub(crate) last_output_range: Option<TxStreamRange>,
+    last_pmtu_output: Option<(Seq, Seq)>,
     pub(crate) rx_timestamps: RxTimestamps,
     input_timestamps: RxPacketTimestamps,
     received_read: u64,
@@ -845,6 +846,7 @@ impl Connection {
             acknowledged: 0,
             tx_timestamps: TxTimestamps::default(),
             last_output_range: None,
+            last_pmtu_output: None,
             rx_timestamps: RxTimestamps::default(),
             input_timestamps: RxPacketTimestamps::default(),
             received_read: 0,
@@ -2002,7 +2004,15 @@ impl Connection {
         self.set_path_mss(mss.min(ceiling).min(budget));
     }
 
-    fn path_payload_limit(&self) -> usize {
+    pub(crate) fn reject_reserved_output(&mut self) {
+        if let Some((start, end)) = self.last_pmtu_output.take()
+            && let Some(p) = &mut self.pmtud
+        {
+            p.reject_latest(start, end);
+        }
+    }
+
+    pub(crate) fn path_payload_limit(&self) -> usize {
         self.pmtud
             .as_ref()
             .map_or(self.config.send_ip_payload_limit as usize, |p| {
@@ -2030,6 +2040,20 @@ impl Connection {
         if mtu < if self.tuple.local.is_ipv4() { 68 } else { 1280 } || self.pmtud.is_none() {
             return Err(Error::InvalidArgument);
         }
+        Ok(())
+    }
+
+    pub(crate) fn set_reserved_first_hop_mtu(
+        &mut self,
+        now: Instant,
+        mtu: u32,
+    ) -> Result<(), Error> {
+        // Local repair owns this output. An MSS change must not schedule an
+        // additional SYN/head retransmission for the same unsubmitted bytes.
+        let pending = (self.syn_pending, self.retx_pending);
+        self.set_first_hop_mtu(now, mtu)?;
+        (self.syn_pending, self.retx_pending) = pending;
+        self.arm_work();
         Ok(())
     }
 
@@ -6785,12 +6809,14 @@ impl Connection {
                 Error::Wire(error)
             }
         })?;
+        self.last_pmtu_output = None;
         if let Some(p) = &mut self.pmtud {
             if let Some((size, payload, trailing)) = pmtu_probe {
                 p.start_probe(seq, payload as u32, trailing as u32, size);
             }
             let length = count as u32 + u32::from(flags & SYN != 0) + u32::from(flags & FIN != 0);
             if length != 0 && !keepalive {
+                self.last_pmtu_output = Some((seq, seq.wrapping_add(length)));
                 p.sent(
                     seq,
                     seq.wrapping_add(length),
@@ -27010,6 +27036,9 @@ mod tests {
         }
     }
 
+    mod output_reservation_policy {
+        include!("connection_reservation_tests.rs");
+    }
     mod output_policy {
         include!("connection_output_tests.rs");
     }
