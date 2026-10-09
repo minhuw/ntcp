@@ -2037,9 +2037,17 @@ impl Connection {
         if offset > d.payload || count > d.payload - offset {
             return Err(Error::InvalidArgument);
         }
-        if d.stream && count != 0 && let Some(selection) = self.reserved_ledger {
+        if d.stream
+            && count != 0
+            && let Some(selection) = self.reserved_ledger
+        {
             let start = Seq(d.start).wrapping_add(offset as u32);
-            if !self.rack.validate_departure(selection, start, start.wrapping_add(count as u32), now) {
+            if !self.rack.validate_departure(
+                selection,
+                start,
+                start.wrapping_add(count as u32),
+                now,
+            ) {
                 return Err(Error::InvalidArgument);
             }
         }
@@ -2055,9 +2063,14 @@ impl Connection {
         finished: bool,
     ) -> Result<(), Error> {
         self.validate_reserved_output(now, d, offset, count)?;
-        if d.stream && count != 0 && let Some(selection) = self.reserved_ledger {
+        if d.stream
+            && count != 0
+            && let Some(selection) = self.reserved_ledger
+        {
             let start = Seq(d.start).wrapping_add(offset as u32);
-            let committed = self.rack.commit_departure(selection, start, start.wrapping_add(count as u32), now);
+            let committed =
+                self.rack
+                    .commit_departure(selection, start, start.wrapping_add(count as u32), now);
             debug_assert!(committed); // Identical read-only preflight above.
         }
         self.update_time(now)?;
@@ -2075,9 +2088,15 @@ impl Connection {
                 self.pacing_deadline = self.general_pacing_deadline(now);
             } else if let Some((rtt, cwnd)) = d.legacy_rate {
                 let spacing = (count as u128 * rtt as u128)
-                    .div_ceil(cwnd as u128).clamp(1, u64::MAX as u128) as u64;
+                    .div_ceil(cwnd as u128)
+                    .clamp(1, u64::MAX as u128) as u64;
                 // Bypass probes cannot erase debt belonging to earlier output.
-                self.pacing_deadline = Some(self.pacing_deadline.unwrap_or(now).max(now).saturating_add(spacing));
+                self.pacing_deadline = Some(
+                    self.pacing_deadline
+                        .unwrap_or(now)
+                        .max(now)
+                        .saturating_add(spacing),
+                );
             }
         }
         if d.fin && finished {
@@ -2089,7 +2108,10 @@ impl Connection {
             self.rto_deadline = if d.rto_head {
                 Some(now.saturating_add(self.rto()))
             } else {
-                Some(d.prior_rto_deadline.unwrap_or(d.selected_at.saturating_add(self.rto())))
+                Some(
+                    d.prior_rto_deadline
+                        .unwrap_or(d.selected_at.saturating_add(self.rto())),
+                )
             };
             // The first accepted sequence-bearing fragment owns this restart;
             // later siblings must not defer that prefix's RTO.
@@ -2112,7 +2134,9 @@ impl Connection {
             d.persist = false;
         }
         if d.keepalive {
-            self.keepalive_deadline = self.config.keepalive
+            self.keepalive_deadline = self
+                .config
+                .keepalive
                 .map(|k| now.saturating_add(self.config.timebase.ticks_from_us(k.interval_us)));
             d.keepalive = false;
         }
@@ -6962,20 +6986,28 @@ impl Connection {
             stream: count != 0 && !syn && !keepalive,
             syn,
             fin: flags & FIN != 0,
-            rto: !keepalive && !probe && (count != 0 || syn || flags & FIN != 0)
+            rto: !keepalive
+                && !probe
+                && (count != 0 || syn || flags & FIN != 0)
                 && (self.rto_deadline.is_none() || retransmitted || tlp),
             rto_head: seq == self.snd_una,
             prior_rto_deadline: self.rto_deadline.or_else(|| {
-                self.rack.head_transmission(self.snd_una)
+                self.rack
+                    .head_transmission(self.snd_una)
                     .map(|(_, sent)| sent.saturating_add(self.rto()))
             }),
             tlp: (fresh_data || new_fin) && !tlp,
             persist: probe,
             keepalive,
-            shrink: retransmit && self.shrink_unanswered_since.is_none()
-                && self.snd_wnd != 0 && self.flight() > self.snd_wnd,
+            shrink: retransmit
+                && self.shrink_unanswered_since.is_none()
+                && self.snd_wnd != 0
+                && self.flight() > self.snd_wnd,
             unanswered: probe && self.persist_unanswered_since.is_none(),
-            bypass: probe || tlp || keepalive || syn
+            bypass: probe
+                || tlp
+                || keepalive
+                || syn
                 || (retransmit && self.consecutive_timeouts != 0 && self.prr.is_none()),
             ..Departure::default()
         });

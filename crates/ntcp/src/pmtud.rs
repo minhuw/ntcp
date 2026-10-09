@@ -231,7 +231,7 @@ impl Pmtud {
         candidate: u32,
     ) -> bool {
         let ipv4 = self.floor == 68;
-        if (ipv4 && (!(20..=60).contains(&header) || header % 4 != 0))
+        if (ipv4 && (!(20..=60).contains(&header) || !header.is_multiple_of(4)))
             || (!ipv4 && header != 40)
             || size < u32::from(header) + 20
         {
@@ -337,9 +337,9 @@ impl Pmtud {
                 *entry = None;
             }
         }
-        let verification_expired = self.verification.is_some_and(|(_, since, _, _)| {
-            now.saturating_sub(since) >= rto.saturating_mul(2)
-        });
+        let verification_expired = self
+            .verification
+            .is_some_and(|(_, since, _, _)| now.saturating_sub(since) >= rto.saturating_mul(2));
         if let Some(p) = self.probe {
             if !p.retried && !p.timeout && covered(ack, p.end) {
                 //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.1

@@ -535,7 +535,9 @@ impl Endpoint {
         if self.generations.get(id.slot) != Some(&id.generation) {
             return Err(EndpointError::InvalidHandle);
         }
-        self.slots[id.slot].as_ref().ok_or(EndpointError::InvalidHandle)
+        self.slots[id.slot]
+            .as_ref()
+            .ok_or(EndpointError::InvalidHandle)
     }
     fn retained_slot_mut(&mut self, id: ConnectionId) -> Result<&mut Slot, EndpointError> {
         self.retained_slot(id)?;
@@ -2642,7 +2644,10 @@ impl Endpoint {
                 return None;
             }
             let d = r.departure.as_ref()?;
-            return self.retained_slot(r.packet.connection?).ok()?.connection
+            return self
+                .retained_slot(r.packet.connection?)
+                .ok()?
+                .connection
                 .reserved_pacing_deadline(self.now, d);
         }
         self.deadlines.first().map(|(time, _)| time)
@@ -2735,10 +2740,19 @@ impl Endpoint {
             let r = self.reservation.current.as_ref().unwrap();
             if r.emitted_bytes != 0
                 && let Some(d) = &r.departure
-                && self.retained_slot(connection.unwrap())?.connection
-                    .reserved_pacing_deadline(now, d).is_some()
+                && self
+                    .retained_slot(connection.unwrap())?
+                    .connection
+                    .reserved_pacing_deadline(now, d)
+                    .is_some()
             {
-                return Ok((PollTransmit { packet: None, more_work: true }, None));
+                return Ok((
+                    PollTransmit {
+                        packet: None,
+                        more_work: true,
+                    },
+                    None,
+                ));
             }
             let attempt = self.reservation.token(connection)?;
             let r = self.reservation.current.as_mut().unwrap();
@@ -2782,8 +2796,13 @@ impl Endpoint {
         }
         let connection = r.packet.connection;
         let (mut departure, offset, count, finished) = (
-            r.departure, r.offset,
-            if r.repaired { r.emitted_bytes } else { r.departure.map_or(0, |d| d.payload) },
+            r.departure,
+            r.offset,
+            if r.repaired {
+                r.emitted_bytes
+            } else {
+                r.departure.map_or(0, |d| d.payload)
+            },
             r.finished,
         );
         if let Some(id) = connection {
@@ -2794,8 +2813,12 @@ impl Endpoint {
             }
         }
         self.clock(now)?;
-        if let Some(id) = connection && let Some(d) = &mut departure {
-            self.retained_slot_mut(id)?.connection.accept_reserved_output(now, d, offset, count, finished)?;
+        if let Some(id) = connection
+            && let Some(d) = &mut departure
+        {
+            self.retained_slot_mut(id)?
+                .connection
+                .accept_reserved_output(now, d, offset, count, finished)?;
         }
         let r = self.reservation.current.as_mut().unwrap();
         if finished {
@@ -2834,7 +2857,9 @@ impl Endpoint {
             owner.reject_reserved_output();
             if let Some(token) = timestamp {
                 for source in [TxTimestampSource::Software, TxTimestampSource::Hardware] {
-                    owner.tx_timestamps.cancel_transmit(token.stream_range(), source);
+                    owner
+                        .tx_timestamps
+                        .cancel_transmit(token.stream_range(), source);
                 }
             }
         }

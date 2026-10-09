@@ -24,7 +24,6 @@ pub(crate) struct Departure {
     pub legacy_rate: Option<(u64, u32)>,
 }
 
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransmitAttempt {
     pub(crate) ordinal: u64,

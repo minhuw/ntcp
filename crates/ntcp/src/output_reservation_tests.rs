@@ -625,8 +625,17 @@ fn review_repro_delayed_acceptance_must_not_timeout() {
     a.accept_transmit(2_000_002, token.unwrap()).unwrap();
     let cwnd = a.transport_info(id).unwrap().cwnd;
     a.on_timeout(2_000_002, 16).unwrap();
-    assert_eq!(a.transport_info(id).unwrap().cwnd, cwnd, "local wait must not cause congestion response");
-    assert!(a.poll_transmit(2_000_002, &mut bytes, 16).unwrap().packet.is_none());
+    assert_eq!(
+        a.transport_info(id).unwrap().cwnd,
+        cwnd,
+        "local wait must not cause congestion response"
+    );
+    assert!(
+        a.poll_transmit(2_000_002, &mut bytes, 16)
+            .unwrap()
+            .packet
+            .is_none()
+    );
 }
 
 #[test]
@@ -639,7 +648,13 @@ fn review_repro_delayed_acceptance_must_charge_actual_departure() {
         a.reject_unsubmitted(token.unwrap()).unwrap();
         let (_, token) = a.poll_reserved_transmit(2_000_002, &mut bytes, 16).unwrap();
         a.accept_transmit(2_000_002, token.unwrap()).unwrap();
-        assert!(a.poll_transmit(2_000_002, &mut bytes, 16).unwrap().packet.is_none(), "general={general}: local repair must leave departure pacing debt");
+        assert!(
+            a.poll_transmit(2_000_002, &mut bytes, 16)
+                .unwrap()
+                .packet
+                .is_none(),
+            "general={general}: local repair must leave departure pacing debt"
+        );
     }
 }
 
@@ -652,12 +667,18 @@ fn reserved_acceptance_time_validation_is_atomic_and_tokens_are_single_use() {
         let (_, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
         let token = token.unwrap();
         let progress = a.send_progress(id).unwrap();
-        assert_eq!(a.accept_transmit(1, token), Err(Error::TimeWentBackwards.into()));
+        assert_eq!(
+            a.accept_transmit(1, token),
+            Err(Error::TimeWentBackwards.into())
+        );
         assert_eq!(a.now, 2);
         assert_eq!(a.send_progress(id).unwrap(), progress);
         assert_eq!(a.reservation.current.as_ref().unwrap().attempt, Some(token));
         a.config.connection.timestamps = true;
-        assert_eq!(a.accept_transmit(u64::MAX, token), Err(Error::AmbiguousTimeJump.into()));
+        assert_eq!(
+            a.accept_transmit(u64::MAX, token),
+            Err(Error::AmbiguousTimeJump.into())
+        );
         assert_eq!(a.now, 2);
         assert_eq!(a.reservation.current.as_ref().unwrap().attempt, Some(token));
         assert!(a.accept_transmit(late, token).unwrap());
@@ -667,7 +688,12 @@ fn reserved_acceptance_time_validation_is_atomic_and_tokens_are_single_use() {
         let cwnd = a.transport_info(id).unwrap().cwnd;
         a.on_timeout(late, 16).unwrap();
         assert_eq!(a.transport_info(id).unwrap().cwnd, cwnd);
-        assert!(a.poll_transmit(late, &mut bytes, 16).unwrap().packet.is_none());
+        assert!(
+            a.poll_transmit(late, &mut bytes, 16)
+                .unwrap()
+                .packet
+                .is_none()
+        );
     }
 }
 
@@ -696,12 +722,24 @@ fn reserved_pacing_gates_each_fragment_and_late_acceptance_has_no_catchup() {
                 assert!(out.packet.is_none() && token.is_none(), "general={general}");
                 let deadline = a.next_deadline().unwrap();
                 assert!(deadline > now);
-                assert!(a.poll_reserved_transmit(deadline - 1, &mut bytes, 16).unwrap().0.packet.is_none());
+                assert!(
+                    a.poll_reserved_transmit(deadline - 1, &mut bytes, 16)
+                        .unwrap()
+                        .0
+                        .packet
+                        .is_none()
+                );
                 now = deadline;
             }
         }
         assert_eq!(total, 1000);
-        assert!(a.poll_transmit(now, &mut bytes, 16).unwrap().packet.is_none(), "general={general}");
+        assert!(
+            a.poll_transmit(now, &mut bytes, 16)
+                .unwrap()
+                .packet
+                .is_none(),
+            "general={general}"
+        );
     }
 }
 
@@ -709,7 +747,8 @@ fn reserved_pacing_gates_each_fragment_and_late_acceptance_has_no_catchup() {
 fn reserved_acceptance_survives_successive_mtu_clock_advances() {
     for endpoint_wide in [false, true] {
         for repair in [false, true] {
-            let (mut a, _, id, _) = configured_pair(None, Some(crate::TimestampGranularity::Microseconds));
+            let (mut a, _, id, _) =
+                configured_pair(None, Some(crate::TimestampGranularity::Microseconds));
             a.set_user_timeout(id, 10_000_000_000).unwrap();
             a.write(id, &[1; 100]).unwrap();
             let mut bytes = [0; 2048];
@@ -734,15 +773,26 @@ fn reserved_acceptance_survives_successive_mtu_clock_advances() {
             };
             assert_eq!(invalid_mtu, Err(Error::InvalidArgument.into()));
             assert_eq!(a.now, now);
-            assert_eq!(a.accept_transmit(now - 1, token), Err(Error::TimeWentBackwards.into()));
+            assert_eq!(
+                a.accept_transmit(now - 1, token),
+                Err(Error::TimeWentBackwards.into())
+            );
             assert_eq!(a.now, now);
             if repair {
                 a.reject_unsubmitted(token).unwrap();
-                token = a.poll_reserved_transmit(now, &mut bytes, 16).unwrap().1.unwrap();
+                token = a
+                    .poll_reserved_transmit(now, &mut bytes, 16)
+                    .unwrap()
+                    .1
+                    .unwrap();
             }
             assert!(a.accept_transmit(now, token).unwrap());
             while a.reservation.current.is_some() {
-                let token = a.poll_reserved_transmit(now, &mut bytes, 16).unwrap().1.unwrap();
+                let token = a
+                    .poll_reserved_transmit(now, &mut bytes, 16)
+                    .unwrap()
+                    .1
+                    .unwrap();
                 assert!(a.accept_transmit(now, token).unwrap());
             }
             assert_eq!(a.send_progress(id).unwrap(), progress);
@@ -766,14 +816,31 @@ fn reserved_departure_preflight_failure_does_not_advance_endpoint_clock() {
     let progress = a.send_progress(id).unwrap();
     // Corrupt only the private departure range to exercise a ledger validation
     // failure, distinct from the public time/token checks.
-    let d = a.reservation.current.as_mut().unwrap().departure.as_mut().unwrap();
+    let d = a
+        .reservation
+        .current
+        .as_mut()
+        .unwrap()
+        .departure
+        .as_mut()
+        .unwrap();
     let start = d.start;
     d.start = start.wrapping_add(1);
-    assert_eq!(a.accept_transmit(100, token), Err(Error::InvalidArgument.into()));
+    assert_eq!(
+        a.accept_transmit(100, token),
+        Err(Error::InvalidArgument.into())
+    );
     assert_eq!(a.now, 2);
     assert_eq!(a.send_progress(id).unwrap(), progress);
     assert_eq!(a.reservation.current.as_ref().unwrap().attempt, Some(token));
-    a.reservation.current.as_mut().unwrap().departure.as_mut().unwrap().start = start;
+    a.reservation
+        .current
+        .as_mut()
+        .unwrap()
+        .departure
+        .as_mut()
+        .unwrap()
+        .start = start;
     // An earlier valid accept proves neither connection nor endpoint clock moved.
     assert!(a.accept_transmit(3, token).unwrap());
 }
