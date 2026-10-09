@@ -1,3 +1,4 @@
+#define ALLOW_EXPERIMENTAL_API // DPDK 23.11 read-only rte_eth_dev_conf_get.
 #include "shim.h"
 #include <errno.h>
 #include <string.h>
@@ -12,7 +13,7 @@ int ntcp_dpdk_valid_port(uint16_t port) {
 
 // Host/PMD registers the standard field/flag during setup. Look up once per
 // adapter, never register or reconfigure a live device on the packet path.
-int ntcp_dpdk_rx_timestamp_lookup(int *offset, uint64_t *flag) {
+static int timestamp_lookup(const char *name, int *offset, uint64_t *flag) {
     struct rte_mbuf_dynfield field;
     int off = rte_mbuf_dynfield_lookup(RTE_MBUF_DYNFIELD_TIMESTAMP_NAME, &field);
     if (off < 0) return -rte_errno;
@@ -20,12 +21,40 @@ int ntcp_dpdk_rx_timestamp_lookup(int *offset, uint64_t *flag) {
         field.align != _Alignof(rte_mbuf_timestamp_t) || field.flags != 0)
         return -EINVAL;
     struct rte_mbuf_dynflag dynflag;
-    int bit = rte_mbuf_dynflag_lookup(RTE_MBUF_DYNFLAG_RX_TIMESTAMP_NAME, &dynflag);
+    int bit = rte_mbuf_dynflag_lookup(name, &dynflag);
     if (bit < 0) return -rte_errno;
     if (bit >= 64 || dynflag.flags != 0) return -EINVAL;
     *offset = off;
     *flag = UINT64_C(1) << bit;
     return 0;
+}
+
+int ntcp_dpdk_rx_timestamp_lookup(int *offset, uint64_t *flag) {
+    return timestamp_lookup(RTE_MBUF_DYNFLAG_RX_TIMESTAMP_NAME, offset, flag);
+}
+
+int ntcp_dpdk_tx_timestamp_lookup(int *offset, uint64_t *flag) {
+    return timestamp_lookup(RTE_MBUF_DYNFLAG_TX_TIMESTAMP_NAME, offset, flag);
+}
+
+int ntcp_dpdk_tx_scheduling_check(uint16_t port, uint16_t queue) {
+    struct rte_eth_dev_info info;
+    int result = rte_eth_dev_info_get(port, &info);
+    if (result < 0) return result;
+    if (queue >= info.nb_tx_queues) return -EINVAL;
+    if (!(info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_SEND_ON_TIMESTAMP))
+        return -ENOTSUP;
+    // This reads actual host configuration, not a caller assertion. Port-wide
+    // offloads apply to all TX queues. Never configure a borrowed port here.
+    struct rte_eth_conf conf;
+    result = rte_eth_dev_conf_get(port, &conf);
+    if (result < 0) return result;
+    if (conf.txmode.offloads & RTE_ETH_TX_OFFLOAD_SEND_ON_TIMESTAMP) return 0;
+    // Also accept a queue-only offload, but only with affirmative PMD evidence.
+    struct rte_eth_txq_info qinfo;
+    result = rte_eth_tx_queue_info_get(port, queue, &qinfo);
+    if (result < 0) return result;
+    return (qinfo.conf.offloads & RTE_ETH_TX_OFFLOAD_SEND_ON_TIMESTAMP) ? 0 : -ENOTSUP;
 }
 
 int ntcp_dpdk_rx_timestamp_status(uint16_t port, uint16_t queue,
@@ -97,7 +126,8 @@ done:
 }
 
 int ntcp_dpdk_transmit(uint16_t port, uint16_t queue, void *pool,
-                       const uint8_t *packet, size_t length) {
+                       const uint8_t *packet, size_t length, int timestamp_offset,
+                       uint64_t timestamp_flag, uint64_t timestamp) {
     if (!length)
         return -EINVAL;
     if (length > NTCP_DPDK_MAX_PACKET_LEN)
@@ -130,6 +160,10 @@ int ntcp_dpdk_transmit(uint16_t port, uint16_t queue, void *pool,
         }
         tail = m;
         offset += chunk;
+    }
+    if (timestamp_offset >= 0) {
+        *RTE_MBUF_DYNFIELD(head, timestamp_offset, rte_mbuf_timestamp_t *) = timestamp;
+        head->ol_flags |= timestamp_flag;
     }
     if (rte_eth_tx_burst(port, queue, &head, 1) == 1)
         return 1; // Driver owns it; never free a submitted mbuf here.

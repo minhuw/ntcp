@@ -1,7 +1,7 @@
 use ntcp_io::{
     ClockDescriptor, ClockDomain, PacketIo, PacketLayer, PacketTimestamp, PacketTimestamps,
     ReceivedPacket, TimestampCapabilities, TimestampPoint, TimestampSource, TimestampUnit,
-    TxOutcome,
+    TransmitTime, TxOutcome, TxSchedulingCapabilities, TxTimestampRequest,
 };
 use std::{ffi::c_void, io, marker::PhantomData, ptr::NonNull, rc::Rc};
 
@@ -9,6 +9,8 @@ use std::{ffi::c_void, io, marker::PhantomData, ptr::NonNull, rc::Rc};
 pub const MAX_PACKET_LEN: usize = 65_535;
 
 unsafe extern "C" {
+    fn ntcp_dpdk_tx_scheduling_check(port: u16, queue: u16) -> i32;
+    fn ntcp_dpdk_tx_timestamp_lookup(offset: *mut i32, flag: *mut u64) -> i32;
     fn ntcp_dpdk_valid_port(port: u16) -> i32;
     fn ntcp_dpdk_rx_timestamp_lookup(offset: *mut i32, flag: *mut u64) -> i32;
     fn ntcp_dpdk_rx_timestamp_status(
@@ -34,6 +36,9 @@ unsafe extern "C" {
         pool: *mut c_void,
         packet: *const u8,
         len: usize,
+        timestamp_offset: i32,
+        timestamp_flag: u64,
+        timestamp: u64,
     ) -> i32;
 }
 
@@ -45,7 +50,7 @@ pub struct RxTimestampStatus {
 }
 
 #[derive(Clone, Copy)]
-struct RxTimestampConfig {
+struct TimestampConfig {
     clock: ClockDescriptor,
     offset: i32,
     flag: u64,
@@ -59,7 +64,8 @@ pub struct Dpdk {
     rx_queue: u16,
     tx_queue: u16,
     pool: NonNull<c_void>,
-    rx_timestamp: Option<RxTimestampConfig>,
+    rx_timestamp: Option<TimestampConfig>,
+    tx_scheduling: Option<TimestampConfig>,
     _local: PhantomData<Rc<()>>,
 }
 
@@ -102,8 +108,65 @@ impl Dpdk {
             tx_queue,
             pool,
             rx_timestamp: None,
+            tx_scheduling: None,
             _local: PhantomData,
         })
+    }
+
+    /// Opt into the already host-enabled SEND_ON_TIMESTAMP offload. No EAL,
+    /// port, queue or dynamic registry configuration is changed. Requires a
+    /// device clock; RawTicks identity must identify the caller's calibration.
+    /// The caller synchronizes/converts targets to the PMD's clock and units:
+    /// there is no absolute monotonic-to-device-clock assumption here.
+    /// PMD scheduling capability is NOT a precision or delivery guarantee.
+    /// The caller must respect PMD ordering/horizon limits (past targets may
+    /// send immediately and distant targets may be capped by the PMD).
+    pub fn enable_tx_scheduling(&mut self, clock: ClockDescriptor) -> io::Result<()> {
+        if !matches!(clock.domain, ClockDomain::Device(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DPDK requires a device clock",
+            ));
+        }
+        // SAFETY: the borrowed port/queue remain live and unchanged.
+        let result = unsafe { ntcp_dpdk_tx_scheduling_check(self.port, self.tx_queue) };
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(-result));
+        }
+        let (mut offset, mut flag) = (-1, 0);
+        // SAFETY: EAL/registry remain live; outputs are writable.
+        let result = unsafe { ntcp_dpdk_tx_timestamp_lookup(&mut offset, &mut flag) };
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(-result));
+        }
+        self.tx_scheduling = Some(TimestampConfig {
+            clock,
+            offset,
+            flag,
+        });
+        Ok(())
+    }
+
+    fn submit(&mut self, packet: &[u8], when: Option<TransmitTime>) -> io::Result<TxOutcome> {
+        let config = when.and(self.tx_scheduling);
+        // SAFETY: shim copies the readable slice; cached metadata was validated
+        // against the registry. Only allocated mbufs transfer to the PMD.
+        match unsafe {
+            ntcp_dpdk_transmit(
+                self.port,
+                self.tx_queue,
+                self.pool.as_ptr(),
+                packet.as_ptr(),
+                packet.len(),
+                config.map_or(-1, |c| c.offset),
+                config.map_or(0, |c| c.flag),
+                when.map_or(0, |w| w.value),
+            )
+        } {
+            0 => Ok(TxOutcome::WouldBlock),
+            1 => Ok(TxOutcome::Submitted),
+            error => Err(io::Error::from_raw_os_error(-error)),
+        }
     }
 
     /// Read-only diagnostic; does not configure or register anything.
@@ -146,7 +209,7 @@ impl Dpdk {
         if result < 0 {
             return Err(io::Error::from_raw_os_error(-result));
         }
-        self.rx_timestamp = Some(RxTimestampConfig {
+        self.rx_timestamp = Some(TimestampConfig {
             clock,
             offset,
             flag,
@@ -209,21 +272,46 @@ impl PacketIo for Dpdk {
         }
     }
 
-    fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
-        // SAFETY: slice is readable; shim copies it before returning and only
-        // transfers allocated mbufs (never the Rust borrow) to the TX driver.
-        match unsafe {
-            ntcp_dpdk_transmit(
-                self.port,
-                self.tx_queue,
-                self.pool.as_ptr(),
-                packet.as_ptr(),
-                packet.len(),
-            )
-        } {
-            0 => Ok(TxOutcome::WouldBlock),
-            1 => Ok(TxOutcome::Submitted),
-            error => Err(io::Error::from_raw_os_error(-error)),
+    fn tx_scheduling_capabilities(&self) -> Option<TxSchedulingCapabilities> {
+        self.tx_scheduling.map(|c| TxSchedulingCapabilities {
+            clock: c.clock,
+            hardware: true,
+        })
+    }
+
+    fn transmit_at(
+        &mut self,
+        packet: &[u8],
+        when: TransmitTime,
+        timestamp: Option<TxTimestampRequest>,
+    ) -> io::Result<TxOutcome> {
+        if let Some(request) = timestamp {
+            return Err(io::Error::new(
+                if request.software || request.hardware {
+                    io::ErrorKind::Unsupported
+                } else {
+                    io::ErrorKind::InvalidInput
+                },
+                "DPDK TX timestamp observations unsupported",
+            ));
         }
+        let config = self.tx_scheduling.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "DPDK TX scheduling disabled")
+        })?;
+        if when.clock != config.clock {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DPDK TX clock mismatch",
+            ));
+        }
+        self.submit(packet, Some(when))
+    }
+
+    fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
+        self.submit(packet, None)
     }
 }
+
+#[cfg(all(test, feature = "test-pmd"))]
+#[path = "scheduling_tests.rs"]
+mod scheduling_tests;

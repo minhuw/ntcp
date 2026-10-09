@@ -137,3 +137,26 @@ void ntcp_test_finish(void) {
     rte_mempool_free(pool);
     assert(rte_eal_cleanup() == 0);
 }
+
+// Deterministic mbuf encoding evidence only: the ring PMD never schedules.
+void ntcp_test_register_tx_timestamp(void) {
+    int offset;
+    uint64_t flag;
+    assert(rte_mbuf_dyn_tx_timestamp_register(&offset, &flag) == 0);
+}
+void ntcp_test_check_scheduled(uint64_t value, unsigned length) {
+    int offset = rte_mbuf_dynfield_lookup(RTE_MBUF_DYNFIELD_TIMESTAMP_NAME, NULL);
+    int bit = rte_mbuf_dynflag_lookup(RTE_MBUF_DYNFLAG_TX_TIMESTAMP_NAME, NULL);
+    assert(offset >= 0 && bit >= 0);
+    struct rte_mbuf *m;
+    assert(rte_ring_dequeue(tx, (void **)&m) == 0);
+    assert(m->ol_flags == (UINT64_C(1) << bit));
+    assert(*RTE_MBUF_DYNFIELD(m, offset, rte_mbuf_timestamp_t *) == value);
+    assert(m->pkt_len == length);
+    for (struct rte_mbuf *s = m; s; s = s->next) {
+        if (s != m) assert(s->ol_flags == 0);
+        const unsigned char *bytes = rte_pktmbuf_mtod(s, const unsigned char *);
+        for (unsigned i = 0; i < s->data_len; ++i) assert(bytes[i] == 7);
+    }
+    rte_pktmbuf_free(m);
+}
