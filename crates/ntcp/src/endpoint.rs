@@ -530,14 +530,23 @@ impl Endpoint {
             generation: self.generations[slot],
         }
     }
-    fn slot(&self, id: ConnectionId) -> Result<&Slot, EndpointError> {
+    // Internal output ownership outlives application release, but not generation reuse.
+    fn retained_slot(&self, id: ConnectionId) -> Result<&Slot, EndpointError> {
         if self.generations.get(id.slot) != Some(&id.generation) {
             return Err(EndpointError::InvalidHandle);
         }
-        self.slots[id.slot]
-            .as_ref()
-            .filter(|slot| !slot.released)
-            .ok_or(EndpointError::InvalidHandle)
+        self.slots[id.slot].as_ref().ok_or(EndpointError::InvalidHandle)
+    }
+    fn retained_slot_mut(&mut self, id: ConnectionId) -> Result<&mut Slot, EndpointError> {
+        self.retained_slot(id)?;
+        Ok(self.slots[id.slot].as_mut().unwrap())
+    }
+    fn slot(&self, id: ConnectionId) -> Result<&Slot, EndpointError> {
+        let slot = self.retained_slot(id)?;
+        if slot.released {
+            return Err(EndpointError::InvalidHandle);
+        }
+        Ok(slot)
     }
     fn slot_mut(&mut self, id: ConnectionId) -> Result<&mut Slot, EndpointError> {
         self.slot(id)?;
@@ -1985,6 +1994,9 @@ impl Endpoint {
         lowat: Option<u32>,
         request: TxTimestampRequest,
     ) -> Result<usize, EndpointError> {
+        if self.reservation.current.is_some() {
+            return Err(EndpointError::OutputReserved);
+        }
         Ok(self
             .slot(id)?
             .connection
@@ -2133,6 +2145,9 @@ impl Endpoint {
         id: ConnectionId,
         lowat: Option<u32>,
     ) -> Result<usize, EndpointError> {
+        if self.reservation.current.is_some() {
+            return Err(EndpointError::OutputReserved);
+        }
         Ok(self.slot(id)?.connection.send_admission_room(lowat))
     }
 
@@ -2704,13 +2719,15 @@ impl Endpoint {
             }
             let connection = r.packet.connection;
             let limit = self
-                .slot(connection.ok_or(EndpointError::InvalidHandle)?)?
+                .retained_slot(connection.ok_or(EndpointError::InvalidHandle)?)?
                 .connection
                 .path_payload_limit();
             self.clock(now)?;
             let attempt = self.reservation.token(connection)?;
             let packet = self.reservation.fragment(limit, out)?;
-            self.reservation.current.as_mut().unwrap().attempt = Some(attempt);
+            let r = self.reservation.current.as_mut().unwrap();
+            r.attempt = Some(attempt);
+            r.abandon_attempt = attempt;
             return Ok((
                 PollTransmit {
                     packet: Some(packet),
@@ -2770,17 +2787,44 @@ impl Endpoint {
         };
         let timestamp = r.packet.tx_timestamp;
         if !r.repaired {
-            self.slot_mut(connection)?
-                .connection
-                .reject_reserved_output();
+            let owner = &mut self.retained_slot_mut(connection)?.connection;
+            owner.reject_reserved_output();
             if let Some(token) = timestamp {
-                self.cancel_tx_timestamp(token, TxTimestampSource::Software)?;
-                self.cancel_tx_timestamp(token, TxTimestampSource::Hardware)?;
+                for source in [TxTimestampSource::Software, TxTimestampSource::Hardware] {
+                    owner.tx_timestamps.cancel_transmit(token.stream_range(), source);
+                }
             }
         }
         let r = self.reservation.current.as_mut().unwrap();
         r.attempt = None;
         r.repaired = true;
+        Ok(true)
+    }
+
+    // Fail the owner and discard only the remaining reservation. Caller certifies
+    // any pending attempt was not submitted (e.g. an adapter-owned WouldBlock
+    // deadline). The latest handle survives rejection, accepted prefixes and
+    // encoding errors for this operation only. Never use for an uncertain submit.
+    pub fn abandon_transmit(
+        &mut self,
+        attempt: crate::TransmitAttempt,
+    ) -> Result<bool, EndpointError> {
+        let Some(r) = &self.reservation.current else {
+            return Ok(false);
+        };
+        if r.abandon_attempt != attempt {
+            return Ok(false);
+        }
+        if let Some(id) = r.packet.connection {
+            let slot = self.retained_slot_mut(id)?;
+            slot.connection.abandon_reserved_output();
+            slot.reset_deadline = None;
+            slot.closed_output_drained = true;
+            self.reservation.current = None;
+            self.refresh(id.slot);
+        } else {
+            self.reservation.current = None;
+        }
         Ok(true)
     }
 

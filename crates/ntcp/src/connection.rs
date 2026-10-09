@@ -2004,6 +2004,14 @@ impl Connection {
         self.set_path_mss(mss.min(ceiling).min(budget));
     }
 
+    pub(crate) fn abandon_reserved_output(&mut self) {
+        self.reject_reserved_output();
+        self.pending_rst = None;
+        self.reset_echo = None;
+        self.reset_reply = false;
+        self.terminal(CloseReason::Aborted);
+    }
+
     pub(crate) fn reject_reserved_output(&mut self) {
         if let Some((start, end)) = self.last_pmtu_output.take()
             && let Some(p) = &mut self.pmtud

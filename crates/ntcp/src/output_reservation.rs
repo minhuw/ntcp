@@ -17,6 +17,7 @@ pub(crate) struct OutputReservation {
 pub(crate) struct ReservedOutput {
     pub packet: Transmit,
     pub attempt: Option<TransmitAttempt>,
+    pub abandon_attempt: TransmitAttempt,
     pub offset: usize,
     pub sacks: usize,
     pub emitted_bytes: usize,
@@ -47,6 +48,7 @@ impl OutputReservation {
         self.current = Some(ReservedOutput {
             packet,
             attempt: Some(attempt),
+            abandon_attempt: attempt,
             offset: 0,
             sacks: 0,
             emitted_bytes: 0,
@@ -133,7 +135,7 @@ impl OutputReservation {
         if !finished {
             header.flags &= !(wire::FIN | wire::PSH);
         }
-        if r.offset != 0 {
+        if (count == 0 && header.flags & wire::SYN == 0) || r.offset != 0 {
             header.flags &= !wire::CWR;
         }
         if header.flags & wire::URG != 0 {
@@ -160,6 +162,7 @@ impl OutputReservation {
         Ok(Transmit {
             len,
             tx_timestamp: None,
+            ecn: if count == 0 { 0 } else { r.packet.ecn },
             ..r.packet
         })
     }
