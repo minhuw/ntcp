@@ -36,6 +36,14 @@ pub(crate) struct Probe {
     retried: bool,
     other_loss: bool,
     timeout: bool,
+    repair_end: Seq,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProbeOutcome {
+    pub start: Seq,
+    end: Seq,
+    pub isolated: bool,
 }
 
 #[derive(Debug)]
@@ -48,6 +56,7 @@ pub(crate) struct Pmtud {
     pub deadline: Option<Instant>,
     reset_search: bool,
     pub probe: Option<Probe>,
+    outcome: Option<ProbeOutcome>,
     // Packetization boundary survives cancellation of the probe's search result.
     repair_range: Option<(Seq, Seq)>,
     pending: Option<(Seq, u32)>,
@@ -121,6 +130,7 @@ impl Pmtud {
             deadline: None,
             reset_search: false,
             probe: None,
+            outcome: None,
             repair_range: None,
             pending: None,
             icmp_since_progress: false,
@@ -199,6 +209,7 @@ impl Pmtud {
 
     pub fn start_probe(&mut self, start: Seq, payload: u32, trailing: u32, size: u32) {
         self.repair_range = Some((start, start.wrapping_add(payload)));
+        self.outcome = None;
         self.probe = Some(Probe {
             start,
             end: start.wrapping_add(payload),
@@ -207,6 +218,7 @@ impl Pmtud {
             retried: false,
             other_loss: false,
             timeout: false,
+            repair_end: start,
         });
     }
 
@@ -229,6 +241,21 @@ impl Pmtud {
     //# PLPMTUD can also be implemented in protocols that rely on timeouts as their
     //# primary mechanism for loss recovery; however, timeouts SHOULD NOT be used as the
     //# primary mechanism for loss indication unless there are no other alternatives.
+
+    pub fn eligible_probe_loss(&self) -> Option<Seq> {
+        self.probe
+            .filter(|p| !p.other_loss && !p.timeout)
+            .map(|p| p.start)
+            .or_else(|| self.outcome.filter(|o| o.isolated).map(|o| o.start))
+    }
+
+    pub fn take_probe_outcome(&mut self, ack: Seq) -> Option<ProbeOutcome> {
+        if self.outcome.is_some_and(|o| covered(ack, o.end)) {
+            self.outcome.take()
+        } else {
+            None
+        }
+    }
 
     pub fn loss(&mut self, start: Seq, multiple: bool) {
         if let Some(p) = &mut self.probe
@@ -261,6 +288,14 @@ impl Pmtud {
             if let Some(p) = &mut self.probe {
                 if overlaps(start, end, p.start, p.end) {
                     p.retried = true;
+                    // A second copy of already repaired gap bytes is another
+                    // loss, unlike the next smaller segment of a split repair.
+                    if start != p.repair_end && covered(p.repair_end, start) {
+                        p.other_loss = true;
+                    }
+                    if covered(end, p.repair_end) {
+                        p.repair_end = end;
+                    }
                 }
                 // Overlap past the gap is not evidence of another lost packet.
                 if start.in_window(p.start, p.end.distance_from(p.start)) != Some(true) {
@@ -765,9 +800,14 @@ impl Pmtud {
                 }
                 self.probe = None;
             } else if covered(ack, p.trailing_end) {
+                self.outcome = Some(ProbeOutcome {
+                    start: p.start,
+                    end: p.trailing_end,
+                    isolated: p.retried && !p.other_loss && !p.timeout,
+                });
                 if p.retried && !p.other_loss {
                     //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2
-                    //= reason=Wait for cumulative delivery of the trailing window and exclude every observed nearby retransmission. Congestion reduction is conservatively retained, never prematurely waived.
+                    //= reason=Wait for cumulative delivery of the trailing window and exclude every observed nearby retransmission. This bound update is independent of the one-shot congestion outcome.
                     //# In the absence of other indications, set search_high to the probe
                     //# size minus one.
                     self.info.search_high = self.info.search_high.min(p.size - 1);
@@ -776,11 +816,11 @@ impl Pmtud {
                         self.info.current_mtu = self.info.search_low;
                     }
                     self.delay(now, cooldown.saturating_mul(if p.timeout { 5 } else { 1 }));
-                } else if p.other_loss && !self.reset_search {
+                } else if p.other_loss && !p.timeout && !self.reset_search {
                     self.deadline = None;
                 }
                 // Multiple/nearby losses are inconclusive; retain search bounds.
-                // Congestion control is never waived, including isolated losses.
+                // Only the one-shot non-timeout isolated result may waive CC.
                 self.probe = None;
             }
         }
@@ -824,6 +864,7 @@ impl Pmtud {
 
     pub fn terminal(&mut self) {
         self.probe = None;
+        self.outcome = None;
         self.repair_range = None;
     }
 
@@ -1050,7 +1091,7 @@ mod tests {
             p.ack(tail, 120, 1000, 1000);
             if multiple {
                 assert_eq!(p.info, before);
-                assert_eq!(p.deadline, None); // recovery alone gates retry
+                assert_eq!(p.deadline, Some(5100)); // timeout retains its fivefold hold
             } else {
                 assert_eq!(p.info.search_high, 1239);
                 assert_eq!(p.deadline, Some(5120));

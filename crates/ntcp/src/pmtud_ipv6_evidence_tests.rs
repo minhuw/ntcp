@@ -358,6 +358,8 @@ fn lost_probe_repairs(iss: u32, smaller_ptb: bool) {
     assert!(probe.size > 1280);
     let before = a.path_mtu_info().unwrap();
     let cwnd = a.congestion.cwnd();
+    let threshold = a.congestion.ssthresh();
+    let old_mss = a.mss;
     let mut trailing = Vec::new();
     for _ in 0..8 {
         trailing.push(wire_packet(&mut a, 41, OutgoingIpv4Options::default()));
@@ -372,8 +374,10 @@ fn lost_probe_repairs(iss: u32, smaller_ptb: bool) {
     }
     assert!(a.retx_pending);
     assert!(a.congestion.in_fast_recovery());
-    // Later duplicate ACKs inflate Reno cwnd; ssthresh retains the loss reduction.
-    assert!(a.congestion.ssthresh() < cwnd);
+    // Repair admission is reduced, but logical congestion awaits isolation proof.
+    assert!(a.congestion.recovery_target() < cwnd);
+    assert_eq!(a.congestion.ssthresh(), threshold);
+    assert_eq!(a.congestion.pending_probe_response(), Some(probe.start));
     if smaller_ptb {
         // Two downstream routers quote the same actual dropped probe.
         assert!(feedback(&mut a, 44, &ptb(&lost[..48], probe.size - 1)));
@@ -419,7 +423,15 @@ fn lost_probe_repairs(iss: u32, smaller_ptb: bool) {
     assert_eq!(a.path_mtu_info().unwrap().current_mtu, 1280);
     if !smaller_ptb {
         assert_eq!(a.path_mtu_info().unwrap().search_high, probe.size - 1);
+        assert_eq!(a.congestion.ssthresh(), threshold);
+        assert_eq!(
+            a.congestion.cwnd(),
+            (u64::from(cwnd) * a.mss as u64 / old_mss as u64) as u32
+        );
+    } else {
+        assert!(a.congestion.ssthresh() < cwnd); // PTB cancellation commits, never undoes CC.
     }
+    assert!(a.congestion.pending_probe_response().is_none());
 }
 
 #[test]

@@ -589,7 +589,6 @@ pub(crate) struct Connection {
     //= reason=Pmtud is stored on the individual Connection, not indexed by remote network or subnet number. A paired connection test leaves the peer PMTUD-disabled while updating only the sender; no route-mask representation is used.
     //# Network or subnet numbers MUST NOT be used as representations of a path, because
     //# there is not a general mechanism to determine the network mask at the remote host.
-
     pmtud: Option<crate::pmtud::Pmtud>,
     advertised_edge: Seq,
     syn_window: u16,
@@ -1624,13 +1623,15 @@ impl Connection {
     //# // Include the (rare) case of cumulatively ACKed bytes:
     //# RecoverFS += (bytes newly cumulatively acknowledged)
     fn start_sack_recovery(&mut self) -> bool {
+        let probe = self.pmtud.as_ref().and_then(|p| p.eligible_probe_loss());
         if self.sack_guard.is_some()
             || self.sack_recovery.is_some()
             || !after(self.data_high(), self.snd_una)
-            || !self.congestion.on_sack_recovery(
+            || !self.congestion.on_sack_recovery_with_probe(
                 self.snd_una,
                 self.data_flight().saturating_sub(self.limited_sent),
                 self.data_high(),
+                probe,
             )
         {
             return false;
@@ -1723,14 +1724,15 @@ impl Connection {
         // of PRR, not merely when PRR is disabled in configuration. Active PRR
         // handles fresh loss through pipe and SafeACK (RFC 9937 section 6.2).
         let new_response = retransmission_lost && self.prr.is_none();
+        if retransmission_lost {
+            self.note_probe_loss(self.snd_una, true);
+        }
         if new_response {
             self.congestion.retransmission_lost(self.data_flight());
         }
         let further_loss = self.rack.pipe() < old_pipe;
         if let Some((start, _)) = self.rack.lowest_lost(self.mss as u32) {
-            if let Some(p) = &mut self.pmtud {
-                p.loss(start, self.rack.counts().lost > 1);
-            }
+            self.note_probe_loss(start, self.rack.counts().lost > 1);
             self.note_iw_loss(start);
             self.start_sack_recovery();
         }
@@ -2105,6 +2107,7 @@ impl Connection {
             .saturating_sub(20 + if self.timestamps { 12 } else { 0 })
             .max(1);
         self.set_path_mss(mss.min(ceiling).min(budget));
+        self.resolve_probe_response();
     }
 
     pub(crate) fn reserved_pacing_deadline(&self, now: Instant, d: &Departure) -> Option<Instant> {
@@ -2264,6 +2267,7 @@ impl Connection {
         {
             p.reject_latest(start, end);
         }
+        self.resolve_probe_response();
     }
 
     pub(crate) fn path_payload_limit(&self) -> usize {
@@ -2399,10 +2403,45 @@ impl Connection {
         Ok(accepted)
     }
 
+    fn note_probe_loss(&mut self, start: Seq, multiple: bool) {
+        if let Some(p) = &mut self.pmtud {
+            p.loss(start, multiple);
+            if self.congestion.pending_probe_response().is_some()
+                && self.congestion.pending_probe_response() != p.eligible_probe_loss()
+            {
+                self.congestion.commit_probe_response();
+            }
+        }
+    }
+
+    // Resolve after recovery/PRR's ending-ACK bookkeeping, not at the earlier
+    // PMTU ACK hook: exit deflation must apply only to repair admission.
+    fn resolve_probe_response(&mut self) {
+        if let Some(p) = &mut self.pmtud {
+            if !self.congestion.in_recovery()
+                && self.sack_recovery.is_none()
+                && self.prr.is_none()
+                && let Some(outcome) = p.take_probe_outcome(self.snd_una)
+            {
+                if outcome.isolated {
+                    self.congestion.suppress_probe_response(outcome.start);
+                } else {
+                    self.congestion.commit_probe_response();
+                }
+            }
+            if self.congestion.pending_probe_response().is_some()
+                && self.congestion.pending_probe_response() != p.eligible_probe_loss()
+            {
+                self.congestion.commit_probe_response();
+            }
+        }
+    }
+
     fn pmtu_cooldown(&self) -> u64 {
-        (u64::from(self.congestion.cwnd()) / self.mss.max(1) as u64 + 1)
+        (u64::from(self.congestion.unsuppressed_cwnd()) / self.mss.max(1) as u64 + 1)
             .saturating_mul(self.rtt.srtt().unwrap_or(1).max(1))
             .max(self.rto())
+            .saturating_add(1)
     }
 
     pub(crate) fn lower_mss(&mut self, mss: u16) -> Result<(), Error> {
@@ -2880,6 +2919,7 @@ impl Connection {
     //# When a TCP host enters TIME-WAIT or CLOSED state, it should ignore any previous state about the negotiation of ECN for that connection.
     fn terminal(&mut self, reason: CloseReason) {
         self.state = State::Closed;
+        self.congestion.commit_probe_response();
         if let Some(p) = &mut self.pmtud {
             p.terminal();
         }
@@ -3015,6 +3055,7 @@ impl Connection {
     }
 
     fn arm_work(&mut self) {
+        self.resolve_probe_response();
         if !self.synchronized() {
             self.select_loss_timer();
             return;
@@ -4478,10 +4519,8 @@ impl Connection {
                 further_loss |= self
                     .rack
                     .mark_scoreboard_losses(&self.scoreboard, self.mss as u32);
-                if let Some(p) = &mut self.pmtud
-                    && let Some((start, _)) = self.rack.lowest_lost(self.mss as u32)
-                {
-                    p.loss(start, self.rack.counts().lost > 1);
+                if let Some((start, _)) = self.rack.lowest_lost(self.mss as u32) {
+                    self.note_probe_loss(start, self.rack.counts().lost > 1);
                 }
             }
             if !advancing && let Some(sample) = self.rack.ack_sample {
@@ -4685,9 +4724,7 @@ impl Connection {
                 {
                     self.rack
                         .mark_scoreboard_losses(&self.scoreboard, self.mss as u32);
-                    if let Some(p) = &mut self.pmtud {
-                        p.loss(self.snd_una, self.rack.counts().lost > 1);
-                    }
+                    self.note_probe_loss(self.snd_una, self.rack.counts().lost > 1);
                     self.start_sack_recovery();
                 }
             }
@@ -4710,11 +4747,16 @@ impl Connection {
             // two duplicate ACKs, bounded by cwnd + 2 MSS and the peer window.
             self.limited_pending =
                 self.duplicate_acks <= 2 && (!self.sack_receive || sack_evidence);
-            if self.congestion.on_duplicate_ack(
+            if self.duplicate_acks == 3 {
+                self.note_probe_loss(self.snd_una, false);
+            }
+            let probe = self.pmtud.as_ref().and_then(|p| p.eligible_probe_loss());
+            if self.congestion.on_duplicate_ack_with_probe(
                 ack,
                 self.data_flight().saturating_sub(self.limited_sent),
                 self.data_high(),
                 ece,
+                probe,
             ) {
                 if self.config.prr && self.config.prr_algorithm == PrrAlgorithm::Rfc9937 {
                     self.prr = Some(Prr::new(
@@ -4724,9 +4766,7 @@ impl Connection {
                     ));
                 }
                 self.note_iw_loss(self.snd_una);
-                if let Some(p) = &mut self.pmtud {
-                    p.loss(self.snd_una, false);
-                }
+                self.note_probe_loss(self.snd_una, false);
                 self.retx_pending = true;
                 self.ecn_cwr_pending |= self.ecn_feedback();
                 self.limited_pending = false;
@@ -4822,7 +4862,7 @@ impl Connection {
             //= reason=Advancing ACKs receive the extra SMSS only when loss detection, pending retransmission and RFC6675 rescue selection indicate no further loss. Real advancing-loss/rescue ACK regressions in connection_output_tests compare the denied bonus against safe advancement and parsed output.
             //# SafeACK = (SND.UNA advances and no further loss indicated)
             let safe_ack = advancing && !further_loss && !self.retx_pending && !rescue_indicated;
-            prr.acknowledge(delivered, pipe, self.congestion.ssthresh(), safe_ack);
+            prr.acknowledge(delivered, pipe, self.congestion.recovery_target(), safe_ack);
             if modern && delivered != 0 {
                 self.congestion
                     .prr_window(pipe.saturating_add(prr.credit()));
@@ -5194,9 +5234,7 @@ impl Connection {
                 .congestion
                 .on_ack_with_ecn(ack, bytes, self.data_flight(), ece)
         {
-            if let Some(p) = &mut self.pmtud {
-                p.loss(ack, false);
-            }
+            self.note_probe_loss(ack, false);
             self.retx_pending = true;
         }
         self.rto_deadline = if self.flight() == 0 {
@@ -7270,6 +7308,7 @@ impl Connection {
                 );
             }
         }
+        self.resolve_probe_response();
         self.last_output_range = if count != 0 && !syn && !keepalive {
             let start = self.acknowledged + u64::from(seq.distance_from(self.send_base));
             let range = TxStreamRange {
@@ -7949,7 +7988,7 @@ impl Connection {
                 prr.acknowledge(
                     delivery,
                     self.rack.pipe(),
-                    self.congestion.ssthresh(),
+                    self.congestion.recovery_target(),
                     false,
                 );
                 if self.sack_recovery.is_some_and(|r| r.entry_pending) {
@@ -27511,6 +27550,9 @@ mod tests {
         mod ipv6_evidence {
             include!("pmtud_ipv6_evidence_tests.rs");
         }
+    }
+    mod pmtud_isolated_cc {
+        include!("pmtud_isolated_cc_tests.rs");
     }
     mod pmtud_lifecycle {
         include!("pmtud_lifecycle_tests.rs");

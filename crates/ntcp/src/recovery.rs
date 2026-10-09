@@ -261,6 +261,14 @@ impl InitialWindow {
     }
 }
 
+// Repair admission is provisional; logical congestion state is never rolled back.
+#[derive(Clone, Copy, Debug)]
+struct ProbeResponse {
+    start: Seq,
+    window: u32,
+    target: u32,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Congestion {
     algorithm: RecoveryAlgorithm,
@@ -286,6 +294,7 @@ pub(crate) struct Congestion {
     timeout_retransmitted: bool,
     // Exclusive end of successfully emitted, still-unacknowledged retransmissions.
     retransmitted_end: Option<Seq>,
+    probe_response: Option<ProbeResponse>,
 }
 
 impl Congestion {
@@ -327,6 +336,7 @@ impl Congestion {
             tlp_reduction_end: None,
             timeout_retransmitted: false,
             retransmitted_end: None,
+            probe_response: None,
         }
     }
 
@@ -444,7 +454,56 @@ impl Congestion {
     }
 
     pub(crate) fn prr_window(&mut self, window: u32) {
-        self.cwnd = window.min(MAX_WINDOW);
+        if let Some(response) = &mut self.probe_response {
+            response.window = window.min(MAX_WINDOW);
+        } else {
+            self.cwnd = window.min(MAX_WINDOW);
+        }
+    }
+
+    pub(crate) fn recovery_target(&self) -> u32 {
+        self.probe_response.map_or(self.ssthresh, |p| p.target)
+    }
+
+    pub(crate) fn unsuppressed_cwnd(&self) -> u32 {
+        self.cwnd
+    }
+
+    pub(crate) fn pending_probe_response(&self) -> Option<Seq> {
+        self.probe_response.map(|p| p.start)
+    }
+
+    // Same repair admission/PRR target as normal loss, but no congestion event
+    // is delivered to Reno/CUBIC unless isolation is disproved. This also avoids
+    // revoking banked PRR credit or replaying delivery when committing the event.
+    fn begin_probe_response(&mut self, start: Seq, flight: u32) {
+        self.probe_response = Some(ProbeResponse {
+            start,
+            window: self.cwnd,
+            target: self.loss_target(flight),
+        });
+    }
+
+    pub(crate) fn commit_probe_response(&mut self) {
+        if let Some(response) = self.probe_response.take() {
+            self.hystart = None;
+            self.startup_ack = None;
+            if let Some(cubic) = &mut self.cubic {
+                cubic.congestion(self.cwnd);
+            }
+            self.congestion_avoidance = true;
+            self.ssthresh = response.target;
+            self.cwnd = response.window;
+            self.acknowledged = 0;
+        }
+    }
+
+    pub(crate) fn suppress_probe_response(&mut self, start: Seq) {
+        if self.pending_probe_response() == Some(start) {
+            // Drop only the repair admission constraint. The logical window
+            // has independently followed MSS decreases throughout recovery.
+            self.probe_response = None;
+        }
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.4
@@ -452,13 +511,15 @@ impl Congestion {
     //#
     //#    cwnd = ssthresh
     pub(crate) fn complete_prr(&mut self) {
-        self.cwnd = self.ssthresh;
-        self.congestion_avoidance = true;
+        self.prr_window(self.recovery_target());
+        if self.probe_response.is_none() {
+            self.congestion_avoidance = true;
+        }
         self.acknowledged = 0;
     }
 
     pub(crate) fn cwnd(&self) -> u32 {
-        self.cwnd
+        self.probe_response.map_or(self.cwnd, |p| p.window)
     }
 
     pub(crate) fn ssthresh(&self) -> u32 {
@@ -488,18 +549,32 @@ impl Congestion {
     pub(crate) fn set_path_mss(&mut self, mss: u32) {
         let increasing = mss > self.mss;
         let (cwnd, ssthresh) = (self.cwnd, self.ssthresh);
+        let response = self.probe_response;
         self.set_mss(mss);
         // RFC4821: raising the path MTU alone cannot raise byte windows.
         // Keep negotiation/decrease rules in set_mss unchanged.
         if increasing {
             self.cwnd = cwnd;
             self.ssthresh = ssthresh;
+            self.probe_response = response;
         }
     }
 
     pub(crate) fn set_mss(&mut self, mss: u32) {
         assert!(mss > 0);
         let mss = mss.min(MAX_WINDOW);
+        if let Some(response) = &mut self.probe_response {
+            if mss < self.mss {
+                response.window =
+                    (u64::from(response.window) * u64::from(mss) / u64::from(self.mss)) as u32;
+                if self.cubic.is_some() {
+                    response.target =
+                        (u64::from(response.target) * u64::from(mss) / u64::from(self.mss)) as u32;
+                }
+            }
+            response.window = response.window.max(mss);
+            response.target = response.target.max(mss.saturating_mul(2));
+        }
         if mss < self.mss {
             // RFC 5681: preserve the segment count when the path MSS falls.
             self.cwnd = ((self.cwnd as u64 * mss as u64) / self.mss as u64) as u32;
@@ -768,20 +843,24 @@ impl Congestion {
         }
         if self.sack_recovery {
             if matches!(relation, Some(Ordering::Equal | Ordering::Greater)) {
-                self.cwnd = self.cwnd.min(self.ssthresh).min(
-                    flight_after_ack
-                        .max(self.mss)
-                        .saturating_add(self.mss)
-                        .min(MAX_WINDOW),
+                self.prr_window(
+                    self.cwnd().min(self.recovery_target()).min(
+                        flight_after_ack
+                            .max(self.mss)
+                            .saturating_add(self.mss)
+                            .min(MAX_WINDOW),
+                    ),
                 );
                 self.sack_recovery = false;
-                self.congestion_avoidance = true;
+                if self.probe_response.is_none() {
+                    self.congestion_avoidance = true;
+                }
                 self.acknowledged = 0;
             }
             return false;
         }
         if self.fast_recovery {
-            let exit_cap = if ece { self.cwnd } else { MAX_WINDOW };
+            let exit_cap = if ece { self.cwnd() } else { MAX_WINDOW };
             if self.algorithm == RecoveryAlgorithm::Reno && relation.is_some() {
                 // Retain recover and the independent ECN epoch: exiting fast recovery
                 // must not allow a second reduction for the same flight.
@@ -789,9 +868,11 @@ impl Congestion {
                 //# When the next ACK arrives that acknowledges previously
                 //# unacknowledged data, a TCP MUST set cwnd to ssthresh (the value
                 //# set in step 2).
-                self.cwnd = self.ssthresh.min(exit_cap);
+                self.prr_window(self.recovery_target().min(exit_cap));
                 self.fast_recovery = false;
-                self.congestion_avoidance = true;
+                if self.probe_response.is_none() {
+                    self.congestion_avoidance = true;
+                }
                 self.acknowledged = 0;
                 return false;
             }
@@ -800,36 +881,45 @@ impl Congestion {
                 // a zero window with no flight has neither ACK clock nor RTO
                 // to restart it. Restore RFC6582 option (1) only here. The
                 // Connection retains its one-window ECN RTO-length send pause.
-                let exit_cap = if self.cwnd == 0 && flight_after_ack == 0 {
+                let exit_cap = if self.cwnd() == 0 && flight_after_ack == 0 {
                     MAX_WINDOW
                 } else {
                     exit_cap
                 };
                 // RFC 6582 option (1) limits the burst after a full ACK.
-                self.cwnd = self.ssthresh.min(exit_cap).min(
-                    flight_after_ack
-                        .max(self.mss)
-                        .saturating_add(self.mss)
-                        .min(MAX_WINDOW),
+                self.prr_window(
+                    self.recovery_target().min(exit_cap).min(
+                        flight_after_ack
+                            .max(self.mss)
+                            .saturating_add(self.mss)
+                            .min(MAX_WINDOW),
+                    ),
                 );
                 self.fast_recovery = false;
-                self.congestion_avoidance = true;
+                if self.probe_response.is_none() {
+                    self.congestion_avoidance = true;
+                }
                 self.acknowledged = 0;
                 return false;
             }
             if relation == Some(Ordering::Less) {
                 // Saturate the complete signed expression, not its subtraction:
                 // an ACK may cover almost the entire inflated window.
-                self.cwnd = (i64::from(self.cwnd) - i64::from(acked)
-                    + if acked >= self.mss {
-                        i64::from(self.mss)
-                    } else {
-                        0
-                    })
-                .clamp(0, i64::from(MAX_WINDOW)) as u32;
+                self.prr_window(
+                    (i64::from(self.cwnd()) - i64::from(acked)
+                        + if acked >= self.mss {
+                            i64::from(self.mss)
+                        } else {
+                            0
+                        })
+                    .clamp(0, i64::from(MAX_WINDOW)) as u32,
+                );
                 return true;
             }
             return false; // Half-space comparisons are not valid TCP ACKs.
+        }
+        if self.probe_response.is_some() {
+            return false; // Repair completed, but trailing flight still needs proof.
         }
         if self
             .ecn_end
@@ -914,6 +1004,7 @@ impl Congestion {
     //# SHOULD invoke a congestion control response equivalent to a fast
     //# recovery.
     pub(crate) fn on_tlp_repair(&mut self, ack: Seq, flight: u32, highest_sent: Seq) -> bool {
+        self.commit_probe_response();
         if self.in_recovery()
             || self
                 .recover
@@ -954,7 +1045,18 @@ impl Congestion {
     //# In the case of packet loss, the
     //# sender MUST reduce _cwnd_ and _ssthresh_ immediately upon entering
     //# loss recovery, similar to [RFC5681] (and [RFC6675]).
+    #[cfg(test)]
     pub(crate) fn on_sack_recovery(&mut self, ack: Seq, flight: u32, highest_sent: Seq) -> bool {
+        self.on_sack_recovery_with_probe(ack, flight, highest_sent, None)
+    }
+
+    pub(crate) fn on_sack_recovery_with_probe(
+        &mut self,
+        ack: Seq,
+        flight: u32,
+        highest_sent: Seq,
+        probe: Option<Seq>,
+    ) -> bool {
         if self.sack_recovery
             || self.fast_recovery
             || self.recover.is_some_and(|end| {
@@ -977,12 +1079,16 @@ impl Congestion {
                 .tlp_reduction_end
                 .is_none_or(|end| ack.serial_cmp(end) == Some(Ordering::Greater))
         {
-            self.reduce_threshold(flight);
+            if let Some(start) = probe {
+                self.begin_probe_response(start, flight);
+            } else {
+                self.reduce_threshold(flight);
+            }
         }
         self.recover = Some(highest_sent);
         self.sack_recovery = true;
         self.fast_recovery = false;
-        self.cwnd = self.ssthresh;
+        self.prr_window(self.recovery_target());
         self.acknowledged = 0;
         self.reset_duplicate_acks();
         true
@@ -1002,6 +1108,7 @@ impl Congestion {
     //# retransmission, the congestion control MUST trigger an additional
     //# congestion response per the aforementioned principle in [RFC5681].
     pub(crate) fn retransmission_lost(&mut self, flight: u32) {
+        self.commit_probe_response();
         // A new loss of a retransmission is additional congestion, not another
         // reduction of the unchanged original cumulative flight. Exclude Reno
         // inflation and respect any previous loss/ECN window reduction.
@@ -1159,6 +1266,7 @@ impl Congestion {
     //= reason=Initial ISS+1 and loss-epoch exclusive end both require strictly greater cumulative ACK for NewReno. Equality suppression, later-byte entry, timeout and wrap are asserted by integrated traces and initial_recover_boundaries_and_long_bounded_progress.
     //# Entry into fast recovery is only possible when the Cumulative Acknowledgment field covers more
     //# than the state variable recover.
+    #[cfg(test)]
     pub(crate) fn on_duplicate_ack(
         &mut self,
         ack: Seq,
@@ -1166,13 +1274,24 @@ impl Congestion {
         highest_sent: Seq,
         ece: bool,
     ) -> bool {
+        self.on_duplicate_ack_with_probe(ack, flight, highest_sent, ece, None)
+    }
+
+    pub(crate) fn on_duplicate_ack_with_probe(
+        &mut self,
+        ack: Seq,
+        flight: u32,
+        highest_sent: Seq,
+        ece: bool,
+        probe: Option<Seq>,
+    ) -> bool {
         self.observe_ack(ack);
         if self.sack_recovery {
             return false;
         }
         if self.fast_recovery {
             if !ece {
-                self.cwnd = self.cwnd.saturating_add(self.mss).min(MAX_WINDOW);
+                self.prr_window(self.cwnd().saturating_add(self.mss).min(MAX_WINDOW));
             }
             return false;
         }
@@ -1184,17 +1303,21 @@ impl Congestion {
             return false;
         }
         if self.ecn_end.is_none() && self.tlp_reduction_end.is_none() {
-            self.reduce_threshold(flight);
+            if let Some(start) = probe.filter(|_| !ece) {
+                self.begin_probe_response(start, flight);
+            } else {
+                self.reduce_threshold(flight);
+            }
         }
         let inflated = self
-            .ssthresh
+            .recovery_target()
             .saturating_add(self.mss.saturating_mul(3))
             .min(MAX_WINDOW);
-        self.cwnd = if ece {
-            self.cwnd.min(inflated)
+        self.prr_window(if ece {
+            self.cwnd().min(inflated)
         } else {
             inflated
-        };
+        });
         self.recover = Some(highest_sent);
         self.fast_recovery = true;
         self.acknowledged = 0;
@@ -1234,6 +1357,7 @@ impl Congestion {
     //# congestion events detected by ECN-Echo ACKs until it reaches a value
     //# of 1 SMSS.
     pub(crate) fn on_ecn(&mut self, ack: Seq, flight: u32, highest_sent: Seq) -> bool {
+        self.commit_probe_response();
         if self
             .tlp_reduction_end
             .is_some_and(|end| ack.serial_cmp(end) != Some(Ordering::Greater))
@@ -1301,17 +1425,23 @@ impl Congestion {
         self.startup_ack = None;
         // Optional RFC 9438 sections 4.6/4.8 are the scoped exception to
         // RFC 5681's half-flight threshold, not a recovery-algorithm change.
-        let reduced = if let Some(cubic) = &mut self.cubic {
+        if let Some(cubic) = &mut self.cubic {
             self.congestion_avoidance = true;
             cubic.congestion(self.cwnd);
+        }
+        //= https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2
+        //= reason=Threshold is in bytes with two-SMSS floor; selector changes beta, not the segment unit.
+        //# *  _ssthresh_: Current slow start threshold in segments.
+        self.ssthresh = self.loss_target(flight);
+    }
+
+    fn loss_target(&self, flight: u32) -> u32 {
+        let reduced = if self.cubic.is_some() {
             (u64::from(flight) * 7 / 10) as u32
         } else {
             flight / 2
         };
-        //= https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2
-        //= reason=Threshold is in bytes with two-SMSS floor; selector changes beta, not the segment unit.
-        //# *  _ssthresh_: Current slow start threshold in segments.
-        self.ssthresh = reduced.max(self.mss.saturating_mul(2)).min(MAX_WINDOW);
+        reduced.max(self.mss.saturating_mul(2)).min(MAX_WINDOW)
     }
 
     // Called only after successful output, not when retransmission is scheduled.
@@ -1395,6 +1525,7 @@ impl Congestion {
     //# [RFC5681] but sets _ssthresh_ using β__cubic_ (same as in
     //# Section 4.6) in a way that is different from Reno TCP [RFC5681].
     pub(crate) fn on_timeout(&mut self, flight: u32, highest_sent: Seq) {
+        self.commit_probe_response();
         self.hystart = None;
         self.startup_ack = None;
         // Repeated RTOs for the same unacknowledged segment retain ssthresh.
