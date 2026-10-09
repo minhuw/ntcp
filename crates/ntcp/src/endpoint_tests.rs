@@ -4417,7 +4417,10 @@ fn general_pacing_saturated_deadline_does_not_rearm_endpoint() {
     deliver(&mut b, u64::MAX, sent);
     deliver(&mut a, u64::MAX, packets(&mut b, u64::MAX));
     let info = a.transport_info(client).unwrap();
-    assert_eq!((info.unacked, info.notsent_bytes, info.send_used), (0, 0, 0));
+    assert_eq!(
+        (info.unacked, info.notsent_bytes, info.send_used),
+        (0, 0, 0)
+    );
 
     // Residual pacing debt cannot drain at MAX, but there is no serviceable
     // future wakeup. Budget exhaustion must not perpetually rearm due MAX.
