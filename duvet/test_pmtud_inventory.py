@@ -171,7 +171,7 @@ class PmtudInventory(unittest.TestCase):
         rows = {p["id"]: p for n in RFCS for p in self.inventory(n)["paragraphs"]}
         self.assertEqual({n: sum(p["status"] == "TODO"
                                  for p in self.inventory(n)["paragraphs"])
-                          for n in RFCS}, {1191: 23, 8201: 16, 4821: 16, 5927: 2})
+                          for n in RFCS}, {1191: 23, 8201: 16, 4821: 19, 5927: 2})
         for id in ("1191-068", "1191-095", "8201-069", "8201-084"):
             self.assertEqual(rows[id]["status"], "covered")
             for fragment in ("0030a96", "Infinity", ">=300", "Endpoint::set_pmtud_policy",
@@ -179,10 +179,7 @@ class PmtudInventory(unittest.TestCase):
                 self.assertIn(fragment, rows[id]["reason"], id)
         expected = {
             "4821-113": ("initial_search_low", "Per-route policy remains open"),
-            "4821-065": ("a4b9a0c", "finite preloss", "recovery/PRR exit", "nonempty flight"),
             "4821-066": ("logical window", "PRR admission", "strict extra", "deadline"),
-            "4821-139": ("finite preloss", "probe size minus one", "MSS decrease scaling"),
-            "4821-142": ("logical window", "independent of configurable periodic aging"),
             "4821-143": ("actual TCP RTO", "one-MSS cwnd", "five times cooldown"),
             "8201-075": ("two successively smaller router PTBs", "wrapping sequences",
                          "PTB cancellation commits"),
@@ -205,6 +202,42 @@ class PmtudInventory(unittest.TestCase):
                 self.assertIn(fragment, rows[id]["reason"], id)
         for id in ("1191-082", "8201-076", "4821-144"):
             self.assertEqual(rows[id]["status"], "TODO", id)
+
+    def test_matching_ptb_keeps_isolated_suppression_spans_partial(self):
+        rows = {p["id"]: p for p in self.inventory(4821)["paragraphs"]}
+        todos = tomllib.loads((ROOT / "duvet/rfc4821-todos.toml").read_text())["TODO"]
+        partial_evidence = {
+            "4821-065": ("a4b9a0c", "finite preloss", "recovery/PRR exit", "nonempty flight"),
+            "4821-139": ("finite preloss", "probe size minus one", "MSS decrease scaling"),
+            "4821-142": ("logical window", "independent of configurable periodic aging"),
+        }
+        for id, fragments in partial_evidence.items():
+            row = rows[id]
+            for fragment in fragments:
+                self.assertIn(fragment, row["reason"], id)
+            self.assertEqual(row["status"], "TODO", id)
+            for fragment in ("Partial no-PTB evidence", "with or without matching PTB",
+                             "apply_ptb cancels", "resolve_probe_response commits",
+                             "only the probe is lost", "trailing packets are delivered",
+                             "IPv6 two-PTB fixture", "does not close this full span"):
+                self.assertIn(fragment, row["reason"], id)
+            self.assertEqual([p["reason"] for p in todos
+                              if " ".join(p["quote"].split()) == row["quote"]],
+                             [row["reason"]])
+            # Keep the proven source/test evidence explicitly partial, not deleted.
+            for evidence in row["evidence"]:
+                source = (ROOT / evidence.split("::", 1)[0]).read_text()
+                self.assertIn("//= reason=" + row["reason"], source)
+        self.assertEqual(rows["4821-011"]["status"], "TODO")
+        # 066 only requires rate limiting when suppression occurs; unlike 142,
+        # it does not also require suppression for every isolated probe failure.
+        self.assertEqual(rows["4821-066"]["status"], "covered")
+        self.assertIn("strict extra interval/tick", rows["4821-066"]["reason"])
+        counts = {n: len(tomllib.loads((ROOT / f"duvet/rfc{n}-todos.toml").read_text())
+                         .get("TODO", [])) for n in RFCS}
+        self.assertEqual(sum(counts.values()), 60)
+        self.assertEqual(sum(len(tomllib.loads(p.read_text()).get("TODO", []))
+                             for p in (ROOT / "duvet").glob("rfc*-todos.toml")), 63)
 
     def test_paws_discovery_gap_names_concrete_supplied_embedding(self):
         todos = tomllib.loads((ROOT / "duvet/rfc7323-todos.toml").read_text())["TODO"]
