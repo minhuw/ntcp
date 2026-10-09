@@ -201,7 +201,8 @@ impl Owner {
                 self.cancel_unused_backend_timestamps();
                 Ok(TxOutcome::WouldBlock)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(TxOutcome::WouldBlock),
+            // Native packet syscalls certify EINTR as WouldBlock at the IO
+            // boundary. Generic/wrapped errors do not certify non-submission.
             Err(e) => Err(e.raw_os_error().unwrap_or(EIO)),
         }
     }

@@ -27,6 +27,8 @@ struct State {
     receives: usize,
     capacity: usize,
     block: bool,
+    interrupted: bool,
+    cancel_error: Option<i32>,
     error: Option<io::ErrorKind>,
     poll_error: Option<io::ErrorKind>,
     disabled: bool,
@@ -70,7 +72,8 @@ impl PacketIo for Fixture {
         if let Some(error) = state.output_error {
             return Err(error.into());
         }
-        if state.block {
+        // Model native packet syscall EINTR: no packet or timestamp consumed.
+        if state.interrupted || state.block {
             return Ok(TxOutcome::WouldBlock);
         }
         state.sent.push_back(bytes.to_vec());
@@ -98,7 +101,8 @@ impl PacketIo for Fixture {
         if let Some(error) = state.error {
             return Err(error.into());
         }
-        if state.block {
+        // Model native packet syscall EINTR: no packet or timestamp consumed.
+        if state.interrupted || state.block {
             return Ok(TxOutcome::WouldBlock);
         }
         let reserved: usize = state
@@ -117,6 +121,9 @@ impl PacketIo for Fixture {
     }
     fn cancel_tx_timestamp(&mut self, cookie: u64) -> io::Result<bool> {
         let mut state = self.0.lock().unwrap();
+        if let Some(errno) = state.cancel_error {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
         state.cancelled.push(cookie);
         let old = state.requests.len();
         state.requests.retain(|r| r.cookie != cookie);
@@ -877,12 +884,14 @@ fn reserved_mtu_drop_split_backpressure_late_accept_and_prefix() {
     assert!(original.len() > 1500);
     assert_eq!(a.reservation_deadline, None);
     let token = a.reservation;
-    state.lock().unwrap().block = true;
+    state.lock().unwrap().interrupted = true;
     advance(&mut a, 100);
     assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
     let deadline = a.reservation_deadline.unwrap();
     assert_eq!(deadline, a.now() + 1_000_000);
-    for _ in 0..3 {
+    for i in 0..3 {
+        state.lock().unwrap().interrupted = i % 2 == 0;
+        state.lock().unwrap().block = i % 2 != 0;
         advance(&mut a, 100);
         assert!(a.prepare_packet(None).unwrap());
         assert_eq!(a.reservation, token);
@@ -893,6 +902,7 @@ fn reserved_mtu_drop_split_backpressure_late_accept_and_prefix() {
     {
         let mut state = state.lock().unwrap();
         state.block = false;
+        state.interrupted = false;
         state.enforce_mtu = true;
         state.mtu = Some(1400);
     }
@@ -916,6 +926,11 @@ fn reserved_mtu_drop_split_backpressure_late_accept_and_prefix() {
     assert!(a.reservation.is_some()); // Accepted prefix does not free the barrier.
     assert_eq!(a.reservation_deadline, Some(deadline));
     assert!(a.prepare_packet(None).unwrap());
+    state.lock().unwrap().interrupted = true;
+    advance(&mut a, 100);
+    assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
+    assert_eq!(a.reservation_deadline, Some(deadline));
+    state.lock().unwrap().interrupted = false;
     state.lock().unwrap().mtu = Some(600);
     assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
     requests.try_recv().unwrap();
@@ -1368,9 +1383,12 @@ fn reserved_late_direct_accept_and_prefix_expiry_keep_accepted_bytes() {
         vec![7; accepted]
     );
     assert!(a.prepare_packet(None).unwrap());
-    state.lock().unwrap().block = true;
+    let deadline = a.reservation_deadline;
+    state.lock().unwrap().interrupted = true;
+    advance(&mut a, 100);
     assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
-    a.test_now = a.reservation_deadline;
+    assert_eq!(a.reservation_deadline, deadline);
+    a.test_now = deadline;
     a.expire_reservation(a.now()).unwrap();
     assert_eq!(a.endpoint.state(cid).unwrap(), ntcp::State::Closed);
     assert!(state.lock().unwrap().sent.is_empty());
@@ -1379,4 +1397,159 @@ fn reserved_late_direct_accept_and_prefix_expiry_keep_accepted_bytes() {
         b.endpoint.state(connection(&b, server)).unwrap(),
         ntcp::State::Established
     );
+}
+
+#[test]
+fn reserved_repeated_interrupted_expires_only_owner_and_releases_commands() {
+    for timestamped in [false, true] {
+        let (mut a, mut b, client, _, state) = pmtud_pair(None);
+        let listener = new(&mut b, SOCK_NONBLOCK);
+        b.execute(listener, Op::Bind("10.73.0.3:16380".parse().unwrap()))
+            .unwrap();
+        b.execute(listener, Op::Listen(4)).unwrap();
+        let healthy = new(&mut a, SOCK_NONBLOCK);
+        assert_eq!(
+            a.execute(healthy, Op::Connect("10.73.0.3:16380".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        pump(&mut a, &mut b);
+        let peer = b
+            .execute(listener, Op::Accept(SOCK_NONBLOCK))
+            .unwrap()
+            .value as u64;
+        if timestamped {
+            state.lock().unwrap().capacity = 2;
+            flags(
+                &mut a,
+                client,
+                ts::TX_SCHED | ts::TX_SOFTWARE | ts::TX_HARDWARE | ts::TX_ACK,
+            );
+        }
+        a.execute(client, Op::Write(vec![5; 100])).unwrap();
+        reserve(&mut a);
+        assert!(a.prepare_packet(None).unwrap());
+        let cid = connection(&a, client);
+        let token = a.reservation;
+        let packet = a.pending_packet.clone();
+        let before = a.endpoint.transport_info(cid).unwrap();
+        state.lock().unwrap().interrupted = true;
+        assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
+        let deadline = a.reservation_deadline.unwrap();
+        assert_eq!(deadline, a.now() + 1_000_000);
+
+        let file =
+            unsafe { libc::memfd_create(c"interrupted-producer".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(file >= 0);
+        let _file = crate::Retained(file);
+        assert_eq!(unsafe { libc::write(file, b"file".as_ptr().cast(), 4) }, 4);
+        let mut offset: libc::off_t = 0;
+        let (reply, produced) = mpsc::sync_channel(1);
+        let mut producer = Request {
+            id: client,
+            op: Op::Transfer {
+                source: file,
+                staging: [-1; 2],
+                offset: Some((&mut offset as *mut libc::off_t) as usize),
+                count: 4,
+                flags: 0,
+            },
+            reply,
+            deadline: None,
+            send: None,
+        };
+        let (reply, closed) = mpsc::sync_channel(1);
+        let mut close = Request {
+            id: client,
+            op: Op::Close,
+            reply,
+            deadline: None,
+            send: None,
+        };
+        for _ in 0..4 {
+            advance(&mut a, 200_000);
+            assert!(!a.service(&mut producer));
+            assert!(!a.service(&mut close));
+            assert!(produced.try_recv().is_err());
+            assert!(closed.try_recv().is_err());
+            assert_eq!(offset, 0);
+            assert!(a.prepare_packet(None).unwrap());
+            assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::WouldBlock));
+            assert_eq!(a.reservation_deadline, Some(deadline));
+            assert_eq!(a.reservation, token);
+            assert_eq!(a.pending_packet, packet);
+            assert_eq!(
+                a.endpoint.transport_info(cid).unwrap().unacked,
+                before.unacked
+            );
+            assert!(state.lock().unwrap().sent.is_empty());
+            assert!(state.lock().unwrap().requests.is_empty());
+            assert_eq!(a.ethernet.as_ref().unwrap().next_cookie, 1);
+        }
+        a.expire_reservation(deadline - 1).unwrap();
+        assert!(a.reservation.is_some());
+        a.test_now = Some(deadline);
+        a.expire_reservation(a.now()).unwrap();
+        assert!(a.reservation.is_none());
+        assert!(a.pending_packet.is_none());
+        assert_eq!(a.endpoint.state(cid).unwrap(), ntcp::State::Closed);
+        assert_eq!(
+            a.endpoint.state(connection(&a, healthy)).unwrap(),
+            ntcp::State::Established
+        );
+        assert!(state.lock().unwrap().sent.is_empty()); // Neither acceptance nor reset.
+        assert_eq!(stage_count(&a, client, 0), 0);
+        assert_eq!(stage_count(&a, client, 2), 0);
+        assert_eq!(a.sockets[&client].timestamps.reserved(), 0);
+        a.events();
+        assert_eq!(a.sockets[&client].error, ECONNABORTED);
+        assert!(a.service(&mut producer));
+        assert!(produced.recv().unwrap().is_err());
+        assert_eq!(offset, 0);
+        assert!(a.service(&mut close));
+        assert!(closed.recv().unwrap().is_ok());
+        state.lock().unwrap().interrupted = false;
+        a.execute(healthy, Op::Write(b"healthy".to_vec())).unwrap();
+        assert!(a.prepare_packet(None).unwrap());
+        assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::Submitted));
+        assert_eq!(state.lock().unwrap().sent.len(), 1);
+        deliver(&mut a, &mut b, &state);
+        assert_eq!(b.execute(peer, Op::Read(99)).unwrap().bytes, b"healthy");
+    }
+}
+
+#[test]
+fn reserved_unknown_interrupted_and_wrapped_cancellation_do_not_certify_rejection() {
+    let (mut a, _, client, _, state) = pmtud_pair(None);
+    a.execute(client, Op::Write(vec![1; 100])).unwrap();
+    reserve(&mut a);
+    assert!(a.prepare_packet(None).unwrap());
+    state.lock().unwrap().output_error = Some(io::ErrorKind::Interrupted);
+    assert_eq!(a.submit_reserved_packet(), Err(EIO));
+    assert!(a.reservation_deadline.is_none());
+    assert!(a.reservation.is_some());
+    assert!(a.pending_packet.is_some());
+    assert!(!a.waiting_mtu);
+
+    for errno in [EINTR, EMSGSIZE] {
+        let (mut a, _, client, _, state) = pmtud_pair(None);
+        state.lock().unwrap().capacity = 2;
+        flags(&mut a, client, ts::TX_SOFTWARE | ts::TX_HARDWARE);
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
+            .unwrap();
+        a.execute(client, Op::Write(vec![1; 100])).unwrap();
+        reserve(&mut a);
+        assert!(a.prepare_packet(None).unwrap());
+        assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::Submitted));
+        a.execute(client, Op::Write(vec![2; 100])).unwrap();
+        assert!(a.prepare_packet(None).unwrap());
+        state.lock().unwrap().cancel_error = Some(errno);
+        assert_eq!(a.submit_reserved_packet(), Err(EIO));
+        assert!(a.reservation_deadline.is_none());
+        assert!(a.reservation.is_some());
+        assert!(a.pending_packet.is_some());
+        assert!(!a.waiting_mtu);
+        assert_eq!(state.lock().unwrap().sent.len(), 1);
+        assert_eq!(state.lock().unwrap().requests.len(), 1);
+    }
 }

@@ -370,7 +370,12 @@ pub(crate) fn received(count: isize, capacity: usize) -> io::Result<Option<usize
 pub(crate) fn transmitted(count: isize, length: usize) -> io::Result<TxOutcome> {
     if count < 0 {
         let error = io::Error::last_os_error();
-        return if error.kind() == io::ErrorKind::WouldBlock {
+        // Linux packet write/send EINTR occurs before any bytes are submitted.
+        // Certify retry here, not for arbitrary PacketIo errors or cancellation.
+        return if matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ) {
             Ok(TxOutcome::WouldBlock)
         } else {
             Err(error)
@@ -571,6 +576,18 @@ pub(crate) mod tests {
             }
         }
         panic!("queue never filled");
+    }
+
+    #[test]
+    fn interrupted_transmit_is_unsubmitted() {
+        // SAFETY: errno is thread-local; model the failed syscall result.
+        unsafe { *libc::__errno_location() = libc::EINTR };
+        assert_eq!(transmitted(-1, 4).unwrap(), TxOutcome::WouldBlock);
+        assert_eq!(transmitted(4, 4).unwrap(), TxOutcome::Submitted);
+        assert_eq!(
+            transmitted(1, 4).unwrap_err().kind(),
+            io::ErrorKind::WriteZero
+        );
     }
 
     #[test]
