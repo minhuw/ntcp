@@ -27,8 +27,21 @@ fn pair() -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
 }
 
 fn paced_pair(pacing: Option<bool>) -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
+    configured_pair(pacing, None)
+}
+
+fn configured_pair(
+    pacing: Option<bool>,
+    granularity: Option<crate::TimestampGranularity>,
+) -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
     let mut a = endpoint();
     let mut b = endpoint();
+    if let Some(granularity) = granularity {
+        a.config.connection.timestamps = true;
+        b.config.connection.timestamps = true;
+        a.config.connection.timestamp_granularity = granularity;
+        b.config.connection.timestamp_granularity = granularity;
+    }
     if let Some(general) = pacing {
         a.config.connection.prr = !general;
         a.config.connection.prr_algorithm = crate::PrrAlgorithm::Rfc9937;
@@ -690,4 +703,77 @@ fn reserved_pacing_gates_each_fragment_and_late_acceptance_has_no_catchup() {
         assert_eq!(total, 1000);
         assert!(a.poll_transmit(now, &mut bytes, 16).unwrap().packet.is_none(), "general={general}");
     }
+}
+
+#[test]
+fn reserved_acceptance_survives_successive_mtu_clock_advances() {
+    for endpoint_wide in [false, true] {
+        for repair in [false, true] {
+            let (mut a, _, id, _) = configured_pair(None, Some(crate::TimestampGranularity::Microseconds));
+            a.set_user_timeout(id, 10_000_000_000).unwrap();
+            a.write(id, &[1; 100]).unwrap();
+            let mut bytes = [0; 2048];
+            let (_, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
+            let mut token = token.unwrap();
+            let progress = a.send_progress(id).unwrap();
+            for step in 1..=2 {
+                let now = 2 + step * (1 << 30);
+                if endpoint_wide {
+                    a.set_endpoint_first_hop_mtu(now, 100).unwrap();
+                } else {
+                    a.set_first_hop_mtu(now, id, 100).unwrap();
+                }
+                assert_eq!(a.now, now);
+                assert_eq!(a.reservation.current.as_ref().unwrap().attempt, Some(token));
+            }
+            let now = a.now;
+            let invalid_mtu = if endpoint_wide {
+                a.set_endpoint_first_hop_mtu(now + 1, 67)
+            } else {
+                a.set_first_hop_mtu(now + 1, id, 67)
+            };
+            assert_eq!(invalid_mtu, Err(Error::InvalidArgument.into()));
+            assert_eq!(a.now, now);
+            assert_eq!(a.accept_transmit(now - 1, token), Err(Error::TimeWentBackwards.into()));
+            assert_eq!(a.now, now);
+            if repair {
+                a.reject_unsubmitted(token).unwrap();
+                token = a.poll_reserved_transmit(now, &mut bytes, 16).unwrap().1.unwrap();
+            }
+            assert!(a.accept_transmit(now, token).unwrap());
+            while a.reservation.current.is_some() {
+                let token = a.poll_reserved_transmit(now, &mut bytes, 16).unwrap().1.unwrap();
+                assert!(a.accept_transmit(now, token).unwrap());
+            }
+            assert_eq!(a.send_progress(id).unwrap(), progress);
+            let cwnd = a.transport_info(id).unwrap().cwnd;
+            a.on_timeout(now, 16).unwrap();
+            assert_eq!(a.state(id).unwrap(), State::Established);
+            assert_eq!(a.transport_info(id).unwrap().cwnd, cwnd);
+            assert!(!a.accept_transmit(u64::MAX, token).unwrap());
+            assert_eq!(a.now, now);
+        }
+    }
+}
+
+#[test]
+fn reserved_departure_preflight_failure_does_not_advance_endpoint_clock() {
+    let (mut a, _, id, _) = pair();
+    a.write(id, &[1; 100]).unwrap();
+    let mut bytes = [0; 2048];
+    let (_, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
+    let token = token.unwrap();
+    let progress = a.send_progress(id).unwrap();
+    // Corrupt only the private departure range to exercise a ledger validation
+    // failure, distinct from the public time/token checks.
+    let d = a.reservation.current.as_mut().unwrap().departure.as_mut().unwrap();
+    let start = d.start;
+    d.start = start.wrapping_add(1);
+    assert_eq!(a.accept_transmit(100, token), Err(Error::InvalidArgument.into()));
+    assert_eq!(a.now, 2);
+    assert_eq!(a.send_progress(id).unwrap(), progress);
+    assert_eq!(a.reservation.current.as_ref().unwrap().attempt, Some(token));
+    a.reservation.current.as_mut().unwrap().departure.as_mut().unwrap().start = start;
+    // An earlier valid accept proves neither connection nor endpoint clock moved.
+    assert!(a.accept_transmit(3, token).unwrap());
 }

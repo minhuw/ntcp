@@ -290,3 +290,81 @@ fn reserved_fresh_rtt_uses_departure_not_retained_timestamp_selection() {
     assert_eq!(a.rack.ack_sample, Some(100));
     assert_eq!(a.rtt.updates, updates + 1);
 }
+
+#[test]
+fn reserved_nonhead_retry_preserves_advancing_ack_rto_restart() {
+    for delay in [0, 50_000, 1_000_000] {
+        let mut a = strict_flight(0);
+        strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
+        packet(&mut a, 200_000);
+        strict_ack(&mut a, 200_001, 1000, &[(7000, 10_000)]);
+        while a.prr.unwrap().credit() != 0 {
+            packet(&mut a, 200_001);
+        }
+        strict_ack(&mut a, 300_000, 2000, &[(7000, 10_000)]);
+        let deadline = a.rto_deadline.unwrap();
+        let head = a.rack.head_transmission(a.snd_una).unwrap();
+        assert!(head.1 + a.rto() < deadline);
+        let mut bytes = [0; 2048];
+        a.transmit_selected(300_000, &mut bytes, true).unwrap().unwrap();
+        let mut d = a.last_departure.unwrap();
+        assert_ne!(Seq(d.start), a.snd_una);
+        assert!(d.rto && !d.rto_head);
+        let count = d.payload;
+        a.accept_reserved_output(300_000 + delay, &mut d, 0, count, true).unwrap();
+        assert_eq!(a.rack.head_transmission(a.snd_una), Some(head));
+        assert_eq!(a.rto_deadline, Some(deadline));
+        if a.now < deadline {
+            a.timeout(deadline - 1).unwrap();
+            assert_eq!(a.consecutive_timeouts, 0);
+        }
+        a.timeout(a.now.max(deadline)).unwrap();
+        assert_eq!(a.consecutive_timeouts, 1);
+        // A genuine timeout selects the head and does own a new departure anchor.
+        a.transmit_selected(a.now, &mut bytes, true).unwrap().unwrap();
+        let mut d = a.last_departure.unwrap();
+        assert!(d.rto && d.rto_head);
+        let count = d.payload;
+        let now = a.now + 50_000;
+        a.accept_reserved_output(now, &mut d, 0, count, true).unwrap();
+        assert_eq!(a.rto_deadline, Some(now + a.rto()));
+        a.timeout(now).unwrap();
+        assert_eq!(a.consecutive_timeouts, 1);
+        a.timeout(a.rto_deadline.unwrap()).unwrap();
+        assert_eq!(a.consecutive_timeouts, 2);
+    }
+}
+
+#[test]
+fn reserved_stale_history_discards_evidence_not_departure_obligation() {
+    let cfg = ConnectionConfig {
+        timestamps: true,
+        timestamp_granularity: TimestampGranularity::Microseconds,
+        user_timeout_us: 10_000_000_000,
+        pmtud: Some(crate::PmtudConfig::new(1500)),
+        sack: true, rack: true, tlp: false,
+        ..config(1024, 100)
+    };
+    let (mut a, _) = pair(cfg, 100);
+    a.write(&[1; 100]).unwrap();
+    a.transmit_selected(40, &mut [0; 2048], true).unwrap().unwrap();
+    let mut d = a.last_departure.unwrap();
+    assert!(a.reserved_ledger.is_some());
+    a.set_reserved_first_hop_mtu(40 + (1 << 30), 1400).unwrap();
+    assert!(a.rack.valid());
+    let now = 40 + (1 << 31);
+    a.set_reserved_first_hop_mtu(now, 1400).unwrap();
+    assert!(!a.rack.valid());
+    assert!(a.reserved_ledger.is_none());
+    assert!(a.sample.is_none() && a.last_timestamp_sent_at.is_none());
+    a.accept_reserved_output(now, &mut d, 0, 40, false).unwrap();
+    let deadline = a.rto_deadline;
+    let remaining = d.payload - 40;
+    a.accept_reserved_output(now + 1, &mut d, 40, remaining, true).unwrap();
+    assert!(!a.rack.valid()); // No old TS/retry history is resurrected.
+    assert_eq!(a.rto_deadline, deadline);
+    a.timeout(now + 1).unwrap();
+    assert_eq!(a.consecutive_timeouts, 0);
+    a.timeout(deadline.unwrap()).unwrap();
+    assert_eq!(a.consecutive_timeouts, 1);
+}

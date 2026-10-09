@@ -2787,7 +2787,11 @@ impl Endpoint {
             r.finished,
         );
         if let Some(id) = connection {
-            self.retained_slot(id)?.connection.check_time(now)?;
+            let owner = &self.retained_slot(id)?.connection;
+            owner.check_time(now)?;
+            if let Some(d) = &departure {
+                owner.validate_reserved_output(now, d, offset, count)?;
+            }
         }
         self.clock(now)?;
         if let Some(id) = connection && let Some(d) = &mut departure {

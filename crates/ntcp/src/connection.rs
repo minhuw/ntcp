@@ -592,6 +592,8 @@ pub(crate) struct Connection {
     pub(crate) tx_timestamps: TxTimestamps,
     pub(crate) last_output_range: Option<TxStreamRange>,
     pub(crate) last_departure: Option<Departure>,
+    // Optional timing evidence, separate from the retained output obligation.
+    reserved_ledger: Option<crate::rack::DepartureSelection>,
     last_pmtu_output: Option<(Seq, Seq)>,
     pub(crate) rx_timestamps: RxTimestamps,
     input_timestamps: RxPacketTimestamps,
@@ -849,6 +851,7 @@ impl Connection {
             tx_timestamps: TxTimestamps::default(),
             last_output_range: None,
             last_departure: None,
+            reserved_ledger: None,
             last_pmtu_output: None,
             rx_timestamps: RxTimestamps::default(),
             input_timestamps: RxPacketTimestamps::default(),
@@ -2020,6 +2023,29 @@ impl Connection {
         }
     }
 
+    pub(crate) fn validate_reserved_output(
+        &self,
+        now: Instant,
+        d: &Departure,
+        offset: usize,
+        count: usize,
+    ) -> Result<(), Error> {
+        self.check_time(now)?;
+        if now < d.selected_at {
+            return Err(Error::TimeWentBackwards);
+        }
+        if offset > d.payload || count > d.payload - offset {
+            return Err(Error::InvalidArgument);
+        }
+        if d.stream && count != 0 && let Some(selection) = self.reserved_ledger {
+            let start = Seq(d.start).wrapping_add(offset as u32);
+            if !self.rack.validate_departure(selection, start, start.wrapping_add(count as u32), now) {
+                return Err(Error::InvalidArgument);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn accept_reserved_output(
         &mut self,
         now: Instant,
@@ -2028,15 +2054,11 @@ impl Connection {
         count: usize,
         finished: bool,
     ) -> Result<(), Error> {
-        self.check_time(now)?;
-        if now < d.selected_at {
-            return Err(Error::TimeWentBackwards);
-        }
-        if d.stream && count != 0 && let Some(selection) = d.ledger {
+        self.validate_reserved_output(now, d, offset, count)?;
+        if d.stream && count != 0 && let Some(selection) = self.reserved_ledger {
             let start = Seq(d.start).wrapping_add(offset as u32);
-            if !self.rack.commit_departure(selection, start, start.wrapping_add(count as u32), now) {
-                return Err(Error::InvalidArgument);
-            }
+            let committed = self.rack.commit_departure(selection, start, start.wrapping_add(count as u32), now);
+            debug_assert!(committed); // Identical read-only preflight above.
         }
         self.update_time(now)?;
         // The encoded TSval names selection, not departure. A scalar covering
@@ -2062,9 +2084,13 @@ impl Connection {
             self.fin_sent_at = Some(now);
         }
         if sequence && d.rto {
-            let head = self.rack.head_transmission(self.snd_una).map(|(_, sent)| sent)
-                .or_else(|| (self.fin_sequence == Some(self.snd_una)).then_some(self.fin_sent_at).flatten());
-            self.rto_deadline = Some(head.unwrap_or(now).saturating_add(self.rto()));
+            // A non-head retry cannot replace an ACK-restarted timer with
+            // head.sent + RTO (nor defer an already overdue older flight).
+            self.rto_deadline = if d.rto_head {
+                Some(now.saturating_add(self.rto()))
+            } else {
+                Some(d.prior_rto_deadline.unwrap_or(d.selected_at.saturating_add(self.rto())))
+            };
             // The first accepted sequence-bearing fragment owns this restart;
             // later siblings must not defer that prefix's RTO.
             d.rto = false;
@@ -2281,6 +2307,9 @@ impl Connection {
             // cleanup/retransmission deadlines; ordinary loss recovery remains.
             if self.flight() != 0 {
                 self.rack.abandon(self.data_high());
+                // The exact reserved bytes/timers survive, but acceptance must
+                // not require or recreate this discarded timestamp evidence.
+                self.reserved_ledger = None;
                 self.prr = None;
                 self.rack_entry_delivery = None;
             }
@@ -6925,6 +6954,7 @@ impl Connection {
                 Error::Wire(error)
             }
         })?;
+        self.reserved_ledger = None;
         self.last_departure = reserve.then_some(Departure {
             selected_at: now,
             start: seq.0,
@@ -6934,6 +6964,11 @@ impl Connection {
             fin: flags & FIN != 0,
             rto: !keepalive && !probe && (count != 0 || syn || flags & FIN != 0)
                 && (self.rto_deadline.is_none() || retransmitted || tlp),
+            rto_head: seq == self.snd_una,
+            prior_rto_deadline: self.rto_deadline.or_else(|| {
+                self.rack.head_transmission(self.snd_una)
+                    .map(|(_, sent)| sent.saturating_add(self.rto()))
+            }),
             tlp: (fresh_data || new_fin) && !tlp,
             persist: probe,
             keepalive,
@@ -7087,8 +7122,8 @@ impl Connection {
                         && end.distance_from(self.snd_una) <= self.snd_wnd,
                 );
             }
-            if let Some(departure) = &mut self.last_departure {
-                departure.ledger = self.rack.departure_selection();
+            if reserve {
+                self.reserved_ledger = self.rack.departure_selection();
             }
             if !self.rack.valid() {
                 self.prr = None;

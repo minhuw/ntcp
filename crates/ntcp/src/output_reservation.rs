@@ -6,13 +6,14 @@ use crate::{ConnectionId, EndpointError, Error, Instant, Transmit, wire};
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Departure {
     pub selected_at: Instant,
-    pub ledger: Option<crate::rack::DepartureSelection>,
     pub start: u32,
     pub payload: usize,
     pub stream: bool,
     pub syn: bool,
     pub fin: bool,
     pub rto: bool,
+    pub rto_head: bool,
+    pub prior_rto_deadline: Option<Instant>,
     pub tlp: bool,
     pub persist: bool,
     pub keepalive: bool,

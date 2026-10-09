@@ -363,11 +363,10 @@ impl Rack {
         self.departure_selection.filter(|_| self.valid())
     }
 
-    // Re-age an already charged copy, not a retransmission. Validate all edges,
-    // coverage and capacity before any split so failure leaves the ledger intact.
-    #[allow(dead_code)] // Consumer: reserved-output timing integration.
-    pub(crate) fn commit_departure(
-        &mut self,
+    // Shared read-only preflight lets the endpoint reject invalid departures
+    // before advancing its clock. Commit uses the same edge/coverage checks.
+    pub(crate) fn validate_departure(
+        &self,
         selection: DepartureSelection,
         start: Seq,
         end: Seq,
@@ -411,6 +410,19 @@ impl Rack {
             })
             .count();
         if splits > self.capacity.saturating_sub(self.intervals.len()) {
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn commit_departure(
+        &mut self,
+        selection: DepartureSelection,
+        start: Seq,
+        end: Seq,
+        now: u64,
+    ) -> bool {
+        if !self.validate_departure(selection, start, end, now) {
             return false;
         }
         // Preflight above guarantees these cannot fail or allocate.
