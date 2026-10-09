@@ -40,7 +40,7 @@ def isolated(executable):
 
     for extra, args in (({}, []), ({'LD_PRELOAD': str(LIBRARY)}, []),
                         ({'LD_PRELOAD': str(LIBRARY), **config_env(
-                            Path(executable).parent, interface='ntcp0', address='10.73.0.2')}, ['--virtual'])):
+                            Path(executable).parent, io_interface='ntcp0', io_address='10.73.0.2')}, ['--virtual'])):
         with socket.socket() as listener, concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind(('10.73.0.1', 16382))

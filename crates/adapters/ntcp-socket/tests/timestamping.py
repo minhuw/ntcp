@@ -22,12 +22,12 @@ def environment():
 def isolated(binary, backend):
     env = environment()
     commands = [ ['ip', 'link', 'set', 'lo', 'up'] ]
-    settings = {'address': '10.73.0.2'}
+    settings = {'io_address': '10.73.0.2'}
     if backend == 'tun':
         commands += [ ['ip', 'tuntap', 'add', 'dev', 'ntcp0', 'mode', 'tun'],
                       ['ip', 'addr', 'add', '10.73.0.1/24', 'dev', 'ntcp0'],
                       ['ip', 'link', 'set', 'ntcp0', 'up'] ]
-        settings['interface'] = 'ntcp0'
+        settings['io_interface'] = 'ntcp0'
     else:
         commands += [ ['ip', 'link', 'add', 'engine0', 'type', 'veth', 'peer', 'name', 'peer0'],
                       ['ip', 'link', 'set', 'engine0', 'address', '02:00:00:00:00:02'],
@@ -36,8 +36,8 @@ def isolated(binary, backend):
                       ['ip', 'addr', 'add', '10.73.0.253/24', 'dev', 'peer0'],
                       ['ip', 'link', 'set', 'engine0', 'up'],
                       ['ip', 'link', 'set', 'peer0', 'up'] ]
-        settings |= {'backend': 'af-packet', 'interface': 'engine0',
-                     'next_hop_mac': '02:00:00:00:00:01'}
+        settings |= {'io_backend': 'af-packet', 'io_interface': 'engine0',
+                     'io_next_hop_mac': '02:00:00:00:00:01'}
     for args in commands:
         subprocess.run(args, env=env, check=True, timeout=10)
 
@@ -57,8 +57,8 @@ def isolated(binary, backend):
         # Two userspace endpoints avoid veth's kernel CHECKSUM_PARTIAL frames;
         # no offload/NIC configuration or checksum bypass is needed.
         server_env = env | {'LD_PRELOAD': str(LIBRARY)} | config_env(
-            Path(binary).parent, **(settings | {'address': '10.73.0.1',
-                'interface': 'peer0', 'next_hop_mac': '02:00:00:00:00:02'}))
+            Path(binary).parent, **(settings | {'io_address': '10.73.0.1',
+                'io_interface': 'peer0', 'io_next_hop_mac': '02:00:00:00:00:02'}))
         with subprocess.Popen([binary, '--server'], env=server_env,
                               stdout=subprocess.PIPE, text=True) as server:
             try:
@@ -95,7 +95,7 @@ def main():
                         str(Path(__file__).with_suffix('.c')), '-o', binary],
                        env=env, check=True, timeout=30)
         subprocess.run([binary, '--invalid'], env=env | {
-            'LD_PRELOAD': str(LIBRARY), **config_env(directory, backend='af-packet')},
+            'LD_PRELOAD': str(LIBRARY), **config_env(directory, io_backend='af-packet')},
             check=True, timeout=10)
         for backend in ['tun', 'af-packet']:
             subprocess.run(['unshare', '--user', '--map-root-user', '--net',

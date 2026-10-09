@@ -28,7 +28,7 @@ def run_case(executable, virtual=False, preload=False):
     if virtual or preload:
         env['LD_PRELOAD'] = str(LIBRARY)
     if virtual:
-        env.update(config_env(Path(executable).parent, interface='ntcp0', address=local))
+        env.update(config_env(Path(executable).parent, io_interface='ntcp0', io_address=local))
     done = threading.Event()
 
     def listener(port):

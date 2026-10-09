@@ -12,14 +12,14 @@ from timestamping import ROOT, LIBRARY, environment
 def isolated(binary, backend, pacing):
     env = environment()
     commands = [['ip', 'link', 'set', 'lo', 'up']]
-    settings = {'address': '10.73.0.2'}
+    settings = {'io_address': '10.73.0.2'}
     if pacing != 'unset':
-        settings['pacing'] = pacing
+        settings['tcp_pacing'] = pacing
     if backend == 'tun':
         commands += [['ip', 'tuntap', 'add', 'dev', 'ntcp0', 'mode', 'tun'],
                      ['ip', 'addr', 'add', '10.73.0.1/24', 'dev', 'ntcp0'],
                      ['ip', 'link', 'set', 'ntcp0', 'up']]
-        settings['interface'] = 'ntcp0'
+        settings['io_interface'] = 'ntcp0'
         server_env = env
     else:
         commands += [['ip', 'link', 'add', 'engine0', 'type', 'veth', 'peer', 'name', 'peer0'],
@@ -29,12 +29,12 @@ def isolated(binary, backend, pacing):
                      ['ip', 'addr', 'add', '10.73.0.253/24', 'dev', 'peer0'],
                      ['ip', 'link', 'set', 'engine0', 'up'],
                      ['ip', 'link', 'set', 'peer0', 'up']]
-        settings |= {'backend': 'af-packet', 'interface': 'engine0',
-                     'next_hop_mac': '02:00:00:00:00:01'}
+        settings |= {'io_backend': 'af-packet', 'io_interface': 'engine0',
+                     'io_next_hop_mac': '02:00:00:00:00:01'}
         # Two userspace endpoints avoid kernel CHECKSUM_PARTIAL frames on veth.
         server_env = env | {'LD_PRELOAD': str(LIBRARY)} | config_env(
-            Path(binary).parent, **(settings | {'address': '10.73.0.1',
-                'interface': 'peer0', 'next_hop_mac': '02:00:00:00:00:02'}))
+            Path(binary).parent, **(settings | {'io_address': '10.73.0.1',
+                'io_interface': 'peer0', 'io_next_hop_mac': '02:00:00:00:00:02'}))
     for command in commands:
         subprocess.run(command, env=env, check=True, timeout=10)
     with subprocess.Popen([binary, '--server'], env=server_env,
@@ -65,7 +65,7 @@ def main():
         for value in ['', 'TRUE', '01', '2']:
             subprocess.run([binary, '--invalid'], env=env | {
                 'LD_PRELOAD': str(LIBRARY), **config_env(
-                    directory, interface='ntcp0', address='10.73.0.2', pacing=value)}, check=True, timeout=10)
+                    directory, io_interface='ntcp0', io_address='10.73.0.2', tcp_pacing=value)}, check=True, timeout=10)
         for backend in ['tun', 'af-packet']:
             for pacing in ['unset', 'false', 'true']:
                 subprocess.run(['unshare', '--user', '--map-root-user', '--net',

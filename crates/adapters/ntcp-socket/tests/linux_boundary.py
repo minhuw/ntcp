@@ -31,7 +31,7 @@ def isolated(directory):
                  ['ip', 'link', 'set', 'ntcp0', 'up']):
         run(args)
     preload = env | {'LD_PRELOAD': str(LIBRARY)} | config_env(
-        directory, interface='ntcp0', address='10.73.0.2')
+        directory, io_interface='ntcp0', io_address='10.73.0.2')
     run([str(directory / 'cancellation'), '--coexist'], env=preload)
 
     def serve(listener, loaded):

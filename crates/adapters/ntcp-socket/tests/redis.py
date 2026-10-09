@@ -232,7 +232,7 @@ def isolated(parent_namespace, artifact_dir):
     assert_engine_unassigned()
     with tempfile.TemporaryDirectory(prefix='redis-data-', dir=artifact_dir) as data:
         preload = clean_env() | {'LD_PRELOAD': str(LIBRARY)} | config_env(
-            data, interface=TUN, address=ENGINE, prefix='24')
+            data, io_interface=TUN, io_address=ENGINE, io_prefix='24')
         before = counters()
         with redis(ENGINE, preload, data, artifact_dir / 'preloaded-server.log') as server:
             assert str(LIBRARY) in pathlib.Path(f'/proc/{server.pid}/maps').read_text(), 'preload not mapped'
@@ -250,9 +250,9 @@ def isolated(parent_namespace, artifact_dir):
             before = counters()
             args = [tool('redis-cli'), '-h', KERNEL, '-p', PORT]
             # A reachable kernel server makes accidental native fallback detectable.
-            missing = preload | config_env(data, interface=TUN, prefix='24')
+            missing = preload | config_env(data, io_interface=TUN, io_prefix='24')
             invalid = preload | config_env(
-                data, interface=TUN, address='not-an-ip-address', prefix='24')
+                data, io_interface=TUN, io_address='not-an-ip-address', io_prefix='24')
             with open(artifact_dir / 'invalid-config.log', 'wb') as log:
                 for label, env in [('missing address', missing), ('invalid address', invalid)]:
                     rejected = subprocess.run([str(arg) for arg in args + ['PING']], env=env,

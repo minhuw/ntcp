@@ -17,7 +17,7 @@ def run(binary, managed=False, preload=False):
     if preload or managed:
         env['LD_PRELOAD'] = str(timestamping.LIBRARY)
     if managed:
-        env.update(config_env(Path(binary).parent, interface='ntcp0', address='10.73.0.2'))
+        env.update(config_env(Path(binary).parent, io_interface='ntcp0', io_address='10.73.0.2'))
 
     def peer(listener):
         for case in range(16):

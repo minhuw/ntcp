@@ -24,9 +24,9 @@ class ConfigFixtureTest(unittest.TestCase):
                 self.assertEqual(env['LD_PRELOAD'], str(pacing.LIBRARY))
                 path = Path(env['NTCP_SOCKET_CONFIG'])
                 invalid_files.append(path)
-                self.assertIn('interface=ntcp0\n', path.read_text())
-                self.assertIn('address=10.73.0.2\n', path.read_text())
-                self.assertTrue(any(f'pacing={value}\n' in path.read_text()
+                self.assertIn('io.interface=ntcp0\n', path.read_text())
+                self.assertIn('io.address=10.73.0.2\n', path.read_text())
+                self.assertTrue(any(f'tcp.pacing={value}\n' in path.read_text()
                                     for value in ('', 'TRUE', '01', '2')))
             elif '--isolated' in args:
                 self.assertNotIn('NTCP_SOCKET_CONFIG', kwargs['env'])
@@ -57,15 +57,23 @@ class ConfigFixtureTest(unittest.TestCase):
                     self.assertNotIn('LD_PRELOAD', env)
                 paths = []
                 for pacing in ('false', 'true', 'invalid'):
-                    settings = dict(backend='af-packet', interface='engine0',
-                                    address='10.73.0.2', next_hop_mac='02:00:00:00:00:01',
-                                    pacing=pacing)
+                    settings = dict(io_backend='af-packet', io_interface='engine0',
+                                    io_address='10.73.0.2', io_next_hop_mac='02:00:00:00:00:01',
+                                    io_prefix='24', tcp_pacing=pacing,
+                                    tcp_pacing_gain_percent='120',
+                                    tcp_pacing_max_bytes_per_second='1000000',
+                                    tcp_pacing_burst_segments='2')
                     config = config_env(directory, **settings)
                     self.assertEqual(list(config), ['NTCP_SOCKET_CONFIG'])
                     path = Path(config['NTCP_SOCKET_CONFIG'])
                     paths.append(path)
                     self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-                    expected = ''.join(f'{key}={value}\n' for key, value in settings.items())
+                    expected = ('io.backend=af-packet\nio.interface=engine0\n'
+                                'io.address=10.73.0.2\nio.next_hop_mac=02:00:00:00:00:01\n'
+                                f'io.prefix=24\ntcp.pacing={pacing}\n'
+                                'tcp.pacing_gain_percent=120\n'
+                                'tcp.pacing_max_bytes_per_second=1000000\n'
+                                'tcp.pacing_burst_segments=2\n')
                     # The closed writer leaves its file readable by a fresh child.
                     result = subprocess.check_output([
                         sys.executable, '-c',

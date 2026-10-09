@@ -26,7 +26,7 @@ def run(executable, virtual=False, preload=False):
     if virtual or preload:
         env['LD_PRELOAD'] = str(LIBRARY)
     if virtual:
-        env.update(config_env(Path(executable).parent, interface='ntcp0', address='10.73.0.2'))
+        env.update(config_env(Path(executable).parent, io_interface='ntcp0', io_address='10.73.0.2'))
 
     def peer(listener):
         listener.settimeout(15)
