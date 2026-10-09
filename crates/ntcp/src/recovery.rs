@@ -474,6 +474,12 @@ impl Congestion {
     //= reason=set_mss scales cwnd by new/old MSS on a decrease; negotiated/path/timestamp vectors assert exact byte ratio. No claim that discovery itself is supplied by TCP.
     //# Specifically, cwnd SHOULD be reduced by the ratio of the old segment size to the new
     //# segment size.
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-4
+    //= reason=PMTU decrease rescales cwnd by new/old MSS for Reno and CUBIC without changing allocation or existing pacing debt; tested with PRR enabled.
+    //# Whenever the MTU is reduced (e.g., when processing ICMP PTB messages), the
+    //# congestion state variable SHOULD be rescaled so as not to raise the window size in
+    //# packets.
+
     pub(crate) fn set_mss(&mut self, mss: u32) {
         assert!(mss > 0);
         let mss = mss.min(MAX_WINDOW);

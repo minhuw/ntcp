@@ -109,6 +109,19 @@ fn ack(a: &mut Connection, now: u64, end: Seq) {
 //= type=test
 //# If a node receives a Packet Too Big message reporting a next-hop MTU
 //# that is less than the IPv6 minimum link MTU, it must discard it.
+//= https://www.rfc-editor.org/rfc/rfc1191#section-6.4
+//= type=test
+//= reason=Dynamic send path MSS never mutates config.mss receive offer; family-floor wire test asserts unchanged receive capability.
+//# PMTU Discovery does not affect the value sent in the TCP MSS option, because that value
+//# is used by the other end of the connection, which may be using an unrelated PMTU value.
+
+//= https://www.rfc-editor.org/rfc/rfc8201#section-4
+//= type=test
+//= reason=IPv6 core rejects1279 without changing1500 estimate and accepts1280; native IPv6 socket transport is not claimed.
+//# If a node receives a Packet Too Big message reporting a next-hop MTU that is less than
+//# the IPv6 minimum link MTU, it must discard it. A node must not reduce its estimate of
+//# the Path MTU below the IPv6 minimum link MTU on receipt of a Packet Too Big message.
+
 fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
     for ipv4 in [true, false] {
         for iss in [0, u32::MAX - 100] {
@@ -184,6 +197,89 @@ fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc1191#section-3
+//= type=test
+//= reason=Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.
+//# When a host receives a Datagram Too Big message, it MUST reduce its estimate of the PMTU
+//# for the relevant path, based on the value of the Next-Hop MTU field in the message (see
+//# section 4). We do not specify the precise behavior of a host in this circumstance, since
+//# different applications may have different requirements, and since different
+//# implementation architectures may favor different strategies.
+
+//= https://www.rfc-editor.org/rfc/rfc1191#section-3
+//= type=test
+//= reason=Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.
+//# We do require that after receiving a Datagram Too Big message, a host MUST attempt to
+//# avoid eliciting more such messages in the near future. The host may either reduce the
+//# size of the datagrams it is sending along the path, or cease setting the Don't Fragment
+//# bit in the headers of those datagrams. Clearly, the former strategy may continue to
+//# elicit Datagram Too Big messages for a while, but since each of these messages (and the
+//# dropped datagrams they respond to) consume Internet resources, the host MUST force the
+//# PMTU Discovery process to converge.
+
+//= https://www.rfc-editor.org/rfc/rfc1191#section-3
+//= type=test
+//= reason=Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.
+//# A host MUST never reduce its estimate of the Path MTU below 68 octets.
+
+//= https://www.rfc-editor.org/rfc/rfc1191#section-3
+//= type=test
+//= reason=Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.
+//# A host MUST not increase its estimate of the Path MTU in response to the contents of a
+//# Datagram Too Big message. A message purporting to announce an increase in the Path MTU
+//# might be a stale datagram that has been floating around in the Internet, a false packet
+//# injected as part of a denial-of-service attack, or the result of having multiple paths
+//# to the destination.
+
+//= https://www.rfc-editor.org/rfc/rfc1191#section-6.4
+//= type=test
+//= reason=Nondecreasing, stale and impossible exact-size quotes are rejected; decreasing accepted feedback alone reaches packetization refresh.
+//# This means that the TCP layer must be able to recognize when a Datagram Too Big
+//# notification actually decreases the PMTU that it has already used to send a datagram on
+//# the given connection, and should ignore any other notifications.
+
+//= https://www.rfc-editor.org/rfc/rfc5927#section-4.1
+//= type=test
+//= reason=Informational mitigation selected as policy: live serial send-window validation plus stronger exact recent packet gate; stale/idle and wrapped-sequence quotes tested, not authentication.
+//# Many TCP implementations have incorporated a validation check such that they react only
+//# to those ICMP error messages that appear to relate to segments currently "in flight" to
+//# the destination system. These implementations check that the TCP sequence number
+//# contained in the payload of the ICMP error message is within the range SND.UNA =<
+//# SEG.SEQ < SND.NXT. This means that they require that the sequence number be within the
+//# range of the data already sent but not yet acknowledged. If an ICMP error message does
+//# not pass this check, it is discarded.
+
+//= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
+//= type=test
+//= reason=Informational policy: reject impossible larger candidates, defer below proven delivery, clear on progress; test contrasts progress with quoted-head RTO. Additional any-progress clearing is conservative, not literal full pseudocode conformance.
+//# Upon receipt of an ICMP "Packet Too Big" error message, the Next-Hop MTU claimed by the
+//# ICMP message (henceforth "claimedmtu") is compared with maxsizesent. If claimedmtu is
+//# larger than maxsizesent, then the ICMP error message is silently discarded. The
+//# rationale for this is that the ICMP error message cannot be legitimate if it claims to
+//# have been triggered by a packet larger than the largest packet we have so far sent for
+//# this connection.
+
+//= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
+//= type=test
+//= reason=Informational policy: reject impossible larger candidates, defer below proven delivery, clear on progress; test contrasts progress with quoted-head RTO. Additional any-progress clearing is conservative, not literal full pseudocode conformance.
+//# On the other hand, if claimedmtu is smaller than maxsizeacked, TCP is supposed to be in
+//# the Path-MTU Update stage. At this stage, these implementations are more cautious with
+//# the errors being reported by the network, and therefore just record the received error
+//# message, and delay the update of the assumed Path-MTU.
+
+//= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
+//= type=test
+//= reason=Informational policy: reject impossible larger candidates, defer below proven delivery, clear on progress; test contrasts progress with quoted-head RTO. Additional any-progress clearing is conservative, not literal full pseudocode conformance.
+//# If, while there is a pending ICMP "Packet Too Big" error message, the TCP SEQ claimed by
+//# the pending message is acknowledged (i.e., an ACK that acknowledges that sequence number
+//# is received), then the "pending error" condition is cleared.
+
+//= https://www.rfc-editor.org/rfc/rfc5927#section-7.4
+//= type=test
+//= reason=Informational serial-arithmetic guidance: Seq::in_window and wrapping comparisons, exercised across u32 wrap; exact-match sent evidence is an additional policy gate.
+//# Notes: All comparisons between sequence numbers must be performed using sequence number
+//# arithmetic.
+
 fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate() {
     for iss in [0, u32::MAX - 100] {
         let (mut a, _) = family_pair(cfg(1500), true, iss);
@@ -270,6 +366,37 @@ fn pmtud_ipv4_header_options_exact_quote_and_retransmit_budget() {
 //= type=test
 //# To do so, it creates a probe packet such that its
 //# size, including the outermost IP headers, is equal to the probe size.
+//= https://www.rfc-editor.org/rfc/rfc8201#section-4
+//= type=test
+//= reason=Both families retain ten-minute PTB hold through ACK progress and local link growth; only subsequent ACK-confirmed PLPMTUD can raise effective PMTU.
+//# Nodes may detect increases in PMTU, but because doing so requires sending packets larger
+//# than the current estimated PMTU, and because the likelihood is that the PMTU will not
+//# have increased, this must be done at infrequent intervals. An attempt to detect an
+//# increase (by sending a packet larger than the current estimate) must not be done less
+//# than 5 minutes after a Packet Too Big message has been received for the given path. The
+//# recommended setting for this timer is twice its minimum value (10 minutes).
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.1
+//= type=test
+//= reason=Binary target is strictly above search_low and <=search_high; actual IP probe size checked for IPv4/IPv6 and constrained by peer/allocation ceilings.
+//# When transmitting probes, the Packetization Layer MUST select a probe size that is
+//# larger than search_low and smaller than or equal to search_high.
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.1
+//= type=test
+//= reason=Unambiguous explicit-probe cumulative ACK raises low and effective MTU; failed encoding cannot create a probe or advance flight.
+//# When the probe is delivered, it is an indication that the Path MTU is at least as large
+//# as the probe size. Set search_low to the probe size. If the probe size is larger than
+//# the eff_pmtu, raise eff_pmtu to the probe size. The probe size might be smaller than the
+//# eff_pmtu if the flow has not been using the full MTU of the path because it is subject
+//# to some other limitation, such as available data in an interactive session.
+
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.2
+//= type=test
+//= reason=Enabled core implements validated PTB, real-data ACK-confirmed probes, bounded search and R1 black-hole fallback. Native IPv4 TUN/AF_PACKET ingress and real MTU startup integrate it. This closes the implementation recommendation, not all external RFC clauses: RFC1191/8201/4821 inventories retain exact gaps; native IPv6 sockets remain unsupported.
+//# Instead, implementation of Path MTU Discovery (PMTUD) and Packetization Layer Path MTU
+//# Discovery (PLPMTUD) is strongly recommended in order for TCP to improve segmentation
+//# decisions.
 fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry() {
     for ipv4 in [true, false] {
         let (mut a, _) = family_pair(cfg(1500), ipv4, u32::MAX - 4000);
@@ -328,6 +455,20 @@ fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry() {
 //# Upon additional
 //# successive timeouts, search_low and eff_pmtu SHOULD be halved, with a
 //# lower bound of 68 bytes for IPv4 and 1280 bytes for IPv6.
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.7
+//= type=test
+//= reason=R1 uses third consecutive data RTO; earlier RTOs preserve PMTU, later ones halve to family floor while cwnd follows normal timeout response.
+//# Under all conditions, a full-stop timeout (also known as a "persistent timeout" in other
+//# documents) SHOULD be taken as an indication of some significantly disruptive event in
+//# the network, such as a router failure or a routing change to a path with a smaller MTU.
+//# For TCP, this occurs when the R1 timeout threshold described by [RFC1122] expires.
+
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.2
+//= type=test
+//= reason=Enabled core implements validated PTB, real-data ACK-confirmed probes, bounded search and R1 black-hole fallback. Native IPv4 TUN/AF_PACKET ingress and real MTU startup integrate it. This closes the implementation recommendation, not all external RFC clauses: RFC1191/8201/4821 inventories retain exact gaps; native IPv6 sockets remain unsupported.
+//# Instead, implementation of Path MTU Discovery (PMTUD) and Packetization Layer Path MTU
+//# Discovery (PLPMTUD) is strongly recommended in order for TCP to improve segmentation
+//# decisions.
 fn pmtud_full_stop_r1_halving_and_normal_congestion_response() {
     for ipv4 in [true, false] {
         let (mut a, _) = family_pair(cfg(1500), ipv4, 0);
@@ -417,6 +558,28 @@ fn pmtud_probe_isolated_and_multiple_loss_wait_for_trailing_ack() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
+//= type=test
+//= reason=Admission requires probe payload plus three MSS of queued/window credit, measured RTT and timestamp/pacing credit. This test asserts absent probe for insufficient window/queue/RTT and bounded paced output.
+//# o The available window is greater than the probe size.
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
+//= type=test
+//= reason=Admission requires probe payload plus three MSS of queued/window credit, measured RTT and timestamp/pacing credit. This test asserts absent probe for insufficient window/queue/RTT and bounded paced output.
+//# o For a protocol using in-band data for probing, enough data is available to send the
+//# probe.
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
+//= type=test
+//= reason=Admission requires probe payload plus three MSS of queued/window credit, measured RTT and timestamp/pacing credit. This test asserts absent probe for insufficient window/queue/RTT and bounded paced output.
+//# In addition, the timely loss detection algorithms in most protocols have pre-conditions
+//# that SHOULD be satisfied before sending a probe. For example, TCP Fast Retransmit is not
+//# robust unless there are sufficient segments following a probe; that is, the sender
+//# SHOULD have enough data queued and sufficient receiver window to send the probe plus at
+//# least Tcprexmtthresh [RFC2760] additional segments. This restriction may inhibit probing
+//# in some protocol states, such as too close to the end of a connection, or when the
+//# window is too small.
+
 fn pmtud_probe_rwnd_queue_eor_timestamp_and_pacing_gates() {
     for gate in 0..5 {
         let mut cfg = cfg(1500);
@@ -456,6 +619,45 @@ fn pmtud_probe_rwnd_queue_eor_timestamp_and_pacing_gates() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc1191#section-3.1
+//= type=test
+//= reason=Peer MSS is stored separately from receive capability; missing IPv4 MSS defaults536 and emitted packets remain <=576 even with local MTU9000.
+//# A host doing PMTU Discovery must obey the rule that it not send IP datagrams larger than
+//# 576 octets unless it has permission from the receiver. For TCP connections, this means
+//# that a host must not send datagrams larger than 40 octets plus the Maximum Segment Size
+//# (MSS) sent by its peer.
+
+//= https://www.rfc-editor.org/rfc/rfc1191#section-3.1
+//= type=test
+//= reason=Peer MSS is stored separately from receive capability; missing IPv4 MSS defaults536 and emitted packets remain <=576 even with local MTU9000.
+//# Note: The TCP MSS is defined to be the relevant IP datagram size minus 40 [9]. The
+//# default of 576 octets for the maximum IP datagram size yields a default of 536 octets
+//# for the TCP MSS.
+
+//= https://www.rfc-editor.org/rfc/rfc1191#section-6.4
+//= type=test
+//= reason=Peer MSS is stored separately from receive capability; missing IPv4 MSS defaults536 and emitted packets remain <=576 even with local MTU9000.
+//# A TCP implementation must also store the MSS value received from its peer (which
+//# defaults to 536), and not send any segment larger than this MSS, regardless of the PMTU.
+//# In 4.xBSD-derived implementations, this requires adding an additional field to the TCP
+//# state record.
+
+//= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
+//= type=test
+//= reason=IPv6 core stores peer MSS separately, defaults1220, caps transmit size independently of local link and retains receive MSS1460.
+//# A TCP implementation must also store the Maximum Segment Size (MSS) value received from
+//# its peer, which represents the EMTU_R, the largest packet that can be reassembled by the
+//# receiver, and must not send any segment larger than this MSS, regardless of the PMTU.
+
+//= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
+//= type=test
+//= reason=IPv6 core stores peer MSS separately, defaults1220, caps transmit size independently of local link and retains receive MSS1460.
+//# The value sent in the TCP MSS option is independent of the PMTU; it is determined by the
+//# receiver reassembly limit EMTU_R. This MSS option value is used by the other end of the
+//# connection, which may be using an unrelated PMTU value. See Section 5, "Packet Size
+//# Issues", and Section 8.3, "Maximum Upper-Layer Payload Size", of [RFC8200] for
+//# information on selecting a value for the TCP MSS option.
+
 fn pmtud_missing_peer_mss_and_small_allocation_remain_independent() {
     for ipv4 in [true, false] {
         let tuple = if ipv4 {
@@ -506,6 +708,21 @@ fn pmtud_missing_peer_mss_and_small_allocation_remain_independent() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc4821#section-6.2
+//= type=test
+//= reason=TCP probes use real queued stream bytes, respecting record boundary and allocation; no synthetic padding or control-only TCP size probe.
+//# These techniques do not work for TCP, because there is not a separate length field or
+//# other mechanism to differentiate between padding and real payload data. With TCP the
+//# only approach is to send additional payload data in an over-sized segment. There are at
+//# least two variants of this approach, discussed in Section 10.1.
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-10.1
+//= type=test
+//= reason=TCP probes use real queued stream bytes, respecting record boundary and allocation; no synthetic padding or control-only TCP size probe.
+//# TCP has no mechanism to distinguish in-band data from padding. Therefore, TCP must
+//# generate probes by appropriately segmenting data. There are two approaches to
+//# segmentation: overlapping and non- overlapping.
+
 fn pmtud_eor_and_allocation_free_probe_feedback_retry() {
     let (mut a, _) = family_pair(cfg(1500), true, 0);
     a.write_with_options(&[3; 100], false, true).unwrap();
@@ -531,6 +748,12 @@ fn pmtud_eor_and_allocation_free_probe_feedback_retry() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.1
+//= type=test
+//= reason=Every non-probe output checks final TCP header/options/data against path payload budget before commit; floor68 retry includes timestamps and SACK within budget.
+//# When transmitting non-probes, the Packetization Layer SHOULD create packets of a size
+//# less than or equal to eff_pmtu.
+
 fn pmtud_floor_clips_timestamp_and_sack_options_on_retry_and_ack() {
     let (mut a, mut b) = family_pair(cfg(1500), true, 0);
     a.write(&[1; 1448]).unwrap();
@@ -565,6 +788,12 @@ fn pmtud_floor_clips_timestamp_and_sack_options_on_retry_and_ack() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc4821#section-4
+//= type=test
+//= reason=PMTU decrease rescales cwnd by new/old MSS for Reno and CUBIC without changing allocation or existing pacing debt; tested with PRR enabled.
+//# Whenever the MTU is reduced (e.g., when processing ICMP PTB messages), the congestion
+//# state variable SHOULD be rescaled so as not to raise the window size in packets.
+
 fn pmtud_cubic_prr_and_rate_cap_keep_original_allocation_and_pacing_debt() {
     for algorithm in [CongestionAlgorithm::Reno, CongestionAlgorithm::Cubic] {
         let mut cfg = cfg(1500);
@@ -663,6 +892,17 @@ fn pmtud_timebase_and_impossible_header_budget_are_bounded() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.2
+//= type=test
+//= reason=Initial/search bound intersects supplied interface, peer, administrative and allocation limits. Administrative ceilings survive validated growth without changing receive MSS.
+//# The initial value for search_high SHOULD be the largest possible packet that might be
+//# supported by the flow. This may be limited by the local interface MTU, by an explicit
+//# protocol mechanism such as the TCP MSS option, or by an intrinsic limit such as the size
+//# of a protocol length field. In addition, the initial value for search_high MAY be
+//# limited by a configuration option to prevent probing above some maximum size.
+//# Search_high is likely to be the same as the initial Path MTU as computed by the
+//# classical Path MTU Discovery algorithm.
+
 fn pmtud_lower_mss_persists_administrative_ceiling_across_validated_growth() {
     for ceiling in [468u16, 1000] {
         let mut config = cfg(1500);

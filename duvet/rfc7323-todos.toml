@@ -19,7 +19,7 @@ MSL seconds.
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.7"
-reason = "Embedding/behavior gap: core exposes lower_mss/send_ip_payload_limit but no autonomous PMTU discovery; tun example sets DF yet explicitly omits ICMP and cannot discover MTU. Closure: provide bounded ICMP PTB or PLPMTUD integration (IPv4/IPv6), propagate reductions to effective send MSS with options, and assert black-hole/PMTU-change behavior. Merely setting DF/static payload cap is not Path MTU Discovery; TCP/IP layering is not a blanket exception."
+reason = "PMTU evidence refreshed against 1abc819: enabled core now has IPv4/IPv6 validated PTB, timestamp/options-aware budgets, real-data PLPMTUD and R1 fallback; native IPv4 socket ingress is tested. Retain the universal PAWS/DF embedding obligation: timestamps/PAWS can be enabled while ConnectionConfig.pmtud is None, static-DF embedding profiles still exist, and native IPv6 socket integration is absent. The enabled-profile tests do not prove every PAWS/DF embedding supplies PMTUD. This is no longer a claim that core discovery is missing; RFC1191/8201/4821 inventories separately track exact remaining clauses."
 quote = '''
 Setting the DF bit implies the use of Path MTU Discovery as described
 in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation

@@ -131,6 +131,25 @@ pub trait PacketIo {
     // May block: Linux's synchronous rtnetlink send can wait for kernel locks
     // before the response poll. Call outside latency-sensitive packet service.
     // Linux queries use the caller's current network namespace.
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-3
+    //= reason=PacketIo reports IP MTU separately from layer-unit buffer capacity. Executable backend fixture distinguishes9000 IP MTU from3514 Ethernet/3500 IP capacity; no physical-link enforcement claim.
+    //# MTU: Maximum Transmission Unit, the size in bytes of the largest IP packet,
+    //# including the IP header and payload, that can be transmitted on a link or path. Note
+    //# that this could more properly be called the IP MTU, to be consistent with how other
+    //# standards organizations use the acronym MTU.
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-3
+    //= reason=PacketIo reports IP MTU separately from layer-unit buffer capacity. Executable backend fixture distinguishes9000 IP MTU from3514 Ethernet/3500 IP capacity; no physical-link enforcement claim.
+    //# Link MTU: The Maximum Transmission Unit, i.e., maximum IP packet size in bytes, that
+    //# can be conveyed in one piece over a link. Be aware that this definition is different
+    //# from the definition used by other standards organizations.
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-3
+    //= reason=PacketIo reports IP MTU separately from layer-unit buffer capacity. Executable backend fixture distinguishes9000 IP MTU from3514 Ethernet/3500 IP capacity; no physical-link enforcement claim.
+    //# For IETF documents, link MTU is uniformly defined as the IP MTU over the link. This
+    //# includes the IP header, but excludes link layer headers and other framing that is
+    //# not part of IP or the IP payload.
+
     fn local_ip_mtu(&self) -> io::Result<Option<u32>> {
         Ok(None)
     }

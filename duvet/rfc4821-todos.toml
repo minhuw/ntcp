@@ -1,0 +1,785 @@
+# Open full-span implementation/test gaps and true actor/alternative exceptions.
+
+# 4821-005
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-1"
+reason = "BCP14 vocabulary declaration is a specification-reader obligation, not packet processing; operative requirements are separately inventoried."
+quote = '''
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC2119].
+'''
+
+# 4821-010
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
+reason = "The detailed search/loss/verification implementation is audited below. Full overview also requires isolated-loss congestion suppression, implicit-probe advancement, or shared IP path state not fully implemented; no blanket algorithm conformance claim."
+quote = '''
+The general strategy is for the Packetization Layer to find an appropriate Path MTU by probing the path with progressively larger packets. If a probe packet is successfully delivered, then the effective Path MTU is raised to the probe size.
+'''
+
+# 4821-011
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
+reason = "The detailed search/loss/verification implementation is audited below. Full overview also requires isolated-loss congestion suppression, implicit-probe advancement, or shared IP path state not fully implemented; no blanket algorithm conformance claim."
+quote = '''
+The isolated loss of a probe packet (with or without an ICMP Packet Too Big message) is treated as an indication of an MTU limit, and not as a congestion indicator. In this case alone, the Packetization Protocol is permitted to retransmit any missing data without adjusting the congestion window.
+'''
+
+# 4821-012
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
+reason = "The detailed search/loss/verification implementation is audited below. Full overview also requires isolated-loss congestion suppression, implicit-probe advancement, or shared IP path state not fully implemented; no blanket algorithm conformance claim."
+quote = '''
+If there is a timeout or additional packets are lost during the probing process, the probe is considered to be inconclusive (e.g., the lost probe does not necessarily indicate that the probe exceeded the Path MTU). Furthermore, the losses are treated like any other congestion indication: window or rate adjustments are mandatory per the relevant congestion control standards [RFC2914]. Probing can resume after a delay that is determined by the nature of the detected failure.
+'''
+
+# 4821-013
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
+reason = "The detailed search/loss/verification implementation is audited below. Full overview also requires isolated-loss congestion suppression, implicit-probe advancement, or shared IP path state not fully implemented; no blanket algorithm conformance claim."
+quote = '''
+PLPMTUD uses a searching technique to find the Path MTU. Each conclusive probe narrows the MTU search range, either by raising the lower limit on a successful probe or lowering the upper limit on a failed probe, converging toward the true Path MTU. For most transport layers, the search should be stopped once the range is narrow enough that the benefit of a larger effective Path MTU is smaller than the search overhead of finding it.
+'''
+
+# 4821-014
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
+reason = "The detailed search/loss/verification implementation is audited below. Full overview also requires isolated-loss congestion suppression, implicit-probe advancement, or shared IP path state not fully implemented; no blanket algorithm conformance claim."
+quote = '''
+The most likely (and least serious) probe failure is due to the link experiencing congestion-related losses while probing. In this case, it is appropriate to retry a probe of the same size as soon as the Packetization Layer has fully adapted to the congestion and recovered from the losses. In other cases, additional losses or timeouts indicate problems with the link or Packetization Layer. In these situations, it is desirable to use longer delays depending on the severity of the error.
+'''
+
+# 4821-015
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
+reason = "The detailed search/loss/verification implementation is audited below. Full overview also requires isolated-loss congestion suppression, implicit-probe advancement, or shared IP path state not fully implemented; no blanket algorithm conformance claim."
+quote = '''
+An optional verification process can be used to detect situations where raising the MTU raises the packet loss rate. For example, if a link is striped across multiple physical channels with inconsistent MTUs, it is possible that a probe will be delivered even if it is too large for some of the physical channels. In such cases, raising the Path MTU to the probe size can cause severe packet loss and abysmal performance. After raising the MTU, the new MTU size can be verified by monitoring the loss rate.
+'''
+
+# 4821-016
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
+reason = "The detailed search/loss/verification implementation is audited below. Full overview also requires isolated-loss congestion suppression, implicit-probe advancement, or shared IP path state not fully implemented; no blanket algorithm conformance claim."
+quote = '''
+Packetization Layer PMTUD (PLPMTUD) introduces some flexibility in the implementation of classical Path MTU Discovery. It can be configured to perform just ICMP black hole recovery to increase the robustness of classical Path MTU Discovery, or at the other extreme, all ICMP processing can be disabled and PLPMTUD can completely replace classical Path MTU Discovery.
+'''
+
+# 4821-017
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
+reason = "The detailed search/loss/verification implementation is audited below. Full overview also requires isolated-loss congestion suppression, implicit-probe advancement, or shared IP path state not fully implemented; no blanket algorithm conformance claim."
+quote = '''
+Classical Path MTU Discovery is subject to protocol failures (connection hangs) if ICMP Packet Too Big (PTB) messages are not delivered or processed for some reason [RFC2923]. With PLPMTUD, classical Path MTU Discovery can be modified to include additional consistency checks without increasing the risk of connection hangs due to spurious failures of the additional checks. Such changes to classical Path MTU Discovery are beyond the scope of this document.
+'''
+
+# 4821-018
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
+reason = "The detailed search/loss/verification implementation is audited below. Full overview also requires isolated-loss congestion suppression, implicit-probe advancement, or shared IP path state not fully implemented; no blanket algorithm conformance claim."
+quote = '''
+In the limiting case, all ICMP PTB messages might be unconditionally ignored, and PLPMTUD can be used as the sole method to discover the Path MTU. In this configuration, PLPMTUD parallels congestion control. An end-to-end transport protocol adjusts properties of the data stream (window size or packet size) while using packet losses to deduce the appropriateness of the adjustments. This technique seems to be more philosophically consistent with the end-to-end principle of the Internet than relying on ICMP messages containing transcribed headers of multiple protocol layers.
+'''
+
+# 4821-019
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
+reason = "The detailed search/loss/verification implementation is audited below. Full overview also requires isolated-loss congestion suppression, implicit-probe advancement, or shared IP path state not fully implemented; no blanket algorithm conformance claim."
+quote = '''
+Most of the difficulty in implementing PLPMTUD arises because it needs to be implemented in several different places within a single node. In general, each Packetization Protocol needs to have its own implementation of PLPMTUD. Furthermore, the natural mechanism to share Path MTU information between concurrent or subsequent connections is a path information cache in the IP layer. The various Packetization Protocols need to have the means to access and update the shared cache in the IP layer. This memo describes PLPMTUD in terms of its primary subsystems without fully describing how they are assembled into a complete implementation.
+'''
+
+# 4821-060
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
+reason = "Physical/link enforcement actor beyond the TCP endpoint. Backend capacity rejection is not proof that every network link enforces its advertised IP MTU."
+quote = '''
+All links MUST enforce their MTU: links that might non- deterministically deliver packets that are larger than their rated MTU MUST consistently discard such packets.
+'''
+
+# 4821-062
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
+reason = "Pmtud and Connection implement bounded probing, but normal congestion reduction is never suppressed even after proven isolated probe loss. Shared IP cache/per-route configuration and full congestion-rescale boundary proofs are incomplete."
+quote = '''
+All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
+'''
+
+# 4821-064
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
+reason = "Pmtud and Connection implement bounded probing, but normal congestion reduction is never suppressed even after proven isolated probe loss. Shared IP cache/per-route configuration and full congestion-rescale boundary proofs are incomplete."
+quote = '''
+To use PLPMTUD, a Packetization Layer MUST have a loss reporting mechanism that provides the sender with timely and accurate indications of which packets were lost in the network.
+'''
+
+# 4821-065
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
+reason = "Pmtud and Connection implement bounded probing, but normal congestion reduction is never suppressed even after proven isolated probe loss. Shared IP cache/per-route configuration and full congestion-rescale boundary proofs are incomplete."
+quote = '''
+Normal congestion control algorithms MUST remain in effect under all conditions except when only an isolated probe packet is detected as lost. In this case alone, the normal congestion (window or data rate) reduction SHOULD be suppressed. If any other data loss is detected, standard congestion control MUST take place.
+'''
+
+# 4821-066
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
+reason = "No congestion reduction is suppressed by current Connection loss processing, so the conditional suppression rate limit is never exercised. pmtu_cooldown computes max(RTO,(cwnd/MSS+1)*SRTT), but no test establishes suppression followed by that minimum headway; keep the full-span evidence gap rather than claim implementation of the absent branch."
+quote = '''
+Suppressed congestion control MUST be rate limited such that it occurs less frequently than the worst-case loss rate for TCP congestion control at a comparable data rate over the same path (i.e., less than the "TCP-friendly" loss rate [tcp-friendly]). This SHOULD be enforced by requiring a minimum headway between a suppressed congestion adjustment (due to a failed probe) and the next attempted probe, which is equal to one round-trip time for each packet permitted by the congestion window. This is discussed further in Section 7.6.2.
+'''
+
+# 4821-067
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
+reason = "Congestion::set_mss preserves byte cwnd on most increases but finally clamps cwnd>=new MSS and ssthresh>=2*new MSS. A small byte window can therefore rise with MTU; no exact all-state rescaling test proves the MUST. Probe ACK growth must also be distinguished from MTU-only adjustment."
+quote = '''
+Whenever the MTU is raised, the congestion state variables MUST be rescaled so as not to raise the window size in bytes (or data rate in bytes per seconds).
+'''
+
+# 4821-069
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
+reason = "Pmtud and Connection implement bounded probing, but normal congestion reduction is never suppressed even after proven isolated probe loss. Shared IP cache/per-route configuration and full congestion-rescale boundary proofs are incomplete."
+quote = '''
+If PLPMTUD updates the MTU for a particular path, all Packetization Layer sessions that share the path representation (as described in Section 5.2) SHOULD be notified to make use of the new MTU and make the required congestion control adjustments.
+'''
+
+# 4821-070
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
+reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
+quote = '''
+All implementations MUST include mechanisms for applications to selectively transmit packets larger than the current effective Path MTU, but smaller than the first-hop link MTU. This is necessary to implement PLPMTUD using a connectionless protocol within an application and to implement diagnostic tools that do not rely on the operating system's implementation of Path MTU Discovery. See Section 9 for further discussion.
+'''
+
+# 4821-071
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
+reason = "Pmtud and Connection implement bounded probing, but normal congestion reduction is never suppressed even after proven isolated probe loss. Shared IP cache/per-route configuration and full congestion-rescale boundary proofs are incomplete."
+quote = '''
+Implementations MAY use different heuristics to select the initial effective Path MTU for each protocol. Connectionless protocols and protocols that do not support PLPMTUD SHOULD have their own default value for the initial effective Path MTU, which can be set to a more conservative (smaller) value than the initial value used by TCP and other protocols that are well suited to PLPMTUD. There SHOULD be per-protocol and per-route limits on the initial effective Path MTU (eff_pmtu) and the upper searching limit (search_high). See Section 7.2 for further discussion.
+'''
+
+# 4821-074
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.1"
+reason = "Core accounts IP/TCP/options for supported headers, but this complete span lacks exhaustive probe/non-probe/control/repaired header tests for all supported combinations; IPv6 extension headers are unsupported."
+quote = '''
+The way in which PLPMTUD operates across multiple layers requires a mechanism for accounting header sizes at all layers between IP and the Packetization Layer (inclusive). When transmitting non-probe packets, it is sufficient for the Packetization Layer to ensure an upper bound on final IP packet size, so as not to exceed the current
+'''
+
+# 4821-075
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.1"
+reason = "Core accounts IP/TCP/options for supported headers, but this complete span lacks exhaustive probe/non-probe/control/repaired header tests for all supported combinations; IPv6 extension headers are unsupported."
+quote = '''
+effective Path MTU. All Packetization Layers participating in classical Path MTU Discovery have this requirement already. When conducting a probe, the Packetization Layer MUST determine the probe packet's final size including IP headers. This requirement is specific to PLPMTUD, and satisfying it may require additional inter- layer communication in existing implementations.
+'''
+
+# 4821-076
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
+reason = "PMTU state is per Connection; no shared IP cache, destination-minimum aggregation or route-policy limits. Connection identity avoids unsafe subnet sharing, but is not proof of the complete cache recommendation."
+quote = '''
+This memo uses the concept of a "flow" to define the scope of the Path MTU Discovery algorithms. For many implementations, a flow would naturally correspond to an instance of each protocol (i.e., each connection or session). In such implementations, the algorithms described in this document are performed within each session for each protocol. The observed PMTU (eff_pmtu in Section 7.1) MAY be shared between different flows with a common path representation.
+'''
+
+# 4821-077
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
+reason = "Optional shared/destination/source-route/IPv6-flow-label cache representation is not selected. Per-connection tuple state is used; IP shared-cache SHOULD is independently TODO."
+quote = '''
+Alternatively, PLPMTUD could be implemented such that its complete state is associated with the path representations. Such an implementation could use multiple connections or sessions for each probe sequence. This approach is likely to converge much more quickly in some environments, such as where an application uses many small connections, each of which is too short to complete the Path MTU Discovery process.
+'''
+
+# 4821-078
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
+reason = "PMTU state is per Connection; no shared IP cache, destination-minimum aggregation or route-policy limits. Connection identity avoids unsafe subnet sharing, but is not proof of the complete cache recommendation."
+quote = '''
+Within a single implementation, different protocols can use either of these two approaches. Due to protocol specific differences in constraints on generating probes (Section 6.2) and the MTU searching algorithm (Section 7.3), it may not be feasible for different Packetization Layer protocols to share PLPMTUD state. This suggests that it may be possible for some protocols to share probing state, but other protocols can only share observed PMTU. In this case, the different protocols will have different PMTU convergence properties.
+'''
+
+# 4821-079
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
+reason = "PMTU state is per Connection; no shared IP cache, destination-minimum aggregation or route-policy limits. Connection identity avoids unsafe subnet sharing, but is not proof of the complete cache recommendation."
+quote = '''
+The IP layer SHOULD be used to store the cached PMTU value and other shared state such as MTU values reported by ICMP PTB messages. Ideally, this shared state should be associated with a specific path traversed by packets exchanged between the source and destination nodes. However, in most cases a node will not have enough information to completely and accurately identify such a path. Rather, a node must associate a PMTU value with some local representation of a path. It is left to the implementation to select the local representation of a path.
+'''
+
+# 4821-080
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
+reason = "Optional shared/destination/source-route/IPv6-flow-label cache representation is not selected. Per-connection tuple state is used; IP shared-cache SHOULD is independently TODO."
+quote = '''
+An implementation MAY use the destination address as the local representation of a path. The PMTU value associated with a destination would be the minimum PMTU learned across the set of all paths in use to that destination. The set of paths in use to a
+'''
+
+# 4821-081
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
+reason = "Optional shared/destination/source-route/IPv6-flow-label cache representation is not selected. Per-connection tuple state is used; IP shared-cache SHOULD is independently TODO."
+quote = '''
+particular destination is expected to be small, in many cases consisting of a single path. This approach will result in the use of optimally sized packets on a per-destination basis, and integrates nicely with the conceptual model of a host as described in [RFC2461]: a PMTU value could be stored with the corresponding entry in the destination cache. Since Network Address Translators (NATs) and other forms of middle boxes may exhibit differing PMTUs simultaneously at a single IP address, the minimum value SHOULD be stored.
+'''
+
+# 4821-082
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
+reason = "PMTU state is per Connection; no shared IP cache, destination-minimum aggregation or route-policy limits. Connection identity avoids unsafe subnet sharing, but is not proof of the complete cache recommendation."
+quote = '''
+Network or subnet numbers MUST NOT be used as representations of a path, because there is not a general mechanism to determine the network mask at the remote host.
+'''
+
+# 4821-083
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
+reason = "Optional shared/destination/source-route/IPv6-flow-label cache representation is not selected. Per-connection tuple state is used; IP shared-cache SHOULD is independently TODO."
+quote = '''
+For source-routed packets (i.e., packets containing an IPv6 routing header, or IPv4 Loose Source and Record Route (LSRR) or Strict Source and Record Route (SSRR) options), the source route MAY further qualify the local representation of a path. An implementation MAY use source route information in the local representation of a path.
+'''
+
+# 4821-084
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.2"
+reason = "Optional shared/destination/source-route/IPv6-flow-label cache representation is not selected. Per-connection tuple state is used; IP shared-cache SHOULD is independently TODO."
+quote = '''
+If IPv6 flows are in use, an implementation MAY use the 3-tuple of the Flow label and the source and destination addresses [RFC2460][RFC3697] as the local representation of a path. Such an approach could theoretically result in the use of optimally sized packets on a per-flow basis, providing finer granularity than MTU values maintained on a per-destination basis.
+'''
+
+# 4821-085
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.3"
+reason = "IPsec security-association/header accounting is outside this stack; no IPsec transform is implemented. Caller-supplied interface MTU is not proof of tunnel/IPsec overhead support."
+quote = '''
+This document does not take a stance on the placement of IP Security (IPsec) [RFC2401], which logically sits between IP and the Packetization Layer. A PLPMTUD implementation can treat IPsec either as part of IP or as part of the Packetization Layer, as long as the accounting is consistent within the implementation. If IPsec is treated as part of the IP layer, then each security association to a remote node may need to be treated as a separate path. If IPsec is treated as part of the Packetization Layer, the IPsec header size MUST be included in the Packetization Layer's header size calculations.
+'''
+
+# 4821-086
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.4"
+reason = "Multicast packetization/aggregation actor is outside unicast TCP; no multicast PLPMTUD implementation is claimed."
+quote = '''
+In the case of a multicast destination address, copies of a packet may traverse many different paths to reach many different nodes. The local representation of the "path" to a multicast destination must in fact represent a potentially large set of paths.
+'''
+
+# 4821-087
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.4"
+reason = "Multicast packetization/aggregation actor is outside unicast TCP; no multicast PLPMTUD implementation is claimed."
+quote = '''
+Minimally, an implementation MAY maintain a single MTU value to be used for all multicast packets originated from the node. This MTU SHOULD be sufficiently small that it is expected to be less than the Path MTU of all paths comprising the multicast tree. If a Path MTU of less than the configured multicast MTU is learned via unicast means, the multicast MTU MAY be reduced to this value. This approach is likely to result in the use of smaller packets than is necessary for many paths.
+'''
+
+# 4821-088
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-5.4"
+reason = "Multicast packetization/aggregation actor is outside unicast TCP; no multicast PLPMTUD implementation is claimed."
+quote = '''
+If the application using multicast gets complete delivery reports (unlikely since this requirement has poor scaling properties), PLPMTUD MAY be implemented in multicast protocols such that the smallest path MTU learned across a group becomes the effective MTU for that group.
+'''
+
+# 4821-090
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-6.1"
+reason = "Fast retransmit/SACK/RACK detect losses; exact whole-span reordered-leading/trailing-window matrix is not established. Isolated-loss suppression remains deliberately unimplemented."
+quote = '''
+It is important that the Packetization Layer has a timely and robust mechanism for detecting and reporting losses. PLPMTUD makes MTU adjustments on the basis of detected losses. Any delays or inaccuracy in loss notification is likely to result in incorrect MTU decisions or slow convergence. It is important that the mechanism can robustly distinguish between the isolated loss of just a probe and other losses in the probe's leading and trailing windows.
+'''
+
+# 4821-091
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-6.1"
+reason = "Fast retransmit/SACK/RACK detect losses; exact whole-span reordered-leading/trailing-window matrix is not established. Isolated-loss suppression remains deliberately unimplemented."
+quote = '''
+It is best if Packetization Protocols use an explicit loss detection mechanism such as a Selective Acknowledgment (SACK) scoreboard [RFC3517] or ACK Vector [RFC4340] to distinguish real losses from reordered data, although implicit mechanisms such as TCP Reno style duplicate acknowledgments counting are sufficient.
+'''
+
+# 4821-092
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-6.1"
+reason = "Fast retransmit/SACK/RACK detect losses; exact whole-span reordered-leading/trailing-window matrix is not established. Isolated-loss suppression remains deliberately unimplemented."
+quote = '''
+PLPMTUD can also be implemented in protocols that rely on timeouts as their primary mechanism for loss recovery; however, timeouts SHOULD NOT be used as the primary mechanism for loss indication unless there are no other alternatives.
+'''
+
+# 4821-095
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-6.2"
+reason = "Non-TCP padding/control/adjunct-protocol alternatives are not selected. TCP has only real-data probes; its segmentation obligations remain audited."
+quote = '''
+Some protocols might be extended to allow arbitrary padding with dummy data. This greatly simplifies the implementation because the probing can be performed without participation from higher layers and if the probe fails, the missing data (the "probe gap") is ensured to fit within the current MTU when it is retransmitted. This is probably the most appropriate method for protocols that support arbitrary length options or multiplexing within the protocol itself.
+'''
+
+# 4821-096
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-6.2"
+reason = "Non-TCP padding/control/adjunct-protocol alternatives are not selected. TCP has only real-data probes; its segmentation obligations remain audited."
+quote = '''
+Many Packetization Layer protocols can carry pure control messages (without any data from higher protocol layers), which can be padded to arbitrary lengths. For example, the SCTP PAD chunk can be used in this manner (see Section 10.2). This approach has the advantage that nothing needs to be retransmitted if the probe is lost.
+'''
+
+# 4821-098
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-6.2"
+reason = "Non-TCP padding/control/adjunct-protocol alternatives are not selected. TCP has only real-data probes; its segmentation obligations remain audited."
+quote = '''
+In a few cases, there may be no reasonable mechanisms to generate probes within the Packetization Layer protocol itself. As a last resort, it may be possible to rely on an adjunct protocol, such as ICMP ECHO ("ping"), to send probe packets. See Section 10.3 for further discussion of this approach.
+'''
+
+# 4821-101
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.1"
+reason = "Pmtud::ack records max_acked for implicit packets but does not raise search_low on ordinary non-probe ACKs. Explicit probes have success/failure state; full implicit-probe SHOULD is unmet."
+quote = '''
+search_low: The smallest useful probe size, minus one. The network is expected to be able to deliver packets of size search_low.
+'''
+
+# 4821-102
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.1"
+reason = "Pmtud::ack records max_acked for implicit packets but does not raise search_low on ordinary non-probe ACKs. Explicit probes have success/failure state; full implicit-probe SHOULD is unmet."
+quote = '''
+search_high: The greatest useful probe size. Packets of size search_high are expected to be too large for the network to deliver.
+'''
+
+# 4821-103
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.1"
+reason = "Pmtud::ack records max_acked for implicit packets but does not raise search_low on ordinary non-probe ACKs. Explicit probes have success/failure state; full implicit-probe SHOULD is unmet."
+quote = '''
+eff_pmtu: The effective PMTU for this flow. This is the largest non-probe packet permitted by PLPMTUD for the path.
+'''
+
+# 4821-109
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.1"
+reason = "Pmtud::ack records max_acked for implicit packets but does not raise search_low on ordinary non-probe ACKs. Explicit probes have success/failure state; full implicit-probe SHOULD is unmet."
+quote = '''
+When probing upward, eff_pmtu always equals search_low. In other states, such as initial conditions, after ICMP PTB message processing or following PLPMTUD on another flow sharing the same path representation, eff_pmtu may be different from search_low. Normally, eff_pmtu will be greater than or equal to search_low and less than search_high. It is generally expected but not required that probe size will be greater than eff_pmtu.
+'''
+
+# 4821-110
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.1"
+reason = "Pmtud::ack records max_acked for implicit packets but does not raise search_low on ordinary non-probe ACKs. Explicit probes have success/failure state; full implicit-probe SHOULD is unmet."
+quote = '''
+For initial conditions when there is no information about the path, eff_pmtu may be greater than search_low. The initial value of search_low SHOULD be conservatively low, but performance may be better if eff_pmtu starts at a higher, less conservative, value. See Section 7.2.
+'''
+
+# 4821-111
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.1"
+reason = "Pmtud::ack updates max_acked for an unambiguous ordinary packet but never raises search_low from it. Only an explicit Probe changes search_low. The implicit-probe SHOULD is unmet; normal losses are not treated as explicit probe failures."
+quote = '''
+If eff_pmtu is larger than search_low, it is explicitly permitted to send non-probe packets larger than search_low. When such a packet is acknowledged, it is effectively an "implicit probe" and search_low SHOULD be raised to the size of the acknowledged packet. However, if an "implicit probe" is lost, it MUST NOT be treated as a probe failure as a true probe would be. If eff_pmtu is too large, this condition will only be detected with ICMP PTB messages or black hole discovery (see Section 7.7).
+'''
+
+# 4821-113
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
+reason = "Pmtud::new hard-codes initial low=min(bound,1024) for IPv4 and min(bound,1280) for IPv6. PmtudConfig exposes only first_hop_mtu, so the initial search_low configurability SHOULD is unmet."
+quote = '''
+It is RECOMMENDED that search_low be initially set to an MTU size that is likely to work over a very wide range of environments. Given today's technologies, a value of 1024 bytes is probably safe enough. The initial value for search_low SHOULD be configurable.
+'''
+
+# 4821-115
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
+reason = "Initial low is hard-coded min(bound,1024) for IPv4 or min(bound,1280) for IPv6; eff/high start at bound. PmtudConfig has no independent initial-low/eff/high or per-route policy override."
+quote = '''
+A conservative configuration would be to set eff_pmtu to search_high, and rely on ICMP PTB messages to set the eff_pmtu down as appropriate. In this configuration, classical PMTUD is fully functional and PLPMTUD is only invoked to recover from ICMP black holes through the procedure described in Section 7.7.
+'''
+
+# 4821-116
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
+reason = "Optional initial-value/search heuristics for other environments/protocols are not selected; interface-bound initial eff and binary explicit-probe search are used. Configuration SHOULD remains TODO."
+quote = '''
+In some cases, where it is known that classical PMTUD is likely to fail (for example, if ICMP PTB messages are administratively disabled for security reasons), using a small initial eff_pmtu will avoid the costly timeouts required for black hole detection. The trade-off is that using a smaller than necessary initial eff_pmtu might cause reduced performance.
+'''
+
+# 4821-117
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
+reason = "Initial low is hard-coded min(bound,1024) for IPv4 or min(bound,1280) for IPv6; eff/high start at bound. PmtudConfig has no independent initial-low/eff/high or per-route policy override."
+quote = '''
+Note that the initial eff_pmtu can be any value in the range search_low to search_high. An initial eff_pmtu of 1400 bytes might be a good compromise because it would be safe for nearly all tunnels over all common networking gear, and yet close to the optimal MTU for the majority of paths in the Internet today. This might be improved by using some statistics of other recent flows: for example, the initial eff_pmtu for a flow might be set to the median of the probe size for all recent successful probes.
+'''
+
+# 4821-118
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
+reason = "Optional initial-value/search heuristics for other environments/protocols are not selected; interface-bound initial eff and binary explicit-probe search are used. Configuration SHOULD remains TODO."
+quote = '''
+Since the cost of PLPMTUD is dominated by the protocol specific overheads of generating and processing probes, it is probably desirable for each protocol to have its own heuristics to select the initial eff_pmtu. It is especially important that connectionless protocols and other protocols that may not receive clear indications of ICMP black holes use conservative (smaller) initial values for eff_pmtu, as described in Section 10.3.
+'''
+
+# 4821-119
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
+reason = "PmtudConfig exposes first_hop_mtu only. No independent initial eff_pmtu/search_low/search_high overrides or per-route policy configuration exist; receive MSS and scratch limits are not equivalents."
+quote = '''
+There SHOULD be per-protocol and per-route configuration options to override initial values for eff_pmtu and other PLPMTUD state variables.
+'''
+
+# 4821-120
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.3"
+reason = "Binary target and one-byte convergence with ten-minute reset exist; alternative search optimizations are not selected. Full initial-bound reset tests must distinguish convergence, link growth and PTB hold."
+quote = '''
+The probe may have a size anywhere in the "probe size range" described above. However, a number of factors affect the selection of an appropriate size. A simple strategy might be to do a binary search halving the probe size range with each probe. However, for some protocols, such as TCP, failed probes are more expensive than successful ones, since data in a failed probe will need to be retransmitted. For such protocols, a strategy that raises the probe size in smaller increments might have lower overhead. For many protocols, both at and above the Packetization Layer, the benefit of increasing MTU sizes may follow a step function such that it is not advantageous to probe within certain regions at all.
+'''
+
+# 4821-121
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.3"
+reason = "Optional initial-value/search heuristics for other environments/protocols are not selected; interface-bound initial eff and binary explicit-probe search are used. Configuration SHOULD remains TODO."
+quote = '''
+As an optimization, it may be appropriate to probe at certain common or expected MTU sizes, for example, 1500 bytes for standard Ethernet, or 1500 bytes minus header sizes for tunnel protocols.
+'''
+
+# 4821-122
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.3"
+reason = "Optional initial-value/search heuristics for other environments/protocols are not selected; interface-bound initial eff and binary explicit-probe search are used. Configuration SHOULD remains TODO."
+quote = '''
+Some protocols may use other mechanisms to choose the probe sizes. For example, protocols that have certain natural data block sizes might simply assemble messages from a number of blocks until the total size is smaller than search_high, and if possible larger than search_low.
+'''
+
+# 4821-124
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.4"
+reason = "Candidate gates no recovery/probe/loss, RTT, window and queued trailing data; full clause needs exact all-gates/no-state-change executable evidence, not only a source predicate."
+quote = '''
+Before sending a probe, the flow MUST meet at least the following conditions:
+'''
+
+# 4821-125
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.4"
+reason = "Candidate gates no recovery/probe/loss, RTT, window and queued trailing data; full clause needs exact all-gates/no-state-change executable evidence, not only a source predicate."
+quote = '''
+o It has no outstanding probes or losses.
+'''
+
+# 4821-126
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.4"
+reason = "Candidate gates no recovery/probe/loss, RTT, window and queued trailing data; full clause needs exact all-gates/no-state-change executable evidence, not only a source predicate."
+quote = '''
+o If the last probe failed or was inconclusive, then the probe timeout has expired (see Section 7.6.2).
+'''
+
+# 4821-130
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.4"
+reason = "Optional PLPMTUD-specific non-probe accumulation delay is not selected: ordinary data may transmit when probe queue preconditions fail. This does not waive existing TCP cork/pacing rules."
+quote = '''
+Protocols MAY delay sending non-probes in order to accumulate enough data to meet the pre-conditions for probing. The delayed sending algorithm SHOULD use some self-scaling technique to appropriately limit the time that the data is delayed. For example, the returning ACKs can be used to prevent the window from falling by more than the amount of data needed for the probe.
+'''
+
+# 4821-131
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.5"
+reason = "Probe records commit after successful encode and complete IP size is tested. Timeout classification remains conservative and congestion suppression is not implemented; no all-outcomes full-span pass."
+quote = '''
+Once a probe size in the appropriate range has been selected, and the above preconditions have been met, the Packetization Layer MAY conduct a probe. To do so, it creates a probe packet such that its size, including the outermost IP headers, is equal to the probe size. After sending the probe it awaits a response, which will have one of the following results:
+'''
+
+# 4821-132
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.5"
+reason = "Probe records commit after successful encode and complete IP size is tested. Timeout classification remains conservative and congestion suppression is not implemented; no all-outcomes full-span pass."
+quote = '''
+Success: The probe is acknowledged as having been received by the remote host.
+'''
+
+# 4821-133
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.5"
+reason = "Probe records commit after successful encode and complete IP size is tested. Timeout classification remains conservative and congestion suppression is not implemented; no all-outcomes full-span pass."
+quote = '''
+Failure: A protocol mechanism indicates that the probe was lost, but no packets in the leading or trailing window were lost.
+'''
+
+# 4821-134
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.5"
+reason = "Probe records commit after successful encode and complete IP size is tested. Timeout classification remains conservative and congestion suppression is not implemented; no all-outcomes full-span pass."
+quote = '''
+Timeout failure: A protocol mechanism indicates that the probe was lost, and no packets in the leading window were lost, but is unable to determine whether any packets in the trailing window were lost. For example, loss is detected by a timeout, and go-back-n retransmission is used.
+'''
+
+# 4821-135
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.5"
+reason = "Probe records commit after successful encode and complete IP size is tested. Timeout classification remains conservative and congestion suppression is not implemented; no all-outcomes full-span pass."
+quote = '''
+Inconclusive: The probe was lost in addition to other packets in the leading or trailing windows.
+'''
+
+# 4821-136
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6"
+reason = "All response types must be audited separately; isolated-loss suppression and implicit-probe behavior prevent a blanket response pass."
+quote = '''
+When a probe has completed, the result SHOULD be processed as follows, categorized by the probe's result type.
+'''
+
+# 4821-138
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.1"
+reason = "Explicit unambiguous probe ACK and two-RTO verification exist; full span needs size-below-eff and repeated-increase evidence."
+quote = '''
+Note that if a flow's packets are routed via multiple paths, or over a path with a non-deterministic MTU, delivery of a single probe packet does not indicate that all packets of that size will be delivered. To be robust in such a case, the Packetization Layer SHOULD conduct MTU verification as described in Section 7.8.
+'''
+
+# 4821-139
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2"
+reason = "Pmtud waits for trailing cumulative delivery and narrows bounds, but Connection already invokes congestion reduction on loss. Recommended isolated-probe suppression is not implemented; no exception disguises this SHOULD gap."
+quote = '''
+When only the probe is lost, it is treated as an indication that the Path MTU is smaller than the probe size. In this case alone, the loss SHOULD NOT be interpreted as congestion signal.
+'''
+
+# 4821-141
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2"
+reason = "Pmtud waits for trailing cumulative delivery and narrows bounds, but Connection already invokes congestion reduction on loss. Recommended isolated-probe suppression is not implemented; no exception disguises this SHOULD gap."
+quote = '''
+If an ICMP PTB message is received matching the probe packet, then search_high and eff_pmtu MAY be set from the MTU value indicated in the message. Note that the ICMP message may be received either before or after the protocol loss indication.
+'''
+
+# 4821-142
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2"
+reason = "Pmtud waits for trailing cumulative delivery and narrows bounds, but Connection already invokes congestion reduction on loss. Recommended isolated-probe suppression is not implemented; no exception disguises this SHOULD gap."
+quote = '''
+A probe failure event is the one situation under which the Packetization Layer SHOULD ignore loss as a congestion signal. Because there is some small risk that suppressing congestion control might have unanticipated consequences (even for one isolated loss), it is REQUIRED that probe failure events be less frequent than the normal period for losses under standard congestion control. Specifically, after a probe failure event and suppressed congestion control, PLPMTUD MUST NOT probe again until an interval that is larger than the expected interval between congestion control events. See Section 4 for details. The simplest estimate of the interval to the next congestion event is the same number of round trips as the current congestion window in packets.
+'''
+
+# 4821-143
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.3"
+reason = "Timeout retains congestion response and five-times delay. Full go-back-n-specific response is not established for every recovery configuration."
+quote = '''
+If the loss was detected with a timeout and repaired with go-back-n retransmission, then congestion window reduction will be necessary. The relatively high price of a failed probe in this case may merit a longer time interval until the next probe. A time interval that is five times the non-timeout failure case (Section 7.6.2) is RECOMMENDED.
+'''
+
+# 4821-144
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.4"
+reason = "Multiple observed losses preserve bounds; full same-size next-probe admission after actual recovery requires explicit test. Existing tests establish preservation but do not assert the next emitted probe size in all configurations."
+quote = '''
+The presence of other losses near the loss of the probe may indicate that the probe was lost due to congestion rather than due to an MTU limitation. In this case, the state variables eff_pmtu, search_low, and search_high SHOULD NOT be updated, and the same-sized probe SHOULD be attempted again as soon as the probing preconditions are met (i.e., once the packetization layer has no outstanding unrecovered losses). At this point, it is particularly appropriate to re-probe since the flow's congestion window will be at its lowest point, minimizing the probability of congestive losses.
+'''
+
+# 4821-146
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.7"
+reason = "R1=3 triggers fallback and successive halving; no-ICMP and ICMP-since-progress branches need exact tests, including initial eff==low and quoted-tail timeout. Family floors are intentionally retained."
+quote = '''
+If there is a full-stop timeout and there was not an ICMP message indicating a reason (PTB, Net unreachable, etc., or the ICMP message was ignored for some reason), the RECOMMENDED first recovery action is to treat this as a detected ICMP black hole as defined in [RFC2923].
+'''
+
+# 4821-147
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.7"
+reason = "R1=3 triggers fallback and successive halving; no-ICMP and ICMP-since-progress branches need exact tests, including initial eff==low and quoted-tail timeout. Family floors are intentionally retained."
+quote = '''
+The response to a detected black hole depends on the current values for search_low and eff_pmtu. If eff_pmtu is larger than search_low, set eff_pmtu to search_low. Otherwise, set both eff_pmtu and search_low to the initial value for search_low. Upon additional successive timeouts, search_low and eff_pmtu SHOULD be halved, with a lower bound of 68 bytes for IPv4 and 1280 bytes for IPv6. Even lower lower bounds MAY be permitted to support limited operation over links with MTUs that are smaller than permitted by the IP specifications.
+'''
+
+# 4821-153
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-8"
+reason = "TCP packetizes to path budget and IPv4 codec sets DF. Generic host fragmentation and protocols without PLPMTUD require a separate IP-stack implementation."
+quote = '''
+Packetization Layers SHOULD avoid sending messages that will require fragmentation [Kent87] [frag-errors]. However, entirely preventing fragmentation is not always possible. Some Packetization Layers, such as a UDP application outside the kernel, may be unable to change the size of messages it sends, resulting in datagram sizes that exceed the Path MTU.
+'''
+
+# 4821-154
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-8"
+reason = "TCP packetizes to path budget and IPv4 codec sets DF. Generic host fragmentation and protocols without PLPMTUD require a separate IP-stack implementation."
+quote = '''
+IPv4 permitted such applications to send packets without the DF bit set. Oversized packets without the DF bit set would be fragmented in the network or sending host when they encountered a link with an MTU smaller than the packet. In some case, packets could be fragmented more than once if there were cascaded links with progressively smaller MTUs. This approach is NOT RECOMMENDED.
+'''
+
+# 4821-155
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-8"
+reason = "Host IP fragmentation of application datagrams is outside TCP stream packetization; ntcp does not provide a UDP/raw datagram fragmentation service. DF and TCP budget requirements remain in scope."
+quote = '''
+It is RECOMMENDED that IPv4 implementations use a strategy that mimics IPv6 functionality. When an application sends datagrams that are larger than the effective Path MTU, they SHOULD be fragmented to the Path MTU in the host IP layer even if they are smaller than the MTU of the first link, directly attached to the host. The DF bit SHOULD be set on the fragments, so they will not be fragmented again in the network. This technique will minimize the likelihood that applications will rely on IPv4 fragmentation in a way that cannot be implemented in IPv6. At least one major operating system already uses this strategy. Section 9 describes some exceptions to this rule when the application is sending oversized packets for probing or diagnostic purposes.
+'''
+
+# 4821-156
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-8"
+reason = "TCP packetizes to path budget and IPv4 codec sets DF. Generic host fragmentation and protocols without PLPMTUD require a separate IP-stack implementation."
+quote = '''
+Since protocols that do not implement PLPMTUD are still subject to problems due to ICMP black holes, it may be desirable to limit to these protocols to "safe" MTUs likely to work on any path (e.g., 1280 bytes). Allow any protocol implementing PLPMTUD to operate over the full range supported by the lower layer.
+'''
+
+# 4821-157
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-8"
+reason = "TCP packetizes to path budget and IPv4 codec sets DF. Generic host fragmentation and protocols without PLPMTUD require a separate IP-stack implementation."
+quote = '''
+Note that IP fragmentation divides data into packets, so it is minimally a Packetization Layer. However, it does not have a mechanism to detect lost packets, so it cannot support a native implementation of PLPMTUD. Fragmentation-based PLPMTUD requires an adjunct protocol as described in Section 10.3.
+'''
+
+# 4821-158
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-9"
+reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
+quote = '''
+All implementations MUST include a mechanism where applications using connectionless protocols can send their own probes. This is necessary to implement PLPMTUD in an application protocol as described in Section 10.4 or to implement diagnostic tools for debugging problems with PMTUD. There MUST be a mechanism that permits an application to send datagrams that are larger than eff_pmtu, the operating systems estimate of the Path MTU, without being fragmented. If these are IPv4 packets, they MUST have the DF bit set.
+'''
+
+# 4821-159
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-9"
+reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
+quote = '''
+At this time, most operating systems support two modes for sending datagrams: one that silently fragments packets that are too large, and another that rejects packets that are too large. Neither of these modes is suitable for implementing PLPMTUD in an application or diagnosing problems with Path MTU Discovery. A third mode is REQUIRED where the datagram is sent even if it is larger than the current estimate of the Path MTU.
+'''
+
+# 4821-160
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-9"
+reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
+quote = '''
+Implementing PLPMTUD in an application also requires a mechanism where the application can inform the operating system about the outcome of the probe as described in Section 7.6, or directly update search_low, search_high, and eff_pmtu, described in Section 7.1.
+'''
+
+# 4821-162
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-10"
+reason = "Section6 obligations remain separately audited; this cross-reference is not a blanket conformance pass."
+quote = '''
+All Packetization Layer protocols must consider all of the issues discussed in Section 6. For many protocols, it is straightforward to address these issues. This section discusses specific details for implementing PLPMTUD with a couple of protocols. It is hoped that the descriptions here will be sufficient illustration for implementers to adapt to additional protocols.
+'''
+
+# 4821-170
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.1"
+reason = "Overlapping TCP probe method is not selected. Non-overlapping segmentation avoids deliberate duplicate probe data; its bounded repair requirements remain in scope."
+quote = '''
+An alternate approach is to send subsequent data overlapping the probe such that the probe gap is equal in length to the current MSS. In the case of a successful probe, this has added overhead in that it will send some data twice, but it will have to retransmit only one segment after a lost probe. When a probe succeeds, there will likely be some duplicate acknowledgments generated due to the duplicate data sent. It is important that these duplicate acknowledgments not trigger Fast Retransmit. As such, an implementation using this approach SHOULD limit the probe size to three times the current MSS (causing at most 2 duplicate acknowledgments), or appropriately adjust its duplicate acknowledgment threshold for data immediately after a successful probe.
+'''
+
+# 4821-177
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.1"
+reason = "TCP selects non-overlapping real-data probes with bounded gap repairs. Whole chosen segmentation needs actual receiver-produced ACK/retry evidence."
+quote = '''
+The choice of which segmentation method to use should be based on what is simplest and most efficient for a given TCP implementation.
+'''
+
+# 4821-178
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.2"
+reason = "SCTP TSN/chunk/heartbeat/PAD/multipath actor is outside this TCP implementation."
+quote = '''
+In the Stream Control Transmission Protocol (SCTP) [RFC2960], the application writes messages to SCTP, which divides the data into smaller "chunks" suitable for transmission through the network. Each chunk is assigned a Transmission Sequence Number (TSN). Once a TSN has been transmitted, SCTP cannot change the chunk size. SCTP multi- path support normally requires SCTP to choose a chunk size such that its messages to fit the smallest PMTU of all paths. Although not required, implementations may bundle multiple data chunks together to make larger IP packets to send on paths with a larger PMTU. Note that SCTP must independently probe the PMTU on each path to the peer.
+'''
+
+# 4821-179
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.2"
+reason = "SCTP TSN/chunk/heartbeat/PAD/multipath actor is outside this TCP implementation."
+quote = '''
+The RECOMMENDED method for generating probes is to add a chunk consisting only of padding to an SCTP message. The PAD chunk defined in [RFC4820] SHOULD be attached to a minimum length HEARTBEAT (HB) chunk to build a probe packet. This method is fully compatible with all current SCTP implementations.
+'''
+
+# 4821-180
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.2"
+reason = "SCTP TSN/chunk/heartbeat/PAD/multipath actor is outside this TCP implementation."
+quote = '''
+SCTP MAY also probe with a method similar to TCP's described above, using inline data. Using such a method has the advantage that successful probes have no additional overhead; however, failed probes will require retransmission of data, which may impact flow performance.
+'''
+
+# 4821-183
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.3"
+reason = "IP-fragmentation/connectionless adjunct-protocol PLPMTUD is outside TCP in-band packetization."
+quote = '''
+To support IP fragmentation as a Packetization Layer under an unmodified application, an implementation SHOULD rely on the Path MTU sharing described in Section 5.2 plus an adjunct protocol to probe the Path MTU. There are a number of protocols that might be used for the purpose, such as ICMP ECHO and ECHO REPLY, or "traceroute" style UDP datagrams that trigger ICMP messages. Use of ICMP ECHO and ECHO REPLY will probe both forward and return paths, so the sender will only be able to take advantage of the minimum of the two. Other methods that probe only the forward path are preferred if available.
+'''
+
+# 4821-186
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.3"
+reason = "IP-fragmentation/connectionless adjunct-protocol PLPMTUD is outside TCP in-band packetization."
+quote = '''
+Since connectionless protocols might not keep enough state to effectively diagnose MTU black holes, it would be more robust to err on the side of using too small of an initial MTU (e.g., 1 kByte or less) prior to probing a path to measure the MTU. For this reason, implementations that use IP fragmentation SHOULD use an initial eff_pmtu, which is selected as described in Section 7.2, except using a separate global control for the default initial eff_mtu for connectionless protocols.
+'''
+
+# 4821-187
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.3"
+reason = "IP-fragmentation/connectionless adjunct-protocol PLPMTUD is outside TCP in-band packetization."
+quote = '''
+Connectionless protocols also introduce an additional problem with maintaining the path information cache: there are no events corresponding to connection establishment and tear-down to use to manage the cache itself. A natural approach would be to keep an immutable cache entry for the "default path", which has a eff_pmtu that is fixed at the initial value for connectionless protocols. The adjunct Path MTU Discovery protocol would be invoked once the number of fragmented datagrams to any particular destination reaches some configurable threshold (e.g., 5 datagrams). A new path cache entry would be created when the adjunct protocol updates eff_pmtu, and deleted on the basis of a timer or a Least Recently Used cache replacement algorithm.
+'''
+
+# 4821-188
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.4"
+reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
+quote = '''
+The disadvantages of relying on IP fragmentation and an adjunct protocol to perform Path MTU Discovery can be overcome by implementing Path MTU Discovery within the application itself, using the application's own protocol. The application must have some suitable method for generating probes and have an accurate and timely mechanism to determine whether the probes were lost.
+'''
+
+# 4821-189
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.4"
+reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
+quote = '''
+Ideally, the application protocol includes a lightweight echo function that confirms message delivery, plus a mechanism for padding the messages out to the desired probe size, such that the padding is not echoed. This combination (akin to the SCTP HB plus PAD) is RECOMMENDED because an application can separately measure the MTU of each direction on a path with asymmetrical MTUs.
+'''
+
+# 4821-190
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.4"
+reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
+quote = '''
+For protocols that cannot implement PLPMTUD with "echo plus pad", there are often alternate methods for generating probes. For example, the protocol may have a variable length echo that effectively measures minimum MTU of both the forward and return path's, or there may be a way to add padding to regular messages carrying real application data. There may also be alternate ways to segment application data to generate probes, or as a last resort, it may be feasible to extend the protocol with new message types specifically to support MTU discovery.
+'''
+
+# 4821-191
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.4"
+reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
+quote = '''
+Note that if it is necessary to add new message types to support PLPMTUD, the most general approach is to add ECHO and PAD messages, which permit the greatest possible latitude in how an application- specific implementation of PLPMTUD interacts with other applications and protocols on the same end system.
+'''
+
+# 4821-192
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-10.4"
+reason = "Connectionless application/diagnostic datagram probe API actor; this repository implements TCP stream packetization, not a host UDP/raw-datagram stack. TCP in-band probing remains in scope."
+quote = '''
+All application probing techniques require the ability to send messages that are larger than the current eff_pmtu described in Section 9.
+'''
+
+# 4821-194
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-11"
+reason = "No shared path state is exposed to untrusted applications; no configurable ICMP-ignore policy exists on PmtudConfig. Avoid interpreting this security discussion as a complete threat-model proof."
+quote = '''
+Since PLPMTUD is designed for robust operation without any ICMP or other messages from the network, it can be configured to ignore all ICMP messages, either globally or on a per-application basis. In such a configuration, it cannot be attacked unless the attacker can identify and cause probe packets to be lost. Attacking PLPMTUD reduces performance, but not as much as attacking congestion control by causing arbitrary packets to be lost. Such an attacker might do far more damage by completely disrupting specific protocols, such as DNS.
+'''
+
+# 4821-195
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc4821#section-11"
+reason = "No shared path state is exposed to untrusted applications; no configurable ICMP-ignore policy exists on PmtudConfig. Avoid interpreting this security discussion as a complete threat-model proof."
+quote = '''
+Since packetization protocols may share state with each other, if one packetization protocol (particularly an application) were hostile to other protocols on the same host, it could harm performance in the other protocols by reducing the effective MTU. If a packetization protocol is untrusted, it should not be allowed to write to shared state.
+'''

@@ -2297,6 +2297,10 @@ impl Endpoint {
         self.refresh(index);
         Ok(accepted)
     }
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.2
+    //= reason=Endpoint routes the quoted outbound tuple to its connection-local path. IPv6-capable core dispatch only; no IPv6 native socket or shared route-cache claim.
+    //# When a Packet Too Big message is received, the node determines which path the
+    //# message applies to based on the contents of the Packet Too Big message.
     pub fn pmtu_feedback(
         &mut self,
         now: Instant,

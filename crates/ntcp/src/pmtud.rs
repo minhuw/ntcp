@@ -121,6 +121,16 @@ impl Pmtud {
         }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.3
+    //= reason=One-byte convergence schedules600s reset; link growth cannot increase eff without an ACK; before/at-deadline targets and bounded reset asserted.
+    //# Each Packetization Layer MUST determine when probing has converged, that is, when
+    //# the probe size range is small enough that further probing is no longer worth its
+    //# cost. When probing has converged, a timer SHOULD be set. When the timer expires,
+    //# search_high should be reset to its initial value (described above) so that probing
+    //# can resume. Thus, if the path changes, increasing the Path MTU, then the flow will
+    //# eventually take advantage of it. The value for this timer MUST NOT be less than 5
+    //# minutes and is recommended to be 10 minutes, per RFC 1981.
+
     pub fn tick(&mut self, now: Instant) {
         if self.deadline.is_some_and(|d| d <= now) {
             self.deadline = None;
@@ -130,6 +140,11 @@ impl Pmtud {
             self.reset_search = false;
         }
     }
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.1
+    //= reason=Binary target is strictly above search_low and <=search_high; actual IP probe size checked for IPv4/IPv6 and constrained by peer/allocation ceilings.
+    //# When transmitting probes, the Packetization Layer MUST select a probe size that is
+    //# larger than search_low and smaller than or equal to search_high.
 
     pub fn target(&self) -> Option<u32> {
         if self.deadline.is_some()
@@ -222,6 +237,99 @@ impl Pmtud {
     }
 
     // Core also checks tuple and the live SND.UNA <= SEG.SEQ < SND.NXT window.
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-3
+    //= reason=Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.
+    //# When a host receives a Datagram Too Big message, it MUST reduce its estimate of the
+    //# PMTU for the relevant path, based on the value of the Next-Hop MTU field in the
+    //# message (see section 4). We do not specify the precise behavior of a host in this
+    //# circumstance, since different applications may have different requirements, and
+    //# since different implementation architectures may favor different strategies.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-3
+    //= reason=Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.
+    //# We do require that after receiving a Datagram Too Big message, a host MUST attempt
+    //# to avoid eliciting more such messages in the near future. The host may either reduce
+    //# the size of the datagrams it is sending along the path, or cease setting the Don't
+    //# Fragment bit in the headers of those datagrams. Clearly, the former strategy may
+    //# continue to elicit Datagram Too Big messages for a while, but since each of these
+    //# messages (and the dropped datagrams they respond to) consume Internet resources, the
+    //# host MUST force the PMTU Discovery process to converge.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-3
+    //= reason=Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.
+    //# A host MUST never reduce its estimate of the Path MTU below 68 octets.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-3
+    //= reason=Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.
+    //# A host MUST not increase its estimate of the Path MTU in response to the contents of
+    //# a Datagram Too Big message. A message purporting to announce an increase in the Path
+    //# MTU might be a stale datagram that has been floating around in the Internet, a false
+    //# packet injected as part of a denial-of-service attack, or the result of having
+    //# multiple paths to the destination.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-5
+    //= reason=Zero next-hop MTU uses quoted total length, legacy IHL correction and next lower plateau; exact packet evidence bounds the input and floor68 is retained.
+    //# Any search strategy must have some "memory" of previous estimates in order to chose
+    //# the next one. One approach is to use the currently-cached estimate of the Path MTU,
+    //# but in fact there is better information available in the Datagram Too Big message
+    //# itself. All ICMP Destination Unreachable messages, including this one, contain the
+    //# IP header of the original datagram, which contains the Total Length of the datagram
+    //# that was too big to be forwarded without fragmentation. Since this Total Length may
+    //# be less than the current PMTU estimate, but is nonetheless larger than the actual
+    //# PMTU, it may be a good input to the method for choosing the next PMTU estimate.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-5
+    //= reason=Zero next-hop MTU uses quoted total length, legacy IHL correction and next lower plateau; exact packet evidence bounds the input and floor68 is retained.
+    //# Note: routers based on implementations derived from 4.2BSD Unix send an incorrect
+    //# value for the Total Length of the original IP datagram. The value sent by these
+    //# routers is the sum of the original Total Length and the original Header Length
+    //# (expressed in octets). Since it is impossible for the host receiving such a Datagram
+    //# Too Big message to know if it sent by one of these routers, the host must be
+    //# conservative and assume that it is. If the Total Length field returned is not less
+    //# than the current PMTU estimate, it must be reduced by 4 times the value of the
+    //# returned Header Length field.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-5
+    //= reason=Zero next-hop MTU uses quoted total length, legacy IHL correction and next lower plateau; exact packet evidence bounds the input and floor68 is retained.
+    //# The strategy we recommend, then, is to use as the next PMTU estimate the greatest
+    //# plateau value that is less than the returned Total Length field (corrected, if
+    //# necessary, according to the Note above).
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-6.4
+    //= reason=Nondecreasing, stale and impossible exact-size quotes are rejected; decreasing accepted feedback alone reaches packetization refresh.
+    //# This means that the TCP layer must be able to recognize when a Datagram Too Big
+    //# notification actually decreases the PMTU that it has already used to send a datagram
+    //# on the given connection, and should ignore any other notifications.
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-4
+    //= reason=IPv6 core rejects1279 without changing1500 estimate and accepts1280; native IPv6 socket transport is not claimed.
+    //# If a node receives a Packet Too Big message reporting a next-hop MTU that is less
+    //# than the IPv6 minimum link MTU, it must discard it. A node must not reduce its
+    //# estimate of the Path MTU below the IPv6 minimum link MTU on receipt of a Packet Too
+    //# Big message.
+
+    //= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
+    //= reason=Informational policy: reject impossible larger candidates, defer below proven delivery, clear on progress; test contrasts progress with quoted-head RTO. Additional any-progress clearing is conservative, not literal full pseudocode conformance.
+    //# Upon receipt of an ICMP "Packet Too Big" error message, the Next-Hop MTU claimed by
+    //# the ICMP message (henceforth "claimedmtu") is compared with maxsizesent. If
+    //# claimedmtu is larger than maxsizesent, then the ICMP error message is silently
+    //# discarded. The rationale for this is that the ICMP error message cannot be
+    //# legitimate if it claims to have been triggered by a packet larger than the largest
+    //# packet we have so far sent for this connection.
+
+    //= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
+    //= reason=Informational policy: reject impossible larger candidates, defer below proven delivery, clear on progress; test contrasts progress with quoted-head RTO. Additional any-progress clearing is conservative, not literal full pseudocode conformance.
+    //# On the other hand, if claimedmtu is smaller than maxsizeacked, TCP is supposed to be
+    //# in the Path-MTU Update stage. At this stage, these implementations are more cautious
+    //# with the errors being reported by the network, and therefore just record the
+    //# received error message, and delay the update of the assumed Path-MTU.
+
+    //= https://www.rfc-editor.org/rfc/rfc5927#section-7.2
+    //= reason=Informational policy: reject impossible larger candidates, defer below proven delivery, clear on progress; test contrasts progress with quoted-head RTO. Additional any-progress clearing is conservative, not literal full pseudocode conformance.
+    //# If, while there is a pending ICMP "Packet Too Big" error message, the TCP SEQ
+    //# claimed by the pending message is acknowledged (i.e., an ACK that acknowledges that
+    //# sequence number is received), then the "pending error" condition is cleared.
+
     pub fn feedback(
         &mut self,
         now: Instant,
@@ -313,6 +421,16 @@ impl Pmtud {
         self.icmp_since_progress = true;
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-4
+    //= reason=Both families retain ten-minute PTB hold through ACK progress and local link growth; only subsequent ACK-confirmed PLPMTUD can raise effective PMTU.
+    //# Nodes may detect increases in PMTU, but because doing so requires sending packets
+    //# larger than the current estimated PMTU, and because the likelihood is that the PMTU
+    //# will not have increased, this must be done at infrequent intervals. An attempt to
+    //# detect an increase (by sending a packet larger than the current estimate) must not
+    //# be done less than 5 minutes after a Packet Too Big message has been received for the
+    //# given path. The recommended setting for this timer is twice its minimum value (10
+    //# minutes).
+
     fn apply_ptb(&mut self, mtu: u32, now: Instant) {
         self.icmp_since_progress = true;
         self.info.current_mtu = mtu.min(self.info.current_mtu);
@@ -323,6 +441,46 @@ impl Pmtud {
         self.deadline = Some(now.saturating_add(self.hold));
         self.reset_search = true;
     }
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.1
+    //= reason=Unambiguous explicit-probe cumulative ACK raises low and effective MTU; failed encoding cannot create a probe or advance flight.
+    //# When the probe is delivered, it is an indication that the Path MTU is at least as
+    //# large as the probe size. Set search_low to the probe size. If the probe size is
+    //# larger than the eff_pmtu, raise eff_pmtu to the probe size. The probe size might be
+    //# smaller than the eff_pmtu if the flow has not been using the full MTU of the path
+    //# because it is subject to some other limitation, such as available data in an
+    //# interactive session.
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2
+    //= reason=Real receiver ACKs resolve full trailing flight before isolated classification; upper bound becomes probe-1 and invalid eff falls to low; second hole preserves bounds. No congestion-suppression claim.
+    //# In the absence of other indications, set search_high to the probe size minus one.
+    //# The eff_pmtu might be larger than the probe size if the flow has not been using the
+    //# full MTU of the path because it is subject to some other limitation, such as
+    //# available data in an interactive session. If eff_pmtu is larger than the probe size,
+    //# eff_pmtu MUST be reduced to no larger than search_high, and SHOULD be reduced to
+    //# search_low, as the eff_pmtu has been determined to be invalid, similar to after a
+    //# full-stop timeout (see Section 7.7).
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.8
+    //= reason=Selected verification heuristic tracks retry/original ratio >10% across two RTO intervals, preserves prior verified baseline and restores it after repeated increases. Not empirical multipath validation.
+    //# Striping in this manner is often operationally undesirable for other reasons (e.g.,
+    //# due to packet reordering) and is usually avoided by hashing each flow to a single
+    //# path. However, to increase robustness, an implementation SHOULD implement some form
+    //# of MTU verification, such that if increasing eff_pmtu results in a sharp increase in
+    //# loss rate, it will fall back to using a lower MTU.
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.8
+    //= reason=Selected verification heuristic tracks retry/original ratio >10% across two RTO intervals, preserves prior verified baseline and restores it after repeated increases. Not empirical multipath validation.
+    //# A RECOMMENDED strategy would be to save the value of eff_pmtu before raising it.
+    //# Then, if loss rate rises above a threshold for a period of time (e.g., loss rate is
+    //# higher than 10% over multiple retransmission timeout (RTO) intervals), then the new
+    //# MTU is
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.8
+    //= reason=Selected verification heuristic tracks retry/original ratio >10% across two RTO intervals, preserves prior verified baseline and restores it after repeated increases. Not empirical multipath validation.
+    //# considered incorrect. The saved value of eff_pmtu SHOULD be restored, and
+    //# search_high reduced in the same manner as in a probe failure. PLPMTUD
+    //# implementations SHOULD implement MTU verification.
 
     pub fn ack(&mut self, ack: Seq, now: Instant, cooldown: u64, rto: u64) {
         self.pending = None;
@@ -410,6 +568,14 @@ impl Pmtud {
         self.deadline = Some(self.deadline.unwrap_or(0).max(now.saturating_add(interval)));
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.7
+    //= reason=R1 uses third consecutive data RTO; earlier RTOs preserve PMTU, later ones halve to family floor while cwnd follows normal timeout response.
+    //# Under all conditions, a full-stop timeout (also known as a "persistent timeout" in
+    //# other documents) SHOULD be taken as an indication of some significantly disruptive
+    //# event in the network, such as a router failure or a routing change to a path with a
+    //# smaller MTU. For TCP, this occurs when the R1 timeout threshold described by
+    //# [RFC1122] expires.
+
     pub fn timeout(&mut self, now: Instant, head: Seq, consecutive: u32, cooldown: u64) {
         if let Some((seq, mtu)) = self.pending.take() {
             // Only the quoted data's timeout authorizes a deferred decrease.
@@ -463,6 +629,37 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-5
+    //= type=test
+    //= reason=Zero next-hop MTU uses quoted total length, legacy IHL correction and next lower plateau; exact packet evidence bounds the input and floor68 is retained.
+    //# Any search strategy must have some "memory" of previous estimates in order to chose
+    //# the next one. One approach is to use the currently-cached estimate of the Path MTU,
+    //# but in fact there is better information available in the Datagram Too Big message
+    //# itself. All ICMP Destination Unreachable messages, including this one, contain the
+    //# IP header of the original datagram, which contains the Total Length of the datagram
+    //# that was too big to be forwarded without fragmentation. Since this Total Length may
+    //# be less than the current PMTU estimate, but is nonetheless larger than the actual
+    //# PMTU, it may be a good input to the method for choosing the next PMTU estimate.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-5
+    //= type=test
+    //= reason=Zero next-hop MTU uses quoted total length, legacy IHL correction and next lower plateau; exact packet evidence bounds the input and floor68 is retained.
+    //# Note: routers based on implementations derived from 4.2BSD Unix send an incorrect
+    //# value for the Total Length of the original IP datagram. The value sent by these
+    //# routers is the sum of the original Total Length and the original Header Length
+    //# (expressed in octets). Since it is impossible for the host receiving such a Datagram
+    //# Too Big message to know if it sent by one of these routers, the host must be
+    //# conservative and assume that it is. If the Total Length field returned is not less
+    //# than the current PMTU estimate, it must be reduced by 4 times the value of the
+    //# returned Header Length field.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-5
+    //= type=test
+    //= reason=Zero next-hop MTU uses quoted total length, legacy IHL correction and next lower plateau; exact packet evidence bounds the input and floor68 is retained.
+    //# The strategy we recommend, then, is to use as the next PMTU estimate the greatest
+    //# plateau value that is less than the returned Total Length field (corrected, if
+    //# necessary, according to the Note above).
+
     fn pmtud_exact_evidence_eviction_legacy_header_correction_and_floor() {
         for (reported, expected) in [(1500, 1006), (1520, 1492)] {
             let mut p = state(true);
@@ -559,6 +756,17 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.3
+    //= type=test
+    //= reason=One-byte convergence schedules600s reset; link growth cannot increase eff without an ACK; before/at-deadline targets and bounded reset asserted.
+    //# Each Packetization Layer MUST determine when probing has converged, that is, when
+    //# the probe size range is small enough that further probing is no longer worth its
+    //# cost. When probing has converged, a timer SHOULD be set. When the timer expires,
+    //# search_high should be reset to its initial value (described above) so that probing
+    //# can resume. Thus, if the path changes, increasing the Path MTU, then the flow will
+    //# eventually take advantage of it. The value for this timer MUST NOT be less than 5
+    //# minutes and is recommended to be 10 minutes, per RFC 1981.
+
     fn pmtud_convergence_hold_and_link_growth_require_ack_proof() {
         let mut p = state(true);
         p.info.search_low = 1500;

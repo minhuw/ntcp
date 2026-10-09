@@ -354,6 +354,15 @@ pub struct Feedback {
 
 // Decode a complete outer IP frame; the inner IP frame may be a partial quote,
 // but must contain its entire header and at least TCP's ports and sequence.
+//= https://www.rfc-editor.org/rfc/rfc1191#section-4
+//= reason=Decoded quote length is complete original IP length, not quoted byte count or Ethernet frame size; no router-generation claim.
+//# The size includes the IP header and IP data, and does not include any lower-level
+//# headers.
+//= https://www.rfc-editor.org/rfc/rfc5927#section-4.3
+//= reason=Informational rationale: outer source may be a router, not the peer. Runtime fixture sends PTB from10.73.0.1 for peer10.73.0.3; quoted tuple/live sequence and checksums still gate acceptance.
+//# The source address of ICMP error messages does not need to be spoofed to perform the
+//# attacks described in this document, as the ICMP error messages might legitimately come
+//# from an intermediate system.
 pub fn decode_icmp(bytes: &[u8]) -> Result<Feedback, Error> {
     let outer = parse(bytes, false)?;
     let icmp = outer.payload;

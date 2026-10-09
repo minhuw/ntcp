@@ -311,6 +311,11 @@ fn icmp_checked_quotes_and_ptb() {
     }
 }
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc1191#section-4
+//= type=test
+//= reason=Decoded quote length is complete original IP length, not quoted byte count or Ethernet frame size; no router-generation claim.
+//# The size includes the IP header and IP data, and does not include any lower-level
+//# headers.
 fn ptb_zero_mtu_and_original_lengths() {
     for v6 in [false, true] {
         let header = if v6 { 40 } else { 20 };

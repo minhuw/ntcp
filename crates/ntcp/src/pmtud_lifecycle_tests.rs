@@ -29,6 +29,24 @@ fn unscaled_pair(iss: u32) -> (Connection, Connection) {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2
+//= type=test
+//= reason=Real receiver ACKs resolve full trailing flight before isolated classification; upper bound becomes probe-1 and invalid eff falls to low; second hole preserves bounds. No congestion-suppression claim.
+//# In the absence of other indications, set search_high to the probe size minus one. The
+//# eff_pmtu might be larger than the probe size if the flow has not been using the full MTU
+//# of the path because it is subject to some other limitation, such as available data in an
+//# interactive session. If eff_pmtu is larger than the probe size, eff_pmtu MUST be reduced
+//# to no larger than search_high, and SHOULD be reduced to search_low, as the eff_pmtu has
+//# been determined to be invalid, similar to after a full-stop timeout (see Section 7.7).
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-10.1
+//= type=test
+//= reason=Selected non-overlapping real-data probes; actual receiver-generated ACKs exercise multiple smaller gap repairs and prevent crossing the probe boundary.
+//# In the non-overlapping method, data is segmented such that the probe and any subsequent
+//# segments contain no overlapping data. If the probe is lost, the "probe gap" will be a
+//# full probe size minus headers. Data in the probe gap will need to be retransmitted with
+//# multiple smaller segments.
+
 fn pmtud_lifecycle_real_repairs_isolated_and_second_hole_beyond_three_mss() {
     for second_hole in [false, true] {
         for iss in [0, u32::MAX - 4000] {
@@ -101,6 +119,29 @@ fn pmtud_lifecycle_real_repairs_isolated_and_second_hole_beyond_three_mss() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.8
+//= type=test
+//= reason=Selected verification heuristic tracks retry/original ratio >10% across two RTO intervals, preserves prior verified baseline and restores it after repeated increases. Not empirical multipath validation.
+//# Striping in this manner is often operationally undesirable for other reasons (e.g., due
+//# to packet reordering) and is usually avoided by hashing each flow to a single path.
+//# However, to increase robustness, an implementation SHOULD implement some form of MTU
+//# verification, such that if increasing eff_pmtu results in a sharp increase in loss rate,
+//# it will fall back to using a lower MTU.
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.8
+//= type=test
+//= reason=Selected verification heuristic tracks retry/original ratio >10% across two RTO intervals, preserves prior verified baseline and restores it after repeated increases. Not empirical multipath validation.
+//# A RECOMMENDED strategy would be to save the value of eff_pmtu before raising it. Then,
+//# if loss rate rises above a threshold for a period of time (e.g., loss rate is higher
+//# than 10% over multiple retransmission timeout (RTO) intervals), then the new MTU is
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.8
+//= type=test
+//= reason=Selected verification heuristic tracks retry/original ratio >10% across two RTO intervals, preserves prior verified baseline and restores it after repeated increases. Not empirical multipath validation.
+//# considered incorrect. The saved value of eff_pmtu SHOULD be restored, and search_high
+//# reduced in the same manner as in a probe failure. PLPMTUD implementations SHOULD
+//# implement MTU verification.
+
 fn pmtud_lifecycle_multi_increase_keeps_verification_baseline_and_loss_evidence() {
     let mut p = crate::pmtud::Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000);
     p.info.current_mtu = 1024;

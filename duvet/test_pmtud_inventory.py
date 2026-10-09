@@ -1,0 +1,127 @@
+import hashlib
+import json
+from pathlib import Path
+import re
+import tomllib
+import unittest
+
+from check_rfc_coverage import PREFIX, check
+from test_rfc_coverage import complete_report
+
+ROOT = Path(__file__).resolve().parent.parent
+RFCS = (1191, 8201, 4821, 5927)
+
+
+def normalize(text):
+    # Published text page furniture is not part of a clause. Do not fix spelling,
+    # hyphens, numbers or punctuation when checking exact quotations.
+    lines = [line for line in text.splitlines()
+             if not re.match(r"^(Mogul & Deering|McCann, et al\.|Mathis & Heffner|Gont)\s", line)
+             and not re.match(r"^RFC (1191|8201|4821|5927)\s", line)]
+    return " ".join("\n".join(lines).split())
+
+
+class PmtudInventory(unittest.TestCase):
+    def inventory(self, rfc):
+        return json.loads((ROOT / f"duvet/rfc{rfc}-inventory.json").read_text())
+
+    def test_registration_and_document_status(self):
+        config = tomllib.loads((ROOT / "duvet/duvet.toml").read_text())
+        sources = {s["source"] for s in config["specification"]}
+        self.assertTrue({f"{PREFIX}{n}" for n in RFCS} <= sources)
+        self.assertNotIn(f"{PREFIX}1981", sources)
+        self.assertNotIn(f"{PREFIX}8899", sources)
+        self.assertIn("obsoletes RFC1981", self.inventory(8201)["scope"])
+        self.assertEqual(self.inventory(5927)["document_status"], "Informational")
+        summaries, errors = check(complete_report())
+        self.assertFalse(errors)
+        self.assertEqual(summaries["5927"]["document_status"], "Informational")
+        for n in (1191, 8201, 4821):
+            self.assertEqual(self.inventory(n)["document_status"], "Standards Track")
+
+    def test_inventory_dispositions_match_exact_additions_and_todos(self):
+        # Counts pin the reviewed inventory, including prose without BCP14 words.
+        expected = {1191: (111, 77), 8201: (107, 52),
+                    4821: (215, 118), 5927: (257, 68)}
+        for n in RFCS:
+            inv = self.inventory(n)
+            rows = inv["paragraphs"]
+            operative = [p for p in rows if p["status"] != "context"]
+            self.assertEqual((len(rows), len(operative)), expected[n], n)
+            self.assertEqual(len({p["id"] for p in rows}), len(rows))
+            additions = tomllib.loads((ROOT / f"duvet/rfc{n}-additions.toml").read_text())["spec"]
+            todos = tomllib.loads((ROOT / f"duvet/rfc{n}-todos.toml").read_text())
+            key = lambda p: (p["target"], " ".join(p["quote"].split()))
+            self.assertEqual({key(p) for p in operative}, {key(p) for p in additions})
+            self.assertTrue(all("level" not in p for p in additions))
+            for status in ("TODO", "exception"):
+                self.assertEqual({key(p) for p in operative if p["status"] == status},
+                                 {key(p) for p in todos.get(status, [])})
+            for p in rows:
+                self.assertIn(p["status"], ("context", "covered", "TODO", "exception"))
+                self.assertTrue(p["reason"].strip(), p["id"])
+                if p["status"] == "covered":
+                    self.assertEqual(len(p["evidence"]), 2)
+                    for is_test, evidence in enumerate(p["evidence"]):
+                        path, anchor = evidence.split("::", 1)
+                        source = (ROOT / path).read_text()
+                        self.assertIn(anchor, source, p["id"])
+                        blocks = re.split(r"(?m)^\s*//= (?=https://)", source)[1:]
+                        matching = []
+                        for block in blocks:
+                            if block.splitlines()[0].strip() != p["target"]:
+                                continue
+                            quote = " ".join(re.findall(r"(?m)^\s*//# ?(.*)$", block))
+                            if " ".join(quote.split()) == " ".join(p["quote"].split()):
+                                matching.append(block)
+                        self.assertTrue(matching, p["id"])
+                        self.assertTrue(any(("//= type=test" in b) == bool(is_test)
+                                            for b in matching), p["id"])
+
+    def test_lowercase_algorithm_and_security_spans_cannot_disappear(self):
+        required = {
+            1191: ("576 octets unless", "Header Length field", "greatest plateau value",
+                   "MUST not retransmit datagrams", "PMTU Discovery does not affect"),
+            8201: ("must discard it", "must not increase", "less than 5 minutes",
+                   "including IPv6 extension headers", "must not be considered as a congestion"),
+            4821: ("implicit probe", "search_low SHOULD be raised", "SHOULD be configurable",
+                   "same-sized probe", "R1 timeout threshold", "search_high to the probe size minus one",
+                   "Data in the probe gap", "The saved value of eff_pmtu SHOULD be restored"),
+            5927: ("SND.UNA =< SEG.SEQ < SND.NXT", "maxsizesent", "maxsizeacked",
+                   '"pending error" condition is cleared', "sequence number arithmetic",
+                   "claimedmtu <= MINIMUM_MTU"),
+        }
+        for n, fragments in required.items():
+            spans = [p["quote"] for p in self.inventory(n)["paragraphs"]
+                     if p["status"] != "context"]
+            for fragment in fragments:
+                self.assertTrue(any(fragment in q for q in spans), (n, fragment))
+        # Known implementation gaps must not silently become scope exceptions.
+        for n, numbers in {1191: (69,), 8201: (76,), 4821: (67, 111, 113, 119),
+                           5927: (103, 104, 106, 108, 109)}.items():
+            rows = {p["id"]: p for p in self.inventory(n)["paragraphs"]}
+            for i in numbers:
+                self.assertEqual(rows[f"{n}-{i:03}"]["status"], "TODO")
+
+    def test_all_inventory_quotes_match_official_text_when_cached(self):
+        for n in RFCS:
+            with self.subTest(rfc=n):
+                path = ROOT / f"workbench/pmtud/rfcs/rfc{n}.txt"
+                if not path.exists():
+                    self.skipTest("Official RFC cache is agent-local; fetch RFC Editor texts to run provenance check")
+                raw = path.read_bytes()
+                inv = self.inventory(n)
+                self.assertEqual(hashlib.sha256(raw).hexdigest(), inv["text_sha256"])
+                official = normalize(raw.decode("utf-8-sig"))
+                for p in inv["paragraphs"]:
+                    self.assertIn(" ".join(p["quote"].split()), official, p["id"])
+
+    def test_errata_dispositions_are_not_silently_applied_as_new_norms(self):
+        expected = {1191: [(9093, "Verified")], 8201: [],
+                    4821: [(907, "Rejected")], 5927: [(8323, "Verified")]}
+        for n in RFCS:
+            self.assertEqual([(e["id"], e["status"]) for e in self.inventory(n)["errata"]], expected[n])
+
+
+if __name__ == "__main__":
+    unittest.main()

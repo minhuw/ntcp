@@ -1,12 +1,2 @@
-# Unresolved functional obligations; not implementation waivers.
-# Embedding contracts and verified erratum 8167 remain unchanged.
-
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.2"
-feature = "BASE-056"
-reason = "Adapter/integration gap: lower_mss applies supplied limits; TUN has no ICMP discovery input. PMTUD requires validated fragmentation-needed/Packet-Too-Big feedback tied to a quoted live tuple and transmitted sequence, a path-MTU cache, correct IP/TCP header subtraction and total payload-limit updates, plus stale/spoofed-feedback tests. PLPMTUD additionally requires identified size probes, ACK-confirmed success, bounded search, black-hole fallback and upward adjustment, which lowering-only MSS cannot express. Static configuration and caller hooks provide no discovery evidence; an implementing adapter or probe API is required."
-quote = '''
-Instead, implementation of Path MTU Discovery (PMTUD) and Packetization Layer
-Path MTU Discovery (PLPMTUD) is strongly recommended in order for TCP to
-improve segmentation decisions.
-'''
+# BASE-056 implementation recommendation is now evidenced in core and native IPv4 tests.
+# Exact PMTUD/PLPMTUD clause gaps remain in RFC1191/8201/4821 inventories; no full compliance claim.

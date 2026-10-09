@@ -601,6 +601,28 @@ fn output_error_finalizes_logical_send_parked_after_output_once() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc4821#section-3
+//= type=test
+//= reason=PacketIo reports IP MTU separately from layer-unit buffer capacity. Executable backend fixture distinguishes9000 IP MTU from3514 Ethernet/3500 IP capacity; no physical-link enforcement claim.
+//# MTU: Maximum Transmission Unit, the size in bytes of the largest IP packet, including
+//# the IP header and payload, that can be transmitted on a link or path. Note that this
+//# could more properly be called the IP MTU, to be consistent with how other standards
+//# organizations use the acronym MTU.
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-3
+//= type=test
+//= reason=PacketIo reports IP MTU separately from layer-unit buffer capacity. Executable backend fixture distinguishes9000 IP MTU from3514 Ethernet/3500 IP capacity; no physical-link enforcement claim.
+//# Link MTU: The Maximum Transmission Unit, i.e., maximum IP packet size in bytes, that can
+//# be conveyed in one piece over a link. Be aware that this definition is different from
+//# the definition used by other standards organizations.
+
+//= https://www.rfc-editor.org/rfc/rfc4821#section-3
+//= type=test
+//= reason=PacketIo reports IP MTU separately from layer-unit buffer capacity. Executable backend fixture distinguishes9000 IP MTU from3514 Ethernet/3500 IP capacity; no physical-link enforcement claim.
+//# For IETF documents, link MTU is uniformly defined as the IP MTU over the link. This
+//# includes the IP header, but excludes link layer headers and other framing that is not
+//# part of IP or the IP payload.
+
 fn pmtud_startup_uses_real_mtu_and_separate_adapter_capacity() {
     let state = Arc::new(Mutex::new(State {
         mtu: Some(9000),
@@ -756,6 +778,23 @@ fn mtu(owner: &mut Owner, socket: u64) -> i32 {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc1191#section-2
+//= type=test
+//= reason=Native IPv4 input validates codec output then dispatches quoted tuple/sequence to endpoint policy; tests reject wrong checksum/tuple/window and observe bounded output after valid PTB.
+//# Upon receipt of such a message (henceforth called a "Datagram Too Big" message), the
+//# source host reduces its assumed PMTU for the path.
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.2
+//= type=test
+//= reason=Enabled core implements validated PTB, real-data ACK-confirmed probes, bounded search and R1 black-hole fallback. Native IPv4 TUN/AF_PACKET ingress and real MTU startup integrate it. This closes the implementation recommendation, not all external RFC clauses: RFC1191/8201/4821 inventories retain exact gaps; native IPv6 sockets remain unsupported.
+//# Instead, implementation of Path MTU Discovery (PMTUD) and Packetization Layer Path MTU
+//# Discovery (PLPMTUD) is strongly recommended in order for TCP to improve segmentation
+//# decisions.
+//= https://www.rfc-editor.org/rfc/rfc5927#section-4.3
+//= type=test
+//= reason=Informational rationale: outer source may be a router, not the peer. Runtime fixture sends PTB from10.73.0.1 for peer10.73.0.3; quoted tuple/live sequence and checksums still gate acceptance.
+//# The source address of ICMP error messages does not need to be spoofed to perform the
+//# attacks described in this document, as the ICMP error messages might legitimately come
+//# from an intermediate system.
 fn pmtud_jumbo_allocation_capacity_and_validated_ingress() {
     for capacity in [None, Some(3514)] {
         let (mut a, mut b, client, server, state) = pmtud_pair(capacity);

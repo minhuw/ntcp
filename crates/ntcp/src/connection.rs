@@ -1971,6 +1971,36 @@ impl Connection {
         Ok(true)
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-3.1
+    //= reason=Peer MSS is stored separately from receive capability; missing IPv4 MSS defaults536 and emitted packets remain <=576 even with local MTU9000.
+    //# A host doing PMTU Discovery must obey the rule that it not send IP datagrams larger
+    //# than 576 octets unless it has permission from the receiver. For TCP connections,
+    //# this means that a host must not send datagrams larger than 40 octets plus the
+    //# Maximum Segment Size (MSS) sent by its peer.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-3.1
+    //= reason=Peer MSS is stored separately from receive capability; missing IPv4 MSS defaults536 and emitted packets remain <=576 even with local MTU9000.
+    //# Note: The TCP MSS is defined to be the relevant IP datagram size minus 40 [9]. The
+    //# default of 576 octets for the maximum IP datagram size yields a default of 536
+    //# octets for the TCP MSS.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-6.4
+    //= reason=Peer MSS is stored separately from receive capability; missing IPv4 MSS defaults536 and emitted packets remain <=576 even with local MTU9000.
+    //# A TCP implementation must also store the MSS value received from its peer (which
+    //# defaults to 536), and not send any segment larger than this MSS, regardless of the
+    //# PMTU. In 4.xBSD-derived implementations, this requires adding an additional field to
+    //# the TCP state record.
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.2
+    //= reason=Initial/search bound intersects supplied interface, peer, administrative and allocation limits. Administrative ceilings survive validated growth without changing receive MSS.
+    //# The initial value for search_high SHOULD be the largest possible packet that might
+    //# be supported by the flow. This may be limited by the local interface MTU, by an
+    //# explicit protocol mechanism such as the TCP MSS option, or by an intrinsic limit
+    //# such as the size of a protocol length field. In addition, the initial value for
+    //# search_high MAY be limited by a configuration option to prevent probing above some
+    //# maximum size. Search_high is likely to be the same as the initial Path MTU as
+    //# computed by the classical Path MTU Discovery algorithm.
+
     fn path_bound(&self, link: u32) -> u32 {
         let base = if self.tuple.local.is_ipv4() { 20 } else { 40 };
         let floor = if self.tuple.local.is_ipv4() { 68 } else { 1280 };
@@ -1983,6 +2013,27 @@ impl Connection {
         .min((u32::from(self.peer_mss.min(self.send_mss_limit)) + base + 20).max(floor))
         .min((self.scratch.len() as u32 + base + 20).max(floor))
     }
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-6.4
+    //= reason=Dynamic send path MSS never mutates config.mss receive offer; family-floor wire test asserts unchanged receive capability.
+    //# PMTU Discovery does not affect the value sent in the TCP MSS option, because that
+    //# value is used by the other end of the connection, which may be using an unrelated
+    //# PMTU value.
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
+    //= reason=IPv6 core stores peer MSS separately, defaults1220, caps transmit size independently of local link and retains receive MSS1460.
+    //# A TCP implementation must also store the Maximum Segment Size (MSS) value received
+    //# from its peer, which represents the EMTU_R, the largest packet that can be
+    //# reassembled by the receiver, and must not send any segment larger than this MSS,
+    //# regardless of the PMTU.
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
+    //= reason=IPv6 core stores peer MSS separately, defaults1220, caps transmit size independently of local link and retains receive MSS1460.
+    //# The value sent in the TCP MSS option is independent of the PMTU; it is determined by
+    //# the receiver reassembly limit EMTU_R. This MSS option value is used by the other end
+    //# of the connection, which may be using an unrelated PMTU value. See Section 5,
+    //# "Packet Size Issues", and Section 8.3, "Maximum Upper-Layer Payload Size", of
+    //# [RFC8200] for information on selecting a value for the TCP MSS option.
 
     fn refresh_path_mss(&mut self) {
         let Some(link) = self.pmtud.as_ref().map(|p| p.info.first_hop_mtu) else {
@@ -2224,6 +2275,26 @@ impl Connection {
         Ok(())
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc5927#section-4.1
+    //= reason=Informational mitigation selected as policy: live serial send-window validation plus stronger exact recent packet gate; stale/idle and wrapped-sequence quotes tested, not authentication.
+    //# Many TCP implementations have incorporated a validation check such that they react
+    //# only to those ICMP error messages that appear to relate to segments currently "in
+    //# flight" to the destination system. These implementations check that the TCP sequence
+    //# number contained in the payload of the ICMP error message is within the range
+    //# SND.UNA =< SEG.SEQ < SND.NXT. This means that they require that the sequence number
+    //# be within the range of the data already sent but not yet acknowledged. If an ICMP
+    //# error message does not pass this check, it is discarded.
+
+    //= https://www.rfc-editor.org/rfc/rfc5927#section-7.4
+    //= reason=Informational serial-arithmetic guidance: Seq::in_window and wrapping comparisons, exercised across u32 wrap; exact-match sent evidence is an additional policy gate.
+    //# Notes: All comparisons between sequence numbers must be performed using sequence
+    //# number arithmetic.
+
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.2
+    //= reason=Enabled core implements validated PTB, real-data ACK-confirmed probes, bounded search and R1 black-hole fallback. Native IPv4 TUN/AF_PACKET ingress and real MTU startup integrate it. This closes the implementation recommendation, not all external RFC clauses: RFC1191/8201/4821 inventories retain exact gaps; native IPv6 sockets remain unsupported.
+    //# Instead, implementation of Path MTU Discovery (PMTUD) and Packetization Layer Path
+    //# MTU Discovery (PLPMTUD) is strongly recommended in order for TCP to improve
+    //# segmentation decisions.
     pub(crate) fn pmtu_feedback(
         &mut self,
         now: Instant,
@@ -6555,6 +6626,40 @@ impl Connection {
                     && !self.cork
                     && !self.more
             });
+            //= https://www.rfc-editor.org/rfc/rfc4821#section-6.2
+            //= reason=TCP probes use real queued stream bytes, respecting record boundary and allocation; no synthetic padding or control-only TCP size probe.
+            //# These techniques do not work for TCP, because there is not a separate length
+            //# field or other mechanism to differentiate between padding and real payload
+            //# data. With TCP the only approach is to send additional payload data in an
+            //# over-sized segment. There are at least two variants of this approach,
+            //# discussed in Section 10.1.
+
+            //= https://www.rfc-editor.org/rfc/rfc4821#section-10.1
+            //= reason=TCP probes use real queued stream bytes, respecting record boundary and allocation; no synthetic padding or control-only TCP size probe.
+            //# TCP has no mechanism to distinguish in-band data from padding. Therefore,
+            //# TCP must generate probes by appropriately segmenting data. There are two
+            //# approaches to segmentation: overlapping and non- overlapping.
+
+            //= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
+            //= reason=Admission requires probe payload plus three MSS of queued/window credit, measured RTT and timestamp/pacing credit. This test asserts absent probe for insufficient window/queue/RTT and bounded paced output.
+            //# o The available window is greater than the probe size.
+
+            //= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
+            //= reason=Admission requires probe payload plus three MSS of queued/window credit, measured RTT and timestamp/pacing credit. This test asserts absent probe for insufficient window/queue/RTT and bounded paced output.
+            //# o For a protocol using in-band data for probing, enough data is available to
+            //# send the probe.
+
+            //= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
+            //= reason=Admission requires probe payload plus three MSS of queued/window credit, measured RTT and timestamp/pacing credit. This test asserts absent probe for insufficient window/queue/RTT and bounded paced output.
+            //# In addition, the timely loss detection algorithms in most protocols have
+            //# pre-conditions that SHOULD be satisfied before sending a probe. For example,
+            //# TCP Fast Retransmit is not robust unless there are sufficient segments
+            //# following a probe; that is, the sender SHOULD have enough data queued and
+            //# sufficient receiver window to send the probe plus at least Tcprexmtthresh
+            //# [RFC2760] additional segments. This restriction may inhibit probing in some
+            //# protocol states, such as too close to the end of a connection, or when the
+            //# window is too small.
+
             let candidate = candidate.and_then(|size| {
                 let payload = size
                     .checked_sub(u32::from(self.ip_header_len) + 20 + option_len as u32)?
@@ -6952,7 +7057,19 @@ impl Connection {
             destination: self.tuple.remote.ip(),
         };
         // Include TCP options on every output path, before committing any state.
+        //= https://www.rfc-editor.org/rfc/rfc4821#section-10.1
+        //= reason=Selected non-overlapping real-data probes; actual receiver-generated ACKs exercise multiple smaller gap repairs and prevent crossing the probe boundary.
+        //# In the non-overlapping method, data is segmented such that the probe and any
+        //# subsequent segments contain no overlapping data. If the probe is lost, the
+        //# "probe gap" will be a full probe size minus headers. Data in the probe gap will
+        //# need to be retransmitted with multiple smaller segments.
+
         let pmtu_probe = pmtu_probe.filter(|&(_, payload, _)| count == payload && !retransmitted);
+        //= https://www.rfc-editor.org/rfc/rfc4821#section-7.1
+        //= reason=Every non-probe output checks final TCP header/options/data against path payload budget before commit; floor68 retry includes timestamps and SACK within budget.
+        //# When transmitting non-probes, the Packetization Layer SHOULD create packets of a
+        //# size less than or equal to eff_pmtu.
+
         let path_limit = pmtu_probe.map_or(self.path_payload_limit(), |(size, _, _)| {
             size.saturating_sub(u32::from(self.ip_header_len)) as usize
         });

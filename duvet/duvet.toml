@@ -122,6 +122,38 @@ format = "ietf"
 source = "https://www.rfc-editor.org/rfc/rfc9438"
 format = "ietf"
 
+# IPv4 PMTUD; IPv6 PMTUD (obsoletes RFC1981); TCP PLPMTUD.
+# RFC5927 is Informational: security-policy evidence, not Standards Track norms.
+# RFC8899 is not registered as a TCP normative specification.
+
+[[requirement]]
+pattern = "workbench/duvet/requirements/**/rfc1191/*.toml"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc1191"
+format = "ietf"
+
+[[requirement]]
+pattern = "workbench/duvet/requirements/**/rfc8201/*.toml"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc8201"
+format = "ietf"
+
+[[requirement]]
+pattern = "workbench/duvet/requirements/**/rfc4821/*.toml"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc4821"
+format = "ietf"
+
+[[requirement]]
+pattern = "workbench/duvet/requirements/**/rfc5927/*.toml"
+
+[[specification]]
+source = "https://www.rfc-editor.org/rfc/rfc5927"
+format = "ietf"
+
 [report.html]
 enabled = false
 

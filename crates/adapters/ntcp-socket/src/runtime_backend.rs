@@ -238,6 +238,10 @@ impl Owner {
         }
         Ok(())
     }
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-2
+    //= reason=Native IPv4 input validates codec output then dispatches quoted tuple/sequence to endpoint policy; tests reject wrong checksum/tuple/window and observe bounded output after valid PTB.
+    //# Upon receipt of such a message (henceforth called a "Datagram Too Big" message), the
+    //# source host reduces its assumed PMTU for the path.
     fn input_ip(&mut self, bytes: &[u8], stamps: ntcp::RxPacketTimestamps) {
         let Ok(p) = ntcp_ip::parse(bytes, false) else {
             return;

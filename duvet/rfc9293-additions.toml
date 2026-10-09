@@ -590,7 +590,7 @@ receive an unsolicited general "connection reset" signal. Enter the CLOSED
 state, delete the TCB, and return.
 '''
 
-# BASE-056: lower_mss exposes a reduction hook, not autonomous PMTUD/PLPMTUD.
+# BASE-056: enabled discovery implementation; exact external-RFC gaps remain separately tracked.
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.2"
 level = "SHOULD"

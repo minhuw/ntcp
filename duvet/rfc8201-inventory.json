@@ -1,0 +1,832 @@
+{
+  "rfc": 8201,
+  "document_status": "Standards Track",
+  "scope": "IPv6 endpoint PMTUD; obsoletes RFC1981",
+  "text_sha256": "96c2ea7ac1bf5810f6b817d4ac372a35f68231d2bd0e2675740f1268eb9ac752",
+  "paragraphs": [
+    {
+      "id": "8201-001",
+      "section": "1",
+      "quote": "When one IPv6 node has a large amount of data to send to another node, the data is transmitted in a series of IPv6 packets. These packets can have a size less than or equal to the Path MTU (PMTU). Alternatively, they can be larger packets that are fragmented into a series of fragments each with a size less than or equal to the PMTU.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-002",
+      "section": "1",
+      "quote": "It is usually preferable that these packets be of the largest size that can successfully traverse the path from the source node to the destination node without the need for IPv6 fragmentation. This packet size is referred to as the Path MTU, and it is equal to the minimum link MTU of all the links in a path. This document defines a standard mechanism for a node to discover the PMTU of an arbitrary path.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-003",
+      "section": "1",
+      "quote": "IPv6 nodes should implement Path MTU Discovery in order to discover and take advantage of paths with PMTU greater than the IPv6 minimum link MTU [RFC8200]. A minimal IPv6 implementation (e.g., in a boot ROM) may choose to omit implementation of Path MTU Discovery.",
+      "status": "TODO",
+      "reason": "IPv6 core PMTUD is opt-in; PMTUD-disabled configuration does not itself force an IPv6 1280-byte send limit. Socket native runtime is IPv4-only; no IPv6 socket integration is claimed.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-1"
+    },
+    {
+      "id": "8201-004",
+      "section": "1",
+      "quote": "Nodes not implementing Path MTU Discovery must use the IPv6 minimum link MTU defined in [RFC8200] as the maximum packet size. In most cases, this will result in the use of smaller packets than necessary, because most paths have a PMTU greater than the IPv6 minimum link MTU. A node sending packets much smaller than the Path MTU allows is wasting network resources and probably getting suboptimal throughput.",
+      "status": "TODO",
+      "reason": "IPv6 core PMTUD is opt-in; PMTUD-disabled configuration does not itself force an IPv6 1280-byte send limit. Socket native runtime is IPv4-only; no IPv6 socket integration is claimed.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-1"
+    },
+    {
+      "id": "8201-005",
+      "section": "1",
+      "quote": "Nodes implementing Path MTU Discovery and sending packets larger than the IPv6 minimum link MTU are susceptible to problematic connectivity if ICMPv6 [ICMPv6] messages are blocked or not transmitted. For example, this will result in connections that complete the TCP three- way handshake correctly but then hang when data is transferred. This state is referred to as a black-hole connection [RFC2923]. Path MTU Discovery relies on ICMPv6 Packet Too Big (PTB) to determine the MTU of the path.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-006",
+      "section": "1",
+      "quote": "An extension to Path MTU Discovery defined in this document can be found in [RFC4821]. RFC 4821 defines a method for Packetization Layer Path MTU Discovery (PLPMTUD) designed for use over paths where delivery of ICMPv6 messages to a host is not assured.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-007",
+      "section": "1",
+      "quote": "Note: This document is an update to [RFC1981] that was published prior to [RFC2119] being published. Consequently, although RFC 1981 used the \"should/must\" style language in upper and lower case, this document does not cite the RFC 2119 definitions and only uses lower case for these words.",
+      "status": "context",
+      "reason": "Scope/keyword note: lowercase must/should carry operative prose; they are inventoried rather than skipped by uppercase BCP14 extraction."
+    },
+    {
+      "id": "8201-008",
+      "section": "2",
+      "quote": "node a device that implements IPv6.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-009",
+      "section": "2",
+      "quote": "router a node that forwards IPv6 packets not explicitly addressed to itself.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-010",
+      "section": "2",
+      "quote": "host any node that is not a router.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-011",
+      "section": "2",
+      "quote": "upper layer a protocol layer immediately above IPv6. Examples are transport protocols such as TCP and UDP, control protocols such as ICMPv6, routing protocols such as OSPF, and internet-layer or lower-layer protocols being \"tunneled\" over (i.e., encapsulated in) IPv6 such as Internetwork Packet Exchange (IPX), AppleTalk, or IPv6 itself.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-012",
+      "section": "2",
+      "quote": "link a communication facility or medium over which nodes can communicate at the link layer, i.e., the layer immediately below IPv6. Examples are Ethernets (simple or bridged); PPP links; X.25, Frame Relay, or ATM networks; and internet-layer or higher-layer \"tunnels\", such as tunnels over IPv4 or IPv6 itself.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-013",
+      "section": "2",
+      "quote": "interface a node's attachment to a link.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-014",
+      "section": "2",
+      "quote": "address an IPv6-layer identifier for an interface or a set of interfaces.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-015",
+      "section": "2",
+      "quote": "packet an IPv6 header plus payload. The packet can have a size less than or equal to the PMTU. Alternatively, this can be a larger packet that is fragmented into a series of fragments each with a size less than or equal to the PMTU.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-016",
+      "section": "2",
+      "quote": "link MTU the maximum transmission unit, i.e., maximum packet size in octets, that can be conveyed in one piece over a link.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-017",
+      "section": "2",
+      "quote": "path the set of links traversed by a packet between a source node and a destination node.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-018",
+      "section": "2",
+      "quote": "path MTU the minimum link MTU of all the links in a path between a source node and a destination node.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-019",
+      "section": "2",
+      "quote": "PMTU path MTU.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-020",
+      "section": "2",
+      "quote": "Path MTU Discovery the process by which a node learns the PMTU of a path.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-021",
+      "section": "2",
+      "quote": "EMTU_S Effective MTU for sending; used by upper-layer protocols to limit the size of IP packets they queue for sending [RFC6691] [RFC1122].",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-022",
+      "section": "2",
+      "quote": "EMTU_R Effective MTU for receiving; the largest packet that can be reassembled at the receiver [RFC1122].",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-023",
+      "section": "2",
+      "quote": "flow a sequence of packets sent from a particular source to a particular (unicast or multicast) destination for which the source desires special handling by the intervening routers.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-024",
+      "section": "2",
+      "quote": "flow id a combination of a source address and a non-zero flow label.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-025",
+      "section": "3",
+      "quote": "This memo describes a technique to dynamically discover the PMTU of a path. The basic idea is that a source node initially assumes that the PMTU of a path is the (known) MTU of the first hop in the path. If any of the packets sent on that path are too large to be forwarded by some node along the path, that node will discard them and return ICMPv6 Packet Too Big messages. Upon receipt of such a message, the source node reduces its assumed PMTU for the path based on the MTU of the constricting hop as reported in the Packet Too Big message. The decreased PMTU causes the source to send smaller packets or change EMTU_S to cause the upper layer to reduce the size of IP packets it sends.",
+      "status": "TODO",
+      "reason": "IPv6 Connection and codec implement discovery without same-link bypass; native socket runtime accepts only IPv4. Full IPv6 ingress/departure integration and all overview behavior are not established by core-only tests.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+    },
+    {
+      "id": "8201-026",
+      "section": "3",
+      "quote": "The Path MTU Discovery process ends when the source node's estimate of the PMTU is less than or equal to the actual PMTU. Note that several iterations of the packet-sent/Packet-Too-Big-message-received cycle may occur before the Path MTU Discovery process ends, as there may be links with smaller MTUs further along the path.",
+      "status": "TODO",
+      "reason": "IPv6 Connection and codec implement discovery without same-link bypass; native socket runtime accepts only IPv4. Full IPv6 ingress/departure integration and all overview behavior are not established by core-only tests.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+    },
+    {
+      "id": "8201-027",
+      "section": "3",
+      "quote": "Alternatively, the node may elect to end the discovery process by ceasing to send packets larger than the IPv6 minimum link MTU.",
+      "status": "exception",
+      "reason": "Optional terminate-discovery-at-minimum mode is not selected in enabled PMTUD; selected TCP PLPMTUD continues ACK-confirmed search. Disabled-mode limit remains TODO.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+    },
+    {
+      "id": "8201-028",
+      "section": "3",
+      "quote": "The PMTU of a path may change over time, due to changes in the routing topology. Reductions of the PMTU are detected by Packet Too Big messages. To detect increases in a path's PMTU, a node periodically increases its assumed PMTU. This will almost always result in packets being discarded and Packet Too Big messages being",
+      "status": "TODO",
+      "reason": "IPv6 Connection and codec implement discovery without same-link bypass; native socket runtime accepts only IPv4. Full IPv6 ingress/departure integration and all overview behavior are not established by core-only tests.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+    },
+    {
+      "id": "8201-029",
+      "section": "3",
+      "quote": "generated, because in most cases the PMTU of the path will not have changed. Therefore, attempts to detect increases in a path's PMTU should be done infrequently.",
+      "status": "TODO",
+      "reason": "IPv6 Connection and codec implement discovery without same-link bypass; native socket runtime accepts only IPv4. Full IPv6 ingress/departure integration and all overview behavior are not established by core-only tests.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+    },
+    {
+      "id": "8201-030",
+      "section": "3",
+      "quote": "Path MTU Discovery supports multicast as well as unicast destinations. In the case of a multicast destination, copies of a packet may traverse many different paths to many different nodes. Each path may have a different PMTU, and a single multicast packet may result in multiple Packet Too Big messages, each reporting a different next-hop MTU. The minimum PMTU value across the set of paths in use determines the size of subsequent packets sent to the multicast destination.",
+      "status": "exception",
+      "reason": "Multicast path aggregation is outside unicast TCP; no multicast transport implementation is claimed.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+    },
+    {
+      "id": "8201-031",
+      "section": "3",
+      "quote": "Note that Path MTU Discovery must be performed even in cases where a node \"thinks\" a destination is attached to the same link as itself, as it might have a PMTU lower than the link MTU. In a situation such as when a neighboring router acts as proxy [ND] for some destination, the destination can appear to be directly connected, but it is in fact more than one hop away.",
+      "status": "TODO",
+      "reason": "IPv6 Connection and codec implement discovery without same-link bypass; native socket runtime accepts only IPv4. Full IPv6 ingress/departure integration and all overview behavior are not established by core-only tests.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+    },
+    {
+      "id": "8201-032",
+      "section": "4",
+      "quote": "As discussed in Section 1, IPv6 nodes are not required to implement Path MTU Discovery. The requirements in this section apply only to those implementations that include Path MTU Discovery.",
+      "status": "context",
+      "reason": "Applicability note, not a waiver for enabled PMTUD. Disabled IPv6 default-size obligation remains8201-004 TODO."
+    },
+    {
+      "id": "8201-033",
+      "section": "4",
+      "quote": "Nodes should appropriately validate the payload of ICMPv6 PTB messages to ensure these are received in response to transmitted traffic (i.e., a reported error condition that corresponds to an IPv6 packet actually sent by the application) per [ICMPv6].",
+      "status": "TODO",
+      "reason": "IPv6 core feedback validates recent exact packet evidence and enforces family floor/holdoff. Complete clause needs IPv6 codec-to-endpoint integration evidence; socket runtime is IPv4-only. Security deferral is selected RFC5927 policy, not an unconditional immediate decrease.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4"
+    },
+    {
+      "id": "8201-034",
+      "section": "4",
+      "quote": "If a node receives a Packet Too Big message reporting a next-hop MTU that is less than the IPv6 minimum link MTU, it must discard it. A node must not reduce its estimate of the Path MTU below the IPv6 minimum link MTU on receipt of a Packet Too Big message.",
+      "status": "covered",
+      "reason": "IPv6 core rejects1279 without changing1500 estimate and accepts1280; native IPv6 socket transport is not claimed.",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+      ],
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4"
+    },
+    {
+      "id": "8201-035",
+      "section": "4",
+      "quote": "When a node receives a Packet Too Big message, it must reduce its estimate of the PMTU for the relevant path, based on the value of the MTU field in the message. The precise behavior of a node in this circumstance is not specified, since different applications may have different requirements, and since different implementation architectures may favor different strategies.",
+      "status": "TODO",
+      "reason": "IPv6 core feedback validates recent exact packet evidence and enforces family floor/holdoff. Complete clause needs IPv6 codec-to-endpoint integration evidence; socket runtime is IPv4-only. Security deferral is selected RFC5927 policy, not an unconditional immediate decrease.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4"
+    },
+    {
+      "id": "8201-036",
+      "section": "4",
+      "quote": "After receiving a Packet Too Big message, a node must attempt to avoid eliciting more such messages in the near future. The node must reduce the size of the packets it is sending along the path. Using a PMTU estimate larger than the IPv6 minimum link MTU may continue to elicit Packet Too Big messages. Because each of these messages (and",
+      "status": "TODO",
+      "reason": "IPv6 core feedback validates recent exact packet evidence and enforces family floor/holdoff. Complete clause needs IPv6 codec-to-endpoint integration evidence; socket runtime is IPv4-only. Security deferral is selected RFC5927 policy, not an unconditional immediate decrease.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4"
+    },
+    {
+      "id": "8201-037",
+      "section": "4",
+      "quote": "the dropped packets they respond to) consume network resources, nodes using Path MTU Discovery must detect decreases in PMTU as fast as possible.",
+      "status": "TODO",
+      "reason": "IPv6 core feedback validates recent exact packet evidence and enforces family floor/holdoff. Complete clause needs IPv6 codec-to-endpoint integration evidence; socket runtime is IPv4-only. Security deferral is selected RFC5927 policy, not an unconditional immediate decrease.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4"
+    },
+    {
+      "id": "8201-038",
+      "section": "4",
+      "quote": "Nodes may detect increases in PMTU, but because doing so requires sending packets larger than the current estimated PMTU, and because the likelihood is that the PMTU will not have increased, this must be done at infrequent intervals. An attempt to detect an increase (by sending a packet larger than the current estimate) must not be done less than 5 minutes after a Packet Too Big message has been received for the given path. The recommended setting for this timer is twice its minimum value (10 minutes).",
+      "status": "covered",
+      "reason": "Both families retain ten-minute PTB hold through ACK progress and local link growth; only subsequent ACK-confirmed PLPMTUD can raise effective PMTU.",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    fn apply_ptb(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+      ],
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4"
+    },
+    {
+      "id": "8201-039",
+      "section": "4",
+      "quote": "A node must not increase its estimate of the Path MTU in response to the contents of a Packet Too Big message. A message purporting to announce an increase in the Path MTU might be a stale packet that has been floating around in the network, a false packet injected as part of a denial-of-service (DoS) attack, or the result of having multiple paths to the destination, each with a different PMTU.",
+      "status": "TODO",
+      "reason": "IPv6 core feedback validates recent exact packet evidence and enforces family floor/holdoff. Complete clause needs IPv6 codec-to-endpoint integration evidence; socket runtime is IPv4-only. Security deferral is selected RFC5927 policy, not an unconditional immediate decrease.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4"
+    },
+    {
+      "id": "8201-040",
+      "section": "5",
+      "quote": "This section discusses a number of issues related to the implementation of Path MTU Discovery. This is not a specification, but rather a set of notes provided as an aid for implementers.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-041",
+      "section": "5",
+      "quote": "The issues include:",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-042",
+      "section": "5",
+      "quote": "- What layer or layers implement Path MTU Discovery?",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-043",
+      "section": "5",
+      "quote": "- How is the PMTU information cached?",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-044",
+      "section": "5",
+      "quote": "- How is stale PMTU information removed?",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-045",
+      "section": "5",
+      "quote": "- What must transport and higher layers do?",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-046",
+      "section": "5.1",
+      "quote": "In the IP architecture, the choice of what size packet to send is made by a protocol at a layer above IP. This memo refers to such a protocol as a \"packetization protocol\". Packetization protocols are usually transport protocols (for example, TCP) but can also be higher-layer protocols (for example, protocols built on top of UDP).",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-047",
+      "section": "5.1",
+      "quote": "Implementing Path MTU Discovery in the packetization layers simplifies some of the inter-layer issues but has several drawbacks: the implementation may have to be redone for each packetization protocol, it becomes hard to share PMTU information between different",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-048",
+      "section": "5.1",
+      "quote": "packetization layers, and the connection-oriented state maintained by some packetization layers may not easily extend to save PMTU information for long periods.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-049",
+      "section": "5.1",
+      "quote": "It is therefore suggested that the IP layer store PMTU information and that the ICMPv6 layer process received Packet Too Big messages. The packetization layers may respond to changes in the PMTU by changing the size of the messages they send. To support this layering, packetization layers require a way to learn of changes in the value of MMS_S, the \"maximum send transport-message size\" [RFC1122].",
+      "status": "TODO",
+      "reason": "Core subtracts base IPv6 header and TCP options and does not fragment. Codec rejects IPv6 extension-header quotes; no extension-header PMTU accounting or shared IP-layer cache. Full generic IPv6 layering span is not satisfied.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.1"
+    },
+    {
+      "id": "8201-050",
+      "section": "5.1",
+      "quote": "MMS_S is a transport message size calculated by subtracting the size of the IPv6 header (including IPv6 extension headers) from the largest IP packet that can be sent, EMTU_S. MMS_S is limited by a combination of factors, including the PMTU, support for packet fragmentation and reassembly, and the packet reassembly limit (see \"Fragment Header\", Section 4.5 of [RFC8200]). When source fragmentation is available, EMTU_S is set to EMTU_R, as indicated by the receiver using an upper-layer protocol or based on protocol requirements (1500 octets for IPv6). When a message larger than PMTU is to be transmitted, the source creates fragments, each limited by PMTU. When source fragmentation is not desired, EMTU_S is set to PMTU, and the upper-layer protocol is expected to either perform its own fragmentation and reassembly or otherwise limit the size of its messages accordingly.",
+      "status": "TODO",
+      "reason": "Core subtracts base IPv6 header and TCP options and does not fragment. Codec rejects IPv6 extension-header quotes; no extension-header PMTU accounting or shared IP-layer cache. Full generic IPv6 layering span is not satisfied.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.1"
+    },
+    {
+      "id": "8201-051",
+      "section": "5.1",
+      "quote": "However, packetization layers are encouraged to avoid sending messages that will require source fragmentation (for the case against fragmentation, see [FRAG]).",
+      "status": "TODO",
+      "reason": "Core subtracts base IPv6 header and TCP options and does not fragment. Codec rejects IPv6 extension-header quotes; no extension-header PMTU accounting or shared IP-layer cache. Full generic IPv6 layering span is not satisfied.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.1"
+    },
+    {
+      "id": "8201-052",
+      "section": "5.2",
+      "quote": "Ideally, a PMTU value should be associated with a specific path traversed by packets exchanged between the source and destination nodes. However, in most cases a node will not have enough information to completely and accurately identify such a path. Rather, a node must associate a PMTU value with some local representation of a path. It is left to the implementation to select the local representation of a path. For nodes with multiple interfaces, Path MTU information should be maintained for each IPv6 link.",
+      "status": "TODO",
+      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+    },
+    {
+      "id": "8201-053",
+      "section": "5.2",
+      "quote": "In the case of a multicast destination address, copies of a packet may traverse many different paths to reach many different nodes. The local representation of the \"path\" to a multicast destination must represent a potentially large set of paths.",
+      "status": "exception",
+      "reason": "Multicast path aggregation is outside unicast TCP; no multicast transport implementation is claimed.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+    },
+    {
+      "id": "8201-054",
+      "section": "5.2",
+      "quote": "Minimally, an implementation could maintain a single PMTU value to be used for all packets originated from the node. This PMTU value would be the minimum PMTU learned across the set of all paths in use by the node. This approach is likely to result in the use of smaller packets than is necessary for many paths. In the case of multipath routing (e.g., Equal-Cost Multipath Routing (ECMP)), a set of paths can exist even for a single source and destination pair.",
+      "status": "exception",
+      "reason": "Alternative global/destination/flow-label/source-route cache keys are not selected; Connection-local tuple is the path representation. Shared-cache and IPv6 routing-header recommendations retain TODOs.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+    },
+    {
+      "id": "8201-055",
+      "section": "5.2",
+      "quote": "An implementation could use the destination address as the local representation of a path. The PMTU value associated with a destination would be the minimum PMTU learned across the set of all paths in use to that destination. This approach will result in the use of optimally sized packets on a per-destination basis. This approach integrates nicely with the conceptual model of a host as described in [ND]: a PMTU value could be stored with the corresponding entry in the destination cache.",
+      "status": "exception",
+      "reason": "Alternative global/destination/flow-label/source-route cache keys are not selected; Connection-local tuple is the path representation. Shared-cache and IPv6 routing-header recommendations retain TODOs.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+    },
+    {
+      "id": "8201-056",
+      "section": "5.2",
+      "quote": "If flows [RFC8200] are in use, an implementation could use the flow id as the local representation of a path. Packets sent to a particular destination but belonging to different flows may use different paths, as with ECMP, in which the choice of path might depend on the flow id. This approach might result in the use of optimally sized packets on a per-flow basis, providing finer granularity than PMTU values maintained on a per-destination basis.",
+      "status": "exception",
+      "reason": "Alternative global/destination/flow-label/source-route cache keys are not selected; Connection-local tuple is the path representation. Shared-cache and IPv6 routing-header recommendations retain TODOs.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+    },
+    {
+      "id": "8201-057",
+      "section": "5.2",
+      "quote": "For source-routed packets (i.e. packets containing an IPv6 Routing header [RFC8200]), the source route may further qualify the local representation of a path.",
+      "status": "exception",
+      "reason": "Alternative global/destination/flow-label/source-route cache keys are not selected; Connection-local tuple is the path representation. Shared-cache and IPv6 routing-header recommendations retain TODOs.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+    },
+    {
+      "id": "8201-058",
+      "section": "5.2",
+      "quote": "Initially, the PMTU value for a path is assumed to be the (known) MTU of the first-hop link.",
+      "status": "TODO",
+      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+    },
+    {
+      "id": "8201-059",
+      "section": "5.2",
+      "quote": "When a Packet Too Big message is received, the node determines which path the message applies to based on the contents of the Packet Too Big message. For example, if the destination address is used as the local representation of a path, the destination address from the original packet would be used to determine which path the message applies to.",
+      "status": "TODO",
+      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+    },
+    {
+      "id": "8201-060",
+      "section": "5.2",
+      "quote": "Note: if the original packet contained a Routing header, the Routing header should be used to determine the location of the destination address within the original packet. If Segments Left is equal to zero, the destination address is in the Destination Address field in the IPv6 header. If Segments Left is greater than zero, the destination address is the last address (Address[n]) in the Routing header.",
+      "status": "TODO",
+      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+    },
+    {
+      "id": "8201-061",
+      "section": "5.2",
+      "quote": "The node then uses the value in the MTU field in the Packet Too Big message as a tentative PMTU value or the IPv6 minimum link MTU if that is larger, and compares the tentative PMTU to the existing PMTU. If the tentative PMTU is less than the existing PMTU estimate, the tentative PMTU replaces the existing PMTU as the PMTU value for the path.",
+      "status": "TODO",
+      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+    },
+    {
+      "id": "8201-062",
+      "section": "5.2",
+      "quote": "The packetization layers must be notified about decreases in the PMTU. Any packetization layer instance (for example, a TCP connection) that is actively using the path must be notified if the PMTU estimate is decreased.",
+      "status": "TODO",
+      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+    },
+    {
+      "id": "8201-063",
+      "section": "5.2",
+      "quote": "Note: even if the Packet Too Big message contains an Original Packet Header that refers to a UDP packet, the TCP layer must be notified if any of its connections use the given path.",
+      "status": "TODO",
+      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+    },
+    {
+      "id": "8201-064",
+      "section": "5.2",
+      "quote": "Also, the instance that sent the packet that elicited the Packet Too Big message should be notified that its packet has been dropped, even if the PMTU estimate has not changed, so that it may retransmit the dropped data.",
+      "status": "TODO",
+      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+    },
+    {
+      "id": "8201-065",
+      "section": "5.2",
+      "quote": "Note: An implementation can avoid the use of an asynchronous notification mechanism for PMTU decreases by postponing notification until the next attempt to send a packet larger than the PMTU estimate. In this approach, when an attempt is made to SEND a packet that is larger than the PMTU estimate, the SEND function should fail and return a suitable error indication. This approach may be more suitable to a connectionless packetization layer (such as one using UDP), which (in some implementations) may be hard to \"notify\" from the ICMPv6 layer. In this case, the normal timeout-based retransmission mechanisms would be used to recover from the dropped packets.",
+      "status": "TODO",
+      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+    },
+    {
+      "id": "8201-066",
+      "section": "5.2",
+      "quote": "It is important to understand that the notification of the packetization layer instances using the path about the change in the PMTU is distinct from the notification of a specific instance that a packet has been dropped. The latter should be done as soon as practical (i.e., asynchronously from the point of view of the packetization layer instance), while the former may be delayed until a packetization layer instance wants to create a packet.",
+      "status": "TODO",
+      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+    },
+    {
+      "id": "8201-067",
+      "section": "5.3",
+      "quote": "Internetwork topology is dynamic; routes change over time. While the local representation of a path may remain constant, the actual path(s) in use may change. Thus, PMTU information cached by a node can become stale.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-068",
+      "section": "5.3",
+      "quote": "If the stale PMTU value is too large, this will be discovered almost immediately once a large enough packet is sent on the path. No such mechanism exists for realizing that a stale PMTU value is too small, so an implementation should \"age\" cached values. When a PMTU value has not been decreased for a while (on the order of 10 minutes), it should probe to find if a larger PMTU is supported.",
+      "status": "TODO",
+      "reason": "Ten-minute reset exists; no PmtudConfig aging duration/infinity setting. IPv6 core timers are tested, not a production IPv6 socket path.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.3"
+    },
+    {
+      "id": "8201-069",
+      "section": "5.3",
+      "quote": "Note: an implementation should provide a means for changing the timeout duration, including setting it to \"infinity\". For example, nodes attached to a link with a large MTU that is then attached to the rest of the Internet via a link with a small MTU are never going to discover a new non-local PMTU, so they should not have to put up with dropped packets every 10 minutes.",
+      "status": "TODO",
+      "reason": "Ten-minute reset exists; no PmtudConfig aging duration/infinity setting. IPv6 core timers are tested, not a production IPv6 socket path.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.3"
+    },
+    {
+      "id": "8201-070",
+      "section": "5.4",
+      "quote": "A packetization layer (e.g., TCP) must use the PMTU for the path(s) in use by a connection; it should not send segments that would result in packets larger than the PMTU, except to probe during PMTU Discovery (this probe packet must not be fragmented to the PMTU). A simple implementation could ask the IP layer for this value each time it created a new segment, but this could be inefficient. An implementation typically caches other values derived from the PMTU. It may be simpler to receive asynchronous notification when the PMTU changes, so that these variables may be also updated.",
+      "status": "TODO",
+      "reason": "Core bounds data and repair by current PMTU and peer MSS. Complete IPv6 packetization/ECN/loss interaction requires exact full-span tests; native sockets are IPv4-only. PTB invokes set_mss rescaling, not a proven unchanged congestion window.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+    },
+    {
+      "id": "8201-071",
+      "section": "5.4",
+      "quote": "A TCP implementation must also store the Maximum Segment Size (MSS) value received from its peer, which represents the EMTU_R, the largest packet that can be reassembled by the receiver, and must not send any segment larger than this MSS, regardless of the PMTU.",
+      "status": "covered",
+      "reason": "IPv6 core stores peer MSS separately, defaults1220, caps transmit size independently of local link and retains receive MSS1460.",
+      "evidence": [
+        "crates/ntcp/src/connection.rs::    fn refresh_path_mss(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_missing_peer_mss_and_small_allocation_remain_independent()"
+      ],
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+    },
+    {
+      "id": "8201-072",
+      "section": "5.4",
+      "quote": "The value sent in the TCP MSS option is independent of the PMTU; it is determined by the receiver reassembly limit EMTU_R. This MSS option value is used by the other end of the connection, which may be using an unrelated PMTU value. See Section 5, \"Packet Size Issues\", and Section 8.3, \"Maximum Upper-Layer Payload Size\", of [RFC8200] for information on selecting a value for the TCP MSS option.",
+      "status": "covered",
+      "reason": "IPv6 core stores peer MSS separately, defaults1220, caps transmit size independently of local link and retains receive MSS1460.",
+      "evidence": [
+        "crates/ntcp/src/connection.rs::    fn refresh_path_mss(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_missing_peer_mss_and_small_allocation_remain_independent()"
+      ],
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+    },
+    {
+      "id": "8201-073",
+      "section": "5.4",
+      "quote": "Reception of a Packet Too Big message implies that a packet was dropped by the node that sent the ICMPv6 message. A reliable upper- layer protocol will detect this loss by its own means, and recover it by its normal retransmission methods. The retransmission could result in delay, depending on the loss detection method used by the upper-layer protocol. If the Path MTU Discovery process requires several steps to find the PMTU of the full path, this could finally delay the retransmission by many round-trip times.",
+      "status": "TODO",
+      "reason": "Core bounds data and repair by current PMTU and peer MSS. Complete IPv6 packetization/ECN/loss interaction requires exact full-span tests; native sockets are IPv4-only. PTB invokes set_mss rescaling, not a proven unchanged congestion window.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+    },
+    {
+      "id": "8201-074",
+      "section": "5.4",
+      "quote": "Alternatively, the retransmission could be done in immediate response to a notification that the Path MTU was decreased, but only for the specific connection specified by the Packet Too Big message. The packet size used in the retransmission should be no larger than the new PMTU.",
+      "status": "TODO",
+      "reason": "Core bounds data and repair by current PMTU and peer MSS. Complete IPv6 packetization/ECN/loss interaction requires exact full-span tests; native sockets are IPv4-only. PTB invokes set_mss rescaling, not a proven unchanged congestion window.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+    },
+    {
+      "id": "8201-075",
+      "section": "5.4",
+      "quote": "Note: A packetization layer that determines a probe packet is lost needs to adapt the segment size of the retransmission. Using the reported size in the last Packet Too Big message, however, can lead to further losses as there might be smaller PMTU limits at the routers further along the path. This would lead to loss of all retransmitted segments and therefore cause unnecessary congestion as well as additional packets to be sent each time a new router announces a smaller MTU. Any packetization layer that uses retransmission is therefore also responsible for congestion control of its retransmissions [RFC8085].",
+      "status": "TODO",
+      "reason": "Core bounds data and repair by current PMTU and peer MSS. Complete IPv6 packetization/ECN/loss interaction requires exact full-span tests; native sockets are IPv4-only. PTB invokes set_mss rescaling, not a proven unchanged congestion window.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+    },
+    {
+      "id": "8201-076",
+      "section": "5.4",
+      "quote": "A loss caused by a PMTU probe indicated by the reception of a Packet Too Big message must not be considered as a congestion notification, and hence the congestion window may not change.",
+      "status": "TODO",
+      "reason": "Accepted PTB calls refresh_path_mss and Congestion::set_mss, rescaling cwnd down on a decreased MSS. There is no distinct PTB-probe-loss branch proving unchanged congestion window; the IPv6 wire-floor test instead asserts the changed byte ratio. Do not falsely close the literal clause.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+    },
+    {
+      "id": "8201-077",
+      "section": "5.5",
+      "quote": "Some transport protocols are not allowed to repacketize when doing a retransmission. That is, once an attempt is made to transmit a segment of a certain size, the transport cannot split the contents of the segment into smaller segments for retransmission. In such a case, the original segment can be fragmented by the IP layer during retransmission. Subsequent segments, when transmitted for the first time, should be no larger than allowed by the Path MTU.",
+      "status": "exception",
+      "reason": "Non-repacketizing transport protocol actor; TCP retransmissions can be split and no IP fragmentation service is provided.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.5"
+    },
+    {
+      "id": "8201-078",
+      "section": "5.5",
+      "quote": "Path MTU Discovery for IPv4 [RFC1191] used NFS as an example of a UDP-based application that benefits from PMTU Discovery. Since then, [RFC7530] states that the supported transport layer between NFS and IP must be an IETF standardized transport protocol that is specified to avoid network congestion; such transports include TCP, Stream Control Transmission Protocol (SCTP) [RFC4960], and the Datagram Congestion Control Protocol (DCCP) [RFC4340]. In this case, the transport is responsible for ensuring that transmitted segments (except probes) conform to the Path MTU, including supporting PMTU Discovery probe transmissions as needed.",
+      "status": "TODO",
+      "reason": "No exact full-span implementation/test evidence recorded; remains an explicit audit gap, not a conformance pass.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.5"
+    },
+    {
+      "id": "8201-079",
+      "section": "5.6",
+      "quote": "It is suggested that an implementation provides a way for a system utility program to:",
+      "status": "TODO",
+      "reason": "No per-path management disable/arbitrary PMTU or aging-timeout API. Disabling PMTUD does not automatically cap IPv6 packets to1280.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
+    },
+    {
+      "id": "8201-080",
+      "section": "5.6",
+      "quote": "- Specify that Path MTU Discovery not be done on a given path.",
+      "status": "TODO",
+      "reason": "No per-path management disable/arbitrary PMTU or aging-timeout API. Disabling PMTUD does not automatically cap IPv6 packets to1280.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
+    },
+    {
+      "id": "8201-081",
+      "section": "5.6",
+      "quote": "- Change the PMTU value associated with a given path.",
+      "status": "TODO",
+      "reason": "No per-path management disable/arbitrary PMTU or aging-timeout API. Disabling PMTUD does not automatically cap IPv6 packets to1280.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
+    },
+    {
+      "id": "8201-082",
+      "section": "5.6",
+      "quote": "The former can be accomplished by associating a flag with the path; when a packet is sent on a path with this flag set, the IP layer does not send packets larger than the IPv6 minimum link MTU.",
+      "status": "TODO",
+      "reason": "No per-path management disable/arbitrary PMTU or aging-timeout API. Disabling PMTUD does not automatically cap IPv6 packets to1280.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
+    },
+    {
+      "id": "8201-083",
+      "section": "5.6",
+      "quote": "These features might be used to work around an anomalous situation or by a routing protocol implementation that is able to obtain Path MTU values.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-084",
+      "section": "5.6",
+      "quote": "The implementation should also provide a way to change the timeout period for aging stale PMTU information.",
+      "status": "TODO",
+      "reason": "No per-path management disable/arbitrary PMTU or aging-timeout API. Disabling PMTUD does not automatically cap IPv6 packets to1280.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
+    },
+    {
+      "id": "8201-085",
+      "section": "6",
+      "quote": "This Path MTU Discovery mechanism makes possible two DoS attacks, both based on a malicious party sending false Packet Too Big messages to a node.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-086",
+      "section": "6",
+      "quote": "In the first attack, the false message indicates a PMTU much smaller than reality. In response, the victim node should never set its PMTU estimate below the IPv6 minimum link MTU. A sender that falsely reduces to this MTU would observe suboptimal performance.",
+      "status": "TODO",
+      "reason": "Core guards prevent sub1280 reductions and ICMP increases; no complete IPv6 socket security integration evidence.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-6"
+    },
+    {
+      "id": "8201-087",
+      "section": "6",
+      "quote": "In the second attack, the false message indicates a PMTU larger than reality. If believed, this could cause temporary blockage as the victim sends packets that will be dropped by some router. Within one round-trip time, the node would discover its mistake (receiving Packet Too Big messages from that router), but frequent repetition of this attack could cause lots of packets to be dropped. A node, however, must not raise its estimate of the PMTU based on a Packet Too Big message, so it should not be vulnerable to this attack.",
+      "status": "TODO",
+      "reason": "Core guards prevent sub1280 reductions and ICMP increases; no complete IPv6 socket security integration evidence.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-6"
+    },
+    {
+      "id": "8201-088",
+      "section": "6",
+      "quote": "Both of these attacks can cause a black-hole connection, that is, the TCP three-way handshake completes correctly but the connection hangs when data is transferred.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-089",
+      "section": "6",
+      "quote": "A malicious party could also cause problems if it could stop a victim from receiving legitimate Packet Too Big messages, but in this case there are simpler DoS attacks available.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-090",
+      "section": "6",
+      "quote": "If ICMPv6 filtering prevents reception of ICMPv6 Packet Too Big messages, the source will not learn the actual path MTU. \"Packetization Layer Path MTU Discovery\" [RFC4821] does not rely upon network support for ICMPv6 messages and is therefore considered more robust than standard PMTUD. It is not susceptible to \"black-holed\" connections caused by the filtering of ICMPv6 messages. See [RFC4890] for recommendations regarding filtering ICMPv6 messages.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-091",
+      "section": "7",
+      "quote": "This document does not require any IANA actions.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-092",
+      "section": "8.1",
+      "quote": "[ICMPv6] Conta, A., Deering, S., and M. Gupta, Ed., \"Internet Control Message Protocol (ICMPv6) for the Internet Protocol Version 6 (IPv6) Specification\", STD 89, RFC 4443, DOI 10.17487/RFC4443, March 2006, <http://www.rfc-editor.org/info/rfc4443>.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-093",
+      "section": "8.1",
+      "quote": "[RFC8200] Deering, S. and R. Hinden, \"Internet Protocol, Version 6 (IPv6) Specification\", STD 86, RFC 8200, DOI 10.17487/RFC8200, July 2017, <http://www.rfc-editor.org/info/rfc8200>.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-094",
+      "section": "8.2",
+      "quote": "[FRAG] Kent, C. and J. Mogul, \"Fragmentation Considered Harmful\", In Proc. SIGCOMM '87 Workshop on Frontiers in Computer Communications Technology, DOI 10.1145/55483.55524, August 1987.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-095",
+      "section": "8.2",
+      "quote": "[ND] Narten, T., Nordmark, E., Simpson, W., and H. Soliman, \"Neighbor Discovery for IP version 6 (IPv6)\", RFC 4861, DOI 10.17487/RFC4861, September 2007, <http://www.rfc-editor.org/info/rfc4861>.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-096",
+      "section": "8.2",
+      "quote": "[RFC1122] Braden, R., Ed., \"Requirements for Internet Hosts - Communication Layers\", STD 3, RFC 1122, DOI 10.17487/RFC1122, October 1989, <http://www.rfc-editor.org/info/rfc1122>.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-097",
+      "section": "8.2",
+      "quote": "[RFC1191] Mogul, J. and S. Deering, \"Path MTU discovery\", RFC 1191, DOI 10.17487/RFC1191, November 1990, <http://www.rfc-editor.org/info/rfc1191>.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-098",
+      "section": "8.2",
+      "quote": "[RFC1981] McCann, J., Deering, S., and J. Mogul, \"Path MTU Discovery for IP version 6\", RFC 1981, DOI 10.17487/RFC1981, August 1996, <http://www.rfc-editor.org/info/rfc1981>.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-099",
+      "section": "8.2",
+      "quote": "[RFC2119] Bradner, S., \"Key words for use in RFCs to Indicate Requirement Levels\", BCP 14, RFC 2119, DOI 10.17487/RFC2119, March 1997, <http://www.rfc-editor.org/info/rfc2119>.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-100",
+      "section": "8.2",
+      "quote": "[RFC2923] Lahey, K., \"TCP Problems with Path MTU Discovery\", RFC 2923, DOI 10.17487/RFC2923, September 2000, <http://www.rfc-editor.org/info/rfc2923>.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-101",
+      "section": "8.2",
+      "quote": "[RFC4340] Kohler, E., Handley, M., and S. Floyd, \"Datagram Congestion Control Protocol (DCCP)\", RFC 4340, DOI 10.17487/RFC4340, March 2006, <http://www.rfc-editor.org/info/rfc4340>.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-102",
+      "section": "8.2",
+      "quote": "[RFC4821] Mathis, M. and J. Heffner, \"Packetization Layer Path MTU Discovery\", RFC 4821, DOI 10.17487/RFC4821, March 2007, <http://www.rfc-editor.org/info/rfc4821>.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-103",
+      "section": "8.2",
+      "quote": "[RFC4890] Davies, E. and J. Mohacsi, \"Recommendations for Filtering ICMPv6 Messages in Firewalls\", RFC 4890, DOI 10.17487/RFC4890, May 2007, <http://www.rfc-editor.org/info/rfc4890>.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-104",
+      "section": "8.2",
+      "quote": "[RFC4960] Stewart, R., Ed., \"Stream Control Transmission Protocol\", RFC 4960, DOI 10.17487/RFC4960, September 2007, <http://www.rfc-editor.org/info/rfc4960>.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-105",
+      "section": "8.2",
+      "quote": "[RFC6691] Borman, D., \"TCP Options and Maximum Segment Size (MSS)\", RFC 6691, DOI 10.17487/RFC6691, July 2012, <http://www.rfc-editor.org/info/rfc6691>.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-106",
+      "section": "8.2",
+      "quote": "[RFC7530] Haynes, T., Ed. and D. Noveck, Ed., \"Network File System (NFS) Version 4 Protocol\", RFC 7530, DOI 10.17487/RFC7530, March 2015, <http://www.rfc-editor.org/info/rfc7530>.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    },
+    {
+      "id": "8201-107",
+      "section": "8.2",
+      "quote": "[RFC8085] Eggert, L., Fairhurst, G., and G. Shepherd, \"UDP Usage Guidelines\", BCP 145, RFC 8085, DOI 10.17487/RFC8085, March 2017, <http://www.rfc-editor.org/info/rfc8085>.",
+      "status": "context",
+      "reason": "Explanatory background, terminology, example, cross-reference or bibliography; operative behavior is inventoried in the selected spans, not inferred from keyword occurrence."
+    }
+  ],
+  "errata": [],
+  "errata_url": "https://www.rfc-editor.org/errata/rfc8201",
+  "nonoperative_sections": [
+    "front matter, abstract, copyright, section2 definitions, section7 IANA, section8 references, appendicesA/B comparisons/change log, acknowledgements, author addresses"
+  ],
+  "counting_note": "Duvet requirement counts are audit spans, including advice and overlapping automatic/manual quotes; they are not counts of unique mandatory norms. Covered includes exceptions; subtract excepted for source-and-test-only coverage.",
+  "interpretation": "Standards Track IPv6 replacement forRFC1981. Lowercase must/should are intentional (section1); section5 explicitly provides implementation notes rather than a specification. Section4 sub1280 discard controls conflicting older section5.2 clamp prose."
+}

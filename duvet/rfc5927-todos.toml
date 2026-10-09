@@ -1,0 +1,506 @@
+# Open full-span implementation/test gaps and true actor/alternative exceptions.
+# RFC5927 TODOs describe policy/evidence differences, NOT mandatory TCP nonconformance.
+
+# 5927-003
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-1"
+reason = "Informational security guidance, not Standards Track TCP mandates; general ICMP validation is partly implemented but does not establish every mitigation in this document."
+quote = '''
+It is clear that implementations should be more cautious when processing ICMP error messages, to eliminate or mitigate the use of ICMP to perform attacks against TCP [RFC4907].
+'''
+
+# 5927-008
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-1"
+reason = "Informational BCP14 declaration is interpreted by specification readers; it does not make this RFC Standards Track or convert historical quotations into current TCP mandates."
+quote = '''
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in RFC 2119 [RFC2119].
+'''
+
+# 5927-011
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-2.1"
+reason = "Transport recovers without ICMP via ordinary loss timers/PLPMTUD; this informational robustness statement is not a newly imposed TCP MUST."
+quote = '''
+It is important to note that ICMP error messages are transmitted unreliably and may be discarded due to data corruption, network congestion, or rate-limiting. Thus, while they provide useful information, upper-layer protocols cannot depend on ICMP for correct operation.
+'''
+
+# 5927-023
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-2.2"
+reason = "Informational historical RFC1122 description; current RFC9293 owns normative error semantics. General non-PTB ICMP routing is not wired by native runtime."
+quote = '''
+The Host Requirements RFC [RFC1122] states in Section 4.2.3.9 that TCP MUST act on an ICMP error message passed up from the IP layer, directing it to the connection that triggered the error.
+'''
+
+# 5927-024
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-2.2"
+reason = "Informational historical RFC1122 description; current RFC9293 owns normative error semantics. General non-PTB ICMP routing is not wired by native runtime."
+quote = '''
+In order to allow ICMP messages to be demultiplexed by the receiving system, part of the original packet that triggered the message is included in the payload of the ICMP error message. Thus, the receiving system can use that information to match the ICMP error to the transport protocol instance that triggered it.
+'''
+
+# 5927-029
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-2.3"
+reason = "Informational IPsec administrator/security-association actor; ntcp has no IPsec transform or IPsec ICMP-policy API."
+quote = '''
+Section 5.2 of [RFC4301] describes the processing of inbound IP traffic in the case of "unprotected-to-protected". In the case of ICMP, when an unprotected ICMP error message is received, it is
+'''
+
+# 5927-030
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-2.3"
+reason = "Informational IPsec administrator/security-association actor; ntcp has no IPsec transform or IPsec ICMP-policy API."
+quote = '''
+matched to the corresponding security association by means of the SPI (Security Parameters Index) included in the payload of the ICMP error message. Then, local policy is applied to determine whether to accept or reject the message and, if accepted, what action to take as a result. For example, if an ICMP Destination Unreachable message is received, the implementation must decide whether to act on it, reject it, or act on it with constraints. Section 8 ("Path MTU/DF Processing") discusses the processing of unauthenticated ICMPv4 "fragmentation needed and DF bit set" (type 3, code 4) and ICMPv6 "Packet Too Big" (type 2, code 0) messages when an IPsec implementation is configured to process (vs. ignore) such messages.
+'''
+
+# 5927-031
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-2.3"
+reason = "Informational IPsec administrator/security-association actor; ntcp has no IPsec transform or IPsec ICMP-policy API."
+quote = '''
+Section 6.1.1 of [RFC4301] notes that processing of unauthenticated ICMP error messages may result in denial or degradation of service, and therefore it would be desirable to ignore such messages. However, it also notes that in many cases, ignoring these ICMP messages can degrade service, e.g., because of a failure to process PMTUD and redirection messages, and therefore there is also a motivation for accepting and acting upon them. It finally states that to accommodate both ends of this spectrum, a compliant IPsec implementation MUST permit a local administrator to configure an IPsec implementation to accept or reject unauthenticated ICMP traffic, and that this control MUST be at the granularity of ICMP type and MAY be at the granularity of ICMP type and code. Additionally, an implementation SHOULD incorporate mechanisms and parameters for dealing with such traffic.
+'''
+
+# 5927-032
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-2.3"
+reason = "Informational IPsec administrator/security-association actor; ntcp has no IPsec transform or IPsec ICMP-policy API."
+quote = '''
+Thus, the policy to apply for the processing of unprotected ICMP error messages is left up to the implementation and administrator.
+'''
+
+# 5927-034
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-3"
+reason = "Historical ICMP message generator requirements are not requirements to generate router errors in this TCP endpoint. Quote decoder validation remains in scope."
+quote = '''
+For ICMPv4, [RFC0792] states that the IP header plus the first 64 bits of the packet that triggered the ICMPv4 message are to be included in the payload of the ICMPv4 error message. Thus, it is assumed that all data needed to identify a transport protocol instance and process the ICMPv4 error message is contained in the first 64 bits of the transport protocol header. Section 3.2.2 of [RFC1122] states that "the Internet header and at least the first 8 data octets of the datagram that triggered the error" are to be
+'''
+
+# 5927-035
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-3"
+reason = "Historical ICMP message generator requirements are not requirements to generate router errors in this TCP endpoint. Quote decoder validation remains in scope."
+quote = '''
+included in the payload of ICMPv4 error messages, and that "more than 8 octets MAY be sent", thus allowing implementations to include more data from the original packet than those required by the original ICMPv4 specification. The "Requirements for IP Version 4 Routers" RFC [RFC1812] states that ICMPv4 error messages "SHOULD contain as much of the original datagram as possible without the length of the ICMP datagram exceeding 576 bytes".
+'''
+
+# 5927-036
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-3"
+reason = "Historical ICMP generator/quotation rules describe information available for validation, not new TCP mandatory norms."
+quote = '''
+Thus, for ICMPv4 messages generated by hosts, we can only expect to get the entire IP header of the original packet, plus the first 64 bits of its payload. For TCP, this means that the only fields that will be included in the ICMPv4 payload are the source port number, the destination port number, and the 32-bit TCP sequence number. This clearly imposes a constraint on the possible validation checks that can be performed, as there is not much information available on which to perform them.
+'''
+
+# 5927-038
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-3"
+reason = "Historical ICMP message generator requirements are not requirements to generate router errors in this TCP endpoint. Quote decoder validation remains in scope."
+quote = '''
+[RFC4884] updated [RFC0792] and specified that ICMPv4 Destination Unreachable (type 3), Time Exceeded (type 11), and Parameter Problem (type 12) messages that have an ICMP Extension Structure appended include at least 128 octets in the "original datagram" field. This would improve the situation, but at the time of this writing, [RFC4884] is not yet widely deployed for end-systems.
+'''
+
+# 5927-039
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-3"
+reason = "Historical ICMP message generator requirements are not requirements to generate router errors in this TCP endpoint. Quote decoder validation remains in scope."
+quote = '''
+For IPv6, the payload of ICMPv6 error messages includes as many octets from the IPv6 packet that triggered the ICMPv6 error message as will fit without making the resulting ICMPv6 error message exceed the minimum IPv6 MTU (1280 octets) [RFC4443]. Thus, more information is available than in the IPv4 case.
+'''
+
+# 5927-040
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-3"
+reason = "Unselected optional authentication deployment requiring router security associations; no IPsec authentication is claimed, and quote plausibility is not authentication."
+quote = '''
+Hosts could require ICMP error messages to be authenticated [RFC4301], in order to act upon them. However, while this requirement could make sense for those ICMP error messages sent by hosts, it would not be feasible for those ICMP error messages generated by routers, as this would imply either that the attacked system should have a security association [RFC4301] with every
+'''
+
+# 5927-041
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-3"
+reason = "Unselected optional authentication deployment requiring router security associations; no IPsec authentication is claimed, and quote plausibility is not authentication."
+quote = '''
+existing intermediate system, or that it should be able to establish one dynamically. Current levels of deployment of protocols for dynamic establishment of security associations makes this unfeasible. Additionally, this would require routers to use certificates with paths compatible for all hosts on the network. Finally, there may be some scenarios, such as embedded devices, in which the processing power requirements of authentication might not allow IPsec authentication to be implemented effectively.
+'''
+
+# 5927-049
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-4.2"
+reason = "Ephemeral-port randomization is separate security-policy behavior; this PMTU audit has not established entropy/range tests for native allocation. Informational recommendation remains unclosed, not a mandatory TCP norm."
+quote = '''
+As discussed in the previous sections, in order to perform any of the attacks described in this document, an attacker would need to guess (or know) the four-tuple that identifies the connection to be attacked. Increasing the port number range used for outgoing TCP connections, and randomizing the port number chosen for each outgoing TCP connection, would make it harder for an attacker to perform any of the attacks discussed in this document.
+'''
+
+# 5927-050
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-4.2"
+reason = "Ephemeral-port randomization is separate security-policy behavior; this PMTU audit has not established entropy/range tests for native allocation. Informational recommendation remains unclosed, not a mandatory TCP norm."
+quote = '''
+[PORT-RANDOM] recommends that transport protocols randomize the ephemeral ports used by clients, and proposes a number of randomization algorithms.
+'''
+
+# 5927-051
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-4.3"
+reason = "Informational firewall/NAT ingress/egress filtering actor, not a TCP endpoint feature. Runtime accepts intermediate-router outer source addresses."
+quote = '''
+The source address of ICMP error messages does not need to be spoofed to perform the attacks described in this document, as the ICMP error messages might legitimately come from an intermediate system. Therefore, simple filtering based on the source address of ICMP error messages does not serve as a counter-measure against these attacks. However, a more advanced packet filtering can be implemented in middlebox devices such as firewalls and NATs. Middleboxes implementing such advanced filtering look at the payload of the ICMP error messages, and perform ingress and egress packet filtering based on the source address of the IP header contained in the payload of the ICMP error message. As the source address contained in the payload of the ICMP error message does need to be spoofed to perform the attacks described in this document, this kind of advanced filtering serves as a counter-measure against these attacks. As with traditional egress filtering [IP-filtering], egress filtering based on the ICMP payload can help to prevent users of the network being
+'''
+
+# 5927-052
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-4.3"
+reason = "Informational firewall/NAT ingress/egress filtering actor, not a TCP endpoint feature. Runtime accepts intermediate-router outer source addresses."
+quote = '''
+protected by the firewall from successfully performing ICMP attacks against TCP connections established between external systems. Additionally, ingress filtering based on the ICMP payload can prevent TCP connections established between internal systems from being attacked by external systems. [ICMP-Filtering] provides examples of ICMP filtering based on the ICMP payload.
+'''
+
+# 5927-055
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-5.1"
+reason = "Historical quotations/extrapolations from older error-handling specifications describe attack exposure, not new RFC5927 TCP mandates. Current RFC9293 controls normative handling; recommended security mitigation remains separately TODO."
+quote = '''
+o If the network problem being reported is a "hard error", TCP will abort the corresponding connection.
+'''
+
+# 5927-056
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-5.1"
+reason = "Historical quotations/extrapolations from older error-handling specifications describe attack exposure, not new RFC5927 TCP mandates. Current RFC9293 controls normative handling; recommended security mitigation remains separately TODO."
+quote = '''
+o If the network problem being reported is a "soft error", TCP will just record this information, and repeatedly retransmit its data until they either get acknowledged, or the connection times out.
+'''
+
+# 5927-057
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-5.1"
+reason = "Historical quotations/extrapolations from older error-handling specifications describe attack exposure, not new RFC5927 TCP mandates. Current RFC9293 controls normative handling; recommended security mitigation remains separately TODO."
+quote = '''
+The Host Requirements RFC [RFC1122] states (in Section 4.2.3.9) that a host SHOULD abort the corresponding connection when receiving an ICMPv4 error message that indicates a "hard error", and states that ICMPv4 error messages of type 3 (Destination Unreachable), codes 2 (protocol unreachable), 3 (port unreachable), and 4 (fragmentation needed and DF bit set) should be considered as indicating "hard errors". In the case of ICMPv4 port unreachables, the specifications are ambiguous, as Section 4.2.3.9 of [RFC1122] states that TCP SHOULD abort the corresponding connection in response to them, but Section 3.2.2.1 of the same RFC ([RFC1122]) states that TCP MUST abort the connection in response to them.
+'''
+
+# 5927-058
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-5.1"
+reason = "Historical quotations/extrapolations from older error-handling specifications describe attack exposure, not new RFC5927 TCP mandates. Current RFC9293 controls normative handling; recommended security mitigation remains separately TODO."
+quote = '''
+While [RFC4443] did not exist when [RFC1122] was published, one could extrapolate the concept of "hard errors" to ICMPv6 error messages of type 1 (Destination Unreachable), codes 1 (communication with destination administratively prohibited), and 4 (port unreachable).
+'''
+
+# 5927-066
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-5.2"
+reason = "Connection::network_error still aborts HardUnreachable in synchronized states and runtime only dispatches PTB. Described hard-to-soft mitigation is not implemented end-to-end; Informational policy gap, not a Standards Track violation."
+quote = '''
+This error message indicates that the system sending the ICMP error message received a packet meant for a socket (IP address, port number) on which there is no process listening. Those transport protocols that have their own mechanisms for signaling this condition should not be receiving these error messages, as the protocol would signal the port unreachable condition by means of its own mechanisms. Assuming that once a connection is established it is not usual for the transport protocol to change (or be reloaded), it should be unusual to get these error messages.
+'''
+
+# 5927-068
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-5.2"
+reason = "Connection::network_error still aborts HardUnreachable in synchronized states and runtime only dispatches PTB. Described hard-to-soft mitigation is not implemented end-to-end; Informational policy gap, not a Standards Track violation."
+quote = '''
+This error message indicates that an intermediate node needed to fragment a datagram, but the DF (Don't Fragment) bit in the IP header was set. It is considered a "soft error" when TCP implements PMTUD, and a "hard error" if TCP does not implement PMTUD. Those TCP/IP stacks that do not implement PMTUD (or have disabled it) but support IP fragmentation/reassembly should not be sending their IP packets with the DF bit set, and thus should not be receiving these ICMP error messages. Some TCP/IP stacks that do not implement PMTUD and that do not support IP fragmentation/ reassembly are known to send their packets with the DF bit set, and thus could legitimately receive these ICMP error messages.
+'''
+
+# 5927-073
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-5.2"
+reason = "Historical quotations/extrapolations from older error-handling specifications describe attack exposure, not new RFC5927 TCP mandates. Current RFC9293 controls normative handling; recommended security mitigation remains separately TODO."
+quote = '''
+The Host Requirements RFC [RFC1122] states in Section 4.2.3.9 that TCP SHOULD abort the corresponding connection in response to ICMPv4 messages of type 3 (Destination Unreachable), codes 2 (protocol unreachable), 3 (port unreachable), and 4 (fragmentation needed and DF bit set). However, Section 3.2.2.1 states that TCP MUST accept an ICMPv4 port unreachable (type 3, code 3) for the same purpose as a RST. Therefore, for ICMPv4 messages of type 3, codes 2 and 4, there is room to go against the advice provided in the existing specifications, while in the case of ICMPv4 messages of type 3, code 3, there is ambiguity in the specifications that may or may not provide some room to go against that advice.
+'''
+
+# 5927-074
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-5.2"
+reason = "Connection::network_error still aborts HardUnreachable in synchronized states and runtime only dispatches PTB. Described hard-to-soft mitigation is not implemented end-to-end; Informational policy gap, not a Standards Track violation."
+quote = '''
+Based on this analysis, most popular TCP implementations treat all ICMP "hard errors" received for connections in any of the synchronized states (ESTABLISHED, FIN-WAIT-1, FIN-WAIT-2, CLOSE-WAIT, CLOSING, LAST-ACK, or TIME-WAIT) as "soft errors". That is, they do not abort the corresponding connection upon receipt of them.
+'''
+
+# 5927-075
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-5.2"
+reason = "Connection::network_error still aborts HardUnreachable in synchronized states and runtime only dispatches PTB. Described hard-to-soft mitigation is not implemented end-to-end; Informational policy gap, not a Standards Track violation."
+quote = '''
+Additionally, they do not extrapolate ICMP errors across TCP connections. This policy is based on the premise that TCP should be as robust as possible. Aborting the connection would be to ignore the valuable feature of the Internet -- that for many internal failures, it reconstructs its function without any disruption of the endpoints [RFC0816].
+'''
+
+# 5927-077
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-5.2"
+reason = "Connection::network_error still aborts HardUnreachable in synchronized states and runtime only dispatches PTB. Described hard-to-soft mitigation is not implemented end-to-end; Informational policy gap, not a Standards Track violation."
+quote = '''
+It is interesting to note that, as ICMP error messages are transmitted unreliably, transport protocols should not depend on them for correct functioning. In the event one of these messages were legitimate, the corresponding connection would eventually time out. Also, applications may still be notified asynchronously about the error condition, and thus may still abort their connections on their own if they consider it appropriate.
+'''
+
+# 5927-081
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-6.1"
+reason = "Historical quotations/extrapolations from older error-handling specifications describe attack exposure, not new RFC5927 TCP mandates. Current RFC9293 controls normative handling; recommended security mitigation remains separately TODO."
+quote = '''
+The Host Requirements RFC [RFC1122] states in Section 4.2.3.9 that hosts MUST react to ICMPv4 Source Quench messages by slowing transmission on the connection. Thus, an attacker could send ICMPv4 Source Quench (type 4, code 0) messages to a TCP endpoint to make it reduce the rate at which it sends data to the other endpoint of the connection. [RFC1122] further adds that the RECOMMENDED procedure is to put the corresponding connection in the slow-start phase of TCP's congestion control algorithm [RFC5681]. In the case of those implementations that use an initial congestion window of one segment, a sustained attack would reduce the throughput of the attacked connection to about SMSS (Sender Maximum Segment Size) [RFC5681] bytes per RTT (round-trip time). The throughput achieved during an attack might be a little higher if a larger initial congestion window is in use [RFC3390].
+'''
+
+# 5927-082
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-6.2"
+reason = "Historical quotations/extrapolations from older error-handling specifications describe attack exposure, not new RFC5927 TCP mandates. Current RFC9293 controls normative handling; recommended security mitigation remains separately TODO."
+quote = '''
+As discussed in the "Requirements for IP Version 4 Routers" RFC [RFC1812], research seems to suggest that ICMPv4 Source Quench messages are an ineffective (and unfair) antidote for congestion. [RFC1812] further states that routers SHOULD NOT send ICMPv4 Source Quench messages in response to congestion. Furthermore, TCP implements its own congestion control mechanisms ([RFC5681] [RFC3168]) that do not depend on ICMPv4 Source Quench messages.
+'''
+
+# 5927-083
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-6.2"
+reason = "Source Quench is ignored by core and native PTB-only dispatch, but this broad historical paragraph is not an independent TCP mandate."
+quote = '''
+Based on this reasoning, a large number of implementations completely ignore ICMPv4 Source Quench messages meant for TCP connections. This behavior has been implemented in, at least, Linux [Linux] since 2004, and in FreeBSD [FreeBSD], NetBSD [NetBSD], and OpenBSD [OpenBSD] since 2005. However, it must be noted that this behavior violates the requirement in [RFC1122] to react to ICMPv4 Source Quench messages by slowing transmission on the connection.
+'''
+
+# 5927-086
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.1"
+reason = "Historical IPv6 sub1280 Fragment Header workaround is obsolete under RFC8201 section4: discard the report. IPv4 floor68 remains legal; do not impose the section7.4 pseudocode <=floor rejection."
+quote = '''
+The PMTUD mechanism for IPv4 uses the Don't Fragment (DF) bit in the IP header to dynamically discover the Path MTU. The basic idea behind the PMTUD mechanism is that a source system assumes that the MTU of the path is that of the first hop, and sends all its datagrams with the DF bit set. If any of the datagrams is too large to be forwarded without fragmentation by some intermediate router, the router will discard the corresponding datagram and will return an ICMPv4 "Destination Unreachable, fragmentation needed and DF set" (type 3, code 4) error message to the sending system. This message will report the MTU of the constricting hop, so that the sending system can reduce the assumed Path-MTU accordingly.
+'''
+
+# 5927-087
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.1"
+reason = "Historical IPv6 sub1280 Fragment Header workaround is obsolete under RFC8201 section4: discard the report. IPv4 floor68 remains legal; do not impose the section7.4 pseudocode <=floor rejection."
+quote = '''
+For IPv6, intermediate systems do not fragment packets. Thus, there's an "implicit" DF bit set in every packet sent on a network. If any of the datagrams is too large to be forwarded without fragmentation by some intermediate router, the router will discard the corresponding datagram, and will return an ICMPv6 "Packet Too Big" (type 2, code 0) error message to the sending system. This message will report the MTU of the constricting hop, so that the sending system can reduce the assumed Path-MTU accordingly.
+'''
+
+# 5927-092
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.1"
+reason = "Historical IPv6 Fragment Header workaround is superseded by RFC8201 section4 sub1280 discard. IPv4 minimum68 is independently implemented; this exception does not exclude the IPv4 floor requirement."
+quote = '''
+For IPv4, the reported Next-Hop MTU could be as small as 68 octets, as [RFC0791] requires every internet module to be able to forward a datagram of 68 octets without further fragmentation. For IPv6, while the required minimum IPv6 MTU is 1280, the reported Next-Hop MTU can be smaller than 1280 octets [RFC2460]. If the reported Next-Hop MTU is smaller than the minimum IPv6 MTU, the receiving host is not required to reduce the Path-MTU to a value smaller than 1280, but is required to include a fragmentation header in the outgoing packets to that destination from that moment on.
+'''
+
+# 5927-093
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
+reason = "Informational policy differs from the literal algorithm: max_sent/max_acked start at0 and are not reset to family floor/candidate on PTB; exact64-entry sent evidence is additionally required, any cumulative progress clears pending, and only matching head timeout applies it. Do not claim exact RFC5927 state-machine conformance."
+quote = '''
+The IETF has standardized a Path-MTU Discovery mechanism called "Packetization Layer Path MTU Discovery" (PLPMTUD) that does not depend on ICMP error messages. Implementation of the aforementioned mechanism in replacement of the traditional PMTUD (specified in [RFC1191] and [RFC1981]) eliminates this vulnerability. However, it can also lead to an increase in PMTUD convergence time.
+'''
+
+# 5927-094
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
+reason = "Informational policy differs from the literal algorithm: max_sent/max_acked start at0 and are not reset to family floor/candidate on PTB; exact64-entry sent evidence is additionally required, any cumulative progress clears pending, and only matching head timeout applies it. Do not claim exact RFC5927 state-machine conformance."
+quote = '''
+This section describes a modification to the PMTUD mechanism specified in [RFC1191] and [RFC1981] that has been incorporated in OpenBSD and NetBSD (since 2005) to improve TCP's resistance to the blind performance-degrading attack described in Section 7.1. The described counter-measure basically disregards ICMP messages when a connection makes progress, without violating any of the requirements stated in [RFC1191] and [RFC1981].
+'''
+
+# 5927-096
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
+reason = "Informational policy differs from the literal algorithm: max_sent/max_acked start at0 and are not reset to family floor/candidate on PTB; exact64-entry sent evidence is additionally required, any cumulative progress clears pending, and only matching head timeout applies it. Do not claim exact RFC5927 state-machine conformance."
+quote = '''
+In addition to the general validation check described in Section 4.1, these implementations include a modification to TCP's reaction to ICMP "Packet Too Big" error messages that disregards them when a connection makes progress, and honors them only after the corresponding data have been retransmitted a specified number of times. This means that upon receipt of an ICMP "Packet Too Big"
+'''
+
+# 5927-097
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
+reason = "Informational policy differs from the literal algorithm: max_sent/max_acked start at0 and are not reset to family floor/candidate on PTB; exact64-entry sent evidence is additionally required, any cumulative progress clears pending, and only matching head timeout applies it. Do not claim exact RFC5927 state-machine conformance."
+quote = '''
+error message, TCP just records this information, and honors it only when the corresponding data have already been retransmitted a specified number of times.
+'''
+
+# 5927-099
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
+reason = "Informational policy differs from the literal algorithm: max_sent/max_acked start at0 and are not reset to family floor/candidate on PTB; exact64-entry sent evidence is additionally required, any cumulative progress clears pending, and only matching head timeout applies it. Do not claim exact RFC5927 state-machine conformance."
+quote = '''
+In order to protect TCP from the attack against the PMTUD mechanism, while still allowing TCP to quickly determine the initial Path-MTU for a connection, the aforementioned implementations have divided the traditional PMTUD mechanism into two stages: Initial Path-MTU Discovery and Path-MTU Update.
+'''
+
+# 5927-100
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
+reason = "Informational policy differs from the literal algorithm: max_sent/max_acked start at0 and are not reset to family floor/candidate on PTB; exact64-entry sent evidence is additionally required, any cumulative progress clears pending, and only matching head timeout applies it. Do not claim exact RFC5927 state-machine conformance."
+quote = '''
+The Initial Path-MTU Discovery stage is when TCP tries to send segments that are larger than the ones that have so far been sent and acknowledged for this connection. That is, in the Initial Path-MTU Discovery stage, TCP has no record of these large segments getting to the destination host, and thus these implementations believe the network when it reports that these packets are too large to reach the destination host without being fragmented.
+'''
+
+# 5927-101
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
+reason = "Informational policy differs from the literal algorithm: max_sent/max_acked start at0 and are not reset to family floor/candidate on PTB; exact64-entry sent evidence is additionally required, any cumulative progress clears pending, and only matching head timeout applies it. Do not claim exact RFC5927 state-machine conformance."
+quote = '''
+The Path-MTU Update stage is when TCP tries to send segments that are equal to or smaller than the ones that have already been sent and acknowledged for this connection. During the Path-MTU Update stage, TCP already has knowledge of the estimated Path-MTU for the given connection. Thus, in this case, these implementations are more cautious with the errors being reported by the network.
+'''
+
+# 5927-102
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
+reason = "Informational policy differs from the literal algorithm: max_sent/max_acked start at0 and are not reset to family floor/candidate on PTB; exact64-entry sent evidence is additionally required, any cumulative progress clears pending, and only matching head timeout applies it. Do not claim exact RFC5927 state-machine conformance."
+quote = '''
+In order to allow TCP to distinguish segments between those performing Initial Path-MTU Discovery and those performing Path-MTU Update, two new variables are introduced to TCP: maxsizesent and maxsizeacked.
+'''
+
+# 5927-103
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
+reason = "Informational policy mismatch: Pmtud::new sets max_sent=0, not family minimum; sent() increases it including SYN/FIN sequence-bearing packets. Exact sent evidence additionally limits acceptance. No literal initialization/reset conformance claim."
+quote = '''
+The maxsizesent variable holds the size (in octets) of the largest packet that has so far been sent for this connection. It is initialized to 68 (the minimum IPv4 MTU) when the underlying Internet Protocol is IPv4, and is initialized to 1280 (the minimum IPv6 MTU) when the underlying Internet Protocol is IPv6. Whenever a packet larger than maxsizesent octets is sent, maxsizesent is set to that value.
+'''
+
+# 5927-104
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
+reason = "Informational policy mismatch: max_acked starts at0, not family minimum. It advances only from unambiguous packets still in the bounded64-entry ring, so evicted/retransmitted cumulative-ACK evidence is deliberately not inferred. No literal largest-ever-ACKed-packet invariant is claimed."
+quote = '''
+On the other hand, maxsizeacked holds the size (in octets) of the largest packet (data, plus headers) that has so far been acknowledged for this connection. It is initialized to 68 (the minimum IPv4 MTU) when the underlying Internet Protocol is IPv4, and is initialized to 1280 (the minimum IPv6 MTU) when the underlying Internet Protocol is IPv6. Whenever an acknowledgement for a packet larger than maxsizeacked octets is received, maxsizeacked is set to the size of that acknowledged packet. Note that because of TCP's cumulative acknowledgement, a single ACK may acknowledge the receipt of more than one packet. When that happens, the algorithm may "incorrectly" assume it is in the "Path-MTU Update" stage, rather than the "Initial Path-MTU Discovery" stage (as described below).
+'''
+
+# 5927-106
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
+reason = "Informational policy mismatch: initial candidate>=max_acked may apply immediately, but apply_ptb does not reset max_sent to family minimum. Existing wire tests prove immediate decrease, not the full specified post-update variable state."
+quote = '''
+If this check is passed, claimedmtu is compared with maxsizeacked. If claimedmtu is equal to or larger than maxsizeacked, TCP is supposed to be at the Initial Path-MTU Discovery stage, and thus the ICMP "Packet Too Big" error message is honored immediately. That is, the assumed Path-MTU is updated according to the Next-Hop MTU claimed in the ICMP error message. Also, maxsizesent is reset to the minimum MTU of the Internet Protocol in use (68 for IPv4, and 1280 for IPv6).
+'''
+
+# 5927-108
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
+reason = "Informational policy difference: no per-segment nsegrto counter or configurable MAXSEGRTO exists. A pending quoted sequence equal to timeout head is applied on that RTO (fixed one-timeout policy); timeouts preceding receipt are not retained per segment."
+quote = '''
+To perform this delay, one new variable and one new parameter are introduced to TCP: nsegrto and MAXSEGRTO. The nsegrto variable holds the number of times a specified segment has timed out. It is initialized to zero, and is incremented by one every time the corresponding segment times out. MAXSEGRTO specifies the number of times a given segment must time out before an ICMP "Packet Too Big" error message can be honored, and can be set, in principle, to any value greater than or equal to 0.
+'''
+
+# 5927-109
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
+reason = "Informational policy mismatch: timeout applies a pending matching-head candidate, but does not set max_acked=claimedmtu or reset max_sent to the family floor. Consequently later feedback can remain deferred under older proven-size evidence."
+quote = '''
+Thus, if nsegrto is greater than or equal to MAXSEGRTO, and there's a pending ICMP "Packet Too Big" error message, the corresponding error message is processed. At that point, maxsizeacked is set to claimedmtu, and maxsizesent is set to 68 (for IPv4) or 1280 (for IPv6).
+'''
+
+# 5927-111
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
+reason = "Informational policy differs from the literal algorithm: max_sent/max_acked start at0 and are not reset to family floor/candidate on PTB; exact64-entry sent evidence is additionally required, any cumulative progress clears pending, and only matching head timeout applies it. Do not claim exact RFC5927 state-machine conformance."
+quote = '''
+The rationale behind performing this delayed processing of ICMP "Packet Too Big" messages is that if there is progress on the connection, the ICMP "Packet Too Big" errors must be a false claim. By checking for progress on the connection, rather than just for staleness of the received ICMP messages, TCP is protected from attack even if the offending ICMP messages are "in window", and as a corollary, is made more robust to spurious ICMP messages triggered by, for example, corrupted TCP segments.
+'''
+
+# 5927-112
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
+reason = "Informational policy differs from the literal algorithm: max_sent/max_acked start at0 and are not reset to family floor/candidate on PTB; exact64-entry sent evidence is additionally required, any cumulative progress clears pending, and only matching head timeout applies it. Do not claim exact RFC5927 state-machine conformance."
+quote = '''
+MAXSEGRTO can be set, in principle, to any value greater than or equal to 0. Setting MAXSEGRTO to 0 would make TCP perform the traditional PMTUD mechanism defined in [RFC1191] and [RFC1981]. A MAXSEGRTO of 1 provides enough protection for most cases. In any case, implementations are free to choose higher values for this constant. MAXSEGRTO could be a function of the Next-Hop MTU claimed in the received ICMP "Packet Too Big" message. That is, higher values for MAXSEGRTO could be imposed when the received ICMP "Packet Too Big" message claims a Next-Hop MTU that is smaller than some specified value. Both OpenBSD and NetBSD set MAXSEGRTO to 1.
+'''
+
+# 5927-113
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
+reason = "Optional stronger always-defer policy is not selected: initial plausible reports may apply immediately. Selected progress/timeout policy remains separately audited."
+quote = '''
+In the event a higher level of protection is desired at the expense of a higher delay in the discovery of the Path-MTU, an implementation could consider TCP to always be in the Path-MTU Update stage, thus always delaying the update of the assumed Path-MTU.
+'''
+
+# 5927-183
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.4"
+reason = "Informational pseudocode is not a TCP normative algorithm. Core uses serial arithmetic and exact sent evidence, but omits literal max-size resets/counters, accepts legal IPv4 MTU68, and follows section7.2 >=maxsizeacked prose rather than inconsistent > pseudocode."
+quote = '''
+current_mtu = initial_mtu; maxsizesent = MINIMUM_MTU; maxsizeacked = MINIMUM_MTU; nsegrto = 0; pending_message = 0;
+'''
+
+# 5927-185
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.4"
+reason = "Informational pseudocode is not a TCP normative algorithm. Core uses serial arithmetic and exact sent evidence, but omits literal max-size resets/counters, accepts legal IPv4 MTU68, and follows section7.2 >=maxsizeacked prose rather than inconsistent > pseudocode."
+quote = '''
+if (packet_size > maxsizesent) maxsizesent = packet_size;
+'''
+
+# 5927-187
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.4"
+reason = "Informational pseudocode is not a TCP normative algorithm. Core uses serial arithmetic and exact sent evidence, but omits literal max-size resets/counters, accepts legal IPv4 MTU68, and follows section7.2 >=maxsizeacked prose rather than inconsistent > pseudocode."
+quote = '''
+if (acked_packet_size > maxsizeacked) maxsizeacked = acked_packet_size;
+'''
+
+# 5927-188
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.4"
+reason = "Informational pseudocode is not a TCP normative algorithm. Core uses serial arithmetic and exact sent evidence, but omits literal max-size resets/counters, accepts legal IPv4 MTU68, and follows section7.2 >=maxsizeacked prose rather than inconsistent > pseudocode."
+quote = '''
+if (pending_message) if (ack > claimedtcpseq){ pending_message = 0; nsegrto = 0; }
+'''
+
+# 5927-190
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.4"
+reason = "Informational pseudocode <=MINIMUM_MTU rejection conflicts with legal IPv4 MTU68 and section7.2 prose; this policy branch is intentionally not selected. RFC1191 floor68 and RFC8201 sub1280 discard control behavior."
+quote = '''
+if (claimedmtu <= MINIMUM_MTU) drop_message();
+'''
+
+# 5927-191
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.4"
+reason = "Informational pseudocode is not a TCP normative algorithm. Core uses serial arithmetic and exact sent evidence, but omits literal max-size resets/counters, accepts legal IPv4 MTU68, and follows section7.2 >=maxsizeacked prose rather than inconsistent > pseudocode."
+quote = '''
+if (claimedtcpseq < SND.UNA || claimedtcpseq >= SND.NXT) drop_message();
+'''
+
+# 5927-192
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.4"
+reason = "Informational pseudocode is not a TCP normative algorithm. Core uses serial arithmetic and exact sent evidence, but omits literal max-size resets/counters, accepts legal IPv4 MTU68, and follows section7.2 >=maxsizeacked prose rather than inconsistent > pseudocode."
+quote = '''
+else { if (claimedmtu > maxsizesent || claimedmtu >= current_mtu) drop_message();
+'''
+
+# 5927-193
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.4"
+reason = "Informational pseudocode is not a TCP normative algorithm. Core uses serial arithmetic and exact sent evidence, but omits literal max-size resets/counters, accepts legal IPv4 MTU68, and follows section7.2 >=maxsizeacked prose rather than inconsistent > pseudocode."
+quote = '''
+else { if (claimedmtu > maxsizeacked){ adjust_mtu(); current_mtu = claimedmtu; maxsizesent = MINIMUM_MTU; }
+'''
+
+# 5927-194
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.4"
+reason = "Informational pseudocode is not a TCP normative algorithm. Core uses serial arithmetic and exact sent evidence, but omits literal max-size resets/counters, accepts legal IPv4 MTU68, and follows section7.2 >=maxsizeacked prose rather than inconsistent > pseudocode."
+quote = '''
+else { pending_message = 1; save_message(); } } }
+'''
+
+# 5927-196
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.4"
+reason = "Informational pseudocode is not a TCP normative algorithm. Core uses serial arithmetic and exact sent evidence, but omits literal max-size resets/counters, accepts legal IPv4 MTU68, and follows section7.2 >=maxsizeacked prose rather than inconsistent > pseudocode."
+quote = '''
+nsegrto++;
+'''
+
+# 5927-197
+[[TODO]]
+target = "https://www.rfc-editor.org/rfc/rfc5927#section-7.4"
+reason = "Informational pseudocode is not a TCP normative algorithm. Core uses serial arithmetic and exact sent evidence, but omits literal max-size resets/counters, accepts legal IPv4 MTU68, and follows section7.2 >=maxsizeacked prose rather than inconsistent > pseudocode."
+quote = '''
+if (pending_message && nsegrto >= MAXSEGRTO){ adjust_mtu(); nsegrto = 0; pending_message = 0; maxsizeacked = claimedmtu; maxsizesent = MINIMUM_MTU; current_mtu = claimedmtu; }
+'''

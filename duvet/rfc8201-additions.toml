@@ -1,0 +1,365 @@
+# Exact published audit spans; whitespace reflow only. No invented BCP14 levels.
+
+# 8201-003
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-1"
+quote = '''
+IPv6 nodes should implement Path MTU Discovery in order to discover and take advantage of paths with PMTU greater than the IPv6 minimum link MTU [RFC8200]. A minimal IPv6 implementation (e.g., in a boot ROM) may choose to omit implementation of Path MTU Discovery.
+'''
+
+# 8201-004
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-1"
+quote = '''
+Nodes not implementing Path MTU Discovery must use the IPv6 minimum link MTU defined in [RFC8200] as the maximum packet size. In most cases, this will result in the use of smaller packets than necessary, because most paths have a PMTU greater than the IPv6 minimum link MTU. A node sending packets much smaller than the Path MTU allows is wasting network resources and probably getting suboptimal throughput.
+'''
+
+# 8201-025
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+quote = '''
+This memo describes a technique to dynamically discover the PMTU of a path. The basic idea is that a source node initially assumes that the PMTU of a path is the (known) MTU of the first hop in the path. If any of the packets sent on that path are too large to be forwarded by some node along the path, that node will discard them and return ICMPv6 Packet Too Big messages. Upon receipt of such a message, the source node reduces its assumed PMTU for the path based on the MTU of the constricting hop as reported in the Packet Too Big message. The decreased PMTU causes the source to send smaller packets or change EMTU_S to cause the upper layer to reduce the size of IP packets it sends.
+'''
+
+# 8201-026
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+quote = '''
+The Path MTU Discovery process ends when the source node's estimate of the PMTU is less than or equal to the actual PMTU. Note that several iterations of the packet-sent/Packet-Too-Big-message-received cycle may occur before the Path MTU Discovery process ends, as there may be links with smaller MTUs further along the path.
+'''
+
+# 8201-027
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+quote = '''
+Alternatively, the node may elect to end the discovery process by ceasing to send packets larger than the IPv6 minimum link MTU.
+'''
+
+# 8201-028
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+quote = '''
+The PMTU of a path may change over time, due to changes in the routing topology. Reductions of the PMTU are detected by Packet Too Big messages. To detect increases in a path's PMTU, a node periodically increases its assumed PMTU. This will almost always result in packets being discarded and Packet Too Big messages being
+'''
+
+# 8201-029
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+quote = '''
+generated, because in most cases the PMTU of the path will not have changed. Therefore, attempts to detect increases in a path's PMTU should be done infrequently.
+'''
+
+# 8201-030
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+quote = '''
+Path MTU Discovery supports multicast as well as unicast destinations. In the case of a multicast destination, copies of a packet may traverse many different paths to many different nodes. Each path may have a different PMTU, and a single multicast packet may result in multiple Packet Too Big messages, each reporting a different next-hop MTU. The minimum PMTU value across the set of paths in use determines the size of subsequent packets sent to the multicast destination.
+'''
+
+# 8201-031
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+quote = '''
+Note that Path MTU Discovery must be performed even in cases where a node "thinks" a destination is attached to the same link as itself, as it might have a PMTU lower than the link MTU. In a situation such as when a neighboring router acts as proxy [ND] for some destination, the destination can appear to be directly connected, but it is in fact more than one hop away.
+'''
+
+# 8201-033
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-4"
+quote = '''
+Nodes should appropriately validate the payload of ICMPv6 PTB messages to ensure these are received in response to transmitted traffic (i.e., a reported error condition that corresponds to an IPv6 packet actually sent by the application) per [ICMPv6].
+'''
+
+# 8201-034
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-4"
+quote = '''
+If a node receives a Packet Too Big message reporting a next-hop MTU that is less than the IPv6 minimum link MTU, it must discard it. A node must not reduce its estimate of the Path MTU below the IPv6 minimum link MTU on receipt of a Packet Too Big message.
+'''
+
+# 8201-035
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-4"
+quote = '''
+When a node receives a Packet Too Big message, it must reduce its estimate of the PMTU for the relevant path, based on the value of the MTU field in the message. The precise behavior of a node in this circumstance is not specified, since different applications may have different requirements, and since different implementation architectures may favor different strategies.
+'''
+
+# 8201-036
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-4"
+quote = '''
+After receiving a Packet Too Big message, a node must attempt to avoid eliciting more such messages in the near future. The node must reduce the size of the packets it is sending along the path. Using a PMTU estimate larger than the IPv6 minimum link MTU may continue to elicit Packet Too Big messages. Because each of these messages (and
+'''
+
+# 8201-037
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-4"
+quote = '''
+the dropped packets they respond to) consume network resources, nodes using Path MTU Discovery must detect decreases in PMTU as fast as possible.
+'''
+
+# 8201-038
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-4"
+quote = '''
+Nodes may detect increases in PMTU, but because doing so requires sending packets larger than the current estimated PMTU, and because the likelihood is that the PMTU will not have increased, this must be done at infrequent intervals. An attempt to detect an increase (by sending a packet larger than the current estimate) must not be done less than 5 minutes after a Packet Too Big message has been received for the given path. The recommended setting for this timer is twice its minimum value (10 minutes).
+'''
+
+# 8201-039
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-4"
+quote = '''
+A node must not increase its estimate of the Path MTU in response to the contents of a Packet Too Big message. A message purporting to announce an increase in the Path MTU might be a stale packet that has been floating around in the network, a false packet injected as part of a denial-of-service (DoS) attack, or the result of having multiple paths to the destination, each with a different PMTU.
+'''
+
+# 8201-049
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.1"
+quote = '''
+It is therefore suggested that the IP layer store PMTU information and that the ICMPv6 layer process received Packet Too Big messages. The packetization layers may respond to changes in the PMTU by changing the size of the messages they send. To support this layering, packetization layers require a way to learn of changes in the value of MMS_S, the "maximum send transport-message size" [RFC1122].
+'''
+
+# 8201-050
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.1"
+quote = '''
+MMS_S is a transport message size calculated by subtracting the size of the IPv6 header (including IPv6 extension headers) from the largest IP packet that can be sent, EMTU_S. MMS_S is limited by a combination of factors, including the PMTU, support for packet fragmentation and reassembly, and the packet reassembly limit (see "Fragment Header", Section 4.5 of [RFC8200]). When source fragmentation is available, EMTU_S is set to EMTU_R, as indicated by the receiver using an upper-layer protocol or based on protocol requirements (1500 octets for IPv6). When a message larger than PMTU is to be transmitted, the source creates fragments, each limited by PMTU. When source fragmentation is not desired, EMTU_S is set to PMTU, and the upper-layer protocol is expected to either perform its own fragmentation and reassembly or otherwise limit the size of its messages accordingly.
+'''
+
+# 8201-051
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.1"
+quote = '''
+However, packetization layers are encouraged to avoid sending messages that will require source fragmentation (for the case against fragmentation, see [FRAG]).
+'''
+
+# 8201-052
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+quote = '''
+Ideally, a PMTU value should be associated with a specific path traversed by packets exchanged between the source and destination nodes. However, in most cases a node will not have enough information to completely and accurately identify such a path. Rather, a node must associate a PMTU value with some local representation of a path. It is left to the implementation to select the local representation of a path. For nodes with multiple interfaces, Path MTU information should be maintained for each IPv6 link.
+'''
+
+# 8201-053
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+quote = '''
+In the case of a multicast destination address, copies of a packet may traverse many different paths to reach many different nodes. The local representation of the "path" to a multicast destination must represent a potentially large set of paths.
+'''
+
+# 8201-054
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+quote = '''
+Minimally, an implementation could maintain a single PMTU value to be used for all packets originated from the node. This PMTU value would be the minimum PMTU learned across the set of all paths in use by the node. This approach is likely to result in the use of smaller packets than is necessary for many paths. In the case of multipath routing (e.g., Equal-Cost Multipath Routing (ECMP)), a set of paths can exist even for a single source and destination pair.
+'''
+
+# 8201-055
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+quote = '''
+An implementation could use the destination address as the local representation of a path. The PMTU value associated with a destination would be the minimum PMTU learned across the set of all paths in use to that destination. This approach will result in the use of optimally sized packets on a per-destination basis. This approach integrates nicely with the conceptual model of a host as described in [ND]: a PMTU value could be stored with the corresponding entry in the destination cache.
+'''
+
+# 8201-056
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+quote = '''
+If flows [RFC8200] are in use, an implementation could use the flow id as the local representation of a path. Packets sent to a particular destination but belonging to different flows may use different paths, as with ECMP, in which the choice of path might depend on the flow id. This approach might result in the use of optimally sized packets on a per-flow basis, providing finer granularity than PMTU values maintained on a per-destination basis.
+'''
+
+# 8201-057
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+quote = '''
+For source-routed packets (i.e. packets containing an IPv6 Routing header [RFC8200]), the source route may further qualify the local representation of a path.
+'''
+
+# 8201-058
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+quote = '''
+Initially, the PMTU value for a path is assumed to be the (known) MTU of the first-hop link.
+'''
+
+# 8201-059
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+quote = '''
+When a Packet Too Big message is received, the node determines which path the message applies to based on the contents of the Packet Too Big message. For example, if the destination address is used as the local representation of a path, the destination address from the original packet would be used to determine which path the message applies to.
+'''
+
+# 8201-060
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+quote = '''
+Note: if the original packet contained a Routing header, the Routing header should be used to determine the location of the destination address within the original packet. If Segments Left is equal to zero, the destination address is in the Destination Address field in the IPv6 header. If Segments Left is greater than zero, the destination address is the last address (Address[n]) in the Routing header.
+'''
+
+# 8201-061
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+quote = '''
+The node then uses the value in the MTU field in the Packet Too Big message as a tentative PMTU value or the IPv6 minimum link MTU if that is larger, and compares the tentative PMTU to the existing PMTU. If the tentative PMTU is less than the existing PMTU estimate, the tentative PMTU replaces the existing PMTU as the PMTU value for the path.
+'''
+
+# 8201-062
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+quote = '''
+The packetization layers must be notified about decreases in the PMTU. Any packetization layer instance (for example, a TCP connection) that is actively using the path must be notified if the PMTU estimate is decreased.
+'''
+
+# 8201-063
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+quote = '''
+Note: even if the Packet Too Big message contains an Original Packet Header that refers to a UDP packet, the TCP layer must be notified if any of its connections use the given path.
+'''
+
+# 8201-064
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+quote = '''
+Also, the instance that sent the packet that elicited the Packet Too Big message should be notified that its packet has been dropped, even if the PMTU estimate has not changed, so that it may retransmit the dropped data.
+'''
+
+# 8201-065
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+quote = '''
+Note: An implementation can avoid the use of an asynchronous notification mechanism for PMTU decreases by postponing notification until the next attempt to send a packet larger than the PMTU estimate. In this approach, when an attempt is made to SEND a packet that is larger than the PMTU estimate, the SEND function should fail and return a suitable error indication. This approach may be more suitable to a connectionless packetization layer (such as one using UDP), which (in some implementations) may be hard to "notify" from the ICMPv6 layer. In this case, the normal timeout-based retransmission mechanisms would be used to recover from the dropped packets.
+'''
+
+# 8201-066
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+quote = '''
+It is important to understand that the notification of the packetization layer instances using the path about the change in the PMTU is distinct from the notification of a specific instance that a packet has been dropped. The latter should be done as soon as practical (i.e., asynchronously from the point of view of the packetization layer instance), while the former may be delayed until a packetization layer instance wants to create a packet.
+'''
+
+# 8201-068
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.3"
+quote = '''
+If the stale PMTU value is too large, this will be discovered almost immediately once a large enough packet is sent on the path. No such mechanism exists for realizing that a stale PMTU value is too small, so an implementation should "age" cached values. When a PMTU value has not been decreased for a while (on the order of 10 minutes), it should probe to find if a larger PMTU is supported.
+'''
+
+# 8201-069
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.3"
+quote = '''
+Note: an implementation should provide a means for changing the timeout duration, including setting it to "infinity". For example, nodes attached to a link with a large MTU that is then attached to the rest of the Internet via a link with a small MTU are never going to discover a new non-local PMTU, so they should not have to put up with dropped packets every 10 minutes.
+'''
+
+# 8201-070
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+quote = '''
+A packetization layer (e.g., TCP) must use the PMTU for the path(s) in use by a connection; it should not send segments that would result in packets larger than the PMTU, except to probe during PMTU Discovery (this probe packet must not be fragmented to the PMTU). A simple implementation could ask the IP layer for this value each time it created a new segment, but this could be inefficient. An implementation typically caches other values derived from the PMTU. It may be simpler to receive asynchronous notification when the PMTU changes, so that these variables may be also updated.
+'''
+
+# 8201-071
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+quote = '''
+A TCP implementation must also store the Maximum Segment Size (MSS) value received from its peer, which represents the EMTU_R, the largest packet that can be reassembled by the receiver, and must not send any segment larger than this MSS, regardless of the PMTU.
+'''
+
+# 8201-072
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+quote = '''
+The value sent in the TCP MSS option is independent of the PMTU; it is determined by the receiver reassembly limit EMTU_R. This MSS option value is used by the other end of the connection, which may be using an unrelated PMTU value. See Section 5, "Packet Size Issues", and Section 8.3, "Maximum Upper-Layer Payload Size", of [RFC8200] for information on selecting a value for the TCP MSS option.
+'''
+
+# 8201-073
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+quote = '''
+Reception of a Packet Too Big message implies that a packet was dropped by the node that sent the ICMPv6 message. A reliable upper- layer protocol will detect this loss by its own means, and recover it by its normal retransmission methods. The retransmission could result in delay, depending on the loss detection method used by the upper-layer protocol. If the Path MTU Discovery process requires several steps to find the PMTU of the full path, this could finally delay the retransmission by many round-trip times.
+'''
+
+# 8201-074
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+quote = '''
+Alternatively, the retransmission could be done in immediate response to a notification that the Path MTU was decreased, but only for the specific connection specified by the Packet Too Big message. The packet size used in the retransmission should be no larger than the new PMTU.
+'''
+
+# 8201-075
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+quote = '''
+Note: A packetization layer that determines a probe packet is lost needs to adapt the segment size of the retransmission. Using the reported size in the last Packet Too Big message, however, can lead to further losses as there might be smaller PMTU limits at the routers further along the path. This would lead to loss of all retransmitted segments and therefore cause unnecessary congestion as well as additional packets to be sent each time a new router announces a smaller MTU. Any packetization layer that uses retransmission is therefore also responsible for congestion control of its retransmissions [RFC8085].
+'''
+
+# 8201-076
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+quote = '''
+A loss caused by a PMTU probe indicated by the reception of a Packet Too Big message must not be considered as a congestion notification, and hence the congestion window may not change.
+'''
+
+# 8201-077
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.5"
+quote = '''
+Some transport protocols are not allowed to repacketize when doing a retransmission. That is, once an attempt is made to transmit a segment of a certain size, the transport cannot split the contents of the segment into smaller segments for retransmission. In such a case, the original segment can be fragmented by the IP layer during retransmission. Subsequent segments, when transmitted for the first time, should be no larger than allowed by the Path MTU.
+'''
+
+# 8201-078
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.5"
+quote = '''
+Path MTU Discovery for IPv4 [RFC1191] used NFS as an example of a UDP-based application that benefits from PMTU Discovery. Since then, [RFC7530] states that the supported transport layer between NFS and IP must be an IETF standardized transport protocol that is specified to avoid network congestion; such transports include TCP, Stream Control Transmission Protocol (SCTP) [RFC4960], and the Datagram Congestion Control Protocol (DCCP) [RFC4340]. In this case, the transport is responsible for ensuring that transmitted segments (except probes) conform to the Path MTU, including supporting PMTU Discovery probe transmissions as needed.
+'''
+
+# 8201-079
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
+quote = '''
+It is suggested that an implementation provides a way for a system utility program to:
+'''
+
+# 8201-080
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
+quote = '''
+- Specify that Path MTU Discovery not be done on a given path.
+'''
+
+# 8201-081
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
+quote = '''
+- Change the PMTU value associated with a given path.
+'''
+
+# 8201-082
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
+quote = '''
+The former can be accomplished by associating a flag with the path; when a packet is sent on a path with this flag set, the IP layer does not send packets larger than the IPv6 minimum link MTU.
+'''
+
+# 8201-084
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
+quote = '''
+The implementation should also provide a way to change the timeout period for aging stale PMTU information.
+'''
+
+# 8201-086
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-6"
+quote = '''
+In the first attack, the false message indicates a PMTU much smaller than reality. In response, the victim node should never set its PMTU estimate below the IPv6 minimum link MTU. A sender that falsely reduces to this MTU would observe suboptimal performance.
+'''
+
+# 8201-087
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-6"
+quote = '''
+In the second attack, the false message indicates a PMTU larger than reality. If believed, this could cause temporary blockage as the victim sends packets that will be dropped by some router. Within one round-trip time, the node would discover its mistake (receiving Packet Too Big messages from that router), but frequent repetition of this attack could cause lots of packets to be dropped. A node, however, must not raise its estimate of the PMTU based on a Packet Too Big message, so it should not be vulnerable to this attack.
+'''
