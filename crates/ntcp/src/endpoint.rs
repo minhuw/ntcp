@@ -318,6 +318,7 @@ impl Endpoint {
     ) -> Result<Self, EndpointError> {
         if !(1..=1_024).contains(&config.max_setup_cache_entries)
             || !config.connection.valid_timestamp_timebase()
+            || !config.connection.valid_pacing()
             || config.connection.time_wait_us < 240_000_000
             || config.connection.time_wait_us
                 < 2 * config.connection.timebase.max_segment_lifetime_us

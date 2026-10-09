@@ -4377,9 +4377,22 @@ fn timestamp_offset_time_wait_reuse_and_rollback_keep_virtual_clock() {
 
 #[test]
 fn pacing_endpoint_budget_and_halfclose() {
+    pacing_endpoint_budget_case(None);
+}
+
+#[test]
+fn general_pacing_endpoint_budget_and_halfclose() {
+    pacing_endpoint_budget_case(Some(crate::PacingConfig {
+        max_burst_segments: 1,
+        ..crate::PacingConfig::default()
+    }));
+}
+
+fn pacing_endpoint_budget_case(pacing: Option<crate::PacingConfig>) {
     for scale in [1, 1000] {
         let mut cfg = config();
-        cfg.connection.prr = true;
+        cfg.connection.prr = pacing.is_none();
+        cfg.connection.pacing = pacing;
         cfg.connection.timebase.units_per_second = 1_000_000 * scale;
         assert!(cfg.connection.prr_pacing);
         let (local, remote) = addresses();

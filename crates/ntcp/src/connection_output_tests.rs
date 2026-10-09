@@ -2802,3 +2802,240 @@ fn lowat_byte_admission_transmission_ack_resize_flush_and_wrap() {
         );
     }
 }
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc9937#section-6.4
+//= type=test
+//= reason=Opt-in general pacing bounds same-tick and idle bursts with both Reno and CUBIC and PRR disabled; failed encoding preserves fractional debt. Caller microsecond and nanosecond units are exercised.
+//# It is RECOMMENDED that implementations use pacing to reduce the
+//# burstiness of data traffic.
+fn general_pacing_wire_fractional_burst_idle_and_failed_encode() {
+    for algorithm in [CongestionAlgorithm::Reno, CongestionAlgorithm::Cubic] {
+        for scale in [1, 1000] {
+            let (mut a, _) = pair(
+                ConnectionConfig {
+                    pacing: Some(PacingConfig::default()),
+                    prr: false,
+                    prr_pacing: false,
+                    congestion_algorithm: algorithm,
+                    initial_window: InitialWindow::Iw10,
+                    timebase: CallerTimebase {
+                        units_per_second: 1_000_000 * scale,
+                        ..CallerTimebase::default()
+                    },
+                    nagle: false,
+                    ..config(65_536, 1000)
+                },
+                0,
+            );
+            assert!(a.pacing_enabled());
+            a.rtt = RttEstimator::with_timebase(1_000_000, a.config.timebase);
+            a.rtt.sample(1);
+            a.write(&[0x55; 20_000]).unwrap();
+            let start = 40 * scale;
+            let base = a.snd_una;
+            let snapshot = (a.pacer, a.snd_nxt, a.now, a.rack.pipe(), a.pacing_deadline);
+            assert_eq!(a.transmit(start, &mut [0; 19]), Err(Error::OutputTooSmall));
+            assert_eq!(
+                (a.pacer, a.snd_nxt, a.now, a.rack.pipe(), a.pacing_deadline),
+                snapshot
+            );
+            assert_eq!(outputs(&mut a, start, base).len(), 2);
+            assert_eq!(a.pacing_deadline, Some(start + 1));
+            assert_eq!(a.next_deadline(), Some(start + 1));
+            a.timeout(start + 1).unwrap();
+            assert_eq!(outputs(&mut a, start + 1, base).len(), 2);
+            assert_eq!(outputs(&mut a, start + 2, base).len(), 2);
+            assert_eq!(outputs(&mut a, start + 3, base).len(), 2);
+            // Late service still permits only the configured two-MSS burst.
+            assert_eq!(outputs(&mut a, start + 1000, base).len(), 2);
+            assert_eq!(a.snd_nxt.distance_from(base), 10_000);
+            // Available pacing credit never bypasses the full congestion window.
+            assert!(outputs(&mut a, start + 1001, base).is_empty());
+            let idle = start + 2_000_000 * scale;
+            let high = a.snd_nxt;
+            let seq = a.receive.next();
+            inject(&mut a, idle, seq, high, ACK, 65_535, &[]);
+            assert_eq!(outputs(&mut a, idle, base).len(), 2);
+            assert!(a.transmit(idle, &mut [0; 1500]).unwrap().is_none());
+            a.abort();
+            assert_eq!(a.general_pacing_deadline(idle), None);
+        }
+    }
+}
+
+#[test]
+fn general_pacing_wire_rate_cap_startup_and_rate_changes() {
+    for scale in [1, 1000] {
+        let (mut a, _) = pair(
+            ConnectionConfig {
+                pacing: Some(PacingConfig {
+                    max_bytes_per_second: Some(1_000_000),
+                    max_burst_segments: 1,
+                    ..PacingConfig::default()
+                }),
+                prr: false,
+                nagle: false,
+                initial_window: InitialWindow::Iw10,
+                timebase: CallerTimebase {
+                    units_per_second: 1_000_000 * scale,
+                    ..CallerTimebase::default()
+                },
+                ..config(65_536, 1000)
+            },
+            0,
+        );
+        a.rtt = RttEstimator::with_timebase(1_000_000, a.config.timebase);
+        a.write(&[0x55; 10_000]).unwrap();
+        let start = 40 * scale;
+        packet(&mut a, start);
+        // Before RTT, rate is IW10/one-second estimator RTO * 125%.
+        assert_eq!(a.pacing_deadline, Some(start + 80_000 * scale));
+        let due = a.pacing_deadline.unwrap();
+        a.rtt.sample(scale);
+        let debt = a.pacer;
+        assert!(a.transmit(start, &mut [0; 1500]).unwrap().is_none());
+        assert_eq!(a.pacer, debt); // rate update did not forgive debt
+        let snapshot = (a.pacer, a.snd_nxt, a.now, a.pacing_deadline);
+        assert_eq!(a.transmit(due, &mut [0; 19]), Err(Error::OutputTooSmall));
+        assert_eq!((a.pacer, a.snd_nxt, a.now, a.pacing_deadline), snapshot);
+        packet(&mut a, due);
+        assert_eq!(a.pacing_deadline, Some(due + 1000 * scale));
+        let next = a.pacing_deadline.unwrap();
+        assert!(a.transmit(next - 1, &mut [0; 1500]).unwrap().is_none());
+        packet(&mut a, next);
+        assert_eq!(a.pacing_deadline, Some(next + 1000 * scale));
+    }
+}
+
+#[test]
+fn general_pacing_recovery_control_and_hystart() {
+    for rack in [false, true] {
+        let mut a = strict_flight(0);
+        a.config.pacing = Some(PacingConfig {
+            max_burst_segments: 1,
+            ..PacingConfig::default()
+        });
+        a.config.rack = rack;
+        strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
+        let before = a.prr.unwrap();
+        assert_eq!(prr_packet(&mut a, 200_000).1, 1000);
+        assert_eq!(a.prr.unwrap().counters().2, before.counters().2 + 1000);
+        let deadline = a.pacing_deadline.unwrap();
+        let debt = a.pacer;
+        let credit = a.prr.unwrap().counters();
+        a.retx_pending = true;
+        a.immediate_ack();
+        let ack = packet(&mut a, 200_000);
+        assert!(wire::parse(ip(tuple()), &ack).unwrap().payload.is_empty());
+        assert_eq!(a.pacer, debt);
+        assert_eq!(a.prr.unwrap().counters(), credit);
+        assert!(a.transmit(deadline - 1, &mut [0; 1500]).unwrap().is_none());
+        assert_eq!(
+            a.transmit(deadline, &mut [0; 19]),
+            Err(Error::OutputTooSmall)
+        );
+        assert_eq!(a.pacer, debt);
+        prr_packet(&mut a, deadline);
+        let debt = a.pacer;
+        a.write(&[0x55; 6000]).unwrap();
+        strict_ack(&mut a, deadline, 10_000, &[]);
+        assert!(a.prr.is_none());
+        assert_eq!(a.pacer, debt);
+        assert!(a.transmit(deadline, &mut [0; 1500]).unwrap().is_none());
+        let due = a.general_pacing_deadline(deadline).unwrap();
+        let base = a.snd_una;
+        assert_eq!(outputs(&mut a, due, base).len(), 1);
+    }
+    // RFC9406 L=infinity with general pacing, even with PRR disabled.
+    let (mut a, _) = primed_pair(
+        ConnectionConfig {
+            congestion_algorithm: CongestionAlgorithm::Cubic,
+            initial_window: InitialWindow::Iw10,
+            pacing: Some(PacingConfig::default()),
+            prr: false,
+            nagle: false,
+            ..config(32_000, 1000)
+        },
+        100,
+    );
+    let base = a.snd_una;
+    a.write(&[0x55; 20_000]).unwrap();
+    let mut now = 100_000;
+    for _ in 0..10 {
+        packet(&mut a, now);
+        now = a.general_pacing_deadline(now).unwrap_or(now);
+    }
+    hystart_wire_ack(&mut a, now + 100_000, base.wrapping_add(10_000), ACK);
+    assert_eq!(a.congestion.cwnd(), 20_000);
+}
+
+#[test]
+fn general_pacing_config_validation() {
+    for pacing in [
+        PacingConfig {
+            rate_gain_percent: 0,
+            ..PacingConfig::default()
+        },
+        PacingConfig {
+            max_bytes_per_second: Some(0),
+            ..PacingConfig::default()
+        },
+        PacingConfig {
+            max_burst_segments: 0,
+            ..PacingConfig::default()
+        },
+        PacingConfig {
+            max_burst_segments: u32::MAX,
+            ..PacingConfig::default()
+        },
+    ] {
+        let cfg = ConnectionConfig {
+            pacing: Some(pacing),
+            ..ConnectionConfig::default()
+        };
+        assert!(matches!(
+            Connection::active(tuple(), cfg.clone(), 0, 0),
+            Err(Error::InvalidArgument)
+        ));
+        assert!(matches!(
+            crate::Endpoint::new(
+                crate::EndpointConfig {
+                    connection: cfg,
+                    ..crate::EndpointConfig::default()
+                },
+                [1; 32],
+                0,
+                |_| true
+            ),
+            Err(crate::EndpointError::Connection(Error::InvalidArgument))
+        ));
+    }
+}
+
+#[test]
+fn general_pacing_saturated_clock_preserves_burst_bound_and_actual_send_time() {
+    let (mut a, _) = pair(
+        ConnectionConfig {
+            pacing: Some(PacingConfig {
+                max_bytes_per_second: Some(1),
+                ..PacingConfig::default()
+            }),
+            initial_window: InitialWindow::Iw10,
+            nagle: false,
+            ..config(1024, 1)
+        },
+        0,
+    );
+    a.write(b"abcdef").unwrap();
+    let base = a.snd_una;
+    assert_eq!(outputs(&mut a, u64::MAX, base).len(), 2);
+    assert_eq!(a.last_sent, u64::MAX);
+    assert_eq!(a.pacing_deadline, Some(u64::MAX));
+    assert!(outputs(&mut a, u64::MAX, base).is_empty());
+    a.immediate_ack();
+    let debt = a.pacer;
+    let ack = packet(&mut a, u64::MAX);
+    assert!(wire::parse(ip(tuple()), &ack).unwrap().payload.is_empty());
+    assert_eq!(a.pacer, debt);
+}

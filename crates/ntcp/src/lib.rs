@@ -19,6 +19,7 @@ mod endpoint;
 mod endpoint_tests;
 mod hystart;
 mod ipv4_options;
+mod pacing;
 mod rack;
 mod recovery;
 mod rx_timestamp;
@@ -30,7 +31,7 @@ pub mod wire;
 
 pub use connection::{
     CallerTimebase, CloseReason, ConnectionConfig, ConnectionEvents, Error, Instant,
-    KeepaliveConfig, NetworkError, State, TimestampGranularity, TransportInfo, Tuple,
+    KeepaliveConfig, NetworkError, PacingConfig, State, TimestampGranularity, TransportInfo, Tuple,
 };
 pub use endpoint::{
     AddressValidation, ConnectionId, Endpoint, EndpointConfig, EndpointError, Event,

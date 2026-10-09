@@ -7,6 +7,7 @@ use crate::{
     RxPacketTimestamps, RxReadTimestamps, SendProgress, TxStreamRange, TxTimestampClock,
     TxTimestampRequest, TxTimestampSource, TxTimestampStage,
     buffer::{ReceiveBuffer, SendBuffer},
+    pacing::Pacer,
     rack::Rack,
     recovery::{
         Congestion, CongestionAlgorithm, InitialWindow, Prr, PrrAlgorithm, RecoveryAlgorithm,
@@ -95,6 +96,27 @@ impl TimestampGranularity {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PacingConfig {
+    // Percentage of cwnd/SRTT (estimator RTO before the first RTT sample).
+    pub rate_gain_percent: u16,
+    // Stream bytes, including retransmissions, per second; excludes headers.
+    pub max_bytes_per_second: Option<u64>,
+    // Maximum ordinary-data burst in effective sender MSS units. Nonzero;
+    // the product with configured MSS must fit u32. Probes may exceed it.
+    pub max_burst_segments: u32,
+}
+
+impl Default for PacingConfig {
+    fn default() -> Self {
+        Self {
+            rate_gain_percent: 125,
+            max_bytes_per_second: None,
+            max_burst_segments: 2,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ConnectionConfig {
     pub send_capacity: usize,
@@ -152,9 +174,13 @@ pub struct ConnectionConfig {
     pub prr: bool,
     pub prr_algorithm: PrrAlgorithm,
     // RFC9937 data pacing, effective only with prr=true and Rfc9937.
-    // false is a nonpaced override for equation tests or caller-managed pacing;
-    // it does not implement the RFC9937 section 6.4 pacing recommendation.
+    // With pacing=None, false is a nonpaced override for equation tests or
+    // caller-managed pacing; it does not implement RFC9937 section 6.4.
+    // Ignored by the independent Some(PacingConfig) policy.
     pub prr_pacing: bool,
+    // None preserves legacy PRR-only pacing, including its one-tick minimum.
+    // Some enables fractional bounded-burst pacing independently of PRR/CC.
+    pub pacing: Option<PacingConfig>,
     // Opt-in RFC 8985 tail loss probes; requires rack and sack configuration
     // and negotiated SACK. At most one probe per outstanding flight.
     pub tlp: bool,
@@ -207,6 +233,15 @@ impl Default for KeepaliveConfig {
 }
 
 impl ConnectionConfig {
+    pub(crate) fn valid_pacing(&self) -> bool {
+        self.pacing.is_none_or(|p| {
+            p.rate_gain_percent != 0
+                && p.max_bytes_per_second != Some(0)
+                && p.max_burst_segments != 0
+                && p.max_burst_segments.checked_mul(self.mss as u32).is_some()
+        })
+    }
+
     pub(crate) fn valid_timestamp_timebase(&self) -> bool {
         self.timebase.valid()
     }
@@ -250,6 +285,7 @@ impl Default for ConnectionConfig {
             prr: false,
             prr_algorithm: PrrAlgorithm::default(),
             prr_pacing: true,
+            pacing: None,
             tlp: false,
             peer_max_ack_delay_us: 499_999,
             rto_min_us: 1_000_000,
@@ -486,8 +522,10 @@ pub(crate) struct Connection {
     tlp_flight: Option<Seq>,
     tlp_fresh_rtt: bool,
     prr: Option<Prr>,
-    // One caller-unit eligibility time; never accumulated burst credit.
+    // Legacy eligibility time, or latest general-pacer wakeup. Fractional
+    // general-pacing debt lives separately and survives servicing this timer.
     pacing_deadline: Option<Instant>,
+    pacer: Pacer,
     #[cfg(test)]
     prr_exit_trace: Option<Prr>,
     // LegacyInitialCredit only: prior ACK delivery, capped and bound to its timer.
@@ -613,6 +651,7 @@ impl Connection {
         receive: &mut Option<ReceiveBuffer>,
     ) -> Result<Self, Error> {
         if !config.valid_timestamp_timebase()
+            || !config.valid_pacing()
             || config.timestamp_bytes_per_tick == 0
             || config.timestamp_bytes_per_tick >= 1 << 31
             || (config.tlp && (!config.rack || !config.sack))
@@ -743,6 +782,7 @@ impl Connection {
             tlp_fresh_rtt: false,
             prr: None,
             pacing_deadline: None,
+            pacer: Pacer::default(),
             #[cfg(test)]
             prr_exit_trace: None,
             rack_entry_delivery: None,
@@ -2317,6 +2357,7 @@ impl Connection {
         self.state = State::Closed;
         self.tx_timestamps.cancel_from(0);
         self.pacing_deadline = None;
+        self.pacer = Pacer::default();
         self.reset_tlp();
         self.rack.deadline = None;
         self.prr = None;
@@ -5399,8 +5440,12 @@ impl Connection {
         // Actual stream data on bypasses still schedules spacing (keepalive's
         // garbage octet is not stream data). Fast recovery retries do not
         // bypass. Selection/admission below remains the sole authority to send.
-        let pacing_blocked =
-            self.pacing_enabled() && self.pacing_deadline.is_some_and(|deadline| now < deadline);
+        let pacing_blocked = if self.config.pacing.is_some() {
+            // A saturated deadline still blocks at Instant::MAX.
+            self.general_pacing_deadline(now).is_some()
+        } else {
+            self.pacing_enabled() && self.pacing_deadline.is_some_and(|deadline| now < deadline)
+        };
         let data_live = live && !pacing_blocked;
         let retransmit = reset.is_none()
             && !syn
@@ -6822,7 +6867,21 @@ impl Connection {
         if (fresh_data || new_fin) && !tlp {
             self.schedule_tlp();
         }
-        if count != 0 && !syn && !keepalive && self.pacing_enabled() {
+        if count != 0
+            && !syn
+            && !keepalive
+            && let Some(pacing) = self.config.pacing
+        {
+            let interval = Pacer::interval(
+                self.rtt.srtt().unwrap_or(self.rtt.rto()),
+                self.congestion.cwnd(),
+                pacing.rate_gain_percent,
+                pacing.max_bytes_per_second,
+                self.config.timebase.units_per_second,
+            );
+            self.pacer.sent(now, count, interval);
+            self.pacing_deadline = self.general_pacing_deadline(now);
+        } else if count != 0 && !syn && !keepalive && self.pacing_enabled() {
             // Commit after encode and congestion/idle accounting. Schedule from
             // this output, never from an expired deadline (no catch-up bursts).
             let rtt = self.rtt.srtt().unwrap_or(self.rtt.rto());
@@ -6835,13 +6894,25 @@ impl Connection {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.4
-    //= reason=Connection::transmit gates ordinary/startup and recovery selection on one caller-clock deadline, commits ceil(data*SRTT/cwnd) after encoding (initial RTO fallback), and preserves spacing through recovery exit/idle. Connection::next_deadline/timeout expose budgeted Endpoint::on_timeout wakeups. src/connection_output_tests.rs pacing_wire_spacing_units_idle_and_failed_output, pacing_recovery_budget_exit_and_control, pacing_selection_gates_protocol_probes_and_widened_rate, pacing_no_sack_retries_with_default_policy and src/endpoint_tests.rs pacing_endpoint_budget_and_halfclose verify wire behavior. Explicit nonpaced override and LegacyInitialCredit excluded; protocol-control/probe bypasses scoped at transmit.
+    //= reason=Legacy pacing=None only: Connection::transmit gates ordinary/startup and recovery selection on one caller-clock deadline, commits ceil(data*SRTT/cwnd) after encoding (initial RTO fallback), and preserves spacing through recovery exit/idle. Connection::next_deadline/timeout expose budgeted Endpoint::on_timeout wakeups. src/connection_output_tests.rs pacing_wire_spacing_units_idle_and_failed_output, pacing_recovery_budget_exit_and_control, pacing_selection_gates_protocol_probes_and_widened_rate, pacing_no_sack_retries_with_default_policy and src/endpoint_tests.rs pacing_endpoint_budget_and_halfclose verify wire behavior. Explicit nonpaced override and LegacyInitialCredit excluded; protocol-control/probe bypasses scoped at transmit.
     //# It is RECOMMENDED that implementations use pacing to reduce the
     //# burstiness of data traffic.
     fn pacing_enabled(&self) -> bool {
-        self.config.prr
-            && self.config.prr_algorithm == PrrAlgorithm::Rfc9937
-            && self.config.prr_pacing
+        self.config.pacing.is_some()
+            || (self.config.prr
+                && self.config.prr_algorithm == PrrAlgorithm::Rfc9937
+                && self.config.prr_pacing)
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc9937#section-6.4
+    //= reason=Opt-in PacingConfig gates ordinary/startup and recovery data independently of PRR or Reno/CUBIC. Fractional byte debt bounds startup/idle/late-poll bursts to max_burst_segments effective MSS; successful output alone consumes bytes. cwnd/SRTT times configured gain (RTO fallback), optional caller-unit-correct byte-rate cap, and retained debt across rate changes drive existing next_deadline/timeout wakeups. Protocol-control/probe exemptions remain scoped at transmit; no future-launch or QUIC compliance is claimed. general_pacing tests cover fractional output, bounds, rates, recovery, rollback and saturation; legacy pacing tests cover None unchanged.
+    //# It is RECOMMENDED that implementations use pacing to reduce the
+    //# burstiness of data traffic.
+    fn general_pacing_deadline(&self, now: Instant) -> Option<Instant> {
+        self.config.pacing.and_then(|p| {
+            self.pacer
+                .deadline(now, p.max_burst_segments * self.mss as u32, self.mss)
+        })
     }
 
     pub(crate) fn iw_setup_loss(&self) -> bool {
@@ -6906,7 +6977,11 @@ impl Connection {
         // At most one extra wakeup even if no data remains: timeout consumes
         // eligibility and refresh rechecks admission, so idle cannot busy-loop.
         [
-            self.pacing_deadline,
+            if self.config.pacing.is_some() {
+                self.general_pacing_deadline(self.now)
+            } else {
+                self.pacing_deadline
+            },
             timestamp_wakeup,
             self.loss_timer.map(|(_, deadline)| deadline),
             self.ecn_pause,
@@ -7054,6 +7129,7 @@ impl Connection {
         if due(self.time_wait_deadline, now) {
             self.state = State::Closed;
             self.pacing_deadline = None;
+            self.pacer = Pacer::default();
             self.time_wait_deadline = None;
             self.ack_pending = false;
             return Ok(());
