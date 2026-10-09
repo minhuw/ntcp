@@ -153,8 +153,24 @@ impl Pmtud {
         });
     }
 
+    pub fn loss(&mut self, start: Seq, multiple: bool) {
+        if let Some(p) = &mut self.probe
+            && (multiple || start.in_window(p.start, p.end.distance_from(p.start)) != Some(true))
+        {
+            p.other_loss = true;
+        }
+    }
+
     pub fn sent(&mut self, start: Seq, end: Seq, size: u32, header: u16, retry: bool) {
         self.max_sent = self.max_sent.max(size);
+        if let Some(p) = &mut self.probe
+            && !retry
+            && covered(end, p.trailing_end)
+        {
+            // Three queued segments are only a minimum: all subsequently sent
+            // flight must resolve before a failed probe can be called isolated.
+            p.trailing_end = end;
+        }
         if retry {
             for packet in self.sent.iter_mut().flatten() {
                 if overlaps(start, end, packet.start, packet.end) {
@@ -185,6 +201,24 @@ impl Pmtud {
             ambiguous: retry,
         });
         self.next = (self.next + 1) % self.sent.len();
+    }
+
+    // Known synchronous nonsubmission only: the caller validates output identity
+    // and rearms transport work before any intervening output/input.
+    pub fn reject_latest(&mut self, start: Seq, end: Seq) -> bool {
+        let index = (self.next + self.sent.len() - 1) % self.sent.len();
+        let Some(packet) = self.sent[index].filter(|p| p.start == start && p.end == end) else {
+            return false;
+        };
+        self.sent[index] = None;
+        // A local probe/trailing rejection is inconclusive, not network loss.
+        self.probe = None;
+        if let Some((_, _, sent, lost)) = &mut self.verification {
+            let counter = if packet.ambiguous { lost } else { sent };
+            *counter = counter.saturating_sub(1);
+        }
+        // Earlier retry ambiguity stays conservative; no whole-state rollback.
+        true
     }
 
     // Core also checks tuple and the live SND.UNA <= SEG.SEQ < SND.NXT window.
@@ -311,7 +345,10 @@ impl Pmtud {
                 //# to the probe size.
                 self.info.search_low = p.size;
                 if p.size > self.info.current_mtu {
-                    self.verification = Some((self.info.current_mtu, now, 0, 0));
+                    // Active search can make several increases before verification
+                    // finishes. Keep the last verified baseline and all evidence.
+                    self.verification
+                        .get_or_insert((self.info.current_mtu, now, 0, 0));
                     self.info.current_mtu = p.size;
                 }
                 self.probe = None;

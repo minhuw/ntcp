@@ -1715,6 +1715,9 @@ impl Connection {
         }
         let further_loss = self.rack.pipe() < old_pipe;
         if let Some((start, _)) = self.rack.lowest_lost(self.mss as u32) {
+            if let Some(p) = &mut self.pmtud {
+                p.loss(start, self.rack.counts().lost > 1);
+            }
             self.note_iw_loss(start);
             self.start_sack_recovery();
         }
@@ -2022,11 +2025,16 @@ impl Connection {
         self.pmtud.as_ref().map(|p| p.info)
     }
 
-    pub(crate) fn set_first_hop_mtu(&mut self, now: Instant, mtu: u32) -> Result<(), Error> {
+    pub(crate) fn validate_first_hop_mtu(&self, now: Instant, mtu: u32) -> Result<(), Error> {
         self.check_time(now)?;
         if mtu < if self.tuple.local.is_ipv4() { 68 } else { 1280 } || self.pmtud.is_none() {
             return Err(Error::InvalidArgument);
         }
+        Ok(())
+    }
+
+    pub(crate) fn set_first_hop_mtu(&mut self, now: Instant, mtu: u32) -> Result<(), Error> {
+        self.validate_first_hop_mtu(now, mtu)?;
         let bound = self.path_bound(mtu);
         self.update_time(now)?;
         self.pmtud.as_mut().unwrap().link(mtu, bound, now);
@@ -4120,6 +4128,11 @@ impl Connection {
                 further_loss |= self
                     .rack
                     .mark_scoreboard_losses(&self.scoreboard, self.mss as u32);
+                if let Some(p) = &mut self.pmtud
+                    && let Some((start, _)) = self.rack.lowest_lost(self.mss as u32)
+                {
+                    p.loss(start, self.rack.counts().lost > 1);
+                }
             }
             if !advancing && let Some(sample) = self.rack.ack_sample {
                 self.congestion.observe_startup_ack(
@@ -4322,6 +4335,9 @@ impl Connection {
                 {
                     self.rack
                         .mark_scoreboard_losses(&self.scoreboard, self.mss as u32);
+                    if let Some(p) = &mut self.pmtud {
+                        p.loss(self.snd_una, self.rack.counts().lost > 1);
+                    }
                     self.start_sack_recovery();
                 }
             }
@@ -4358,6 +4374,9 @@ impl Connection {
                     ));
                 }
                 self.note_iw_loss(self.snd_una);
+                if let Some(p) = &mut self.pmtud {
+                    p.loss(self.snd_una, false);
+                }
                 self.retx_pending = true;
                 self.ecn_cwr_pending |= self.ecn_feedback();
                 self.limited_pending = false;
@@ -4825,6 +4844,9 @@ impl Connection {
                 .congestion
                 .on_ack_with_ecn(ack, bytes, self.data_flight(), ece)
         {
+            if let Some(p) = &mut self.pmtud {
+                p.loss(ack, false);
+            }
             self.retx_pending = true;
         }
         self.rto_deadline = if self.flight() == 0 {
@@ -5265,6 +5287,19 @@ impl Connection {
     //# SND.UNA and rwnd.
     fn retry_limit(&self, seq: Seq, proposed: u32) -> u32 {
         let proposed = proposed.min(self.data_high().distance_from(seq));
+        // Repair the probe gap without resending already-delivered trailing
+        // bytes, which would falsely count as a second PMTU loss.
+        let proposed = self
+            .pmtud
+            .as_ref()
+            .and_then(|p| p.probe)
+            .map_or(proposed, |p| {
+                if seq.in_window(p.start, p.end.distance_from(p.start)) == Some(true) {
+                    proposed.min(p.end.distance_from(seq))
+                } else {
+                    proposed
+                }
+            });
         let window = self.snd_wnd.saturating_sub(seq.distance_from(self.snd_una));
         if self.snd_wnd == 0 {
             return 0;
@@ -7249,8 +7284,9 @@ impl Connection {
             timestamp_wakeup,
             self.pmtud
                 .as_ref()
-                .and_then(|p| p.deadline)
-                .filter(|&d| d > self.now),
+                // Unlike pacing, tick consumes even a saturated due deadline.
+                // Input may advance now before Endpoint services that timer.
+                .and_then(|p| p.deadline),
             self.loss_timer.map(|(_, deadline)| deadline),
             self.ecn_pause,
             self.ack_deadline,
@@ -26979,6 +27015,9 @@ mod tests {
     }
     mod pmtud_policy {
         include!("pmtud_tests.rs");
+    }
+    mod pmtud_lifecycle {
+        include!("pmtud_lifecycle_tests.rs");
     }
     #[test]
     fn logical_send_finish_marks_only_selected_byte_and_releases_cork() {
