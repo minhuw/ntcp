@@ -27499,6 +27499,9 @@ mod tests {
     }
     mod pmtud_policy {
         include!("pmtud_tests.rs");
+        mod ipv6_evidence {
+            include!("pmtud_ipv6_evidence_tests.rs");
+        }
     }
     mod pmtud_lifecycle {
         include!("pmtud_lifecycle_tests.rs");
