@@ -4388,6 +4388,58 @@ fn general_pacing_endpoint_budget_and_halfclose() {
     }));
 }
 
+#[test]
+fn general_pacing_saturated_deadline_does_not_rearm_endpoint() {
+    let start = u64::MAX - 1000;
+    let mut cfg = config();
+    cfg.connection.timestamps = false;
+    cfg.connection.delayed_ack_us = 0;
+    cfg.connection.pacing = Some(PacingConfig {
+        max_bytes_per_second: Some(1),
+        ..PacingConfig::default()
+    });
+    assert!(cfg.connection.keepalive.is_none());
+    let (local, remote) = addresses();
+    let mut a = Endpoint::new(cfg.clone(), [1; 32], start, test_policy).unwrap();
+    let mut b = Endpoint::new(cfg, [2; 32], start, test_policy).unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let client = a.connect(start, local, remote).unwrap();
+    pump(&mut a, &mut b, start);
+    let server = b.accept(listener).unwrap();
+
+    a.write(client, &[0x55; 128]).unwrap();
+    let sent = packets(&mut a, start + 1);
+    assert_eq!(sent.len(), 2);
+    for (ip, bytes) in &sent {
+        assert_eq!(wire::parse(*ip, bytes).unwrap().payload.len(), 64);
+    }
+    assert_eq!(a.next_deadline(), Some(u64::MAX));
+    deliver(&mut b, u64::MAX, sent);
+    deliver(&mut a, u64::MAX, packets(&mut b, u64::MAX));
+    let info = a.transport_info(client).unwrap();
+    assert_eq!((info.unacked, info.notsent_bytes, info.send_used), (0, 0, 0));
+
+    // Residual pacing debt cannot drain at MAX, but there is no serviceable
+    // future wakeup. Budget exhaustion must not perpetually rearm due MAX.
+    assert!(!a.on_timeout(u64::MAX, 4).unwrap());
+    assert_eq!(a.next_deadline(), None);
+    assert!(!a.on_timeout(u64::MAX, 1).unwrap());
+    assert!(packets(&mut a, u64::MAX).is_empty());
+
+    // Suppressing the wakeup must not forgive debt or block control output.
+    a.write(client, b"new data").unwrap();
+    assert!(packets(&mut a, u64::MAX).is_empty());
+    b.write(server, b"x").unwrap();
+    deliver(&mut a, u64::MAX, packets(&mut b, u64::MAX));
+    let control = packets(&mut a, u64::MAX);
+    assert_eq!(control.len(), 1);
+    let ack = wire::parse(control[0].0, &control[0].1).unwrap();
+    assert_eq!(ack.header.flags, wire::ACK);
+    assert!(ack.payload.is_empty());
+    assert_eq!(a.transport_info(client).unwrap().notsent_bytes, 8);
+    assert!(packets(&mut a, u64::MAX).is_empty());
+}
+
 fn pacing_endpoint_budget_case(pacing: Option<crate::PacingConfig>) {
     for scale in [1, 1000] {
         let mut cfg = config();

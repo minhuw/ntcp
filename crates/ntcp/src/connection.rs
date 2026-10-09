@@ -6978,7 +6978,10 @@ impl Connection {
         // eligibility and refresh rechecks admission, so idle cannot busy-loop.
         [
             if self.config.pacing.is_some() {
+                // At Instant::MAX debt still blocks admission, but its saturated
+                // deadline cannot be serviced; do not rearm an already-due timer.
                 self.general_pacing_deadline(self.now)
+                    .filter(|&deadline| deadline > self.now)
             } else {
                 self.pacing_deadline
             },
