@@ -359,6 +359,16 @@ fn isolated_probe_cc_terminal_proof_once_and_only_after_extended_tail() {
                 20,
                 false,
             );
+            p.loss(start, false);
+            // Fresh output between loss detection and the first repair cannot
+            // extend the already-emitted tail that the proof must cover.
+            p.sent(
+                start.wrapping_add(6000),
+                start.wrapping_add(7200),
+                1240,
+                20,
+                false,
+            );
             p.sent(start, start.wrapping_add(984), 1024, 20, true);
             if disqualifier == 1 {
                 p.loss(start.wrapping_add(5000), false);
@@ -496,5 +506,129 @@ fn isolated_probe_cc_cancellation_without_mss_change_commits_once() {
         a.congestion.suppress_probe_response(start);
         a.resolve_probe_response();
         assert_eq!(a.congestion.ssthresh(), target);
+    }
+}
+
+#[test]
+fn isolated_probe_cc_replenishment_does_not_extend_recovery_proof() {
+    for mode in 0..3 {
+        for prr in [false, true] {
+            for cubic in [false, true] {
+                let (mut a, mut b) =
+                    pair(isolated_config(mode, prr, cubic, false), u32::MAX - 4000);
+                a.write(b"x").unwrap();
+                deliver(&mut a, &mut b, 32);
+                deliver(&mut b, &mut a, 33);
+                a.write(&[7; 60_000]).unwrap();
+                packet(&mut a, 40); // Drop only the explicit probe.
+                let probe = a.pmtud.as_ref().unwrap().probe.unwrap();
+                let (window, threshold, old_mss) =
+                    (a.congestion.cwnd(), a.congestion.ssthresh(), a.mss);
+                let trailing: Vec<_> = (0..8).map(|_| packet(&mut a, 41)).collect();
+                let proof_end = a.snd_nxt;
+                assert!(after(proof_end, probe.trailing_end));
+                let mut now = 140;
+                for bytes in &trailing {
+                    real_ack(&mut a, &mut b, bytes, now, false);
+                }
+                if !a.congestion.in_recovery() {
+                    now = a.rack.deadline.unwrap();
+                    a.timeout(now).unwrap();
+                }
+                assert_eq!(a.congestion.pending_probe_response(), Some(probe.start));
+                // ACK split repairs, but hold the one that will end recovery.
+                let ending_repair = loop {
+                    now += 1;
+                    let bytes = packet(&mut a, now);
+                    let segment = wire::parse(ip(a.tuple), &bytes).unwrap();
+                    let end = Seq(segment.header.sequence)
+                        .wrapping_add(segment.payload.len() as u32);
+                    if end == probe.end {
+                        break bytes;
+                    }
+                    assert!(after(probe.end, end));
+                    real_ack(&mut a, &mut b, &bytes, now, false);
+                };
+                assert!(a.congestion.in_recovery());
+                now += 1;
+                let outstanding = packet(&mut a, now);
+                assert_eq!(
+                    wire::parse(ip(a.tuple), &outstanding).unwrap().header.sequence,
+                    proof_end.0
+                ); // Fresh output before the recovery-ending ACK.
+                real_ack(&mut a, &mut b, &ending_repair, now, false);
+                assert_eq!(a.snd_una, proof_end);
+                assert!(!a.congestion.in_recovery());
+                assert!(a.prr.is_none());
+                assert!(a.flight() > 0);
+                let mut drain = [0; 65_536];
+                b.read(&mut drain).unwrap();
+                let mut outstanding = alloc::collections::VecDeque::from([outstanding]);
+                // Refill the admitted window before each ACK, including for CUBIC's
+                // cwnd-limited growth test. Neither fixed nor broken code drains flight.
+                for _ in 0..8 {
+                    now += 1;
+                    loop {
+                        let mut fresh = vec![0; 2000];
+                        let Some(len) = a.transmit(now, &mut fresh).unwrap() else {
+                            break;
+                        };
+                        fresh.truncate(len);
+                        outstanding.push_back(fresh);
+                    }
+                    let bytes = outstanding.pop_front().unwrap();
+                    real_ack(&mut a, &mut b, &bytes, now, false);
+                    assert!(a.flight() > 0);
+                    assert!(!outstanding.is_empty());
+                    b.read(&mut drain).unwrap();
+                    a.write(&[7; 1460]).unwrap();
+                }
+                assert!(
+                    a.congestion.pending_probe_response().is_none(),
+                    "mode={mode}, prr={prr}, cubic={cubic}: replenishment pinned proof"
+                );
+                let p = a.pmtud.as_mut().unwrap();
+                assert!(p.probe.is_none());
+                assert!(p.take_probe_outcome(a.snd_una).is_none()); // Already consumed once.
+                assert!(p.deadline.is_some());
+                assert_eq!(a.congestion.ssthresh(), threshold);
+                let scaled_window =
+                    (u64::from(window) * a.mss as u64 / old_mss as u64) as u32;
+                assert!(
+                    a.congestion.cwnd() > scaled_window,
+                    "mode={mode}, prr={prr}, cubic={cubic}: cwnd={} scaled={scaled_window}",
+                    a.congestion.cwnd()
+                ); // Ordinary ACK growth resumed.
+            }
+        }
+    }
+}
+
+#[test]
+fn isolated_probe_cc_loss_freezes_original_minimum_tail() {
+    for cause in 0..3 {
+        let mut p =
+            crate::pmtud::Pmtud::new(crate::PmtudConfig::new(1500), 1500, true, 600_000_000);
+        let start = Seq(u32::MAX - 500);
+        let end = start.wrapping_add(1200);
+        let tail = end.wrapping_add(3000);
+        p.start_probe(start, 1200, 3000, 1240);
+        p.sent(start, end, 1240, 20, false);
+        match cause {
+            0 => p.loss(start, false),
+            1 => p.timeout(1, start, 1, 1000),
+            _ => p.sent(start, end, 1240, 20, true),
+        }
+        p.sent(end, tail.wrapping_add(1200), 4240, 20, false);
+        assert_eq!(p.probe.unwrap().trailing_end, tail);
+        if cause != 2 {
+            p.sent(start, end, 1240, 20, true);
+        }
+        p.ack(end, 2, 1000, 1000);
+        assert!(p.probe.is_some()); // Freezing cannot discard the unsent minimum.
+        assert!(p.take_probe_outcome(end).is_none());
+        p.ack(tail, 3, 1000, 1000);
+        assert_eq!(p.take_probe_outcome(tail).unwrap().isolated, cause != 1);
+        assert!(p.take_probe_outcome(tail).is_none());
     }
 }

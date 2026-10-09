@@ -24,6 +24,7 @@ pub(crate) struct Probe {
     pub trailing_end: Seq,
     pub size: u32,
     retried: bool,
+    loss_reported: bool,
     other_loss: bool,
     timeout: bool,
     repair_end: Seq,
@@ -230,6 +231,7 @@ impl Pmtud {
             trailing_end: start.wrapping_add(payload + trailing),
             size,
             retried: false,
+            loss_reported: false,
             other_loss: false,
             timeout: false,
             repair_end: start,
@@ -272,10 +274,12 @@ impl Pmtud {
     }
 
     pub fn loss(&mut self, start: Seq, multiple: bool) {
-        if let Some(p) = &mut self.probe
-            && (multiple || start.in_window(p.start, p.end.distance_from(p.start)) != Some(true))
-        {
-            p.other_loss = true;
+        if let Some(p) = &mut self.probe {
+            // Freeze before recovery can emit fresh data, not on its ending ACK.
+            p.loss_reported = true;
+            if multiple || start.in_window(p.start, p.end.distance_from(p.start)) != Some(true) {
+                p.other_loss = true;
+            }
         }
     }
 
@@ -287,10 +291,13 @@ impl Pmtud {
         self.max_sent = self.max_sent.max(size);
         if let Some(p) = &mut self.probe
             && !retry
+            && !p.loss_reported
+            && !p.retried
+            && !p.timeout
             && covered(end, p.trailing_end)
         {
-            // Three queued segments are only a minimum: all subsequently sent
-            // flight must resolve before a failed probe can be called isolated.
+            // Retain the minimum trailing requirement and all flight emitted
+            // before loss. Recovery/replenishment must not move proof forever.
             p.trailing_end = end;
         }
         if retry {
