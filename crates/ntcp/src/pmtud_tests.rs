@@ -659,3 +659,65 @@ fn pmtud_timebase_and_impossible_header_budget_are_bounded() {
     assert_eq!(a.transmit(0, &mut [0; 200]), Err(Error::InvalidArgument));
     assert_eq!(a.snd_nxt, a.iss);
 }
+
+#[test]
+fn pmtud_lower_mss_persists_administrative_ceiling_across_validated_growth() {
+    for ceiling in [468u16, 1000] {
+        let mut config = cfg(1500);
+        config.timestamps = false;
+        let (mut a, _) = family_pair(config, true, 0);
+        assert_eq!(a.mss, 1460);
+        a.write(&[1; 1460]).unwrap();
+        let frame = wire_packet(&mut a, 40, OutgoingIpv4Options::default());
+        let seq = a.snd_una.0;
+        assert!(
+            a.pmtu_feedback(41, seq, frame.len() as u32, 20, 508)
+                .unwrap()
+        );
+        assert_eq!(a.mss, 468);
+
+        a.lower_mss(ceiling).unwrap();
+        assert_eq!(a.send_mss_limit, ceiling);
+        assert_eq!(a.mss, 468);
+        assert_eq!(a.config.mss, 1460);
+        let before = a.path_mtu_info();
+        assert_eq!(a.lower_mss(0), Err(Error::InvalidArgument));
+        assert_eq!(a.lower_mss(ceiling + 1), Err(Error::InvalidArgument));
+        assert_eq!(a.path_mtu_info(), before);
+        a.lower_mss(ceiling).unwrap();
+        let end = a.snd_nxt;
+        ack(&mut a, 50, end);
+
+        // For the equal-effective ceiling, first lower the link so real
+        // probe/ACK growth can exercise the saved ceiling too.
+        if ceiling == 468 {
+            a.set_first_hop_mtu(51, 296).unwrap();
+        }
+        let reduced = a.path_mtu_info().unwrap().current_mtu;
+        a.set_first_hop_mtu(52, 2000).unwrap();
+        assert_eq!(a.path_mtu_info().unwrap().current_mtu, reduced);
+        let deadline = a.pmtud.as_ref().unwrap().deadline.unwrap();
+        a.timeout(deadline).unwrap();
+        assert_eq!(
+            a.path_mtu_info().unwrap().search_high,
+            u32::from(ceiling) + 40
+        );
+        a.write(&[5; 20_000]).unwrap();
+        for step in 0..16 {
+            let now = deadline + step * 1000;
+            let frame = wire_packet(&mut a, now, OutgoingIpv4Options::default());
+            let probe = a.pmtud.as_ref().unwrap().probe.unwrap();
+            assert_eq!(frame.len(), probe.size as usize);
+            assert!(probe.size > a.path_mtu_info().unwrap().current_mtu);
+            assert!(frame.len() <= usize::from(ceiling) + 40);
+            ack(&mut a, now + 100, probe.end);
+            assert_eq!(a.path_mtu_info().unwrap().current_mtu, probe.size);
+            assert!(a.mss <= usize::from(ceiling));
+            if a.mss == usize::from(ceiling) {
+                break;
+            }
+        }
+        assert_eq!(a.mss, usize::from(ceiling));
+        assert_eq!(a.lower_mss(ceiling + 1), Err(Error::InvalidArgument));
+    }
+}

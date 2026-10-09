@@ -2067,6 +2067,15 @@ impl Connection {
     }
 
     pub(crate) fn lower_mss(&mut self, mss: u16) -> Result<(), Error> {
+        if self.pmtud.is_some() {
+            // Administrative reductions are independent of the transient path MSS.
+            if mss == 0 || mss > self.send_mss_limit {
+                return Err(Error::InvalidArgument);
+            }
+            self.send_mss_limit = self.send_mss_limit.min(mss);
+            self.refresh_path_mss();
+            return Ok(());
+        }
         let effective = mss
             .saturating_sub(if self.timestamps { 12 } else { 0 })
             .max(1);
@@ -2076,16 +2085,10 @@ impl Connection {
         if effective as usize == self.mss {
             return Ok(());
         }
-        if self.pmtud.is_none() {
-            // Legacy explicit MSS override retains its original SYN behavior.
-            self.config.mss = self.config.mss.min(mss);
-        }
+        // Legacy explicit MSS override retains its original SYN behavior.
+        self.config.mss = self.config.mss.min(mss);
         self.send_mss_limit = self.send_mss_limit.min(mss);
-        if self.pmtud.is_some() {
-            self.refresh_path_mss();
-        } else {
-            self.set_path_mss(effective as usize);
-        }
+        self.set_path_mss(effective as usize);
         Ok(())
     }
 
