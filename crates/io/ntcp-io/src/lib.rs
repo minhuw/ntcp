@@ -48,6 +48,28 @@ pub struct ClockDescriptor {
     pub unit: TimestampUnit,
 }
 
+// Absolute value in an explicit clock; no implicit clock conversion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransmitTime {
+    pub value: u64,
+    pub clock: ClockDescriptor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TxSchedulingCapabilities {
+    pub clock: ClockDescriptor,
+    pub hardware: bool,
+}
+
+// Best-effort negative observation, not a delivery completion. Requested time
+// is identity, not a unique cookie. errno/code are native backend diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TxSchedulingError {
+    pub when: TransmitTime,
+    pub errno: u32,
+    pub code: u8,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PacketTimestamp {
     pub value: u64,
@@ -101,6 +123,34 @@ pub trait PacketIo {
     fn layer(&self) -> PacketLayer;
     fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>>;
     fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome>;
+
+    fn tx_scheduling_capabilities(&self) -> Option<TxSchedulingCapabilities> {
+        None
+    }
+
+    // Validate clock, horizon and optional timestamp sources before submission.
+    // WouldBlock consumes neither packet nor request. Never fall back to an
+    // immediate send on failure. Submitted is ownership, NOT scheduling success.
+    fn transmit_at(
+        &mut self,
+        _packet: &[u8],
+        _when: TransmitTime,
+        _timestamp: Option<TxTimestampRequest>,
+    ) -> io::Result<TxOutcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "scheduled TX unsupported",
+        ))
+    }
+
+    // Bounded nonblocking polling; absence is NOT evidence of delivery. When
+    // timestamps share a queue, callers must budget both polling APIs.
+    fn poll_tx_scheduling_error(&mut self) -> io::Result<Option<TxSchedulingError>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "scheduled TX unsupported",
+        ))
+    }
 
     fn timestamp_capabilities(&self) -> TimestampCapabilities {
         TimestampCapabilities::default()
@@ -235,6 +285,27 @@ mod tests {
         );
         assert_eq!(
             io.cancel_tx_timestamp(u64::MAX).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(io.tx_scheduling_capabilities(), None);
+        assert_eq!(
+            io.transmit_at(
+                &[1],
+                TransmitTime {
+                    value: 123,
+                    clock: ClockDescriptor {
+                        domain: ClockDomain::Monotonic,
+                        unit: TimestampUnit::Nanoseconds
+                    }
+                },
+                None
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            io.poll_tx_scheduling_error().unwrap_err().kind(),
             io::ErrorKind::Unsupported
         );
         assert_eq!(mock.transmitted, 0);

@@ -1,10 +1,12 @@
 #![cfg(target_os = "linux")]
 
+mod scheduling;
 mod timestamp;
 use ntcp_io::{
-    PacketIo, PacketLayer, ReceivedPacket, TimestampCapabilities, TxOutcome, TxTimestampCompletion,
-    TxTimestampRequest,
+    PacketIo, PacketLayer, ReceivedPacket, TimestampCapabilities, TransmitTime, TxOutcome,
+    TxSchedulingCapabilities, TxSchedulingError, TxTimestampCompletion, TxTimestampRequest,
 };
+pub use scheduling::TxSchedulingConfig;
 use std::{
     io,
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
@@ -15,6 +17,8 @@ use timestamp::{Control, State};
 pub struct AfPacket {
     fd: OwnedFd,
     timestamps: Option<State>,
+    scheduling: Option<TxSchedulingConfig>,
+    scheduling_error: Option<TxSchedulingError>,
 }
 
 impl AfPacket {
@@ -141,7 +145,49 @@ impl AfPacket {
         Ok(Self {
             fd,
             timestamps: None,
+            scheduling: None,
+            scheduling_error: None,
         })
+    }
+
+    // Caller owns fq and its horizon configuration for this socket's lifetime.
+    // fq horizon/queue drops may NOT report individual errors; no delivery ACK.
+    pub fn enable_tx_scheduling(&mut self, config: TxSchedulingConfig) -> io::Result<()> {
+        if self.scheduling.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "TX scheduling already configured",
+            ));
+        }
+        if !config.caller_owned_fq
+            || config.max_future_ns == 0
+            || config.max_future_ns > i64::MAX as u64
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "caller-owned fq and bounded horizon required",
+            ));
+        }
+        let option = libc::sock_txtime {
+            clockid: libc::CLOCK_MONOTONIC,
+            flags: libc::SOF_TXTIME_REPORT_ERRORS,
+        };
+        // SAFETY: live fd and correctly sized Linux sock_txtime. Strict mode:
+        // no DEADLINE_MODE, and this adapter never enables PACKET_QDISC_BYPASS.
+        if unsafe {
+            libc::setsockopt(
+                self.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_TXTIME,
+                (&option as *const libc::sock_txtime).cast(),
+                std::mem::size_of_val(&option) as _,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        self.scheduling = Some(config);
+        Ok(())
     }
 
     // One-time opt-in; the host owns NIC timestamp configuration. Explicit TX
@@ -171,6 +217,116 @@ impl AfPacket {
         }
         self.timestamps = Some(state);
         Ok(())
+    }
+}
+
+impl AfPacket {
+    fn send_controlled(
+        &mut self,
+        packet: &[u8],
+        when: Option<TransmitTime>,
+        request: Option<TxTimestampRequest>,
+    ) -> io::Result<TxOutcome> {
+        let (mut control, mut length, prepared) = if let Some(request) = request {
+            if !request.software && !request.hardware {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "empty timestamp request",
+                ));
+            }
+            let state = self
+                .timestamps
+                .as_ref()
+                .ok_or_else(timestamp::unsupported)?;
+            let Some(id) = state.prepare(request)? else {
+                return Ok(TxOutcome::WouldBlock);
+            };
+            let (control, length) = Control::tx(request, id);
+            (control, length, Some((id, request)))
+        } else {
+            (Control::new(), 0, None)
+        };
+        if let Some(when) = when {
+            control.append(&mut length, libc::SOL_SOCKET, libc::SCM_TXTIME, when.value);
+        }
+        let mut vector = libc::iovec {
+            iov_base: packet.as_ptr().cast_mut().cast(),
+            iov_len: packet.len(),
+        };
+        // SAFETY: pointers remain live through sendmsg; send does not mutate iov.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut vector;
+        message.msg_iovlen = 1;
+        control.attach(&mut message);
+        message.msg_controllen = length as _;
+        // SAFETY: message and its readable packet/control buffers are live.
+        let count = unsafe {
+            libc::sendmsg(
+                self.as_raw_fd(),
+                &message,
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if count < 0
+            && matches!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINVAL | libc::ENOPROTOOPT | libc::EOPNOTSUPP)
+            )
+        {
+            return Err(timestamp::unsupported());
+        }
+        let outcome = transmitted(count, packet.len())?;
+        if outcome == TxOutcome::Submitted
+            && let Some((id, request)) = prepared
+        {
+            self.timestamps.as_mut().unwrap().submitted(id, request);
+        }
+        Ok(outcome)
+    }
+
+    #[allow(clippy::unnecessary_cast)]
+    fn poll_error_queue(&mut self) -> io::Result<()> {
+        // A single buffered scheduling error applies backpressure to the shared
+        // queue. Never eat timestamp completions or silently overwrite errors.
+        if self.scheduling_error.is_some() {
+            return Ok(());
+        }
+        let mut control = Control::new();
+        // SAFETY: zero msghdr with no payload is valid for MSG_ERRQUEUE.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        control.attach(&mut message);
+        // SAFETY: writable control storage remains live through recvmsg.
+        let count = unsafe {
+            libc::recvmsg(
+                self.as_raw_fd(),
+                &mut message,
+                libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT,
+            )
+        };
+        if count < 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::WouldBlock {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        let metadata = control.parse(
+            message.msg_controllen as usize,
+            message.msg_flags,
+            self.timestamps.as_ref().and_then(|s| s.config.device_clock),
+            true,
+        )?;
+        self.dispatch_error(metadata);
+        Ok(())
+    }
+
+    fn dispatch_error(&mut self, metadata: timestamp::Metadata) {
+        if let Some(error) = metadata.error.and_then(scheduling::error) {
+            self.scheduling_error = Some(error);
+        } else if let Some(state) = self.timestamps.as_mut() {
+            state.complete(metadata);
+        }
     }
 }
 
@@ -292,56 +448,45 @@ impl PacketIo for AfPacket {
         Ok(Some(ReceivedPacket { len, timestamps }))
     }
 
+    fn tx_scheduling_capabilities(&self) -> Option<TxSchedulingCapabilities> {
+        self.scheduling.map(|_| TxSchedulingCapabilities {
+            clock: scheduling::CLOCK,
+            hardware: false,
+        })
+    }
+
+    fn transmit_at(
+        &mut self,
+        packet: &[u8],
+        when: TransmitTime,
+        timestamp: Option<TxTimestampRequest>,
+    ) -> io::Result<TxOutcome> {
+        let config = self
+            .scheduling
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "TX scheduling disabled"))?;
+        config.validate(when, scheduling::now()?)?;
+        self.send_controlled(packet, Some(when), timestamp)
+    }
+
     fn transmit_with_timestamp(
         &mut self,
         packet: &[u8],
         request: TxTimestampRequest,
     ) -> io::Result<TxOutcome> {
-        if !request.software && !request.hardware {
+        self.send_controlled(packet, None, Some(request))
+    }
+
+    fn poll_tx_scheduling_error(&mut self) -> io::Result<Option<TxSchedulingError>> {
+        if self.scheduling.is_none() {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "empty timestamp request",
+                io::ErrorKind::Unsupported,
+                "TX scheduling disabled",
             ));
         }
-        let state = self
-            .timestamps
-            .as_ref()
-            .ok_or_else(timestamp::unsupported)?;
-        let Some(id) = state.prepare(request)? else {
-            return Ok(TxOutcome::WouldBlock);
-        };
-        let (mut control, length) = Control::tx(request, id);
-        let mut vector = libc::iovec {
-            iov_base: packet.as_ptr().cast_mut().cast(),
-            iov_len: packet.len(),
-        };
-        // SAFETY: pointers remain live through sendmsg; send does not mutate iov.
-        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-        message.msg_iov = &mut vector;
-        message.msg_iovlen = 1;
-        control.attach(&mut message);
-        message.msg_controllen = length as _;
-        // SAFETY: message and its readable packet/control buffers are live.
-        let count = unsafe {
-            libc::sendmsg(
-                self.as_raw_fd(),
-                &message,
-                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-            )
-        };
-        if count < 0
-            && matches!(
-                io::Error::last_os_error().raw_os_error(),
-                Some(libc::EINVAL | libc::ENOPROTOOPT | libc::EOPNOTSUPP)
-            )
-        {
-            return Err(timestamp::unsupported());
+        if self.scheduling_error.is_none() {
+            self.poll_error_queue()?;
         }
-        let outcome = transmitted(count, packet.len())?;
-        if outcome == TxOutcome::Submitted {
-            self.timestamps.as_mut().unwrap().submitted(id, request);
-        }
-        Ok(outcome)
+        Ok(self.scheduling_error.take())
     }
 
     fn cancel_tx_timestamp(&mut self, cookie: u64) -> io::Result<bool> {
@@ -357,7 +502,6 @@ impl PacketIo for AfPacket {
 
     #[allow(clippy::unnecessary_cast)] // msghdr lengths differ on musl/glibc
     fn poll_tx_timestamp(&mut self) -> io::Result<Option<TxTimestampCompletion>> {
-        let fd = self.as_raw_fd();
         let state = self
             .timestamps
             .as_mut()
@@ -368,30 +512,8 @@ impl PacketIo for AfPacket {
         if let Some(event) = state.pop() {
             return Ok(Some(event));
         }
-        // Consume at most ONE error-queue record, including unrelated records.
-        let mut control = Control::new();
-        // SAFETY: zero msghdr with no packet iov is valid for MSG_ERRQUEUE;
-        // OPT_TSONLY means the timestamp does not need a payload buffer.
-        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-        control.attach(&mut message);
-        // SAFETY: writable control storage is live through recvmsg.
-        let count =
-            unsafe { libc::recvmsg(fd, &mut message, libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT) };
-        if count < 0 {
-            let error = io::Error::last_os_error();
-            return if error.kind() == io::ErrorKind::WouldBlock {
-                Ok(None)
-            } else {
-                Err(error)
-            };
-        }
-        state.complete(control.parse(
-            message.msg_controllen as usize,
-            message.msg_flags,
-            state.config.device_clock,
-            true,
-        )?);
-        Ok(state.pop())
+        self.poll_error_queue()?;
+        Ok(self.timestamps.as_mut().unwrap().pop())
     }
 
     fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
@@ -442,6 +564,135 @@ pub(crate) mod tests {
             }
         }
         panic!("queue never filled");
+    }
+
+    #[test]
+    fn scheduled_validation_backpressure_and_error_demux() {
+        let (fd, peer) = pair();
+        let config = TxSchedulingConfig {
+            caller_owned_fq: true,
+            max_future_ns: 1_000_000_000,
+        };
+        let mut a = AfPacket {
+            fd,
+            timestamps: None,
+            scheduling: None,
+            scheduling_error: None,
+        };
+        let mut b = AfPacket {
+            fd: peer,
+            timestamps: None,
+            scheduling: None,
+            scheduling_error: None,
+        };
+        let when = TransmitTime {
+            value: scheduling::now().unwrap() + 500_000_000,
+            clock: scheduling::CLOCK,
+        };
+        assert_eq!(
+            a.transmit_at(b"x", when, None).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(
+            a.enable_tx_scheduling(TxSchedulingConfig {
+                caller_owned_fq: false,
+                ..config
+            })
+            .is_err()
+        );
+        a.scheduling = Some(config); // synthetic config; validation never reaches sendmsg
+        for value in [0, u64::MAX] {
+            assert_eq!(
+                a.transmit_at(b"x", TransmitTime { value, ..when }, None)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        let request = TxTimestampRequest {
+            cookie: 1,
+            software: true,
+            hardware: false,
+        };
+        let mut state = State::new(TimestampConfig {
+            tx_software: true,
+            tx_completion_capacity: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let id = state.prepare(request).unwrap().unwrap();
+        state.submitted(id, request);
+        a.timestamps = Some(state);
+        assert_eq!(
+            a.transmit_at(
+                b"x",
+                when,
+                Some(TxTimestampRequest {
+                    cookie: 2,
+                    ..request
+                })
+            )
+            .unwrap(),
+            TxOutcome::WouldBlock
+        );
+        assert!(!a.cancel_tx_timestamp(2).unwrap());
+        assert_eq!(b.receive(&mut [0; 8]).unwrap(), None);
+
+        // Feed native cmsgs through the same parser and dispatcher as recvmsg.
+        let mut control = Control::new();
+        let mut used = 0;
+        let mut native: libc::sock_extended_err = unsafe { std::mem::zeroed() };
+        native.ee_origin = 6; // SO_EE_ORIGIN_TXTIME
+        native.ee_data = (when.value >> 32) as u32;
+        native.ee_info = when.value as u32;
+        native.ee_errno = libc::ECANCELED as u32;
+        native.ee_code = 2;
+        control.append(
+            &mut used,
+            libc::SOL_PACKET,
+            libc::PACKET_TX_TIMESTAMP,
+            native,
+        );
+        a.dispatch_error(control.parse(used, 0, None, true).unwrap());
+        assert!(a.poll_tx_timestamp().unwrap().is_none()); // queued error stalls reads
+        assert_eq!(a.poll_tx_scheduling_error().unwrap().unwrap().when, when);
+        native.ee_origin = libc::SO_EE_ORIGIN_TIMESTAMPING;
+        native.ee_errno = libc::ENOMSG as u32;
+        native.ee_info = 0;
+        native.ee_data = id;
+        let mut used = 0;
+        control.append(
+            &mut used,
+            libc::SOL_PACKET,
+            libc::PACKET_TX_TIMESTAMP,
+            native,
+        );
+        control.append(
+            &mut used,
+            libc::SOL_SOCKET,
+            libc::SCM_TIMESTAMPING,
+            [
+                libc::timespec {
+                    tv_sec: 1,
+                    tv_nsec: 2,
+                },
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+            ],
+        );
+        a.dispatch_error(control.parse(used, 0, None, true).unwrap());
+        assert!(a.poll_tx_scheduling_error().unwrap().is_none());
+        assert_eq!(
+            a.poll_tx_timestamp().unwrap().unwrap().cookie,
+            request.cookie
+        );
+        assert!(a.poll_tx_timestamp().unwrap().is_none());
     }
 
     #[test]
@@ -513,10 +764,14 @@ pub(crate) mod tests {
         let mut a = AfPacket {
             fd: a,
             timestamps: None,
+            scheduling: None,
+            scheduling_error: None,
         };
         let mut b = AfPacket {
             fd: b,
             timestamps: None,
+            scheduling: None,
+            scheduling_error: None,
         };
         flags(a.as_raw_fd());
         assert_eq!(a.layer(), PacketLayer::Ethernet);
