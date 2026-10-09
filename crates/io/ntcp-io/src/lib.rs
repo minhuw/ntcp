@@ -127,8 +127,10 @@ pub trait PacketIo {
     fn layer(&self) -> PacketLayer;
 
     // Current interface IP MTU, including IP header, excluding L2/FCS.
-    // Read-only, bounded query; unknown is distinct from a failed query.
-    // Linux queries may wait up to 100ms and use the caller's network namespace.
+    // Read-only control-plane query; unknown is distinct from a failed query.
+    // May block: Linux's synchronous rtnetlink send can wait for kernel locks
+    // before the response poll. Call outside latency-sensitive packet service.
+    // Linux queries use the caller's current network namespace.
     fn local_ip_mtu(&self) -> io::Result<Option<u32>> {
         Ok(None)
     }

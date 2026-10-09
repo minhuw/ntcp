@@ -103,6 +103,9 @@ dependencies = [
 [[package]]
 name = "ntcp-io"
 version = "0.0.1"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "ntcp-io-af-packet"

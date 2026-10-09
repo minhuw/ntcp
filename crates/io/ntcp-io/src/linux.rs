@@ -1,5 +1,6 @@
 // Shared read-only rtnetlink queries, keyed by ifindex (not a cached name/MTU).
-// Uses the caller's current network namespace. Fixed buffer and one bounded wait.
+// Uses the caller's current network namespace and a fixed response buffer.
+// The response poll is bounded; synchronous kernel request processing is not.
 use std::{
     io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
