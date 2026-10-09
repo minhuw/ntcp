@@ -176,22 +176,6 @@ quote = '''
 It is important to understand that the notification of the packetization layer instances using the path about the change in the PMTU is distinct from the notification of a specific instance that a packet has been dropped. The latter should be done as soon as practical (i.e., asynchronously from the point of view of the packetization layer instance), while the former may be delayed until a packetization layer instance wants to create a packet.
 '''
 
-# 8201-069
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.3"
-reason = "PmtudConfig exposes no aging-duration or infinity setting; the 600-second hold/reset interval is fixed. The periodic probe required by 8201-068 is implemented."
-quote = '''
-Note: an implementation should provide a means for changing the timeout duration, including setting it to "infinity". For example, nodes attached to a link with a large MTU that is then attached to the rest of the Internet via a link with a small MTU are never going to discover a new non-local PMTU, so they should not have to put up with dropped packets every 10 minutes.
-'''
-
-# 8201-075
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
-reason = "Core adapts probe-gap retransmissions and retains congestion control, but exact IPv6 lost-probe repair plus subsequent smaller-router-PTB/congestion behavior is not recorded. The isolated/multiple-probe-loss wire test currently uses IPv4; this is a specific evidence gap, not a native IPv6 socket obligation."
-quote = '''
-Note: A packetization layer that determines a probe packet is lost needs to adapt the segment size of the retransmission. Using the reported size in the last Packet Too Big message, however, can lead to further losses as there might be smaller PMTU limits at the routers further along the path. This would lead to loss of all retransmitted segments and therefore cause unnecessary congestion as well as additional packets to be sent each time a new router announces a smaller MTU. Any packetization layer that uses retransmission is therefore also responsible for congestion control of its retransmissions [RFC8085].
-'''
-
 # 8201-076
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
@@ -246,12 +230,4 @@ target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
 reason = "No per-path disable flag enforces a 1280-byte ceiling; a PMTUD-disabled core connection does not automatically use that IPv6 minimum."
 quote = '''
 The former can be accomplished by associating a flag with the path; when a packet is sent on a path with this flag set, the IP layer does not send packets larger than the IPv6 minimum link MTU.
-'''
-
-# 8201-084
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
-reason = "No API configures the fixed 600-second aging/search-reset interval."
-quote = '''
-The implementation should also provide a way to change the timeout period for aging stale PMTU information.
 '''

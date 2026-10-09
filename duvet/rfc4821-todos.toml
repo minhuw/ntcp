@@ -11,7 +11,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 # 4821-011
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
-reason = "Missing behavior: isolated probe loss narrows the MTU search after trailing delivery, but Connection already reduces congestion. The isolation-specific SHOULD is retained at 065/139/142."
+reason = "Partial gap after 76800de and a4b9a0c: finite isolated-loss proof now suppresses logical congestion response after recovery exit, retaining normal repair admission and independent MSS scaling. The complete with-or-without-PTB span is not established: apply_ptb cancels probe classification, and the IPv6 two-PTB fixture explicitly asserts a committed normal congestion response rather than isolation suppression. This is not the literal unchanged-cwnd advice at1191-082/8201-076."
 quote = '''
 The isolated loss of a probe packet (with or without an ICMP Packet Too Big message) is treated as an indication of an MTU limit, and not as a congestion indicator. In this case alone, the Packetization Protocol is permitted to retransmit any missing data without adjusting the congestion window.
 '''
@@ -19,7 +19,7 @@ The isolated loss of a probe packet (with or without an ICMP Packet Too Big mess
 # 4821-012
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-2"
-reason = "Evidence gap: multiple-loss bound preservation and normal congestion response are tested separately; an integrated probe-timeout trace establishing both congestion response and resume timing is not recorded. No isolated-loss suppression or shared-cache claim belongs to this clause."
+reason = "Partial evidence gap after 76800de: real receiver timeout/other-loss traces now establish normal congestion response and preservation of the fivefold timeout hold; pure PMTUD timeout tests pin exact deadlines. The full inconclusive/resume sequence is not established by an integrated next-probe assertion after actual timeout recovery. Timeout-only repair can narrow search_high after trailing delivery; do not infer the full inconclusive-result clause from congestion-response tests alone."
 quote = '''
 If there is a timeout or additional packets are lost during the probing process, the probe is considered to be inconclusive (e.g., the lost probe does not necessarily indicate that the probe exceeded the Path MTU). Furthermore, the losses are treated like any other congestion indication: window or rate adjustments are mandatory per the relevant congestion control standards [RFC2914]. Probing can resume after a delay that is determined by the nature of the detected failure.
 '''
@@ -64,22 +64,6 @@ quote = '''
 All hosts SHOULD use IPv4 fragmentation in a mode that mimics IPv6 functionality. All fragmentation SHOULD be done on the host, and all IPv4 packets, including fragments, SHOULD have the DF bit set such that they will not be fragmented (again) in the network. See Section 8.
 '''
 
-# 4821-065
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
-reason = "Missing behavior: Connection retains normal congestion response for all losses, including subsequently proven isolated probe loss. Thus the isolated-loss reduction SHOULD is unmet; the normal-response MUST is not waived."
-quote = '''
-Normal congestion control algorithms MUST remain in effect under all conditions except when only an isolated probe packet is detected as lost. In this case alone, the normal congestion (window or data rate) reduction SHOULD be suppressed. If any other data loss is detected, standard congestion control MUST take place.
-'''
-
-# 4821-066
-[[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
-reason = "Conditional requirement is not activated: no congestion adjustment is suppressed. The missing isolated-loss suppression SHOULD remains TODO at 065/139/142. If suppression is added, its rate/headway MUST be verified; current cooldown arithmetic alone is not proof of that future branch."
-quote = '''
-Suppressed congestion control MUST be rate limited such that it occurs less frequently than the worst-case loss rate for TCP congestion control at a comparable data rate over the same path (i.e., less than the "TCP-friendly" loss rate [tcp-friendly]). This SHOULD be enforced by requiring a minimum headway between a suppressed congestion adjustment (due to a failed probe) and the next attempted probe, which is equal to one round-trip time for each packet permitted by the congestion window. This is discussed further in Section 7.6.2.
-'''
-
 # 4821-069
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
@@ -99,7 +83,7 @@ All implementations MUST include mechanisms for applications to selectively tran
 # 4821-071
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
-reason = "Missing configuration advice: first_hop_mtu is supplied per Connection, but there are no independent per-route initial eff_pmtu/search_high limits. The optional per-protocol heuristic and connectionless-protocol defaults do not require TCP to implement other protocols."
+reason = "Partial gap after 0030a96: independent per-connection creation initial_mtu and initial_search_high limits are implemented and validated, with independent initial_search_low and retained administrative high ceiling. No per-route policy service supplies the full per-protocol/per-route recommendation. Optional other-protocol heuristics/defaults do not require TCP to implement other protocols."
 quote = '''
 Implementations MAY use different heuristics to select the initial effective Path MTU for each protocol. Connectionless protocols and protocols that do not support PLPMTUD SHOULD have their own default value for the initial effective Path MTU, which can be set to a more conservative (smaller) value than the initial value used by TCP and other protocols that are well suited to PLPMTUD. There SHOULD be per-protocol and per-route limits on the initial effective Path MTU (eff_pmtu) and the upper searching limit (search_high). See Section 7.2 for further discussion.
 '''
@@ -224,14 +208,6 @@ quote = '''
 In a few cases, there may be no reasonable mechanisms to generate probes within the Packetization Layer protocol itself. As a last resort, it may be possible to rely on an adjunct protocol, such as ICMP ECHO ("ping"), to send probe packets. See Section 10.3 for further discussion of this approach.
 '''
 
-# 4821-113
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
-reason = "Pmtud::new hard-codes initial low=min(bound,1024) for IPv4 and min(bound,1280) for IPv6. PmtudConfig exposes only first_hop_mtu, so the initial search_low configurability SHOULD is unmet."
-quote = '''
-It is RECOMMENDED that search_low be initially set to an MTU size that is likely to work over a very wide range of environments. Given today's technologies, a value of 1024 bytes is probably safe enough. The initial value for search_low SHOULD be configurable.
-'''
-
 # 4821-116
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
@@ -259,7 +235,7 @@ Since the cost of PLPMTUD is dominated by the protocol specific overheads of gen
 # 4821-119
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
-reason = "PmtudConfig exposes first_hop_mtu only. No independent initial eff_pmtu/search_low/search_high overrides or per-route policy configuration exist; receive MSS and scratch limits are not equivalents."
+reason = "Partial gap after 0030a96: PmtudConfig provides validated independent creation-only initial_mtu/initial_search_low/initial_search_high overrides. No per-route policy configuration/service exists; the per-connection API does not establish the complete per-protocol/per-route clause."
 quote = '''
 There SHOULD be per-protocol and per-route configuration options to override initial values for eff_pmtu and other PLPMTUD state variables.
 '''
@@ -315,17 +291,9 @@ Protocols MAY delay sending non-probes in order to accumulate enough data to mee
 # 4821-136
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6"
-reason = "Missing behavior in the following response list: the isolated-loss congestion suppression SHOULD (139/142) is unmet. Implicit probes and shared caches are not part of this explicit-probe response clause."
+reason = "Partial evidence gap after 76800de and a4b9a0c: finite isolated proof, logical congestion suppression and timeout congestion response are now tested. The full categorized response list still includes the unresolved same-sized next probe after inconclusive recovery at144; this umbrella clause is not closed merely by fixing139/142."
 quote = '''
 When a probe has completed, the result SHOULD be processed as follows, categorized by the probe's result type.
-'''
-
-# 4821-139
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2"
-reason = "Pmtud waits for trailing cumulative delivery and narrows bounds, but Connection already invokes congestion reduction on loss. Recommended isolated-probe suppression is not implemented; no exception disguises this SHOULD gap."
-quote = '''
-When only the probe is lost, it is treated as an indication that the Path MTU is smaller than the probe size. In this case alone, the loss SHOULD NOT be interpreted as congestion signal.
 '''
 
 # 4821-141
@@ -334,22 +302,6 @@ target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2"
 reason = "Optional use of matching PTB to set search_high/eff_pmtu is subject to the selected security gate: feedback may be deferred below proven delivery. No requirement to implement unconditional PTB updates before/after loss is imposed by MAY; actual bound updates remain audited at 140."
 quote = '''
 If an ICMP PTB message is received matching the probe packet, then search_high and eff_pmtu MAY be set from the MTU value indicated in the message. Note that the ICMP message may be received either before or after the protocol loss indication.
-'''
-
-# 4821-142
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2"
-reason = "Missing behavior: isolated probe failure still triggers normal congestion reduction, contrary to the suppression SHOULD. The subsequent rate-limit REQUIRED/MUST NOT is conditional on suppressed congestion control and is not currently violated; it must be audited if suppression is implemented."
-quote = '''
-A probe failure event is the one situation under which the Packetization Layer SHOULD ignore loss as a congestion signal. Because there is some small risk that suppressing congestion control might have unanticipated consequences (even for one isolated loss), it is REQUIRED that probe failure events be less frequent than the normal period for losses under standard congestion control. Specifically, after a probe failure event and suppressed congestion control, PLPMTUD MUST NOT probe again until an interval that is larger than the expected interval between congestion control events. See Section 4 for details. The simplest estimate of the interval to the next congestion event is the same number of round trips as the current congestion window in packets.
-'''
-
-# 4821-143
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.3"
-reason = "Evidence gap: timeout() delays probes by five times cooldown, and unit test pmtud_probe_timeout_cooldown_inconclusive_and_unambiguous_ack checks the deadline. Normal timeout congestion response is tested separately; an integrated go-back-n probe repair trace proving both is not recorded."
-quote = '''
-If the loss was detected with a timeout and repaired with go-back-n retransmission, then congestion window reduction will be necessary. The relatively high price of a failed probe in this case may merit a longer time interval until the next probe. A time interval that is five times the non-timeout failure case (Section 7.6.2) is RECOMMENDED.
 '''
 
 # 4821-144

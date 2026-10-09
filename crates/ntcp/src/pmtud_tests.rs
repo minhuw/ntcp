@@ -618,7 +618,7 @@ fn pmtud_ipv4_header_options_exact_quote_and_retransmit_budget() {
 
 //= https://www.rfc-editor.org/rfc/rfc8201#section-5.3
 //= type=test
-//= reason=Enabled IPv6 core holds PTB/converged search for 600 seconds, reopens the upper search bound on expiry, and emits an ACK-confirmed larger probe. The dual-family real-probe test exercises periodic retry; configurable aging is the separate 8201-069 TODO.
+//= reason=Enabled IPv6 core holds PTB for 600 seconds and defaults converged-search aging to 600 seconds, reopens the upper search bound on expiry, and emits an ACK-confirmed larger probe. The dual-family real-probe test exercises periodic retry; configurable periodic aging is separately covered at 8201-069.
 //# If the stale PMTU value is too large, this will be discovered almost immediately
 //# once a large enough packet is sent on the path. No such mechanism exists for
 //# realizing that a stale PMTU value is too small, so an implementation should "age"
@@ -723,7 +723,7 @@ fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry() {
 //# decisions.
 //= https://www.rfc-editor.org/rfc/rfc4821#section-7.1
 //= type=test
-//= reason=Pmtud::new initializes search_low to min(bound,1024) for IPv4 or min(bound,1280) for IPv6. The full-stop test checks both family starting lows through the first fallback; independent configurability remains TODO at 113.
+//= reason=By default Pmtud::new initializes search_low to min(bound,1024) for IPv4 or min(bound,1280) for IPv6. The full-stop test checks both family starting lows through the first fallback; independent creation-time configurability is covered at 113.
 //# For initial conditions when there is no information about the path, eff_pmtu may
 //# be greater than search_low. The initial value of search_low SHOULD be
 //# conservatively low, but performance may be better if eff_pmtu starts at a higher,

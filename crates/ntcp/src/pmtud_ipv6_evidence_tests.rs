@@ -435,6 +435,25 @@ fn lost_probe_repairs(iss: u32, smaller_ptb: bool) {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2
+//= type=test
+//= reason=Reviewed 76800de plus a4b9a0c: provisional normal repair admission and PRR remain active; only finite preloss extended-tail cumulative proof followed by recovery/PRR exit suppresses the logical loss response. Real receiver NewReno/SACK/RACK, PRR, Reno/CUBIC and pacing matrices assert isolated suppression and normal response on other loss; disqualifiers cover ECE, RTO and ordinary loss. Replenishment retains nonempty flight and resumes ACK growth. Independent MSS decrease scaling remains, not literal unchanged-cwnd advice. Pmtud::ack narrows search_high to probe size minus one after the finite proof.
+//# When only the probe is lost, it is treated as an indication that the Path MTU is
+//# smaller than the probe size. In this case alone, the loss SHOULD NOT be
+//# interpreted as congestion signal.
+
+//= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
+//= type=test
+//= reason=Reviewed IPv6 lost_probe_repairs wire fixture and 76800de: actual receiver repairs are split within the probe gap and conservative packet budget, including two successively smaller router PTBs down to1280 and wrapping sequences. Normal repair admission remains active; isolated proof retains only MSS-scaled logical cwnd, while PTB cancellation commits normal congestion response. Both PTB repair-boundary tests assert the committed threshold; no unchanged-cwnd or shared-path fanout claim.
+//# Note: A packetization layer that determines a probe packet is lost needs to
+//# adapt the segment size of the retransmission. Using the reported size in the
+//# last Packet Too Big message, however, can lead to further losses as there might
+//# be smaller PMTU limits at the routers further along the path. This would lead to
+//# loss of all retransmitted segments and therefore cause unnecessary congestion as
+//# well as additional packets to be sent each time a new router announces a smaller
+//# MTU. Any packetization layer that uses retransmission is therefore also
+//# responsible for congestion control of its retransmissions [RFC8085].
+
 fn ipv6_lost_probe_real_receiver_repairs_and_congestion() {
     for iss in [0, u32::MAX - 4000] {
         lost_probe_repairs(iss, false);
@@ -442,11 +461,35 @@ fn ipv6_lost_probe_real_receiver_repairs_and_congestion() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
+//= type=test
+//= reason=Reviewed IPv6 lost_probe_repairs wire fixture and 76800de: actual receiver repairs are split within the probe gap and conservative packet budget, including two successively smaller router PTBs down to1280 and wrapping sequences. Normal repair admission remains active; isolated proof retains only MSS-scaled logical cwnd, while PTB cancellation commits normal congestion response. Both PTB repair-boundary tests assert the committed threshold; no unchanged-cwnd or shared-path fanout claim.
+//# Note: A packetization layer that determines a probe packet is lost needs to
+//# adapt the segment size of the retransmission. Using the reported size in the
+//# last Packet Too Big message, however, can lead to further losses as there might
+//# be smaller PMTU limits at the routers further along the path. This would lead to
+//# loss of all retransmitted segments and therefore cause unnecessary congestion as
+//# well as additional packets to be sent each time a new router announces a smaller
+//# MTU. Any packetization layer that uses retransmission is therefore also
+//# responsible for congestion control of its retransmissions [RFC8085].
+
 fn ipv6_smaller_ptb_preserves_probe_repair_boundary_regression() {
     lost_probe_repairs(0, true);
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
+//= type=test
+//= reason=Reviewed IPv6 lost_probe_repairs wire fixture and 76800de: actual receiver repairs are split within the probe gap and conservative packet budget, including two successively smaller router PTBs down to1280 and wrapping sequences. Normal repair admission remains active; isolated proof retains only MSS-scaled logical cwnd, while PTB cancellation commits normal congestion response. Both PTB repair-boundary tests assert the committed threshold; no unchanged-cwnd or shared-path fanout claim.
+//# Note: A packetization layer that determines a probe packet is lost needs to
+//# adapt the segment size of the retransmission. Using the reported size in the
+//# last Packet Too Big message, however, can lead to further losses as there might
+//# be smaller PMTU limits at the routers further along the path. This would lead to
+//# loss of all retransmitted segments and therefore cause unnecessary congestion as
+//# well as additional packets to be sent each time a new router announces a smaller
+//# MTU. Any packetization layer that uses retransmission is therefore also
+//# responsible for congestion control of its retransmissions [RFC8085].
+
 fn ipv6_smaller_ptb_preserves_wrapped_probe_repair_boundary_regression() {
     lost_probe_repairs(u32::MAX - 4000, true);
 }

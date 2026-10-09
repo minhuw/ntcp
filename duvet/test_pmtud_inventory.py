@@ -103,7 +103,7 @@ class PmtudInventory(unittest.TestCase):
             for fragment in fragments:
                 self.assertTrue(any(fragment in q for q in spans), (n, fragment))
         # Known implementation gaps must not silently become scope exceptions.
-        for n, numbers in {8201: (76,), 4821: (113, 119)}.items():
+        for n, numbers in {8201: (76,), 4821: (71, 119)}.items():
             rows = {p["id"]: p for p in self.inventory(n)["paragraphs"]}
             for i in numbers:
                 self.assertEqual(rows[f"{n}-{i:03}"]["status"], "TODO")
@@ -124,14 +124,13 @@ class PmtudInventory(unittest.TestCase):
             "covered": ("1191-005a", "1191-005b", "1191-005d", "1191-006b",
                         "1191-014a", "1191-013a", "1191-013c", "1191-013e",
                         "8201-003", "8201-035", "8201-051", "8201-058",
-                        "8201-068", "8201-086", "1191-069"),
+                        "8201-068", "8201-086", "1191-069", "1191-068", "8201-069"),
             "context": ("1191-015", "1191-029", "1191-060", "1191-066"),
             "exception": ("1191-005c", "1191-006a", "1191-007", "1191-013d",
                           "1191-013f", "1191-063", "8201-025b", "8201-065",
                           *alternatives),
             # These are open obligations/evidence gaps, not expected runtime failures.
-            "TODO": ("1191-068", "8201-004", "8201-060",
-                     "8201-069", "8201-076"),
+            "TODO": ("8201-004", "8201-060", "8201-076"),
         }
         for status, ids in expected.items():
             for id in ids:
@@ -163,10 +162,49 @@ class PmtudInventory(unittest.TestCase):
                 self.assertEqual(rows[id]["status"], "covered")
                 for fragment in fragments:
                     self.assertIn(fragment, rows[id]["reason"])
-        # The simulation does not establish an actual on-link/ND decision;
-        # per-interface identity and congestion-policy review remain separate.
-        for id in ("8201-031", "8201-052", "8201-075"):
+        # The simulation does not establish an actual on-link/ND decision
+        # or same-address per-interface identity.
+        for id in ("8201-031", "8201-052"):
             self.assertEqual(rows[id]["status"], "TODO")
+
+    def test_reviewed_policy_and_isolated_cc_closures_preserve_partial_gaps(self):
+        rows = {p["id"]: p for n in RFCS for p in self.inventory(n)["paragraphs"]}
+        self.assertEqual({n: sum(p["status"] == "TODO"
+                                 for p in self.inventory(n)["paragraphs"])
+                          for n in RFCS}, {1191: 23, 8201: 16, 4821: 16, 5927: 2})
+        for id in ("1191-068", "1191-095", "8201-069", "8201-084"):
+            self.assertEqual(rows[id]["status"], "covered")
+            for fragment in ("0030a96", "Infinity", ">=300", "Endpoint::set_pmtud_policy",
+                             "independent mandatory 600-second PTB hold"):
+                self.assertIn(fragment, rows[id]["reason"], id)
+        expected = {
+            "4821-113": ("initial_search_low", "Per-route policy remains open"),
+            "4821-065": ("a4b9a0c", "finite preloss", "recovery/PRR exit", "nonempty flight"),
+            "4821-066": ("logical window", "PRR admission", "strict extra", "deadline"),
+            "4821-139": ("finite preloss", "probe size minus one", "MSS decrease scaling"),
+            "4821-142": ("logical window", "independent of configurable periodic aging"),
+            "4821-143": ("actual TCP RTO", "one-MSS cwnd", "five times cooldown"),
+            "8201-075": ("two successively smaller router PTBs", "wrapping sequences",
+                         "PTB cancellation commits"),
+        }
+        for id, fragments in expected.items():
+            self.assertEqual(rows[id]["status"], "covered", id)
+            for fragment in fragments:
+                self.assertIn(fragment, rows[id]["reason"], id)
+        partials = {
+            "1191-099": ("runtime", "912cf80", "up-to-date reference"),
+            "4821-011": ("apply_ptb cancels", "committed normal congestion response"),
+            "4821-012": ("fivefold timeout hold", "integrated next-probe assertion"),
+            "4821-071": ("per-connection", "No per-route policy"),
+            "4821-119": ("initial_mtu/initial_search_low/initial_search_high", "No per-route"),
+            "4821-136": ("suppression", "same-sized next probe"),
+        }
+        for id, fragments in partials.items():
+            self.assertEqual(rows[id]["status"], "TODO", id)
+            for fragment in fragments:
+                self.assertIn(fragment, rows[id]["reason"], id)
+        for id in ("1191-082", "8201-076", "4821-144"):
+            self.assertEqual(rows[id]["status"], "TODO", id)
 
     def test_paws_discovery_gap_names_concrete_supplied_embedding(self):
         todos = tomllib.loads((ROOT / "duvet/rfc7323-todos.toml").read_text())["TODO"]

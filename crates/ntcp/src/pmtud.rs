@@ -84,7 +84,7 @@ impl Pmtud {
     //# of a path is the (known) MTU of its first hop, and sends all
     //# datagrams on that path with the DF bit set.
     //= https://www.rfc-editor.org/rfc/rfc4821#section-7.1
-    //= reason=Pmtud::new initializes search_low to min(bound,1024) for IPv4 or min(bound,1280) for IPv6. The full-stop test checks both family starting lows through the first fallback; independent configurability remains TODO at 113.
+    //= reason=By default Pmtud::new initializes search_low to min(bound,1024) for IPv4 or min(bound,1280) for IPv6. The full-stop test checks both family starting lows through the first fallback; independent creation-time configurability is covered at 113.
     //# For initial conditions when there is no information about the path, eff_pmtu may
     //# be greater than search_low. The initial value of search_low SHOULD be
     //# conservatively low, but performance may be better if eff_pmtu starts at a higher,
@@ -181,7 +181,7 @@ impl Pmtud {
     //# minutes and is recommended to be 10 minutes, per RFC 1981.
 
     //= https://www.rfc-editor.org/rfc/rfc8201#section-5.3
-    //= reason=Enabled IPv6 core holds PTB/converged search for 600 seconds, reopens the upper search bound on expiry, and emits an ACK-confirmed larger probe. The dual-family real-probe test exercises periodic retry; configurable aging is the separate 8201-069 TODO.
+    //= reason=Enabled IPv6 core holds PTB for 600 seconds and defaults converged-search aging to 600 seconds, reopens the upper search bound on expiry, and emits an ACK-confirmed larger probe. The dual-family real-probe test exercises periodic retry; configurable periodic aging is separately covered at 8201-069.
     //# If the stale PMTU value is too large, this will be discovered almost immediately
     //# once a large enough packet is sent on the path. No such mechanism exists for
     //# realizing that a stale PMTU value is too small, so an implementation should
@@ -776,6 +776,12 @@ impl Pmtud {
     //# large, this condition will only be detected with ICMP PTB messages or black hole
     //# discovery (see Section 7.7).
 
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2
+    //= reason=Reviewed 76800de plus a4b9a0c: provisional normal repair admission and PRR remain active; only finite preloss extended-tail cumulative proof followed by recovery/PRR exit suppresses the logical loss response. Real receiver NewReno/SACK/RACK, PRR, Reno/CUBIC and pacing matrices assert isolated suppression and normal response on other loss; disqualifiers cover ECE, RTO and ordinary loss. Replenishment retains nonempty flight and resumes ACK growth. Independent MSS decrease scaling remains, not literal unchanged-cwnd advice. Pmtud::ack narrows search_high to probe size minus one after the finite proof.
+    //# When only the probe is lost, it is treated as an indication that the Path MTU is
+    //# smaller than the probe size. In this case alone, the loss SHOULD NOT be
+    //# interpreted as congestion signal.
+
     pub fn ack(&mut self, ack: Seq, now: Instant, cooldown: u64, rto: u64) {
         if self.repair_range.is_some_and(|(_, end)| covered(ack, end)) {
             self.repair_range = None;
@@ -892,6 +898,32 @@ impl Pmtud {
         self.deadline.into_iter().chain(self.periodic_deadline).min()
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-6.3
+    //= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+    //# Note: an implementation should provide a means for changing the timeout
+    //# duration, including setting it to "infinity". For example, hosts attached to an
+    //# FDDI network which is then attached to the rest of the Internet via a slow
+    //# serial line are never going to discover a new non-local PMTU, so they should not
+    //# have to put up with dropped datagrams every 10 minutes.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-6.6
+    //= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+    //# The implementation should also provide a way to change the timeout period for
+    //# aging stale PMTU information.
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.3
+    //= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+    //# Note: an implementation should provide a means for changing the timeout
+    //# duration, including setting it to "infinity". For example, nodes attached to a
+    //# link with a large MTU that is then attached to the rest of the Internet via a
+    //# link with a small MTU are never going to discover a new non-local PMTU, so they
+    //# should not have to put up with dropped packets every 10 minutes.
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.6
+    //= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+    //# The implementation should also provide a way to change the timeout period for
+    //# aging stale PMTU information.
+
     pub fn set_policy(&mut self, now: Instant, policy: PmtudPolicy, aging: Option<u64>) {
         self.plateaus = policy.ipv4_plateaus;
         if self.aging != aging {
@@ -904,6 +936,17 @@ impl Pmtud {
             }
         }
     }
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
+    //= reason=Reviewed IPv6 lost_probe_repairs wire fixture and 76800de: actual receiver repairs are split within the probe gap and conservative packet budget, including two successively smaller router PTBs down to1280 and wrapping sequences. Normal repair admission remains active; isolated proof retains only MSS-scaled logical cwnd, while PTB cancellation commits normal congestion response. Both PTB repair-boundary tests assert the committed threshold; no unchanged-cwnd or shared-path fanout claim.
+    //# Note: A packetization layer that determines a probe packet is lost needs to
+    //# adapt the segment size of the retransmission. Using the reported size in the
+    //# last Packet Too Big message, however, can lead to further losses as there might
+    //# be smaller PMTU limits at the routers further along the path. This would lead to
+    //# loss of all retransmitted segments and therefore cause unnecessary congestion as
+    //# well as additional packets to be sent each time a new router announces a smaller
+    //# MTU. Any packetization layer that uses retransmission is therefore also
+    //# responsible for congestion control of its retransmissions [RFC8085].
 
     pub fn repair_limit(&self, seq: Seq, proposed: u32) -> u32 {
         match self.repair_range {
@@ -931,6 +974,14 @@ impl Pmtud {
     //# event in the network, such as a router failure or a routing change to a path with a
     //# smaller MTU. For TCP, this occurs when the R1 timeout threshold described by
     //# [RFC1122] expires.
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.3
+    //= reason=Reviewed 76800de: real receiver disqualifier matrix drops a probe repair and fires actual TCP RTO, asserting one-MSS cwnd, reduced threshold and committed response throughout cumulative repair. Non-SACK NewReno as well as SACK/RACK, PRR and Reno/CUBIC are exercised. Pmtud::timeout applies five times cooldown; exact deadline unit test and integrated timeout trace prove later inconclusive retry loss cannot erase it. This is TCP timeout repair, not a new generic go-back-n transport.
+    //# If the loss was detected with a timeout and repaired with go-back-n
+    //# retransmission, then congestion window reduction will be necessary. The
+    //# relatively high price of a failed probe in this case may merit a longer time
+    //# interval until the next probe. A time interval that is five times the
+    //# non-timeout failure case (Section 7.6.2) is RECOMMENDED.
 
     pub fn timeout(&mut self, now: Instant, head: Seq, consecutive: u32, cooldown: u64) {
         if let Some((seq, mtu)) = self.pending.take() {
@@ -1123,6 +1174,15 @@ mod tests {
     }
 
     #[test]
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.3
+    //= type=test
+    //= reason=Reviewed 76800de: real receiver disqualifier matrix drops a probe repair and fires actual TCP RTO, asserting one-MSS cwnd, reduced threshold and committed response throughout cumulative repair. Non-SACK NewReno as well as SACK/RACK, PRR and Reno/CUBIC are exercised. Pmtud::timeout applies five times cooldown; exact deadline unit test and integrated timeout trace prove later inconclusive retry loss cannot erase it. This is TCP timeout repair, not a new generic go-back-n transport.
+    //# If the loss was detected with a timeout and repaired with go-back-n
+    //# retransmission, then congestion window reduction will be necessary. The
+    //# relatively high price of a failed probe in this case may merit a longer time
+    //# interval until the next probe. A time interval that is five times the
+    //# non-timeout failure case (Section 7.6.2) is RECOMMENDED.
+
     fn pmtud_probe_timeout_cooldown_inconclusive_and_unambiguous_ack() {
         for multiple in [false, true] {
             let mut p = state(true);

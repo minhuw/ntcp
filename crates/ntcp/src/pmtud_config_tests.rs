@@ -32,6 +32,14 @@ fn family_tuple(ipv4: bool) -> Tuple {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.2
+//= type=test
+//= reason=Reviewed 0030a96: independent creation-only initial_search_low is validated with initial_mtu/initial_search_high, family and allocation bounds. Defaults remain conservative IPv4 min(mtu,1024) and IPv6 min(mtu,1280); dual-family tests assert defaults, independent overrides, rejection rather than silent clamping, and subsequent peer caps. Per-route policy remains open at 071/119.
+//# It is RECOMMENDED that search_low be initially set to an MTU size that is likely
+//# to work over a very wide range of environments. Given today's technologies, a
+//# value of 1024 bytes is probably safe enough. The initial value for search_low
+//# SHOULD be configurable.
+
 fn pmtud_config_initial_bounds_defaults_and_independent_overrides() {
     for ipv4 in [true, false] {
         let low = if ipv4 { 1024 } else { 1280 };
@@ -77,6 +85,14 @@ fn pmtud_config_initial_bounds_defaults_and_independent_overrides() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc4821#section-7.2
+//= type=test
+//= reason=Reviewed 0030a96: independent creation-only initial_search_low is validated with initial_mtu/initial_search_high, family and allocation bounds. Defaults remain conservative IPv4 min(mtu,1024) and IPv6 min(mtu,1280); dual-family tests assert defaults, independent overrides, rejection rather than silent clamping, and subsequent peer caps. Per-route policy remains open at 071/119.
+//# It is RECOMMENDED that search_low be initially set to an MTU size that is likely
+//# to work over a very wide range of environments. Given today's technologies, a
+//# value of 1024 bytes is probably safe enough. The initial value for search_low
+//# SHOULD be configurable.
+
 fn pmtud_config_invalid_explicit_values_are_not_silently_clamped() {
     for ipv4 in [true, false] {
         let floor = if ipv4 { 68 } else { 1280 };
@@ -157,6 +173,36 @@ fn pmtud_config_peer_caps_apply_to_defaults_and_explicit_initial_settings() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc1191#section-6.3
+//= type=test
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//# Note: an implementation should provide a means for changing the timeout
+//# duration, including setting it to "infinity". For example, hosts attached to an
+//# FDDI network which is then attached to the rest of the Internet via a slow
+//# serial line are never going to discover a new non-local PMTU, so they should not
+//# have to put up with dropped datagrams every 10 minutes.
+
+//= https://www.rfc-editor.org/rfc/rfc1191#section-6.6
+//= type=test
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//# The implementation should also provide a way to change the timeout period for
+//# aging stale PMTU information.
+
+//= https://www.rfc-editor.org/rfc/rfc8201#section-5.3
+//= type=test
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//# Note: an implementation should provide a means for changing the timeout
+//# duration, including setting it to "infinity". For example, nodes attached to a
+//# link with a large MTU that is then attached to the rest of the Internet via a
+//# link with a small MTU are never going to discover a new non-local PMTU, so they
+//# should not have to put up with dropped packets every 10 minutes.
+
+//= https://www.rfc-editor.org/rfc/rfc8201#section-5.6
+//= type=test
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//# The implementation should also provide a way to change the timeout period for
+//# aging stale PMTU information.
+
 fn pmtud_config_checked_aging_timebases_and_live_rearming() {
     for units in [1_000_000, 1_000_000_000] {
         for seconds in [0, 299, u64::MAX / units + 1] {
@@ -216,6 +262,36 @@ fn pmtud_config_checked_aging_timebases_and_live_rearming() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc1191#section-6.3
+//= type=test
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//# Note: an implementation should provide a means for changing the timeout
+//# duration, including setting it to "infinity". For example, hosts attached to an
+//# FDDI network which is then attached to the rest of the Internet via a slow
+//# serial line are never going to discover a new non-local PMTU, so they should not
+//# have to put up with dropped datagrams every 10 minutes.
+
+//= https://www.rfc-editor.org/rfc/rfc1191#section-6.6
+//= type=test
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//# The implementation should also provide a way to change the timeout period for
+//# aging stale PMTU information.
+
+//= https://www.rfc-editor.org/rfc/rfc8201#section-5.3
+//= type=test
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//# Note: an implementation should provide a means for changing the timeout
+//# duration, including setting it to "infinity". For example, nodes attached to a
+//# link with a large MTU that is then attached to the rest of the Internet via a
+//# link with a small MTU are never going to discover a new non-local PMTU, so they
+//# should not have to put up with dropped packets every 10 minutes.
+
+//= https://www.rfc-editor.org/rfc/rfc8201#section-5.6
+//= type=test
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//# The implementation should also provide a way to change the timeout period for
+//# aging stale PMTU information.
+
 fn pmtud_config_infinity_keeps_ptb_hold_and_failure_retry() {
     for ipv4 in [true, false] {
         let header = if ipv4 { 20 } else { 40 };
@@ -371,6 +447,36 @@ fn pmtud_config_live_update_preserves_probe_repair_and_connection_state_without_
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc1191#section-6.3
+//= type=test
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//# Note: an implementation should provide a means for changing the timeout
+//# duration, including setting it to "infinity". For example, hosts attached to an
+//# FDDI network which is then attached to the rest of the Internet via a slow
+//# serial line are never going to discover a new non-local PMTU, so they should not
+//# have to put up with dropped datagrams every 10 minutes.
+
+//= https://www.rfc-editor.org/rfc/rfc1191#section-6.6
+//= type=test
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//# The implementation should also provide a way to change the timeout period for
+//# aging stale PMTU information.
+
+//= https://www.rfc-editor.org/rfc/rfc8201#section-5.3
+//= type=test
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//# Note: an implementation should provide a means for changing the timeout
+//# duration, including setting it to "infinity". For example, nodes attached to a
+//# link with a large MTU that is then attached to the rest of the Internet via a
+//# link with a small MTU are never going to discover a new non-local PMTU, so they
+//# should not have to put up with dropped packets every 10 minutes.
+
+//= https://www.rfc-editor.org/rfc/rfc8201#section-5.6
+//= type=test
+//= reason=Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.
+//# The implementation should also provide a way to change the timeout period for
+//# aging stale PMTU information.
+
 fn pmtud_config_endpoint_policy_update_preserves_reserved_output_and_is_transactional() {
     let mut e = crate::Endpoint::new(
         crate::EndpointConfig {

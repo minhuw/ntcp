@@ -2450,6 +2450,14 @@ impl Connection {
 
     // Resolve after recovery/PRR's ending-ACK bookkeeping, not at the earlier
     // PMTU ACK hook: exit deflation must apply only to repair admission.
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-4
+    //= reason=Reviewed 76800de plus a4b9a0c: provisional normal repair admission and PRR remain active; only finite preloss extended-tail cumulative proof followed by recovery/PRR exit suppresses the logical loss response. Real receiver NewReno/SACK/RACK, PRR, Reno/CUBIC and pacing matrices assert isolated suppression and normal response on other loss; disqualifiers cover ECE, RTO and ordinary loss. Replenishment retains nonempty flight and resumes ACK growth. Independent MSS decrease scaling remains, not literal unchanged-cwnd advice.
+    //# Normal congestion control algorithms MUST remain in effect under all conditions
+    //# except when only an isolated probe packet is detected as lost. In this case
+    //# alone, the normal congestion (window or data rate) reduction SHOULD be
+    //# suppressed. If any other data loss is detected, standard congestion control MUST
+    //# take place.
+
     fn resolve_probe_response(&mut self) {
         if let Some(p) = &mut self.pmtud {
             if !self.congestion.in_recovery()
@@ -2470,6 +2478,29 @@ impl Connection {
             }
         }
     }
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-4
+    //= reason=Reviewed 76800de plus a4b9a0c: isolated suppression waits for finite cumulative proof and recovery exit; pmtu_cooldown uses the unsuppressed logical window, not transient PRR admission, with one RTT per packet plus a strict extra interval/tick and an RTO floor. Real receiver matrix checks no target before the deadline and a target at it; dedicated arithmetic test distinguishes logical14600 from admission1000. Mandatory failure cooldown is independent of configurable periodic aging.
+    //# Suppressed congestion control MUST be rate limited such that it occurs less
+    //# frequently than the worst-case loss rate for TCP congestion control at a
+    //# comparable data rate over the same path (i.e., less than the "TCP-friendly" loss
+    //# rate [tcp-friendly]). This SHOULD be enforced by requiring a minimum headway
+    //# between a suppressed congestion adjustment (due to a failed probe) and the next
+    //# attempted probe, which is equal to one round-trip time for each packet permitted
+    //# by the congestion window. This is discussed further in Section 7.6.2.
+
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2
+    //= reason=Reviewed 76800de plus a4b9a0c: isolated suppression waits for finite cumulative proof and recovery exit; pmtu_cooldown uses the unsuppressed logical window, not transient PRR admission, with one RTT per packet plus a strict extra interval/tick and an RTO floor. Real receiver matrix checks no target before the deadline and a target at it; dedicated arithmetic test distinguishes logical14600 from admission1000. Mandatory failure cooldown is independent of configurable periodic aging.
+    //# A probe failure event is the one situation under which the Packetization Layer
+    //# SHOULD ignore loss as a congestion signal. Because there is some small risk that
+    //# suppressing congestion control might have unanticipated consequences (even for
+    //# one isolated loss), it is REQUIRED that probe failure events be less frequent
+    //# than the normal period for losses under standard congestion control.
+    //# Specifically, after a probe failure event and suppressed congestion control,
+    //# PLPMTUD MUST NOT probe again until an interval that is larger than the expected
+    //# interval between congestion control events. See Section 4 for details. The
+    //# simplest estimate of the interval to the next congestion event is the same
+    //# number of round trips as the current congestion window in packets.
 
     fn pmtu_cooldown(&self) -> u64 {
         (u64::from(self.congestion.unsuppressed_cwnd()) / self.mss.max(1) as u64 + 1)

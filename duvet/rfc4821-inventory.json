@@ -85,7 +85,7 @@
       "section": "2",
       "quote": "The isolated loss of a probe packet (with or without an ICMP Packet Too Big message) is treated as an indication of an MTU limit, and not as a congestion indicator. In this case alone, the Packetization Protocol is permitted to retransmit any missing data without adjusting the congestion window.",
       "status": "TODO",
-      "reason": "Missing behavior: isolated probe loss narrows the MTU search after trailing delivery, but Connection already reduces congestion. The isolation-specific SHOULD is retained at 065/139/142.",
+      "reason": "Partial gap after 76800de and a4b9a0c: finite isolated-loss proof now suppresses logical congestion response after recovery exit, retaining normal repair admission and independent MSS scaling. The complete with-or-without-PTB span is not established: apply_ptb cancels probe classification, and the IPv6 two-PTB fixture explicitly asserts a committed normal congestion response rather than isolation suppression. This is not the literal unchanged-cwnd advice at1191-082/8201-076.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-2"
     },
     {
@@ -93,7 +93,7 @@
       "section": "2",
       "quote": "If there is a timeout or additional packets are lost during the probing process, the probe is considered to be inconclusive (e.g., the lost probe does not necessarily indicate that the probe exceeded the Path MTU). Furthermore, the losses are treated like any other congestion indication: window or rate adjustments are mandatory per the relevant congestion control standards [RFC2914]. Probing can resume after a delay that is determined by the nature of the detected failure.",
       "status": "TODO",
-      "reason": "Evidence gap: multiple-loss bound preservation and normal congestion response are tested separately; an integrated probe-timeout trace establishing both congestion response and resume timing is not recorded. No isolated-loss suppression or shared-cache claim belongs to this clause.",
+      "reason": "Partial evidence gap after 76800de: real receiver timeout/other-loss traces now establish normal congestion response and preservation of the fivefold timeout hold; pure PMTUD timeout tests pin exact deadlines. The full inconclusive/resume sequence is not established by an integrated next-probe assertion after actual timeout recovery. Timeout-only repair can narrow search_high after trailing delivery; do not infer the full inconclusive-result clause from congestion-response tests alone.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-2"
     },
     {
@@ -499,17 +499,25 @@
       "id": "4821-065",
       "section": "4",
       "quote": "Normal congestion control algorithms MUST remain in effect under all conditions except when only an isolated probe packet is detected as lost. In this case alone, the normal congestion (window or data rate) reduction SHOULD be suppressed. If any other data loss is detected, standard congestion control MUST take place.",
-      "status": "TODO",
-      "reason": "Missing behavior: Connection retains normal congestion response for all losses, including subsequently proven isolated probe loss. Thus the isolated-loss reduction SHOULD is unmet; the normal-response MUST is not waived.",
-      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4"
+      "status": "covered",
+      "reason": "Reviewed 76800de plus a4b9a0c: provisional normal repair admission and PRR remain active; only finite preloss extended-tail cumulative proof followed by recovery/PRR exit suppresses the logical loss response. Real receiver NewReno/SACK/RACK, PRR, Reno/CUBIC and pacing matrices assert isolated suppression and normal response on other loss; disqualifiers cover ECE, RTO and ordinary loss. Replenishment retains nonempty flight and resumes ACK growth. Independent MSS decrease scaling remains, not literal unchanged-cwnd advice.",
+      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+      "evidence": [
+        "crates/ntcp/src/connection.rs::    fn resolve_probe_response(",
+        "crates/ntcp/src/pmtud_isolated_cc_tests.rs::fn isolated_probe_cc_real_receiver_recovery_matrix()"
+      ]
     },
     {
       "id": "4821-066",
       "section": "4",
       "quote": "Suppressed congestion control MUST be rate limited such that it occurs less frequently than the worst-case loss rate for TCP congestion control at a comparable data rate over the same path (i.e., less than the \"TCP-friendly\" loss rate [tcp-friendly]). This SHOULD be enforced by requiring a minimum headway between a suppressed congestion adjustment (due to a failed probe) and the next attempted probe, which is equal to one round-trip time for each packet permitted by the congestion window. This is discussed further in Section 7.6.2.",
-      "status": "exception",
-      "reason": "Conditional requirement is not activated: no congestion adjustment is suppressed. The missing isolated-loss suppression SHOULD remains TODO at 065/139/142. If suppression is added, its rate/headway MUST be verified; current cooldown arithmetic alone is not proof of that future branch.",
-      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4"
+      "status": "covered",
+      "reason": "Reviewed 76800de plus a4b9a0c: isolated suppression waits for finite cumulative proof and recovery exit; pmtu_cooldown uses the unsuppressed logical window, not transient PRR admission, with one RTT per packet plus a strict extra interval/tick and an RTO floor. Real receiver matrix checks no target before the deadline and a target at it; dedicated arithmetic test distinguishes logical14600 from admission1000. Mandatory failure cooldown is independent of configurable periodic aging.",
+      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+      "evidence": [
+        "crates/ntcp/src/connection.rs::    fn pmtu_cooldown(",
+        "crates/ntcp/src/pmtud_isolated_cc_tests.rs::fn isolated_probe_cc_real_receiver_recovery_matrix()"
+      ]
     },
     {
       "id": "4821-067",
@@ -556,7 +564,7 @@
       "section": "4",
       "quote": "Implementations MAY use different heuristics to select the initial effective Path MTU for each protocol. Connectionless protocols and protocols that do not support PLPMTUD SHOULD have their own default value for the initial effective Path MTU, which can be set to a more conservative (smaller) value than the initial value used by TCP and other protocols that are well suited to PLPMTUD. There SHOULD be per-protocol and per-route limits on the initial effective Path MTU (eff_pmtu) and the upper searching limit (search_high). See Section 7.2 for further discussion.",
       "status": "TODO",
-      "reason": "Missing configuration advice: first_hop_mtu is supplied per Connection, but there are no independent per-route initial eff_pmtu/search_high limits. The optional per-protocol heuristic and connectionless-protocol defaults do not require TCP to implement other protocols.",
+      "reason": "Partial gap after 0030a96: independent per-connection creation initial_mtu and initial_search_high limits are implemented and validated, with independent initial_search_low and retained administrative high ceiling. No per-route policy service supplies the full per-protocol/per-route recommendation. Optional other-protocol heuristics/defaults do not require TCP to implement other protocols.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4"
     },
     {
@@ -890,7 +898,7 @@
       "section": "7.1",
       "quote": "For initial conditions when there is no information about the path, eff_pmtu may be greater than search_low. The initial value of search_low SHOULD be conservatively low, but performance may be better if eff_pmtu starts at a higher, less conservative, value. See Section 7.2.",
       "status": "covered",
-      "reason": "Pmtud::new initializes search_low to min(bound,1024) for IPv4 or min(bound,1280) for IPv6. The full-stop test checks both family starting lows through the first fallback; independent configurability remains TODO at 113.",
+      "reason": "By default Pmtud::new initializes search_low to min(bound,1024) for IPv4 or min(bound,1280) for IPv6. The full-stop test checks both family starting lows through the first fallback; independent creation-time configurability is covered at 113.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.1",
       "evidence": [
         "crates/ntcp/src/pmtud.rs::    pub fn new(",
@@ -925,9 +933,13 @@
       "id": "4821-113",
       "section": "7.2",
       "quote": "It is RECOMMENDED that search_low be initially set to an MTU size that is likely to work over a very wide range of environments. Given today's technologies, a value of 1024 bytes is probably safe enough. The initial value for search_low SHOULD be configurable.",
-      "status": "TODO",
-      "reason": "Pmtud::new hard-codes initial low=min(bound,1024) for IPv4 and min(bound,1280) for IPv6. PmtudConfig exposes only first_hop_mtu, so the initial search_low configurability SHOULD is unmet.",
-      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
+      "status": "covered",
+      "reason": "Reviewed 0030a96: independent creation-only initial_search_low is validated with initial_mtu/initial_search_high, family and allocation bounds. Defaults remain conservative IPv4 min(mtu,1024) and IPv6 min(mtu,1280); dual-family tests assert defaults, independent overrides, rejection rather than silent clamping, and subsequent peer caps. Per-route policy remains open at 071/119.",
+      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.2",
+      "evidence": [
+        "crates/ntcp/src/pmtud_config.rs::    pub(crate) fn initial_values(",
+        "crates/ntcp/src/pmtud_config_tests.rs::fn pmtud_config_initial_bounds_defaults_and_independent_overrides()"
+      ]
     },
     {
       "id": "4821-114",
@@ -972,7 +984,7 @@
       "section": "7.2",
       "quote": "There SHOULD be per-protocol and per-route configuration options to override initial values for eff_pmtu and other PLPMTUD state variables.",
       "status": "TODO",
-      "reason": "PmtudConfig exposes first_hop_mtu only. No independent initial eff_pmtu/search_low/search_high overrides or per-route policy configuration exist; receive MSS and scratch limits are not equivalents.",
+      "reason": "Partial gap after 0030a96: PmtudConfig provides validated independent creation-only initial_mtu/initial_search_low/initial_search_high overrides. No per-route policy configuration/service exists; the per-connection API does not establish the complete per-protocol/per-route clause.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
     },
     {
@@ -1123,7 +1135,7 @@
       "section": "7.6",
       "quote": "When a probe has completed, the result SHOULD be processed as follows, categorized by the probe's result type.",
       "status": "TODO",
-      "reason": "Missing behavior in the following response list: the isolated-loss congestion suppression SHOULD (139/142) is unmet. Implicit probes and shared caches are not part of this explicit-probe response clause.",
+      "reason": "Partial evidence gap after 76800de and a4b9a0c: finite isolated proof, logical congestion suppression and timeout congestion response are now tested. The full categorized response list still includes the unresolved same-sized next probe after inconclusive recovery at144; this umbrella clause is not closed merely by fixing139/142.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6"
     },
     {
@@ -1154,9 +1166,13 @@
       "id": "4821-139",
       "section": "7.6.2",
       "quote": "When only the probe is lost, it is treated as an indication that the Path MTU is smaller than the probe size. In this case alone, the loss SHOULD NOT be interpreted as congestion signal.",
-      "status": "TODO",
-      "reason": "Pmtud waits for trailing cumulative delivery and narrows bounds, but Connection already invokes congestion reduction on loss. Recommended isolated-probe suppression is not implemented; no exception disguises this SHOULD gap.",
-      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2"
+      "status": "covered",
+      "reason": "Reviewed 76800de plus a4b9a0c: provisional normal repair admission and PRR remain active; only finite preloss extended-tail cumulative proof followed by recovery/PRR exit suppresses the logical loss response. Real receiver NewReno/SACK/RACK, PRR, Reno/CUBIC and pacing matrices assert isolated suppression and normal response on other loss; disqualifiers cover ECE, RTO and ordinary loss. Replenishment retains nonempty flight and resumes ACK growth. Independent MSS decrease scaling remains, not literal unchanged-cwnd advice. Pmtud::ack narrows search_high to probe size minus one after the finite proof.",
+      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn ack(",
+        "crates/ntcp/src/pmtud_isolated_cc_tests.rs::fn isolated_probe_cc_real_receiver_recovery_matrix()"
+      ]
     },
     {
       "id": "4821-140",
@@ -1182,17 +1198,25 @@
       "id": "4821-142",
       "section": "7.6.2",
       "quote": "A probe failure event is the one situation under which the Packetization Layer SHOULD ignore loss as a congestion signal. Because there is some small risk that suppressing congestion control might have unanticipated consequences (even for one isolated loss), it is REQUIRED that probe failure events be less frequent than the normal period for losses under standard congestion control. Specifically, after a probe failure event and suppressed congestion control, PLPMTUD MUST NOT probe again until an interval that is larger than the expected interval between congestion control events. See Section 4 for details. The simplest estimate of the interval to the next congestion event is the same number of round trips as the current congestion window in packets.",
-      "status": "TODO",
-      "reason": "Missing behavior: isolated probe failure still triggers normal congestion reduction, contrary to the suppression SHOULD. The subsequent rate-limit REQUIRED/MUST NOT is conditional on suppressed congestion control and is not currently violated; it must be audited if suppression is implemented.",
-      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2"
+      "status": "covered",
+      "reason": "Reviewed 76800de plus a4b9a0c: isolated suppression waits for finite cumulative proof and recovery exit; pmtu_cooldown uses the unsuppressed logical window, not transient PRR admission, with one RTT per packet plus a strict extra interval/tick and an RTO floor. Real receiver matrix checks no target before the deadline and a target at it; dedicated arithmetic test distinguishes logical14600 from admission1000. Mandatory failure cooldown is independent of configurable periodic aging.",
+      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2",
+      "evidence": [
+        "crates/ntcp/src/connection.rs::    fn pmtu_cooldown(",
+        "crates/ntcp/src/pmtud_isolated_cc_tests.rs::fn isolated_probe_cc_real_receiver_recovery_matrix()"
+      ]
     },
     {
       "id": "4821-143",
       "section": "7.6.3",
       "quote": "If the loss was detected with a timeout and repaired with go-back-n retransmission, then congestion window reduction will be necessary. The relatively high price of a failed probe in this case may merit a longer time interval until the next probe. A time interval that is five times the non-timeout failure case (Section 7.6.2) is RECOMMENDED.",
-      "status": "TODO",
-      "reason": "Evidence gap: timeout() delays probes by five times cooldown, and unit test pmtud_probe_timeout_cooldown_inconclusive_and_unambiguous_ack checks the deadline. Normal timeout congestion response is tested separately; an integrated go-back-n probe repair trace proving both is not recorded.",
-      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.3"
+      "status": "covered",
+      "reason": "Reviewed 76800de: real receiver disqualifier matrix drops a probe repair and fires actual TCP RTO, asserting one-MSS cwnd, reduced threshold and committed response throughout cumulative repair. Non-SACK NewReno as well as SACK/RACK, PRR and Reno/CUBIC are exercised. Pmtud::timeout applies five times cooldown; exact deadline unit test and integrated timeout trace prove later inconclusive retry loss cannot erase it. This is TCP timeout repair, not a new generic go-back-n transport.",
+      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.3",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn timeout(",
+        "crates/ntcp/src/pmtud_isolated_cc_tests.rs::fn isolated_probe_cc_real_receiver_disqualifiers()"
+      ]
     },
     {
       "id": "4821-144",

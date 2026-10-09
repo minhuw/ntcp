@@ -100,6 +100,13 @@ impl PmtudConfig {
         }
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.2
+    //= reason=Reviewed 0030a96: independent creation-only initial_search_low is validated with initial_mtu/initial_search_high, family and allocation bounds. Defaults remain conservative IPv4 min(mtu,1024) and IPv6 min(mtu,1280); dual-family tests assert defaults, independent overrides, rejection rather than silent clamping, and subsequent peer caps. Per-route policy remains open at 071/119.
+    //# It is RECOMMENDED that search_low be initially set to an MTU size that is likely
+    //# to work over a very wide range of environments. Given today's technologies, a
+    //# value of 1024 bytes is probably safe enough. The initial value for search_low
+    //# SHOULD be configurable.
+
     pub(crate) fn initial_values(self, bound: u32, ipv4: bool) -> Result<(u32, u32, u32), Error> {
         let floor = if ipv4 { 68 } else { 1280 };
         let max = if ipv4 { 65535 } else { 65575 };

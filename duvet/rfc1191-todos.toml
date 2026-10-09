@@ -232,14 +232,6 @@ quote = '''
 immediately once a datagram is sent to the given destination. No such mechanism exists for realizing that a stale PMTU value is too small, so an implementation should "age" cached values. When a PMTU value has not been decreased for a while (on the order of 10 minutes), the PMTU estimate should be set to the first-hop data-link MTU, and the packetization layers should be notified of the change. This will cause the complete PMTU Discovery process to take place again.
 '''
 
-# 1191-068
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.3"
-reason = "PmtudConfig has no aging-duration or infinity setting; the discovery hold/reset interval is fixed at 600 seconds. Periodic probing itself is implemented."
-quote = '''
-Note: an implementation should provide a means for changing the timeout duration, including setting it to "infinity". For example, hosts attached to an FDDI network which is then attached to the rest of the Internet via a slow serial line are never going to discover a new non-local PMTU, so they should not have to put up with dropped datagrams every 10 minutes.
-'''
-
 # 1191-070
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.3"
@@ -368,18 +360,10 @@ quote = '''
 The former can be accomplished by associating a flag with the routing entry; when a packet is sent via a route with this flag set, the IP layer leaves the DF bit clear no matter what the upper layer requests.
 '''
 
-# 1191-095
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.6"
-reason = "No API changes the fixed 600-second aging/search-reset interval."
-quote = '''
-The implementation should also provide a way to change the timeout period for aging stale PMTU information.
-'''
-
 # 1191-099
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-7"
-reason = "Fixed compile-time plateau list; no runtime customer update control or exhaustive proof of contemporary plateau selection. RFC1191 marks this section implementation advice, not protocol specification."
+reason = "Partial gap after 0030a96 and 912cf80: bounded runtime Ipv4Plateaus (at most16 descending unique legal values ending in68) and live Endpoint::set_pmtud_policy provide source-free table replacement; tests cover custom selection, validation and legal IPv4 floor feedback. The default remains the historical RFC1191 table, with no up-to-date reference justification for contemporary plateau selection. Retain this full-span implementation-advice TODO for that aspect, not for missing runtime configuration."
 quote = '''
 We do not expect that the values in the table, especially for higher MTU levels, are going to be valid forever. The values given here are an implementation suggestion, NOT a specification or requirement. Implementors should use up-to-date references to pick a set of plateaus; it is important that the table not contain too many entries or the process of searching for a PMTU might waste Internet resources. Implementors should also make it convenient for customers without source code to update the table values in their systems (for example, the table in a BSD-derived Unix kernel could be changed using a new "ioctl" command).
 '''
@@ -387,7 +371,7 @@ We do not expect that the values in the table, especially for higher MTU levels,
 # 1191-100
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-7"
-reason = "Optional suggested plateau-table additions are not selected; fixed RFC1191 table is used. Configurability recommendation remains TODO."
+reason = "Optional suggested plateau-table additions are not selected by default; the historical RFC1191 table remains the default. Runtime bounded table replacement is implemented; contemporary reference selection remains open at1191-099."
 quote = '''
 Note: It might be a good idea to add a few table entries for values equal to small powers of 2 plus 40 (for the IP and TCP headers), where no similar values exist, since this seems to be a reasonably non-arbitrary way of choosing arbitrary values.
 '''
@@ -395,7 +379,7 @@ Note: It might be a good idea to add a few table entries for values equal to sma
 # 1191-101
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-7"
-reason = "Optional suggested plateau-table additions are not selected; fixed RFC1191 table is used. Configurability recommendation remains TODO."
+reason = "Optional suggested plateau-table additions are not selected by default; the historical RFC1191 table remains the default. Runtime bounded table replacement is implemented; contemporary reference selection remains open at1191-099."
 quote = '''
 The table might also contain entries for values slightly less than large powers of 2, in case MTUs are defined near those values (it is better in this case for the table entries to be low than to be high, or else the next lowest plateau may be chosen instead).
 '''

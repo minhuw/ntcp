@@ -610,7 +610,7 @@
       "section": "5.3",
       "quote": "If the stale PMTU value is too large, this will be discovered almost immediately once a large enough packet is sent on the path. No such mechanism exists for realizing that a stale PMTU value is too small, so an implementation should \"age\" cached values. When a PMTU value has not been decreased for a while (on the order of 10 minutes), it should probe to find if a larger PMTU is supported.",
       "status": "covered",
-      "reason": "Enabled IPv6 core holds PTB/converged search for 600 seconds, reopens the upper search bound on expiry, and emits an ACK-confirmed larger probe. The dual-family real-probe test exercises periodic retry; configurable aging is the separate 8201-069 TODO.",
+      "reason": "Enabled IPv6 core holds PTB for 600 seconds and defaults converged-search aging to 600 seconds, reopens the upper search bound on expiry, and emits an ACK-confirmed larger probe. The dual-family real-probe test exercises periodic retry; configurable periodic aging is separately covered at 8201-069.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.3",
       "evidence": [
         "crates/ntcp/src/pmtud.rs::    pub fn tick(",
@@ -621,9 +621,13 @@
       "id": "8201-069",
       "section": "5.3",
       "quote": "Note: an implementation should provide a means for changing the timeout duration, including setting it to \"infinity\". For example, nodes attached to a link with a large MTU that is then attached to the rest of the Internet via a link with a small MTU are never going to discover a new non-local PMTU, so they should not have to put up with dropped packets every 10 minutes.",
-      "status": "TODO",
-      "reason": "PmtudConfig exposes no aging-duration or infinity setting; the 600-second hold/reset interval is fixed. The periodic probe required by 8201-068 is implemented.",
-      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.3"
+      "status": "covered",
+      "reason": "Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.3",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn set_policy(",
+        "crates/ntcp/src/pmtud_config_tests.rs::fn pmtud_config_checked_aging_timebases_and_live_rearming()"
+      ]
     },
     {
       "id": "8201-070",
@@ -684,9 +688,13 @@
       "id": "8201-075",
       "section": "5.4",
       "quote": "Note: A packetization layer that determines a probe packet is lost needs to adapt the segment size of the retransmission. Using the reported size in the last Packet Too Big message, however, can lead to further losses as there might be smaller PMTU limits at the routers further along the path. This would lead to loss of all retransmitted segments and therefore cause unnecessary congestion as well as additional packets to be sent each time a new router announces a smaller MTU. Any packetization layer that uses retransmission is therefore also responsible for congestion control of its retransmissions [RFC8085].",
-      "status": "TODO",
-      "reason": "Core adapts probe-gap retransmissions and retains congestion control, but exact IPv6 lost-probe repair plus subsequent smaller-router-PTB/congestion behavior is not recorded. The isolated/multiple-probe-loss wire test currently uses IPv4; this is a specific evidence gap, not a native IPv6 socket obligation.",
-      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+      "status": "covered",
+      "reason": "Reviewed IPv6 lost_probe_repairs wire fixture and 76800de: actual receiver repairs are split within the probe gap and conservative packet budget, including two successively smaller router PTBs down to1280 and wrapping sequences. Normal repair admission remains active; isolated proof retains only MSS-scaled logical cwnd, while PTB cancellation commits normal congestion response. Both PTB repair-boundary tests assert the committed threshold; no unchanged-cwnd or shared-path fanout claim.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn repair_limit(",
+        "crates/ntcp/src/pmtud_ipv6_evidence_tests.rs::fn ipv6_lost_probe_real_receiver_repairs_and_congestion()"
+      ]
     },
     {
       "id": "8201-076",
@@ -776,9 +784,13 @@
       "id": "8201-084",
       "section": "5.6",
       "quote": "The implementation should also provide a way to change the timeout period for aging stale PMTU information.",
-      "status": "TODO",
-      "reason": "No API configures the fixed 600-second aging/search-reset interval.",
-      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
+      "status": "covered",
+      "reason": "Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn set_policy(",
+        "crates/ntcp/src/pmtud_config_tests.rs::fn pmtud_config_checked_aging_timebases_and_live_rearming()"
+      ]
     },
     {
       "id": "8201-085",
