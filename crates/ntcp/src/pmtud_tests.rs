@@ -375,6 +375,8 @@ fn pmtud_probe_isolated_and_multiple_loss_wait_for_trailing_ack() {
         while a.snd_nxt.distance_from(probe.start) < probe.trailing_end.distance_from(probe.start) {
             packet(&mut a, 41);
         }
+        // The last emitted segment can extend beyond the initial probe boundary.
+        let trailing_end = a.snd_nxt;
         // Fast retransmit inferred through real duplicate ACKs, not a PMTU waiver.
         // First ACK updates the scaled window; three subsequent ACKs are duplicates.
         for _ in 0..4 {
@@ -398,7 +400,7 @@ fn pmtud_probe_isolated_and_multiple_loss_wait_for_trailing_ack() {
                 probe.end.0
             );
         }
-        ack(&mut a, 45, probe.trailing_end);
+        ack(&mut a, 45, trailing_end);
         let info = a.path_mtu_info().unwrap();
         if multiple {
             assert_eq!(info.search_high, before.search_high);
