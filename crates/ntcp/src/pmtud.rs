@@ -337,6 +337,9 @@ impl Pmtud {
                 *entry = None;
             }
         }
+        let verification_expired = self.verification.is_some_and(|(_, since, _, _)| {
+            now.saturating_sub(since) >= rto.saturating_mul(2)
+        });
         if let Some(p) = self.probe {
             if !p.retried && !p.timeout && covered(ack, p.end) {
                 //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.1
@@ -346,9 +349,11 @@ impl Pmtud {
                 self.info.search_low = p.size;
                 if p.size > self.info.current_mtu {
                     // Active search can make several increases before verification
-                    // finishes. Keep the last verified baseline and all evidence.
+                    // finishes. Keep the last verified baseline and all evidence,
+                    // but observe each new size for another two RTO intervals.
                     self.verification
-                        .get_or_insert((self.info.current_mtu, now, 0, 0));
+                        .get_or_insert((self.info.current_mtu, now, 0, 0))
+                        .1 = now;
                     self.info.current_mtu = p.size;
                 }
                 self.probe = None;
@@ -376,7 +381,9 @@ impl Pmtud {
         //# PLPMTUD implementations SHOULD implement MTU verification.
         // Two RTO intervals with >10% retry/original packets revert the increase.
         if let Some((previous, since, sent, lost)) = self.verification
-            && now.saturating_sub(since) >= rto.saturating_mul(2)
+            // A new increase must not defer an already-due lossy rollback.
+            && (now.saturating_sub(since) >= rto.saturating_mul(2)
+                || verification_expired && lost.saturating_mul(10) > sent)
             && sent != 0
         {
             if lost.saturating_mul(10) > sent {

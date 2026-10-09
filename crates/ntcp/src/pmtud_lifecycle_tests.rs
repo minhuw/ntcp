@@ -120,9 +120,63 @@ fn pmtud_lifecycle_multi_increase_keeps_verification_baseline_and_loss_evidence(
         }
     }
     p.ack(seq, 2100, 1000, 1000);
+    assert_eq!(p.info.current_mtu, 1440);
+    p.ack(seq, 3999, 1000, 1000);
+    assert_eq!(p.info.current_mtu, 1440);
+    p.ack(seq, 4000, 1000, 1000);
     assert_eq!(p.info.current_mtu, 1024);
     assert_eq!(p.info.search_low, 1024);
     assert_eq!(p.info.search_high, 1439);
+}
+
+#[test]
+fn pmtud_lifecycle_increase_on_verification_expiry_requires_new_observation_interval() {
+    for prior_loss in [false, true] {
+        let mut p = crate::pmtud::Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000);
+        p.info.current_mtu = 1024;
+        p.start_probe(Seq(0), 1200, 3000, 1240);
+        p.sent(Seq(0), Seq(1200), 1240, 20, false);
+        p.ack(Seq(1200), 100, 1000, 1000);
+        let mut seq = Seq(1200);
+        for _ in 0..4 {
+            let end = seq.wrapping_add(1200);
+            p.sent(seq, end, 1240, 20, false);
+            if prior_loss {
+                p.sent(seq, end, 1240, 20, true);
+            }
+            seq = end;
+        }
+        p.ack(seq, 2000, 1000, 1000);
+        assert_eq!(p.info.current_mtu, 1240);
+        let end = seq.wrapping_add(1340);
+        p.start_probe(seq, 1340, 3000, 1380);
+        p.sent(seq, end, 1380, 20, false);
+        // This ACK expires the first increase's window and proves a new size.
+        p.ack(end, 2100, 1000, 1000);
+        seq = end;
+        if prior_loss {
+            // Restarting observation must not postpone an already-due rollback.
+            assert_eq!(p.info.current_mtu, 1024);
+            assert_eq!(p.info.search_low, 1024);
+            assert_eq!(p.info.search_high, 1379);
+            continue;
+        }
+        assert_eq!(p.info.current_mtu, 1380);
+        for n in 0..4 {
+            let end = seq.wrapping_add(1340);
+            p.sent(seq, end, 1380, 20, false);
+            if n < 2 {
+                p.sent(seq, end, 1380, 20, true);
+            }
+            seq = end;
+        }
+        p.ack(seq, 4099, 1000, 1000);
+        assert_eq!(p.info.current_mtu, 1380);
+        p.ack(seq, 4100, 1000, 1000);
+        assert_eq!(p.info.current_mtu, 1024);
+        assert_eq!(p.info.search_low, 1024);
+        assert_eq!(p.info.search_high, 1379);
+    }
 }
 
 fn endpoint_packet(a: &mut Endpoint, now: u64) -> (IpMetadata, Vec<u8>) {
