@@ -2354,9 +2354,13 @@ impl Endpoint {
         id: ConnectionId,
         policy: crate::PmtudPolicy,
     ) -> Result<(), EndpointError> {
-        self.slot(id)?.connection.validate_pmtud_policy(now, policy)?;
+        self.slot(id)?
+            .connection
+            .validate_pmtud_policy(now, policy)?;
         self.clock(now)?;
-        self.slot_mut(id)?.connection.set_pmtud_policy(now, policy)?;
+        self.slot_mut(id)?
+            .connection
+            .set_pmtud_policy(now, policy)?;
         self.refresh(id.slot);
         Ok(())
     }

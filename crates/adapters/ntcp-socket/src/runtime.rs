@@ -671,7 +671,7 @@ impl Owner {
         {
             packet[6] = 0;
             packet[10..12].fill(0);
-            let checksum = ntcp_ip::checksum(&packet[..20]);
+            let checksum = ntcp_ip_common::checksum(&packet[..20]);
             packet[10..12].copy_from_slice(&checksum.to_be_bytes());
         }
         Ok(packet)

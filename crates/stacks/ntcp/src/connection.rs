@@ -237,7 +237,9 @@ impl Default for KeepaliveConfig {
 impl ConnectionConfig {
     pub fn validate(&self, ipv4: bool) -> Result<(), Error> {
         if let Some(p) = self.pmtud {
-            p.policy.search_aging.ticks(self.timebase.units_per_second)?;
+            p.policy
+                .search_aging
+                .ticks(self.timebase.units_per_second)?;
             p.initial_values(self.initial_path_bound(p.first_hop_mtu, ipv4), ipv4)?;
         }
         if !self.valid_timestamp_timebase()
@@ -2328,7 +2330,11 @@ impl Connection {
 
     pub(crate) fn validate_first_hop_mtu(&self, now: Instant, mtu: u32) -> Result<(), Error> {
         self.check_time(now)?;
-        let range = if self.tuple.local.is_ipv4() { 68..=65535 } else { 1280..=65575 };
+        let range = if self.tuple.local.is_ipv4() {
+            68..=65535
+        } else {
+            1280..=65575
+        };
         if !range.contains(&mtu) || self.pmtud.is_none() {
             return Err(Error::InvalidArgument);
         }

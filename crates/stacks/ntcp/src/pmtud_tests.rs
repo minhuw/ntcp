@@ -46,7 +46,7 @@ fn wire_packet(a: &mut Connection, now: u64, options: OutgoingIpv4Options) -> Ve
             out[9] = 6;
             out[12..16].copy_from_slice(&src.octets());
             out[16..20].copy_from_slice(&dst.octets());
-            let checksum = ntcp_ip::checksum(&out[..header]);
+            let checksum = ntcp_ip_common::checksum(&out[..header]);
             out[10..12].copy_from_slice(&checksum.to_be_bytes());
             header
         }
@@ -63,7 +63,7 @@ fn wire_packet(a: &mut Connection, now: u64, options: OutgoingIpv4Options) -> Ve
     };
     out[header..header + tcp.len()].copy_from_slice(&tcp);
     out.truncate(header + tcp.len());
-    let parsed = ntcp_ip::parse(&out, true).unwrap();
+    let parsed = parse_ip_test(&out, true).unwrap();
     wire::parse(ip(a.tuple), parsed.payload).unwrap();
     out
 }
@@ -224,7 +224,7 @@ fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
             let original_mss = a.mss;
             a.write(&[7; 1460]).unwrap(); // insufficient trailing data: not a probe
             let frame = wire_packet(&mut a, 40, OutgoingIpv4Options::default());
-            let ip = ntcp_ip::parse(&frame, false).unwrap();
+            let ip = parse_ip_test(&frame, false).unwrap();
             let segment = wire::parse(
                 IpMetadata {
                     source: ip.ip.source,
@@ -255,7 +255,7 @@ fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
             );
             let retry = wire_packet(&mut a, 43, OutgoingIpv4Options::default());
             assert!(retry.len() <= floor as usize);
-            let ip = ntcp_ip::parse(&retry, false).unwrap();
+            let ip = parse_ip_test(&retry, false).unwrap();
             let retry = wire::parse(
                 IpMetadata {
                     source: ip.ip.source,
@@ -273,7 +273,7 @@ fn pmtud_wire_family_floors_options_wrap_and_receive_offer() {
     let mut a = Connection::active(tuple(), cfg(68), 0, 0).unwrap();
     let syn = wire_packet(&mut a, 0, OutgoingIpv4Options::default());
     assert!(syn.len() <= 68);
-    let parsed = ntcp_ip::parse(&syn, false).unwrap();
+    let parsed = parse_ip_test(&syn, false).unwrap();
     assert_eq!(
         wire::parse(
             IpMetadata {
@@ -792,7 +792,7 @@ fn pmtud_probe_isolated_and_multiple_loss_wait_for_trailing_ack() {
             // A partial recovery ACK exposes a second hole in the trailing window.
             ack(&mut a, 44, probe.end);
             let retry = wire_packet(&mut a, 44, OutgoingIpv4Options::default());
-            let parsed = ntcp_ip::parse(&retry, false).unwrap();
+            let parsed = parse_ip_test(&retry, false).unwrap();
             assert_eq!(
                 wire::parse(ip(a.tuple), parsed.payload)
                     .unwrap()
@@ -1048,7 +1048,7 @@ fn pmtud_floor_clips_timestamp_and_sack_options_on_retry_and_ack() {
         .unwrap();
     let bytes = wire_packet(&mut a, 44, OutgoingIpv4Options::default());
     assert!(bytes.len() <= 68);
-    let packet = ntcp_ip::parse(&bytes, false).unwrap();
+    let packet = parse_ip_test(&bytes, false).unwrap();
     let segment = wire::parse(ip(a.tuple), packet.payload).unwrap();
     assert!(segment.options.timestamps.is_some());
     assert!(segment.options.sack_blocks[0].is_some());
@@ -1127,7 +1127,7 @@ fn pmtud_lost_probe_retry_subtracts_sack_options_once() {
     a.timeout(expiry).unwrap();
     let frame = wire_packet(&mut a, expiry, OutgoingIpv4Options::default());
     assert_eq!(frame.len(), low as usize);
-    let parsed = ntcp_ip::parse(&frame, false).unwrap();
+    let parsed = parse_ip_test(&frame, false).unwrap();
     assert!(
         wire::parse(ip(a.tuple), parsed.payload)
             .unwrap()
@@ -1230,5 +1230,25 @@ fn pmtud_lower_mss_persists_administrative_ceiling_across_validated_growth() {
         }
         assert_eq!(a.mss, usize::from(ceiling));
         assert_eq!(a.lower_mss(ceiling + 1), Err(Error::InvalidArgument));
+    }
+}
+
+// Test-only projection lets the original mixed-family assertions stay intact.
+fn parse_ip_test(
+    bytes: &[u8],
+    source_routes: bool,
+) -> Result<ntcp_ip::Packet<'_>, ntcp_ip_common::Error> {
+    if bytes.first().ok_or(ntcp_ip_common::Error::Truncated)? >> 4 == 6 {
+        let p = ntcp_ip6::parse(bytes)?;
+        Ok(ntcp_ip::Packet {
+            ip: p.ip,
+            traffic_class: p.traffic_class,
+            hop_limit: p.hop_limit,
+            protocol: p.protocol,
+            ipv4_options: Default::default(),
+            payload: p.payload,
+        })
+    } else {
+        ntcp_ip::parse(bytes, source_routes)
     }
 }

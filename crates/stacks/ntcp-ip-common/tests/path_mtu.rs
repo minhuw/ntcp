@@ -1,4 +1,4 @@
-use ntcp_ip::path_mtu::*;
+use ntcp_ip_common::path_mtu::*;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 

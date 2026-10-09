@@ -113,7 +113,9 @@ impl Pmtud {
     //# first-hop link.
 
     pub fn new(config: PmtudConfig, bound: u32, ipv4: bool, hold: u64) -> Self {
-        let (mtu, low, high) = config.initial_values(bound, ipv4).expect("validated PMTUD bounds");
+        let (mtu, low, high) = config
+            .initial_values(bound, ipv4)
+            .expect("validated PMTUD bounds");
         Self {
             info: PathMtuInfo {
                 first_hop_mtu: config.first_hop_mtu,
@@ -152,7 +154,10 @@ impl Pmtud {
     pub fn constrain(&mut self, bound: u32) {
         self.bound = bound;
         self.initial_low =
-            bound.min(self.low_limit.unwrap_or(if self.floor == 68 { 1024 } else { 1280 }));
+            bound.min(
+                self.low_limit
+                    .unwrap_or(if self.floor == 68 { 1024 } else { 1280 }),
+            );
         self.info.current_mtu = self.info.current_mtu.min(bound);
         self.info.search_low = self.info.search_low.min(bound);
         self.info.search_high = self.info.search_high.min(self.search_ceiling());
@@ -797,10 +802,15 @@ impl Pmtud {
                     // Ordinary delivery validates only the current non-probe
                     // range. Old larger flight must not undo a PTB/link bound,
                     // and explicit probes retain their own timeout/verification rules.
-                    if packet.size <= self.info.current_mtu.min(self.info.search_high).min(self.bound)
-                        && self.probe.is_none_or(|p| {
-                            !overlaps(packet.start, packet.end, p.start, p.end)
-                        })
+                    if packet.size
+                        <= self
+                            .info
+                            .current_mtu
+                            .min(self.info.search_high)
+                            .min(self.bound)
+                        && self
+                            .probe
+                            .is_none_or(|p| !overlaps(packet.start, packet.end, p.start, p.end))
                     {
                         self.info.search_low = self.info.search_low.max(packet.size);
                     }
@@ -895,7 +905,10 @@ impl Pmtud {
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.deadline.into_iter().chain(self.periodic_deadline).min()
+        self.deadline
+            .into_iter()
+            .chain(self.periodic_deadline)
+            .min()
     }
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.3

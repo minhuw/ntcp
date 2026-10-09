@@ -202,7 +202,7 @@ fn submit(owner: &mut Owner) {
 }
 fn deliver(owner: &mut Owner, peer: &mut Owner, state: &Arc<Mutex<State>>) {
     while let Some(frame) = state.lock().unwrap().sent.pop_front() {
-        let ethernet = ntcp_ip::parse_ethernet(&frame).unwrap();
+        let ethernet = ntcp_ethernet::parse_ethernet(&frame).unwrap();
         let ip = ntcp_ip::parse(ethernet.payload, false).unwrap();
         peer.input(peer.now(), ip.ip, ip.traffic_class, ip.payload)
             .unwrap();
@@ -239,7 +239,14 @@ fn unsupported_receive_is_packet_local_and_budgeted() {
     prepare(&mut a);
     let bytes = a.pending_packet.take().unwrap();
     let mut frame = vec![0; bytes.len() + 14];
-    ntcp_ip::encode_ethernet(&mut frame, [2; 6], [4; 6], ntcp_ip::ETHERTYPE_IPV4, &bytes).unwrap();
+    ntcp_ethernet::encode_ethernet(
+        &mut frame,
+        [2; 6],
+        [4; 6],
+        ntcp_ethernet::ETHERTYPE_IPV4,
+        &bytes,
+    )
+    .unwrap();
     {
         let mut state = state.lock().unwrap();
         // Models the consumed VLAN-stripped receive rejection from AF_PACKET.
@@ -755,18 +762,25 @@ fn ptb(packet: &[u8], mtu: u16) -> Vec<u8> {
     ip[26..28].copy_from_slice(&mtu.to_be_bytes());
     ip[28..].copy_from_slice(&packet[..28]);
     fix_ptb_checksum(&mut ip);
-    let checksum = ntcp_ip::checksum(&ip[..20]);
+    let checksum = ntcp_ip_common::checksum(&ip[..20]);
     ip[10..12].copy_from_slice(&checksum.to_be_bytes());
     ip
 }
 fn fix_ptb_checksum(ip: &mut [u8]) {
     ip[22..24].fill(0);
-    let checksum = ntcp_ip::checksum(&ip[20..]);
+    let checksum = ntcp_ip_common::checksum(&ip[20..]);
     ip[22..24].copy_from_slice(&checksum.to_be_bytes());
 }
 fn ingress(owner: &mut Owner, state: &Arc<Mutex<State>>, ip: &[u8]) {
     let mut frame = vec![0; (14 + ip.len()).max(60)];
-    ntcp_ip::encode_ethernet(&mut frame, [4; 6], [2; 6], ntcp_ip::ETHERTYPE_IPV4, ip).unwrap();
+    ntcp_ethernet::encode_ethernet(
+        &mut frame,
+        [4; 6],
+        [2; 6],
+        ntcp_ethernet::ETHERTYPE_IPV4,
+        ip,
+    )
+    .unwrap();
     state.lock().unwrap().incoming.push_back(Ok(frame));
     owner.receive_batch(&mut vec![0; 65549]).unwrap();
 }
@@ -835,7 +849,7 @@ fn pmtud_jumbo_allocation_capacity_and_validated_ingress() {
         let mut bad = valid.clone();
         bad[19] = 99; // Valid checksums but addressed to another local IP.
         bad[10..12].fill(0);
-        let checksum = ntcp_ip::checksum(&bad[..20]);
+        let checksum = ntcp_ip_common::checksum(&bad[..20]);
         bad[10..12].copy_from_slice(&checksum.to_be_bytes());
         ingress(&mut a, &state, &bad);
         assert_eq!(mtu(&mut a, client), bound as i32);
@@ -994,7 +1008,7 @@ fn reserved_mtu_drop_split_backpressure_late_accept_and_prefix() {
     let mut seq = start;
     let mut count = 0;
     for (index, frame) in state.lock().unwrap().sent.iter().enumerate() {
-        let ethernet = ntcp_ip::parse_ethernet(frame).unwrap();
+        let ethernet = ntcp_ethernet::parse_ethernet(frame).unwrap();
         assert!(ethernet.payload.len() <= if index == 0 { 1400 } else { 600 });
         let ip = ntcp_ip::parse(ethernet.payload, false).unwrap();
         let tcp = ntcp::wire::parse(ip.ip, ip.payload).unwrap();
@@ -1236,7 +1250,7 @@ fn reserved_pacing_alone_has_no_deadline_and_late_accept_debits_once() {
     assert!(!a.prepare_packet(None).unwrap()); // No catch-up credit after late accept.
     // Free the two-packet initial congestion window, without selecting new output.
     for frame in state.lock().unwrap().sent.drain(..) {
-        let frame = ntcp_ip::parse_ethernet(&frame).unwrap();
+        let frame = ntcp_ethernet::parse_ethernet(&frame).unwrap();
         let ip = ntcp_ip::parse(frame.payload, false).unwrap();
         b.input(b.now(), ip.ip, ip.traffic_class, ip.payload)
             .unwrap();
@@ -1426,7 +1440,7 @@ fn reserved_late_direct_accept_and_prefix_expiry_keep_accepted_bytes() {
     assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::Submitted));
     assert!(a.reservation.is_some());
     let frame = state.lock().unwrap().sent.pop_front().unwrap();
-    let frame = ntcp_ip::parse_ethernet(&frame).unwrap();
+    let frame = ntcp_ethernet::parse_ethernet(&frame).unwrap();
     let ip = ntcp_ip::parse(frame.payload, false).unwrap();
     let accepted = ntcp::wire::parse(ip.ip, ip.payload).unwrap().payload.len();
     b.input(b.now(), ip.ip, ip.traffic_class, ip.payload)

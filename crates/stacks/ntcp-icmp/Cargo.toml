@@ -1,0 +1,21 @@
+[package]
+name = "ntcp-icmp"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/minhuw/ntcp"
+
+[dependencies]
+ntcp-ip-common = { version = "0.0.1", path = "../ntcp-ip-common" }
+ntcp = { version = "0.0.1", path = "../ntcp" }
+ntcp-ip = { version = "0.0.1", path = "../ntcp-ip", optional = true }
+ntcp-ip6 = { version = "0.0.1", path = "../ntcp-ip6", optional = true }
+
+[features]
+default = ["ipv4", "ipv6"]
+ipv4 = ["dep:ntcp-ip"]
+ipv6 = ["dep:ntcp-ip6"]
+
+[dev-dependencies]
+ntcp-ip = { version = "0.0.1", path = "../ntcp-ip" }
+ntcp-ip6 = { version = "0.0.1", path = "../ntcp-ip6" }

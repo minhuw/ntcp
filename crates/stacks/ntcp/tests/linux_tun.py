@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 
-ROOT = pathlib.Path(__file__).resolve().parents[3]
+ROOT = pathlib.Path(__file__).resolve().parents[4]
 
 
 def assert_timestamp_negotiation(sock):

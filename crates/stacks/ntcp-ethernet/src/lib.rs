@@ -1,4 +1,5 @@
-use crate::{Error, ipv4::ipv4_bounds, ipv6::ipv6_bounds};
+#![no_std]
+pub use ntcp_ip_common::Error;
 
 pub const ETHERNET_HEADER: usize = 14;
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -11,9 +12,12 @@ pub struct Ethernet<'a> {
     pub payload: &'a [u8],
 }
 fn ethernet_payload(ether_type: u16, payload: &[u8]) -> Result<usize, Error> {
+    let _ = payload;
     match ether_type {
-        ETHERTYPE_IPV4 => Ok(ipv4_bounds(payload)?.1),
-        ETHERTYPE_IPV6 => ipv6_bounds(payload),
+        #[cfg(feature = "ipv4")]
+        ETHERTYPE_IPV4 => Ok(ntcp_ip::ipv4_bounds(payload)?.1),
+        #[cfg(feature = "ipv6")]
+        ETHERTYPE_IPV6 => ntcp_ip6::ipv6_bounds(payload),
         0x8100 | 0x88a8 | 0x9100 => Err(Error::VlanUnsupported),
         _ => Err(Error::EtherTypeUnsupported),
     }

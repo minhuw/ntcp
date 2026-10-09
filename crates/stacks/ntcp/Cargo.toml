@@ -5,7 +5,7 @@ edition = "2024"
 description = "A standards-first, event-driven TCP stack in Rust"
 license = "MIT"
 repository = "https://github.com/minhuw/ntcp"
-readme = "../../README.md"
+readme = "../../../README.md"
 keywords = ["tcp", "networking", "event-driven"]
 categories = ["network-programming"]
 include = ["/src/**", "/examples/**", "/tests/**", "/Cargo.toml", "/README.md", "/LICENSE"]
@@ -17,5 +17,8 @@ sha2 = { version = "0.10", default-features = false }
 [dev-dependencies]
 libc = "0.2"
 ntcp-ip = { version = "0.0.1", path = "../ntcp-ip" }
-ntcp-io = { version = "0.0.1", path = "../io/ntcp-io" }
-ntcp-io-tun = { version = "0.0.1", path = "../io/ntcp-io-tun" }
+ntcp-io = { version = "0.0.1", path = "../../io/ntcp-io" }
+ntcp-io-tun = { version = "0.0.1", path = "../../io/ntcp-io-tun" }
+ntcp-ip6 = { version = "0.0.1", path = "../ntcp-ip6" }
+ntcp-icmp = { version = "0.0.1", path = "../ntcp-icmp" }
+ntcp-ip-common = { version = "0.0.1", path = "../ntcp-ip-common" }

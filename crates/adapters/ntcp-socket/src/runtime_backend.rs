@@ -100,7 +100,7 @@ impl Owner {
             return Err(errno());
         }
         let next_hop = config.io.next_hop_mac.ok_or(EINVAL)?;
-        let mut io = AfPacket::bind(index, ntcp_ip::ETHERTYPE_IPV4)
+        let mut io = AfPacket::bind(index, ntcp_ethernet::ETHERTYPE_IPV4)
             .map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
         let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
         if name.as_bytes_with_nul().len() > request.ifr_name.len() {
@@ -216,7 +216,7 @@ impl Owner {
                 Ok(Some(received)) => {
                     let bytes = &input[..received.len];
                     let bytes = if self.ethernet.is_some() {
-                        let Ok(frame) = ntcp_ip::parse_ethernet(bytes) else {
+                        let Ok(frame) = ntcp_ethernet::parse_ethernet(bytes) else {
                             continue;
                         };
                         frame.payload
@@ -251,8 +251,8 @@ impl Owner {
         }
         if p.protocol == 6 {
             let _ = self.input_stamped(self.now(), p.ip, p.traffic_class, p.payload, stamps);
-        } else if let Ok(feedback) = ntcp_ip::decode_icmp(bytes)
-            && feedback.kind == ntcp_ip::FeedbackKind::PacketTooBig
+        } else if let Ok(feedback) = ntcp_icmp::decode_icmp(bytes)
+            && feedback.kind == ntcp_icmp::FeedbackKind::PacketTooBig
         {
             let q = feedback.quoted;
             let _ = self.endpoint.pmtu_feedback(
@@ -378,11 +378,11 @@ impl EthernetBackend {
         packet: &[u8],
     ) -> std::io::Result<TxOutcome> {
         let mut frame = vec![0; (packet.len() + 14).max(60)];
-        let n = ntcp_ip::encode_ethernet(
+        let n = ntcp_ethernet::encode_ethernet(
             &mut frame,
             self.local,
             self.next_hop,
-            ntcp_ip::ETHERTYPE_IPV4,
+            ntcp_ethernet::ETHERTYPE_IPV4,
             packet,
         )
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;

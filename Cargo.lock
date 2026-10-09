@@ -94,10 +94,33 @@ version = "0.0.1"
 dependencies = [
  "hmac",
  "libc",
+ "ntcp-icmp",
  "ntcp-io",
  "ntcp-io-tun",
  "ntcp-ip",
+ "ntcp-ip-common",
+ "ntcp-ip6",
  "sha2",
+]
+
+[[package]]
+name = "ntcp-ethernet"
+version = "0.0.1"
+dependencies = [
+ "ntcp",
+ "ntcp-ip",
+ "ntcp-ip-common",
+ "ntcp-ip6",
+]
+
+[[package]]
+name = "ntcp-icmp"
+version = "0.0.1"
+dependencies = [
+ "ntcp",
+ "ntcp-ip",
+ "ntcp-ip-common",
+ "ntcp-ip6",
 ]
 
 [[package]]
@@ -147,6 +170,21 @@ name = "ntcp-ip"
 version = "0.0.1"
 dependencies = [
  "ntcp",
+ "ntcp-ip-common",
+ "ntcp-ip6",
+]
+
+[[package]]
+name = "ntcp-ip-common"
+version = "0.0.1"
+
+[[package]]
+name = "ntcp-ip6"
+version = "0.0.1"
+dependencies = [
+ "ntcp",
+ "ntcp-ip",
+ "ntcp-ip-common",
 ]
 
 [[package]]
@@ -166,10 +204,13 @@ dependencies = [
  "cc",
  "libc",
  "ntcp",
+ "ntcp-ethernet",
+ "ntcp-icmp",
  "ntcp-io",
  "ntcp-io-af-packet",
  "ntcp-io-tun",
  "ntcp-ip",
+ "ntcp-ip-common",
 ]
 
 [[package]]

@@ -337,7 +337,7 @@ fn parse_frame(bytes: &[u8]) -> Result<(IpMetadata, &[u8])> {
     Ok((p.ip, p.payload))
 }
 fn ip_checksum(bytes: &[u8]) -> u16 {
-    ntcp_ip::checksum(bytes)
+    ntcp_ip_common::checksum(bytes)
 }
 fn frame(tx: ntcp::Transmit, tcp: &[u8]) -> Result<Vec<u8>> {
     let mut packet = vec![0; 20 + tcp.len()];

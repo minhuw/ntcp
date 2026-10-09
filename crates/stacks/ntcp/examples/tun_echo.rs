@@ -80,7 +80,7 @@ mod linux {
     }
 
     #[cfg(test)]
-    use ntcp_ip::checksum;
+    use ntcp_ip_common::checksum;
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.3
     //#   A TCP implementation MUST silently discard an incoming SYN segment
@@ -198,7 +198,7 @@ mod linux {
     //= reason=Direct-TCP IPv6 base-header adapter extracts the identical ECN field from Traffic Class; extension headers, fragmentation and jumbograms are scoped adapter limits.
     //# Bits 6 and 7 in the IPv4 TOS octet are designated as the ECN field. The IPv4 TOS octet corresponds to the Traffic Class octet in IPv6, and the ECN field is defined identically in both cases.
     fn parse_ipv6(packet: &[u8], local: Ipv6Addr) -> Option<(IpMetadata, u8, &[u8])> {
-        let parsed = ntcp_ip::parse(packet, false).ok()?;
+        let parsed = ntcp_ip6::parse(packet).ok()?;
         let (IpAddr::V6(source), IpAddr::V6(destination)) =
             (parsed.ip.source, parsed.ip.destination)
         else {
@@ -224,7 +224,7 @@ mod linux {
             return Err(invalid("invalid outgoing IPv6 address"));
         }
         let capacity = packet.len().min(MTU);
-        ntcp_ip::encode(&mut packet[..capacity], transmit, 0)
+        ntcp_ip6::encode(&mut packet[..capacity], transmit)
             .map_err(|_| invalid("invalid outgoing IPv6 base-header packet"))
     }
 

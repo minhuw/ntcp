@@ -1,9 +1,20 @@
+#![no_std]
 use core::net::{IpAddr, Ipv6Addr};
-use ntcp::{IpMetadata, Ipv4Options};
+use ntcp::IpMetadata;
 
-use crate::{Error, FeedbackKind, IPV6_HEADER, Packet, checksum};
+pub use ntcp_ip_common::Error;
+pub const IPV6_HEADER: usize = 40;
 
-pub(super) fn parse(bytes: &[u8]) -> Result<Packet<'_>, Error> {
+#[derive(Clone, Copy, Debug)]
+pub struct Packet<'a> {
+    pub ip: IpMetadata,
+    pub traffic_class: u8,
+    pub hop_limit: u8,
+    pub protocol: u8,
+    pub payload: &'a [u8],
+}
+
+pub fn parse(bytes: &[u8]) -> Result<Packet<'_>, Error> {
     let total = ipv6_bounds(bytes)?;
     if bytes[7] == 0 {
         return Err(Error::Invalid);
@@ -19,7 +30,6 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Packet<'_>, Error> {
         traffic_class: (bytes[0] << 4) | (bytes[1] >> 4),
         hop_limit: bytes[7],
         protocol: bytes[6],
-        ipv4_options: Ipv4Options::default(),
         payload: &bytes[40..],
     })
 }
@@ -28,7 +38,9 @@ fn v6(b: &[u8]) -> Ipv6Addr {
     a.copy_from_slice(b);
     a.into()
 }
-pub(super) fn ipv6_bounds(b: &[u8]) -> Result<usize, Error> {
+// Validate a complete header; declared packet length may exceed the supplied
+// bytes for ICMP quotes. Callers must check it before slicing packet data.
+pub fn ipv6_bounds(b: &[u8]) -> Result<usize, Error> {
     if b.len() < 40 {
         return Err(Error::Truncated);
     }
@@ -47,7 +59,7 @@ pub(super) fn ipv6_bounds(b: &[u8]) -> Result<usize, Error> {
     Ok(40 + payload)
 }
 
-pub(super) fn encode_ipv6(packet: &mut [u8], transmit: ntcp::Transmit) -> Result<usize, Error> {
+pub fn encode(packet: &mut [u8], transmit: ntcp::Transmit) -> Result<usize, Error> {
     let (IpAddr::V6(source), IpAddr::V6(destination)) =
         (transmit.ip.source, transmit.ip.destination)
     else {
@@ -77,23 +89,9 @@ pub(super) fn encode_ipv6(packet: &mut [u8], transmit: ntcp::Transmit) -> Result
     Ok(total)
 }
 
-pub fn icmpv6_checksum(ip: IpMetadata, bytes: &[u8]) -> Result<u16, Error> {
-    let (IpAddr::V6(source), IpAddr::V6(destination)) = (ip.source, ip.destination) else {
-        return Err(Error::Version);
-    };
-    let len = u32::try_from(bytes.len()).map_err(|_| Error::Length)?;
-    let mut pseudo = [0; 40];
-    pseudo[..16].copy_from_slice(&source.octets());
-    pseudo[16..32].copy_from_slice(&destination.octets());
-    pseudo[32..36].copy_from_slice(&len.to_be_bytes());
-    pseudo[39] = 58;
-    let mut sum = u32::from(!checksum(&pseudo)) + u32::from(!checksum(bytes));
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    Ok(!(sum as u16))
-}
-pub(super) fn quote_header(b: &[u8]) -> Result<(IpMetadata, usize, usize, u8), Error> {
+// Checked quoted header: returns metadata, header length, original packet
+// length, and protocol. Expired hop limits are valid in error quotes.
+pub fn quote_header(b: &[u8]) -> Result<(IpMetadata, usize, usize, u8), Error> {
     let total = ipv6_bounds(b)?;
     Ok((
         IpMetadata {
@@ -104,19 +102,4 @@ pub(super) fn quote_header(b: &[u8]) -> Result<(IpMetadata, usize, usize, u8), E
         total,
         b[6],
     ))
-}
-
-pub(super) fn icmp_feedback(icmp: &[u8]) -> Result<(FeedbackKind, Option<u32>), Error> {
-    Ok(match (icmp[0], icmp[1]) {
-        (1, 0..=7) => (FeedbackKind::DestinationUnreachable, None),
-        (3, 0..=1) => (FeedbackKind::TimeExceeded, None),
-        (4, 0..=2) => (FeedbackKind::ParameterProblem, None),
-        (2, 0) => (
-            FeedbackKind::PacketTooBig,
-            Some(u32::from_be_bytes(
-                icmp[4..8].try_into().map_err(|_| Error::Truncated)?,
-            )),
-        ),
-        _ => return Err(Error::ProtocolUnsupported),
-    })
 }

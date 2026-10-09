@@ -1,11 +1,23 @@
+#![no_std]
 use core::net::{IpAddr, Ipv4Addr};
 use ntcp::{IpMetadata, Ipv4Options};
 
-use crate::{Error, FeedbackKind, IPV4_HEADER, Packet, checksum};
+pub use ntcp_ip_common::{Error, checksum};
+pub const IPV4_HEADER: usize = 20;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Packet<'a> {
+    pub ip: IpMetadata,
+    pub traffic_class: u8,
+    pub hop_limit: u8,
+    pub protocol: u8,
+    pub ipv4_options: Ipv4Options,
+    pub payload: &'a [u8],
+}
 
 const IP_HEADER: usize = IPV4_HEADER;
 
-pub(super) fn parse(bytes: &[u8], source_routes_enabled: bool) -> Result<Packet<'_>, Error> {
+pub fn parse(bytes: &[u8], source_routes_enabled: bool) -> Result<Packet<'_>, Error> {
     let (header, total) = ipv4_bounds(bytes)?;
     if bytes[8] == 0 {
         return Err(Error::Invalid);
@@ -34,7 +46,9 @@ pub(super) fn parse(bytes: &[u8], source_routes_enabled: bool) -> Result<Packet<
 fn v4(b: &[u8]) -> Ipv4Addr {
     Ipv4Addr::new(b[0], b[1], b[2], b[3])
 }
-pub(super) fn ipv4_bounds(b: &[u8]) -> Result<(usize, usize), Error> {
+// Validate a complete header; declared packet length may exceed the supplied
+// bytes for ICMP quotes. Callers must check it before slicing packet data.
+pub fn ipv4_bounds(b: &[u8]) -> Result<(usize, usize), Error> {
     if b.len() < 20 {
         return Err(Error::Truncated);
     }
@@ -68,11 +82,7 @@ pub(super) fn ipv4_bounds(b: &[u8]) -> Result<(usize, usize), Error> {
 //# Normally, the host continues to set DF in all datagrams, so that if the route
 //# changes and the new PMTU is lower, it will be discovered.
 
-pub(super) fn encode_ipv4(
-    packet: &mut [u8],
-    transmit: ntcp::Transmit,
-    timestamp: u32,
-) -> Result<usize, Error> {
+pub fn encode(packet: &mut [u8], transmit: ntcp::Transmit, timestamp: u32) -> Result<usize, Error> {
     let ntcp::Transmit {
         ip,
         len: tcp_len,
@@ -133,7 +143,9 @@ pub(super) fn encode_ipv4(
     Ok(total_len)
 }
 
-pub(super) fn quote_header(b: &[u8]) -> Result<(IpMetadata, usize, usize, u8), Error> {
+// Checked quoted header: returns metadata, header length, original packet
+// length, and protocol. Expired hop limits are valid in error quotes.
+pub fn quote_header(b: &[u8]) -> Result<(IpMetadata, usize, usize, u8), Error> {
     let (header, total) = ipv4_bounds(b)?;
     let mut destination = v4(&b[16..20]);
     // Quotes can catch source-routed datagrams before their final hop. Core
@@ -180,20 +192,4 @@ pub(super) fn quote_header(b: &[u8]) -> Result<(IpMetadata, usize, usize, u8), E
         total,
         b[9],
     ))
-}
-
-pub(super) fn icmp_feedback(icmp: &[u8]) -> Result<(FeedbackKind, Option<u32>), Error> {
-    Ok(match (icmp[0], icmp[1]) {
-        (3, 4) => (
-            FeedbackKind::PacketTooBig,
-            match u16::from_be_bytes([icmp[6], icmp[7]]) {
-                0 => None,
-                mtu => Some(u32::from(mtu)),
-            },
-        ),
-        (3, 0..=15) => (FeedbackKind::DestinationUnreachable, None),
-        (11, 0..=1) => (FeedbackKind::TimeExceeded, None),
-        (12, 0..=2) => (FeedbackKind::ParameterProblem, None),
-        _ => return Err(Error::ProtocolUnsupported),
-    })
 }

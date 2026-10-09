@@ -34,14 +34,14 @@ fn ptb(frame: &[u8], mtu: u32) -> Vec<u8> {
 
 fn seal_ptb(bytes: &mut [u8]) {
     bytes[42..44].fill(0);
-    let outer = ntcp_ip::parse(bytes, false).unwrap();
-    let sum = ntcp_ip::icmpv6_checksum(outer.ip, outer.payload).unwrap();
+    let outer = ntcp_ip6::parse(bytes).unwrap();
+    let sum = ntcp_icmp::icmpv6_checksum(outer.ip, outer.payload).unwrap();
     bytes[42..44].copy_from_slice(&sum.to_be_bytes());
 }
 
 fn feedback(a: &mut Connection, now: u64, bytes: &[u8]) -> bool {
-    let f = ntcp_ip::decode_icmp(bytes).unwrap();
-    assert_eq!(f.kind, ntcp_ip::FeedbackKind::PacketTooBig);
+    let f = ntcp_icmp::decode_icmp(bytes).unwrap();
+    assert_eq!(f.kind, ntcp_icmp::FeedbackKind::PacketTooBig);
     assert_eq!(f.quoted.ip.source, a.tuple.local.ip());
     assert_eq!(f.quoted.ip.destination, a.tuple.remote.ip());
     assert_eq!(f.quoted.source_port, a.tuple.local.port());
@@ -57,7 +57,7 @@ fn feedback(a: &mut Connection, now: u64, bytes: &[u8]) -> bool {
 }
 
 fn receive(b: &mut Connection, now: u64, frame: &[u8]) {
-    let p = ntcp_ip::parse(frame, false).unwrap();
+    let p = ntcp_ip6::parse(frame).unwrap();
     b.input(
         now,
         &wire::parse(
@@ -113,25 +113,25 @@ fn ipv6_ptb_malformed_forged_stale_and_nonincreasing_wire_quotes() {
         let mut malformed = valid.clone();
         malformed[42] ^= 1;
         assert_eq!(
-            ntcp_ip::decode_icmp(&malformed).unwrap_err(),
-            ntcp_ip::Error::Checksum
+            ntcp_icmp::decode_icmp(&malformed).unwrap_err(),
+            ntcp_ip_common::Error::Checksum
         );
         for cut in [40, 47] {
-            assert!(ntcp_ip::decode_icmp(&ptb(&frame[..cut], 1400)).is_err());
+            assert!(ntcp_icmp::decode_icmp(&ptb(&frame[..cut], 1400)).is_err());
         }
         let mut malformed = valid.clone();
         malformed[52..54].copy_from_slice(&19u16.to_be_bytes());
         seal_ptb(&mut malformed);
         assert_eq!(
-            ntcp_ip::decode_icmp(&malformed).unwrap_err(),
-            ntcp_ip::Error::Quote
+            ntcp_icmp::decode_icmp(&malformed).unwrap_err(),
+            ntcp_ip_common::Error::Quote
         );
         let mut wrong_outer = valid.clone();
         wrong_outer[39] ^= 1;
         seal_ptb(&mut wrong_outer);
         assert_eq!(
-            ntcp_ip::decode_icmp(&wrong_outer).unwrap_err(),
-            ntcp_ip::Error::Quote
+            ntcp_icmp::decode_icmp(&wrong_outer).unwrap_err(),
+            ntcp_ip_common::Error::Quote
         );
         for (offset, value) in [(47, frame[47].wrapping_add(1)), (5, frame[5] - 1)] {
             let mut forged = frame[..48].to_vec();
@@ -222,7 +222,7 @@ fn endpoint_packet(a: &mut Endpoint, now: u64) -> Vec<u8> {
 }
 
 fn endpoint_feedback(a: &mut Endpoint, now: u64, bytes: &[u8]) -> bool {
-    let f = ntcp_ip::decode_icmp(bytes).unwrap();
+    let f = ntcp_icmp::decode_icmp(bytes).unwrap();
     a.pmtu_feedback(
         now,
         Tuple {
@@ -270,7 +270,7 @@ fn ipv6_endpoint_quoted_tuple_dispatch_and_distinct_local_identity_isolation() {
         };
         let id = a.connect(now, t.local, t.remote).unwrap();
         let syn = endpoint_packet(&mut a, now);
-        let p = ntcp_ip::parse(&syn, false).unwrap();
+        let p = ntcp_ip6::parse(&syn).unwrap();
         let mut peer = v6_config();
         peer.pmtud = None;
         let mut b = Connection::passive(
@@ -391,7 +391,7 @@ fn lost_probe_repairs(iss: u32, smaller_ptb: bool) {
         let now = 50 + n;
         let start = a.snd_una;
         let frame = wire_packet(&mut a, now, OutgoingIpv4Options::default());
-        let p = ntcp_ip::parse(&frame, false).unwrap();
+        let p = ntcp_ip6::parse(&frame).unwrap();
         let s = wire::parse(
             IpMetadata {
                 source: p.ip.source,
