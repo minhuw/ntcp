@@ -26,8 +26,8 @@
       "reason": "Enabled IPv6 core implements PTB decrease, full packet budgets and ACK-confirmed upward discovery; the dual-family test performs a real probe after PTB holdoff. Optional minimal implementations are not required to omit discovery. No native IPv6 socket claim.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-1",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn new(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn new(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
       ]
     },
     {
@@ -194,8 +194,8 @@
       "reason": "Enabled IPv6 state starts at the caller first-hop bound (subject to peer/allocation caps); family-floor test asserts the initial 1500-byte estimate before rejecting subminimum feedback.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn new(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn new(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
       ]
     },
     {
@@ -216,8 +216,8 @@
       "reason": "Enabled IPv6 core consumes validated PTB, reduces the estimate and emits a smaller unfragmented retry. The dual-family floor test checks complete packet length and retry payload; no native IPv6 socket claim.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+        "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
       ]
     },
     {
@@ -251,8 +251,8 @@
       "reason": "Enabled IPv6 core reduces its estimate from validated PTB; the dual-family floor test checks the new estimate and bounded retry.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
       ]
     },
     {
@@ -303,8 +303,8 @@
       "reason": "IPv6 base-header wire test from 819b8f2 covers decode_icmp checksum, truncation, impossible quoted payload length and outer-destination rejection, then exact sent-ledger sequence/size validation and stale quotes after real receiver ACKs, idle or with new flight, including wrap. A valid minimal quote is accepted. Plausibility validation is not authentication against a knowledgeable attacker; no native IPv6 socket or extension-header claim.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_ipv6_evidence_tests.rs::fn ipv6_ptb_malformed_forged_stale_and_nonincreasing_wire_quotes()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_ipv6_evidence_tests.rs::fn ipv6_ptb_malformed_forged_stale_and_nonincreasing_wire_quotes()"
       ]
     },
     {
@@ -314,8 +314,8 @@
       "status": "covered",
       "reason": "IPv6 core rejects1279 without changing1500 estimate and accepts1280; native IPv6 socket transport is not claimed.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4"
     },
@@ -327,8 +327,8 @@
       "reason": "Enabled IPv6 core applies a validated initial PTB decrease; the floor test checks 1500 to 1280 and repacketized retry. Later reports below proven delivery follow the selected deferred security policy, not unconditional trust of every ICMP packet.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
       ]
     },
     {
@@ -339,8 +339,8 @@
       "reason": "Validated initial IPv6 PTB reduces packet size; the dual-family floor test asserts a complete retry no larger than 1280. Smaller successive legal reports pass the same strictly decreasing path; no source fragmentation is used.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+        "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
       ]
     },
     {
@@ -351,8 +351,8 @@
       "reason": "Enabled IPv6 core applies validated initial decreases and deliberately defers below-proven-delivery reports under the selected security policy. Test from 819b8f2 establishes proof with a real 1500-byte packet/receiver ACK, contrasts progress clearing with quoted-head RTO applying 1280, and verifies bounded wire repair and receiver ACK progress through wrap. No unconditional trust of PTB or native IPv6 socket claim.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_ipv6_evidence_tests.rs::fn ipv6_below_proven_ptb_progress_clears_but_head_rto_applies()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_ipv6_evidence_tests.rs::fn ipv6_below_proven_ptb_progress_clears_but_head_rto_applies()"
       ]
     },
     {
@@ -362,8 +362,8 @@
       "status": "covered",
       "reason": "Both families retain ten-minute PTB hold through ACK progress and local link growth; only subsequent ACK-confirmed PLPMTUD can raise effective PMTU.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    fn apply_ptb(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+        "crates/stacks/ntcp/src/pmtud.rs::    fn apply_ptb(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4"
     },
@@ -375,8 +375,8 @@
       "reason": "Pmtud::feedback rejects nondecreasing candidates. IPv6 base-header wire test from 819b8f2 supplies exact emitted-packet quotes with equal/larger MTUs (1500, 2000, UINT32_MAX), then repeats 1400/1500/2000 after an accepted 1400 decrease; estimates never increase, including wrapped sequence ranges. No native IPv6 socket or extension-header claim.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_ipv6_evidence_tests.rs::fn ipv6_ptb_malformed_forged_stale_and_nonincreasing_wire_quotes()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_ipv6_evidence_tests.rs::fn ipv6_ptb_malformed_forged_stale_and_nonincreasing_wire_quotes()"
       ]
     },
     {
@@ -466,8 +466,8 @@
       "reason": "Enabled TCP limits complete IPv6 packets to the path budget rather than invoking source fragmentation; the family-floor test parses base-header packets and checks resized retry length with timestamp options. Extension headers and shared caches are not prerequisites of this avoidance recommendation.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.1",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    fn refresh_path_mss(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+        "crates/stacks/ntcp/src/connection.rs::    fn refresh_path_mss(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
       ]
     },
     {
@@ -526,8 +526,8 @@
       "reason": "Enabled IPv6 PMTU starts at the supplied first-hop bound, with separate allocation/peer ceilings. The dual-family floor test asserts 1500 initially; the small-allocation test covers independent limiting.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn new(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn new(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
       ]
     },
     {
@@ -538,8 +538,8 @@
       "reason": "Endpoint::pmtu_feedback dispatches the decoded quoted outbound tuple to its connection-local path. IPv6 base-header test from 819b8f2 rejects wrong quoted source/destination addresses and ports and isolates accepted 1280/1400 updates across two distinct local addresses. This does not establish same-address per-interface isolation, Routing Header interpretation or native IPv6 sockets.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2",
       "evidence": [
-        "crates/ntcp/src/endpoint.rs::    pub fn pmtu_feedback(",
-        "crates/ntcp/src/pmtud_ipv6_evidence_tests.rs::fn ipv6_endpoint_quoted_tuple_dispatch_and_distinct_local_identity_isolation()"
+        "crates/stacks/ntcp/src/endpoint.rs::    pub fn pmtu_feedback(",
+        "crates/stacks/ntcp/src/pmtud_ipv6_evidence_tests.rs::fn ipv6_endpoint_quoted_tuple_dispatch_and_distinct_local_identity_isolation()"
       ]
     },
     {
@@ -613,8 +613,8 @@
       "reason": "Enabled IPv6 core holds PTB for 600 seconds and defaults converged-search aging to 600 seconds, reopens the upper search bound on expiry, and emits an ACK-confirmed larger probe. The dual-family real-probe test exercises periodic retry; configurable periodic aging is separately covered at 8201-069.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.3",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn tick(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn tick(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
       ]
     },
     {
@@ -625,8 +625,8 @@
       "reason": "Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.3",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn set_policy(",
-        "crates/ntcp/src/pmtud_config_tests.rs::fn pmtud_config_checked_aging_timebases_and_live_rearming()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn set_policy(",
+        "crates/stacks/ntcp/src/pmtud_config_tests.rs::fn pmtud_config_checked_aging_timebases_and_live_rearming()"
       ]
     },
     {
@@ -637,8 +637,8 @@
       "reason": "Connection uses the PMTU-derived budget for ordinary data/retries and a distinct bounded real-data probe size. Dual-family wire tests check the exact larger probe and unchanged effective PMTU before ACK; base-header IPv6 packets are unfragmented. IP-service polling is an optional implementation example.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    fn refresh_path_mss(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+        "crates/stacks/ntcp/src/connection.rs::    fn refresh_path_mss(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
       ]
     },
     {
@@ -648,8 +648,8 @@
       "status": "covered",
       "reason": "IPv6 core stores peer MSS separately, defaults1220, caps transmit size independently of local link and retains receive MSS1460.",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    fn refresh_path_mss(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_missing_peer_mss_and_small_allocation_remain_independent()"
+        "crates/stacks/ntcp/src/connection.rs::    fn refresh_path_mss(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_missing_peer_mss_and_small_allocation_remain_independent()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
     },
@@ -660,8 +660,8 @@
       "status": "covered",
       "reason": "IPv6 core stores peer MSS separately, defaults1220, caps transmit size independently of local link and retains receive MSS1460.",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    fn refresh_path_mss(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_missing_peer_mss_and_small_allocation_remain_independent()"
+        "crates/stacks/ntcp/src/connection.rs::    fn refresh_path_mss(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_missing_peer_mss_and_small_allocation_remain_independent()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
     },
@@ -680,8 +680,8 @@
       "reason": "Validated feedback updates the matched Connection and emits a retry no larger than the new IPv6 PMTU; the dual-family floor test checks sequence, payload and full packet length. Exact dropped-range notification is distinct and remains open in 8201-064/066.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+        "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
       ]
     },
     {
@@ -692,8 +692,8 @@
       "reason": "Reviewed IPv6 lost_probe_repairs wire fixture and 76800de: actual receiver repairs are split within the probe gap and conservative packet budget, including two successively smaller router PTBs down to1280 and wrapping sequences. Normal repair admission remains active; isolated proof retains only MSS-scaled logical cwnd, while PTB cancellation commits normal congestion response. Both PTB repair-boundary tests assert the committed threshold; no unchanged-cwnd or shared-path fanout claim.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn repair_limit(",
-        "crates/ntcp/src/pmtud_ipv6_evidence_tests.rs::fn ipv6_lost_probe_real_receiver_repairs_and_congestion()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn repair_limit(",
+        "crates/stacks/ntcp/src/pmtud_ipv6_evidence_tests.rs::fn ipv6_lost_probe_real_receiver_repairs_and_congestion()"
       ]
     },
     {
@@ -737,8 +737,8 @@
       "reason": "TCP packetizes ordinary data to the path budget and provides real-data discovery probes. The dual-family test checks complete probe length and ACK-confirmed increase; this is the transport duty, not an NFS conformance claim.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.5",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    fn refresh_path_mss(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+        "crates/stacks/ntcp/src/connection.rs::    fn refresh_path_mss(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
       ]
     },
     {
@@ -788,8 +788,8 @@
       "reason": "Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn set_policy(",
-        "crates/ntcp/src/pmtud_config_tests.rs::fn pmtud_config_checked_aging_timebases_and_live_rearming()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn set_policy(",
+        "crates/stacks/ntcp/src/pmtud_config_tests.rs::fn pmtud_config_checked_aging_timebases_and_live_rearming()"
       ]
     },
     {
@@ -807,8 +807,8 @@
       "reason": "Same enabled-core floor invariant as 8201-034: sub1280 feedback is discarded and a legal 1280 report is accepted. The dual-family wire test asserts both outcomes; no native IPv6 socket or complete threat-model claim.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-6",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
       ]
     },
     {
@@ -819,8 +819,8 @@
       "reason": "The strictly-decreasing feedback guard prevents the described increase attack. IPv6 base-header wire test from 819b8f2 rejects equal/larger MTUs before and after a valid decrease, including wrap. The hypothetical router round-trip is not claimed as a separate implemented behavior; no native IPv6 socket or extension-header claim.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-6",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_ipv6_evidence_tests.rs::fn ipv6_ptb_malformed_forged_stale_and_nonincreasing_wire_quotes()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_ipv6_evidence_tests.rs::fn ipv6_ptb_malformed_forged_stale_and_nonincreasing_wire_quotes()"
       ]
     },
     {

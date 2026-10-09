@@ -324,8 +324,8 @@
       "status": "covered",
       "reason": "Informational mitigation selected as policy: live serial send-window validation plus stronger exact recent packet gate; stale/idle and wrapped-sequence quotes tested, not authentication.",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc5927#section-4.1"
     },
@@ -557,8 +557,8 @@
       "reason": "Selected connection-local policy: network_error mutates only the matched Connection and PMTU feedback has no cross-connection cache. The existing validation test checks live-sequence rejection and error processing on that instance.",
       "target": "https://www.rfc-editor.org/rfc/rfc5927#section-5.2",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    pub(crate) fn network_error(",
-        "crates/ntcp/src/connection.rs::    fn network_errors_validate_quote_and_mss_reduction_repacketizes()"
+        "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn network_error(",
+        "crates/stacks/ntcp/src/connection.rs::    fn network_errors_validate_quote_and_mss_reduction_repacketizes()"
       ]
     },
     {
@@ -752,8 +752,8 @@
       "reason": "Selected cautious-update behavior defers a candidate below proven delivery; existing wire test contrasts progress clearing with quoted-head timeout. Historical variable resets are not claimed.",
       "target": "https://www.rfc-editor.org/rfc/rfc5927#section-7.2",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ]
     },
     {
@@ -786,8 +786,8 @@
       "status": "covered",
       "reason": "Selected plausibility gate rejects a candidate larger than max_sent and also requires it to be smaller than the exact recently sent packet. The security test rejects equal/larger reported sizes; this does not authenticate ICMP.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
     },
@@ -806,8 +806,8 @@
       "status": "covered",
       "reason": "Selected below-proven-size update policy records a pending report without lowering PMTU; the wire test asserts PMTU remains 1500 until matching-head timeout.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
     },
@@ -834,8 +834,8 @@
       "status": "covered",
       "reason": "Selected policy clears pending when the quoted sequence is acknowledged; the security test exercises advancing partial ACK and proves a later timeout does not apply the report. Additional clearing on any other progress is a deliberate deviation, not literal algorithm equivalence.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc5927#section-7.2"
     },
@@ -1368,8 +1368,8 @@
       "reason": "Selected max-sent update is implemented exactly as max_sent.max(size) in sent(). Exact-evidence tests send real sizes and exercise acceptance/rejection against their recorded upper bound; initialization/reset choices are separate clauses.",
       "target": "https://www.rfc-editor.org/rfc/rfc5927#section-7.4",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn sent(",
-        "crates/ntcp/src/pmtud.rs::    fn pmtud_exact_evidence_eviction_legacy_header_correction_and_floor()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn sent(",
+        "crates/stacks/ntcp/src/pmtud.rs::    fn pmtud_exact_evidence_eviction_legacy_header_correction_and_floor()"
       ]
     },
     {
@@ -1418,8 +1418,8 @@
       "reason": "Selected live-sequence check uses serial arithmetic for SND.UNA<=seq<SND.NXT; the same stale/idle/wrapped quote test supports 044. Unrelated initialization and reset deviations do not invalidate this branch.",
       "target": "https://www.rfc-editor.org/rfc/rfc5927#section-7.4",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ]
     },
     {
@@ -1430,8 +1430,8 @@
       "reason": "Selected gate rejects candidate>=current_mtu or >=max_sent, and additionally requires a smaller value than the exact quoted sent size. The security wire test rejects equal and larger reports; stricter rejection is not a missing historical branch.",
       "target": "https://www.rfc-editor.org/rfc/rfc5927#section-7.4",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ]
     },
     {
@@ -1480,8 +1480,8 @@
       "status": "covered",
       "reason": "Informational serial-arithmetic guidance: Seq::in_window and wrapping comparisons, exercised across u32 wrap; exact-match sent evidence is an additional policy gate.",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc5927#section-7.4"
     },

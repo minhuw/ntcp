@@ -244,7 +244,7 @@ class PmtudInventory(unittest.TestCase):
         matching = [p for p in todos if p["target"] == f"{PREFIX}7323#section-5.7"]
         self.assertEqual(len(matching), 1)
         reason = matching[0]["reason"]
-        for fragment in ("crates/ntcp/examples/tun_echo.rs", "NTCP_TIMESTAMPS=1",
+        for fragment in ("crates/stacks/ntcp/examples/tun_echo.rs", "NTCP_TIMESTAMPS=1",
                          "DF", "pmtud=None", "input_frame", "TCP only", "ICMP PTB"):
             self.assertIn(fragment, reason)
 

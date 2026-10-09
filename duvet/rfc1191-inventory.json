@@ -48,7 +48,7 @@
       "reason": "Enabled PMTUD initializes from the supplied first-hop MTU, capped by independent peer/allocation ceilings; native startup/jumbo tests establish those bounds. This does not assert a router implementation.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn new(",
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn new(",
         "crates/adapters/ntcp-socket/src/runtime_backend_tests.rs::fn pmtud_jumbo_allocation_capacity_and_validated_ingress()"
       ]
     },
@@ -61,8 +61,8 @@
       "reason": "The IPv4 codec always sets DF; its ECN/DSCP matrix asserts 0x4000 with no fragment offset. Keeping DF is the selected TCP behavior, not optional clear-DF termination.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2",
       "evidence": [
-        "crates/ntcp-ip/src/ipv4.rs::pub(super) fn encode_ipv4(",
-        "crates/ntcp/examples/tun_echo.rs::        fn ipv4_dscp_and_ecn_are_independent()"
+        "crates/stacks/ntcp-ip/src/lib.rs::pub fn encode(",
+        "crates/stacks/ntcp/examples/tun_echo.rs::        fn ipv4_dscp_and_ecn_are_independent()"
       ]
     },
     {
@@ -83,8 +83,8 @@
       "reason": "Enabled core applies validated initial PTB decreases and repacketizes to the new budget; feedback below previously proven delivery is deliberately deferred until the quoted head times out. Immediate and deferred cases are separate from upward probing.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ]
     },
     {
@@ -112,8 +112,8 @@
       "reason": "Enabled IPv4 PMTUD retains DF in the codec and reacts to validated lower-MTU feedback; zero-MTU and family-floor tests exercise decrease and bounded repair. This is not a claim about arbitrary external embeddings.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ]
     },
     {
@@ -140,8 +140,8 @@
       "reason": "Enabled core applies validated initial PTB decreases and repacketizes to the new budget; feedback below previously proven delivery is deliberately deferred until the quoted head times out. Immediate and deferred cases are separate from upward probing.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ]
     },
     {
@@ -175,8 +175,8 @@
       "status": "covered",
       "reason": "Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3"
     },
@@ -187,8 +187,8 @@
       "status": "covered",
       "reason": "Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3"
     },
@@ -208,8 +208,8 @@
       "reason": "Enabled core applies validated initial PTB decreases and repacketizes to the new budget; feedback below previously proven delivery is deliberately deferred until the quoted head times out. Immediate and deferred cases are separate from upward probing.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ]
     },
     {
@@ -230,8 +230,8 @@
       "reason": "Accepted PTB inhibits upward probing for 600 seconds, including after ACK progress and local link growth. The core test checks the deadline and subsequent real probe for both IP families.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
       ]
     },
     {
@@ -252,8 +252,8 @@
       "reason": "Exact PTB half of the two-timer recommendation in parent 1191-013: accepted PTB holds upward probing for the recommended 600 seconds. The separate 2-minute post-success half is unselected, not covered by this evidence.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
       ]
     },
     {
@@ -281,8 +281,8 @@
       "reason": "IPv4 zero Next-Hop MTU selects the next lower plateau using exact sent length and legacy header correction. Connection, direct-state and native socket tests cover zero-MTU processing; the following section5 cross-reference is context, not a missing feature.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ]
     },
     {
@@ -299,8 +299,8 @@
       "status": "covered",
       "reason": "Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3"
     },
@@ -311,8 +311,8 @@
       "status": "covered",
       "reason": "Enabled IPv4 PMTUD: exact sent evidence, legal floor and strictly decreasing candidates; repeated/nondecreasing reports do not rearm. Security-selected deferred updates are tested separately from immediate initial discovery.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3"
     },
@@ -323,8 +323,8 @@
       "status": "covered",
       "reason": "Peer MSS is stored separately from receive capability; missing IPv4 MSS defaults536 and emitted packets remain <=576 even with local MTU9000.",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    fn path_bound(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_missing_peer_mss_and_small_allocation_remain_independent()"
+        "crates/stacks/ntcp/src/connection.rs::    fn path_bound(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_missing_peer_mss_and_small_allocation_remain_independent()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3.1"
     },
@@ -335,8 +335,8 @@
       "status": "covered",
       "reason": "Peer MSS is stored separately from receive capability; missing IPv4 MSS defaults536 and emitted packets remain <=576 even with local MTU9000.",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    fn path_bound(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_missing_peer_mss_and_small_allocation_remain_independent()"
+        "crates/stacks/ntcp/src/connection.rs::    fn path_bound(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_missing_peer_mss_and_small_allocation_remain_independent()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3.1"
     },
@@ -489,8 +489,8 @@
       "status": "covered",
       "reason": "Zero next-hop MTU uses quoted total length, legacy IHL correction and next lower plateau; exact packet evidence bounds the input and floor68 is retained.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud.rs::    fn pmtud_exact_evidence_eviction_legacy_header_correction_and_floor()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud.rs::    fn pmtud_exact_evidence_eviction_legacy_header_correction_and_floor()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-5"
     },
@@ -501,8 +501,8 @@
       "status": "covered",
       "reason": "Zero next-hop MTU uses quoted total length, legacy IHL correction and next lower plateau; exact packet evidence bounds the input and floor68 is retained.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud.rs::    fn pmtud_exact_evidence_eviction_legacy_header_correction_and_floor()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud.rs::    fn pmtud_exact_evidence_eviction_legacy_header_correction_and_floor()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-5"
     },
@@ -513,8 +513,8 @@
       "status": "covered",
       "reason": "Zero next-hop MTU uses quoted total length, legacy IHL correction and next lower plateau; exact packet evidence bounds the input and floor68 is retained.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud.rs::    fn pmtud_exact_evidence_eviction_legacy_header_correction_and_floor()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud.rs::    fn pmtud_exact_evidence_eviction_legacy_header_correction_and_floor()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-5"
     },
@@ -720,8 +720,8 @@
       "reason": "Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.3",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn set_policy(",
-        "crates/ntcp/src/pmtud_config_tests.rs::fn pmtud_config_checked_aging_timebases_and_live_rearming()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn set_policy(",
+        "crates/stacks/ntcp/src/pmtud_config_tests.rs::fn pmtud_config_checked_aging_timebases_and_live_rearming()"
       ]
     },
     {
@@ -732,8 +732,8 @@
       "reason": "Connection::set_path_mss creates retx_pending/SYN retry work only on decreases; growth leaves legitimate pending work and timers intact. Tests from 742e320 exercise MSS-only growth with remaining flight and no output, actual RTO retry preservation, SYN work, and real upward-probe ACKs followed by new data rather than trailing-byte retransmission (both families and wrap).",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.3",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    fn set_path_mss(&mut self, effective: usize) {",
-        "crates/ntcp/src/pmtud_growth_tests.rs::fn pmtud_growth_mss_changes_preserve_existing_retry_and_syn_work()"
+        "crates/stacks/ntcp/src/connection.rs::    fn set_path_mss(&mut self, effective: usize) {",
+        "crates/stacks/ntcp/src/pmtud_growth_tests.rs::fn pmtud_growth_mss_changes_preserve_existing_retry_and_syn_work()"
       ]
     },
     {
@@ -791,8 +791,8 @@
       "reason": "Connection caches PMTU-derived MSS and bounds packetization by it; family-floor wire tests assert repaired packets within the updated PMTU. GET_MAXSIZES polling is an example, not a required API. Probe behavior is the selected RFC4821 extension.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.4",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    fn refresh_path_mss(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+        "crates/stacks/ntcp/src/connection.rs::    fn refresh_path_mss(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
       ]
     },
     {
@@ -802,8 +802,8 @@
       "status": "covered",
       "reason": "Peer MSS is stored separately from receive capability; missing IPv4 MSS defaults536 and emitted packets remain <=576 even with local MTU9000.",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    fn path_bound(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_missing_peer_mss_and_small_allocation_remain_independent()"
+        "crates/stacks/ntcp/src/connection.rs::    fn path_bound(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_missing_peer_mss_and_small_allocation_remain_independent()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.4"
     },
@@ -822,8 +822,8 @@
       "reason": "Accepted feedback refreshes only the matched Connection; the family-floor test verifies retry sequence/payload and complete packet size within the new PMTU. Cross-connection dispatch is additionally exercised by native tuple validation; this does not close exact dropped-range notification or burst deduplication.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.4",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+        "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
       ]
     },
     {
@@ -841,8 +841,8 @@
       "status": "covered",
       "reason": "Nondecreasing, stale and impossible exact-size quotes are rejected; decreasing accepted feedback alone reaches packetization refresh.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.4"
     },
@@ -869,8 +869,8 @@
       "status": "covered",
       "reason": "Dynamic send path MSS never mutates config.mss receive offer; family-floor wire test asserts unchanged receive capability.",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    fn refresh_path_mss(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+        "crates/stacks/ntcp/src/connection.rs::    fn refresh_path_mss(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.4"
     },
@@ -960,8 +960,8 @@
       "reason": "Reviewed 0030a96: PmtudPolicy exposes SearchAging::Seconds (validated >=300 with checked caller-timebase conversion) and Infinity through creation and live Endpoint::set_pmtud_policy. Tests exercise finite rearming, disabled periodic aging and both families retaining independent mandatory 600-second PTB hold and failure cooldown. No route/cache or socket-parser integration is claimed.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.6",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn set_policy(",
-        "crates/ntcp/src/pmtud_config_tests.rs::fn pmtud_config_checked_aging_timebases_and_live_rearming()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn set_policy(",
+        "crates/stacks/ntcp/src/pmtud_config_tests.rs::fn pmtud_config_checked_aging_timebases_and_live_rearming()"
       ]
     },
     {
@@ -1070,8 +1070,8 @@
       "reason": "The IPv4 estimate retains the legal 68-byte floor; the core wire test demonstrates bounded payload repair at that floor. This repeats the floor invariant, not a guarantee against an on-path ICMP blocker.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-8",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
       ]
     },
     {
@@ -1082,8 +1082,8 @@
       "reason": "IPv4 feedback rejects equal/larger and impossible candidates; exact-quote tests show these do not raise the estimate. The hypothetical attack narrative is not a separate router round-trip or on-path-blocker obligation.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-8",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
       ]
     },
     {

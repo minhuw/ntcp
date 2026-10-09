@@ -76,8 +76,8 @@
       "reason": "Explicit probe ACK raises effective PMTU and search_low; the wire test checks both families and the next larger probe.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-2",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn ack(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn ack(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
       ]
     },
     {
@@ -104,8 +104,8 @@
       "reason": "Bound updates are implemented in ack(): explicit success raises low, isolated failure lowers high, and low>=high stops search and schedules reset. The convergence test exercises stop/reset; failure-side executable evidence is separately linked at 140. No single combined trace is required by this overview.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-2",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn ack(",
-        "crates/ntcp/src/pmtud.rs::    fn pmtud_convergence_hold_and_link_growth_require_ack_proof()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn ack(",
+        "crates/stacks/ntcp/src/pmtud.rs::    fn pmtud_convergence_hold_and_link_growth_require_ack_proof()"
       ]
     },
     {
@@ -124,8 +124,8 @@
       "reason": "Selected MTU verification observes retry/original loss ratio and restores the prior baseline after repeated increases; no physical multipath experiment is claimed.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-2",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn ack(",
-        "crates/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_multi_increase_keeps_verification_baseline_and_loss_evidence()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn ack(",
+        "crates/stacks/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_multi_increase_keeps_verification_baseline_and_loss_evidence()"
       ]
     },
     {
@@ -491,8 +491,8 @@
       "reason": "TCP duplicate-ACK recovery reports probe loss; real receiver ACKs distinguish an isolated loss from a second hole beyond the minimum trailing window. This covers a loss-reporting mechanism, not suppression of congestion control.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn loss(",
-        "crates/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_real_repairs_isolated_and_second_hole_beyond_three_mss()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn loss(",
+        "crates/stacks/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_real_repairs_isolated_and_second_hole_beyond_three_mss()"
       ]
     },
     {
@@ -503,8 +503,8 @@
       "reason": "Partial no-PTB evidence from 76800de plus a4b9a0c: provisional normal repair admission and PRR remain active; only finite preloss extended-tail cumulative proof followed by recovery/PRR exit suppresses the logical loss response. Real receiver NewReno/SACK/RACK, PRR, Reno/CUBIC and pacing matrices assert isolated suppression and normal response on other loss; disqualifiers cover ECE, RTO and ordinary loss. Replenishment retains nonempty flight and resumes ACK growth. Independent MSS decrease scaling remains, not literal unchanged-cwnd advice. Partial gap: RFC4821 sections 2, 4 and 7.6.2 cover isolated loss with or without matching PTB. apply_ptb cancels probe classification; resolve_probe_response commits normal congestion response even when only the probe is lost and trailing packets are delivered, as asserted by the IPv6 two-PTB fixture. No-PTB evidence does not close this full span.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    fn resolve_probe_response(",
-        "crates/ntcp/src/pmtud_isolated_cc_tests.rs::fn isolated_probe_cc_real_receiver_recovery_matrix()"
+        "crates/stacks/ntcp/src/connection.rs::    fn resolve_probe_response(",
+        "crates/stacks/ntcp/src/pmtud_isolated_cc_tests.rs::fn isolated_probe_cc_real_receiver_recovery_matrix()"
       ]
     },
     {
@@ -515,8 +515,8 @@
       "reason": "Reviewed 76800de plus a4b9a0c: isolated suppression waits for finite cumulative proof and recovery exit; pmtu_cooldown uses the unsuppressed logical window, not transient PRR admission, with one RTT per packet plus a strict extra interval/tick and an RTO floor. Real receiver matrix checks no target before the deadline and a target at it; dedicated arithmetic test distinguishes logical14600 from admission1000. Mandatory failure cooldown is independent of configurable periodic aging.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    fn pmtu_cooldown(",
-        "crates/ntcp/src/pmtud_isolated_cc_tests.rs::fn isolated_probe_cc_real_receiver_recovery_matrix()"
+        "crates/stacks/ntcp/src/connection.rs::    fn pmtu_cooldown(",
+        "crates/stacks/ntcp/src/pmtud_isolated_cc_tests.rs::fn isolated_probe_cc_real_receiver_recovery_matrix()"
       ]
     },
     {
@@ -527,8 +527,8 @@
       "reason": "Enabled PMTUD uses Congestion::set_path_mss: generic MSS unit bookkeeping is retained, but upward changes restore byte cwnd/ssthresh without changing pacing. Tests from 742e320 assert exact no-ACK header-budget growth after real data RTO for Reno and CUBIC, plus a real RTO/recovery/ordinary-ACK/upward-probe trace separating allowed ACK growth from MTU-only threshold inflation. This is not full CUBIC trajectory evidence or closure of unrelated ACK/MSS obligations.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
       "evidence": [
-        "crates/ntcp/src/recovery.rs::    pub(crate) fn set_path_mss(&mut self, mss: u32) {",
-        "crates/ntcp/src/pmtud_growth_tests.rs::fn pmtud_growth_header_budget_does_not_inflate_post_rto_byte_windows()"
+        "crates/stacks/ntcp/src/recovery.rs::    pub(crate) fn set_path_mss(&mut self, mss: u32) {",
+        "crates/stacks/ntcp/src/pmtud_growth_tests.rs::fn pmtud_growth_header_budget_does_not_inflate_post_rto_byte_windows()"
       ]
     },
     {
@@ -538,8 +538,8 @@
       "status": "covered",
       "reason": "PMTU decrease rescales cwnd by new/old MSS for Reno and CUBIC without changing allocation or existing pacing debt; tested with PRR enabled.",
       "evidence": [
-        "crates/ntcp/src/recovery.rs::    pub(crate) fn set_mss(&mut self, mss: u32) {",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_cubic_prr_and_rate_cap_keep_original_allocation_and_pacing_debt()"
+        "crates/stacks/ntcp/src/recovery.rs::    pub(crate) fn set_mss(&mut self, mss: u32) {",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_cubic_prr_and_rate_cap_keep_original_allocation_and_pacing_debt()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4"
     },
@@ -589,8 +589,8 @@
       "reason": "Supported non-probe accounting subtracts actual IP header length and TCP options. The IPv4 options test rejects a mismatched quote header and bounds repair including those headers; unsupported IPsec/IPv6 extension headers are not emitted.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.1",
       "evidence": [
-        "crates/ntcp/src/connection.rs::        let path_limit = pmtu_probe.map_or",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_ipv4_header_options_exact_quote_and_retransmit_budget()"
+        "crates/stacks/ntcp/src/connection.rs::        let path_limit = pmtu_probe.map_or",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_ipv4_header_options_exact_quote_and_retransmit_budget()"
       ]
     },
     {
@@ -601,8 +601,8 @@
       "reason": "The selected probe size includes IP and TCP headers. The wire test asserts final IPv4/IPv6 probe length equals the recorded size and failed encoding cannot commit probe state; no unsupported extension-header emission is claimed.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.1",
       "evidence": [
-        "crates/ntcp/src/connection.rs::        let path_limit = pmtu_probe.map_or",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+        "crates/stacks/ntcp/src/connection.rs::        let path_limit = pmtu_probe.map_or",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
       ]
     },
     {
@@ -660,8 +660,8 @@
       "reason": "Pmtud is stored on the individual Connection, not indexed by remote network or subnet number. A paired connection test leaves the peer PMTUD-disabled while updating only the sender; no route-mask representation is used.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-5.2",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    pmtud: Option<crate::pmtud::Pmtud>,",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+        "crates/stacks/ntcp/src/connection.rs::    pmtud: Option<crate::pmtud::Pmtud>,",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
       ]
     },
     {
@@ -735,8 +735,8 @@
       "reason": "The allowed implicit TCP duplicate-ACK mechanism is used in this non-SACK fixture: actual receiver ACKs trigger repairs and distinguish the second hole. SACK is not mandatory in this paragraph.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-6.1",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn loss(",
-        "crates/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_real_repairs_isolated_and_second_hole_beyond_three_mss()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn loss(",
+        "crates/stacks/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_real_repairs_isolated_and_second_hole_beyond_three_mss()"
       ]
     },
     {
@@ -747,8 +747,8 @@
       "reason": "Timeout is not the primary loss detector: real receiver duplicate ACKs trigger probe repair before any timeout in the non-SACK lifecycle test.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-6.1",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn loss(",
-        "crates/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_real_repairs_isolated_and_second_hole_beyond_three_mss()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn loss(",
+        "crates/stacks/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_real_repairs_isolated_and_second_hole_beyond_three_mss()"
       ]
     },
     {
@@ -788,8 +788,8 @@
       "status": "covered",
       "reason": "TCP probes use real queued stream bytes, respecting record boundary and allocation; no synthetic padding or control-only TCP size probe.",
       "evidence": [
-        "crates/ntcp/src/connection.rs::            let candidate = candidate.and_then(|size| {",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_eor_and_allocation_free_probe_feedback_retry()"
+        "crates/stacks/ntcp/src/connection.rs::            let candidate = candidate.and_then(|size| {",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_eor_and_allocation_free_probe_feedback_retry()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-6.2"
     },
@@ -864,8 +864,8 @@
       "status": "covered",
       "reason": "Every non-probe output checks final TCP header/options/data against path payload budget before commit; floor68 retry includes timestamps and SACK within budget.",
       "evidence": [
-        "crates/ntcp/src/connection.rs::        let path_limit = pmtu_probe.map_or",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_floor_clips_timestamp_and_sack_options_on_retry_and_ack()"
+        "crates/stacks/ntcp/src/connection.rs::        let path_limit = pmtu_probe.map_or",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_floor_clips_timestamp_and_sack_options_on_retry_and_ack()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.1"
     },
@@ -876,8 +876,8 @@
       "status": "covered",
       "reason": "Binary target is strictly above search_low and <=search_high; actual IP probe size checked for IPv4/IPv6 and constrained by peer/allocation ceilings.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn target(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn target(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.1"
     },
@@ -888,8 +888,8 @@
       "status": "covered",
       "reason": "State relationship is retained as operative: upward probe success sets low and effective PMTU together; the wire test checks both values and the next upward probe. Initial eff>low is permitted and does not imply an implicit-ACK update here; that distinct SHOULD remains TODO at 111.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn ack(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn ack(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.1"
     },
@@ -901,8 +901,8 @@
       "reason": "By default Pmtud::new initializes search_low to min(bound,1024) for IPv4 or min(bound,1280) for IPv6. The full-stop test checks both family starting lows through the first fallback; independent creation-time configurability is covered at 113.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.1",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn new(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_full_stop_r1_halving_and_normal_congestion_response()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn new(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_full_stop_r1_halving_and_normal_congestion_response()"
       ]
     },
     {
@@ -913,8 +913,8 @@
       "reason": "Pmtud::ack raises search_low only from fully cumulatively acknowledged, unambiguous ordinary sent packets within effective MTU, search_high and path bounds; explicit-probe overlap retains separate timeout/verification rules. Tests from 742e320 cover real ordinary ACKs in both families/wrap, retry ambiguity, partial ACK, local rejection, PTB/link ceilings, stale quotes, holdoff and probe timeout. Ordinary loss does not enter explicit probe-failure handling; mixed ordinary/explicit success preserves larger ordinary proof.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.1",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn ack(&mut self, ack: Seq, now: Instant, cooldown: u64, rto: u64) {",
-        "crates/ntcp/src/pmtud_growth_tests.rs::fn pmtud_growth_ordinary_wire_ack_with_trailing_flight_and_legacy()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn ack(&mut self, ack: Seq, now: Instant, cooldown: u64, rto: u64) {",
+        "crates/stacks/ntcp/src/pmtud_growth_tests.rs::fn pmtud_growth_ordinary_wire_ack_with_trailing_flight_and_legacy()"
       ]
     },
     {
@@ -924,8 +924,8 @@
       "status": "covered",
       "reason": "Initial/search bound intersects supplied interface, peer, administrative and allocation limits. Administrative ceilings survive validated growth without changing receive MSS.",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    fn path_bound(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_lower_mss_persists_administrative_ceiling_across_validated_growth()"
+        "crates/stacks/ntcp/src/connection.rs::    fn path_bound(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_lower_mss_persists_administrative_ceiling_across_validated_growth()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
     },
@@ -937,8 +937,8 @@
       "reason": "Reviewed 0030a96: independent creation-only initial_search_low is validated with initial_mtu/initial_search_high, family and allocation bounds. Defaults remain conservative IPv4 min(mtu,1024) and IPv6 min(mtu,1280); dual-family tests assert defaults, independent overrides, rejection rather than silent clamping, and subsequent peer caps. Per-route policy remains open at 071/119.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.2",
       "evidence": [
-        "crates/ntcp/src/pmtud_config.rs::    pub(crate) fn initial_values(",
-        "crates/ntcp/src/pmtud_config_tests.rs::fn pmtud_config_initial_bounds_defaults_and_independent_overrides()"
+        "crates/stacks/ntcp/src/pmtud_config.rs::    pub(crate) fn initial_values(",
+        "crates/stacks/ntcp/src/pmtud_config_tests.rs::fn pmtud_config_initial_bounds_defaults_and_independent_overrides()"
       ]
     },
     {
@@ -1017,8 +1017,8 @@
       "status": "covered",
       "reason": "One-byte convergence schedules600s reset; link growth cannot increase eff without an ACK; before/at-deadline targets and bounded reset asserted.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn tick(",
-        "crates/ntcp/src/pmtud.rs::    fn pmtud_convergence_hold_and_link_growth_require_ack_proof()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn tick(",
+        "crates/stacks/ntcp/src/pmtud.rs::    fn pmtud_convergence_hold_and_link_growth_require_ack_proof()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.3"
     },
@@ -1053,8 +1053,8 @@
       "status": "covered",
       "reason": "Admission requires probe payload plus three MSS of queued/window credit, measured RTT and timestamp/pacing credit. This test asserts absent probe for insufficient window/queue/RTT and bounded paced output.",
       "evidence": [
-        "crates/ntcp/src/connection.rs::            let candidate = candidate.and_then(|size| {",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_probe_rwnd_queue_eor_timestamp_and_pacing_gates()"
+        "crates/stacks/ntcp/src/connection.rs::            let candidate = candidate.and_then(|size| {",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_probe_rwnd_queue_eor_timestamp_and_pacing_gates()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.4"
     },
@@ -1065,8 +1065,8 @@
       "status": "covered",
       "reason": "Admission requires probe payload plus three MSS of queued/window credit, measured RTT and timestamp/pacing credit. This test asserts absent probe for insufficient window/queue/RTT and bounded paced output.",
       "evidence": [
-        "crates/ntcp/src/connection.rs::            let candidate = candidate.and_then(|size| {",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_probe_rwnd_queue_eor_timestamp_and_pacing_gates()"
+        "crates/stacks/ntcp/src/connection.rs::            let candidate = candidate.and_then(|size| {",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_probe_rwnd_queue_eor_timestamp_and_pacing_gates()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.4"
     },
@@ -1077,8 +1077,8 @@
       "status": "covered",
       "reason": "Admission requires probe payload plus three MSS of queued/window credit, measured RTT and timestamp/pacing credit. This test asserts absent probe for insufficient window/queue/RTT and bounded paced output.",
       "evidence": [
-        "crates/ntcp/src/connection.rs::            let candidate = candidate.and_then(|size| {",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_probe_rwnd_queue_eor_timestamp_and_pacing_gates()"
+        "crates/stacks/ntcp/src/connection.rs::            let candidate = candidate.and_then(|size| {",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_probe_rwnd_queue_eor_timestamp_and_pacing_gates()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.4"
     },
@@ -1098,8 +1098,8 @@
       "reason": "Probe is committed only after successful encoding; final IP length equals the selected size in IPv4 and IPv6. Outcome-specific response requirements are separate, not prerequisites for this size/commit clause.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.5",
       "evidence": [
-        "crates/ntcp/src/connection.rs::        let path_limit = pmtu_probe.map_or",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+        "crates/stacks/ntcp/src/connection.rs::        let path_limit = pmtu_probe.map_or",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
       ]
     },
     {
@@ -1145,8 +1145,8 @@
       "status": "covered",
       "reason": "Unambiguous explicit-probe cumulative ACK raises low and effective MTU; failed encoding cannot create a probe or advance flight.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn ack(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn ack(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.1"
     },
@@ -1158,8 +1158,8 @@
       "reason": "MTU verification is implemented and the multi-increase lifecycle test restores the original verified baseline after sustained loss; the same evidence supports 150-152. No size-below-eff test is needed for this verification recommendation.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.1",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn ack(",
-        "crates/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_multi_increase_keeps_verification_baseline_and_loss_evidence()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn ack(",
+        "crates/stacks/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_multi_increase_keeps_verification_baseline_and_loss_evidence()"
       ]
     },
     {
@@ -1170,8 +1170,8 @@
       "reason": "Partial no-PTB evidence from 76800de plus a4b9a0c: provisional normal repair admission and PRR remain active; only finite preloss extended-tail cumulative proof followed by recovery/PRR exit suppresses the logical loss response. Real receiver NewReno/SACK/RACK, PRR, Reno/CUBIC and pacing matrices assert isolated suppression and normal response on other loss; disqualifiers cover ECE, RTO and ordinary loss. Replenishment retains nonempty flight and resumes ACK growth. Independent MSS decrease scaling remains, not literal unchanged-cwnd advice. Pmtud::ack narrows search_high to probe size minus one after the finite proof. Partial gap: RFC4821 sections 2, 4 and 7.6.2 cover isolated loss with or without matching PTB. apply_ptb cancels probe classification; resolve_probe_response commits normal congestion response even when only the probe is lost and trailing packets are delivered, as asserted by the IPv6 two-PTB fixture. No-PTB evidence does not close this full span.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn ack(",
-        "crates/ntcp/src/pmtud_isolated_cc_tests.rs::fn isolated_probe_cc_real_receiver_recovery_matrix()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn ack(",
+        "crates/stacks/ntcp/src/pmtud_isolated_cc_tests.rs::fn isolated_probe_cc_real_receiver_recovery_matrix()"
       ]
     },
     {
@@ -1181,8 +1181,8 @@
       "status": "covered",
       "reason": "Real receiver ACKs resolve full trailing flight before isolated classification; upper bound becomes probe-1 and invalid eff falls to low; second hole preserves bounds. No congestion-suppression claim.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn ack(",
-        "crates/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_real_repairs_isolated_and_second_hole_beyond_three_mss()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn ack(",
+        "crates/stacks/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_real_repairs_isolated_and_second_hole_beyond_three_mss()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2"
     },
@@ -1202,8 +1202,8 @@
       "reason": "Partial no-PTB evidence from 76800de plus a4b9a0c: isolated suppression waits for finite cumulative proof and recovery exit; pmtu_cooldown uses the unsuppressed logical window, not transient PRR admission, with one RTT per packet plus a strict extra interval/tick and an RTO floor. Real receiver matrix checks no target before the deadline and a target at it; dedicated arithmetic test distinguishes logical14600 from admission1000. Mandatory failure cooldown is independent of configurable periodic aging. Partial gap: RFC4821 sections 2, 4 and 7.6.2 cover isolated loss with or without matching PTB. apply_ptb cancels probe classification; resolve_probe_response commits normal congestion response even when only the probe is lost and trailing packets are delivered, as asserted by the IPv6 two-PTB fixture. No-PTB evidence does not close this full span.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.2",
       "evidence": [
-        "crates/ntcp/src/connection.rs::    fn pmtu_cooldown(",
-        "crates/ntcp/src/pmtud_isolated_cc_tests.rs::fn isolated_probe_cc_real_receiver_recovery_matrix()"
+        "crates/stacks/ntcp/src/connection.rs::    fn pmtu_cooldown(",
+        "crates/stacks/ntcp/src/pmtud_isolated_cc_tests.rs::fn isolated_probe_cc_real_receiver_recovery_matrix()"
       ]
     },
     {
@@ -1214,8 +1214,8 @@
       "reason": "Reviewed 76800de: real receiver disqualifier matrix drops a probe repair and fires actual TCP RTO, asserting one-MSS cwnd, reduced threshold and committed response throughout cumulative repair. Non-SACK NewReno as well as SACK/RACK, PRR and Reno/CUBIC are exercised. Pmtud::timeout applies five times cooldown; exact deadline unit test and integrated timeout trace prove later inconclusive retry loss cannot erase it. This is TCP timeout repair, not a new generic go-back-n transport.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.6.3",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn timeout(",
-        "crates/ntcp/src/pmtud_isolated_cc_tests.rs::fn isolated_probe_cc_real_receiver_disqualifiers()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn timeout(",
+        "crates/stacks/ntcp/src/pmtud_isolated_cc_tests.rs::fn isolated_probe_cc_real_receiver_disqualifiers()"
       ]
     },
     {
@@ -1233,8 +1233,8 @@
       "status": "covered",
       "reason": "R1 uses third consecutive data RTO; earlier RTOs preserve PMTU, later ones halve to family floor while cwnd follows normal timeout response.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn timeout(",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_full_stop_r1_halving_and_normal_congestion_response()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn timeout(",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_full_stop_r1_halving_and_normal_congestion_response()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.7"
     },
@@ -1275,8 +1275,8 @@
       "status": "covered",
       "reason": "Selected verification heuristic tracks retry/original ratio >10% across two RTO intervals, preserves prior verified baseline and restores it after repeated increases. Not empirical multipath validation.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn ack(",
-        "crates/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_multi_increase_keeps_verification_baseline_and_loss_evidence()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn ack(",
+        "crates/stacks/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_multi_increase_keeps_verification_baseline_and_loss_evidence()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.8"
     },
@@ -1287,8 +1287,8 @@
       "status": "covered",
       "reason": "Selected verification heuristic tracks retry/original ratio >10% across two RTO intervals, preserves prior verified baseline and restores it after repeated increases. Not empirical multipath validation.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn ack(",
-        "crates/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_multi_increase_keeps_verification_baseline_and_loss_evidence()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn ack(",
+        "crates/stacks/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_multi_increase_keeps_verification_baseline_and_loss_evidence()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.8"
     },
@@ -1299,8 +1299,8 @@
       "status": "covered",
       "reason": "Selected verification heuristic tracks retry/original ratio >10% across two RTO intervals, preserves prior verified baseline and restores it after repeated increases. Not empirical multipath validation.",
       "evidence": [
-        "crates/ntcp/src/pmtud.rs::    pub fn ack(",
-        "crates/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_multi_increase_keeps_verification_baseline_and_loss_evidence()"
+        "crates/stacks/ntcp/src/pmtud.rs::    pub fn ack(",
+        "crates/stacks/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_multi_increase_keeps_verification_baseline_and_loss_evidence()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.8"
     },
@@ -1312,8 +1312,8 @@
       "reason": "TCP avoids fragmentation by respecting the current complete-IP non-probe budget; the floor/options repair test checks the emitted size. The UDP example does not require a host datagram fragmentation service.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-8",
       "evidence": [
-        "crates/ntcp/src/connection.rs::        let path_limit = pmtu_probe.map_or",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_floor_clips_timestamp_and_sack_options_on_retry_and_ack()"
+        "crates/stacks/ntcp/src/connection.rs::        let path_limit = pmtu_probe.map_or",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_floor_clips_timestamp_and_sack_options_on_retry_and_ack()"
       ]
     },
     {
@@ -1392,8 +1392,8 @@
       "status": "covered",
       "reason": "TCP probes use real queued stream bytes, respecting record boundary and allocation; no synthetic padding or control-only TCP size probe.",
       "evidence": [
-        "crates/ntcp/src/connection.rs::            let candidate = candidate.and_then(|size| {",
-        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_eor_and_allocation_free_probe_feedback_retry()"
+        "crates/stacks/ntcp/src/connection.rs::            let candidate = candidate.and_then(|size| {",
+        "crates/stacks/ntcp/src/pmtud_tests.rs::fn pmtud_eor_and_allocation_free_probe_feedback_retry()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-10.1"
     },
@@ -1404,8 +1404,8 @@
       "status": "covered",
       "reason": "Selected non-overlapping real-data probes; actual receiver-generated ACKs exercise multiple smaller gap repairs and prevent crossing the probe boundary.",
       "evidence": [
-        "crates/ntcp/src/connection.rs::        let pmtu_probe = pmtu_probe.filter",
-        "crates/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_real_repairs_isolated_and_second_hole_beyond_three_mss()"
+        "crates/stacks/ntcp/src/connection.rs::        let pmtu_probe = pmtu_probe.filter",
+        "crates/stacks/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_real_repairs_isolated_and_second_hole_beyond_three_mss()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-10.1"
     },
@@ -1502,8 +1502,8 @@
       "reason": "Non-overlapping segmentation is the selected simple TCP method; the real-receiver lifecycle test already demonstrates bounded multiple gap repairs (164). No additional receiver-evidence gap exists in this choice statement.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-10.1",
       "evidence": [
-        "crates/ntcp/src/connection.rs::        let pmtu_probe = pmtu_probe.filter",
-        "crates/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_real_repairs_isolated_and_second_hole_beyond_three_mss()"
+        "crates/stacks/ntcp/src/connection.rs::        let pmtu_probe = pmtu_probe.filter",
+        "crates/stacks/ntcp/src/pmtud_lifecycle_tests.rs::fn pmtud_lifecycle_real_repairs_isolated_and_second_hole_beyond_three_mss()"
       ]
     },
     {

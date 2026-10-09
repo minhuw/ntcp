@@ -19,7 +19,7 @@ MSL seconds.
 
 [[TODO]]
 target = "https://www.rfc-editor.org/rfc/rfc7323#section-5.7"
-reason = "Enabled core implements PMTUD/PLPMTUD and native IPv4 socket integration is tested. The concrete remaining embedding gap is crates/ntcp/examples/tun_echo.rs: NTCP_TIMESTAMPS=1 enables timestamps/PAWS, IPv4 encoding sets DF, ConnectionConfig retains default pmtud=None, and input_frame dispatches TCP only rather than ICMP PTB. This supplied example therefore lacks discovery in its PAWS/DF profile. Optional disabled configuration alone, unknown external embeddings, and absence of native IPv6 sockets are not evidence that the TCP implementation lacks PMTUD."
+reason = "Enabled core implements PMTUD/PLPMTUD and native IPv4 socket integration is tested. The concrete remaining embedding gap is crates/stacks/ntcp/examples/tun_echo.rs: NTCP_TIMESTAMPS=1 enables timestamps/PAWS, IPv4 encoding sets DF, ConnectionConfig retains default pmtud=None, and input_frame dispatches TCP only rather than ICMP PTB. This supplied example therefore lacks discovery in its PAWS/DF profile. Optional disabled configuration alone, unknown external embeddings, and absence of native IPv6 sockets are not evidence that the TCP implementation lacks PMTUD."
 quote = '''
 Setting the DF bit implies the use of Path MTU Discovery as described
 in [RFC1191], [RFC1981], and [RFC4821]; thus, any TCP implementation
