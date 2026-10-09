@@ -286,3 +286,128 @@ fn fixed_capacity_reuse_and_allocation_free_operations() {
     let allocations = ALLOCS.with(|count| count.replace(None).unwrap());
     assert_eq!(allocations, 0);
 }
+
+#[test]
+fn smaller_success_never_lowers_shared_mtu_or_clears_revalidation() {
+    let mut s = PathMtuService::<1>::new();
+    let policy = Policy {
+        aging: Some(10),
+        ..Policy::default()
+    };
+    let tcp = s.register(key(), 1500, policy, 0).unwrap();
+    let udp = s.register(key(), 1500, policy, 0).unwrap();
+    for now in [1, 10] {
+        s.age(tcp, now).unwrap();
+        let before = s.query(udp).unwrap();
+        assert_eq!(before.revalidation_needed, now == 10);
+        assert_eq!(
+            s.confirm_probe(before.context, 1200, now),
+            Err(Error::InvalidMtu)
+        );
+        assert_eq!(s.query(tcp).unwrap(), before);
+        assert_eq!(s.query(udp).unwrap(), before);
+    }
+    // Equal success can revalidate the current MTU, but cannot evade the cap.
+    let c = s.query(tcp).unwrap().context;
+    s.confirm_probe(c, 1500, 11).unwrap();
+    assert!(!s.query(udp).unwrap().revalidation_needed);
+    assert_eq!(s.age(udp, 20), Ok(None));
+    assert!(s.age(udp, 21).unwrap().is_some());
+}
+
+#[test]
+fn outstanding_drops_survive_cache_decrease_equal_probe_and_raise() {
+    for intervening in 0..3 {
+        for candidate in [1300, 1450, 1600] {
+            let mut s = PathMtuService::<1>::new();
+            let tcp = s.register(key(), 1500, Policy::default(), 0).unwrap();
+            let udp = s.register(key(), 1500, Policy::default(), 0).unwrap();
+            let departure = s.query(tcp).unwrap().context;
+            let first = HostValidatedDrop::new(departure, key(), 11, 1400);
+            let second = HostValidatedDrop::new(departure, key(), 22, candidate);
+            match intervening {
+                0 => {
+                    s.decrease(first, 1).unwrap();
+                }
+                1 => {
+                    s.confirm_probe(departure, 1500, 1).unwrap();
+                }
+                _ => {
+                    s.decrease(first, 1).unwrap();
+                    s.confirm_probe(s.query(udp).unwrap().context, 1500, 2)
+                        .unwrap();
+                }
+            }
+            let before = s.query(tcp).unwrap();
+            let outcome = s.decrease(second, 3).unwrap();
+            assert_eq!(
+                outcome.dropped,
+                PacketDrop {
+                    context: departure,
+                    packet_id: 22
+                }
+            );
+            assert_eq!(outcome.change.is_some(), candidate < before.mtu);
+            assert_eq!(s.query(tcp).unwrap().mtu, before.mtu.min(candidate));
+            assert_eq!(s.query(tcp), s.query(udp));
+            // Includes unchanged larger reports: negative evidence still makes
+            // an earlier upward probe obsolete, not other outstanding drops.
+            assert_eq!(
+                s.confirm_probe(before.context, 1500, 4),
+                Err(Error::StaleContext)
+            );
+            let again = s.decrease(first, 4).unwrap();
+            assert_eq!(again.dropped.context, departure);
+            assert_eq!(again.dropped.packet_id, 11);
+            assert_eq!(
+                s.query(tcp).unwrap().mtu,
+                before.mtu.min(candidate).min(1400)
+            );
+        }
+    }
+}
+
+#[test]
+fn explicit_configuration_epochs_and_route_reuse_reject_old_evidence() {
+    for replacement in 0..7 {
+        let mut s = PathMtuService::<1>::new();
+        let h = s.register(key(), 1500, Policy::default(), 0).unwrap();
+        let old = s.query(h).unwrap().context;
+        let policy = match replacement {
+            1 => Policy {
+                aging: Some(10),
+                ..Policy::default()
+            },
+            2 => Policy {
+                mtu: Some(1400),
+                ..Policy::default()
+            },
+            3 => Policy {
+                enabled: false,
+                ipv4_df: Ipv4Df::Clear,
+                ..Policy::default()
+            },
+            _ => Policy::default(),
+        };
+        if replacement < 4 {
+            s.set_policy(h, policy, 1).unwrap();
+        } else {
+            s.first_hop_changed(h, [1400, 1500, 1600][replacement - 4], 1)
+                .unwrap();
+        }
+        assert_eq!(
+            s.decrease(HostValidatedDrop::new(old, key(), 1, 1300), 2),
+            Err(Error::StaleContext)
+        );
+        assert_eq!(s.confirm_probe(old, 1500, 2), Err(Error::StaleContext));
+        let current = s.query(h).unwrap().context;
+        s.invalidate(h).unwrap();
+        let new = s.register(key(), 1500, Policy::default(), 2).unwrap();
+        assert_ne!(h, new);
+        assert_eq!(
+            s.decrease(HostValidatedDrop::new(current, key(), 2, 1300), 3),
+            Err(Error::StaleContext)
+        );
+        assert_eq!(s.confirm_probe(current, 1500, 3), Err(Error::StaleContext));
+    }
+}

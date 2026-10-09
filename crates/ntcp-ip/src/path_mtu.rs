@@ -90,6 +90,9 @@ pub struct PathHandle(u64);
 pub struct PathContext {
     handle: PathHandle,
     key: PathKey,
+    // Drops survive cache updates, but not explicit configuration replacement.
+    epoch: u64,
+    // Upward evidence must also postdate every accepted drop/probe.
     revision: u64,
 }
 
@@ -237,7 +240,8 @@ impl<const N: usize> PathMtuService<N> {
 
     fn context_index(&self, context: PathContext) -> Result<usize, Error> {
         let i = self.index(context.handle)?;
-        if self.entries[i].unwrap().snapshot.context != context {
+        let current = self.entries[i].unwrap().snapshot.context;
+        if current.key != context.key || current.epoch != context.epoch {
             return Err(Error::StaleContext);
         }
         Ok(i)
@@ -276,6 +280,7 @@ impl<const N: usize> PathMtuService<N> {
                 context: PathContext {
                     handle,
                     key,
+                    epoch: serial,
                     revision: serial,
                 },
                 local_mtu,
@@ -314,11 +319,11 @@ impl<const N: usize> PathMtuService<N> {
             return Err(Error::InvalidMtu);
         }
         self.time(now, None)?;
+        // Even an unchanged report is negative evidence against an older probe.
+        let serial = self.next_serial()?;
+        entry.snapshot.context.revision = serial;
         let change = if before.policy.enabled && evidence.candidate_mtu < before.mtu {
             entry.deadline = self.time(now, before.policy.aging)?;
-            let serial = self.next_serial()?;
-            entry.snapshot.context.revision = serial;
-            self.serial = serial;
             entry.snapshot.mtu = evidence.candidate_mtu;
             entry.snapshot.revalidation_needed = false;
             Some(Change {
@@ -330,16 +335,20 @@ impl<const N: usize> PathMtuService<N> {
             None
         };
         self.entries[i] = Some(entry);
+        self.serial = serial;
         self.now = now;
         Ok(DropOutcome {
             change,
             dropped: PacketDrop {
-                context: before.context,
+                context: evidence.context,
                 packet_id: evidence.packet_id,
             },
         })
     }
 
+    // Every explicit policy/first-hop configuration call starts a new evidence
+    // epoch, even with equal values or only aging/DF changes. Hosts must retain
+    // departure contexts, never relabel old evidence with a freshly queried one.
     pub fn set_policy(
         &mut self,
         handle: PathHandle,
@@ -383,6 +392,7 @@ impl<const N: usize> PathMtuService<N> {
         let serial = self.next_serial()?;
         let after = Snapshot {
             context: PathContext {
+                epoch: serial,
                 revision: serial,
                 ..before.context
             },
@@ -406,6 +416,8 @@ impl<const N: usize> PathMtuService<N> {
 
     // Host attests successful same-context probe, with timing/loss/ACK checks
     // performed by the packetization layer. Does not copy its search bounds.
+    // Success proves only a lower bound: smaller confirmations are rejected
+    // without changing the MTU, deadline or revalidation request.
     pub fn confirm_probe(
         &mut self,
         context: PathContext,
@@ -414,8 +426,11 @@ impl<const N: usize> PathMtuService<N> {
     ) -> Result<Change, Error> {
         let i = self.context_index(context)?;
         let before = self.entries[i].unwrap().snapshot;
+        if before.context != context {
+            return Err(Error::StaleContext);
+        }
         let cap = Self::cap(context.key, before.local_mtu, before.policy)?;
-        if !before.policy.enabled || mtu < context.key.floor()? || mtu > cap {
+        if !before.policy.enabled || mtu < before.mtu || mtu > cap {
             return Err(Error::InvalidMtu);
         }
         let deadline = self.time(now, before.policy.aging)?;
@@ -476,5 +491,68 @@ impl<const N: usize> PathMtuService<N> {
             after: None,
             reason: ChangeReason::Invalidated,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_mutations_preserve_clock_deadline_and_evidence_generations() {
+        let mut s = PathMtuService::<1>::new();
+        let key = PathKey::new(
+            IpAddr::from([192, 0, 2, 1]),
+            IpAddr::from([192, 0, 2, 2]),
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        let policy = Policy {
+            aging: Some(10),
+            ..Policy::default()
+        };
+        let h = s.register(key, 1500, policy, 10).unwrap();
+        let context = s.query(h).unwrap().context;
+        for (now, serial, error) in [
+            (9, s.serial, Error::ClockWentBackwards),
+            (u64::MAX, s.serial, Error::TimeOverflow),
+            (11, u64::MAX, Error::GenerationExhausted),
+        ] {
+            s.serial = serial;
+            let before = (
+                s.query(h).unwrap(),
+                s.entries[0].unwrap().deadline,
+                s.now,
+                s.serial,
+            );
+            let evidence = HostValidatedDrop::new(context, key, 1, 1400);
+            assert_eq!(s.decrease(evidence, now), Err(error));
+            assert_eq!(s.confirm_probe(context, 1500, now), Err(error));
+            assert_eq!(s.set_policy(h, policy, now), Err(error));
+            assert_eq!(s.first_hop_changed(h, 1400, now), Err(error));
+            assert_eq!(
+                (
+                    s.query(h).unwrap(),
+                    s.entries[0].unwrap().deadline,
+                    s.now,
+                    s.serial
+                ),
+                before
+            );
+        }
+        // Unchanged drops also require fresh probe revisions; exhaustion is atomic.
+        assert_eq!(
+            s.decrease(HostValidatedDrop::new(context, key, 2, 1600), 11),
+            Err(Error::GenerationExhausted)
+        );
+        s.invalidate(h).unwrap();
+        assert_eq!(
+            s.register(key, 1500, policy, 11),
+            Err(Error::GenerationExhausted)
+        );
+        assert_eq!(s.iter().count(), 0);
+        assert_eq!(s.now, 10);
     }
 }
