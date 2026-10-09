@@ -344,7 +344,10 @@ fn pmtud_lifecycle_detected_trailing_loss_survives_delivery_without_retry() {
         p.sent(Seq(1200 + n * 1000), Seq(2200 + n * 1000), 1040, 20, false);
     }
     p.sent(Seq(0), Seq(984), 1024, 20, true);
-    let before = p.info;
+    let mut before = p.info;
+    // Unretried trailing delivery is an implicit probe, independent of the
+    // inconclusive explicit probe: only its proven lower bound may change.
+    before.search_low = 1040;
     // Detection precedes retransmission. Even if the second hole's original
     // arrives before its repair is emitted, retain the loss classification.
     p.loss(Seq(5200), false);

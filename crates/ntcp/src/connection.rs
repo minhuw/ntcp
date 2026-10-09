@@ -2435,9 +2435,14 @@ impl Connection {
         if effective == self.mss {
             return;
         }
+        let decreased = effective < self.mss;
         self.output_push_batch = None;
         self.mss = effective;
-        self.congestion.set_mss(effective as u32);
+        if self.pmtud.is_some() {
+            self.congestion.set_path_mss(effective as u32);
+        } else {
+            self.congestion.set_mss(effective as u32);
+        }
         if let Some(prr) = &mut self.prr {
             prr.set_mss(effective as u32);
         }
@@ -2445,7 +2450,9 @@ impl Connection {
             recovery.pipe = self.recovery_pipe(recovery.high_rxt);
             self.sack_recovery = Some(recovery);
         }
-        if self.flight() != 0 {
+        // An increase is not evidence of loss. Leave existing retry work alone;
+        // only a decrease may require repacketizing outstanding bytes.
+        if decreased && self.flight() != 0 {
             if self.handshake_pending() {
                 self.syn_pending = true;
             } else if self.synchronized() && self.snd_wnd != 0 && self.sack_recovery.is_none() {
@@ -27505,6 +27512,9 @@ mod tests {
     }
     mod pmtud_lifecycle {
         include!("pmtud_lifecycle_tests.rs");
+    }
+    mod pmtud_growth {
+        include!("pmtud_growth_tests.rs");
     }
     #[test]
     fn logical_send_finish_marks_only_selected_byte_and_releases_cork() {

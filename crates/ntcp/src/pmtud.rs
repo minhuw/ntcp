@@ -679,6 +679,16 @@ impl Pmtud {
             {
                 if !packet.ambiguous {
                     self.max_acked = self.max_acked.max(packet.size);
+                    // Ordinary delivery validates only the current non-probe
+                    // range. Old larger flight must not undo a PTB/link bound,
+                    // and explicit probes retain their own timeout/verification rules.
+                    if packet.size <= self.info.current_mtu.min(self.info.search_high).min(self.bound)
+                        && self.probe.is_none_or(|p| {
+                            !overlaps(packet.start, packet.end, p.start, p.end)
+                        })
+                    {
+                        self.info.search_low = self.info.search_low.max(packet.size);
+                    }
                 }
                 *entry = None;
             }
@@ -692,7 +702,7 @@ impl Pmtud {
                 //# Set search_low to the probe
                 //# size.  If the probe size is larger than the eff_pmtu, raise eff_pmtu
                 //# to the probe size.
-                self.info.search_low = p.size;
+                self.info.search_low = self.info.search_low.max(p.size);
                 if p.size > self.info.current_mtu {
                     // Active search can make several increases before verification
                     // finishes. Keep the last verified baseline and all evidence,

@@ -480,6 +480,18 @@ impl Congestion {
     //# congestion state variable SHOULD be rescaled so as not to raise the window size in
     //# packets.
 
+    pub(crate) fn set_path_mss(&mut self, mss: u32) {
+        let increasing = mss > self.mss;
+        let (cwnd, ssthresh) = (self.cwnd, self.ssthresh);
+        self.set_mss(mss);
+        // RFC4821: raising the path MTU alone cannot raise byte windows.
+        // Keep negotiation/decrease rules in set_mss unchanged.
+        if increasing {
+            self.cwnd = cwnd;
+            self.ssthresh = ssthresh;
+        }
+    }
+
     pub(crate) fn set_mss(&mut self, mss: u32) {
         assert!(mss > 0);
         let mss = mss.min(MAX_WINDOW);
