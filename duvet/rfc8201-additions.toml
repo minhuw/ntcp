@@ -14,18 +14,25 @@ quote = '''
 Nodes not implementing Path MTU Discovery must use the IPv6 minimum link MTU defined in [RFC8200] as the maximum packet size. In most cases, this will result in the use of smaller packets than necessary, because most paths have a PMTU greater than the IPv6 minimum link MTU. A node sending packets much smaller than the Path MTU allows is wasting network resources and probably getting suboptimal throughput.
 '''
 
-# 8201-025
+# 8201-025a
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-3"
 quote = '''
-This memo describes a technique to dynamically discover the PMTU of a path. The basic idea is that a source node initially assumes that the PMTU of a path is the (known) MTU of the first hop in the path. If any of the packets sent on that path are too large to be forwarded by some node along the path, that node will discard them and return ICMPv6 Packet Too Big messages. Upon receipt of such a message, the source node reduces its assumed PMTU for the path based on the MTU of the constricting hop as reported in the Packet Too Big message. The decreased PMTU causes the source to send smaller packets or change EMTU_S to cause the upper layer to reduce the size of IP packets it sends.
+The basic idea is that a source node initially assumes that the PMTU of a path is the (known) MTU of the first hop in the path.
 '''
 
-# 8201-026
+# 8201-025b
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-3"
 quote = '''
-The Path MTU Discovery process ends when the source node's estimate of the PMTU is less than or equal to the actual PMTU. Note that several iterations of the packet-sent/Packet-Too-Big-message-received cycle may occur before the Path MTU Discovery process ends, as there may be links with smaller MTUs further along the path.
+If any of the packets sent on that path are too large to be forwarded by some node along the path, that node will discard them and return ICMPv6 Packet Too Big messages.
+'''
+
+# 8201-025c
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+quote = '''
+Upon receipt of such a message, the source node reduces its assumed PMTU for the path based on the MTU of the constricting hop as reported in the Packet Too Big message. The decreased PMTU causes the source to send smaller packets or change EMTU_S to cause the upper layer to reduce the size of IP packets it sends.
 '''
 
 # 8201-027
@@ -35,11 +42,18 @@ quote = '''
 Alternatively, the node may elect to end the discovery process by ceasing to send packets larger than the IPv6 minimum link MTU.
 '''
 
-# 8201-028
+# 8201-028a
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-3"
 quote = '''
-The PMTU of a path may change over time, due to changes in the routing topology. Reductions of the PMTU are detected by Packet Too Big messages. To detect increases in a path's PMTU, a node periodically increases its assumed PMTU. This will almost always result in packets being discarded and Packet Too Big messages being
+Reductions of the PMTU are detected by Packet Too Big messages.
+'''
+
+# 8201-028b
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+quote = '''
+To detect increases in a path's PMTU, a node periodically increases its assumed PMTU. This will almost always result in packets being discarded and Packet Too Big messages being
 '''
 
 # 8201-029
@@ -273,13 +287,6 @@ quote = '''
 The value sent in the TCP MSS option is independent of the PMTU; it is determined by the receiver reassembly limit EMTU_R. This MSS option value is used by the other end of the connection, which may be using an unrelated PMTU value. See Section 5, "Packet Size Issues", and Section 8.3, "Maximum Upper-Layer Payload Size", of [RFC8200] for information on selecting a value for the TCP MSS option.
 '''
 
-# 8201-073
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
-quote = '''
-Reception of a Packet Too Big message implies that a packet was dropped by the node that sent the ICMPv6 message. A reliable upper- layer protocol will detect this loss by its own means, and recover it by its normal retransmission methods. The retransmission could result in delay, depending on the loss detection method used by the upper-layer protocol. If the Path MTU Discovery process requires several steps to find the PMTU of the full path, this could finally delay the retransmission by many round-trip times.
-'''
-
 # 8201-074
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
@@ -308,11 +315,18 @@ quote = '''
 Some transport protocols are not allowed to repacketize when doing a retransmission. That is, once an attempt is made to transmit a segment of a certain size, the transport cannot split the contents of the segment into smaller segments for retransmission. In such a case, the original segment can be fragmented by the IP layer during retransmission. Subsequent segments, when transmitted for the first time, should be no larger than allowed by the Path MTU.
 '''
 
-# 8201-078
+# 8201-078a
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.5"
 quote = '''
-Path MTU Discovery for IPv4 [RFC1191] used NFS as an example of a UDP-based application that benefits from PMTU Discovery. Since then, [RFC7530] states that the supported transport layer between NFS and IP must be an IETF standardized transport protocol that is specified to avoid network congestion; such transports include TCP, Stream Control Transmission Protocol (SCTP) [RFC4960], and the Datagram Congestion Control Protocol (DCCP) [RFC4340]. In this case, the transport is responsible for ensuring that transmitted segments (except probes) conform to the Path MTU, including supporting PMTU Discovery probe transmissions as needed.
+Since then, [RFC7530] states that the supported transport layer between NFS and IP must be an IETF standardized transport protocol that is specified to avoid network congestion; such transports include TCP, Stream Control Transmission Protocol (SCTP) [RFC4960], and the Datagram Congestion Control Protocol (DCCP) [RFC4340].
+'''
+
+# 8201-078b
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc8201#section-5.5"
+quote = '''
+In this case, the transport is responsible for ensuring that transmitted segments (except probes) conform to the Path MTU, including supporting PMTU Discovery probe transmissions as needed.
 '''
 
 # 8201-079

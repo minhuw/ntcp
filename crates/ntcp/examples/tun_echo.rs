@@ -1678,6 +1678,17 @@ mod linux {
         //= type=test
         //= reason=IPv4 example sets DF for all packets; ECN/DSCP matrix explicitly asserts DF and no fragment offset, including both ECT codepoints.
         //# ECN-capable packets MAY have the DF (Don't Fragment) bit set.
+        //= https://www.rfc-editor.org/rfc/rfc1191#section-2
+        //= type=test
+        //= reason=The IPv4 codec always sets DF; its ECN/DSCP matrix asserts 0x4000 with no fragment offset. Keeping DF is the selected TCP behavior, not optional clear-DF termination.
+        //# and sends all datagrams on that path with the DF bit set.
+
+        //= https://www.rfc-editor.org/rfc/rfc1191#section-2
+        //= type=test
+        //= reason=Enabled IPv4 PMTUD retains DF in the codec and reacts to validated lower-MTU feedback; zero-MTU and family-floor tests exercise decrease and bounded repair. This is not a claim about arbitrary external embeddings.
+        //# Normally, the host continues to set DF in all datagrams, so that if the
+        //# route changes and the new PMTU is lower, it will be discovered.
+
         fn ipv4_dscp_and_ecn_are_independent() {
             let (mut bytes, _, local) = packet();
             let ip = IpMetadata {

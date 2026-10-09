@@ -160,6 +160,15 @@ pub fn encode(bytes: &mut [u8], transmit: Transmit, timestamp: u32) -> Result<us
         IpAddr::V6(_) => encode_ipv6(bytes, transmit),
     }
 }
+//= https://www.rfc-editor.org/rfc/rfc1191#section-2
+//= reason=The IPv4 codec always sets DF; its ECN/DSCP matrix asserts 0x4000 with no fragment offset. Keeping DF is the selected TCP behavior, not optional clear-DF termination.
+//# and sends all datagrams on that path with the DF bit set.
+
+//= https://www.rfc-editor.org/rfc/rfc1191#section-2
+//= reason=Enabled IPv4 PMTUD retains DF in the codec and reacts to validated lower-MTU feedback; zero-MTU and family-floor tests exercise decrease and bounded repair. This is not a claim about arbitrary external embeddings.
+//# Normally, the host continues to set DF in all datagrams, so that if the route
+//# changes and the new PMTU is lower, it will be discovered.
+
 fn encode_ipv4(
     packet: &mut [u8],
     transmit: ntcp::Transmit,

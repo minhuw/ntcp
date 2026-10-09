@@ -795,6 +795,12 @@ fn mtu(owner: &mut Owner, socket: u64) -> i32 {
 //# The source address of ICMP error messages does not need to be spoofed to perform the
 //# attacks described in this document, as the ICMP error messages might legitimately come
 //# from an intermediate system.
+//= https://www.rfc-editor.org/rfc/rfc1191#section-2
+//= type=test
+//= reason=Enabled PMTUD initializes from the supplied first-hop MTU, capped by independent peer/allocation ceilings; native startup/jumbo tests establish those bounds. This does not assert a router implementation.
+//# The basic idea is that a source host initially assumes that the PMTU of a path is
+//# the (known) MTU of its first hop,
+
 fn pmtud_jumbo_allocation_capacity_and_validated_ingress() {
     for capacity in [None, Some(3514)] {
         let (mut a, mut b, client, server, state) = pmtud_pair(capacity);
@@ -849,6 +855,14 @@ fn pmtud_jumbo_allocation_capacity_and_validated_ingress() {
 }
 
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc1191#section-3
+//= type=test
+//= reason=IPv4 zero Next-Hop MTU selects the next lower plateau using exact sent length and legacy header correction. Connection, direct-state and native socket tests cover zero-MTU processing; the following section5 cross-reference is context, not a missing feature.
+//# Hosts MUST be able to deal with Datagram Too Big messages that do not include the
+//# next-hop MTU, since it is not feasible to upgrade all the routers in the Internet in
+//# any finite time. A Datagram Too Big message from an unmodified router can be
+//# recognized by the presence of a zero in the (newly-defined) Next-Hop MTU field.
+
 fn pmtud_zero_mtu_and_ipv4_floor_are_dispatched_without_clamping() {
     for candidate in [0, 68] {
         let (mut a, _, client, _, state) = pmtud_pair(None);

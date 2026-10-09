@@ -2048,6 +2048,39 @@ impl Connection {
     //# "Packet Size Issues", and Section 8.3, "Maximum Upper-Layer Payload Size", of
     //# [RFC8200] for information on selecting a value for the TCP MSS option.
 
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-6.4
+    //= reason=Connection caches PMTU-derived MSS and bounds packetization by it; family-floor wire tests assert repaired packets within the updated PMTU. GET_MAXSIZES polling is an example, not a required API. Probe behavior is the selected RFC4821 extension.
+    //# The TCP layer must track the PMTU for the destination of a connection; it should
+    //# not send datagrams that would be larger than this. A simple implementation could
+    //# ask the IP layer for this value (using the GET_MAXSIZES interface described in
+    //# [1]) each time it created a new segment, but this could be inefficient.
+    //# Moreover, TCP implementations that follow the "slow-start" congestion-avoidance
+    //# algorithm [4] typically calculate and cache several other values derived from
+    //# the PMTU. It may be simpler to receive asynchronous notification when the PMTU
+    //# changes, so that these variables may be updated.
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.1
+    //= reason=Enabled TCP limits complete IPv6 packets to the path budget rather than invoking source fragmentation; the family-floor test parses base-header packets and checks resized retry length with timestamp options. Extension headers and shared caches are not prerequisites of this avoidance recommendation.
+    //# However, packetization layers are encouraged to avoid sending messages that will
+    //# require source fragmentation (for the case against fragmentation, see [FRAG]).
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
+    //= reason=Connection uses the PMTU-derived budget for ordinary data/retries and a distinct bounded real-data probe size. Dual-family wire tests check the exact larger probe and unchanged effective PMTU before ACK; base-header IPv6 packets are unfragmented. IP-service polling is an optional implementation example.
+    //# A packetization layer (e.g., TCP) must use the PMTU for the path(s) in use by a
+    //# connection; it should not send segments that would result in packets larger than
+    //# the PMTU, except to probe during PMTU Discovery (this probe packet must not be
+    //# fragmented to the PMTU). A simple implementation could ask the IP layer for this
+    //# value each time it created a new segment, but this could be inefficient. An
+    //# implementation typically caches other values derived from the PMTU. It may be
+    //# simpler to receive asynchronous notification when the PMTU changes, so that
+    //# these variables may be also updated.
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.5
+    //= reason=TCP packetizes ordinary data to the path budget and provides real-data discovery probes. The dual-family test checks complete probe length and ACK-confirmed increase; this is the transport duty, not an NFS conformance claim.
+    //# In this case, the transport is responsible for ensuring that transmitted
+    //# segments (except probes) conform to the Path MTU, including supporting PMTU
+    //# Discovery probe transmissions as needed.
+
     fn refresh_path_mss(&mut self) {
         let Some(link) = self.pmtud.as_ref().map(|p| p.info.first_hop_mtu) else {
             return;
@@ -2311,6 +2344,35 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc5927#section-7.4
     //= reason=Selected live-sequence check uses serial arithmetic for SND.UNA<=seq<SND.NXT; the same stale/idle/wrapped quote test supports 044. Unrelated initialization and reset deviations do not invalidate this branch.
     //# if (claimedtcpseq < SND.UNA || claimedtcpseq >= SND.NXT) drop_message();
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-6.4
+    //= reason=Accepted feedback refreshes only the matched Connection; the family-floor test verifies retry sequence/payload and complete packet size within the new PMTU. Cross-connection dispatch is additionally exercised by native tuple validation; this does not close exact dropped-range notification or burst deduplication.
+    //# Alternatively, the retransmission could be done in immediate response to a
+    //# notification that the Path MTU has changed, but only for the specific connection
+    //# specified by the Datagram Too Big message. The datagram size used in the
+    //# retransmission should, of course, be no larger than the new PMTU.
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-3
+    //= reason=Enabled IPv6 core consumes validated PTB, reduces the estimate and emits a smaller unfragmented retry. The dual-family floor test checks complete packet length and retry payload; no native IPv6 socket claim.
+    //# Upon receipt of such a message, the source node reduces its assumed PMTU for the
+    //# path based on the MTU of the constricting hop as reported in the Packet Too Big
+    //# message. The decreased PMTU causes the source to send smaller packets or change
+    //# EMTU_S to cause the upper layer to reduce the size of IP packets it sends.
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-4
+    //= reason=Validated initial IPv6 PTB reduces packet size; the dual-family floor test asserts a complete retry no larger than 1280. Smaller successive legal reports pass the same strictly decreasing path; no source fragmentation is used.
+    //# After receiving a Packet Too Big message, a node must attempt to avoid eliciting
+    //# more such messages in the near future. The node must reduce the size of the
+    //# packets it is sending along the path. Using a PMTU estimate larger than the IPv6
+    //# minimum link MTU may continue to elicit Packet Too Big messages. Because each of
+    //# these messages (and
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.4
+    //= reason=Validated feedback updates the matched Connection and emits a retry no larger than the new IPv6 PMTU; the dual-family floor test checks sequence, payload and full packet length. Exact dropped-range notification is distinct and remains open in 8201-064/066.
+    //# Alternatively, the retransmission could be done in immediate response to a
+    //# notification that the Path MTU was decreased, but only for the specific
+    //# connection specified by the Packet Too Big message. The packet size used in the
+    //# retransmission should be no larger than the new PMTU.
 
     pub(crate) fn pmtu_feedback(
         &mut self,

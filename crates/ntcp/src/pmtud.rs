@@ -81,6 +81,28 @@ impl Pmtud {
     //# conservatively low, but performance may be better if eff_pmtu starts at a higher,
     //# less conservative, value. See Section 7.2.
 
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-2
+    //= reason=Enabled PMTUD initializes from the supplied first-hop MTU, capped by independent peer/allocation ceilings; native startup/jumbo tests establish those bounds. This does not assert a router implementation.
+    //# The basic idea is that a source host initially assumes that the PMTU of a path
+    //# is the (known) MTU of its first hop,
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-1
+    //= reason=Enabled IPv6 core implements PTB decrease, full packet budgets and ACK-confirmed upward discovery; the dual-family test performs a real probe after PTB holdoff. Optional minimal implementations are not required to omit discovery. No native IPv6 socket claim.
+    //# IPv6 nodes should implement Path MTU Discovery in order to discover and take
+    //# advantage of paths with PMTU greater than the IPv6 minimum link MTU [RFC8200]. A
+    //# minimal IPv6 implementation (e.g., in a boot ROM) may choose to omit
+    //# implementation of Path MTU Discovery.
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-3
+    //= reason=Enabled IPv6 state starts at the caller first-hop bound (subject to peer/allocation caps); family-floor test asserts the initial 1500-byte estimate before rejecting subminimum feedback.
+    //# The basic idea is that a source node initially assumes that the PMTU of a path
+    //# is the (known) MTU of the first hop in the path.
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.2
+    //= reason=Enabled IPv6 PMTU starts at the supplied first-hop bound, with separate allocation/peer ceilings. The dual-family floor test asserts 1500 initially; the small-allocation test covers independent limiting.
+    //# Initially, the PMTU value for a path is assumed to be the (known) MTU of the
+    //# first-hop link.
+
     pub fn new(config: PmtudConfig, bound: u32, ipv4: bool, hold: u64) -> Self {
         let low = bound.min(if ipv4 { 1024 } else { 1280 });
         Self {
@@ -137,6 +159,14 @@ impl Pmtud {
     //# can resume. Thus, if the path changes, increasing the Path MTU, then the flow will
     //# eventually take advantage of it. The value for this timer MUST NOT be less than 5
     //# minutes and is recommended to be 10 minutes, per RFC 1981.
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-5.3
+    //= reason=Enabled IPv6 core holds PTB/converged search for 600 seconds, reopens the upper search bound on expiry, and emits an ACK-confirmed larger probe. The dual-family real-probe test exercises periodic retry; configurable aging is the separate 8201-069 TODO.
+    //# If the stale PMTU value is too large, this will be discovered almost immediately
+    //# once a large enough packet is sent on the path. No such mechanism exists for
+    //# realizing that a stale PMTU value is too small, so an implementation should
+    //# "age" cached values. When a PMTU value has not been decreased for a while (on
+    //# the order of 10 minutes), it should probe to find if a larger PMTU is supported.
 
     pub fn tick(&mut self, now: Instant) {
         if self.deadline.is_some_and(|d| d <= now) {
@@ -372,6 +402,80 @@ impl Pmtud {
     //= https://www.rfc-editor.org/rfc/rfc5927#section-7.4
     //= reason=Selected gate rejects candidate>=current_mtu or >=max_sent, and additionally requires a smaller value than the exact quoted sent size. The security wire test rejects equal and larger reports; stricter rejection is not a missing historical branch.
     //# else { if (claimedmtu > maxsizesent || claimedmtu >= current_mtu) drop_message();
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-2
+    //= reason=Enabled core applies validated initial PTB decreases and repacketizes to the new budget; feedback below previously proven delivery is deliberately deferred until the quoted head times out. Immediate and deferred cases are separate from upward probing.
+    //# Upon receipt of such a message (henceforth called a "Datagram Too Big" message),
+    //# the source host reduces its assumed PMTU for the path.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-2
+    //= reason=Enabled IPv4 PMTUD retains DF in the codec and reacts to validated lower-MTU feedback; zero-MTU and family-floor tests exercise decrease and bounded repair. This is not a claim about arbitrary external embeddings.
+    //# Normally, the host continues to set DF in all datagrams, so that if the route
+    //# changes and the new PMTU is lower, it will be discovered.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-2
+    //= reason=Enabled core applies validated initial PTB decreases and repacketizes to the new budget; feedback below previously proven delivery is deliberately deferred until the quoted head times out. Immediate and deferred cases are separate from upward probing.
+    //# Reductions of the PMTU are detected by Datagram Too Big messages, except on
+    //# paths for which the host has stopped setting the DF bit.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-3
+    //= reason=Enabled core applies validated initial PTB decreases and repacketizes to the new budget; feedback below previously proven delivery is deliberately deferred until the quoted head times out. Immediate and deferred cases are separate from upward probing.
+    //# Hosts using PMTU Discovery MUST detect decreases in Path MTU as fast as
+    //# possible.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-3
+    //= reason=Accepted PTB inhibits upward probing for 600 seconds, including after ACK progress and local link growth. The core test checks the deadline and subsequent real probe for both IP families.
+    //# An attempt to detect an increase (by sending a datagram larger than the current
+    //# estimate) MUST NOT be done less than 5 minutes after a Datagram Too Big message
+    //# has been received for the given destination,
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-3
+    //= reason=IPv4 zero Next-Hop MTU selects the next lower plateau using exact sent length and legacy header correction. Connection, direct-state and native socket tests cover zero-MTU processing; the following section5 cross-reference is context, not a missing feature.
+    //# Hosts MUST be able to deal with Datagram Too Big messages that do not include
+    //# the next-hop MTU, since it is not feasible to upgrade all the routers in the
+    //# Internet in any finite time. A Datagram Too Big message from an unmodified
+    //# router can be recognized by the presence of a zero in the (newly-defined)
+    //# Next-Hop MTU field.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-8
+    //= reason=The IPv4 estimate retains the legal 68-byte floor; the core wire test demonstrates bounded payload repair at that floor. This repeats the floor invariant, not a guarantee against an on-path ICMP blocker.
+    //# In the first attack, the false message indicates a PMTU much smaller than
+    //# reality. This should not entirely stop data flow, since the victim host should
+    //# never set its PMTU estimate below the absolute minimum, but at 8 octets of IP
+    //# data per datagram, progress could be slow.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-8
+    //= reason=IPv4 feedback rejects equal/larger and impossible candidates; exact-quote tests show these do not raise the estimate. The hypothetical attack narrative is not a separate router round-trip or on-path-blocker obligation.
+    //# In the other attack, the false message indicates a PMTU greater than reality. If
+    //# believed, this could cause temporary blockage as the victim sends datagrams that
+    //# will be dropped by some router. Within one round-trip time, the host would
+    //# discover its mistake (receiving Datagram Too Big messages from that router), but
+    //# frequent repetition of this attack could cause lots of datagrams to be dropped.
+    //# A host, however, should never raise its estimate of the PMTU based on a Datagram
+    //# Too Big message, so should not be vulnerable to this attack.
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-3
+    //= reason=Enabled IPv6 core reduces its estimate from validated PTB; the dual-family floor test checks the new estimate and bounded retry.
+    //# Reductions of the PMTU are detected by Packet Too Big messages.
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-4
+    //= reason=Enabled IPv6 core applies a validated initial PTB decrease; the floor test checks 1500 to 1280 and repacketized retry. Later reports below proven delivery follow the selected deferred security policy, not unconditional trust of every ICMP packet.
+    //# When a node receives a Packet Too Big message, it must reduce its estimate of
+    //# the PMTU for the relevant path, based on the value of the MTU field in the
+    //# message. The precise behavior of a node in this circumstance is not specified,
+    //# since different applications may have different requirements, and since
+    //# different implementation architectures may favor different strategies.
+
+    //= https://www.rfc-editor.org/rfc/rfc8201#section-6
+    //= reason=Same enabled-core floor invariant as 8201-034: sub1280 feedback is discarded and a legal 1280 report is accepted. The dual-family wire test asserts both outcomes; no native IPv6 socket or complete threat-model claim.
+    //# In the first attack, the false message indicates a PMTU much smaller than
+    //# reality. In response, the victim node should never set its PMTU estimate below
+    //# the IPv6 minimum link MTU. A sender that falsely reduces to this MTU would
+    //# observe suboptimal performance.
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-3
+    //= reason=Exact PTB half of the two-timer recommendation in parent 1191-013: accepted PTB holds upward probing for the recommended 600 seconds. The separate 2-minute post-success half is unselected, not covered by this evidence.
+    //# 10 minutes
 
     pub fn feedback(
         &mut self,
@@ -748,6 +852,15 @@ mod tests {
     //= type=test
     //= reason=Selected max-sent update is implemented exactly as max_sent.max(size) in sent(). Exact-evidence tests send real sizes and exercise acceptance/rejection against their recorded upper bound; initialization/reset choices are separate clauses.
     //# if (packet_size > maxsizesent) maxsizesent = packet_size;
+
+    //= https://www.rfc-editor.org/rfc/rfc1191#section-3
+    //= type=test
+    //= reason=IPv4 zero Next-Hop MTU selects the next lower plateau using exact sent length and legacy header correction. Connection, direct-state and native socket tests cover zero-MTU processing; the following section5 cross-reference is context, not a missing feature.
+    //# Hosts MUST be able to deal with Datagram Too Big messages that do not include
+    //# the next-hop MTU, since it is not feasible to upgrade all the routers in the
+    //# Internet in any finite time. A Datagram Too Big message from an unmodified
+    //# router can be recognized by the presence of a zero in the (newly-defined)
+    //# Next-Hop MTU field.
 
     fn pmtud_exact_evidence_eviction_legacy_header_correction_and_floor() {
         for (reported, expected) in [(1500, 1006), (1520, 1492)] {

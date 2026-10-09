@@ -1,7 +1,7 @@
 {
   "rfc": 8201,
   "document_status": "Standards Track",
-  "scope": "IPv6 endpoint PMTUD; obsoletes RFC1981",
+  "scope": "IPv6 enabled unicast TCP core/base-header codec PMTUD; disabled-profile and extension-header gaps separately identified; obsoletes RFC1981",
   "text_sha256": "96c2ea7ac1bf5810f6b817d4ac372a35f68231d2bd0e2675740f1268eb9ac752",
   "paragraphs": [
     {
@@ -22,16 +22,20 @@
       "id": "8201-003",
       "section": "1",
       "quote": "IPv6 nodes should implement Path MTU Discovery in order to discover and take advantage of paths with PMTU greater than the IPv6 minimum link MTU [RFC8200]. A minimal IPv6 implementation (e.g., in a boot ROM) may choose to omit implementation of Path MTU Discovery.",
-      "status": "TODO",
-      "reason": "IPv6 core PMTUD is opt-in; PMTUD-disabled configuration does not itself force an IPv6 1280-byte send limit. Socket native runtime is IPv4-only; no IPv6 socket integration is claimed.",
-      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-1"
+      "status": "covered",
+      "reason": "Enabled IPv6 core implements PTB decrease, full packet budgets and ACK-confirmed upward discovery; the dual-family test performs a real probe after PTB holdoff. Optional minimal implementations are not required to omit discovery. No native IPv6 socket claim.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-1",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn new(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+      ]
     },
     {
       "id": "8201-004",
       "section": "1",
       "quote": "Nodes not implementing Path MTU Discovery must use the IPv6 minimum link MTU defined in [RFC8200] as the maximum packet size. In most cases, this will result in the use of smaller packets than necessary, because most paths have a PMTU greater than the IPv6 minimum link MTU. A node sending packets much smaller than the Path MTU allows is wasting network resources and probably getting suboptimal throughput.",
       "status": "TODO",
-      "reason": "IPv6 core PMTUD is opt-in; PMTUD-disabled configuration does not itself force an IPv6 1280-byte send limit. Socket native runtime is IPv4-only; no IPv6 socket integration is claimed.",
+      "reason": "The PMTUD-disabled core configuration does not itself cap IPv6 sends to the 1280-byte minimum. This disabled-profile obligation is separate from enabled-core discovery evidence; absence of native IPv6 sockets is not the reason.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-1"
     },
     {
@@ -178,17 +182,50 @@
       "id": "8201-025",
       "section": "3",
       "quote": "This memo describes a technique to dynamically discover the PMTU of a path. The basic idea is that a source node initially assumes that the PMTU of a path is the (known) MTU of the first hop in the path. If any of the packets sent on that path are too large to be forwarded by some node along the path, that node will discard them and return ICMPv6 Packet Too Big messages. Upon receipt of such a message, the source node reduces its assumed PMTU for the path based on the MTU of the constricting hop as reported in the Packet Too Big message. The decreased PMTU causes the source to send smaller packets or change EMTU_S to cause the upper layer to reduce the size of IP packets it sends.",
-      "status": "TODO",
-      "reason": "IPv6 Connection and codec implement discovery without same-link bypass; native socket runtime accepts only IPv4. Full IPv6 ingress/departure integration and all overview behavior are not established by core-only tests.",
+      "status": "context",
+      "reason": "Original mixed paragraph preserved verbatim; exact operative subspans below distinguish host behavior, other actors and selected-algorithm scope. Unselected or explanatory text is not a missing implementation."
+    },
+    {
+      "id": "8201-025a",
+      "section": "3",
+      "quote": "The basic idea is that a source node initially assumes that the PMTU of a path is the (known) MTU of the first hop in the path.",
+      "parent": "8201-025",
+      "status": "covered",
+      "reason": "Enabled IPv6 state starts at the caller first-hop bound (subject to peer/allocation caps); family-floor test asserts the initial 1500-byte estimate before rejecting subminimum feedback.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn new(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+      ]
+    },
+    {
+      "id": "8201-025b",
+      "section": "3",
+      "quote": "If any of the packets sent on that path are too large to be forwarded by some node along the path, that node will discard them and return ICMPv6 Packet Too Big messages.",
+      "parent": "8201-025",
+      "status": "exception",
+      "reason": "Forwarding-node discard/ICMPv6 generation actor; this unicast TCP endpoint does not act as a router.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+    },
+    {
+      "id": "8201-025c",
+      "section": "3",
+      "quote": "Upon receipt of such a message, the source node reduces its assumed PMTU for the path based on the MTU of the constricting hop as reported in the Packet Too Big message. The decreased PMTU causes the source to send smaller packets or change EMTU_S to cause the upper layer to reduce the size of IP packets it sends.",
+      "parent": "8201-025",
+      "status": "covered",
+      "reason": "Enabled IPv6 core consumes validated PTB, reduces the estimate and emits a smaller unfragmented retry. The dual-family floor test checks complete packet length and retry payload; no native IPv6 socket claim.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3",
+      "evidence": [
+        "crates/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+      ]
     },
     {
       "id": "8201-026",
       "section": "3",
       "quote": "The Path MTU Discovery process ends when the source node's estimate of the PMTU is less than or equal to the actual PMTU. Note that several iterations of the packet-sent/Packet-Too-Big-message-received cycle may occur before the Path MTU Discovery process ends, as there may be links with smaller MTUs further along the path.",
-      "status": "TODO",
-      "reason": "IPv6 Connection and codec implement discovery without same-link bypass; native socket runtime accepts only IPv4. Full IPv6 ingress/departure integration and all overview behavior are not established by core-only tests.",
-      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3"
+      "status": "context",
+      "reason": "Overview explanation of convergence and possible repeated PTB cycles, not a separate obligation to implement native IPv6 sockets. Operative reduction and sizing duties remain in section4."
     },
     {
       "id": "8201-027",
@@ -202,16 +239,37 @@
       "id": "8201-028",
       "section": "3",
       "quote": "The PMTU of a path may change over time, due to changes in the routing topology. Reductions of the PMTU are detected by Packet Too Big messages. To detect increases in a path's PMTU, a node periodically increases its assumed PMTU. This will almost always result in packets being discarded and Packet Too Big messages being",
-      "status": "TODO",
-      "reason": "IPv6 Connection and codec implement discovery without same-link bypass; native socket runtime accepts only IPv4. Full IPv6 ingress/departure integration and all overview behavior are not established by core-only tests.",
+      "status": "context",
+      "reason": "Original mixed paragraph preserved verbatim; exact operative subspans below distinguish host behavior, other actors and selected-algorithm scope. Unselected or explanatory text is not a missing implementation."
+    },
+    {
+      "id": "8201-028a",
+      "section": "3",
+      "quote": "Reductions of the PMTU are detected by Packet Too Big messages.",
+      "parent": "8201-028",
+      "status": "covered",
+      "reason": "Enabled IPv6 core reduces its estimate from validated PTB; the dual-family floor test checks the new estimate and bounded retry.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+      ]
+    },
+    {
+      "id": "8201-028b",
+      "section": "3",
+      "quote": "To detect increases in a path's PMTU, a node periodically increases its assumed PMTU. This will almost always result in packets being discarded and Packet Too Big messages being",
+      "parent": "8201-028",
+      "status": "exception",
+      "reason": "Classical blind periodic estimate increases are not selected; ACK-confirmed RFC4821 probes reopen after a ten-minute hold. RFC8201 section1 identifies this extension and RFC4821 section1 relaxes classical algorithms. No exception to PTB holdoff or congestion control.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3"
     },
     {
       "id": "8201-029",
       "section": "3",
       "quote": "generated, because in most cases the PMTU of the path will not have changed. Therefore, attempts to detect increases in a path's PMTU should be done infrequently.",
-      "status": "TODO",
-      "reason": "IPv6 Connection and codec implement discovery without same-link bypass; native socket runtime accepts only IPv4. Full IPv6 ingress/departure integration and all overview behavior are not established by core-only tests.",
+      "status": "exception",
+      "reason": "Continuation of the unselected blind-increase mechanism in 8201-028b. Selected RFC4821 active search is ACK-confirmed; accepted PTB and converged search retain ten-minute timers (8201-038/068). RFC4821 section1 is the narrow algorithm basis, not a general conformance waiver.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3"
     },
     {
@@ -227,7 +285,7 @@
       "section": "3",
       "quote": "Note that Path MTU Discovery must be performed even in cases where a node \"thinks\" a destination is attached to the same link as itself, as it might have a PMTU lower than the link MTU. In a situation such as when a neighboring router acts as proxy [ND] for some destination, the destination can appear to be directly connected, but it is in fact more than one hop away.",
       "status": "TODO",
-      "reason": "IPv6 Connection and codec implement discovery without same-link bypass; native socket runtime accepts only IPv4. Full IPv6 ingress/departure integration and all overview behavior are not established by core-only tests.",
+      "reason": "The enabled core has no same-link bypass, but no exact test models a destination treated as on-link via a proxy with a smaller downstream PMTU. Retain that scenario evidence gap, not a requirement for native IPv6 sockets.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-3"
     },
     {
@@ -242,7 +300,7 @@
       "section": "4",
       "quote": "Nodes should appropriately validate the payload of ICMPv6 PTB messages to ensure these are received in response to transmitted traffic (i.e., a reported error condition that corresponds to an IPv6 packet actually sent by the application) per [ICMPv6].",
       "status": "TODO",
-      "reason": "IPv6 core feedback validates recent exact packet evidence and enforces family floor/holdoff. Complete clause needs IPv6 codec-to-endpoint integration evidence; socket runtime is IPv4-only. Security deferral is selected RFC5927 policy, not an unconditional immediate decrease.",
+      "reason": "Core checks exact recent sent packet evidence and live sequence/tuple identity; IPv6 tests establish floor handling, but the malformed/stale/forged-quote rejection matrix is currently IPv4-focused. Missing IPv6-specific validation evidence remains; native sockets are not the scope criterion.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4"
     },
     {
@@ -261,24 +319,32 @@
       "id": "8201-035",
       "section": "4",
       "quote": "When a node receives a Packet Too Big message, it must reduce its estimate of the PMTU for the relevant path, based on the value of the MTU field in the message. The precise behavior of a node in this circumstance is not specified, since different applications may have different requirements, and since different implementation architectures may favor different strategies.",
-      "status": "TODO",
-      "reason": "IPv6 core feedback validates recent exact packet evidence and enforces family floor/holdoff. Complete clause needs IPv6 codec-to-endpoint integration evidence; socket runtime is IPv4-only. Security deferral is selected RFC5927 policy, not an unconditional immediate decrease.",
-      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4"
+      "status": "covered",
+      "reason": "Enabled IPv6 core applies a validated initial PTB decrease; the floor test checks 1500 to 1280 and repacketized retry. Later reports below proven delivery follow the selected deferred security policy, not unconditional trust of every ICMP packet.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+      ]
     },
     {
       "id": "8201-036",
       "section": "4",
       "quote": "After receiving a Packet Too Big message, a node must attempt to avoid eliciting more such messages in the near future. The node must reduce the size of the packets it is sending along the path. Using a PMTU estimate larger than the IPv6 minimum link MTU may continue to elicit Packet Too Big messages. Because each of these messages (and",
-      "status": "TODO",
-      "reason": "IPv6 core feedback validates recent exact packet evidence and enforces family floor/holdoff. Complete clause needs IPv6 codec-to-endpoint integration evidence; socket runtime is IPv4-only. Security deferral is selected RFC5927 policy, not an unconditional immediate decrease.",
-      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4"
+      "status": "covered",
+      "reason": "Validated initial IPv6 PTB reduces packet size; the dual-family floor test asserts a complete retry no larger than 1280. Smaller successive legal reports pass the same strictly decreasing path; no source fragmentation is used.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4",
+      "evidence": [
+        "crates/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+      ]
     },
     {
       "id": "8201-037",
       "section": "4",
       "quote": "the dropped packets they respond to) consume network resources, nodes using Path MTU Discovery must detect decreases in PMTU as fast as possible.",
       "status": "TODO",
-      "reason": "IPv6 core feedback validates recent exact packet evidence and enforces family floor/holdoff. Complete clause needs IPv6 codec-to-endpoint integration evidence; socket runtime is IPv4-only. Security deferral is selected RFC5927 policy, not an unconditional immediate decrease.",
+      "reason": "Continuation of the decrease-speed requirement in 8201-036. Initial decrease is tested for IPv6; exact IPv6 deferred-below-proven-delivery versus progress/RTO behavior is not yet exercised (the detailed security deferral test is IPv4). No native-socket requirement is inferred.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4"
     },
     {
@@ -298,7 +364,7 @@
       "section": "4",
       "quote": "A node must not increase its estimate of the Path MTU in response to the contents of a Packet Too Big message. A message purporting to announce an increase in the Path MTU might be a stale packet that has been floating around in the network, a false packet injected as part of a denial-of-service (DoS) attack, or the result of having multiple paths to the destination, each with a different PMTU.",
       "status": "TODO",
-      "reason": "IPv6 core feedback validates recent exact packet evidence and enforces family floor/holdoff. Complete clause needs IPv6 codec-to-endpoint integration evidence; socket runtime is IPv4-only. Security deferral is selected RFC5927 policy, not an unconditional immediate decrease.",
+      "reason": "Pmtud::feedback has a shared strictly-decreasing guard, but an exact IPv6 equal/larger-MTU rejection test is not recorded; existing nonincrease attack inputs are IPv4. Retain this narrow family-specific evidence gap, not a native-socket or unrelated shared-cache obligation.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-4"
     },
     {
@@ -369,7 +435,7 @@
       "section": "5.1",
       "quote": "It is therefore suggested that the IP layer store PMTU information and that the ICMPv6 layer process received Packet Too Big messages. The packetization layers may respond to changes in the PMTU by changing the size of the messages they send. To support this layering, packetization layers require a way to learn of changes in the value of MMS_S, the \"maximum send transport-message size\" [RFC1122].",
       "status": "TODO",
-      "reason": "Core subtracts base IPv6 header and TCP options and does not fragment. Codec rejects IPv6 extension-header quotes; no extension-header PMTU accounting or shared IP-layer cache. Full generic IPv6 layering span is not satisfied.",
+      "reason": "PMTU state lives in Connection rather than the suggested IP-layer cache, and there is no generic MMS_S-change interface to other packetization layers. Extension-header parsing is not the reason for this storage/service gap.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.1"
     },
     {
@@ -377,23 +443,27 @@
       "section": "5.1",
       "quote": "MMS_S is a transport message size calculated by subtracting the size of the IPv6 header (including IPv6 extension headers) from the largest IP packet that can be sent, EMTU_S. MMS_S is limited by a combination of factors, including the PMTU, support for packet fragmentation and reassembly, and the packet reassembly limit (see \"Fragment Header\", Section 4.5 of [RFC8200]). When source fragmentation is available, EMTU_S is set to EMTU_R, as indicated by the receiver using an upper-layer protocol or based on protocol requirements (1500 octets for IPv6). When a message larger than PMTU is to be transmitted, the source creates fragments, each limited by PMTU. When source fragmentation is not desired, EMTU_S is set to PMTU, and the upper-layer protocol is expected to either perform its own fragmentation and reassembly or otherwise limit the size of its messages accordingly.",
       "status": "TODO",
-      "reason": "Core subtracts base IPv6 header and TCP options and does not fragment. Codec rejects IPv6 extension-header quotes; no extension-header PMTU accounting or shared IP-layer cache. Full generic IPv6 layering span is not satisfied.",
+      "reason": "Supported base IPv6 headers and TCP options are budgeted without source fragmentation, but accounting for IPv6 extension-header lengths is unsupported. Source fragmentation is an explicitly conditional alternative, not itself a required missing capability.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.1"
     },
     {
       "id": "8201-051",
       "section": "5.1",
       "quote": "However, packetization layers are encouraged to avoid sending messages that will require source fragmentation (for the case against fragmentation, see [FRAG]).",
-      "status": "TODO",
-      "reason": "Core subtracts base IPv6 header and TCP options and does not fragment. Codec rejects IPv6 extension-header quotes; no extension-header PMTU accounting or shared IP-layer cache. Full generic IPv6 layering span is not satisfied.",
-      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.1"
+      "status": "covered",
+      "reason": "Enabled TCP limits complete IPv6 packets to the path budget rather than invoking source fragmentation; the family-floor test parses base-header packets and checks resized retry length with timestamp options. Extension headers and shared caches are not prerequisites of this avoidance recommendation.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.1",
+      "evidence": [
+        "crates/ntcp/src/connection.rs::    fn refresh_path_mss(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+      ]
     },
     {
       "id": "8201-052",
       "section": "5.2",
       "quote": "Ideally, a PMTU value should be associated with a specific path traversed by packets exchanged between the source and destination nodes. However, in most cases a node will not have enough information to completely and accurately identify such a path. Rather, a node must associate a PMTU value with some local representation of a path. It is left to the implementation to select the local representation of a path. For nodes with multiple interfaces, Path MTU information should be maintained for each IPv6 link.",
       "status": "TODO",
-      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "reason": "Connection-local tuple is the selected representation of a path. The remaining full-span evidence gap is multi-interface/per-IPv6-link identity and isolation; this paragraph permits choosing a representation and does not itself require a shared cache or Routing Header parser.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
     },
     {
@@ -440,16 +510,20 @@
       "id": "8201-058",
       "section": "5.2",
       "quote": "Initially, the PMTU value for a path is assumed to be the (known) MTU of the first-hop link.",
-      "status": "TODO",
-      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
-      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
+      "status": "covered",
+      "reason": "Enabled IPv6 PMTU starts at the supplied first-hop bound, with separate allocation/peer ceilings. The dual-family floor test asserts 1500 initially; the small-allocation test covers independent limiting.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn new(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+      ]
     },
     {
       "id": "8201-059",
       "section": "5.2",
       "quote": "When a Packet Too Big message is received, the node determines which path the message applies to based on the contents of the Packet Too Big message. For example, if the destination address is used as the local representation of a path, the destination address from the original packet would be used to determine which path the message applies to.",
       "status": "TODO",
-      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "reason": "Endpoint dispatch and Connection validation use the quoted tuple, but no exact IPv6 wrong-destination/wrong-tuple dispatch test is recorded. Routing Header interpretation is the separate 8201-060 gap, not a prerequisite for supported base-header paths.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
     },
     {
@@ -457,7 +531,7 @@
       "section": "5.2",
       "quote": "Note: if the original packet contained a Routing header, the Routing header should be used to determine the location of the destination address within the original packet. If Segments Left is equal to zero, the destination address is in the Destination Address field in the IPv6 header. If Segments Left is greater than zero, the destination address is the last address (Address[n]) in the Routing header.",
       "status": "TODO",
-      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "reason": "The IPv6 quote decoder rejects extension headers and does not locate the final destination through a Routing Header/Segments Left. This is a concrete unsupported-header gap, not generic cache fanout.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
     },
     {
@@ -465,7 +539,7 @@
       "section": "5.2",
       "quote": "The node then uses the value in the MTU field in the Packet Too Big message as a tentative PMTU value or the IPv6 minimum link MTU if that is larger, and compares the tentative PMTU to the existing PMTU. If the tentative PMTU is less than the existing PMTU estimate, the tentative PMTU replaces the existing PMTU as the PMTU value for the path.",
       "status": "TODO",
-      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "reason": "Literal section5.2 prose suggests clamping a sub1280 report, but section4 explicitly requires discarding it; the implementation follows section4 (8201-034). Legal decreasing values are applied. Retain this textual inconsistency explicitly rather than claim the complete clamping algorithm or invent a missing cache requirement.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
     },
     {
@@ -473,7 +547,7 @@
       "section": "5.2",
       "quote": "The packetization layers must be notified about decreases in the PMTU. Any packetization layer instance (for example, a TCP connection) that is actively using the path must be notified if the PMTU estimate is decreased.",
       "status": "TODO",
-      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "reason": "PTB changes only the matching Connection; no shared-path fanout notifies every packetization-layer instance using that path.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
     },
     {
@@ -481,7 +555,7 @@
       "section": "5.2",
       "quote": "Note: even if the Packet Too Big message contains an Original Packet Header that refers to a UDP packet, the TCP layer must be notified if any of its connections use the given path.",
       "status": "TODO",
-      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "reason": "UDP-quoted IPv6 PTB is not dispatched to TCP connections sharing the path; no cross-protocol notification mechanism exists.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
     },
     {
@@ -489,15 +563,15 @@
       "section": "5.2",
       "quote": "Also, the instance that sent the packet that elicited the Packet Too Big message should be notified that its packet has been dropped, even if the PMTU estimate has not changed, so that it may retransmit the dropped data.",
       "status": "TODO",
-      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "reason": "Equal/nondecreasing PTB is rejected without separately notifying the sending instance that its packet was dropped. Normal retransmission is not the stated unchanged-PMTU notification.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
     },
     {
       "id": "8201-065",
       "section": "5.2",
       "quote": "Note: An implementation can avoid the use of an asynchronous notification mechanism for PMTU decreases by postponing notification until the next attempt to send a packet larger than the PMTU estimate. In this approach, when an attempt is made to SEND a packet that is larger than the PMTU estimate, the SEND function should fail and return a suitable error indication. This approach may be more suitable to a connectionless packetization layer (such as one using UDP), which (in some implementations) may be hard to \"notify\" from the ICMPv6 layer. In this case, the normal timeout-based retransmission mechanisms would be used to recover from the dropped packets.",
-      "status": "TODO",
-      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "status": "exception",
+      "reason": "Unselected alternative that defers PMTU-decrease notification until SEND fails, suggested especially for UDP. TCP uses validated feedback and immediate packetization refresh instead; shared-path fanout and dropped-packet notification are audited separately.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
     },
     {
@@ -505,7 +579,7 @@
       "section": "5.2",
       "quote": "It is important to understand that the notification of the packetization layer instances using the path about the change in the PMTU is distinct from the notification of a specific instance that a packet has been dropped. The latter should be done as soon as practical (i.e., asynchronously from the point of view of the packetization layer instance), while the former may be delayed until a packetization layer instance wants to create a packet.",
       "status": "TODO",
-      "reason": "Flow-local state exists, but no shared IP path cache, cross-protocol fanout, IPv6 routing-header parser, or multi-interface identity integration proves this full recommendation. Sub1280 PTB is discarded per section4, not clamped from contradictory older section5.2 prose.",
+      "reason": "No separate immediate dropped-packet notification exists independently of a PMTU change; the Connection updates its budget and may rearm head retry. The distinction matters even without a shared IP cache.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.2"
     },
     {
@@ -519,25 +593,33 @@
       "id": "8201-068",
       "section": "5.3",
       "quote": "If the stale PMTU value is too large, this will be discovered almost immediately once a large enough packet is sent on the path. No such mechanism exists for realizing that a stale PMTU value is too small, so an implementation should \"age\" cached values. When a PMTU value has not been decreased for a while (on the order of 10 minutes), it should probe to find if a larger PMTU is supported.",
-      "status": "TODO",
-      "reason": "Ten-minute reset exists; no PmtudConfig aging duration/infinity setting. IPv6 core timers are tested, not a production IPv6 socket path.",
-      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.3"
+      "status": "covered",
+      "reason": "Enabled IPv6 core holds PTB/converged search for 600 seconds, reopens the upper search bound on expiry, and emits an ACK-confirmed larger probe. The dual-family real-probe test exercises periodic retry; configurable aging is the separate 8201-069 TODO.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.3",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn tick(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+      ]
     },
     {
       "id": "8201-069",
       "section": "5.3",
       "quote": "Note: an implementation should provide a means for changing the timeout duration, including setting it to \"infinity\". For example, nodes attached to a link with a large MTU that is then attached to the rest of the Internet via a link with a small MTU are never going to discover a new non-local PMTU, so they should not have to put up with dropped packets every 10 minutes.",
       "status": "TODO",
-      "reason": "Ten-minute reset exists; no PmtudConfig aging duration/infinity setting. IPv6 core timers are tested, not a production IPv6 socket path.",
+      "reason": "PmtudConfig exposes no aging-duration or infinity setting; the 600-second hold/reset interval is fixed. The periodic probe required by 8201-068 is implemented.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.3"
     },
     {
       "id": "8201-070",
       "section": "5.4",
       "quote": "A packetization layer (e.g., TCP) must use the PMTU for the path(s) in use by a connection; it should not send segments that would result in packets larger than the PMTU, except to probe during PMTU Discovery (this probe packet must not be fragmented to the PMTU). A simple implementation could ask the IP layer for this value each time it created a new segment, but this could be inefficient. An implementation typically caches other values derived from the PMTU. It may be simpler to receive asynchronous notification when the PMTU changes, so that these variables may be also updated.",
-      "status": "TODO",
-      "reason": "Core bounds data and repair by current PMTU and peer MSS. Complete IPv6 packetization/ECN/loss interaction requires exact full-span tests; native sockets are IPv4-only. PTB invokes set_mss rescaling, not a proven unchanged congestion window.",
-      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+      "status": "covered",
+      "reason": "Connection uses the PMTU-derived budget for ordinary data/retries and a distinct bounded real-data probe size. Dual-family wire tests check the exact larger probe and unchanged effective PMTU before ACK; base-header IPv6 packets are unfragmented. IP-service polling is an optional implementation example.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4",
+      "evidence": [
+        "crates/ntcp/src/connection.rs::    fn refresh_path_mss(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+      ]
     },
     {
       "id": "8201-071",
@@ -567,24 +649,27 @@
       "id": "8201-073",
       "section": "5.4",
       "quote": "Reception of a Packet Too Big message implies that a packet was dropped by the node that sent the ICMPv6 message. A reliable upper- layer protocol will detect this loss by its own means, and recover it by its normal retransmission methods. The retransmission could result in delay, depending on the loss detection method used by the upper-layer protocol. If the Path MTU Discovery process requires several steps to find the PMTU of the full path, this could finally delay the retransmission by many round-trip times.",
-      "status": "TODO",
-      "reason": "Core bounds data and repair by current PMTU and peer MSS. Complete IPv6 packetization/ECN/loss interaction requires exact full-span tests; native sockets are IPv4-only. PTB invokes set_mss rescaling, not a proven unchanged congestion window.",
-      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+      "status": "context",
+      "reason": "Explains ordinary reliable-transport loss recovery and its latency. The selected immediate-on-decrease alternative is separately audited in 8201-074; this is not an unchanged-cwnd requirement."
     },
     {
       "id": "8201-074",
       "section": "5.4",
       "quote": "Alternatively, the retransmission could be done in immediate response to a notification that the Path MTU was decreased, but only for the specific connection specified by the Packet Too Big message. The packet size used in the retransmission should be no larger than the new PMTU.",
-      "status": "TODO",
-      "reason": "Core bounds data and repair by current PMTU and peer MSS. Complete IPv6 packetization/ECN/loss interaction requires exact full-span tests; native sockets are IPv4-only. PTB invokes set_mss rescaling, not a proven unchanged congestion window.",
-      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
+      "status": "covered",
+      "reason": "Validated feedback updates the matched Connection and emits a retry no larger than the new IPv6 PMTU; the dual-family floor test checks sequence, payload and full packet length. Exact dropped-range notification is distinct and remains open in 8201-064/066.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4",
+      "evidence": [
+        "crates/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+      ]
     },
     {
       "id": "8201-075",
       "section": "5.4",
       "quote": "Note: A packetization layer that determines a probe packet is lost needs to adapt the segment size of the retransmission. Using the reported size in the last Packet Too Big message, however, can lead to further losses as there might be smaller PMTU limits at the routers further along the path. This would lead to loss of all retransmitted segments and therefore cause unnecessary congestion as well as additional packets to be sent each time a new router announces a smaller MTU. Any packetization layer that uses retransmission is therefore also responsible for congestion control of its retransmissions [RFC8085].",
       "status": "TODO",
-      "reason": "Core bounds data and repair by current PMTU and peer MSS. Complete IPv6 packetization/ECN/loss interaction requires exact full-span tests; native sockets are IPv4-only. PTB invokes set_mss rescaling, not a proven unchanged congestion window.",
+      "reason": "Core adapts probe-gap retransmissions and retains congestion control, but exact IPv6 lost-probe repair plus subsequent smaller-router-PTB/congestion behavior is not recorded. The isolated/multiple-probe-loss wire test currently uses IPv4; this is a specific evidence gap, not a native IPv6 socket obligation.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.4"
     },
     {
@@ -607,16 +692,37 @@
       "id": "8201-078",
       "section": "5.5",
       "quote": "Path MTU Discovery for IPv4 [RFC1191] used NFS as an example of a UDP-based application that benefits from PMTU Discovery. Since then, [RFC7530] states that the supported transport layer between NFS and IP must be an IETF standardized transport protocol that is specified to avoid network congestion; such transports include TCP, Stream Control Transmission Protocol (SCTP) [RFC4960], and the Datagram Congestion Control Protocol (DCCP) [RFC4340]. In this case, the transport is responsible for ensuring that transmitted segments (except probes) conform to the Path MTU, including supporting PMTU Discovery probe transmissions as needed.",
-      "status": "TODO",
-      "reason": "No exact full-span implementation/test evidence recorded; remains an explicit audit gap, not a conformance pass.",
+      "status": "context",
+      "reason": "Original mixed paragraph preserved verbatim; exact operative subspans below distinguish host behavior, other actors and selected-algorithm scope. Unselected or explanatory text is not a missing implementation."
+    },
+    {
+      "id": "8201-078a",
+      "section": "5.5",
+      "quote": "Since then, [RFC7530] states that the supported transport layer between NFS and IP must be an IETF standardized transport protocol that is specified to avoid network congestion; such transports include TCP, Stream Control Transmission Protocol (SCTP) [RFC4960], and the Datagram Congestion Control Protocol (DCCP) [RFC4340].",
+      "parent": "8201-078",
+      "status": "exception",
+      "reason": "NFS transport-selection actor: ntcp supplies TCP, not an NFS implementation choosing its transport.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.5"
+    },
+    {
+      "id": "8201-078b",
+      "section": "5.5",
+      "quote": "In this case, the transport is responsible for ensuring that transmitted segments (except probes) conform to the Path MTU, including supporting PMTU Discovery probe transmissions as needed.",
+      "parent": "8201-078",
+      "status": "covered",
+      "reason": "TCP packetizes ordinary data to the path budget and provides real-data discovery probes. The dual-family test checks complete probe length and ACK-confirmed increase; this is the transport duty, not an NFS conformance claim.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.5",
+      "evidence": [
+        "crates/ntcp/src/connection.rs::    fn refresh_path_mss(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+      ]
     },
     {
       "id": "8201-079",
       "section": "5.6",
       "quote": "It is suggested that an implementation provides a way for a system utility program to:",
       "status": "TODO",
-      "reason": "No per-path management disable/arbitrary PMTU or aging-timeout API. Disabling PMTUD does not automatically cap IPv6 packets to1280.",
+      "reason": "Introduces the per-path utility controls in 8201-080/081; there is no system-utility path-control interface.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
     },
     {
@@ -624,7 +730,7 @@
       "section": "5.6",
       "quote": "- Specify that Path MTU Discovery not be done on a given path.",
       "status": "TODO",
-      "reason": "No per-path management disable/arbitrary PMTU or aging-timeout API. Disabling PMTUD does not automatically cap IPv6 packets to1280.",
+      "reason": "PMTUD is configured per connection at creation; no system-utility per-path discovery-disable control exists.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
     },
     {
@@ -632,7 +738,7 @@
       "section": "5.6",
       "quote": "- Change the PMTU value associated with a given path.",
       "status": "TODO",
-      "reason": "No per-path management disable/arbitrary PMTU or aging-timeout API. Disabling PMTUD does not automatically cap IPv6 packets to1280.",
+      "reason": "No administrative API sets an arbitrary path PMTU estimate; lower_mss only establishes an independent send ceiling.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
     },
     {
@@ -640,7 +746,7 @@
       "section": "5.6",
       "quote": "The former can be accomplished by associating a flag with the path; when a packet is sent on a path with this flag set, the IP layer does not send packets larger than the IPv6 minimum link MTU.",
       "status": "TODO",
-      "reason": "No per-path management disable/arbitrary PMTU or aging-timeout API. Disabling PMTUD does not automatically cap IPv6 packets to1280.",
+      "reason": "No per-path disable flag enforces a 1280-byte ceiling; a PMTUD-disabled core connection does not automatically use that IPv6 minimum.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
     },
     {
@@ -655,7 +761,7 @@
       "section": "5.6",
       "quote": "The implementation should also provide a way to change the timeout period for aging stale PMTU information.",
       "status": "TODO",
-      "reason": "No per-path management disable/arbitrary PMTU or aging-timeout API. Disabling PMTUD does not automatically cap IPv6 packets to1280.",
+      "reason": "No API configures the fixed 600-second aging/search-reset interval.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-5.6"
     },
     {
@@ -669,16 +775,20 @@
       "id": "8201-086",
       "section": "6",
       "quote": "In the first attack, the false message indicates a PMTU much smaller than reality. In response, the victim node should never set its PMTU estimate below the IPv6 minimum link MTU. A sender that falsely reduces to this MTU would observe suboptimal performance.",
-      "status": "TODO",
-      "reason": "Core guards prevent sub1280 reductions and ICMP increases; no complete IPv6 socket security integration evidence.",
-      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-6"
+      "status": "covered",
+      "reason": "Same enabled-core floor invariant as 8201-034: sub1280 feedback is discarded and a legal 1280 report is accepted. The dual-family wire test asserts both outcomes; no native IPv6 socket or complete threat-model claim.",
+      "target": "https://www.rfc-editor.org/rfc/rfc8201#section-6",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+      ]
     },
     {
       "id": "8201-087",
       "section": "6",
       "quote": "In the second attack, the false message indicates a PMTU larger than reality. If believed, this could cause temporary blockage as the victim sends packets that will be dropped by some router. Within one round-trip time, the node would discover its mistake (receiving Packet Too Big messages from that router), but frequent repetition of this attack could cause lots of packets to be dropped. A node, however, must not raise its estimate of the PMTU based on a Packet Too Big message, so it should not be vulnerable to this attack.",
       "status": "TODO",
-      "reason": "Core guards prevent sub1280 reductions and ICMP increases; no complete IPv6 socket security integration evidence.",
+      "reason": "Pmtud::feedback has a shared strictly-decreasing guard, but an exact IPv6 equal/larger-MTU rejection test is not recorded; existing nonincrease attack inputs are IPv4. Retain this narrow family-specific evidence gap, not a native-socket or unrelated shared-cache obligation.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-6"
     },
     {
@@ -827,6 +937,6 @@
   "nonoperative_sections": [
     "front matter, abstract, copyright, section2 definitions, section7 IANA, section8 references, appendicesA/B comparisons/change log, acknowledgements, author addresses"
   ],
-  "counting_note": "Duvet requirement counts are audit spans, including advice and overlapping automatic/manual quotes; they are not counts of unique mandatory norms. Covered includes exceptions; subtract excepted for source-and-test-only coverage.",
+  "counting_note": "Duvet requirement counts are audit spans, including advice and overlapping automatic/manual quotes; they are not counts of unique mandatory norms. Covered includes exceptions; subtract excepted for source-and-test-only coverage. Original paragraph IDs and quotes are preserved; lowercase suffix IDs are exact operative subspans linked by parent. Mixed originals are context, not duplicate operative requirements.",
   "interpretation": "Standards Track IPv6 replacement forRFC1981. Lowercase must/should are intentional (section1); section5 explicitly provides implementation notes rather than a specification. Section4 sub1280 discard controls conflicting older section5.2 clamp prose."
 }

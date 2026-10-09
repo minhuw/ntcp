@@ -1,17 +1,45 @@
 # Exact published audit spans; whitespace reflow only. No invented BCP14 levels.
 
-# 1191-005
+# 1191-005a
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-2"
 quote = '''
-In this memo, we describe a technique for using the Don't Fragment (DF) bit in the IP header to dynamically discover the PMTU of a path. The basic idea is that a source host initially assumes that the PMTU of a path is the (known) MTU of its first hop, and sends all datagrams on that path with the DF bit set. If any of the datagrams are too large to be forwarded without fragmentation by some router along the path, that router will discard them and return ICMP Destination Unreachable messages with a code meaning "fragmentation needed and DF set" [7]. Upon receipt of such a message (henceforth called a "Datagram Too Big" message), the source host reduces its assumed PMTU for the path.
+The basic idea is that a source host initially assumes that the PMTU of a path is the (known) MTU of its first hop,
 '''
 
-# 1191-006
+# 1191-005b
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-2"
 quote = '''
-The PMTU discovery process ends when the host's estimate of the PMTU is low enough that its datagrams can be delivered without fragmentation. Or, the host may elect to end the discovery process by ceasing to set the DF bit in the datagram headers; it may do so, for example, because it is willing to have datagrams fragmented in some circumstances. Normally, the host continues to set DF in all datagrams, so that if the route changes and the new PMTU is lower, it will be discovered.
+and sends all datagrams on that path with the DF bit set.
+'''
+
+# 1191-005c
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1191#section-2"
+quote = '''
+If any of the datagrams are too large to be forwarded without fragmentation by some router along the path, that router will discard them and return ICMP Destination Unreachable messages with a code meaning "fragmentation needed and DF set" [7].
+'''
+
+# 1191-005d
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1191#section-2"
+quote = '''
+Upon receipt of such a message (henceforth called a "Datagram Too Big" message), the source host reduces its assumed PMTU for the path.
+'''
+
+# 1191-006a
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1191#section-2"
+quote = '''
+Or, the host may elect to end the discovery process by ceasing to set the DF bit in the datagram headers; it may do so, for example, because it is willing to have datagrams fragmented in some circumstances.
+'''
+
+# 1191-006b
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1191#section-2"
+quote = '''
+Normally, the host continues to set DF in all datagrams, so that if the route changes and the new PMTU is lower, it will be discovered.
 '''
 
 # 1191-007
@@ -21,11 +49,18 @@ quote = '''
 Unfortunately, the Datagram Too Big message, as currently specified, does not report the MTU of the hop for which the rejected datagram was too big, so the source host cannot tell exactly how much to reduce its assumed PMTU. To remedy this, we propose that a currently unused header field in the Datagram Too Big message be used to report the MTU of the constricting hop. This is the only change specified for routers in support of PMTU Discovery.
 '''
 
-# 1191-008
+# 1191-008a
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-2"
 quote = '''
-The PMTU of a path may change over time, due to changes in the routing topology. Reductions of the PMTU are detected by Datagram Too Big messages, except on paths for which the host has stopped setting the DF bit. To detect increases in a path's PMTU, a host periodically increases its assumed PMTU (and if it had stopped, resumes setting the DF bit). This will almost always result in datagrams being discarded and Datagram Too Big messages being
+Reductions of the PMTU are detected by Datagram Too Big messages, except on paths for which the host has stopped setting the DF bit.
+'''
+
+# 1191-008b
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1191#section-2"
+quote = '''
+To detect increases in a path's PMTU, a host periodically increases its assumed PMTU (and if it had stopped, resumes setting the DF bit). This will almost always result in datagrams being discarded and Datagram Too Big messages being
 '''
 
 # 1191-009
@@ -49,25 +84,53 @@ quote = '''
 We do require that after receiving a Datagram Too Big message, a host MUST attempt to avoid eliciting more such messages in the near future. The host may either reduce the size of the datagrams it is sending along the path, or cease setting the Don't Fragment bit in the headers of those datagrams. Clearly, the former strategy may continue to elicit Datagram Too Big messages for a while, but since each of these messages (and the dropped datagrams they respond to) consume Internet resources, the host MUST force the PMTU Discovery process to converge.
 '''
 
-# 1191-013
+# 1191-013a
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-3"
 quote = '''
-Hosts using PMTU Discovery MUST detect decreases in Path MTU as fast as possible. Hosts MAY detect increases in Path MTU, but because doing so requires sending datagrams larger than the current estimated PMTU, and because the likelihood is that the PMTU will not have increased, this MUST be done at infrequent intervals. An attempt to detect an increase (by sending a datagram larger than the current estimate) MUST NOT be done less than 5 minutes after a Datagram Too Big message has been received for the given destination, or less than 1 minute after a previous, successful attempted increase. We recommend setting these timers at twice their minimum values (10 minutes and 2 minutes, respectively).
+Hosts using PMTU Discovery MUST detect decreases in Path MTU as fast as possible.
 '''
 
-# 1191-014
+# 1191-013b
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-3"
 quote = '''
-Hosts MUST be able to deal with Datagram Too Big messages that do not include the next-hop MTU, since it is not feasible to upgrade all the routers in the Internet in any finite time. A Datagram Too Big message from an unmodified router can be recognized by the presence of a zero in the (newly-defined) Next-Hop MTU field. (This is required by the ICMP specification [7], which says that "unused" fields must be zero.) In section 5, we discuss possible strategies
+Hosts MAY detect increases in Path MTU, but because doing so requires sending datagrams larger than the current estimated PMTU, and because the likelihood is that the PMTU will not have increased, this MUST be done at infrequent intervals.
 '''
 
-# 1191-015
+# 1191-013c
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-3"
 quote = '''
-for a host to follow in response to an old-style Datagram Too Big message (one sent by an unmodified router).
+An attempt to detect an increase (by sending a datagram larger than the current estimate) MUST NOT be done less than 5 minutes after a Datagram Too Big message has been received for the given destination,
+'''
+
+# 1191-013d
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1191#section-3"
+quote = '''
+or less than 1 minute after a previous, successful attempted increase.
+'''
+
+# 1191-013e
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1191#section-3"
+quote = '''
+10 minutes
+'''
+
+# 1191-013f
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1191#section-3"
+quote = '''
+2 minutes, respectively).
+'''
+
+# 1191-014a
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1191#section-3"
+quote = '''
+Hosts MUST be able to deal with Datagram Too Big messages that do not include the next-hop MTU, since it is not feasible to upgrade all the routers in the Internet in any finite time. A Datagram Too Big message from an unmodified router can be recognized by the presence of a zero in the (newly-defined) Next-Hop MTU field.
 '''
 
 # 1191-016
@@ -133,13 +196,6 @@ quote = '''
 When a router is unable to forward a datagram because it exceeds the MTU of the next-hop network and its Don't Fragment bit is set, the router is required to return an ICMP Destination Unreachable message to the source of the datagram, with the Code indicating "fragmentation needed and DF set". To support the Path MTU Discovery technique specified in this memo, the router MUST include the MTU of that next-hop network in the low-order 16 bits of the ICMP header field that is labelled "unused" in the ICMP specification [7]. The high-order 16 bits remain unused, and MUST be set to zero. Thus, the message has the following format:
 '''
 
-# 1191-029
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc1191#section-4"
-quote = '''
-The size in octets of the largest datagram that could be forwarded, along the path of the original datagram, without being fragmented at this router. The size includes the IP header and IP data, and does not include any lower-level headers.
-'''
-
 # 1191-030
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-4"
@@ -152,13 +208,6 @@ This field will never contain a value less than 68, since every router "must be 
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-5"
 quote = '''
 The simplest thing for a host to do in response to such a message is to assume that the PMTU is the minimum of its currently-assumed PMTU and 576, and to stop setting the DF bit in datagrams sent on that path. Thus, the host falls back to the same PMTU as it would choose under current practice (see section 3.3.3 of "Requirements for Internet Hosts -- Communication Layers" [1]). This strategy has the advantage that it terminates quickly, and does no worse than existing practice. It fails, however, to avoid fragmentation in some cases, and to make the most efficient utilization of the internetwork in other cases.
-'''
-
-# 1191-033
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc1191#section-5"
-quote = '''
-More sophisticated strategies involve "searching" for an accurate PMTU estimate, by continuing to send datagrams with the DF bit while varying their sizes. A good search strategy is one that obtains an accurate estimate of the Path MTU without causing many packets to be lost in the process.
 '''
 
 # 1191-034
@@ -201,13 +250,6 @@ The strategy we recommend, then, is to use as the next PMTU estimate the greates
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.1"
 quote = '''
 We therefore believe that the IP layer should store PMTU information and that the ICMP layer should process received Datagram Too Big messages. The packetization layers must still be able to respond to changes in the Path MTU, by changing the size of the datagrams they send, and must also be able to specify that datagrams are sent with the DF bit set. We do not want the IP layer to simply set the DF bit in every packet, since it is possible that a packetization layer, perhaps a UDP application outside the kernel, is unable to change its datagram size. Protocols involving intentional fragmentation, while inelegant, are sometimes successful (NFS being the primary example), and we do not want to break such protocols.
-'''
-
-# 1191-051
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.1"
-quote = '''
-To support this layering, packetization layers require an extension of the IP service interface defined in [1]:
 '''
 
 # 1191-052
@@ -259,13 +301,6 @@ quote = '''
 Note: even if the Datagram Too Big message contains an Original Datagram Header that refers to a UDP packet, the TCP layer must be notified if any of its connections use the given
 '''
 
-# 1191-060
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
-quote = '''
-path.
-'''
-
 # 1191-061
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
@@ -285,13 +320,6 @@ Alternatively, an implementation can avoid the use of an asynchronous notificati
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
 quote = '''
 It is important to understand that the notification of the packetization layer instances using the path about the change in the PMTU is distinct from the notification of a specific instance that a packet has been dropped. The latter should be done as soon as practical (i.e., asynchronously from the point of view of the packetization layer instance), while the former may be delayed until a packetization layer instance wants to create a packet. Retransmission should be done for only for those packets that are known to be dropped, as indicated by a Datagram Too Big message.
-'''
-
-# 1191-066
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.3"
-quote = '''
-Because a host using PMTU Discovery always sets the DF bit, if the stale PMTU value is too large, this will be discovered almost
 '''
 
 # 1191-067
@@ -362,13 +390,6 @@ The TCP layer must track the PMTU for the destination of a connection; it should
 target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.4"
 quote = '''
 A TCP implementation must also store the MSS value received from its peer (which defaults to 536), and not send any segment larger than this MSS, regardless of the PMTU. In 4.xBSD-derived implementations, this requires adding an additional field to the TCP state record.
-'''
-
-# 1191-078
-[[spec]]
-target = "https://www.rfc-editor.org/rfc/rfc1191#section-6.4"
-quote = '''
-Finally, when a Datagram Too Big message is received, it implies that a datagram was dropped by the router that sent the ICMP message. It is sufficient to treat this as any other dropped segment, and wait until the retransmission timer expires to cause retransmission of the segment. If the PMTU Discovery process requires several steps to estimate the right PMTU, this could delay the connection by many round-trip times.
 '''
 
 # 1191-079

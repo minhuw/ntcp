@@ -1,7 +1,7 @@
 {
   "rfc": 1191,
   "document_status": "Standards Track",
-  "scope": "IPv4 endpoint PMTUD",
+  "scope": "IPv4 enabled unicast TCP core/codec PMTUD; disabled/example gaps separately identified",
   "text_sha256": "3de7c2cb99832c6d1929f9f918172865831848f77e8ab585488125581afa6b68",
   "paragraphs": [
     {
@@ -36,40 +36,129 @@
       "id": "1191-005",
       "section": "2",
       "quote": "In this memo, we describe a technique for using the Don't Fragment (DF) bit in the IP header to dynamically discover the PMTU of a path. The basic idea is that a source host initially assumes that the PMTU of a path is the (known) MTU of its first hop, and sends all datagrams on that path with the DF bit set. If any of the datagrams are too large to be forwarded without fragmentation by some router along the path, that router will discard them and return ICMP Destination Unreachable messages with a code meaning \"fragmentation needed and DF set\" [7]. Upon receipt of such a message (henceforth called a \"Datagram Too Big\" message), the source host reduces its assumed PMTU for the path.",
-      "status": "TODO",
-      "reason": "Pmtud initializes a caller-bound path and TCP/IP emits DF, but this complete classical overview also covers router behavior and blind periodic increases; no end-to-end router/classical-increase test establishes the whole span. TCP uses ACK-confirmed RFC4821 increases instead.",
+      "status": "context",
+      "reason": "Original mixed paragraph preserved verbatim; exact operative subspans below distinguish host behavior, other actors and selected-algorithm scope. Unselected or explanatory text is not a missing implementation."
+    },
+    {
+      "id": "1191-005a",
+      "section": "2",
+      "quote": "The basic idea is that a source host initially assumes that the PMTU of a path is the (known) MTU of its first hop,",
+      "parent": "1191-005",
+      "status": "covered",
+      "reason": "Enabled PMTUD initializes from the supplied first-hop MTU, capped by independent peer/allocation ceilings; native startup/jumbo tests establish those bounds. This does not assert a router implementation.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn new(",
+        "crates/adapters/ntcp-socket/src/runtime_backend_tests.rs::fn pmtud_jumbo_allocation_capacity_and_validated_ingress()"
+      ]
+    },
+    {
+      "id": "1191-005b",
+      "section": "2",
+      "quote": "and sends all datagrams on that path with the DF bit set.",
+      "parent": "1191-005",
+      "status": "covered",
+      "reason": "The IPv4 codec always sets DF; its ECN/DSCP matrix asserts 0x4000 with no fragment offset. Keeping DF is the selected TCP behavior, not optional clear-DF termination.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2",
+      "evidence": [
+        "crates/ntcp-ip/src/lib.rs::fn encode_ipv4(",
+        "crates/ntcp/examples/tun_echo.rs::        fn ipv4_dscp_and_ecn_are_independent()"
+      ]
+    },
+    {
+      "id": "1191-005c",
+      "section": "2",
+      "quote": "If any of the datagrams are too large to be forwarded without fragmentation by some router along the path, that router will discard them and return ICMP Destination Unreachable messages with a code meaning \"fragmentation needed and DF set\" [7].",
+      "parent": "1191-005",
+      "status": "exception",
+      "reason": "Router discard/ICMP-generation actor; this TCP endpoint consumes these reports but does not forward packets.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2"
+    },
+    {
+      "id": "1191-005d",
+      "section": "2",
+      "quote": "Upon receipt of such a message (henceforth called a \"Datagram Too Big\" message), the source host reduces its assumed PMTU for the path.",
+      "parent": "1191-005",
+      "status": "covered",
+      "reason": "Enabled core applies validated initial PTB decreases and repacketizes to the new budget; feedback below previously proven delivery is deliberately deferred until the quoted head times out. Immediate and deferred cases are separate from upward probing.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+      ]
     },
     {
       "id": "1191-006",
       "section": "2",
       "quote": "The PMTU discovery process ends when the host's estimate of the PMTU is low enough that its datagrams can be delivered without fragmentation. Or, the host may elect to end the discovery process by ceasing to set the DF bit in the datagram headers; it may do so, for example, because it is willing to have datagrams fragmented in some circumstances. Normally, the host continues to set DF in all datagrams, so that if the route changes and the new PMTU is lower, it will be discovered.",
-      "status": "TODO",
-      "reason": "Pmtud initializes a caller-bound path and TCP/IP emits DF, but this complete classical overview also covers router behavior and blind periodic increases; no end-to-end router/classical-increase test establishes the whole span. TCP uses ACK-confirmed RFC4821 increases instead.",
+      "status": "context",
+      "reason": "Original mixed paragraph preserved verbatim; exact operative subspans below distinguish host behavior, other actors and selected-algorithm scope. Unselected or explanatory text is not a missing implementation."
+    },
+    {
+      "id": "1191-006a",
+      "section": "2",
+      "quote": "Or, the host may elect to end the discovery process by ceasing to set the DF bit in the datagram headers; it may do so, for example, because it is willing to have datagrams fragmented in some circumstances.",
+      "parent": "1191-006",
+      "status": "exception",
+      "reason": "Optional clear-DF termination is not selected. TCP keeps DF and reduces packet size; not implementing this permission is not a missing feature.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2"
+    },
+    {
+      "id": "1191-006b",
+      "section": "2",
+      "quote": "Normally, the host continues to set DF in all datagrams, so that if the route changes and the new PMTU is lower, it will be discovered.",
+      "parent": "1191-006",
+      "status": "covered",
+      "reason": "Enabled IPv4 PMTUD retains DF in the codec and reacts to validated lower-MTU feedback; zero-MTU and family-floor tests exercise decrease and bounded repair. This is not a claim about arbitrary external embeddings.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+      ]
     },
     {
       "id": "1191-007",
       "section": "2",
       "quote": "Unfortunately, the Datagram Too Big message, as currently specified, does not report the MTU of the hop for which the rejected datagram was too big, so the source host cannot tell exactly how much to reduce its assumed PMTU. To remedy this, we propose that a currently unused header field in the Datagram Too Big message be used to report the MTU of the constricting hop. This is the only change specified for routers in support of PMTU Discovery.",
-      "status": "TODO",
-      "reason": "Pmtud initializes a caller-bound path and TCP/IP emits DF, but this complete classical overview also covers router behavior and blind periodic increases; no end-to-end router/classical-increase test establishes the whole span. TCP uses ACK-confirmed RFC4821 increases instead.",
+      "status": "exception",
+      "reason": "Router ICMP-generation change, introduced by historical context; ntcp is a TCP endpoint, not a forwarding router. Host zero-MTU compatibility is covered separately in 1191-014a.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2"
     },
     {
       "id": "1191-008",
       "section": "2",
       "quote": "The PMTU of a path may change over time, due to changes in the routing topology. Reductions of the PMTU are detected by Datagram Too Big messages, except on paths for which the host has stopped setting the DF bit. To detect increases in a path's PMTU, a host periodically increases its assumed PMTU (and if it had stopped, resumes setting the DF bit). This will almost always result in datagrams being discarded and Datagram Too Big messages being",
-      "status": "TODO",
-      "reason": "Pmtud initializes a caller-bound path and TCP/IP emits DF, but this complete classical overview also covers router behavior and blind periodic increases; no end-to-end router/classical-increase test establishes the whole span. TCP uses ACK-confirmed RFC4821 increases instead.",
+      "status": "context",
+      "reason": "Original mixed paragraph preserved verbatim; exact operative subspans below distinguish host behavior, other actors and selected-algorithm scope. Unselected or explanatory text is not a missing implementation."
+    },
+    {
+      "id": "1191-008a",
+      "section": "2",
+      "quote": "Reductions of the PMTU are detected by Datagram Too Big messages, except on paths for which the host has stopped setting the DF bit.",
+      "parent": "1191-008",
+      "status": "covered",
+      "reason": "Enabled core applies validated initial PTB decreases and repacketizes to the new budget; feedback below previously proven delivery is deliberately deferred until the quoted head times out. Immediate and deferred cases are separate from upward probing.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+      ]
+    },
+    {
+      "id": "1191-008b",
+      "section": "2",
+      "quote": "To detect increases in a path's PMTU, a host periodically increases its assumed PMTU (and if it had stopped, resumes setting the DF bit). This will almost always result in datagrams being discarded and Datagram Too Big messages being",
+      "parent": "1191-008",
+      "status": "exception",
+      "reason": "Unselected classical blind upward-estimate heuristic. TCP selects ACK-confirmed RFC4821 probing (Pmtud::target/ack/tick; pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry). RFC4821 section1 implicitly relaxes classical algorithm requirements without updating RFC1191; section4 still governs congestion response. This exception is only for this upward-search alternative, not decreases, PTB holdoff, or 1191-069 retransmit-on-increase.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2"
     },
     {
       "id": "1191-009",
       "section": "2",
       "quote": "generated, because in most cases the PMTU of the path will not have changed, so it should be done infrequently.",
-      "status": "TODO",
-      "reason": "Pmtud initializes a caller-bound path and TCP/IP emits DF, but this complete classical overview also covers router behavior and blind periodic increases; no end-to-end router/classical-increase test establishes the whole span. TCP uses ACK-confirmed RFC4821 increases instead.",
+      "status": "exception",
+      "reason": "Continuation of the unselected classical upward-search discussion in 1191-008b. Unselected classical blind upward-estimate heuristic. TCP selects ACK-confirmed RFC4821 probing (Pmtud::target/ack/tick; pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry). RFC4821 section1 implicitly relaxes classical algorithm requirements without updating RFC1191; section4 still governs congestion response. This exception is only for this upward-search alternative, not decreases, PTB holdoff, or 1191-069 retransmit-on-increase.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-2"
     },
     {
@@ -107,25 +196,101 @@
       "id": "1191-013",
       "section": "3",
       "quote": "Hosts using PMTU Discovery MUST detect decreases in Path MTU as fast as possible. Hosts MAY detect increases in Path MTU, but because doing so requires sending datagrams larger than the current estimated PMTU, and because the likelihood is that the PMTU will not have increased, this MUST be done at infrequent intervals. An attempt to detect an increase (by sending a datagram larger than the current estimate) MUST NOT be done less than 5 minutes after a Datagram Too Big message has been received for the given destination, or less than 1 minute after a previous, successful attempted increase. We recommend setting these timers at twice their minimum values (10 minutes and 2 minutes, respectively).",
-      "status": "TODO",
-      "reason": "Validated immediate/deferred PTB processing exists. Classical one-minute-after-success upward timer is not implemented: active RFC4821 search continues after an ACK. RFC4821 section1 relaxes classical operation, but this audit does not claim literal RFC1191 timer conformance.",
+      "status": "context",
+      "reason": "Original mixed paragraph preserved verbatim; exact operative subspans below distinguish host behavior, other actors and selected-algorithm scope. Unselected or explanatory text is not a missing implementation."
+    },
+    {
+      "id": "1191-013a",
+      "section": "3",
+      "quote": "Hosts using PMTU Discovery MUST detect decreases in Path MTU as fast as possible.",
+      "parent": "1191-013",
+      "status": "covered",
+      "reason": "Enabled core applies validated initial PTB decreases and repacketizes to the new budget; feedback below previously proven delivery is deliberately deferred until the quoted head times out. Immediate and deferred cases are separate from upward probing.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+      ]
+    },
+    {
+      "id": "1191-013b",
+      "section": "3",
+      "quote": "Hosts MAY detect increases in Path MTU, but because doing so requires sending datagrams larger than the current estimated PMTU, and because the likelihood is that the PMTU will not have increased, this MUST be done at infrequent intervals.",
+      "parent": "1191-013",
+      "status": "exception",
+      "reason": "Classical blind increase frequency is replaced by ACK-confirmed active search under RFC4821 section1. Converged search and accepted PTB retain a ten-minute hold; this does not waive that holdoff. Unselected classical blind upward-estimate heuristic. TCP selects ACK-confirmed RFC4821 probing (Pmtud::target/ack/tick; pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry). RFC4821 section1 implicitly relaxes classical algorithm requirements without updating RFC1191; section4 still governs congestion response. This exception is only for this upward-search alternative, not decreases, PTB holdoff, or 1191-069 retransmit-on-increase.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3"
+    },
+    {
+      "id": "1191-013c",
+      "section": "3",
+      "quote": "An attempt to detect an increase (by sending a datagram larger than the current estimate) MUST NOT be done less than 5 minutes after a Datagram Too Big message has been received for the given destination,",
+      "parent": "1191-013",
+      "status": "covered",
+      "reason": "Accepted PTB inhibits upward probing for 600 seconds, including after ACK progress and local link growth. The core test checks the deadline and subsequent real probe for both IP families.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+      ]
+    },
+    {
+      "id": "1191-013d",
+      "section": "3",
+      "quote": "or less than 1 minute after a previous, successful attempted increase.",
+      "parent": "1191-013",
+      "status": "exception",
+      "reason": "Only the classical one-minute-after-success timer is unselected: RFC4821 section1 permits algorithm relaxation; successful ACK-confirmed active search proceeds without a fresh minute hold. The PTB minimum remains covered in 1191-013c; no section4 congestion waiver.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3"
+    },
+    {
+      "id": "1191-013e",
+      "section": "3",
+      "quote": "10 minutes",
+      "parent": "1191-013",
+      "status": "covered",
+      "reason": "Exact PTB half of the two-timer recommendation in parent 1191-013: accepted PTB holds upward probing for the recommended 600 seconds. The separate 2-minute post-success half is unselected, not covered by this evidence.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry()"
+      ]
+    },
+    {
+      "id": "1191-013f",
+      "section": "3",
+      "quote": "2 minutes, respectively).",
+      "parent": "1191-013",
+      "status": "exception",
+      "reason": "Only the post-success half of the two-timer recommendation in parent 1191-013 is unselected under RFC4821 section1: active ACK-confirmed search does not wait 2 minutes. The recommended 10-minute PTB hold is independently covered by 1191-013c/e.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3"
     },
     {
       "id": "1191-014",
       "section": "3",
       "quote": "Hosts MUST be able to deal with Datagram Too Big messages that do not include the next-hop MTU, since it is not feasible to upgrade all the routers in the Internet in any finite time. A Datagram Too Big message from an unmodified router can be recognized by the presence of a zero in the (newly-defined) Next-Hop MTU field. (This is required by the ICMP specification [7], which says that \"unused\" fields must be zero.) In section 5, we discuss possible strategies",
-      "status": "TODO",
-      "reason": "Validated immediate/deferred PTB processing exists. Classical one-minute-after-success upward timer is not implemented: active RFC4821 search continues after an ACK. RFC4821 section1 relaxes classical operation, but this audit does not claim literal RFC1191 timer conformance.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3"
+      "status": "context",
+      "reason": "Original mixed paragraph preserved verbatim; exact operative subspans below distinguish host behavior, other actors and selected-algorithm scope. Unselected or explanatory text is not a missing implementation."
+    },
+    {
+      "id": "1191-014a",
+      "section": "3",
+      "quote": "Hosts MUST be able to deal with Datagram Too Big messages that do not include the next-hop MTU, since it is not feasible to upgrade all the routers in the Internet in any finite time. A Datagram Too Big message from an unmodified router can be recognized by the presence of a zero in the (newly-defined) Next-Hop MTU field.",
+      "parent": "1191-014",
+      "status": "covered",
+      "reason": "IPv4 zero Next-Hop MTU selects the next lower plateau using exact sent length and legacy header correction. Connection, direct-state and native socket tests cover zero-MTU processing; the following section5 cross-reference is context, not a missing feature.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+      ]
     },
     {
       "id": "1191-015",
       "section": "3",
       "quote": "for a host to follow in response to an old-style Datagram Too Big message (one sent by an unmodified router).",
-      "status": "TODO",
-      "reason": "Validated immediate/deferred PTB processing exists. Classical one-minute-after-success upward timer is not implemented: active RFC4821 search continues after an ACK. RFC4821 section1 relaxes classical operation, but this audit does not claim literal RFC1191 timer conformance.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3"
+      "status": "context",
+      "reason": "Page continuation of the section5 cross-reference in 1191-014, not a separate host requirement. The exact operative zero-MTU compatibility text is covered in 1191-014a."
     },
     {
       "id": "1191-016",
@@ -187,7 +352,7 @@
       "section": "3.1",
       "quote": "Some TCP implementations send an MSS option only if the destination host is on a non-connected network. However, in general the TCP layer may not have the appropriate information to make this decision, so it is preferable to leave to the IP layer the task of determining a suitable MTU for the Internet path.",
       "status": "TODO",
-      "reason": "Receive MSS and path send budget are separate, but the complete advertised-MMS_R/link-based recommendation is not exhaustively tested for multihoming and all receive configuration bounds.",
+      "reason": "Quoted RFC1122 layering recommendation: path selection is Connection-local, not an IP-layer MTU service. This is not a multihoming MSS-advertisement clause; first-hop limits and advertised MSS are audited separately.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3.1"
     },
     {
@@ -202,7 +367,7 @@
       "section": "3.1",
       "quote": "Moreover, doing this prevents PMTU Discovery from discovering PMTUs larger than 576, so hosts SHOULD no longer lower the value they send",
       "status": "TODO",
-      "reason": "Receive MSS and path send budget are separate, but the complete advertised-MMS_R/link-based recommendation is not exhaustively tested for multihoming and all receive configuration bounds.",
+      "reason": "Nonlocal peers must not receive an artificially lowered MSS offer. Configuration-based MSS does not branch on locality, but no exact local-versus-nonlocal SYN-offer comparison is recorded. The sentence continues in 1191-024; this is an evidence gap, not missing PMTUD.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3.1"
     },
     {
@@ -210,7 +375,7 @@
       "section": "3.1",
       "quote": "in the MSS option. The MSS option should be 40 octets less than the size of the largest datagram the host is able to reassemble (MMS_R, as defined in [1]); in many cases, this will be the architectural limit of 65495 (65535 - 40) octets. A host MAY send an MSS value derived from the MTU of its connected network (the maximum MTU over its connected networks, for a multi-homed host); this should not cause problems for PMTU Discovery, and may dissuade a broken peer from sending enormous datagrams.",
       "status": "TODO",
-      "reason": "Receive MSS and path send budget are separate, but the complete advertised-MMS_R/link-based recommendation is not exhaustively tested for multihoming and all receive configuration bounds.",
+      "reason": "Continuation of 1191-023 plus receive-MSS sizing advice. The receive offer stays independent of discovered send PMTU, but the configured MSS is not proven to represent MMS_R-40 or the permitted maximum connected-link MTU in multi-homed configurations. The optional link-derived choice itself is not a required feature.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3.1"
     },
     {
@@ -218,7 +383,7 @@
       "section": "3.1",
       "quote": "Note: At the moment, we see no reason to send an MSS greater than the maximum MTU of the connected networks, and we recommend that hosts do not use 65495. It is quite possible that some IP implementations have sign-bit bugs that would be tickled by unnecessary use of such a large MSS.",
       "status": "TODO",
-      "reason": "Receive MSS and path send budget are separate, but the complete advertised-MMS_R/link-based recommendation is not exhaustively tested for multihoming and all receive configuration bounds.",
+      "reason": "The configured receive MSS is not proven bounded by the maximum connected-link MTU for this recommendation; current PMTUD tests deliberately allow receive MSS1460 with a smaller send-path MTU. No evidence of a sign-bit bug is claimed.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-3.1"
     },
     {
@@ -247,9 +412,8 @@
       "id": "1191-029",
       "section": "4",
       "quote": "The size in octets of the largest datagram that could be forwarded, along the path of the original datagram, without being fragmented at this router. The size includes the IP header and IP data, and does not include any lower-level headers.",
-      "status": "TODO",
-      "reason": "No exact full-span implementation/test evidence recorded; remains an explicit audit gap, not a conformance pass.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-4"
+      "status": "context",
+      "reason": "Definition of the router Next-Hop MTU field: IP header plus IP data, excluding link headers. Retained verbatim as terminology, not an independent missing host algorithm; byte accounting remains in the packetization clauses."
     },
     {
       "id": "1191-030",
@@ -278,9 +442,8 @@
       "id": "1191-033",
       "section": "5",
       "quote": "More sophisticated strategies involve \"searching\" for an accurate PMTU estimate, by continuing to send datagrams with the DF bit while varying their sizes. A good search strategy is one that obtains an accurate estimate of the Path MTU without causing many packets to be lost in the process.",
-      "status": "TODO",
-      "reason": "Selected policy uses a fixed plateau table and quoted total-length/header correction. This alternative algorithm/recommendation span needs its own exact evidence; do not infer a 576-byte floor or binary search from PLPMTUD.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-5"
+      "status": "context",
+      "reason": "Introduces search strategies without selecting an additional algorithm. The operative selected zero-MTU plateau algorithm is covered by 1191-039/040/041; the qualitative description does not require another search implementation."
     },
     {
       "id": "1191-034",
@@ -416,23 +579,22 @@
       "section": "6.1",
       "quote": "We therefore believe that the IP layer should store PMTU information and that the ICMP layer should process received Datagram Too Big messages. The packetization layers must still be able to respond to changes in the Path MTU, by changing the size of the datagrams they send, and must also be able to specify that datagrams are sent with the DF bit set. We do not want the IP layer to simply set the DF bit in every packet, since it is possible that a packetization layer, perhaps a UDP application outside the kernel, is unable to change its datagram size. Protocols involving intentional fragmentation, while inelegant, are sometimes successful (NFS being the primary example), and we do not want to break such protocols.",
       "status": "TODO",
-      "reason": "PMTU lives in Connection, not a shared IP-layer path cache; codec and runtime dispatch ICMP, and packetization adapts, but complete inter-layer/shared-cache recommendations are not implemented.",
+      "reason": "The shared IP-layer PMTU storage recommendation is not implemented: state lives in Connection. TCP does adapt its packetization and the codec sets DF; this retained layering gap is not a claim that those host behaviors are absent.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.1"
     },
     {
       "id": "1191-051",
       "section": "6.1",
       "quote": "To support this layering, packetization layers require an extension of the IP service interface defined in [1]:",
-      "status": "TODO",
-      "reason": "PMTU lives in Connection, not a shared IP-layer path cache; codec and runtime dispatch ICMP, and packetization adapts, but complete inter-layer/shared-cache recommendations are not implemented.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.1"
+      "status": "context",
+      "reason": "Introduction to the IP service extension listed in 1191-052, not an independent service requirement."
     },
     {
       "id": "1191-052",
       "section": "6.1",
       "quote": "A way to learn of changes in the value of MMS_S, the \"maximum send transport-message size\", which is derived from the Path MTU by subtracting the minimum IP header size.",
       "status": "TODO",
-      "reason": "PMTU lives in Connection, not a shared IP-layer path cache; codec and runtime dispatch ICMP, and packetization adapts, but complete inter-layer/shared-cache recommendations are not implemented.",
+      "reason": "No generic IP MMS_S-change service interface is exposed to packetization layers; TCP internally refreshes its own send budget.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.1"
     },
     {
@@ -440,7 +602,7 @@
       "section": "6.2",
       "quote": "In general, the IP layer should associate each PMTU value that it has learned with a specific path. A path is identified by a source address, a destination address and an IP type-of-service. (Some implementations do not record the source address of paths; this is acceptable for single-homed hosts, which have only one possible source address.)",
       "status": "TODO",
-      "reason": "Connection-local PMTU and tuple dispatch exist; no route-identity cache or cross-connection/cross-protocol notification implements this full recommendation. Endpoint-wide local-link updates are not discovered shared-path updates.",
+      "reason": "Connection identity stores local/remote addresses but does not provide the described shared IP path association including type-of-service.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
     },
     {
@@ -455,7 +617,7 @@
       "section": "6.2",
       "quote": "The obvious place to store this association is as a field in the routing table entries. A host will not have a route for every possible destination, but it should be able to cache a per-host route for every active destination. (This requirement is already imposed by the need to process ICMP Redirect messages.)",
       "status": "TODO",
-      "reason": "Connection-local PMTU and tuple dispatch exist; no route-identity cache or cross-connection/cross-protocol notification implements this full recommendation. Endpoint-wide local-link updates are not discovered shared-path updates.",
+      "reason": "No per-host routing-table PMTU cache exists. Connection-local state is not evidence of the suggested routing-cache organization.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
     },
     {
@@ -463,7 +625,7 @@
       "section": "6.2",
       "quote": "When the first packet is sent to a host for which no per-host route exists, a route is chosen either from the set of per-network routes, or from the set of default routes. The PMTU fields in these route entries should be initialized to be the MTU of the associated first-hop data link, and must never be changed by the PMTU Discovery process. (PMTU Discovery only creates or changes entries for per-host routes). Until a Datagram Too Big message is received, the PMTU associated with the initially-chosen route is presumed to be accurate.",
       "status": "TODO",
-      "reason": "Connection-local PMTU and tuple dispatch exist; no route-identity cache or cross-connection/cross-protocol notification implements this full recommendation. Endpoint-wide local-link updates are not discovered shared-path updates.",
+      "reason": "No per-network/default/per-host routing-entry hierarchy implements this initialization and immutable first-hop-entry scheme. Connection first-hop initialization is independently implemented.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
     },
     {
@@ -471,7 +633,7 @@
       "section": "6.2",
       "quote": "When a Datagram Too Big message is received, the ICMP layer determines a new estimate for the Path MTU (either from a non-zero Next-Hop MTU value in the packet, or using the method described in section 5). If a per-host route for this path does not exist, then one is created (almost as if a per-host ICMP Redirect is being processed; the new route uses the same first-hop router as the current route). If the PMTU estimate associated with the per-host route is higher than the new estimate, then the value in the routing entry is changed.",
       "status": "TODO",
-      "reason": "Connection-local PMTU and tuple dispatch exist; no route-identity cache or cross-connection/cross-protocol notification implements this full recommendation. Endpoint-wide local-link updates are not discovered shared-path updates.",
+      "reason": "A received PTB can reduce a Connection estimate, but no per-host route is created or updated in a routing table as described here.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
     },
     {
@@ -479,7 +641,7 @@
       "section": "6.2",
       "quote": "The packetization layers must be notified about decreases in the PMTU. Any packetization layer instance (for example, a TCP connection) that is actively using the path must be notified if the PMTU estimate is decreased.",
       "status": "TODO",
-      "reason": "Connection-local PMTU and tuple dispatch exist; no route-identity cache or cross-connection/cross-protocol notification implements this full recommendation. Endpoint-wide local-link updates are not discovered shared-path updates.",
+      "reason": "Validated feedback updates only the matching Connection; no shared-path fanout notifies every active packetization-layer instance.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
     },
     {
@@ -487,23 +649,22 @@
       "section": "6.2",
       "quote": "Note: even if the Datagram Too Big message contains an Original Datagram Header that refers to a UDP packet, the TCP layer must be notified if any of its connections use the given",
       "status": "TODO",
-      "reason": "Connection-local PMTU and tuple dispatch exist; no route-identity cache or cross-connection/cross-protocol notification implements this full recommendation. Endpoint-wide local-link updates are not discovered shared-path updates.",
+      "reason": "UDP-quoted PTB is not dispatched to TCP connections sharing that path; no cross-protocol fanout. Sentence continuation is preserved in 1191-060.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
     },
     {
       "id": "1191-060",
       "section": "6.2",
       "quote": "path.",
-      "status": "TODO",
-      "reason": "Connection-local PMTU and tuple dispatch exist; no route-identity cache or cross-connection/cross-protocol notification implements this full recommendation. Endpoint-wide local-link updates are not discovered shared-path updates.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
+      "status": "context",
+      "reason": "Only the word \"path.\" continuing 1191-059. The complete cross-protocol fanout concern is retained there; this is not a second missing feature."
     },
     {
       "id": "1191-061",
       "section": "6.2",
       "quote": "Also, the instance that sent the datagram that elicited the Datagram Too Big message should be notified that its datagram has been dropped, even if the PMTU estimate has not changed, so that it may retransmit the dropped datagram.",
       "status": "TODO",
-      "reason": "Connection-local PMTU and tuple dispatch exist; no route-identity cache or cross-connection/cross-protocol notification implements this full recommendation. Endpoint-wide local-link updates are not discovered shared-path updates.",
+      "reason": "Nondecreasing PTB is rejected without a separate dropped-datagram notification. The stated notification even when PMTU is unchanged is not implemented; normal loss recovery is distinct.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
     },
     {
@@ -517,8 +678,8 @@
       "id": "1191-063",
       "section": "6.2",
       "quote": "Alternatively, an implementation can avoid the use of an asynchronous notification mechanism for PMTU decreases by postponing notification until the next attempt to send a datagram larger than the PMTU estimate. In this approach, when an attempt is made to SEND a datagram with the DF bit set, and the datagram is larger than the PMTU estimate, the SEND function should fail and return a suitable error indication. This approach may be more suitable to a connectionless packetization layer (such as one using UDP), which (in some implementations) may be hard to \"notify\" from the ICMP layer. In this case, the normal timeout-based retransmission mechanisms would be used to recover from the dropped datagrams.",
-      "status": "TODO",
-      "reason": "Connection-local PMTU and tuple dispatch exist; no route-identity cache or cross-connection/cross-protocol notification implements this full recommendation. Endpoint-wide local-link updates are not discovered shared-path updates.",
+      "status": "exception",
+      "reason": "Unselected alternative that defers PMTU-decrease notification until SEND fails, suggested especially for UDP. TCP uses validated feedback and immediate packetization refresh instead; shared-path fanout and dropped-packet notification are audited separately.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
     },
     {
@@ -526,7 +687,7 @@
       "section": "6.2",
       "quote": "It is important to understand that the notification of the packetization layer instances using the path about the change in the PMTU is distinct from the notification of a specific instance that a packet has been dropped. The latter should be done as soon as practical (i.e., asynchronously from the point of view of the packetization layer instance), while the former may be delayed until a packetization layer instance wants to create a packet. Retransmission should be done for only for those packets that are known to be dropped, as indicated by a Datagram Too Big message.",
       "status": "TODO",
-      "reason": "Connection-local PMTU and tuple dispatch exist; no route-identity cache or cross-connection/cross-protocol notification implements this full recommendation. Endpoint-wide local-link updates are not discovered shared-path updates.",
+      "reason": "Feedback rearms the connection head after an MSS change, rather than identifying only the exact ICMP-quoted dropped range for retransmission. No separate dropped-packet notification is provided for unchanged PMTU.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.2"
     },
     {
@@ -540,16 +701,15 @@
       "id": "1191-066",
       "section": "6.3",
       "quote": "Because a host using PMTU Discovery always sets the DF bit, if the stale PMTU value is too large, this will be discovered almost",
-      "status": "TODO",
-      "reason": "Ten-minute ACK-confirmed PLPMTUD search reset is implemented, not blind first-hop PMTU reset. No configurable aging/infinity or route-redirect cache invalidation API exists. Upward refresh_path_mss calls set_path_mss, which can rearm head retry while other data remains outstanding; no no-retransmit-on-increase proof.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.3"
+      "status": "context",
+      "reason": "Page-split explanatory introduction about discovering a stale overlarge PMTU; no independent timer or retransmission requirement. Operative aging alternative follows in 1191-067."
     },
     {
       "id": "1191-067",
       "section": "6.3",
       "quote": "immediately once a datagram is sent to the given destination. No such mechanism exists for realizing that a stale PMTU value is too small, so an implementation should \"age\" cached values. When a PMTU value has not been decreased for a while (on the order of 10 minutes), the PMTU estimate should be set to the first-hop data-link MTU, and the packetization layers should be notified of the change. This will cause the complete PMTU Discovery process to take place again.",
-      "status": "TODO",
-      "reason": "Ten-minute ACK-confirmed PLPMTUD search reset is implemented, not blind first-hop PMTU reset. No configurable aging/infinity or route-redirect cache invalidation API exists. Upward refresh_path_mss calls set_path_mss, which can rearm head retry while other data remains outstanding; no no-retransmit-on-increase proof.",
+      "status": "exception",
+      "reason": "Unselected classical blind upward-estimate heuristic. TCP selects ACK-confirmed RFC4821 probing (Pmtud::target/ack/tick; pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry). RFC4821 section1 implicitly relaxes classical algorithm requirements without updating RFC1191; section4 still governs congestion response. This exception is only for this upward-search alternative, not decreases, PTB holdoff, or 1191-069 retransmit-on-increase. This paragraph suggests resetting the effective estimate directly to first-hop MTU; the selected timer reopens search_high without raising the effective estimate before an ACK.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.3"
     },
     {
@@ -557,7 +717,7 @@
       "section": "6.3",
       "quote": "Note: an implementation should provide a means for changing the timeout duration, including setting it to \"infinity\". For example, hosts attached to an FDDI network which is then attached to the rest of the Internet via a slow serial line are never going to discover a new non-local PMTU, so they should not have to put up with dropped datagrams every 10 minutes.",
       "status": "TODO",
-      "reason": "Ten-minute ACK-confirmed PLPMTUD search reset is implemented, not blind first-hop PMTU reset. No configurable aging/infinity or route-redirect cache invalidation API exists. Upward refresh_path_mss calls set_path_mss, which can rearm head retry while other data remains outstanding; no no-retransmit-on-increase proof.",
+      "reason": "PmtudConfig has no aging-duration or infinity setting; the discovery hold/reset interval is fixed at 600 seconds. Periodic probing itself is implemented.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.3"
     },
     {
@@ -572,32 +732,32 @@
       "id": "1191-070",
       "section": "6.3",
       "quote": "One approach to implementing PMTU aging is to add a timestamp field to the routing table entry. This field is initialized to a \"reserved\" value, indicating that the PMTU has never been changed. Whenever the PMTU is decreased in response to a Datagram Too Big message, the timestamp is set to the current time.",
-      "status": "TODO",
-      "reason": "Ten-minute ACK-confirmed PLPMTUD search reset is implemented, not blind first-hop PMTU reset. No configurable aging/infinity or route-redirect cache invalidation API exists. Upward refresh_path_mss calls set_path_mss, which can rearm head retry while other data remains outstanding; no no-retransmit-on-increase proof.",
+      "status": "exception",
+      "reason": "Unselected routing-table timestamp/periodic-scan example introduced by \"One approach\" in section6.3. Connection-local RFC4821 search uses Pmtud::deadline/tick and ACK-confirmed probes instead (RFC4821 section1 algorithm relaxation; section4 obligations remain). This is not a waiver of configurable aging or no-retransmit-on-increase.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.3"
     },
     {
       "id": "1191-071",
       "section": "6.3",
       "quote": "Once a minute, a timer-driven procedure runs through the routing table, and for each entry whose timestamp is not \"reserved\" and is older than the timeout interval:",
-      "status": "TODO",
-      "reason": "Ten-minute ACK-confirmed PLPMTUD search reset is implemented, not blind first-hop PMTU reset. No configurable aging/infinity or route-redirect cache invalidation API exists. Upward refresh_path_mss calls set_path_mss, which can rearm head retry while other data remains outstanding; no no-retransmit-on-increase proof.",
+      "status": "exception",
+      "reason": "Unselected routing-table timestamp/periodic-scan example introduced by \"One approach\" in section6.3. Connection-local RFC4821 search uses Pmtud::deadline/tick and ACK-confirmed probes instead (RFC4821 section1 algorithm relaxation; section4 obligations remain). This is not a waiver of configurable aging or no-retransmit-on-increase.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.3"
     },
     {
       "id": "1191-072",
       "section": "6.3",
       "quote": "- The PMTU estimate is set to the MTU of the associated first hop.",
-      "status": "TODO",
-      "reason": "Ten-minute ACK-confirmed PLPMTUD search reset is implemented, not blind first-hop PMTU reset. No configurable aging/infinity or route-redirect cache invalidation API exists. Upward refresh_path_mss calls set_path_mss, which can rearm head retry while other data remains outstanding; no no-retransmit-on-increase proof.",
+      "status": "exception",
+      "reason": "Unselected routing-table timestamp/periodic-scan example introduced by \"One approach\" in section6.3. Connection-local RFC4821 search uses Pmtud::deadline/tick and ACK-confirmed probes instead (RFC4821 section1 algorithm relaxation; section4 obligations remain). This is not a waiver of configurable aging or no-retransmit-on-increase.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.3"
     },
     {
       "id": "1191-073",
       "section": "6.3",
       "quote": "- Packetization layers using this route are notified of the increase.",
-      "status": "TODO",
-      "reason": "Ten-minute ACK-confirmed PLPMTUD search reset is implemented, not blind first-hop PMTU reset. No configurable aging/infinity or route-redirect cache invalidation API exists. Upward refresh_path_mss calls set_path_mss, which can rearm head retry while other data remains outstanding; no no-retransmit-on-increase proof.",
+      "status": "exception",
+      "reason": "Unselected routing-table timestamp/periodic-scan example introduced by \"One approach\" in section6.3. Connection-local RFC4821 search uses Pmtud::deadline/tick and ACK-confirmed probes instead (RFC4821 section1 algorithm relaxation; section4 obligations remain). This is not a waiver of configurable aging or no-retransmit-on-increase.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.3"
     },
     {
@@ -605,7 +765,7 @@
       "section": "6.3",
       "quote": "PMTU estimates may disappear from the routing table if the per-host routes are removed; this can happen in response to an ICMP Redirect message, or because certain routing-table daemons delete old routes after several minutes. Also, on a multi-homed host a topology change may result in the use of a different source interface. When this happens, if the packetization layer is not notified then it may continue to use a cached PMTU value that is now too small. One solution is to notify the packetization layer of a possible PMTU change whenever a Redirect message causes a route change, and whenever a route is simply deleted from the routing table.",
       "status": "TODO",
-      "reason": "Ten-minute ACK-confirmed PLPMTUD search reset is implemented, not blind first-hop PMTU reset. No configurable aging/infinity or route-redirect cache invalidation API exists. Upward refresh_path_mss calls set_path_mss, which can rearm head retry while other data remains outstanding; no no-retransmit-on-increase proof.",
+      "reason": "No ICMP Redirect/route-deletion notification API refreshes packetization state. Local-link MTU updates are not equivalent to routing-cache invalidation.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.3"
     },
     {
@@ -619,9 +779,13 @@
       "id": "1191-076",
       "section": "6.4",
       "quote": "The TCP layer must track the PMTU for the destination of a connection; it should not send datagrams that would be larger than this. A simple implementation could ask the IP layer for this value (using the GET_MAXSIZES interface described in [1]) each time it created a new segment, but this could be inefficient. Moreover, TCP implementations that follow the \"slow-start\" congestion-avoidance algorithm [4] typically calculate and cache several other values derived from the PMTU. It may be simpler to receive asynchronous notification when the PMTU changes, so that these variables may be updated.",
-      "status": "TODO",
-      "reason": "Per-packet budget and peer ceiling exist. set_path_mss rearms head retransmission rather than retaining the exact ICMP-quoted lost range; Congestion::set_mss scales cwnd down. No exact one-retry/no-congestion-response and send-window-multiple proof covers this complete recommendation.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.4"
+      "status": "covered",
+      "reason": "Connection caches PMTU-derived MSS and bounds packetization by it; family-floor wire tests assert repaired packets within the updated PMTU. GET_MAXSIZES polling is an example, not a required API. Probe behavior is the selected RFC4821 extension.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.4",
+      "evidence": [
+        "crates/ntcp/src/connection.rs::    fn refresh_path_mss(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+      ]
     },
     {
       "id": "1191-077",
@@ -639,24 +803,27 @@
       "id": "1191-078",
       "section": "6.4",
       "quote": "Finally, when a Datagram Too Big message is received, it implies that a datagram was dropped by the router that sent the ICMP message. It is sufficient to treat this as any other dropped segment, and wait until the retransmission timer expires to cause retransmission of the segment. If the PMTU Discovery process requires several steps to estimate the right PMTU, this could delay the connection by many round-trip times.",
-      "status": "TODO",
-      "reason": "Per-packet budget and peer ceiling exist. set_path_mss rearms head retransmission rather than retaining the exact ICMP-quoted lost range; Congestion::set_mss scales cwnd down. No exact one-retry/no-congestion-response and send-window-multiple proof covers this complete recommendation.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.4"
+      "status": "context",
+      "reason": "Explains ordinary retransmission as a sufficient recovery option and its latency cost; the selected immediate-on-decrease alternative is audited in 1191-079, not an additional mandatory timer mode."
     },
     {
       "id": "1191-079",
       "section": "6.4",
       "quote": "Alternatively, the retransmission could be done in immediate response to a notification that the Path MTU has changed, but only for the specific connection specified by the Datagram Too Big message. The datagram size used in the retransmission should, of course, be no larger than the new PMTU.",
-      "status": "TODO",
-      "reason": "Per-packet budget and peer ceiling exist. set_path_mss rearms head retransmission rather than retaining the exact ICMP-quoted lost range; Congestion::set_mss scales cwnd down. No exact one-retry/no-congestion-response and send-window-multiple proof covers this complete recommendation.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.4"
+      "status": "covered",
+      "reason": "Accepted feedback refreshes only the matched Connection; the family-floor test verifies retry sequence/payload and complete packet size within the new PMTU. Cross-connection dispatch is additionally exercised by native tuple validation; this does not close exact dropped-range notification or burst deduplication.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.4",
+      "evidence": [
+        "crates/ntcp/src/connection.rs::    pub(crate) fn pmtu_feedback(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+      ]
     },
     {
       "id": "1191-080",
       "section": "6.4",
       "quote": "Note: One MUST not retransmit in response to every Datagram Too Big message, since a burst of several oversized segments will give rise to several such messages and hence several retransmissions of the same data. If the new estimated PMTU is still wrong, the process repeats, and there is an exponential growth in the number of superfluous segments sent!",
       "status": "TODO",
-      "reason": "Per-packet budget and peer ceiling exist. set_path_mss rearms head retransmission rather than retaining the exact ICMP-quoted lost range; Congestion::set_mss scales cwnd down. No exact one-retry/no-congestion-response and send-window-multiple proof covers this complete recommendation.",
+      "reason": "Equal/nondecreasing reports are rejected, but no exact burst test establishes absence of repeated retransmission of the same data for several successively decreasing PTBs before ACK progress.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.4"
     },
     {
@@ -684,7 +851,7 @@
       "section": "6.4",
       "quote": "TCP performance can be reduced if the sender's maximum window size is not an exact multiple of the segment size in use (this is not the congestion window size, which is always a multiple of the segment size). In many system (such as those derived from 4.2BSD), the segment size is often set to 1024 octets, and the maximum window size (the \"send space\") is usually a multiple of 1024 octets, so the proper relationship holds by default. If PMTU Discovery is used, however, the segment size may not be a submultiple of the send space, and it may change during a connection; this means that the TCP layer may need to change the transmission window size when PMTU Discovery changes the PMTU value. The maximum window size should be set to the greatest multiple of the segment size (PMTU - 40) that is less than or equal to the sender's buffer space size.",
       "status": "TODO",
-      "reason": "Per-packet budget and peer ceiling exist. set_path_mss rearms head retransmission rather than retaining the exact ICMP-quoted lost range; Congestion::set_mss scales cwnd down. No exact one-retry/no-congestion-response and send-window-multiple proof covers this complete recommendation.",
+      "reason": "No adjustment rounds the maximum send window to the greatest multiple of PMTU-40 within send-buffer space; the MSS byte budget alone does not establish this recommendation.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.4"
     },
     {
@@ -743,7 +910,7 @@
       "section": "6.6",
       "quote": "We suggest that an implementation provide a way for a system utility program to:",
       "status": "TODO",
-      "reason": "No per-route management/DF-disable or aging-timeout control; PmtudConfig exposes only first_hop_mtu. Administrative lower_mss is a send ceiling, not arbitrary path-cache control.",
+      "reason": "Introduces the per-route administrative controls in 1191-091/092; no system-utility route-control interface exists.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.6"
     },
     {
@@ -751,7 +918,7 @@
       "section": "6.6",
       "quote": "- Specify that PMTU Discovery not be done on a given route.",
       "status": "TODO",
-      "reason": "No per-route management/DF-disable or aging-timeout control; PmtudConfig exposes only first_hop_mtu. Administrative lower_mss is a send ceiling, not arbitrary path-cache control.",
+      "reason": "PMTUD is configured per connection at creation, but no system-utility control disables discovery on a given route.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.6"
     },
     {
@@ -759,7 +926,7 @@
       "section": "6.6",
       "quote": "- Change the PMTU value associated with a given route.",
       "status": "TODO",
-      "reason": "No per-route management/DF-disable or aging-timeout control; PmtudConfig exposes only first_hop_mtu. Administrative lower_mss is a send ceiling, not arbitrary path-cache control.",
+      "reason": "No administrative API sets an arbitrary per-route PMTU estimate. lower_mss is a send ceiling, not a route-cache setter.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.6"
     },
     {
@@ -767,7 +934,7 @@
       "section": "6.6",
       "quote": "The former can be accomplished by associating a flag with the routing entry; when a packet is sent via a route with this flag set, the IP layer leaves the DF bit clear no matter what the upper layer requests.",
       "status": "TODO",
-      "reason": "No per-route management/DF-disable or aging-timeout control; PmtudConfig exposes only first_hop_mtu. Administrative lower_mss is a send ceiling, not arbitrary path-cache control.",
+      "reason": "The suggested route flag to override DF is not provided; the IPv4 codec always sets DF.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.6"
     },
     {
@@ -782,7 +949,7 @@
       "section": "6.6",
       "quote": "The implementation should also provide a way to change the timeout period for aging stale PMTU information.",
       "status": "TODO",
-      "reason": "No per-route management/DF-disable or aging-timeout control; PmtudConfig exposes only first_hop_mtu. Administrative lower_mss is a send ceiling, not arbitrary path-cache control.",
+      "reason": "No API changes the fixed 600-second aging/search-reset interval.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-6.6"
     },
     {
@@ -834,24 +1001,24 @@
       "id": "1191-102",
       "section": "7.1",
       "quote": "Section 6.3 suggests detecting increases in the PMTU value by periodically increasing the PTMU estimate to the first-hop MTU. Since it is likely that this process will simply \"rediscover\" the current PTMU estimate, at the cost of several dropped datagrams, it should not be done often.",
-      "status": "TODO",
-      "reason": "ACK-confirmed binary PLPMTUD search is selected, not periodic blind next-plateau increases with configurable short/long classical timers. Literal classical heuristic is not claimed.",
+      "status": "exception",
+      "reason": "Unselected classical blind upward-estimate heuristic. TCP selects ACK-confirmed RFC4821 probing (Pmtud::target/ack/tick; pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry). RFC4821 section1 implicitly relaxes classical algorithm requirements without updating RFC1191; section4 still governs congestion response. This exception is only for this upward-search alternative, not decreases, PTB holdoff, or 1191-069 retransmit-on-increase.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-7.1"
     },
     {
       "id": "1191-103",
       "section": "7.1",
       "quote": "A better approach is to periodically increase the PMTU estimate to the next-highest value in the plateau table (or the first-hop MTU, if that is smaller). If the increased estimate is wrong, at most one round-trip time is wasted before the correct value is rediscovered. If the increased estimate is still too low, a higher estimate will be attempted somewhat later.",
-      "status": "TODO",
-      "reason": "ACK-confirmed binary PLPMTUD search is selected, not periodic blind next-plateau increases with configurable short/long classical timers. Literal classical heuristic is not claimed.",
+      "status": "exception",
+      "reason": "Unselected classical blind upward-estimate heuristic. TCP selects ACK-confirmed RFC4821 probing (Pmtud::target/ack/tick; pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry). RFC4821 section1 implicitly relaxes classical algorithm requirements without updating RFC1191; section4 still governs congestion response. This exception is only for this upward-search alternative, not decreases, PTB holdoff, or 1191-069 retransmit-on-increase.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-7.1"
     },
     {
       "id": "1191-104",
       "section": "7.1",
       "quote": "Because it may take several such periods to discover a significant increase in the PMTU, we recommend that a short timeout period should be used after the estimate is increased, and a longer timeout be used",
-      "status": "TODO",
-      "reason": "ACK-confirmed binary PLPMTUD search is selected, not periodic blind next-plateau increases with configurable short/long classical timers. Literal classical heuristic is not claimed.",
+      "status": "exception",
+      "reason": "Unselected classical blind upward-estimate heuristic. TCP selects ACK-confirmed RFC4821 probing (Pmtud::target/ack/tick; pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry). RFC4821 section1 implicitly relaxes classical algorithm requirements without updating RFC1191; section4 still governs congestion response. This exception is only for this upward-search alternative, not decreases, PTB holdoff, or 1191-069 retransmit-on-increase.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-7.1"
     },
     {
@@ -872,8 +1039,8 @@
       "id": "1191-107",
       "section": "7.1",
       "quote": "after the PTMU estimate is decreased because of a Datagram Too Big message. For example, after the PTMU estimate is decreased, the timeout should be set to 10 minutes; once this timer expires and a larger MTU is attempted, the timeout can be set to a much smaller value (say, 2 minutes). In no case should the timeout be shorter than the estimated round-trip time, if this is known.",
-      "status": "TODO",
-      "reason": "ACK-confirmed binary PLPMTUD search is selected, not periodic blind next-plateau increases with configurable short/long classical timers. Literal classical heuristic is not claimed.",
+      "status": "exception",
+      "reason": "Unselected classical blind upward-estimate heuristic. TCP selects ACK-confirmed RFC4821 probing (Pmtud::target/ack/tick; pmtud_real_probe_ack_restore_failed_encode_and_periodic_retry). RFC4821 section1 implicitly relaxes classical algorithm requirements without updating RFC1191; section4 still governs congestion response. This exception is only for this upward-search alternative, not decreases, PTB holdoff, or 1191-069 retransmit-on-increase.",
       "target": "https://www.rfc-editor.org/rfc/rfc1191#section-7.1"
     },
     {
@@ -887,17 +1054,25 @@
       "id": "1191-109",
       "section": "8",
       "quote": "In the first attack, the false message indicates a PMTU much smaller than reality. This should not entirely stop data flow, since the victim host should never set its PMTU estimate below the absolute minimum, but at 8 octets of IP data per datagram, progress could be slow.",
-      "status": "TODO",
-      "reason": "Family floor and nonincrease guards exist; the complete security prose does not establish resistance to an on-path ICMP blocker.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-8"
+      "status": "covered",
+      "reason": "The IPv4 estimate retains the legal 68-byte floor; the core wire test demonstrates bounded payload repair at that floor. This repeats the floor invariant, not a guarantee against an on-path ICMP blocker.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-8",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_wire_family_floors_options_wrap_and_receive_offer()"
+      ]
     },
     {
       "id": "1191-110",
       "section": "8",
       "quote": "In the other attack, the false message indicates a PMTU greater than reality. If believed, this could cause temporary blockage as the victim sends datagrams that will be dropped by some router. Within one round-trip time, the host would discover its mistake (receiving Datagram Too Big messages from that router), but frequent repetition of this attack could cause lots of datagrams to be dropped. A host, however, should never raise its estimate of the PMTU based on a Datagram Too Big message, so should not be vulnerable to this attack.",
-      "status": "TODO",
-      "reason": "Family floor and nonincrease guards exist; the complete security prose does not establish resistance to an on-path ICMP blocker.",
-      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-8"
+      "status": "covered",
+      "reason": "IPv4 feedback rejects equal/larger and impossible candidates; exact-quote tests show these do not raise the estimate. The hypothetical attack narrative is not a separate router round-trip or on-path-blocker obligation.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1191#section-8",
+      "evidence": [
+        "crates/ntcp/src/pmtud.rs::    pub fn feedback(",
+        "crates/ntcp/src/pmtud_tests.rs::fn pmtud_quote_security_zero_plateaus_and_progress_deferred_candidate()"
+      ]
     },
     {
       "id": "1191-111",
@@ -919,6 +1094,6 @@
   "nonoperative_sections": [
     "front matter, abstract, acknowledgements, references, author addresses"
   ],
-  "counting_note": "Duvet requirement counts are audit spans, including advice and overlapping automatic/manual quotes; they are not counts of unique mandatory norms. Covered includes exceptions; subtract excepted for source-and-test-only coverage.",
+  "counting_note": "Duvet requirement counts are audit spans, including advice and overlapping automatic/manual quotes; they are not counts of unique mandatory norms. Covered includes exceptions; subtract excepted for source-and-test-only coverage. Original paragraph IDs and quotes are preserved; lowercase suffix IDs are exact operative subspans linked by parent. Mixed originals are context, not duplicate operative requirements.",
   "interpretation": "Sections2-4 specify IPv4 PMTUD. Sections5-7 explicitly provide implementation suggestions; retain their operative recommendations without inventing BCP14 levels. Section8 repeats security invariants."
 }
