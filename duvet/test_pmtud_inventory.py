@@ -41,8 +41,8 @@ class PmtudInventory(unittest.TestCase):
 
     def test_inventory_dispositions_match_exact_additions_and_todos(self):
         # Counts pin the reviewed inventory, including prose without BCP14 words.
-        expected = {1191: (111, 77), 8201: (107, 52),
-                    4821: (215, 118), 5927: (257, 68)}
+        expected = {1191: (126, 80), 8201: (114, 54),
+                    4821: (215, 104), 5927: (257, 55)}
         for n in RFCS:
             inv = self.inventory(n)
             rows = inv["paragraphs"]
@@ -57,7 +57,13 @@ class PmtudInventory(unittest.TestCase):
             for status in ("TODO", "exception"):
                 self.assertEqual({key(p) for p in operative if p["status"] == status},
                                  {key(p) for p in todos.get(status, [])})
+            by_id = {p["id"]: p for p in rows}
             for p in rows:
+                if "parent" in p:
+                    parent = by_id[p["parent"]]
+                    self.assertEqual(parent["status"], "context", p["id"])
+                    self.assertIn(p["quote"], parent["quote"], p["id"])
+                    self.assertEqual(p["section"], parent["section"], p["id"])
                 self.assertIn(p["status"], ("context", "covered", "TODO", "exception"))
                 self.assertTrue(p["reason"].strip(), p["id"])
                 if p["status"] == "covered":
@@ -110,6 +116,41 @@ class PmtudInventory(unittest.TestCase):
             self.assertEqual(row["status"], "exception")
             self.assertIn("Selected Informational policy deviation:", row["reason"])
             self.assertIn("historical algorithm is deliberately not selected", row["reason"])
+
+    def test_classical_operative_closures_and_selected_alternatives(self):
+        rows = {p["id"]: p for n in (1191, 8201)
+                for p in self.inventory(n)["paragraphs"]}
+        alternatives = tuple(f"1191-{i:03}" for i in (70, 71, 72, 73, 102, 103, 104, 107))
+        expected = {
+            "covered": ("1191-005a", "1191-005b", "1191-005d", "1191-006b",
+                        "1191-014a", "1191-013a", "1191-013c", "1191-013e",
+                        "8201-003", "8201-035", "8201-051", "8201-058",
+                        "8201-068", "8201-086"),
+            "context": ("1191-015", "1191-029", "1191-060", "1191-066"),
+            "exception": ("1191-005c", "1191-006a", "1191-007", "1191-013d",
+                          "1191-013f", "1191-063", "8201-025b", "8201-065",
+                          *alternatives),
+            # These are open obligations/evidence gaps, not expected runtime failures.
+            "TODO": ("1191-068", "1191-069", "8201-004", "8201-060",
+                     "8201-069", "8201-076"),
+        }
+        for status, ids in expected.items():
+            for id in ids:
+                with self.subTest(id=id):
+                    self.assertEqual(rows[id]["status"], status)
+        for id in (*alternatives, "1191-013d", "1191-013f"):
+            self.assertIn("RFC4821 section1", rows[id]["reason"], id)
+        for fragment in ("set_path_mss", "retx_pending", "remaining flight"):
+            self.assertIn(fragment, rows["1191-069"]["reason"])
+
+    def test_paws_discovery_gap_names_concrete_supplied_embedding(self):
+        todos = tomllib.loads((ROOT / "duvet/rfc7323-todos.toml").read_text())["TODO"]
+        matching = [p for p in todos if p["target"] == f"{PREFIX}7323#section-5.7"]
+        self.assertEqual(len(matching), 1)
+        reason = matching[0]["reason"]
+        for fragment in ("crates/ntcp/examples/tun_echo.rs", "NTCP_TIMESTAMPS=1",
+                         "DF", "pmtud=None", "input_frame", "TCP only", "ICMP PTB"):
+            self.assertIn(fragment, reason)
 
     def test_all_inventory_quotes_match_official_text_when_cached(self):
         for n in RFCS:
