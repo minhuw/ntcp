@@ -774,6 +774,13 @@ unsafe fn address(p: *const sockaddr, len: socklen_t) -> Result<SocketAddr> {
         u16::from_be(p.sin_port),
     ))
 }
+// Linux rejects AF_UNSPEC for an implicit Fast Open connect (not a disconnect).
+unsafe fn send_address(p: *const sockaddr, len: socklen_t, flags: i32) -> Result<SocketAddr> {
+    if flags & MSG_FASTOPEN != 0 && len >= 2 && load(p.cast::<u16>())? as i32 == AF_UNSPEC {
+        return Err(EOPNOTSUPP);
+    }
+    unsafe { address(p, len) }
+}
 unsafe fn output_addr(addr: SocketAddr, p: *mut sockaddr, len: *mut socklen_t) -> Result<()> {
     if p.is_null() {
         return Ok(());
@@ -1023,7 +1030,7 @@ unsafe fn transfer(fd: i32, p: *mut c_void, n: usize, flags: i32, write: bool) -
     if flags
         & !(MSG_DONTWAIT
             | if write {
-                MSG_NOSIGNAL | MSG_ZEROCOPY | MSG_MORE | MSG_EOR
+                MSG_NOSIGNAL | MSG_ZEROCOPY | MSG_MORE | MSG_EOR | MSG_FASTOPEN
             } else {
                 MSG_PEEK
             })
@@ -1325,7 +1332,7 @@ unsafe fn vectors_output(
     write: bool,
     copies: Vec<(usize, Vec<u8>)>,
 ) -> Result<i64> {
-    unsafe { vectors_timestamp(fd, v, count, flags, write, copies, None) }
+    unsafe { vectors_timestamp(fd, v, count, flags, write, copies, (None, None)) }
 }
 unsafe fn vectors_timestamp(
     fd: i32,
@@ -1334,7 +1341,7 @@ unsafe fn vectors_timestamp(
     flags: i32,
     write: bool,
     copies: Vec<(usize, Vec<u8>)>,
-    stamp: Option<u32>,
+    (stamp, destination): (Option<u32>, Option<SocketAddr>),
 ) -> Result<i64> {
     if !(0..=1024).contains(&count) {
         return Err(EINVAL);
@@ -1354,7 +1361,9 @@ unsafe fn vectors_timestamp(
             .ok_or(EINVAL)?;
     }
     if write {
-        if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_ZEROCOPY | MSG_MORE | MSG_EOR) != 0 {
+        if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_ZEROCOPY | MSG_MORE | MSG_EOR | MSG_FASTOPEN)
+            != 0
+        {
             return Err(runtime::unsupported_option("send flags"));
         }
         let id = owned(fd)?.ok_or(EBADF)?;
@@ -1364,7 +1373,9 @@ unsafe fn vectors_timestamp(
             .collect();
         let result = retry(
             id,
-            if let Some(stamp) = stamp {
+            if destination.is_some() {
+                Op::SendTo(sources, flags, destination, stamp)
+            } else if let Some(stamp) = stamp {
                 Op::SendTimestamp(sources, flags, stamp)
             } else {
                 Op::Send(sources, flags)
@@ -1432,13 +1443,23 @@ pub unsafe extern "C" fn ntcp_managed_sendmsg(fd: i32, p: *const msghdr, flags: 
         }
         let m = load(p)?;
         let stamp = send_timestamp_control(&m)?;
-        if !m.msg_name.is_null() {
-            unsafe {
-                address(m.msg_name.cast(), m.msg_namelen)?;
-            }
-        }
+        let destination = if !m.msg_name.is_null() {
+            Some(unsafe { send_address(m.msg_name.cast(), m.msg_namelen, flags)? })
+        } else {
+            None
+        };
         let n = i32::try_from(m.msg_iovlen).map_err(|_| EINVAL)?;
-        unsafe { vectors_timestamp(fd, m.msg_iov, n, flags, true, Vec::new(), stamp) }
+        unsafe {
+            vectors_timestamp(
+                fd,
+                m.msg_iov,
+                n,
+                flags,
+                true,
+                Vec::new(),
+                (stamp, destination),
+            )
+        }
     }) as ssize_t
 }
 #[unsafe(no_mangle)]
@@ -1528,14 +1549,18 @@ pub unsafe extern "C" fn ntcp_managed_sendto(
         if owned(fd)?.is_none() {
             return raw(unsafe { syscall(SYS_sendto, fd, p, n, flags, addr, len) });
         }
-        if !addr.is_null() {
-            unsafe {
-                address(addr, len)?;
-            }
+        let destination = if !addr.is_null() {
+            Some(unsafe { send_address(addr, len, flags)? })
         } else if len != 0 {
             return Err(EFAULT);
-        }
-        unsafe { transfer(fd, p.cast_mut(), n, flags, true) }
+        } else {
+            None
+        };
+        let vector = iovec {
+            iov_base: p.cast_mut(),
+            iov_len: n,
+        };
+        unsafe { vectors_timestamp(fd, &vector, 1, flags, true, Vec::new(), (None, destination)) }
     }) as ssize_t
 }
 #[unsafe(no_mangle)]
@@ -1606,8 +1631,11 @@ pub unsafe extern "C" fn ntcp_managed_setsockopt(
         let Some(id) = owned(fd)? else {
             return raw(unsafe { syscall(SYS_setsockopt, fd, level, name, p, len) });
         };
-        if matches!((level, name), (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF | 37 | 65))
-            && (len as i32) < 4
+        if matches!(
+            (level, name),
+            (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF | 37 | 65)
+                | (IPPROTO_TCP, TCP_FASTOPEN | TCP_FASTOPEN_CONNECT)
+        ) && (len as i32) < 4
         {
             return Err(EINVAL);
         }
@@ -1664,7 +1692,11 @@ pub unsafe extern "C" fn ntcp_managed_getsockopt(
         let Some(id) = owned(fd)? else {
             return raw(unsafe { syscall(SYS_getsockopt, fd, level, name, p, len) });
         };
-        if matches!((level, name), (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF)) {
+        if matches!(
+            (level, name),
+            (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF)
+                | (IPPROTO_TCP, TCP_FASTOPEN | TCP_FASTOPEN_CONNECT)
+        ) {
             let requested = load(len)?;
             if (requested as i32) < 0 {
                 return Err(EINVAL);
@@ -2878,3 +2910,6 @@ mod inq_tests;
 
 #[cfg(all(test, feature = "packet-test"))]
 mod stream_read_tests;
+
+#[cfg(test)]
+mod fast_open_abi_tests;

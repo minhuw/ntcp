@@ -27,6 +27,9 @@ pub(super) struct LogicalSend {
     cookie: Option<u64>,
     zc: Option<u32>,
     zerocopy: bool,
+    destination: Option<SocketAddr>,
+    fast_open_started: bool,
+    wait_handshake: bool,
 }
 impl LogicalSend {
     pub(super) fn new(
@@ -35,6 +38,7 @@ impl LogicalSend {
         sources: Vec<(usize, usize)>,
         flags: i32,
         stamp: Option<u32>,
+        destination: Option<SocketAddr>,
     ) -> Result<Self> {
         let total = sources
             .iter()
@@ -63,6 +67,9 @@ impl LogicalSend {
             cookie: None,
             zc: None,
             zerocopy: socket.zerocopy && flags & MSG_ZEROCOPY != 0,
+            destination,
+            fast_open_started: false,
+            wait_handshake: false,
         })
     }
     #[cfg(test)]
@@ -70,13 +77,93 @@ impl LogicalSend {
         self.total
     }
     fn done(&self) -> bool {
-        self.accepted == self.total
+        self.accepted == self.total && !self.wait_handshake
+    }
+    fn copy_chunk(&self, count: usize) -> Result<Vec<u8>> {
+        let mut bytes = vec![0; count];
+        let mut copied = 0;
+        let mut index = self.index;
+        let mut offset = self.offset;
+        while copied < count {
+            let (address, len) = self.sources[index];
+            let len = (len - offset).min(count - copied);
+            if len == 0 {
+                index += 1;
+                offset = 0;
+                continue;
+            }
+            let address = address.checked_add(offset).ok_or(EFAULT)?;
+            // A fault anywhere in this bounded chunk admits none of it.
+            memory(bytes[copied..].as_mut_ptr(), address as *mut u8, len, false)?;
+            copied += len;
+            offset += len;
+            if offset == self.sources[index].1 {
+                index += 1;
+                offset = 0;
+            }
+        }
+        Ok(bytes)
+    }
+    fn advance(&mut self, mut count: usize) {
+        self.accepted += count;
+        while count != 0 {
+            let n = count.min(self.sources[self.index].1 - self.offset);
+            self.offset += n;
+            count -= n;
+            if self.offset == self.sources[self.index].1 {
+                self.index += 1;
+                self.offset = 0;
+            }
+        }
     }
 }
 impl Owner {
     // One bounded copy/admission per service turn. No foreign data survives a
     // turn except bytes already owned by TCP; the cursor advances only on write.
     fn send_step(&mut self, id: u64, send: &mut LogicalSend, blocking: bool) -> Result<()> {
+        let socket = self.sockets.get(&id).ok_or(EBADF)?;
+        if !send.fast_open_started
+            && (send.flags & MSG_FASTOPEN != 0 || socket.deferred_peer.is_some())
+        {
+            if socket.deferred_peer.is_none() {
+                self.check_connect(id)?;
+            }
+            let remote = socket.deferred_peer.or(send.destination).ok_or(EINVAL)?;
+            if remote.port() == 0 {
+                return Err(EINVAL);
+            }
+            // No completion/timestamp range may be fabricated for bytes queued
+            // by core's initial-copy API. Reject before consuming or connecting.
+            if send.flags & MSG_ZEROCOPY != 0 || send.bits & crate::timestamping::TX_RECORD != 0 {
+                return Err(EOPNOTSUPP);
+            }
+            let lowat =
+                effective_notsent_lowat(socket.notsent_lowat, self.socket_policy.notsent_lowat);
+            let count = send
+                .total
+                .min(BYTES)
+                .min(socket.send_capacity)
+                .min(lowat as usize);
+            if count == 0 && send.total != 0 {
+                return Err(EAGAIN);
+            }
+            // Crucially precedes local-port allocation, core connection, and
+            // clearing the deferred peer. EFAULT leaves the socket retryable.
+            let bytes = send.copy_chunk(count)?;
+            let local = self.connect_local(id)?;
+            let n = self.start_connection(id, local, remote, Some(&bytes))?;
+            send.fast_open_started = true;
+            send.advance(n);
+            send.wait_handshake = blocking;
+            if n == 0 && !blocking {
+                return Err(EINPROGRESS);
+            }
+            return Ok(());
+        }
+        if send.wait_handshake {
+            self.send_state(id)?;
+            send.wait_handshake = false;
+        }
         let connected = matches!(
             self.sockets.get(&id).ok_or(EBADF)?.handle,
             Handle::Connection(_)
@@ -126,29 +213,8 @@ impl Owner {
             observed.try_reserve_exact(4).map_err(|_| ENOBUFS)?;
         }
         let count = remaining.min(BYTES).min(room);
-        let mut bytes = vec![0; count];
-        let mut copied = 0;
-        let mut index = send.index;
-        let mut offset = send.offset;
-        while copied < count {
-            let (address, len) = send.sources[index];
-            let len = (len - offset).min(count - copied);
-            if len == 0 {
-                index += 1;
-                offset = 0;
-                continue;
-            }
-            let address = address.checked_add(offset).ok_or(EFAULT)?;
-            // The temporary chunk is one copy transaction: a fault in any
-            // page/iovec admits none of it. Earlier owner turns remain accepted.
-            memory(bytes[copied..].as_mut_ptr(), address as *mut u8, len, false)?;
-            copied += len;
-            offset += len;
-            if offset == send.sources[index].1 {
-                index += 1;
-                offset = 0;
-            }
-        }
+        let bytes = send.copy_chunk(count)?;
+        let copied = bytes.len();
         let cid = cid.ok_or(ENOTCONN)?;
         let flags = if blocking && copied < remaining {
             (send.flags | MSG_MORE) & !MSG_EOR
@@ -158,9 +224,7 @@ impl Owner {
         let cookie = self.timestamp_cookie;
         let n = self.timestamp_write_bits(id, cid, &bytes[..copied], flags, send.bits)?;
         debug_assert_eq!(n, copied); // Exclusive owner: admission cannot change during copy.
-        send.accepted += n;
-        send.index = index;
-        send.offset = offset;
+        send.advance(n);
         send.cid = Some(cid);
         send.end = self.endpoint.send_progress(cid).map_err(engine)?.queued_end;
         if let Some(old) = send.cookie.take() {
@@ -270,8 +334,9 @@ impl Owner {
         sources: Vec<(usize, usize)>,
         flags: i32,
         stamp: Option<u32>,
+        destination: Option<SocketAddr>,
     ) -> Result<Reply> {
-        let mut send = LogicalSend::new(self, id, sources, flags, stamp)?;
+        let mut send = LogicalSend::new(self, id, sources, flags, stamp, destination)?;
         let result = self.send_step(id, &mut send, false);
         self.finish_send(id, &mut send, result)
     }
@@ -287,6 +352,9 @@ impl Owner {
         count: usize,
         flags: i32,
     ) -> Result<i32> {
+        if self.sockets.get(&id).ok_or(EBADF)?.deferred_peer.is_some() {
+            return Err(EOPNOTSUPP);
+        }
         if count == 0 {
             return match offset {
                 Some(offset) => raw(unsafe {

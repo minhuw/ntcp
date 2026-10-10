@@ -233,7 +233,7 @@ fn logical_max_count_and_page_fault_without_large_allocation() {
             0,
         );
         assert_ne!(p, MAP_FAILED);
-        let send = LogicalSend::new(&a, client, vec![(p as usize, huge)], 0, None).unwrap();
+        let send = LogicalSend::new(&a, client, vec![(p as usize, huge)], 0, None, None).unwrap();
         assert_eq!(send.total_for_test(), send::max_rw_count());
         assert!(
             a.execute(client, Op::Send(vec![(p as usize, huge)], 0))

@@ -317,3 +317,5 @@ fn last_close_retries_full_admission_instead_of_leaking_removed_fd() {
     runtime.call(42, Op::Close).unwrap();
     worker.join().unwrap();
 }
+
+include!("runtime_fast_open_tests.rs");

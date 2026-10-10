@@ -3,6 +3,8 @@
 mod backend;
 #[path = "runtime_egress.rs"]
 mod egress;
+#[path = "runtime_fast_open.rs"]
+mod fast_open;
 #[path = "runtime_output.rs"]
 mod output;
 #[path = "runtime_send.rs"]
@@ -63,6 +65,7 @@ pub enum Op {
     #[cfg(test)]
     WriteFlags(Vec<u8>, i32),
     Send(Vec<(usize, usize)>, i32),
+    SendTo(Vec<(usize, usize)>, i32, Option<SocketAddr>, Option<u32>),
     Transfer {
         source: i32,
         staging: [i32; 2],
@@ -330,6 +333,9 @@ struct Socket {
     cork: bool,
     inq: bool,
     notsent_lowat: u32,
+    fast_open_limit: i32,
+    fast_open_connect: bool,
+    deferred_peer: Option<SocketAddr>,
     readiness: i32,
     readiness_generations: [u64; 5],
     keepalive: bool,
@@ -368,6 +374,9 @@ impl Socket {
             cork: false,
             inq: false,
             notsent_lowat: 0,
+            fast_open_limit: 0,
+            fast_open_connect: false,
+            deferred_peer: None,
             readiness: 0,
             readiness_generations: [0; 5],
             keepalive: false,
@@ -769,16 +778,19 @@ impl Owner {
         } else {
             (&request.op, false)
         };
-        if matches!(op, Op::Send(..) | Op::SendTimestamp(..)) {
+        if matches!(op, Op::Send(..) | Op::SendTimestamp(..) | Op::SendTo(..)) {
             if request.send.is_none() {
-                let (sources, flags, stamp) = match op {
-                    Op::Send(sources, flags) => (sources.clone(), *flags, None),
+                let (sources, flags, stamp, destination) = match op {
+                    Op::Send(sources, flags) => (sources.clone(), *flags, None, None),
                     Op::SendTimestamp(sources, flags, stamp) => {
-                        (sources.clone(), *flags, Some(*stamp))
+                        (sources.clone(), *flags, Some(*stamp), None)
+                    }
+                    Op::SendTo(sources, flags, destination, stamp) => {
+                        (sources.clone(), *flags, *stamp, *destination)
                     }
                     _ => unreachable!(),
                 };
-                match LogicalSend::new(self, request.id, sources, flags, stamp) {
+                match LogicalSend::new(self, request.id, sources, flags, stamp, destination) {
                     Ok(send) => request.send = Some(send),
                     Err(e) => {
                         let _ = request.reply.send(Err(e));
@@ -1246,7 +1258,7 @@ impl Owner {
         if s.write_shutdown || matches!(state, State::Closed | State::TimeWait) {
             return Err(EPIPE);
         }
-        if matches!(state, State::SynSent | State::SynReceived) {
+        if state == State::SynSent || state == State::SynReceived && !s.connected {
             return Err(EAGAIN);
         }
         Ok(cid)
@@ -1306,7 +1318,11 @@ impl Owner {
             bits |= EPOLLERR;
         }
         match s.handle {
-            Handle::Fresh => (),
+            Handle::Fresh => {
+                if s.deferred_peer.is_some() {
+                    bits |= EPOLLOUT;
+                }
+            }
             Handle::Listener(_) => {
                 if s.acceptable {
                     bits |= EPOLLIN;
@@ -1338,7 +1354,8 @@ impl Owner {
                 if s.write_shutdown
                     || s.error != 0
                     || matches!(state, State::Closed | State::TimeWait)
-                    || (matches!(state, State::Established | State::CloseWait)
+                    || ((matches!(state, State::Established | State::CloseWait)
+                        || state == State::SynReceived && s.connected)
                         && info.send_used < info.send_capacity
                         && notsent_writable(
                             info.notsent_bytes,
@@ -1415,7 +1432,10 @@ impl Owner {
         let s = self.sockets.get(&id).ok_or(EBADF)?;
         match op {
             Op::Bind(mut addr) => {
-                if !matches!(s.handle, Handle::Fresh) || s.local.is_some() {
+                if !matches!(s.handle, Handle::Fresh)
+                    || s.local.is_some()
+                    || s.deferred_peer.is_some()
+                {
                     return Err(EINVAL);
                 }
                 if !s.freebind && addr.ip() != IpAddr::V4(self.local) && !addr.ip().is_unspecified()
@@ -1436,9 +1456,10 @@ impl Owner {
                 self.sockets.get_mut(&id).unwrap().local = Some(addr);
             }
             Op::Listen(backlog) => {
-                if !matches!(s.handle, Handle::Fresh) {
+                if !matches!(s.handle, Handle::Fresh) || s.deferred_peer.is_some() {
                     return Err(EOPNOTSUPP);
                 }
+                let fast_open_limit = s.fast_open_limit;
                 let capacities = (s.send_capacity, s.receive_capacity);
                 let application_timeout = user_timeout_us(s.user_timeout_ms)?;
                 let local = match s.local {
@@ -1468,6 +1489,13 @@ impl Owner {
                     && let Err(e) = self
                         .endpoint
                         .set_listener_rx_timestamp_capacity(listener, timestamps::PHASES)
+                {
+                    let _ = self.endpoint.close_listener(listener);
+                    return Err(engine(e));
+                }
+                if let Err(e) = self
+                    .endpoint
+                    .set_listener_fast_open(listener, fast_open_limit as usize)
                 {
                     let _ = self.endpoint.close_listener(listener);
                     return Err(engine(e));
@@ -1567,68 +1595,38 @@ impl Owner {
                 // Core emits Acceptable on empty->nonempty; stay readable until accept returns EAGAIN.
             }
             Op::Connect(remote) => {
-                match s.handle {
-                    Handle::Fresh => (),
-                    Handle::Listener(_) => return Err(EINVAL),
-                    Handle::Connection(cid) => {
-                        return Err(
-                            if matches!(
-                                self.endpoint.state(cid),
-                                Ok(State::SynSent | State::SynReceived)
-                            ) {
-                                EALREADY
-                            } else {
-                                EISCONN
-                            },
-                        );
-                    }
-                }
+                self.check_connect(id)?;
                 if remote.port() == 0 {
                     return Err(EINVAL);
                 }
-                let options = s.clone();
-                self.connection_options
-                    .retain(|p| self.endpoint.connection_exists(p.0));
-                if self.connection_options.len() == self.socket_limit() {
-                    return Err(ENOBUFS);
+                let local = self.connect_local(id)?;
+                if self.sockets[&id].fast_open_connect {
+                    self.endpoint.enable_fast_open().map_err(engine)?;
+                    if self
+                        .endpoint
+                        .has_fast_open_cookie(self.now(), local.ip(), remote.ip())
+                        .map_err(engine)?
+                    {
+                        let s = self.sockets.get_mut(&id).unwrap();
+                        s.local = Some(local);
+                        s.deferred_peer = Some(remote);
+                        return Ok(out);
+                    }
+                    self.start_connection(id, local, remote, Some(&[]))?;
+                } else {
+                    self.start_connection(id, local, remote, None)?;
                 }
-                let mut local = match s.local {
-                    Some(a) => a,
-                    None => SocketAddr::new(self.local.into(), self.port()?),
-                };
-                if local.ip().is_unspecified() {
-                    local.set_ip(self.local.into());
-                }
-                let cid = self
-                    .endpoint
-                    .connect_with_buffer_capacities(
-                        self.now(),
-                        local,
-                        remote,
-                        options.send_capacity,
-                        options.receive_capacity,
-                    )
-                    .map_err(engine)?;
-                if let Err(e) = self.apply_options(cid, &options) {
-                    self.rollback_connection(cid);
-                    return Err(e);
-                }
-                self.connection_options.push((
-                    cid,
-                    options.tos,
-                    options.discover,
-                    Some(options.zerocopy),
-                ));
-                let s = self.sockets.get_mut(&id).unwrap();
-                s.handle = Handle::Connection(cid);
-                s.local = Some(local);
                 return Err(EINPROGRESS);
             }
             Op::Read(capacity) | Op::Peek(capacity) | Op::ReadTo(capacity, _, _, _) => {
                 let foreign = matches!(op, Op::ReadTo(..));
                 let peek = matches!(op, Op::Peek(_) | Op::ReadTo(..));
                 let Handle::Connection(cid) = s.handle else {
-                    return Err(ENOTCONN);
+                    return Err(if s.deferred_peer.is_some() {
+                        EAGAIN
+                    } else {
+                        ENOTCONN
+                    });
                 };
                 if capacity == 0 {
                     if let Op::ReadTo(_, _, _, copies) = &op {
@@ -1729,13 +1727,16 @@ impl Owner {
                 };
                 out.timeout_us = self.endpoint.urgent_remaining(cid).map_err(engine)?;
             }
-            Op::Send(_, _) | Op::SendTimestamp(..) => {
-                let (sources, flags, override_flags) = match op {
-                    Op::Send(sources, flags) => (sources, flags, None),
-                    Op::SendTimestamp(sources, flags, stamp) => (sources, flags, Some(stamp)),
+            Op::Send(_, _) | Op::SendTimestamp(..) | Op::SendTo(..) => {
+                let (sources, flags, override_flags, destination) = match op {
+                    Op::Send(sources, flags) => (sources, flags, None, None),
+                    Op::SendTimestamp(sources, flags, stamp) => (sources, flags, Some(stamp), None),
+                    Op::SendTo(sources, flags, destination, stamp) => {
+                        (sources, flags, stamp, destination)
+                    }
                     _ => unreachable!(),
                 };
-                return self.send_once(id, sources, flags, override_flags);
+                return self.send_once(id, sources, flags, override_flags, destination);
             }
             Op::RxTimestamp(count) => {
                 let Handle::Connection(cid) = s.handle else {
@@ -1974,6 +1975,25 @@ impl Owner {
                         user_timeout_us(value)?;
                         s.user_timeout_ms = value;
                     }
+                    (IPPROTO_TCP, TCP_FASTOPEN) => {
+                        if value < 0
+                            || !matches!(s.handle, Handle::Fresh | Handle::Listener(_))
+                            || s.deferred_peer.is_some()
+                        {
+                            return Err(EINVAL);
+                        }
+                        // Linux clamps the queue bound; our endpoint's admission limit is fixed.
+                        s.fast_open_limit = value.min(self.defaults.max_connections as i32);
+                    }
+                    (IPPROTO_TCP, TCP_FASTOPEN_CONNECT) => {
+                        if !(0..=1).contains(&value)
+                            || !matches!(s.handle, Handle::Fresh)
+                            || s.deferred_peer.is_some()
+                        {
+                            return Err(EINVAL);
+                        }
+                        s.fast_open_connect = value != 0;
+                    }
                     (IPPROTO_TCP, TCP_NODELAY) => s.nodelay = value != 0,
                     (IPPROTO_TCP, TCP_CORK) => s.cork = value != 0,
                     // Linux copies an int into an unsigned u32, including negative inputs.
@@ -2058,6 +2078,16 @@ impl Owner {
                         )
                         .map_err(engine)?;
                 }
+                if (level, name) == (IPPROTO_TCP, TCP_FASTOPEN) {
+                    if s.fast_open_limit != 0 {
+                        self.endpoint.enable_fast_open().map_err(engine)?;
+                    }
+                    if let Handle::Listener(listener) = s.handle {
+                        self.endpoint
+                            .set_listener_fast_open(listener, s.fast_open_limit as usize)
+                            .map_err(engine)?;
+                    }
+                }
                 self.sockets.insert(id, candidate);
                 // Linux tcp_setsockopt calls sk_write_space even for a repeated
                 // LOWAT value. Notify each ET registration, not just 0->OUT.
@@ -2090,6 +2120,8 @@ impl Owner {
                     (SOL_SOCKET, SO_KEEPALIVE) => s.keepalive as i32,
                     (SOL_SOCKET, SO_SNDBUF) => s.send_capacity as i32,
                     (SOL_SOCKET, SO_RCVBUF) => s.receive_capacity as i32,
+                    (IPPROTO_TCP, TCP_FASTOPEN) => s.fast_open_limit,
+                    (IPPROTO_TCP, TCP_FASTOPEN_CONNECT) => s.fast_open_connect as i32,
                     (IPPROTO_TCP, TCP_NODELAY) => s.nodelay as i32,
                     (IPPROTO_TCP, TCP_CORK) => s.cork as i32,
                     (IPPROTO_TCP, TCP_INQ) => s.inq as i32,
@@ -2123,6 +2155,10 @@ impl Owner {
             }
             Op::Name(peer) => {
                 out.addr = Some(if peer {
+                    if let Some(peer) = s.deferred_peer {
+                        out.addr = Some(peer);
+                        return Ok(out);
+                    }
                     let Handle::Connection(cid) = s.handle else {
                         return Err(ENOTCONN);
                     };
