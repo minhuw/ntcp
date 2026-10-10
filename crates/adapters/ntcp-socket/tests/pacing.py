@@ -9,10 +9,12 @@ from socket_config import config_env
 from timestamping import ROOT, LIBRARY, environment
 
 
-def isolated(binary, backend, pacing, egress_capacity=32):
+def isolated(binary, backend, pacing, egress_capacity=32, gso=False):
     env = environment()
     commands = [['ip', 'link', 'set', 'lo', 'up']]
     settings = {'io_address': '10.73.0.2', 'io_egress_capacity': egress_capacity}
+    if gso:
+        settings |= {'io_gso_max_bytes': 65536, 'io_gso_max_segments': 16}
     if pacing != 'unset':
         settings['tcp_pacing'] = pacing
     if backend == 'tun':

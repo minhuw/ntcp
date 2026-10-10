@@ -515,3 +515,63 @@ fn egress_capacity_is_a_positive_resource_bound() {
     config.io.egress_capacity = 0;
     assert!(config.validate().is_err());
 }
+
+#[test]
+fn software_gso_bounds_are_optional_paired_and_fail_closed() {
+    let original = SocketConfig::parse(BASE).unwrap();
+    assert_eq!(original.io.gso, None);
+    let config = SocketConfig::parse(&format!(
+        "{BASE}io.gso_max_bytes=65536\nio.gso_max_segments=16"
+    ))
+    .unwrap();
+    assert_eq!(
+        config.io.gso,
+        Some(ntcp::GsoLimits {
+            max_bytes: 65536,
+            max_segments: 16
+        })
+    );
+    assert_eq!(
+        config.tcp.connection.send_ip_payload_limit,
+        original.tcp.connection.send_ip_payload_limit
+    );
+    assert_eq!(config.tcp.max_buffer_bytes, original.tcp.max_buffer_bytes);
+    for suffix in [
+        "io.gso_max_bytes=65536",
+        "io.gso_max_segments=16",
+        "io.gso_max_bytes=0\nio.gso_max_segments=2",
+        "io.gso_max_bytes=65536\nio.gso_max_segments=1",
+        "io.gso_max_bytes=2\nio.gso_max_segments=3",
+        "io.gso_max_bytes=2147483648\nio.gso_max_segments=2",
+        "io.gso_max_bytes=-1\nio.gso_max_segments=2",
+        "io.gso_max_bytes=+2\nio.gso_max_segments=2",
+        "io.gso_max_bytes=2\nio.gso_max_segments=2\nio.gso_max_segments=2",
+    ] {
+        assert!(
+            SocketConfig::parse(&format!("{BASE}{suffix}")).is_err(),
+            "{suffix}"
+        );
+    }
+    for limits in [
+        ntcp::GsoLimits {
+            max_bytes: 0,
+            max_segments: 2,
+        },
+        ntcp::GsoLimits {
+            max_bytes: 65536,
+            max_segments: 1,
+        },
+        ntcp::GsoLimits {
+            max_bytes: 2,
+            max_segments: 3,
+        },
+        ntcp::GsoLimits {
+            max_bytes: usize::MAX,
+            max_segments: 2,
+        },
+    ] {
+        let mut config = original.clone();
+        config.io.gso = Some(limits);
+        assert!(config.validate().is_err());
+    }
+}

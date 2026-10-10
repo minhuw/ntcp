@@ -33,6 +33,7 @@ pub struct IoConfig {
     pub next_hop_mac: Option<[u8; 6]>,
     pub output_reservation_timeout_ms: u32,
     pub egress_capacity: usize,
+    pub gso: Option<ntcp::GsoLimits>,
 }
 
 fn invalid() -> io::Error {
@@ -63,11 +64,24 @@ impl SocketConfig {
                 next_hop_mac: None,
                 output_reservation_timeout_ms: 1000,
                 egress_capacity: crate::runtime::BUDGET,
+                gso: None,
             },
         }
     }
 
     pub fn validate(&self) -> io::Result<()> {
+        if self.io.gso.is_some_and(|limits| {
+            limits.max_bytes == 0
+                || limits.max_bytes > u32::MAX as usize / 2
+                || limits.max_segments < 2
+                || limits.max_segments > limits.max_bytes
+                || limits
+                    .max_bytes
+                    .checked_mul(self.io.egress_capacity)
+                    .is_none()
+        }) {
+            return Err(invalid());
+        }
         if self.io.egress_capacity == 0
             || self.io.egress_capacity.checked_mul(65535 + 14).is_none()
             || self.io.output_reservation_timeout_ms == 0
@@ -123,6 +137,8 @@ impl SocketConfig {
             return Err(invalid());
         }
         let mut config = Self::new("", Ipv4Addr::UNSPECIFIED);
+        let mut gso_bytes = None;
+        let mut gso_segments = None;
         let mut pacing_enabled = false;
         let mut pacing = ntcp::PacingConfig::default();
         let mut tuned = false;
@@ -148,6 +164,8 @@ impl SocketConfig {
                 "io.address" => config.io.address = value.parse().map_err(|_| invalid())?,
                 "io.prefix" => config.io.prefix = Some(number(value)?),
                 "io.egress_capacity" => config.io.egress_capacity = number(value)?,
+                "io.gso_max_bytes" => gso_bytes = Some(number(value)?),
+                "io.gso_max_segments" => gso_segments = Some(number(value)?),
                 "io.output_reservation_timeout_ms" => {
                     config.io.output_reservation_timeout_ms = number(value)?;
                 }
@@ -190,6 +208,14 @@ impl SocketConfig {
         if tuned && !pacing_enabled {
             return Err(invalid());
         }
+        config.io.gso = match (gso_bytes, gso_segments) {
+            (None, None) => None,
+            (Some(max_bytes), Some(max_segments)) => Some(ntcp::GsoLimits {
+                max_bytes,
+                max_segments,
+            }),
+            _ => return Err(invalid()),
+        };
         config.tcp.connection.pacing = pacing_enabled.then_some(pacing);
         config.validate()?;
         Ok(config)

@@ -29,6 +29,8 @@ pub(super) struct Egress {
     candidates: Vec<ConnectionId>,
     packet_capacity: usize,
     cursor: usize,
+    #[cfg(test)]
+    pub(super) selected_ranges: usize,
 }
 fn buffer(size: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -79,7 +81,18 @@ impl Egress {
             candidates,
             packet_capacity,
             cursor: 0,
+            #[cfg(test)]
+            selected_ranges: 0,
         })
+    }
+    #[cfg(test)]
+    pub(super) fn attempt(&self, owner: ConnectionId) -> ntcp::TransmitAttempt {
+        self.tx
+            .iter()
+            .filter_map(|slot| slot.entry.as_ref())
+            .find(|entry| entry.owner == Some(owner))
+            .unwrap()
+            .attempt
     }
     pub(super) fn mtu_refreshed(&mut self) {
         for slot in &mut self.tx {
@@ -118,7 +131,11 @@ impl Egress {
     }
 }
 impl Owner {
-    pub(super) fn enable_egress(&mut self, capacity: usize) -> Result<()> {
+    pub(super) fn enable_egress(
+        &mut self,
+        capacity: usize,
+        gso: Option<ntcp::GsoLimits>,
+    ) -> Result<()> {
         let packet_capacity = if let Some(backend) = &self.ethernet {
             backend.io.max_packet_len().unwrap_or(65535 + 14)
         } else {
@@ -127,9 +144,16 @@ impl Owner {
                 .and_then(|io| io.max_packet_len())
                 .unwrap_or(65535)
         };
-        self.endpoint
-            .enable_output_reservations_with_capacity(capacity)
-            .map_err(engine)?;
+        // Core charges aggregate storage separately from these scalar wire buffers.
+        match gso {
+            Some(limits) => self
+                .endpoint
+                .enable_output_reservations_with_gso(capacity, limits),
+            None => self
+                .endpoint
+                .enable_output_reservations_with_capacity(capacity),
+        }
+        .map_err(engine)?;
         self.egress = Some(Egress::new(
             capacity,
             packet_capacity,
@@ -268,6 +292,10 @@ impl Owner {
         }
         self.drain_timestamps(ClockPair::sample(self));
         if existing.is_none() {
+            #[cfg(test)]
+            {
+                egress.selected_ranges += 1;
+            }
             let flow = egress.scheduler.open_flow(index as u64).map_err(|_| EIO)?;
             egress.tx[index].entry = Some(Entry {
                 owner,
@@ -553,12 +581,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn software_gso_pool_storage_is_separate_and_budgeted() {
+        let local = Ipv4Addr::new(10, 73, 0, 2);
+        let config = SocketConfig::new("test", local).tcp;
+        let budget = config.max_buffer_bytes;
+        let mut owner = Owner::with_config(local, (local, 24), [1; 32], None, config).unwrap();
+        assert_eq!(
+            owner.enable_egress(
+                1,
+                Some(ntcp::GsoLimits {
+                    max_bytes: budget,
+                    max_segments: 2,
+                })
+            ),
+            Err(ENOMEM)
+        );
+        assert!(owner.egress.is_none());
+        // Failed core allocation leaves the pool configurable. Aggregate bounds
+        // neither raise the IP MTU nor change the runtime's scalar buffer size.
+        let packet_len = owner.output_packet_len();
+        owner
+            .enable_egress(
+                1,
+                Some(ntcp::GsoLimits {
+                    max_bytes: 65536,
+                    max_segments: 16,
+                }),
+            )
+            .unwrap();
+        assert_eq!(owner.output_packet_len(), packet_len);
+        let egress = owner.egress.as_ref().unwrap();
+        assert_eq!(egress.packet_capacity, 65535);
+        assert_eq!(egress.tx[0].bytes.capacity(), 65535);
+        assert_eq!(egress.rx[0].bytes.capacity(), 65535);
+    }
+
+    #[test]
     fn fixed_pool_accounting_and_reused_slot_reject_stale_attempts() {
         let local = Ipv4Addr::new(10, 73, 0, 2);
         let config = SocketConfig::new("test", local).tcp;
         let mut owner = Owner::with_config(local, (local, 24), [1; 32], None, config).unwrap();
         owner.test_now = Some(1000);
-        owner.enable_egress(2).unwrap();
+        owner.enable_egress(2, None).unwrap();
         let mut egress = owner.egress.take().unwrap();
         assert_eq!(egress.tx.len(), 2);
         assert_eq!(egress.rx.len(), 2);

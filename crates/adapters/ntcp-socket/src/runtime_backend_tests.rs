@@ -1653,6 +1653,12 @@ fn reserved_unknown_interrupted_and_wrapped_cancellation_do_not_certify_rejectio
 
 // Two connections share one native-runtime owner and one copying backend.
 fn scheduled_pair(capacity: usize) -> (Owner, Owner, [u64; 2], [u64; 2], Arc<Mutex<State>>) {
+    scheduled_pair_gso(capacity, None)
+}
+fn scheduled_pair_gso(
+    capacity: usize,
+    gso: Option<ntcp::GsoLimits>,
+) -> (Owner, Owner, [u64; 2], [u64; 2], Arc<Mutex<State>>) {
     let (mut a, mut b, first, server, state) = pmtud_pair(None);
     let listener = b
         .sockets
@@ -1675,7 +1681,7 @@ fn scheduled_pair(capacity: usize) -> (Owner, Owner, [u64; 2], [u64; 2], Arc<Mut
     for id in [first, second] {
         a.execute(id, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1)).unwrap();
     }
-    a.enable_egress(capacity).unwrap();
+    a.enable_egress(capacity, gso).unwrap();
     (a, b, [first, second], [server, accepted], state)
 }
 fn deliver_scheduled(a: &mut Owner, b: &mut Owner, state: &Arc<Mutex<State>>) {
@@ -1795,7 +1801,7 @@ fn scheduled_refill_does_not_spin_on_pacing_candidates() {
             ..Default::default()
         }),
     );
-    a.enable_egress(1).unwrap();
+    a.enable_egress(1, None).unwrap();
     a.execute(client, Op::Write(vec![7; 17000])).unwrap();
     a.service_egress().unwrap();
     assert_eq!(state.lock().unwrap().sent.len(), 1);
@@ -2253,4 +2259,232 @@ fn scheduled_last_close_waits_for_its_fin_submission_not_other_owners() {
     assert_eq!(response.recv().unwrap().unwrap().value, 0);
     deliver_scheduled(&mut a, &mut b, &state);
     assert_eq!(b.execute(servers[0], Op::Read(1)).unwrap().value, 0);
+}
+
+const SOFTWARE_GSO: ntcp::GsoLimits = ntcp::GsoLimits {
+    max_bytes: 65536,
+    max_segments: 4,
+};
+
+fn held_segmentation(a: &Owner, cid: ConnectionId) -> Option<ntcp::TransmitSegmentation> {
+    a.endpoint
+        .transmit_segmentation(a.egress.as_ref().unwrap().attempt(cid))
+}
+
+#[test]
+fn software_gso_wire_matches_scalar_and_capacity_one_refills_second_owner() {
+    let mut packets = Vec::new();
+    for gso in [None, Some(SOFTWARE_GSO)] {
+        let (mut a, _, clients, _, state) = scheduled_pair_gso(1, gso);
+        let cid = connection(&a, clients[0]);
+        a.execute(clients[0], Op::Write(vec![7; 26000])).unwrap();
+        state.lock().unwrap().block = true;
+        a.service_egress().unwrap();
+        let descriptor = held_segmentation(&a, cid);
+        assert_eq!(descriptor.is_some(), gso.is_some());
+        if let Some(d) = descriptor {
+            assert!(d.payload_len >= 2 * d.segment_payload_len);
+        }
+        a.execute(clients[1], Op::Write(vec![8; 26000])).unwrap();
+        state.lock().unwrap().block = false;
+        advance(&mut a, 1000);
+        a.service_egress().unwrap();
+        let sent = state.lock().unwrap().sent.clone();
+        assert_eq!(sent.len(), 4);
+        assert!(state.lock().unwrap().output_calls <= BUDGET + 1);
+        // Range owners keep capacity one until the suffix finishes; the next
+        // owner still receives service in this call, not on an ACK round trip.
+        let mut by_port: Vec<_> = sent.into_iter().collect();
+        by_port.sort_by_key(|packet| u16::from_be_bytes(packet[34..36].try_into().unwrap()));
+        packets.push(by_port);
+    }
+    assert_eq!(packets[0], packets[1]);
+}
+
+#[test]
+fn software_gso_midrange_block_replays_ingress_only_after_final_segment() {
+    let (mut a, mut b, clients, servers, state) = scheduled_pair_gso(1, Some(SOFTWARE_GSO));
+    let cid = connection(&a, clients[0]);
+    a.execute(clients[0], Op::Write(vec![7; 26000])).unwrap();
+    state.lock().unwrap().block_after = Some((a.endpoint.tuple(cid).unwrap().local.port(), 1));
+    a.service_egress().unwrap();
+    let descriptor = held_segmentation(&a, cid).unwrap();
+    assert!(descriptor.payload_len >= 2 * descriptor.segment_payload_len);
+    assert_eq!(state.lock().unwrap().sent.len(), 1);
+    let attempt = a.egress.as_ref().unwrap().attempt(cid);
+    b.execute(servers[0], Op::Write(vec![9; 10])).unwrap();
+    assert!(b.prepare_packet(None).unwrap());
+    ingress(&mut a, &state, &b.pending_packet.take().unwrap());
+    assert_eq!(a.endpoint.readable_bytes(cid).unwrap(), 0);
+    advance(&mut a, 1000);
+    a.service_egress().unwrap();
+    assert_eq!(a.egress.as_ref().unwrap().attempt(cid), attempt);
+    assert_eq!(state.lock().unwrap().sent.len(), 1);
+    state.lock().unwrap().block_after = None;
+    advance(&mut a, 1000);
+    a.service_egress().unwrap();
+    assert!(!a.endpoint.is_output_reserved(cid));
+    assert_eq!(state.lock().unwrap().sent.len(), 2);
+    a.receive_batch(&mut vec![0; 65549]).unwrap();
+    assert_eq!(
+        a.execute(clients[0], Op::Read(10)).unwrap().bytes,
+        vec![9; 10]
+    );
+    assert!(!a.endpoint.accept_transmit(a.now(), attempt).unwrap());
+}
+
+#[test]
+fn software_gso_midrange_mtu_shrink_preserves_suffix_and_original_deadline() {
+    for expire in [false, true] {
+        let (mut a, mut b, clients, servers, state) = scheduled_pair_gso(2, Some(SOFTWARE_GSO));
+        let cid = connection(&a, clients[0]);
+        let port = a.endpoint.tuple(cid).unwrap().local.port();
+        a.execute(clients[0], Op::Write(vec![7; 26000])).unwrap();
+        state.lock().unwrap().block = true;
+        a.service_egress().unwrap();
+        let descriptor = held_segmentation(&a, cid).unwrap();
+        {
+            let mut state = state.lock().unwrap();
+            state.block = false;
+            state.block_after = Some((port, 1));
+        }
+        advance(&mut a, 500_000);
+        a.service_egress().unwrap();
+        assert_eq!(state.lock().unwrap().sent.len(), 1);
+        assert_eq!(held_segmentation(&a, cid), Some(descriptor));
+        let rejected = a.egress.as_ref().unwrap().attempt(cid);
+        {
+            let mut state = state.lock().unwrap();
+            state.enforce_mtu = true;
+            state.mtu = Some(1400);
+        }
+        advance(&mut a, 1000);
+        a.service_egress().unwrap(); // EMSGSIZE on the already-selected suffix.
+        assert!(!a.endpoint.accept_transmit(a.now(), rejected).unwrap());
+        a.endpoint
+            .set_endpoint_first_hop_mtu(a.now(), 1400)
+            .unwrap();
+        a.egress.as_mut().unwrap().mtu_refreshed();
+        state.lock().unwrap().block_after = Some((port, 2));
+        a.service_egress().unwrap();
+        assert_eq!(state.lock().unwrap().sent.len(), 2);
+        assert_eq!(held_segmentation(&a, cid), Some(descriptor));
+        let accepted: usize = state
+            .lock()
+            .unwrap()
+            .sent
+            .iter()
+            .map(|frame| {
+                let ip = ntcp_ip::parse(&frame[14..], false).unwrap();
+                ntcp::wire::parse(ip.ip, ip.payload).unwrap().payload.len()
+            })
+            .sum();
+        assert!(accepted > descriptor.segment_payload_len && accepted < descriptor.payload_len);
+        // A different owner can still submit while this suffix is blocked.
+        a.execute(clients[1], Op::Write(vec![8; 10])).unwrap();
+        a.service_egress().unwrap();
+        assert_eq!(state.lock().unwrap().sent.len(), 3);
+        if expire {
+            // First block was at 1000, not the later accept or MTU rejection.
+            a.test_now = Some(1_001_000);
+            a.expire_reservation(a.now()).unwrap();
+            assert_eq!(a.endpoint.state(cid), Ok(ntcp::State::Closed));
+            assert_eq!(
+                a.endpoint.state(connection(&a, clients[1])),
+                Ok(ntcp::State::Established)
+            );
+            assert_eq!(state.lock().unwrap().sent.len(), 3);
+        } else {
+            state.lock().unwrap().block_after = None;
+            advance(&mut a, 1000);
+            a.service_egress().unwrap();
+            assert!(!a.endpoint.is_output_reserved(cid));
+            assert!(
+                state
+                    .lock()
+                    .unwrap()
+                    .sent
+                    .iter()
+                    .skip(1)
+                    .all(|frame| frame.len() <= 1414)
+            );
+            deliver_scheduled(&mut a, &mut b, &state);
+            assert_eq!(
+                b.execute(servers[0], Op::Read(26000)).unwrap().bytes,
+                vec![7; descriptor.payload_len]
+            );
+            assert_eq!(
+                b.execute(servers[1], Op::Read(10)).unwrap().bytes,
+                vec![8; 10]
+            );
+        }
+    }
+}
+
+#[test]
+fn software_gso_pacing_and_timestamp_requests_fall_back_to_scalar() {
+    for timestamp in [false, true] {
+        let pacing = (!timestamp).then_some(ntcp::PacingConfig::default());
+        let (mut a, mut b, client, _, state) = pmtud_paced_pair(None, pacing);
+        a.enable_egress(1, Some(SOFTWARE_GSO)).unwrap();
+        if timestamp {
+            state.lock().unwrap().capacity = 8;
+            flags(
+                &mut a,
+                client,
+                ts::TX_SCHED | ts::TX_SOFTWARE | ts::TX_HARDWARE,
+            );
+        }
+        a.execute(client, Op::Write(vec![7; 26000])).unwrap();
+        state.lock().unwrap().block = true;
+        a.service_egress().unwrap();
+        let cid = connection(&a, client);
+        assert!(a.endpoint.is_output_reserved(cid));
+        assert_eq!(held_segmentation(&a, cid), None);
+        assert!(state.lock().unwrap().requests.is_empty());
+        state.lock().unwrap().block = false;
+        advance(&mut a, 1000);
+        a.service_egress().unwrap();
+        assert!(!state.lock().unwrap().sent.is_empty());
+        if timestamp {
+            deliver_scheduled(&mut a, &mut b, &state);
+            a.service_egress().unwrap();
+            assert_eq!(state.lock().unwrap().requests.len(), 1);
+        }
+    }
+}
+
+#[test]
+#[ignore = "reproducible CPU sample, not a performance gate; run with --ignored --nocapture"]
+fn software_gso_cpu_sample() {
+    fn cpu_ns() -> u64 {
+        let mut time: libc::timespec = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+            0
+        );
+        time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+    }
+    for gso in [None, Some(SOFTWARE_GSO)] {
+        let mut ns = 0;
+        let mut selections = 0;
+        let mut submissions = 0;
+        // Setup/handshake/allocation excluded; fixed seed, clock and two full
+        // physical segments per sample. Counts are runtime fresh selections,
+        // not an assertion about core instruction counts or wire completion.
+        for _ in 0..100 {
+            let (mut a, _, clients, _, state) = scheduled_pair_gso(1, gso);
+            a.execute(clients[0], Op::Write(vec![7; 26000])).unwrap();
+            let start = cpu_ns();
+            a.service_egress().unwrap();
+            ns += cpu_ns() - start;
+            selections += a.egress.as_ref().unwrap().selected_ranges;
+            submissions += state.lock().unwrap().output_calls;
+            assert_eq!(state.lock().unwrap().sent.len(), 2);
+        }
+        eprintln!(
+            "gso={} samples=100 service_cpu_ns={ns} fresh_selections={selections} backend_calls={submissions}",
+            gso.is_some()
+        );
+    }
 }

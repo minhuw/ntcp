@@ -60,7 +60,7 @@ impl Owner {
         config: &crate::IoConfig,
         index: u32,
     ) -> Result<()> {
-        self.enable_egress(config.egress_capacity)?;
+        self.enable_egress(config.egress_capacity, config.gso)?;
         self.mtu_refresh = Some(MtuRefresh::spawn(move || {
             ntcp_io::linux::local_ip_mtu(index)
         })?);

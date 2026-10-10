@@ -63,7 +63,7 @@ fn held_child(siblings: usize, flags: i32) -> (Owner, u64, ConnectionId, Arc<Mut
         next_cookie: 1,
         pending: Vec::new(),
     });
-    b.enable_egress(4).unwrap();
+    b.enable_egress(4, None).unwrap();
     a.execute(clients[0], Op::Write(vec![7; 10])).unwrap();
     assert!(a.prepare_packet(None).unwrap());
     let bytes = a.pending_packet.take().unwrap();
