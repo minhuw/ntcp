@@ -110,7 +110,7 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
     };
     // Reserve owned receive storage before packetdrill starts timed events.
     // Its mlockall(MCL_FUTURE) makes first-touch allocation synchronous.
-    config.preallocate_connections = usize::from(upstream);
+    config.preallocate_connections = usize::from(upstream || profile == Profile::UpstreamWindow8);
     config.connection.mss = 1460;
     config.connection.pacing = pacing.then(ntcp::PacingConfig::default);
     if matches!(profile, Profile::UpstreamWindow8 | Profile::UpstreamBasic) {

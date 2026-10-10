@@ -905,6 +905,48 @@ fn upstream_sack_rto_uses_linux_floor_while_baseline_keeps_core_floor() {
 }
 
 #[test]
+fn window8_changes_only_receive_preallocation() {
+    let mut old = crate::packet_profile::config(Profile::Baseline);
+    old.connection.receive_capacity = 8 * 1024 * 1024;
+    old.connection.delayed_ack_us = 0;
+    let mut current = crate::packet_profile::config(Profile::UpstreamWindow8);
+    assert_eq!(current.preallocate_connections, 1);
+    current.preallocate_connections = 0;
+    assert_eq!(format!("{current:?}"), format!("{old:?}"));
+}
+
+#[test]
+fn window8_preallocation_is_charged_once_and_preserves_admission_limit() {
+    let config = crate::packet_profile::config(Profile::UpstreamWindow8);
+    assert_eq!(config.max_buffer_bytes, 32 * 1024 * 1024);
+    assert_eq!(config.max_connections, 128);
+    assert_eq!(config.max_listeners, 128);
+    assert_eq!(config.max_control_packets, 128);
+    let mut endpoint = Endpoint::new(config.clone(), [42; 32], 0, |_| true).unwrap();
+    let reserved = endpoint.buffer_bytes();
+    assert!(reserved >= 8 * 1024 * 1024);
+    assert!(reserved <= config.max_buffer_bytes);
+    let remote = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080);
+    endpoint
+        .connect(0, SocketAddr::new(local().into(), 40000), remote)
+        .unwrap();
+    assert_eq!(endpoint.buffer_bytes(), reserved);
+    // With the pool consumed, a second connection uses ordinary admission;
+    // two 8 MiB receive charges do not fit the unchanged 32 MiB budget.
+    assert_eq!(
+        endpoint.connect(0, SocketAddr::new(local().into(), 40001), remote),
+        Err(EndpointError::LimitReached)
+    );
+    assert_eq!(endpoint.buffer_bytes(), reserved);
+    let mut insufficient = config;
+    insufficient.max_buffer_bytes = reserved - 1;
+    assert!(matches!(
+        Endpoint::new(insufficient, [42; 32], 0, |_| true),
+        Err(EndpointError::LimitReached)
+    ));
+}
+
+#[test]
 fn only_upstream_cubic_budget_allows_200000_sndbuf_growth() {
     for profile in [
         Profile::Baseline,
