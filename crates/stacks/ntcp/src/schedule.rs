@@ -27,6 +27,10 @@ impl ReadyQueue {
         })
     }
 
+    pub(crate) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        core::iter::successors(self.first, |&index| self.links[index].next)
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.first.is_none()
     }

@@ -27,10 +27,12 @@ pub(crate) struct Departure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransmitAttempt {
     pub(crate) ordinal: u64,
+    pub(crate) reservation: usize,
     pub(crate) connection: Option<ConnectionId>,
 }
 
 pub(crate) struct OutputReservation {
+    pub index: usize,
     pub bytes: Vec<u8>,
     pub current: Option<ReservedOutput>,
     pub ordinal: u64,
@@ -52,6 +54,7 @@ pub(crate) struct ReservedOutput {
 impl OutputReservation {
     pub fn new() -> Self {
         Self {
+            index: 0,
             bytes: Vec::new(),
             current: None,
             ordinal: 0,
@@ -62,6 +65,7 @@ impl OutputReservation {
         self.ordinal = self.ordinal.checked_add(1).ok_or(Error::InvalidArgument)?;
         Ok(TransmitAttempt {
             ordinal: self.ordinal,
+            reservation: self.index,
             connection,
         })
     }

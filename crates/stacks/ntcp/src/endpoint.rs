@@ -314,7 +314,7 @@ struct Listener {
 // Ambiguous overlapping ingress domains need separate endpoints, not implicit
 // context guessing from addresses.
 pub struct Endpoint {
-    reservation: crate::output_reservation::OutputReservation,
+    reservations: Vec<crate::output_reservation::OutputReservation>,
     address_policy: Box<dyn Fn(AddressValidation) -> bool>,
     config: EndpointConfig,
     secret: [u8; 32],
@@ -420,7 +420,7 @@ impl Endpoint {
             .try_reserve_exact(count)
             .map_err(|_| Error::NoMemory)?;
         Ok(Self {
-            reservation: crate::output_reservation::OutputReservation::new(),
+            reservations: Vec::new(),
             address_policy: Box::new(address_policy),
             passive_errors,
             tuples: TupleTable::new(count)?,
@@ -560,8 +560,11 @@ impl Endpoint {
     }
     fn slot_mut(&mut self, id: ConnectionId) -> Result<&mut Slot, EndpointError> {
         self.slot(id)?;
+        let reserved = self.is_output_reserved(id);
         let slot = self.slots[id.slot].as_mut().unwrap();
-        slot.connection.update_time(self.now)?;
+        if !reserved {
+            slot.connection.update_time(self.now)?;
+        }
         Ok(slot)
     }
     fn listener(&self, id: ListenerId) -> Result<&Listener, EndpointError> {
@@ -583,9 +586,6 @@ impl Endpoint {
         address: SocketAddr,
         backlog: usize,
     ) -> Result<ListenerId, EndpointError> {
-        if self.reservation.current.is_some() {
-            return Err(EndpointError::OutputReserved);
-        }
         if !supported_socket(address) {
             return Err(EndpointError::InvalidAddress);
         }
@@ -643,10 +643,14 @@ impl Endpoint {
     }
 
     pub fn close_listener(&mut self, id: ListenerId) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self
+            .listener(id)?
+            .children
+            .iter()
+            .any(|&child| self.is_output_reserved(child))
+        {
             return Err(EndpointError::OutputReserved);
         }
-        self.listener(id)?;
         self.listeners[id.slot].as_mut().unwrap().closing = true;
         self.events.remove(self.config.max_connections + id.slot);
         self.cleanup.push(id.slot);
@@ -657,6 +661,16 @@ impl Endpoint {
         let Some(index) = self.cleanup.pop() else {
             return;
         };
+        if self.listeners[index]
+            .as_ref()
+            .unwrap()
+            .children
+            .last()
+            .is_some_and(|&id| self.is_output_reserved(id))
+        {
+            self.cleanup.push(index);
+            return;
+        }
         let child = self.listeners[index].as_mut().unwrap().children.pop();
         if let Some(id) = child {
             if self.generations[id.slot] == id.generation && self.slots[id.slot].is_some() {
@@ -994,9 +1008,6 @@ impl Endpoint {
         local: SocketAddr,
         remote: SocketAddr,
     ) -> Result<ConnectionId, EndpointError> {
-        if self.reservation.current.is_some() {
-            return Err(EndpointError::OutputReserved);
-        }
         self.clock(now)?;
         let tuple = Tuple { local, remote };
         self.admission(tuple)?;
@@ -1013,9 +1024,6 @@ impl Endpoint {
         send: usize,
         receive: usize,
     ) -> Result<ConnectionId, EndpointError> {
-        if self.reservation.current.is_some() {
-            return Err(EndpointError::OutputReserved);
-        }
         self.clock(now)?;
         let tuple = Tuple { local, remote };
         Connection::validate_buffer_capacities(send, receive)?;
@@ -1042,7 +1050,7 @@ impl Endpoint {
         send: usize,
         receive: usize,
     ) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         Connection::validate_buffer_capacities(send, receive)?;
@@ -1078,9 +1086,6 @@ impl Endpoint {
         send: usize,
         receive: usize,
     ) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
-            return Err(EndpointError::OutputReserved);
-        }
         let rx_ranges = self.listener(id)?.rx_timestamp_capacity;
         Connection::validate_buffer_capacities(send, receive)?;
         self.validate_listener_rx_capacity((send, receive), rx_ranges)?;
@@ -1115,9 +1120,6 @@ impl Endpoint {
         id: ListenerId,
         ranges: usize,
     ) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
-            return Err(EndpointError::OutputReserved);
-        }
         let capacities = self.listener(id)?.buffer_capacities;
         self.validate_listener_rx_capacity(capacities, ranges)?;
         self.listeners[id.slot]
@@ -1189,9 +1191,6 @@ impl Endpoint {
         remote: SocketAddr,
         options: OutgoingIpv4Options,
     ) -> Result<ConnectionId, EndpointError> {
-        if self.reservation.current.is_some() {
-            return Err(EndpointError::OutputReserved);
-        }
         self.validate_ipv4_options(
             IpMetadata {
                 source: local.ip(),
@@ -1251,9 +1250,6 @@ impl Endpoint {
         remote: SocketAddr,
         select_source: impl FnOnce(SocketAddr) -> Result<SocketAddr, EndpointError>,
     ) -> Result<ConnectionId, EndpointError> {
-        if self.reservation.current.is_some() {
-            return Err(EndpointError::OutputReserved);
-        }
         self.clock(now)?;
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
         //# If an application on a multihomed host does not specify the local IP
@@ -1304,6 +1300,10 @@ impl Endpoint {
     }
 
     fn refresh(&mut self, index: usize) {
+        if self.is_output_reserved(self.id(index)) {
+            self.deadlines.set(index, None);
+            return;
+        }
         if let Some(slot) = &self.slots[index]
             && slot.connection.iw_setup_loss()
         {
@@ -1418,16 +1418,21 @@ impl Endpoint {
     }
 
     pub fn accept(&mut self, listener: ListenerId) -> Result<ConnectionId, EndpointError> {
-        if self.reservation.current.is_some() {
-            return Err(EndpointError::OutputReserved);
-        }
-        self.listener(listener)?;
+        let pending = &self.listener(listener)?.pending;
+        let position = pending
+            .iter()
+            .position(|&id| !self.is_output_reserved(id))
+            .ok_or(if pending.is_empty() {
+                Error::WouldBlock.into()
+            } else {
+                EndpointError::OutputReserved
+            })?;
         let id = self.listeners[listener.slot]
             .as_mut()
             .unwrap()
             .pending
-            .pop_front()
-            .ok_or(Error::WouldBlock)?;
+            .remove(position)
+            .unwrap();
         self.unlink_child(listener, id);
         self.slots[id.slot].as_mut().unwrap().listener = None;
         self.refresh(id.slot);
@@ -1579,9 +1584,6 @@ impl Endpoint {
         ip: IpMetadata,
         bytes: &[u8],
     ) -> Result<InputDisposition, EndpointError> {
-        if self.reservation.current.is_some() {
-            return Err(EndpointError::OutputReserved);
-        }
         self.input_with_traffic_class(now, ip, 0, bytes)
     }
 
@@ -1595,9 +1597,6 @@ impl Endpoint {
         traffic_class: u8,
         bytes: &[u8],
     ) -> Result<InputDisposition, EndpointError> {
-        if self.reservation.current.is_some() {
-            return Err(EndpointError::OutputReserved);
-        }
         self.input_with_ipv4_options(now, ip, traffic_class, Ipv4Options::default(), bytes)
     }
 
@@ -1617,9 +1616,6 @@ impl Endpoint {
         options: Ipv4Options,
         bytes: &[u8],
     ) -> Result<InputDisposition, EndpointError> {
-        if self.reservation.current.is_some() {
-            return Err(EndpointError::OutputReserved);
-        }
         self.input_with_timestamps(
             now,
             ip,
@@ -1640,11 +1636,7 @@ impl Endpoint {
         bytes: &[u8],
         timestamps: RxPacketTimestamps,
     ) -> Result<InputDisposition, EndpointError> {
-        if self.reservation.current.is_some() {
-            return Err(EndpointError::OutputReserved);
-        }
         timestamps.validate(self.config.connection.timebase)?;
-        self.clock(now)?;
         if !options.is_empty()
             && (!self.config.ipv4_options_enabled
                 || !ip.source.is_ipv4()
@@ -1702,7 +1694,12 @@ impl Endpoint {
             local: SocketAddr::new(ip.destination, segment.header.destination_port),
             remote: SocketAddr::new(ip.source, segment.header.source_port),
         };
-        if let Some(index) = self.tuples.find(self.hash(tuple), tuple) {
+        let target = self.tuples.find(self.hash(tuple), tuple);
+        if target.is_some_and(|index| self.is_output_reserved(self.id(index))) {
+            return Err(EndpointError::OutputReserved);
+        }
+        self.clock(now)?;
+        if let Some(index) = target {
             let slot = self.slots[index].as_ref().unwrap();
             if slot.connection.reset_pending() || slot.reset_deadline.is_some() {
                 return Ok(InputDisposition::Dropped);
@@ -1872,7 +1869,7 @@ impl Endpoint {
     }
 
     pub fn write(&mut self, id: ConnectionId, bytes: &[u8]) -> Result<usize, EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         let count = self.slot_mut(id)?.connection.write(bytes)?;
@@ -1885,7 +1882,7 @@ impl Endpoint {
         bytes: &[u8],
         push: bool,
     ) -> Result<usize, EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         let count = self.slot_mut(id)?.connection.write_with_push(bytes, push)?;
@@ -1901,7 +1898,7 @@ impl Endpoint {
         more: bool,
         end_of_record: bool,
     ) -> Result<usize, EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         let count = self
@@ -1922,7 +1919,7 @@ impl Endpoint {
         end_of_record: bool,
         lowat: Option<u32>,
     ) -> Result<usize, EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         let count = self
@@ -1942,7 +1939,7 @@ impl Endpoint {
         id: ConnectionId,
         ranges: usize,
     ) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         let old = self.slot(id)?.connection.rx_timestamps.storage_bytes();
@@ -1979,7 +1976,7 @@ impl Endpoint {
         id: ConnectionId,
         phases: usize,
     ) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         let old = self.slot(id)?.connection.tx_timestamps.storage_bytes();
@@ -2004,7 +2001,7 @@ impl Endpoint {
         lowat: Option<u32>,
         request: TxTimestampRequest,
     ) -> Result<usize, EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         Ok(self
@@ -2023,7 +2020,7 @@ impl Endpoint {
         lowat: Option<u32>,
         request: TxTimestampRequest,
     ) -> Result<usize, EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         let count = self.slot_mut(id)?.connection.write_with_timestamp(
@@ -2101,7 +2098,7 @@ impl Endpoint {
         id: ConnectionId,
         cookie: u64,
     ) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         self.slot_mut(id)?
@@ -2114,7 +2111,7 @@ impl Endpoint {
     /// Record a blocked adapter admission without changing send boundaries.
     /// LOWAT-only exhaustion is not byte-buffer backpressure.
     pub fn record_send_backpressure(&mut self, id: ConnectionId) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         self.slot_mut(id)?.connection.record_send_backpressure();
@@ -2131,7 +2128,7 @@ impl Endpoint {
         end_of_record: bool,
         force: bool,
     ) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         self.slot_mut(id)?
@@ -2142,7 +2139,7 @@ impl Endpoint {
     }
 
     pub fn cancel_tx_timestamps(&mut self, id: ConnectionId) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         self.slot_mut(id)?.connection.tx_timestamps.cancel_from(0);
@@ -2155,7 +2152,7 @@ impl Endpoint {
         id: ConnectionId,
         lowat: Option<u32>,
     ) -> Result<usize, EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         Ok(self.slot(id)?.connection.send_admission_room(lowat))
@@ -2163,7 +2160,7 @@ impl Endpoint {
 
     /// Hold partial output until uncork, explicit NODELAY, or a 200ms timeout.
     pub fn set_cork(&mut self, id: ConnectionId, enabled: bool) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         self.slot_mut(id)?.connection.set_cork(enabled);
@@ -2172,7 +2169,7 @@ impl Endpoint {
     }
 
     pub fn flush(&mut self, id: ConnectionId) -> Result<usize, EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         let count = self.slot_mut(id)?.connection.flush()?;
@@ -2180,7 +2177,7 @@ impl Endpoint {
         Ok(count)
     }
     pub fn close(&mut self, id: ConnectionId) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         self.slot_mut(id)?.connection.close()?;
@@ -2188,7 +2185,7 @@ impl Endpoint {
         Ok(())
     }
     pub fn write_urgent(&mut self, id: ConnectionId, bytes: &[u8]) -> Result<usize, EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         let count = self.slot_mut(id)?.connection.write_urgent(bytes)?;
@@ -2205,7 +2202,7 @@ impl Endpoint {
     }
 
     pub fn read(&mut self, id: ConnectionId, out: &mut [u8]) -> Result<usize, EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         let count = self.slot_mut(id)?.connection.read(out)?;
@@ -2220,7 +2217,7 @@ impl Endpoint {
         id: ConnectionId,
         out: &mut [u8],
     ) -> Result<usize, EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         Ok(self.slot_mut(id)?.connection.read_terminal(out)?)
@@ -2232,7 +2229,7 @@ impl Endpoint {
     }
 
     pub fn shutdown(&mut self, id: ConnectionId) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         self.slot_mut(id)?.connection.shutdown()?;
@@ -2240,7 +2237,7 @@ impl Endpoint {
         Ok(())
     }
     pub fn abort(&mut self, id: ConnectionId) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         self.slot_mut(id)?.connection.abort();
@@ -2248,7 +2245,7 @@ impl Endpoint {
         Ok(())
     }
     pub fn set_nagle(&mut self, id: ConnectionId, enabled: bool) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         self.slot_mut(id)?.connection.set_nagle(enabled);
@@ -2270,13 +2267,13 @@ impl Endpoint {
         quoted_sequence: u32,
         error: crate::NetworkError,
     ) -> Result<bool, EndpointError> {
-        if self.reservation.current.is_some() {
-            return Err(EndpointError::OutputReserved);
-        }
-        self.clock(now)?;
         let Some(index) = self.tuples.find(self.hash(tuple), tuple) else {
             return Ok(false);
         };
+        if self.is_output_reserved(self.id(index)) {
+            return Err(EndpointError::OutputReserved);
+        }
+        self.clock(now)?;
         if error == crate::NetworkError::SourceQuench {
             return Ok(false);
         }
@@ -2326,13 +2323,13 @@ impl Endpoint {
         ip_header_len: u16,
         candidate_mtu: u32,
     ) -> Result<bool, EndpointError> {
-        if self.reservation.current.is_some() {
-            return Err(EndpointError::OutputReserved);
-        }
-        self.clock(now)?;
         let Some(index) = self.tuples.find(self.hash(tuple), tuple) else {
             return Ok(false);
         };
+        if self.is_output_reserved(self.id(index)) {
+            return Err(EndpointError::OutputReserved);
+        }
+        self.clock(now)?;
         let accepted = self.slots[index]
             .as_mut()
             .unwrap()
@@ -2354,6 +2351,7 @@ impl Endpoint {
         id: ConnectionId,
         policy: crate::PmtudPolicy,
     ) -> Result<(), EndpointError> {
+        // Existing authorized policy repair changes search aging, not selected bytes.
         self.slot(id)?
             .connection
             .validate_pmtud_policy(now, policy)?;
@@ -2373,12 +2371,7 @@ impl Endpoint {
     ) -> Result<(), EndpointError> {
         self.slot(id)?.connection.validate_first_hop_mtu(now, mtu)?;
         self.clock(now)?;
-        if self
-            .reservation
-            .current
-            .as_ref()
-            .is_some_and(|r| r.packet.connection == Some(id))
-        {
+        if self.is_output_reserved(id) {
             self.slot_mut(id)?
                 .connection
                 .set_reserved_first_hop_mtu(now, mtu)?;
@@ -2417,13 +2410,9 @@ impl Endpoint {
         }
         self.clock(now)?;
         for index in 0..self.slots.len() {
+            let reserved = self.is_output_reserved(self.id(index));
             if let Some(slot) = &mut self.slots[index] {
-                if self
-                    .reservation
-                    .current
-                    .as_ref()
-                    .is_some_and(|r| r.packet.connection.is_some_and(|id| id.slot == index))
-                {
+                if reserved {
                     slot.connection.set_reserved_first_hop_mtu(now, mtu)?;
                 } else {
                     slot.connection.set_first_hop_mtu(now, mtu)?;
@@ -2445,7 +2434,7 @@ impl Endpoint {
     }
 
     pub fn lower_mss(&mut self, id: ConnectionId, mss: u16) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         self.slot_mut(id)?.connection.lower_mss(mss)?;
@@ -2460,7 +2449,7 @@ impl Endpoint {
         id: ConnectionId,
         timeout_us: u64,
     ) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         self.slot_mut(id)?.connection.set_user_timeout(timeout_us)?;
@@ -2472,7 +2461,7 @@ impl Endpoint {
         id: ConnectionId,
         timeout_us: Option<u64>,
     ) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         self.slot_mut(id)?
@@ -2491,9 +2480,6 @@ impl Endpoint {
         id: ListenerId,
         timeout_us: Option<u64>,
     ) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
-            return Err(EndpointError::OutputReserved);
-        }
         self.listener(id)?;
         if timeout_us == Some(0) {
             return Err(Error::InvalidArgument.into());
@@ -2513,7 +2499,7 @@ impl Endpoint {
         id: ConnectionId,
         keepalive: Option<crate::KeepaliveConfig>,
     ) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4
@@ -2536,7 +2522,7 @@ impl Endpoint {
     //# Time to Live (TTL):  The TTL value used to send TCP segments MUST be
     //# configurable (MUST-49).
     pub fn set_hop_limit(&mut self, id: ConnectionId, hop_limit: u8) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         if hop_limit == 0 {
@@ -2556,7 +2542,7 @@ impl Endpoint {
     //# The application layer MUST be able to specify the Differentiated
     //# Services field for segments that are sent on a connection (MUST-48).
     pub fn set_dscp(&mut self, id: ConnectionId, dscp: u8) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         if dscp > 63 {
@@ -2599,7 +2585,7 @@ impl Endpoint {
         Ok(self.slot(id)?.connection.acknowledged())
     }
     pub fn release(&mut self, id: ConnectionId) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
         let state = self.slot(id)?.connection.state();
@@ -2628,9 +2614,6 @@ impl Endpoint {
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8
     //# However, the conditions that are reported asynchronously to the application MUST include:
     pub fn next_event(&mut self) -> Option<Event> {
-        if self.reservation.current.is_some() {
-            return None;
-        }
         if let Some(event) = self.passive_errors.pop_front() {
             return Some(event);
         }
@@ -2646,7 +2629,24 @@ impl Endpoint {
                 self.slots[index].as_ref().unwrap().connection.tuple(),
             ));
         }
-        while let Some(index) = self.events.pop() {
+        loop {
+            let next = self.events.iter().find(|&index| {
+                if index < self.config.max_connections {
+                    return !self.is_output_reserved(self.id(index));
+                }
+                self.listeners[index - self.config.max_connections]
+                    .as_ref()
+                    .is_none_or(|listener| {
+                        listener.closing
+                            || listener.pending.is_empty()
+                            || listener
+                                .pending
+                                .iter()
+                                .any(|&id| !self.is_output_reserved(id))
+                    })
+            });
+            let Some(index) = next else { break };
+            self.events.remove(index);
             if index >= self.config.max_connections {
                 let slot = index - self.config.max_connections;
                 let listener = self.listeners[slot].as_ref()?;
@@ -2684,21 +2684,24 @@ impl Endpoint {
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
-        if let Some(r) = &self.reservation.current {
-            if r.attempt.is_some() {
-                return None;
-            }
-            let d = r.departure.as_ref()?;
-            return self
-                .retained_slot(r.packet.connection?)
-                .ok()?
-                .connection
-                .reserved_pacing_deadline(self.now, d);
-        }
-        self.deadlines.first().map(|(time, _)| time)
+        self.deadlines
+            .first()
+            .map(|(time, _)| time)
+            .into_iter()
+            .chain(self.reservations.iter().filter_map(|slot| {
+                let r = slot.current.as_ref()?;
+                if r.attempt.is_some() {
+                    return None;
+                }
+                self.retained_slot(r.packet.connection?)
+                    .ok()?
+                    .connection
+                    .reserved_pacing_deadline(self.now, r.departure.as_ref()?)
+            }))
+            .min()
     }
     pub fn has_pending_output(&self) -> bool {
-        self.reservation.current.is_some()
+        self.reservations.iter().any(|slot| slot.current.is_some())
             || !self.output.is_empty()
             || !self.control.is_empty()
             || !self.cleanup.is_empty()
@@ -2708,9 +2711,6 @@ impl Endpoint {
     }
 
     pub fn on_timeout(&mut self, now: Instant, budget: usize) -> Result<bool, EndpointError> {
-        if self.reservation.current.is_some() {
-            return Err(EndpointError::OutputReserved);
-        }
         self.clock(now)?;
         for _ in 0..budget {
             let Some((deadline, index)) = self.deadlines.first() else {
@@ -2741,25 +2741,97 @@ impl Endpoint {
     }
 
     pub fn enable_output_reservations(&mut self) -> Result<(), EndpointError> {
-        if self.reservation.current.is_some() {
+        self.enable_output_reservations_with_capacity(1)
+    }
+
+    pub fn enable_output_reservations_with_capacity(
+        &mut self,
+        count: usize,
+    ) -> Result<(), EndpointError> {
+        if self.reservations.iter().any(|slot| slot.current.is_some()) {
             return Err(EndpointError::OutputReserved);
         }
-        if self.reservation.bytes.is_empty() {
-            let size = self.config.connection.send_ip_payload_limit as usize;
-            if size
-                > self
-                    .config
-                    .max_buffer_bytes
-                    .saturating_sub(self.buffer_bytes)
-            {
-                return Err(Error::NoMemory.into());
-            }
-            let mut bytes = reserved_vec(size)?;
-            bytes.resize(size, 0);
-            self.buffer_bytes += size;
-            self.reservation.bytes = bytes;
+        if count == 0 || count > self.config.max_connections.saturating_add(1) {
+            return Err(Error::InvalidArgument.into());
         }
+        if !self.reservations.is_empty() {
+            return if count == self.reservations.len() {
+                Ok(())
+            } else {
+                Err(Error::InvalidArgument.into())
+            };
+        }
+        let size = self.config.connection.send_ip_payload_limit as usize;
+        let charge = size
+            .checked_add(core::mem::size_of::<
+                crate::output_reservation::OutputReservation,
+            >())
+            .and_then(|size| size.checked_mul(count))
+            .ok_or(Error::NoMemory)?;
+        if charge
+            > self
+                .config
+                .max_buffer_bytes
+                .saturating_sub(self.buffer_bytes)
+        {
+            return Err(Error::NoMemory.into());
+        }
+        let mut slots = reserved_vec(count)?;
+        for index in 0..count {
+            let mut slot = crate::output_reservation::OutputReservation::new();
+            slot.index = index;
+            slot.bytes = reserved_vec(size)?;
+            slot.bytes.resize(size, 0);
+            slots.push(slot);
+        }
+        self.reservations = slots;
+        self.buffer_bytes += charge;
         Ok(())
+    }
+
+    // ponytail: bounded linear pool lookup; add a slot index if measured flow counts warrant it.
+    pub fn is_output_reserved(&self, id: ConnectionId) -> bool {
+        self.reservations.iter().any(|slot| {
+            slot.current
+                .as_ref()
+                .is_some_and(|r| r.packet.connection == Some(id))
+        })
+    }
+
+    pub fn ready_connections(&self) -> impl Iterator<Item = ConnectionId> + '_ {
+        self.output
+            .iter()
+            .map(|index| self.id(index))
+            .filter(|&id| {
+                self.reservations
+                    .iter()
+                    .find_map(|slot| {
+                        slot.current
+                            .as_ref()
+                            .filter(|r| r.packet.connection == Some(id))
+                    })
+                    .is_none_or(|r| r.attempt.is_none())
+            })
+    }
+
+    pub fn poll_reserved_transmit_for(
+        &mut self,
+        now: Instant,
+        id: ConnectionId,
+        out: &mut [u8],
+        budget: usize,
+    ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
+        self.retained_slot(id)?;
+        self.poll_reserved_selected(now, out, budget, Some(id))
+    }
+
+    pub fn poll_reserved_stateless_transmit(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        budget: usize,
+    ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
+        self.poll_reserved_selected(now, out, budget, None)
     }
 
     pub fn poll_reserved_transmit(
@@ -2768,21 +2840,109 @@ impl Endpoint {
         out: &mut [u8],
         budget: usize,
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
-        if self.reservation.bytes.is_empty() {
+        if self.reservations.is_empty() {
             return Err(Error::InvalidArgument.into());
         }
-        if let Some(r) = &self.reservation.current {
-            if r.attempt.is_some() {
-                return Err(EndpointError::OutputReserved);
+        let free = self.reservations.iter().any(|slot| slot.current.is_none());
+        if !free
+            && !self
+                .reservations
+                .iter()
+                .any(|slot| slot.current.as_ref().is_some_and(|r| r.attempt.is_none()))
+        {
+            return Err(EndpointError::OutputReserved);
+        }
+        self.clock(now)?;
+        for _ in 0..budget {
+            let next = self
+                .ready_connections()
+                .find(|&id| free || self.is_output_reserved(id));
+            let control = free
+                && !self.control.is_empty()
+                && !self.reservations.iter().any(|slot| {
+                    slot.current
+                        .as_ref()
+                        .is_some_and(|r| r.packet.connection.is_none())
+                });
+            let owner = if control && (self.control_turn || next.is_none()) {
+                None
+            } else {
+                next
+            };
+            if owner.is_none() && !control {
+                self.cleanup_one();
+                continue;
             }
+            let result = self.poll_reserved_selected(now, out, 1, owner)?;
+            if let Some(id) = owner {
+                // Repairs share the ready queue rather than monopolizing its head.
+                if self.is_output_reserved(id) {
+                    self.output.remove(id.slot);
+                    self.output.push(id.slot);
+                }
+            }
+            if result.0.packet.is_some() {
+                return Ok(result);
+            }
+        }
+        Ok((
+            PollTransmit {
+                packet: None,
+                more_work: self.has_pending_output(),
+            },
+            None,
+        ))
+    }
+
+    // Select exactly one owner; None is the independent stateless lane.
+    fn poll_reserved_selected(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        budget: usize,
+        selected: Option<ConnectionId>,
+    ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
+        if self.reservations.is_empty() {
+            return Err(Error::InvalidArgument.into());
+        }
+        let existing = self.reservations.iter().position(|slot| {
+            slot.current
+                .as_ref()
+                .is_some_and(|r| r.packet.connection == selected)
+        });
+        let index = existing
+            .or_else(|| {
+                self.reservations
+                    .iter()
+                    .position(|slot| slot.current.is_none())
+            })
+            .ok_or(EndpointError::OutputReserved)?;
+        if self.reservations[index]
+            .current
+            .as_ref()
+            .is_some_and(|r| r.attempt.is_some())
+        {
+            return Err(EndpointError::OutputReserved);
+        }
+        if budget == 0 {
+            self.clock(now)?;
+            return Ok((
+                PollTransmit {
+                    packet: None,
+                    more_work: self.has_pending_output(),
+                },
+                None,
+            ));
+        }
+        if let Some(r) = &self.reservations[index].current {
             let connection = r.packet.connection;
             let limit = self
                 .retained_slot(connection.ok_or(EndpointError::InvalidHandle)?)?
                 .connection
                 .path_payload_limit();
             self.clock(now)?;
-            let packet = self.reservation.fragment(limit, out)?;
-            let r = self.reservation.current.as_ref().unwrap();
+            let packet = self.reservations[index].fragment(limit, out)?;
+            let r = self.reservations[index].current.as_ref().unwrap();
             if r.emitted_bytes != 0
                 && let Some(d) = &r.departure
                 && self
@@ -2799,10 +2959,15 @@ impl Endpoint {
                     None,
                 ));
             }
-            let attempt = self.reservation.token(connection)?;
-            let r = self.reservation.current.as_mut().unwrap();
+            let attempt = self.reservations[index].token(connection)?;
+            let r = self.reservations[index].current.as_mut().unwrap();
             r.attempt = Some(attempt);
             r.abandon_attempt = attempt;
+            if let Some(id) = connection {
+                self.output.remove(id.slot);
+                self.output.push(id.slot);
+            }
+            self.control_turn = true;
             return Ok((
                 PollTransmit {
                     packet: Some(packet),
@@ -2812,15 +2977,17 @@ impl Endpoint {
             ));
         }
         // Reserve identity before selection: exhaustion must not consume output.
-        let mut attempt = self.reservation.token(None)?;
-        let capacity = out.len().min(self.reservation.bytes.len());
-        let output = self.poll_transmit_inner(now, &mut out[..capacity], budget, true)?;
+        let mut attempt = self.reservations[index].token(None)?;
+        let capacity = out.len().min(self.reservations[index].bytes.len());
+        let output =
+            self.poll_transmit_inner(now, &mut out[..capacity], budget, true, Some(selected))?;
         if let Some(packet) = output.packet {
             attempt.connection = packet.connection;
-            self.reservation.capture(packet, out, attempt);
+            self.reservations[index].capture(packet, out, attempt);
             if let Some(id) = packet.connection {
                 let departure = self.retained_slot(id)?.connection.last_departure;
-                self.reservation.current.as_mut().unwrap().departure = departure;
+                self.reservations[index].current.as_mut().unwrap().departure = departure;
+                self.refresh(id.slot);
             }
             Ok((output, Some(attempt)))
         } else {
@@ -2833,7 +3000,12 @@ impl Endpoint {
         now: Instant,
         attempt: crate::TransmitAttempt,
     ) -> Result<bool, EndpointError> {
-        let Some(r) = &self.reservation.current else {
+        let index = attempt.reservation;
+        let Some(r) = self
+            .reservations
+            .get(index)
+            .and_then(|slot| slot.current.as_ref())
+        else {
             return Ok(false);
         };
         if r.attempt != Some(attempt) {
@@ -2865,9 +3037,9 @@ impl Endpoint {
                 .connection
                 .accept_reserved_output(now, d, offset, count, finished)?;
         }
-        let r = self.reservation.current.as_mut().unwrap();
+        let r = self.reservations[index].current.as_mut().unwrap();
         if finished {
-            self.reservation.current = None;
+            self.reservations[index].current = None;
         } else {
             r.departure = departure;
             r.offset += r.emitted_bytes;
@@ -2886,14 +3058,19 @@ impl Endpoint {
         &mut self,
         attempt: crate::TransmitAttempt,
     ) -> Result<bool, EndpointError> {
-        let Some(r) = &self.reservation.current else {
+        let index = attempt.reservation;
+        let Some(r) = self
+            .reservations
+            .get(index)
+            .and_then(|slot| slot.current.as_ref())
+        else {
             return Ok(false);
         };
         if r.attempt != Some(attempt) {
             return Ok(false);
         }
         let Some(connection) = r.packet.connection else {
-            self.reservation.current = None;
+            self.reservations[index].current = None;
             return Ok(true);
         };
         let timestamp = r.packet.tx_timestamp;
@@ -2908,7 +3085,7 @@ impl Endpoint {
                 }
             }
         }
-        let r = self.reservation.current.as_mut().unwrap();
+        let r = self.reservations[index].current.as_mut().unwrap();
         r.attempt = None;
         r.repaired = true;
         Ok(true)
@@ -2922,7 +3099,12 @@ impl Endpoint {
         &mut self,
         attempt: crate::TransmitAttempt,
     ) -> Result<bool, EndpointError> {
-        let Some(r) = &self.reservation.current else {
+        let index = attempt.reservation;
+        let Some(r) = self
+            .reservations
+            .get(index)
+            .and_then(|slot| slot.current.as_ref())
+        else {
             return Ok(false);
         };
         if r.abandon_attempt != attempt {
@@ -2933,10 +3115,10 @@ impl Endpoint {
             slot.connection.abandon_reserved_output();
             slot.reset_deadline = None;
             slot.closed_output_drained = true;
-            self.reservation.current = None;
+            self.reservations[index].current = None;
             self.refresh(id.slot);
         } else {
-            self.reservation.current = None;
+            self.reservations[index].current = None;
         }
         Ok(true)
     }
@@ -2947,7 +3129,7 @@ impl Endpoint {
         out: &mut [u8],
         budget: usize,
     ) -> Result<PollTransmit, EndpointError> {
-        self.poll_transmit_inner(now, out, budget, false)
+        self.poll_transmit_inner(now, out, budget, false, None)
     }
 
     fn poll_transmit_inner(
@@ -2956,16 +3138,27 @@ impl Endpoint {
         out: &mut [u8],
         budget: usize,
         reserve: bool,
+        selected: Option<Option<ConnectionId>>,
     ) -> Result<PollTransmit, EndpointError> {
-        if self.reservation.current.is_some() {
-            return Err(EndpointError::OutputReserved);
-        }
         self.clock(now)?;
         for _ in 0..budget {
             if !self.cleanup.is_empty() {
                 self.cleanup_one();
             }
-            if !self.control.is_empty() && (self.control_turn || self.output.is_empty()) {
+            let stateless_held = self.reservations.iter().any(|slot| {
+                slot.current
+                    .as_ref()
+                    .is_some_and(|r| r.packet.connection.is_none())
+            });
+            let next = self.output.iter().find(|&index| {
+                let id = self.id(index);
+                !self.is_output_reserved(id) && selected.is_none_or(|owner| owner == Some(id))
+            });
+            if !stateless_held
+                && !self.control.is_empty()
+                && selected.is_none_or(|owner| owner.is_none())
+                && (self.control_turn || next.is_none() || selected == Some(None))
+            {
                 let (ip, header, ipv4_options, mut echo) = *self.control.front().unwrap();
                 if let Some(policy) = self.config.connection.pmtud {
                     let ip_len = match (ip.source, ip.destination) {
@@ -3006,9 +3199,10 @@ impl Endpoint {
                     more_work: self.has_pending_output(),
                 });
             }
-            let Some(index) = self.output.pop() else {
+            let Some(index) = next else {
                 continue;
             };
+            self.output.remove(index);
             let connection = self.id(index);
             let slot = self.slots[index].as_mut().unwrap();
             let tuple = slot.connection.tuple();
@@ -3050,7 +3244,12 @@ impl Endpoint {
                         .last_output_range
                         .map(|range| TxTimestampToken::new(connection, range));
                     self.control_turn = true;
-                    self.refresh(index);
+                    if !reserve {
+                        self.refresh(index);
+                    } else {
+                        // Preserve candidate order, but do not reclaim before capture.
+                        self.output.push(index);
+                    }
                     return Ok(PollTransmit {
                         packet: Some(Transmit {
                             connection: Some(connection),

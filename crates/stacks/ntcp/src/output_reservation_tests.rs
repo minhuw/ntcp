@@ -91,15 +91,15 @@ fn reserved_data_fin_partial_acceptance_and_mutation_barrier() {
     assert_eq!(a.write(id, b"x"), Err(EndpointError::OutputReserved));
     assert_eq!(a.abort(id), Err(EndpointError::OutputReserved));
     assert_eq!(a.release(id), Err(EndpointError::OutputReserved));
-    assert_eq!(a.on_timeout(3, 16), Err(EndpointError::OutputReserved));
+    // Timers and output now skip only the held owner. Ingress is routed before
+    // exclusion: this outbound packet is unknown-tuple input, not input to id.
+    assert_eq!(a.on_timeout(3, 16), Ok(false));
     assert_eq!(
         a.input(3, original.ip, &bytes[..original.len]),
-        Err(EndpointError::OutputReserved)
+        Ok(InputDisposition::Dropped)
     );
-    assert_eq!(
-        a.poll_transmit(3, &mut bytes, 16),
-        Err(EndpointError::OutputReserved)
-    );
+    let stateless = a.poll_transmit(3, &mut bytes, 16).unwrap().packet.unwrap();
+    assert_eq!(stateless.connection, None);
     assert_eq!(
         a.poll_reserved_transmit(3, &mut bytes, 16),
         Err(EndpointError::OutputReserved)
@@ -112,7 +112,7 @@ fn reserved_data_fin_partial_acceptance_and_mutation_barrier() {
         assert!(!a.accept_transmit(a.now, attempt).unwrap());
         let mut total = 0;
         let mut n = 0;
-        while a.reservation.current.is_some() {
+        while a.reservations[0].current.is_some() {
             let (out, token) = a.poll_reserved_transmit(3, &mut bytes, 16).unwrap();
             let p = out.packet.unwrap();
             let token = token.unwrap();
@@ -251,13 +251,13 @@ fn reserved_ack_dsack_option_splitting_wrap_and_ordinal_exhaustion() {
         hop_limit: 64,
         dscp: 0,
     };
-    let token = a.reservation.token(Some(id)).unwrap();
-    a.reservation.capture(packet, &bytes, token);
+    let token = a.reservations[0].token(Some(id)).unwrap();
+    a.reservations[0].capture(packet, &bytes, token);
     a.set_first_hop_mtu(2, id, 68).unwrap();
     a.reject_unsubmitted(token).unwrap();
     let mut blocks = std::vec::Vec::new();
     let mut total = 0;
-    while a.reservation.current.is_some() {
+    while a.reservations[0].current.is_some() {
         let (out, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
         let p = out.packet.unwrap();
         let s = wire::parse(ip, &bytes[..p.len]).unwrap();
@@ -271,7 +271,7 @@ fn reserved_ack_dsack_option_splitting_wrap_and_ordinal_exhaustion() {
     }
     assert_eq!(blocks, [(10, 15), (20, 25), (30, 35), (40, 45)]);
     assert_eq!(total, 20);
-    a.reservation.ordinal = u64::MAX;
+    a.reservations[0].ordinal = u64::MAX;
     a.write(id, b"x").unwrap();
     assert!(a.poll_reserved_transmit(2, &mut bytes, 16).is_err());
     assert!(a.poll_transmit(2, &mut bytes, 16).unwrap().packet.is_some());
@@ -341,16 +341,16 @@ fn reserved_above_ack_dsack_pair_packs_without_padding_at_ipv4_floor() {
         hop_limit: 64,
         dscp: 0,
     };
-    let token = a.reservation.token(Some(id)).unwrap();
-    a.reservation.capture(packet, &bytes, token);
+    let token = a.reservations[0].token(Some(id)).unwrap();
+    a.reservations[0].capture(packet, &bytes, token);
     a.set_first_hop_mtu(2, id, 68).unwrap();
     a.reject_unsubmitted(token).unwrap();
     // Too little space for the pair must not silently change its meaning.
     assert_eq!(
-        a.reservation.fragment(44, &mut bytes),
+        a.reservations[0].fragment(44, &mut bytes),
         Err(EndpointError::ReservationMtuTooSmall)
     );
-    assert_eq!(a.reservation.current.as_ref().unwrap().sacks, 0);
+    assert_eq!(a.reservations[0].current.as_ref().unwrap().sacks, 0);
     let (out, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
     let p = out.packet.unwrap();
     assert_eq!(p.len, 48);
@@ -388,8 +388,8 @@ fn reserved_options_only_fragment_defers_ecn_and_cwr_until_actual_data() {
     }
     let mut bytes = [0; 200];
     let len = wire::encode(ip, header, &options, &[7; 40], &mut bytes).unwrap();
-    let token = a.reservation.token(Some(id)).unwrap();
-    a.reservation.capture(
+    let token = a.reservations[0].token(Some(id)).unwrap();
+    a.reservations[0].capture(
         Transmit {
             connection: Some(id),
             tx_timestamp: None,
@@ -409,7 +409,7 @@ fn reserved_options_only_fragment_defers_ecn_and_cwr_until_actual_data() {
     let mut pure_acks = 0;
     let mut cwr_packets = 0;
     let mut rejected_data = false;
-    while a.reservation.current.is_some() {
+    while a.reservations[0].current.is_some() {
         let (out, token) = a.poll_reserved_transmit(2, &mut bytes, 16).unwrap();
         let p = out.packet.unwrap();
         let token = token.unwrap();
@@ -673,14 +673,20 @@ fn reserved_acceptance_time_validation_is_atomic_and_tokens_are_single_use() {
         );
         assert_eq!(a.now, 2);
         assert_eq!(a.send_progress(id).unwrap(), progress);
-        assert_eq!(a.reservation.current.as_ref().unwrap().attempt, Some(token));
+        assert_eq!(
+            a.reservations[0].current.as_ref().unwrap().attempt,
+            Some(token)
+        );
         a.config.connection.timestamps = true;
         assert_eq!(
             a.accept_transmit(u64::MAX, token),
             Err(Error::AmbiguousTimeJump.into())
         );
         assert_eq!(a.now, 2);
-        assert_eq!(a.reservation.current.as_ref().unwrap().attempt, Some(token));
+        assert_eq!(
+            a.reservations[0].current.as_ref().unwrap().attempt,
+            Some(token)
+        );
         assert!(a.accept_transmit(late, token).unwrap());
         assert!(!a.accept_transmit(u64::MAX, token).unwrap());
         assert!(!a.reject_unsubmitted(token).unwrap());
@@ -708,7 +714,7 @@ fn reserved_pacing_gates_each_fragment_and_late_acceptance_has_no_catchup() {
         a.reject_unsubmitted(token.unwrap()).unwrap();
         let mut now = 2_000_002;
         let mut total = 0;
-        while a.reservation.current.is_some() {
+        while a.reservations[0].current.is_some() {
             let (out, token) = a.poll_reserved_transmit(now, &mut bytes, 16).unwrap();
             let p = out.packet.unwrap();
             let n = wire::parse(p.ip, &bytes[..p.len]).unwrap().payload.len();
@@ -717,7 +723,7 @@ fn reserved_pacing_gates_each_fragment_and_late_acceptance_has_no_catchup() {
             // Backend wait is not idle pacing credit for the accepted bytes.
             now += 2_000_000;
             a.accept_transmit(now, token.unwrap()).unwrap();
-            if a.reservation.current.is_some() {
+            if a.reservations[0].current.is_some() {
                 let (out, token) = a.poll_reserved_transmit(now, &mut bytes, 16).unwrap();
                 assert!(out.packet.is_none() && token.is_none(), "general={general}");
                 let deadline = a.next_deadline().unwrap();
@@ -763,7 +769,10 @@ fn reserved_acceptance_survives_successive_mtu_clock_advances() {
                     a.set_first_hop_mtu(now, id, 100).unwrap();
                 }
                 assert_eq!(a.now, now);
-                assert_eq!(a.reservation.current.as_ref().unwrap().attempt, Some(token));
+                assert_eq!(
+                    a.reservations[0].current.as_ref().unwrap().attempt,
+                    Some(token)
+                );
             }
             let now = a.now;
             let invalid_mtu = if endpoint_wide {
@@ -787,7 +796,7 @@ fn reserved_acceptance_survives_successive_mtu_clock_advances() {
                     .unwrap();
             }
             assert!(a.accept_transmit(now, token).unwrap());
-            while a.reservation.current.is_some() {
+            while a.reservations[0].current.is_some() {
                 let token = a
                     .poll_reserved_transmit(now, &mut bytes, 16)
                     .unwrap()
@@ -816,8 +825,7 @@ fn reserved_departure_preflight_failure_does_not_advance_endpoint_clock() {
     let progress = a.send_progress(id).unwrap();
     // Corrupt only the private departure range to exercise a ledger validation
     // failure, distinct from the public time/token checks.
-    let d = a
-        .reservation
+    let d = a.reservations[0]
         .current
         .as_mut()
         .unwrap()
@@ -832,8 +840,11 @@ fn reserved_departure_preflight_failure_does_not_advance_endpoint_clock() {
     );
     assert_eq!(a.now, 2);
     assert_eq!(a.send_progress(id).unwrap(), progress);
-    assert_eq!(a.reservation.current.as_ref().unwrap().attempt, Some(token));
-    a.reservation
+    assert_eq!(
+        a.reservations[0].current.as_ref().unwrap().attempt,
+        Some(token)
+    );
+    a.reservations[0]
         .current
         .as_mut()
         .unwrap()
@@ -843,4 +854,433 @@ fn reserved_departure_preflight_failure_does_not_advance_endpoint_clock() {
         .start = start;
     // An earlier valid accept proves neither connection nor endpoint clock moved.
     assert!(a.accept_transmit(3, token).unwrap());
+}
+
+fn two_flows() -> (Endpoint, Endpoint, [ConnectionId; 2], [ConnectionId; 2]) {
+    let mut a = endpoint();
+    let mut b = endpoint();
+    let remote = "192.0.2.2:8080".parse().unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let mut clients = std::vec::Vec::new();
+    let mut peers = std::vec::Vec::new();
+    let mut bytes = [0; 2048];
+    for port in [40000, 40001] {
+        let local = SocketAddr::new("192.0.2.1".parse().unwrap(), port);
+        clients.push(a.connect(0, local, remote).unwrap());
+        for step in 0..3 {
+            let (src, dst) = if step == 1 {
+                (&mut b, &mut a)
+            } else {
+                (&mut a, &mut b)
+            };
+            let p = src
+                .poll_transmit(0, &mut bytes, 16)
+                .unwrap()
+                .packet
+                .unwrap();
+            dst.input(0, p.ip, &bytes[..p.len]).unwrap();
+        }
+        peers.push(b.accept(listener).unwrap());
+    }
+    a.enable_output_reservations_with_capacity(2).unwrap();
+    (a, b, clients.try_into().unwrap(), peers.try_into().unwrap())
+}
+
+#[test]
+fn pool_two_active_flows_progress_while_one_backend_would_block() {
+    let (mut a, mut b, [held, other], [held_peer, other_peer]) = two_flows();
+    let mut bytes = [0; 2048];
+    a.write(held, b"backend blocked").unwrap();
+    let (_, held_attempt) = a
+        .poll_reserved_transmit_for(1, held, &mut bytes, 1)
+        .unwrap();
+    let held_attempt = held_attempt.unwrap();
+    let progress = a.send_progress(held).unwrap();
+    let owner_info = a.slot(held).unwrap().connection.transport_info();
+    assert!(a.is_output_reserved(held));
+    assert!(!a.ready_connections().any(|id| id == held));
+
+    b.write(held_peer, b"deferred input").unwrap();
+    let p = b.poll_transmit(2, &mut bytes, 16).unwrap().packet.unwrap();
+    let mut held_input = [0; 2048];
+    held_input[..p.len].copy_from_slice(&bytes[..p.len]);
+    assert_eq!(
+        a.input(2, p.ip, &held_input[..p.len]),
+        Err(EndpointError::OutputReserved)
+    );
+    assert_eq!(a.now, 1);
+    assert_eq!(a.readable_bytes(held).unwrap(), 0);
+    // Invalid packets are parsed/dropped, not spuriously deferred.
+    assert_eq!(a.input(2, p.ip, &[0; 10]), Ok(InputDisposition::Dropped));
+
+    b.write(other_peer, b"independent input").unwrap();
+    let q = b.poll_transmit(2, &mut bytes, 16).unwrap().packet.unwrap();
+    assert_eq!(q.connection, Some(other_peer));
+    assert_eq!(
+        a.input(2, q.ip, &bytes[..q.len]),
+        Ok(InputDisposition::Processed)
+    );
+    assert_eq!(a.readable_bytes(other).unwrap(), 17);
+    a.write(other, b"independent output").unwrap();
+    assert!(a.ready_connections().any(|id| id == other));
+    crate::allocation_tests::fail_after(0, || {
+        let (q, attempt) = a
+            .poll_reserved_transmit_for(3, other, &mut bytes, 1)
+            .unwrap();
+        assert_eq!(q.packet.unwrap().connection, Some(other));
+        let attempt = attempt.unwrap();
+        assert_ne!(attempt, held_attempt); // Both slots' first ordinal is one.
+        assert!(a.accept_transmit(4, attempt).unwrap());
+        assert!(!a.reject_unsubmitted(attempt).unwrap());
+        assert!(!a.abandon_transmit(attempt).unwrap());
+        assert!(a.is_output_reserved(held));
+        let deadline = a.next_deadline().unwrap();
+        assert!(deadline > 4);
+        assert!(!a.on_timeout(deadline, 16).unwrap());
+        let (q, attempt) = a.poll_reserved_transmit(deadline, &mut bytes, 16).unwrap();
+        assert_eq!(q.packet.unwrap().connection, Some(other));
+        assert!(a.accept_transmit(deadline, attempt.unwrap()).unwrap());
+    });
+    assert_eq!(a.send_progress(held).unwrap(), progress);
+    assert_eq!(
+        a.slot(held).unwrap().connection.transport_info(),
+        owner_info
+    );
+    // An older observed time cannot move the endpoint backwards or consume A.
+    assert_eq!(
+        a.accept_transmit(3, held_attempt),
+        Err(Error::TimeWentBackwards.into())
+    );
+    assert!(a.is_output_reserved(held));
+    assert!(a.accept_transmit(a.now, held_attempt).unwrap());
+    assert_eq!(
+        a.input(a.now, p.ip, &held_input[..p.len]),
+        Ok(InputDisposition::Processed)
+    );
+    assert_eq!(a.readable_bytes(held).unwrap(), 14);
+}
+
+#[test]
+fn pool_full_and_selected_budget_leave_ready_and_tcp_unchanged() {
+    let (mut a, _, [one, two], _) = two_flows();
+    let third = a
+        .connect(
+            1,
+            "192.0.2.1:40002".parse().unwrap(),
+            "192.0.2.2:8080".parse().unwrap(),
+        )
+        .unwrap();
+    a.write(one, b"one").unwrap();
+    a.write(two, b"two").unwrap();
+    let mut bytes = [0; 2048];
+    let zero = a.send_progress(one).unwrap();
+    assert!(
+        a.poll_reserved_transmit_for(1, one, &mut bytes, 0)
+            .unwrap()
+            .0
+            .packet
+            .is_none()
+    );
+    assert_eq!(a.send_progress(one).unwrap(), zero);
+    let (_, first) = a.poll_reserved_transmit_for(1, one, &mut bytes, 1).unwrap();
+    let (_, second) = a.poll_reserved_transmit_for(1, two, &mut bytes, 1).unwrap();
+    let before = a.send_progress(third).unwrap();
+    let queue: std::vec::Vec<_> = a.output.iter().collect();
+    let deadline = a.next_deadline();
+    assert_eq!(
+        a.poll_reserved_transmit_for(9, third, &mut bytes, 16),
+        Err(EndpointError::OutputReserved)
+    );
+    assert_eq!(
+        a.poll_reserved_transmit(9, &mut bytes, 16),
+        Err(EndpointError::OutputReserved)
+    );
+    assert_eq!(
+        a.poll_reserved_stateless_transmit(9, &mut bytes, 16),
+        Err(EndpointError::OutputReserved)
+    );
+    assert_eq!(a.now, 1);
+    assert_eq!(a.send_progress(third).unwrap(), before);
+    assert_eq!(a.output.iter().collect::<std::vec::Vec<_>>(), queue);
+    assert_eq!(a.next_deadline(), deadline);
+    assert_eq!(a.write(one, b"no"), Err(EndpointError::OutputReserved));
+    assert_eq!(a.read(two, &mut bytes), Err(EndpointError::OutputReserved));
+    assert_eq!(a.set_nagle(two, true), Err(EndpointError::OutputReserved));
+    assert_eq!(
+        a.check_write_admission(two, None, Default::default()),
+        Err(EndpointError::OutputReserved)
+    );
+    a.accept_transmit(9, second.unwrap()).unwrap();
+    let (out, third_attempt) = a
+        .poll_reserved_transmit_for(9, third, &mut bytes, 1)
+        .unwrap();
+    assert_eq!(out.packet.unwrap().connection, Some(third));
+    assert!(!a.accept_transmit(9, second.unwrap()).unwrap());
+    a.abandon_transmit(third_attempt.unwrap()).unwrap();
+    a.release(third).unwrap();
+    let recycled = a
+        .connect(
+            9,
+            "192.0.2.1:40003".parse().unwrap(),
+            "192.0.2.2:8080".parse().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(recycled.slot, third.slot);
+    assert_ne!(recycled, third);
+    assert_eq!(
+        a.poll_reserved_transmit_for(9, third, &mut bytes, 1),
+        Err(EndpointError::InvalidHandle)
+    );
+    assert!(!a.abandon_transmit(third_attempt.unwrap()).unwrap());
+    assert!(a.is_output_reserved(one));
+    a.accept_transmit(9, first.unwrap()).unwrap();
+}
+
+#[test]
+fn pool_allocation_budget_and_failure_are_atomic() {
+    let mut a = endpoint();
+    let before = a.buffer_bytes();
+    let charge = 2
+        * (a.config.connection.send_ip_payload_limit as usize
+            + core::mem::size_of::<crate::output_reservation::OutputReservation>());
+    a.config.max_buffer_bytes = before + charge - 1;
+    assert_eq!(
+        a.enable_output_reservations_with_capacity(2),
+        Err(Error::NoMemory.into())
+    );
+    assert_eq!(a.buffer_bytes(), before);
+    assert!(a.reservations.is_empty());
+    a.config.max_buffer_bytes += 1;
+    for fail in 0..3 {
+        // Metadata allocation, first packet buffer, second buffer.
+        assert_eq!(
+            crate::allocation_tests::fail_after(fail, || a
+                .enable_output_reservations_with_capacity(2)),
+            Err(Error::NoMemory.into())
+        );
+        assert_eq!(a.buffer_bytes(), before);
+        assert!(a.reservations.is_empty());
+    }
+    assert_eq!(
+        a.enable_output_reservations_with_capacity(0),
+        Err(Error::InvalidArgument.into())
+    );
+    assert_eq!(
+        a.enable_output_reservations_with_capacity(usize::MAX),
+        Err(Error::InvalidArgument.into())
+    );
+    a.enable_output_reservations_with_capacity(2).unwrap();
+    assert_eq!(a.buffer_bytes(), before + charge);
+    a.enable_output_reservations_with_capacity(2).unwrap();
+    assert_eq!(a.buffer_bytes(), before + charge);
+}
+
+#[test]
+fn pool_held_old_timer_is_removed_and_restored_without_blocking_other_due_timer() {
+    let (mut a, _, [held, other], _) = two_flows();
+    let mut bytes = [0; 2048];
+    a.write(held, b"older flight").unwrap();
+    let (_, first) = a
+        .poll_reserved_transmit_for(1, held, &mut bytes, 1)
+        .unwrap();
+    a.accept_transmit(1, first.unwrap()).unwrap();
+    let held_deadline = a.next_deadline().unwrap();
+    a.write(held, b"blocked flight").unwrap();
+    let (_, pending) = a
+        .poll_reserved_transmit_for(2, held, &mut bytes, 1)
+        .unwrap();
+    assert_eq!(a.next_deadline(), None);
+    a.write(other, b"other flight").unwrap();
+    let (_, sent) = a
+        .poll_reserved_transmit_for(3, other, &mut bytes, 1)
+        .unwrap();
+    a.accept_transmit(3, sent.unwrap()).unwrap();
+    let other_deadline = a.next_deadline().unwrap();
+    assert!(other_deadline > held_deadline);
+    assert!(!a.on_timeout(other_deadline, 1).unwrap());
+    assert_eq!(
+        a.slot(held).unwrap().connection.next_deadline(),
+        Some(held_deadline)
+    );
+    let (out, retry) = a
+        .poll_reserved_transmit_for(other_deadline, other, &mut bytes, 1)
+        .unwrap();
+    assert_eq!(out.packet.unwrap().connection, Some(other));
+    a.accept_transmit(other_deadline, retry.unwrap()).unwrap();
+    a.accept_transmit(other_deadline, pending.unwrap()).unwrap();
+    assert_eq!(a.next_deadline(), Some(held_deadline));
+    assert!(!a.on_timeout(other_deadline, 1).unwrap());
+}
+
+#[test]
+fn pool_fragment_repair_timestamp_cancellation_and_pacing_are_owner_local() {
+    let (mut a, _, [one, two], _) = two_flows();
+    let mut bytes = [0; 2048];
+    a.set_tx_timestamp_capacity(one, 4).unwrap();
+    a.write_with_timestamp(
+        one,
+        &[7; 300],
+        false,
+        false,
+        None,
+        TxTimestampRequest {
+            cookie: 42,
+            software_transmit: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    a.write(two, &[8; 300]).unwrap();
+    let (_, first) = a.poll_reserved_transmit_for(1, one, &mut bytes, 1).unwrap();
+    let (_, second) = a.poll_reserved_transmit_for(1, two, &mut bytes, 1).unwrap();
+    let first = first.unwrap();
+    let second = second.unwrap();
+    crate::allocation_tests::fail_after(0, || {
+        a.set_endpoint_first_hop_mtu(2, 100).unwrap();
+        a.reject_unsubmitted(first).unwrap();
+        // Rejection and timestamp cancellation cannot touch the other pool slot.
+        assert!(!a.accept_transmit(2, first).unwrap());
+        assert!(a.is_output_reserved(two));
+        assert!(a.next_tx_timestamp(one).unwrap().is_some());
+        let (out, prefix) = a.poll_reserved_transmit_for(2, one, &mut bytes, 1).unwrap();
+        assert!(out.packet.unwrap().len <= 80);
+        let prefix = prefix.unwrap();
+        assert!(a.accept_transmit(2, prefix).unwrap());
+        assert!(a.is_output_reserved(one));
+        assert!(!a.accept_transmit(2, prefix).unwrap());
+        a.reject_unsubmitted(second).unwrap();
+        let (out, retry) = a.poll_reserved_transmit(2, &mut bytes, 1).unwrap();
+        assert_eq!(out.packet.unwrap().connection, Some(two));
+        assert!(a.abandon_transmit(retry.unwrap()).unwrap());
+        assert!(a.is_output_reserved(one));
+        assert!(!a.abandon_transmit(first).unwrap());
+        // Latest accepted prefix remains the cancellation authority until retry.
+        assert!(a.abandon_transmit(prefix).unwrap());
+    });
+}
+
+#[test]
+fn pool_stateless_lane_and_released_terminal_owner_keep_separate_tickets() {
+    let (mut a, mut b, [one, two], [peer, _]) = two_flows();
+    let mut bytes = [0; 2048];
+    a.abort(one).unwrap();
+    a.release(one).unwrap();
+    let (out, terminal) = a.poll_reserved_transmit_for(1, one, &mut bytes, 1).unwrap();
+    let p = out.packet.unwrap();
+    assert_eq!(p.connection, Some(one));
+    // A late peer packet to the retained reset owner is deferred before mutation.
+    b.write(peer, b"late").unwrap();
+    let late = b.poll_transmit(1, &mut bytes, 16).unwrap().packet.unwrap();
+    assert_eq!(
+        a.input(1, late.ip, &bytes[..late.len]),
+        Err(EndpointError::OutputReserved)
+    );
+    // Same valid segment in the opposite direction has no owner at this endpoint.
+    a.input(
+        1,
+        IpMetadata {
+            source: late.ip.destination,
+            destination: late.ip.source,
+        },
+        &[0; 20],
+    )
+    .unwrap();
+    let ip = IpMetadata {
+        source: "192.0.2.3".parse().unwrap(),
+        destination: "192.0.2.1".parse().unwrap(),
+    };
+    let len = wire::encode(
+        ip,
+        Header {
+            source_port: 999,
+            destination_port: 999,
+            sequence: 1,
+            acknowledgment: 2,
+            flags: ACK,
+            window: 100,
+            urgent_pointer: 0,
+        },
+        &[],
+        &[],
+        &mut bytes,
+    )
+    .unwrap();
+    assert_eq!(a.input(2, ip, &bytes[..len]), Ok(InputDisposition::Dropped));
+    let (out, stateless) = a
+        .poll_reserved_stateless_transmit(2, &mut bytes, 1)
+        .unwrap();
+    assert_eq!(out.packet.unwrap().connection, None);
+    assert!(a.connection_exists(one));
+    assert_eq!(
+        a.poll_reserved_stateless_transmit(2, &mut bytes, 1),
+        Err(EndpointError::OutputReserved)
+    );
+    a.write(two, b"healthy").unwrap();
+    assert!(a.abandon_transmit(stateless.unwrap()).unwrap());
+    assert!(!a.accept_transmit(2, stateless.unwrap()).unwrap());
+    assert!(a.is_output_reserved(one));
+    a.on_timeout(100_000_000, 16).unwrap();
+    assert!(a.connection_exists(one));
+    assert!(a.abandon_transmit(terminal.unwrap()).unwrap());
+    assert!(!a.connection_exists(one));
+    let (out, token) = a
+        .poll_reserved_transmit_for(a.now, two, &mut bytes, 1)
+        .unwrap();
+    assert_eq!(out.packet.unwrap().connection, Some(two));
+    assert!(a.accept_transmit(a.now, token.unwrap()).unwrap());
+}
+
+#[test]
+fn pool_listener_events_and_accept_skip_held_children_without_losing_readiness() {
+    let mut a = endpoint();
+    let mut b = endpoint();
+    let remote = "192.0.2.2:8080".parse().unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let mut bytes = [0; 2048];
+    let mut children = std::vec::Vec::new();
+    for port in [40000, 40001] {
+        let local = SocketAddr::new("192.0.2.1".parse().unwrap(), port);
+        a.connect(0, local, remote).unwrap();
+        for step in 0..3 {
+            let (src, dst) = if step == 1 {
+                (&mut b, &mut a)
+            } else {
+                (&mut a, &mut b)
+            };
+            let packet = src
+                .poll_transmit(0, &mut bytes, 16)
+                .unwrap()
+                .packet
+                .unwrap();
+            dst.input(0, packet.ip, &bytes[..packet.len]).unwrap();
+        }
+        children.push(
+            b.connection_id(Tuple {
+                local: remote,
+                remote: local,
+            })
+            .unwrap(),
+        );
+    }
+    b.enable_output_reservations_with_capacity(2).unwrap();
+    let held = children[0];
+    b.write(held, b"unaccepted but held").unwrap();
+    let (_, token) = b
+        .poll_reserved_transmit_for(1, held, &mut bytes, 1)
+        .unwrap();
+    assert_eq!(
+        b.close_listener(listener),
+        Err(EndpointError::OutputReserved)
+    );
+    b.set_listener_application_timeout(listener, Some(123))
+        .unwrap();
+    // The second child can be accepted without modifying or popping the first.
+    assert_eq!(b.accept(listener).unwrap(), children[1]);
+    assert_eq!(b.accept(listener), Err(EndpointError::OutputReserved));
+    while let Some(event) = b.next_event() {
+        assert!(!matches!(event, Event::Acceptable(_)));
+    }
+    b.accept_transmit(2, token.unwrap()).unwrap();
+    assert!(matches!(b.next_event(), Some(Event::Acceptable(id)) if id == listener));
+    assert_eq!(b.accept(listener).unwrap(), held);
 }
