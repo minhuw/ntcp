@@ -28,10 +28,7 @@ impl Adapter {
         let flags = std::ffi::CString::new(format!("{profile},local={local}")).unwrap();
         let mut table = [0usize; 64];
         unsafe {
-            packetdrill_interface_init(
-                flags.as_ptr(),
-                table.as_mut_ptr().cast(),
-            );
+            packetdrill_interface_init(flags.as_ptr(), table.as_mut_ptr().cast());
         }
         if !ACTIVE.load(Ordering::Acquire) {
             return Err(EIO);
@@ -1140,7 +1137,6 @@ fn detached_fin_keeps_ip_policy_after_real_descriptor_reuse() {
     call(&adapter, 8, fd, 0, vec![], 0).unwrap();
     call(&adapter, 8, listener, 0, vec![], 0).unwrap();
 }
-
 
 // These are live raw-IP/ABI liveness checks, not precise pacing-rate tests.
 // Owner.test_now tests cover burst/deadline accounting without scheduler jitter.
