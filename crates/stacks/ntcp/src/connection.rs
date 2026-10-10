@@ -8030,15 +8030,14 @@ impl Connection {
         if !syn
             && count != 0
             && let Some((start, end)) = self.fast_open_retry
+            && seq == start
         {
-            if seq == start {
-                let next = seq.wrapping_add(count as u32);
-                self.fast_open_retry = if at_or_after(next, end) {
-                    None
-                } else {
-                    Some((next, end))
-                };
-            }
+            let next = seq.wrapping_add(count as u32);
+            self.fast_open_retry = if at_or_after(next, end) {
+                None
+            } else {
+                Some((next, end))
+            };
         }
         if retransmit && length != 0 {
             self.retx_pending = false;

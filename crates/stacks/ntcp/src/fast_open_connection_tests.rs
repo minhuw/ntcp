@@ -19,11 +19,13 @@ fn client(iss: u32, size: usize) -> Connection {
 }
 
 fn synack(a: &mut Connection, acked: u32, now: u64) {
-    let mut options = wire::Options::default();
-    options.mss = Some(536);
-    options.sack_permitted = true;
-    options.timestamps = Some((0, a.timestamp_value(0)));
-    options.fast_open = Some(wire::FastOpenCookie::new(&[8; 8]).unwrap());
+    let options = wire::Options {
+        mss: Some(536),
+        sack_permitted: true,
+        timestamps: Some((0, a.timestamp_value(0))),
+        fast_open: Some(wire::FastOpenCookie::new(&[8; 8]).unwrap()),
+        ..Default::default()
+    };
     let segment = wire::Segment {
         header: wire::Header {
             source_port: tuple().remote.port(),
