@@ -104,6 +104,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ntcp-egress"
+version = "0.0.1"
+
+[[package]]
 name = "ntcp-ethernet"
 version = "0.0.1"
 dependencies = [
