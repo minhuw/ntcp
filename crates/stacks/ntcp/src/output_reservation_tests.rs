@@ -1303,13 +1303,17 @@ fn check_listener_reservation_readiness(consume_event: bool, repair: bool) {
         assert!(b.reject_unsubmitted(token).unwrap());
         assert_eq!(b.accept(listener), Err(EndpointError::OutputReserved));
         assert_eq!(b.next_event(), None);
-        let (_, prefix) = b.poll_reserved_transmit_for(2, held, &mut bytes, 1).unwrap();
+        let (_, prefix) = b
+            .poll_reserved_transmit_for(2, held, &mut bytes, 1)
+            .unwrap();
         assert!(b.accept_transmit(2, prefix.unwrap()).unwrap());
         assert!(b.is_output_reserved(held));
         assert_eq!(b.accept(listener), Err(EndpointError::OutputReserved));
         assert_eq!(b.next_event(), None);
         assert_eq!(b.next_event(), None);
-        let (_, final_fragment) = b.poll_reserved_transmit_for(2, held, &mut bytes, 1).unwrap();
+        let (_, final_fragment) = b
+            .poll_reserved_transmit_for(2, held, &mut bytes, 1)
+            .unwrap();
         token = final_fragment.unwrap();
     }
     assert!(b.accept_transmit(2, token).unwrap());
@@ -1723,11 +1727,28 @@ fn group_exact_bounded_prefix_views_match_scalar_ipv4_ipv6_with_and_without_opti
                     peer.input(3, p.ip, &bytes[..len]).unwrap();
                     scalar.accept_transmit(2, scalar_token.unwrap()).unwrap();
                 }
+                let info = a.transport_info(id).unwrap();
+                let timer_before = a.slot(id).unwrap().connection.next_deadline();
+                // A new group and an exact WouldBlock retry both preflight
+                // without allocations, clock advancement or consuming output.
+                crate::allocation_tests::fail_after(0, || {
+                    assert!(a.validate_transmit_group(3, group).unwrap());
+                    assert!(a.validate_transmit_group(4, group).unwrap());
+                });
+                assert_eq!(a.now, 2);
+                assert_eq!(a.transport_info(id).unwrap(), info);
+                assert_eq!(a.slot(id).unwrap().connection.next_deadline(), timer_before);
+                assert_eq!(a.send_progress(id).unwrap(), progress);
+                assert_eq!(
+                    a.transmit_group(group).unwrap().payload,
+                    &payload[..prefix * size]
+                );
                 crate::allocation_tests::fail_after(0, || {
                     assert!(a.accept_transmit_group(3, group).unwrap())
                 });
                 assert_eq!(a.send_progress(id).unwrap(), progress);
                 assert!(a.transmit_group(group).is_none());
+                assert!(!a.validate_transmit_group(u64::MAX, group).unwrap());
                 assert!(!a.accept_transmit_group(u64::MAX, group).unwrap());
                 assert!(!a.reject_unsubmitted_group(group).unwrap());
                 if prefix == 4 {
@@ -1747,6 +1768,7 @@ fn group_exact_bounded_prefix_views_match_scalar_ipv4_ipv6_with_and_without_opti
                     let view = a.transmit_group(group).unwrap();
                     assert_eq!(view.payload, &payload[prefix * size..]);
                     assert_eq!(view.header.flags & wire::CWR, 0);
+                    assert!(a.validate_transmit_group(5, group).unwrap());
                     assert!(a.accept_transmit_group(5, group).unwrap());
                     assert_eq!(a.slot(id).unwrap().connection.next_deadline(), timer);
                 }
@@ -1834,6 +1856,10 @@ fn group_preparation_failure_clock_errors_and_stale_tokens_are_atomic() {
             .unwrap()
             .start = start.wrapping_add(1);
         assert_eq!(
+            a.validate_transmit_group(100, group),
+            Err(Error::InvalidArgument.into())
+        );
+        assert_eq!(
             a.accept_transmit_group(100, group),
             Err(Error::InvalidArgument.into())
         );
@@ -1852,7 +1878,10 @@ fn group_preparation_failure_clock_errors_and_stale_tokens_are_atomic() {
             (1, Error::TimeWentBackwards),
             (u64::MAX, Error::AmbiguousTimeJump),
         ] {
-            assert_eq!(a.accept_transmit_group(now, group), Err(error.into()));
+            crate::allocation_tests::fail_after(0, || {
+                assert_eq!(a.validate_transmit_group(now, group), Err(error.into()));
+                assert_eq!(a.accept_transmit_group(now, group), Err(error.into()));
+            });
             assert_eq!(a.now, 2);
             assert_eq!(a.send_progress(id).unwrap(), progress);
             assert_eq!(a.transmit_group(group).unwrap().payload.len(), len);
@@ -1860,6 +1889,7 @@ fn group_preparation_failure_clock_errors_and_stale_tokens_are_atomic() {
         }
         assert!(a.reject_unsubmitted_group(group).unwrap());
         assert!(!a.reject_unsubmitted_group(group).unwrap());
+        assert!(!a.validate_transmit_group(3, group).unwrap());
         assert!(!a.accept_transmit_group(3, group).unwrap());
         assert!(!a.accept_transmit(3, token).unwrap());
         let (_, scalar) = a.poll_reserved_transmit_for(3, id, &mut bytes, 1).unwrap();
@@ -1874,6 +1904,7 @@ fn group_preparation_failure_clock_errors_and_stale_tokens_are_atomic() {
             .unwrap()
             .unwrap();
         assert_ne!(next_group, group);
+        assert!(!a.validate_transmit_group(4, group).unwrap());
         assert!(!a.accept_transmit_group(4, group).unwrap());
         assert!(a.reject_unsubmitted_group(next_group).unwrap());
         assert!(
@@ -1882,6 +1913,134 @@ fn group_preparation_failure_clock_errors_and_stale_tokens_are_atomic() {
         );
         assert!(a.abandon_transmit_group(next_group).unwrap());
         assert!(!a.is_output_reserved(id));
+    }
+}
+
+#[test]
+fn group_validation_checks_exact_identity_and_endpoint_clock_without_consuming() {
+    let (mut a, _, id, _) = gso_pair(false, true);
+    a.write(id, &[1; 5000]).unwrap();
+    let (_, attempt) = a
+        .poll_reserved_transmit_for(2, id, &mut [0; 2048], 1)
+        .unwrap();
+    let attempt = attempt.unwrap();
+    let group = a
+        .prepare_transmit_group(attempt, group_limits())
+        .unwrap()
+        .unwrap();
+    let other = a
+        .connect(
+            10,
+            "192.0.2.1:40001".parse().unwrap(),
+            "192.0.2.2:8080".parse().unwrap(),
+        )
+        .unwrap();
+    let info = a.transport_info(id).unwrap();
+    let progress = a.send_progress(id).unwrap();
+    let timer = a.slot(id).unwrap().connection.next_deadline();
+    let len = a.transmit_group(group).unwrap().payload.len();
+    for token in [
+        crate::TransmitGroup(attempt),
+        crate::TransmitGroup(crate::TransmitAttempt {
+            reservation: usize::MAX,
+            ..group.0
+        }),
+        crate::TransmitGroup(crate::TransmitAttempt {
+            connection: Some(other),
+            ..group.0
+        }),
+        crate::TransmitGroup(crate::TransmitAttempt {
+            connection: None,
+            ..group.0
+        }),
+    ] {
+        crate::allocation_tests::fail_after(0, || {
+            // Invalid identity precedes clock validation, just like acceptance.
+            assert_eq!(a.validate_transmit_group(0, token), Ok(false));
+            assert_eq!(a.accept_transmit_group(0, token), Ok(false));
+        });
+    }
+    // The held owner's own clock permits 3; the endpoint clock does not.
+    for now in [3, 9] {
+        crate::allocation_tests::fail_after(0, || {
+            assert_eq!(
+                a.validate_transmit_group(now, group),
+                Err(Error::TimeWentBackwards.into())
+            );
+            assert_eq!(
+                a.accept_transmit_group(now, group),
+                Err(Error::TimeWentBackwards.into())
+            );
+        });
+    }
+    assert_eq!(a.now, 10);
+    assert_eq!(a.transport_info(id).unwrap(), info);
+    assert_eq!(a.send_progress(id).unwrap(), progress);
+    assert_eq!(a.slot(id).unwrap().connection.next_deadline(), timer);
+    assert_eq!(a.transmit_group(group).unwrap().payload.len(), len);
+    let r = a.reservations[0].current.as_ref().unwrap();
+    assert_eq!(r.offset, 0);
+    assert_eq!(r.attempt, Some(group.0));
+    assert_eq!(a.reservations[0].ordinal, group.0.ordinal);
+    assert!(a.validate_transmit_group(11, group).unwrap());
+    assert!(a.accept_transmit_group(11, group).unwrap());
+}
+
+#[test]
+fn group_validation_rejects_owner_history_expiry_despite_other_owner_clock_progress() {
+    for timestamps in [false, true] {
+        let (mut a, _, id, _) = gso_pair_options(false, true, timestamps);
+        a.write(id, &[1; 5000]).unwrap();
+        let (_, attempt) = a
+            .poll_reserved_transmit_for(2, id, &mut [0; 2048], 1)
+            .unwrap();
+        let group = a
+            .prepare_transmit_group(attempt.unwrap(), group_limits())
+            .unwrap()
+            .unwrap();
+        // Default caller ticks are microseconds, timestamp/history ticks ms.
+        let expiry = (1u64 << 31) * 1000;
+        a.connect(
+            expiry - 1000,
+            "192.0.2.1:40001".parse().unwrap(),
+            "192.0.2.2:8080".parse().unwrap(),
+        )
+        .unwrap();
+        assert!(a.validate_transmit_group(expiry - 1, group).unwrap());
+        assert_eq!(a.now, expiry - 1000);
+        a.connect(
+            expiry,
+            "192.0.2.1:40002".parse().unwrap(),
+            "192.0.2.2:8080".parse().unwrap(),
+        )
+        .unwrap();
+        let info = a.transport_info(id).unwrap();
+        let progress = a.send_progress(id).unwrap();
+        let timer = a.slot(id).unwrap().connection.next_deadline();
+        let len = a.transmit_group(group).unwrap().payload.len();
+        for now in [expiry, expiry + 1000] {
+            crate::allocation_tests::fail_after(0, || {
+                assert_eq!(
+                    a.validate_transmit_group(now, group),
+                    Err(Error::AmbiguousTimeJump.into())
+                );
+                assert_eq!(
+                    a.accept_transmit_group(now, group),
+                    Err(Error::AmbiguousTimeJump.into())
+                );
+            });
+            assert_eq!(a.now, expiry);
+            assert_eq!(a.transport_info(id).unwrap(), info);
+            assert_eq!(a.send_progress(id).unwrap(), progress);
+            assert_eq!(a.slot(id).unwrap().connection.next_deadline(), timer);
+            assert_eq!(a.transmit_group(group).unwrap().payload.len(), len);
+            let r = a.reservations[0].current.as_ref().unwrap();
+            assert_eq!(r.offset, 0);
+            assert_eq!(r.attempt, Some(group.0));
+            assert_eq!(a.reservations[0].ordinal, group.0.ordinal);
+        }
+        assert!(a.reject_unsubmitted_group(group).unwrap());
+        assert!(!a.validate_transmit_group(expiry, group).unwrap());
     }
 }
 

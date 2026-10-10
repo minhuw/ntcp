@@ -461,7 +461,7 @@ impl Endpoint {
             })
     }
 
-    fn clock(&mut self, now: Instant) -> Result<(), EndpointError> {
+    fn check_clock(&self, now: Instant) -> Result<(), EndpointError> {
         if now < self.now {
             return Err(Error::TimeWentBackwards.into());
         }
@@ -473,6 +473,11 @@ impl Endpoint {
         {
             return Err(Error::AmbiguousTimeJump.into());
         }
+        Ok(())
+    }
+
+    fn clock(&mut self, now: Instant) -> Result<(), EndpointError> {
+        self.check_clock(now)?;
         self.now = now;
         Ok(())
     }
@@ -2950,6 +2955,38 @@ impl Endpoint {
         })
     }
 
+    /// Read-only, allocation-free acceptance preflight for a prepared group.
+    /// Returns false for a stale/invalid token; clock or owner-history violations
+    /// return the same errors as acceptance, without consuming the group.
+    /// Call immediately before each submission (including WouldBlock retries),
+    /// serializing endpoint access through submission and acceptance. Success
+    /// does not reserve time: acceptance must still validate its submission time.
+    pub fn validate_transmit_group(
+        &self,
+        now: Instant,
+        token: crate::TransmitGroup,
+    ) -> Result<bool, EndpointError> {
+        let Some(r) = self
+            .reservations
+            .get(token.0.reservation)
+            .and_then(|slot| slot.current.as_ref())
+        else {
+            return Ok(false);
+        };
+        let Some(group) = r.group.filter(|g| g.token == token) else {
+            return Ok(false);
+        };
+        let id = token.0.connection.ok_or(EndpointError::InvalidHandle)?;
+        self.retained_slot(id)?.connection.validate_reserved_group(
+            now,
+            &r.departure.unwrap(),
+            r.offset,
+            group.segments,
+        )?;
+        self.check_clock(now)?;
+        Ok(true)
+    }
+
     /// Commit one accepted backend object as N distinct physical spans. `now`
     /// is the monotonic submission time, NOT a per-segment hardware timestamp.
     /// Preflight errors do not mutate state; after backend acceptance callers
@@ -2959,29 +2996,18 @@ impl Endpoint {
         now: Instant,
         token: crate::TransmitGroup,
     ) -> Result<bool, EndpointError> {
+        if !self.validate_transmit_group(now, token)? {
+            return Ok(false);
+        }
         let index = token.0.reservation;
-        let Some(r) = self
-            .reservations
-            .get(index)
-            .and_then(|slot| slot.current.as_ref())
-        else {
-            return Ok(false);
-        };
-        let Some(group) = r.group.filter(|g| g.token == token) else {
-            return Ok(false);
-        };
+        let r = self.reservations[index].current.as_ref().unwrap();
+        let group = r.group.unwrap();
         let mut departure = r.departure.unwrap();
         let size = departure.segmentation.unwrap().segment_payload_len;
         let offset = r.offset;
         let finished = offset + group.bytes == departure.payload;
-        let id = token.0.connection.ok_or(EndpointError::InvalidHandle)?;
-        self.retained_slot(id)?.connection.validate_reserved_group(
-            now,
-            &departure,
-            offset,
-            group.segments,
-        )?;
-        self.clock(now)?;
+        let id = token.0.connection.unwrap();
+        self.now = now;
         let owner = &mut self.retained_slot_mut(id)?.connection;
         for n in 0..group.segments {
             // Collective preflight proves split capacity for the entire prefix;
