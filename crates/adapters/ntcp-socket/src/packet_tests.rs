@@ -3063,3 +3063,6 @@ fn cubic_ecn_profile_changes_only_ecn_enablement() {
     ecn.connection.ecn = false;
     assert_eq!(format!("{ecn:?}"), format!("{cubic:?}"));
 }
+
+#[path = "packet_allocation_tests.rs"]
+mod allocation_tests;

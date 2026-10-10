@@ -12,7 +12,8 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             queue_capacity: packet_profile::LIMIT,
-            egress_capacity: crate::runtime::BUDGET,
+            // Keep two independent held flows and baseline buffer-resize headroom.
+            egress_capacity: 2,
         }
     }
 }
