@@ -3048,6 +3048,17 @@ impl Endpoint {
         }
         if let Some(id) = connection {
             self.refresh(id.slot);
+            // A prior Acceptable may have been consumed for an unheld sibling.
+            // Re-arm only after the final fragment releases this pending child.
+            if finished
+                && let Ok(slot) = self.retained_slot(id)
+                && let Some(parent) = slot.listener
+                && self
+                    .listener(parent)
+                    .is_ok_and(|listener| listener.pending.contains(&id))
+            {
+                self.events.push(self.config.max_connections + parent.slot);
+            }
         }
         Ok(true)
     }

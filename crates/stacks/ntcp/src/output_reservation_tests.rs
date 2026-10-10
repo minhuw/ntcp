@@ -1232,6 +1232,20 @@ fn pool_stateless_lane_and_released_terminal_owner_keep_separate_tickets() {
 
 #[test]
 fn pool_listener_events_and_accept_skip_held_children_without_losing_readiness() {
+    check_listener_reservation_readiness(false, false);
+}
+
+#[test]
+fn pool_listener_consumed_event_requeued_after_acceptance() {
+    check_listener_reservation_readiness(true, false);
+}
+
+#[test]
+fn pool_listener_consumed_event_requeued_after_repair() {
+    check_listener_reservation_readiness(true, true);
+}
+
+fn check_listener_reservation_readiness(consume_event: bool, repair: bool) {
     let mut a = endpoint();
     let mut b = endpoint();
     let remote = "192.0.2.2:8080".parse().unwrap();
@@ -1264,7 +1278,7 @@ fn pool_listener_events_and_accept_skip_held_children_without_losing_readiness()
     }
     b.enable_output_reservations_with_capacity(2).unwrap();
     let held = children[0];
-    b.write(held, b"unaccepted but held").unwrap();
+    b.write(held, &[7; 120]).unwrap();
     let (_, token) = b
         .poll_reserved_transmit_for(1, held, &mut bytes, 1)
         .unwrap();
@@ -1274,13 +1288,34 @@ fn pool_listener_events_and_accept_skip_held_children_without_losing_readiness()
     );
     b.set_listener_application_timeout(listener, Some(123))
         .unwrap();
+    if consume_event {
+        assert!(matches!(b.next_event(), Some(Event::Acceptable(id)) if id == listener));
+    }
     // The second child can be accepted without modifying or popping the first.
     assert_eq!(b.accept(listener).unwrap(), children[1]);
     assert_eq!(b.accept(listener), Err(EndpointError::OutputReserved));
     while let Some(event) = b.next_event() {
         assert!(!matches!(event, Event::Acceptable(_)));
     }
-    b.accept_transmit(2, token.unwrap()).unwrap();
+    let mut token = token.unwrap();
+    if repair {
+        b.set_first_hop_mtu(2, held, 100).unwrap();
+        assert!(b.reject_unsubmitted(token).unwrap());
+        assert_eq!(b.accept(listener), Err(EndpointError::OutputReserved));
+        assert_eq!(b.next_event(), None);
+        let (_, prefix) = b.poll_reserved_transmit_for(2, held, &mut bytes, 1).unwrap();
+        assert!(b.accept_transmit(2, prefix.unwrap()).unwrap());
+        assert!(b.is_output_reserved(held));
+        assert_eq!(b.accept(listener), Err(EndpointError::OutputReserved));
+        assert_eq!(b.next_event(), None);
+        assert_eq!(b.next_event(), None);
+        let (_, final_fragment) = b.poll_reserved_transmit_for(2, held, &mut bytes, 1).unwrap();
+        token = final_fragment.unwrap();
+    }
+    assert!(b.accept_transmit(2, token).unwrap());
+    assert!(!b.is_output_reserved(held));
     assert!(matches!(b.next_event(), Some(Event::Acceptable(id)) if id == listener));
+    assert!(!b.accept_transmit(2, token).unwrap());
+    assert_eq!(b.next_event(), None);
     assert_eq!(b.accept(listener).unwrap(), held);
 }
