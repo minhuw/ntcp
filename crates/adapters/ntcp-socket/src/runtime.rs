@@ -1471,7 +1471,8 @@ impl Owner {
                 let accepted = self.endpoint.accept(listener);
                 if matches!(
                     accepted,
-                    Err(EndpointError::Connection(Error::WouldBlock) | EndpointError::OutputReserved)
+                    Err(EndpointError::Connection(Error::WouldBlock)
+                        | EndpointError::OutputReserved)
                 ) {
                     // All pending children may be held by backend output. Treat
                     // that accept-only pressure like an empty queue; final child
