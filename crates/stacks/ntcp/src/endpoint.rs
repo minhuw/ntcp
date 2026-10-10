@@ -1086,7 +1086,18 @@ impl Endpoint {
     /// freshness of application operations; listeners must separately opt in.
     pub fn enable_fast_open(&mut self) -> Result<(), EndpointError> {
         if self.fast_open.is_none() {
-            self.fast_open = Some(crate::fast_open::FastOpen::new()?);
+            let charge = crate::fast_open::FastOpen::allocation_bytes();
+            if charge
+                > self
+                    .config
+                    .max_buffer_bytes
+                    .saturating_sub(self.buffer_bytes)
+            {
+                return Err(Error::NoMemory.into());
+            }
+            let service = crate::fast_open::FastOpen::new()?;
+            self.fast_open = Some(service);
+            self.buffer_bytes += charge;
         }
         Ok(())
     }

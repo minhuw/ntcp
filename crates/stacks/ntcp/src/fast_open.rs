@@ -23,6 +23,10 @@ pub(crate) struct FastOpen {
 }
 
 impl FastOpen {
+    pub const fn allocation_bytes() -> usize {
+        CAPACITY * core::mem::size_of::<CachedCookie>()
+    }
+
     pub fn new() -> Result<Self, Error> {
         let mut entries = Vec::new();
         entries

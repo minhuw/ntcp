@@ -565,8 +565,10 @@ fn fast_open_explicit_capacity_allocation_rollback_preserves_receive_pool() {
             cfg.connection.receive_capacity = 257;
             cfg.connection.mss = 536;
             cfg.preallocate_connections = preallocate;
-            cfg.max_buffer_bytes =
-                crate::connection::Connection::allocation_bytes(64, 257, 536).unwrap();
+            // Preserve the exact connection allowance, plus the optional cache.
+            cfg.max_buffer_bytes = crate::connection::Connection::allocation_bytes(64, 257, 536)
+                .unwrap()
+                + crate::fast_open::FastOpen::allocation_bytes();
             let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
             a.enable_fast_open().unwrap();
             let before = a.buffer_bytes();
@@ -629,4 +631,132 @@ fn fast_open_explicit_capacity_allocation_rollback_preserves_receive_pool() {
         assert_eq!(accepted, 31);
     }
     assert!(completed);
+}
+
+#[test]
+fn fast_open_cache_enable_budget_exact_fit_and_idempotence() {
+    use crate::fast_open::FastOpen;
+    let charge = FastOpen::allocation_bytes();
+    assert_eq!(
+        charge,
+        64 * core::mem::size_of::<crate::fast_open::CachedCookie>()
+    );
+    let (local, remote) = addresses(false, 40001);
+    for budget in [0, charge - 1, charge] {
+        let cfg = EndpointConfig {
+            max_buffer_bytes: budget,
+            ..EndpointConfig::default()
+        };
+        let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+        if budget < charge {
+            assert_eq!(
+                a.enable_fast_open(),
+                Err(EndpointError::Connection(Error::NoMemory))
+            );
+            assert_eq!(a.buffer_bytes(), 0);
+            assert_eq!(
+                a.connect_fast_open(0, local, remote, b"disabled"),
+                Err(EndpointError::Connection(Error::InvalidState))
+            );
+        } else {
+            a.enable_fast_open().unwrap();
+            assert_eq!(a.buffer_bytes(), charge);
+            // A repeated enable neither allocates nor charges again.
+            crate::allocation_tests::fail_after(0, || a.enable_fast_open()).unwrap();
+            assert_eq!(a.buffer_bytes(), charge);
+            assert_eq!(
+                a.connect(0, local, remote),
+                Err(EndpointError::LimitReached)
+            );
+        }
+        assert!(
+            a.poll_transmit(0, &mut [0; 2048], 64)
+                .unwrap()
+                .packet
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn fast_open_cache_allocation_failure_does_not_publish_or_charge() {
+    let charge = crate::fast_open::FastOpen::allocation_bytes();
+    let cfg = EndpointConfig {
+        max_buffer_bytes: charge,
+        ..EndpointConfig::default()
+    };
+    let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+    let (local, remote) = addresses(false, 40001);
+    assert_eq!(
+        crate::allocation_tests::fail_after(0, || a.enable_fast_open()),
+        Err(EndpointError::Connection(Error::NoMemory))
+    );
+    assert_eq!(a.buffer_bytes(), 0);
+    assert_eq!(
+        a.connect_fast_open(0, local, remote, b"disabled"),
+        Err(EndpointError::Connection(Error::InvalidState))
+    );
+    a.enable_fast_open().unwrap();
+    assert_eq!(a.buffer_bytes(), charge);
+    assert!(
+        a.poll_transmit(0, &mut [0; 2048], 64)
+            .unwrap()
+            .packet
+            .is_none()
+    );
+}
+
+#[test]
+fn fast_open_cache_charge_constrains_subsequent_admission_with_pool_credit() {
+    let cache = crate::fast_open::FastOpen::allocation_bytes();
+    let connection = crate::connection::Connection::allocation_bytes(64, 257, 536).unwrap();
+    let (local, remote) = addresses(false, 40001);
+    for preallocate in [0, 1] {
+        for budget in [connection + cache - 1, connection + cache] {
+            let mut cfg = EndpointConfig::default();
+            cfg.connection.send_capacity = 64;
+            cfg.connection.receive_capacity = 257;
+            cfg.connection.mss = 536;
+            cfg.preallocate_connections = preallocate;
+            cfg.max_buffer_bytes = budget;
+            let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+            assert_eq!(a.buffer_bytes(), preallocate * connection);
+            if preallocate == 1 && budget < connection + cache {
+                assert_eq!(
+                    a.enable_fast_open(),
+                    Err(EndpointError::Connection(Error::NoMemory))
+                );
+                assert_eq!(a.buffer_bytes(), connection);
+                // The failed optional reservation did not spend pooled credit.
+                a.connect(0, local, remote).unwrap();
+                assert_eq!(a.buffer_bytes(), connection);
+                continue;
+            }
+            a.enable_fast_open().unwrap();
+            assert_eq!(a.buffer_bytes(), preallocate * connection + cache);
+            let result =
+                a.connect_fast_open_with_buffer_capacities(0, local, remote, b"miss", 64, 257);
+            if budget < connection + cache {
+                assert_eq!(result, Err(EndpointError::LimitReached));
+                assert_eq!(a.buffer_bytes(), cache);
+                assert!(
+                    a.poll_transmit(0, &mut [0; 2048], 64)
+                        .unwrap()
+                        .packet
+                        .is_none()
+                );
+            } else {
+                let (id, accepted) = result.unwrap();
+                assert_eq!(accepted, 0);
+                assert_eq!(a.buffer_capacities(id).unwrap(), (64, 257));
+                assert_eq!(a.buffer_bytes(), connection + cache);
+                let (other, _) = addresses(false, 40002);
+                assert_eq!(
+                    a.connect(0, other, remote),
+                    Err(EndpointError::LimitReached)
+                );
+                assert_eq!(a.buffer_bytes(), connection + cache);
+            }
+        }
+    }
 }
