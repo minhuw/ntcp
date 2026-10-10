@@ -288,6 +288,8 @@ pub(crate) struct Congestion {
     fast_recovery: bool,
     sack_recovery: bool,
     ecn_end: Option<Seq>,
+    // ECN PRR keeps logical cwnd separate from temporary admission.
+    ecn_prr: Option<(Seq, u32)>,
     // TLP repair reduces congestion without starting recovery. This epoch
     // shares that reduction with later original losses, never bars recovery.
     tlp_reduction_end: Option<Seq>,
@@ -333,6 +335,7 @@ impl Congestion {
             fast_recovery: false,
             sack_recovery: false,
             ecn_end: None,
+            ecn_prr: None,
             tlp_reduction_end: None,
             timeout_retransmitted: false,
             retransmitted_end: None,
@@ -396,7 +399,7 @@ impl Congestion {
 
     // Caller invokes only after committed data output and SND.NXT accounting.
     pub(crate) fn on_data_sent(&mut self, now: u64, flight: u32, end: Seq, cwnd_limited: bool) {
-        let recovery = self.in_recovery();
+        let recovery = self.in_recovery() || self.ecn_prr.is_some();
         if let Some(cubic) = &mut self.cubic {
             cubic.sent(now, flight, self.cwnd, end, recovery, cwnd_limited);
         }
@@ -456,13 +459,26 @@ impl Congestion {
     pub(crate) fn prr_window(&mut self, window: u32) {
         if let Some(response) = &mut self.probe_response {
             response.window = window.min(MAX_WINDOW);
+        } else if let Some((_, admission)) = &mut self.ecn_prr {
+            *admission = window.min(MAX_WINDOW);
         } else {
             self.cwnd = window.min(MAX_WINDOW);
         }
     }
 
+    // RFC9438 ECN can reduce cwnd below the two-MSS ssthresh floor. PRR must
+    // converge to that reduced logical window, not undo persistent ECN backoff.
     pub(crate) fn recovery_target(&self) -> u32 {
-        self.probe_response.map_or(self.ssthresh, |p| p.target)
+        self.probe_response.map_or_else(
+            || {
+                if self.ecn_prr.is_some() {
+                    self.cwnd
+                } else {
+                    self.ssthresh
+                }
+            },
+            |p| p.target,
+        )
     }
 
     pub(crate) fn unsuppressed_cwnd(&self) -> u32 {
@@ -506,12 +522,29 @@ impl Congestion {
         }
     }
 
+    pub(crate) fn start_ecn_prr(&mut self, end: Seq, flight: u32, target: u32) {
+        debug_assert!(self.cubic.is_some() && !self.in_recovery());
+        self.cwnd = target;
+        self.ecn_prr = Some((end, flight));
+    }
+
+    pub(crate) fn ecn_prr_end(&self) -> Option<Seq> {
+        self.ecn_prr.map(|(end, _)| end)
+    }
+
+    pub(crate) fn end_ecn_prr(&mut self) {
+        self.ecn_prr = None;
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.4
+    //= reason=Loss PRR restores ssthresh; ECN restores its logical target, preserving RFC9438's one-SMSS ECN cwnd floor independently of the two-SMSS ssthresh floor.
     //# On the completion of a PRR episode, PRR executes the following:
     //#
     //#    cwnd = ssthresh
     pub(crate) fn complete_prr(&mut self) {
-        self.prr_window(self.recovery_target());
+        if self.ecn_prr.take().is_none() {
+            self.prr_window(self.recovery_target());
+        }
         if self.probe_response.is_none() {
             self.congestion_avoidance = true;
         }
@@ -519,7 +552,10 @@ impl Congestion {
     }
 
     pub(crate) fn cwnd(&self) -> u32 {
-        self.probe_response.map_or(self.cwnd, |p| p.window)
+        self.probe_response.map_or_else(
+            || self.ecn_prr.map_or(self.cwnd, |(_, window)| window),
+            |p| p.window,
+        )
     }
 
     pub(crate) fn ssthresh(&self) -> u32 {
@@ -550,6 +586,7 @@ impl Congestion {
         let increasing = mss > self.mss;
         let (cwnd, ssthresh) = (self.cwnd, self.ssthresh);
         let response = self.probe_response;
+        let ecn_prr = self.ecn_prr;
         self.set_mss(mss);
         // RFC4821: raising the path MTU alone cannot raise byte windows.
         // Keep negotiation/decrease rules in set_mss unchanged.
@@ -557,6 +594,7 @@ impl Congestion {
             self.cwnd = cwnd;
             self.ssthresh = ssthresh;
             self.probe_response = response;
+            self.ecn_prr = ecn_prr;
         }
     }
 
@@ -574,6 +612,11 @@ impl Congestion {
             }
             response.window = response.window.max(mss);
             response.target = response.target.max(mss.saturating_mul(2));
+        }
+        if let Some((_, window)) = &mut self.ecn_prr
+            && mss < self.mss
+        {
+            *window = (u64::from(*window) * u64::from(mss) / u64::from(self.mss)) as u32;
         }
         if mss < self.mss {
             // RFC 5681: preserve the segment count when the path MSS falls.
@@ -927,7 +970,7 @@ impl Congestion {
         {
             self.ecn_end = None;
         }
-        if ece {
+        if ece || self.ecn_prr.is_some() {
             if let Some(cubic) = &mut self.cubic {
                 cubic.ack_flight(flight_after_ack, self.cwnd);
             }
@@ -1068,6 +1111,7 @@ impl Congestion {
         {
             return false;
         }
+        self.end_ecn_prr();
         if self
             .ecn_end
             .is_some_and(|end| ack.serial_cmp(end) == Some(Ordering::Greater))
@@ -1309,6 +1353,7 @@ impl Congestion {
         {
             return false;
         }
+        self.end_ecn_prr();
         if self.ecn_end.is_none() && self.tlp_reduction_end.is_none() {
             if let Some(start) = probe.filter(|_| !ece) {
                 self.begin_probe_response(start, flight);
@@ -1377,12 +1422,25 @@ impl Congestion {
         {
             return false;
         }
-        self.reduce_threshold(flight);
+        // RFC9438 section 4.6 permits a cwnd basis when growth is limited to
+        // validated full-flight ACKs. Cubic::prepare_ack/sent enforce that
+        // eligibility (including receiver limits); idle restart is unchanged.
+        if self.cubic.is_some() && self.in_recovery() {
+            // An ECE ACK beyond the old recovery boundary starts a new event.
+            // Loss PRR admission/inflation is not the logical congestion window.
+            self.cwnd = self.recovery_target();
+        }
+        let basis = if self.cubic.is_some() {
+            self.cwnd
+        } else {
+            flight
+        };
+        self.reduce_threshold(basis);
         // RFC 9438 section 4.6 permits CUBIC's beta=0.7 instead of the
         // RFC 5681/RFC 3168 default Reno half reduction. ECN still reaches one MSS independently
         // of the two-MSS ssthresh floor and shares the existing epoch guards.
         let reduced = if self.cubic.is_some() {
-            (u64::from(flight) * 7 / 10).min(u64::from(self.cwnd)) as u32
+            (u64::from(basis) * 7 / 10) as u32
         } else {
             self.cwnd / 2
         };
@@ -1403,7 +1461,7 @@ impl Congestion {
     //#
     //# ssthresh = cwnd
     //= https://www.rfc-editor.org/rfc/rfc9438#section-3.1
-    //= reason=Selected CUBIC saves pre-event cwnd and sets beta=0.7 of supplied actual eligible flight; two-SMSS threshold/loss floor, independent one-SMSS ECE floor in on_ecn. Existing recovery/PRR owns temporary ACK-clock response cwnd; QUIC is not implemented.
+    //= reason=Selected CUBIC saves pre-event logical cwnd and sets beta=0.7 of actual eligible flight for loss or prior logical cwnd for ECN; two-SMSS threshold/loss floor, independent one-SMSS ECE floor in on_ecn. Existing recovery/PRR owns temporary ACK-clock response cwnd; QUIC is not implemented.
     //# After a window reduction in response to a congestion event detected
     //# by duplicate acknowledgments (ACKs), Explicit Congestion
     //# Notification-Echo (ECN-Echo (ECE)) ACKs [RFC3168], RACK-TLP for TCP
@@ -1411,7 +1469,7 @@ impl Congestion {
     //# congestion window size at which it received the congestion event and
     //# performs a multiplicative decrease of the congestion window.
     //= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
-    //= reason=Selected CUBIC saves pre-event cwnd and sets beta=0.7 of supplied actual eligible flight; two-SMSS threshold/loss floor, independent one-SMSS ECE floor in on_ecn. Existing recovery/PRR owns temporary ACK-clock response cwnd; QUIC is not implemented.
+    //= reason=Selected CUBIC saves pre-event logical cwnd and sets beta=0.7 of actual eligible flight for loss or prior logical cwnd for ECN; two-SMSS threshold/loss floor, independent one-SMSS ECE floor in on_ecn. Existing recovery/PRR owns temporary ACK-clock response cwnd; QUIC is not implemented.
     //# ssthresh =  flight_size * β      new  ssthresh
     //# cubic
     //# cwnd      = cwnd                 save  cwnd
@@ -1423,7 +1481,7 @@ impl Congestion {
     //#
     //# Figure 5
     //= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
-    //= reason=Selected CUBIC saves pre-event cwnd and sets beta=0.7 of supplied actual eligible flight; two-SMSS threshold/loss floor, independent one-SMSS ECE floor in on_ecn. Existing recovery/PRR owns temporary ACK-clock response cwnd; QUIC is not implemented.
+    //= reason=Selected CUBIC saves pre-event logical cwnd and sets beta=0.7 of actual eligible flight for loss or prior logical cwnd for ECN; two-SMSS threshold/loss floor, independent one-SMSS ECE floor in on_ecn. Existing recovery/PRR owns temporary ACK-clock response cwnd; QUIC is not implemented.
     //# The parameter β__cubic_ SHOULD be set to 0.7, which is different from
     //# the multiplicative decrease factor used in [RFC5681] (and [RFC6675])
     //# during fast recovery.
@@ -1532,6 +1590,7 @@ impl Congestion {
     //# [RFC5681] but sets _ssthresh_ using β__cubic_ (same as in
     //# Section 4.6) in a way that is different from Reno TCP [RFC5681].
     pub(crate) fn on_timeout(&mut self, flight: u32, highest_sent: Seq) {
+        self.end_ecn_prr();
         self.commit_probe_response();
         self.hystart = None;
         self.startup_ack = None;

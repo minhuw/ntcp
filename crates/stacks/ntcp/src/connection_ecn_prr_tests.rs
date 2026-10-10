@@ -1,0 +1,442 @@
+use super::*;
+
+fn sender(sack: bool, rack: bool, iss: u32, bytes: usize) -> Connection {
+    let mut cfg = config(32_000, 1000);
+    cfg.ecn = true;
+    cfg.nagle = false;
+    cfg.initial_window = InitialWindow::Iw10;
+    cfg.congestion_algorithm = CongestionAlgorithm::Cubic;
+    cfg.sack = sack;
+    cfg.rack = rack;
+    cfg.prr = true;
+    let (mut a, _) = pair(cfg, iss);
+    a.write(&vec![1; bytes]).unwrap();
+    for _ in 0..bytes.div_ceil(1000) {
+        packet(&mut a, 40);
+    }
+    a
+}
+
+fn ack(a: &mut Connection, now: u64, edge: Seq, ece: bool, blocks: &[(u32, u32)]) {
+    inject_sack(
+        a,
+        now,
+        a.receive.next(),
+        edge,
+        ACK | if ece { ECE } else { 0 },
+        32_000,
+        &[],
+        blocks,
+    );
+}
+
+#[test]
+fn cubic_ecn_prr_safe_entry_output_multiple_acks_and_handoff() {
+    for (sack, rack) in [(false, false), (true, false), (true, true)] {
+        for iss in [0, u32::MAX - 1999] {
+            let mut a = sender(sack, rack, iss, 4000);
+            let base = a.snd_una;
+            let end = a.snd_nxt;
+            ack(&mut a, 50, base.wrapping_add(1000), true, &[]);
+            assert_eq!(a.congestion.ssthresh(), 7000);
+            assert_eq!(a.congestion.unsuppressed_cwnd(), 7000);
+            assert_eq!(a.congestion.cwnd(), 5000);
+            assert_eq!(a.congestion.ecn_prr_end(), Some(end));
+            assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 0));
+            assert_eq!(a.prr.unwrap().credit(), 2000);
+            assert!(!a.retx_pending && !a.congestion.in_recovery());
+            assert_eq!(a.rack.counts().lost, 0);
+            // Failed output consumes neither credit nor the first-fresh CWR.
+            a.write(&[2; 8000]).unwrap();
+            assert_eq!(a.transmit(51, &mut [0; 20]), Err(Error::OutputTooSmall));
+            assert_eq!(a.prr.unwrap().credit(), 2000);
+            for i in 0..2 {
+                let bytes = packet(&mut a, 52);
+                let seg = wire::parse(ip(a.tuple()), &bytes).unwrap();
+                assert_eq!(seg.header.sequence, end.wrapping_add(i * 1000).0);
+                assert_eq!(seg.payload.len(), 1000);
+                assert_eq!(seg.header.flags & CWR != 0, i == 0);
+            }
+            assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 2000));
+            assert!(a.transmit(52, &mut [0; 1500]).unwrap().is_none());
+            assert_eq!(a.congestion.ecn_prr_end(), Some(end)); // CWR output is not completion.
+            ack(&mut a, 60, base.wrapping_add(2000), true, &[]);
+            assert_eq!(a.congestion.unsuppressed_cwnd(), 7000); // Repeated ECE does not re-reduce.
+            assert_eq!(a.prr.unwrap().counters(), (4000, 2000, 2000));
+            assert_eq!(a.prr.unwrap().credit(), 2000);
+            assert_eq!(a.congestion.cwnd(), 6000);
+            // A non-ECE ACK inside the episode must not grow the logical target.
+            ack(&mut a, 70, base.wrapping_add(3000), false, &[]);
+            assert_eq!(a.congestion.unsuppressed_cwnd(), 7000);
+            assert_eq!(a.prr.unwrap().counters(), (4000, 3000, 2000));
+            let before = a.prr.unwrap().counters();
+            ack(&mut a, 80, end, true, &[]);
+            assert!(a.prr.is_none());
+            assert_eq!(a.congestion.ecn_prr_end(), None);
+            assert_eq!(a.prr_exit_trace.unwrap().counters(), before);
+            assert_eq!(a.congestion.cwnd(), 7000);
+            // Ordinary output uses the restored logical window, not stale credit.
+            for _ in 0..5 {
+                packet(&mut a, 81);
+            }
+            assert_eq!(a.data_flight(), 7000);
+            assert!(a.transmit(81, &mut [0; 1500]).unwrap().is_none());
+            // A new event beyond the old boundary uses 7000, not its former 6000 admission.
+            ack(&mut a, 90, end.wrapping_add(1000), true, &[]);
+            assert_eq!(a.congestion.ssthresh(), 4900);
+            assert_eq!(a.congestion.unsuppressed_cwnd(), 4900);
+        }
+    }
+}
+
+#[test]
+fn cubic_ecn_prr_signed_sack_delivery_replay_and_loss_takeover() {
+    for rack in [false, true] {
+        for iss in [0, u32::MAX - 1999] {
+            let mut a = sender(true, rack, iss, 4000);
+            let base = a.snd_una;
+            let end = a.snd_nxt;
+            // Prior SACK evidence is excluded from RecoverFS, not replayed on entry.
+            ack(
+                &mut a,
+                50,
+                base,
+                false,
+                &[(base.wrapping_add(3000).0, end.0)],
+            );
+            assert!(a.prr.is_none());
+            ack(
+                &mut a,
+                51,
+                base.wrapping_add(1000),
+                true,
+                &[(base.wrapping_add(2000).0, end.0)],
+            );
+            assert_eq!(a.prr.unwrap().counters(), (3000, 2000, 0));
+            let before = a.prr.unwrap().counters();
+            let credit = a.prr.unwrap().credit();
+            ack(
+                &mut a,
+                52,
+                base.wrapping_add(1000),
+                true,
+                &[(base.wrapping_add(2000).0, end.0)],
+            );
+            assert_eq!(a.prr.unwrap().counters(), before);
+            assert_eq!(a.prr.unwrap().credit(), credit);
+            ack(&mut a, 53, base.wrapping_add(3000), false, &[]);
+            assert_eq!(a.prr.unwrap().counters(), (3000, 3000, 0)); // Only unsacked hole is new.
+            let before = a.prr.unwrap().counters();
+            ack(&mut a, 54, end, true, &[]);
+            assert_eq!(a.prr_exit_trace.unwrap().counters(), before);
+            assert!(a.prr.is_none());
+        }
+    }
+    for sack in [false, true] {
+        let mut a = sender(sack, false, 0, 8000);
+        let base = a.snd_una;
+        ack(&mut a, 50, base.wrapping_add(1000), true, &[]);
+        let blocks = [(base.wrapping_add(4000).0, base.wrapping_add(8000).0)];
+        for _ in 0..3 {
+            ack(
+                &mut a,
+                60,
+                base.wrapping_add(1000),
+                true,
+                if sack { &blocks } else { &[] },
+            );
+        }
+        assert!(a.congestion.in_recovery());
+        assert_eq!(a.congestion.ecn_prr_end(), None);
+        assert_eq!(a.congestion.ssthresh(), 7000); // Same original-flight reduction.
+        let bytes = packet(&mut a, 61);
+        let seg = wire::parse(ip(a.tuple()), &bytes).unwrap();
+        assert_eq!(seg.header.sequence, base.wrapping_add(1000).0);
+        assert_eq!(seg.header.flags & CWR, 0); // Retransmit does not consume pending CWR.
+        assert!(a.ecn_cwr_pending);
+        let before = a.prr.unwrap().counters();
+        ack(&mut a, 62, base.wrapping_add(2000), true, &[]);
+        assert_eq!(a.congestion.ssthresh(), 7000);
+        assert_eq!(a.prr.unwrap().counters().0, before.0);
+    }
+}
+
+#[test]
+fn cubic_ecn_prr_small_flight_fin_and_cancellations() {
+    for bytes in [1, 500, 1000] {
+        let mut a = sender(true, true, u32::MAX - 200, bytes);
+        let end = a.snd_nxt;
+        ack(&mut a, 50, end, true, &[]);
+        assert!(a.prr.is_none()); // Entry ACK also covers the bounded episode.
+        assert_eq!((a.congestion.cwnd(), a.congestion.ssthresh()), (7000, 7000));
+        assert!(a.ecn_cwr_pending);
+    }
+    for fin in [false, true] {
+        let mut a = sender(true, true, 0, 4000);
+        let base = a.snd_una;
+        if fin {
+            a.shutdown().unwrap();
+            packet(&mut a, 41);
+        }
+        let end = a.snd_nxt;
+        ack(&mut a, 50, base.wrapping_add(1000), true, &[]);
+        assert_eq!(a.congestion.ecn_prr_end(), Some(end));
+        if fin {
+            ack(&mut a, 60, base.wrapping_add(4000), true, &[]);
+            assert!(a.prr.is_some()); // FIN is part of the boundary, not delivered payload.
+            let before = a.prr.unwrap().counters();
+            ack(&mut a, 70, end, true, &[]);
+            assert_eq!(a.prr_exit_trace.unwrap().counters(), before);
+            assert!(a.prr.is_none());
+            assert_eq!(a.state(), State::FinWait2);
+        } else {
+            let threshold = a.congestion.ssthresh();
+            a.timeout(a.rto_deadline.unwrap()).unwrap();
+            assert!(a.prr.is_none());
+            assert_eq!(a.congestion.ecn_prr_end(), None);
+            assert_eq!(a.congestion.cwnd(), 1000);
+            assert_eq!(a.congestion.ssthresh(), threshold);
+        }
+    }
+    let mut a = sender(true, true, 0, 4000);
+    let edge = a.snd_una.wrapping_add(1000);
+    ack(&mut a, 50, edge, true, &[]);
+    let next = a.receive.next();
+    inject(&mut a, 60, next, edge, ACK, 0, &[]);
+    assert!(a.prr.is_none());
+    assert_eq!(a.congestion.ecn_prr_end(), None);
+    assert_eq!(a.congestion.cwnd(), 7000);
+}
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
+//= type=test
+//= reason=Real short-flight and receiver-limited ACKs do not grow the next ECN basis; an enlarged validated window is reduced by actual idle restart before its next ECN response. Complements Cubic clock/limited-end tests.
+//# Implementations
+//# that use _cwnd_ MUST use other measures to prevent _cwnd_ from
+//# growing when the volume of bytes in flight is smaller than
+//# _cwnd_.
+fn cubic_ecn_prr_application_receiver_limits_and_idle_target() {
+    // Neither short-flight ACKs nor receiver-limited full-flight ACKs validate
+    // growth; elapsed wall time cannot inflate the next ECN target.
+    for receiver_limited in [false, true] {
+        let mut a = sender(true, true, 0, if receiver_limited { 10_000 } else { 1000 });
+        let end = a.snd_nxt;
+        let next = a.receive.next();
+        inject(
+            &mut a,
+            100_000,
+            next,
+            end,
+            ACK,
+            if receiver_limited { 1000 } else { 32_000 },
+            &[],
+        );
+        assert_eq!(a.congestion.cwnd(), 10_000);
+        a.write(&[2; 1000]).unwrap();
+        let idle = 100_000 + a.rto();
+        packet(&mut a, idle);
+        assert_eq!(a.congestion.cwnd(), 10_000);
+        let end = a.snd_nxt;
+        ack(&mut a, idle + 100, end, true, &[]);
+        assert_eq!(a.congestion.cwnd(), 7000);
+    }
+    // Independently validate that an actually enlarged window is cut by idle
+    // restart before it supplies a later ECN target.
+    let mut a = sender(true, true, 0, 10_000);
+    let end = a.snd_nxt;
+    ack(&mut a, 100_000, end, false, &[]);
+    assert!(a.congestion.cwnd() > 10_000);
+    a.write(&[2; 1000]).unwrap();
+    let idle = 100_000 + a.rto();
+    packet(&mut a, idle);
+    assert_eq!(a.congestion.cwnd(), 10_000);
+    let end = a.snd_nxt;
+    ack(&mut a, idle + 100, end, true, &[]);
+    assert_eq!(a.congestion.cwnd(), 7000);
+}
+
+#[test]
+fn cubic_ecn_prr_rack_timer_replaces_episode_without_ack_replay() {
+    let mut a = sender(true, true, 0, 8000);
+    let base = a.snd_una;
+    ack(&mut a, 100_000, base.wrapping_add(1000), true, &[]);
+    let end = a.congestion.ecn_prr_end();
+    ack(
+        &mut a,
+        100_001,
+        base.wrapping_add(1000),
+        true,
+        &[(base.wrapping_add(7000).0, base.wrapping_add(8000).0)],
+    );
+    assert_eq!(a.congestion.ecn_prr_end(), end);
+    let deadline = a.rack.deadline.unwrap();
+    a.timeout(deadline).unwrap();
+    assert!(a.sack_recovery.is_some());
+    assert_eq!(a.congestion.ecn_prr_end(), None);
+    assert_eq!(a.congestion.ssthresh(), 7000);
+    assert_eq!(a.prr.unwrap().counters(), (6000, 0, 0));
+    assert_eq!(a.prr.unwrap().credit(), 0); // Timer is not another copy of the ACK.
+    assert!(a.transmit(deadline, &mut [0; 1500]).unwrap().is_none());
+}
+
+#[test]
+fn cubic_ecn_prr_loss_ending_ack_starts_new_logical_event() {
+    for sack in [false, true] {
+        let mut a = sender(sack, false, 0, 10_000);
+        let base = a.snd_una;
+        // Advancing original ACK clears NewReno's initial guard.
+        ack(&mut a, 50, base.wrapping_add(1000), false, &[]);
+        let end = a.snd_nxt;
+        let blocks = [(base.wrapping_add(7000).0, end.0)];
+        for _ in 0..3 {
+            ack(
+                &mut a,
+                60,
+                base.wrapping_add(1000),
+                false,
+                if sack { &blocks } else { &[] },
+            );
+        }
+        let loss_target = a.congestion.ssthresh();
+        assert!(a.congestion.in_recovery());
+        a.write(&[2; 5000]).unwrap();
+        // Deliver the repair, then send beyond the old loss boundary while still
+        // in recovery. The next ECE ACK covers that boundary and starts ECN.
+        packet(&mut a, 61);
+        ack(&mut a, 70, base.wrapping_add(7000), false, &[]);
+        for _ in 0..3 {
+            packet(&mut a, 71);
+        }
+        assert!(after(a.snd_nxt, end.wrapping_add(1000)));
+        ack(&mut a, 80, end.wrapping_add(1000), true, &[]);
+        assert!(!a.congestion.in_recovery());
+        assert!(a.congestion.ecn_prr_end().is_some());
+        assert_eq!(a.congestion.ssthresh(), loss_target * 7 / 10);
+        assert_eq!(a.congestion.unsuppressed_cwnd(), loss_target * 7 / 10);
+        assert_eq!(a.prr.unwrap().counters().1, if sack { 1000 } else { 4000 });
+    }
+}
+
+#[test]
+fn cubic_ecn_prr_reserved_pacing_and_mss_preserve_logical_target() {
+    let mut a = sender(true, true, 0, 4000);
+    let base = a.snd_una;
+    ack(&mut a, 100_000, base.wrapping_add(1000), true, &[]);
+    a.config.prr_pacing = true;
+    a.write(&[2; 4000]).unwrap();
+    let mut bytes = [0; 1500];
+    let n = a
+        .transmit_selected(100_001, &mut bytes, true)
+        .unwrap()
+        .unwrap();
+    let seg = wire::parse(ip(a.tuple()), &bytes[..n]).unwrap();
+    assert_eq!(seg.header.sequence, base.wrapping_add(4000).0);
+    assert_eq!(seg.payload.len(), 1000);
+    let counters = a.prr.unwrap().counters();
+    assert_eq!(counters, (4000, 1000, 1000));
+    let mut departure = a.last_departure.unwrap();
+    a.accept_reserved_output(100_002, &mut departure, 0, 500, false)
+        .unwrap();
+    a.accept_reserved_output(100_003, &mut departure, 500, 500, true)
+        .unwrap();
+    assert_eq!(a.prr.unwrap().counters(), counters); // No double charge at departure.
+    assert_eq!(a.congestion.unsuppressed_cwnd(), 7000);
+    let due = a.pacing_deadline.unwrap();
+    assert!(a.transmit(due - 1, &mut bytes).unwrap().is_none());
+    packet(&mut a, due);
+    assert_eq!(a.prr.unwrap().credit(), 0);
+    assert!(a.transmit(due, &mut bytes).unwrap().is_none());
+    a.lower_mss(500).unwrap();
+    assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 2000));
+    assert_eq!(a.congestion.unsuppressed_cwnd(), 3500);
+    assert_eq!(a.congestion.cwnd(), 2500);
+    assert_eq!(a.congestion.ssthresh(), 3500);
+    ack(&mut a, due + 1, base.wrapping_add(4000), true, &[]);
+    assert!(a.prr.is_none());
+    assert_eq!(a.congestion.cwnd(), 3500);
+}
+
+#[test]
+fn cubic_ecn_prr_one_mss_partial_ack_pause_and_last_ack() {
+    let mut a = sender(true, true, 0, 1000);
+    let mut now = 50;
+    while a.congestion.unsuppressed_cwnd() > 1000 {
+        let end = a.snd_nxt;
+        ack(&mut a, now, end, true, &[]);
+        assert!(a.prr.is_none());
+        a.write(&[2; 1000]).unwrap();
+        now += 10;
+        packet(&mut a, now);
+        now += 10;
+    }
+    let base = a.snd_una;
+    ack(&mut a, now, base.wrapping_add(500), true, &[]);
+    assert_eq!(a.congestion.ssthresh(), 2000);
+    assert_eq!(a.congestion.recovery_target(), 1000);
+    assert_eq!(a.congestion.unsuppressed_cwnd(), 1000);
+    assert_eq!(a.prr.unwrap().credit(), 500);
+    let pause = a.ecn_pause.unwrap();
+    a.write(&[3; 1000]).unwrap();
+    assert!(a.transmit(now, &mut [0; 1500]).unwrap().is_none());
+    let counters = a.prr.unwrap().counters();
+    ack(&mut a, now + 1, base.wrapping_add(1000), true, &[]);
+    assert!(a.prr.is_none());
+    assert_eq!(a.prr_exit_trace.unwrap().counters(), counters);
+    assert_eq!(a.congestion.cwnd(), 1000); // Completion must not restore ssthresh=2000.
+    assert_eq!(a.ecn_pause, Some(pause));
+    ack(&mut a, now + 2, base.wrapping_add(1000), true, &[]);
+    assert_eq!(a.ecn_pause, Some(pause));
+    assert!(a.transmit(pause - 1, &mut [0; 1500]).unwrap().is_none());
+    a.timeout(pause).unwrap();
+    assert_eq!(
+        wire::parse(ip(a.tuple()), &packet(&mut a, pause))
+            .unwrap()
+            .payload
+            .len(),
+        1000
+    );
+
+    let mut a = sender(true, true, u32::MAX - 2000, 4000);
+    let base = a.snd_una;
+    let next = a.receive.next();
+    inject(&mut a, 45, next, base, ACK | FIN, 32_000, &[]);
+    assert_eq!(a.state(), State::CloseWait);
+    a.shutdown().unwrap();
+    packet(&mut a, 46);
+    assert_eq!(a.state(), State::LastAck);
+    let end = a.snd_nxt;
+    ack(&mut a, 50, base.wrapping_add(1000), true, &[]);
+    assert!(a.prr.is_some());
+    ack(&mut a, 60, end, true, &[]);
+    assert_eq!(a.state(), State::Closed);
+    assert!(a.prr.is_none());
+    assert_eq!(a.congestion.ecn_prr_end(), None);
+}
+
+#[test]
+fn cubic_ecn_prr_scoreboard_fallback_cannot_recreate_episode() {
+    for already_active in [false, true] {
+        let mut a = sender(true, true, 0, 4000);
+        let base = a.snd_una;
+        if already_active {
+            ack(&mut a, 50, base.wrapping_add(1000), true, &[]);
+            assert!(a.prr.is_some());
+        }
+        a.scoreboard = Scoreboard::with_capacity(1).unwrap();
+        ack(
+            &mut a,
+            60,
+            base.wrapping_add(1000),
+            true,
+            &[
+                (base.wrapping_add(2000).0, base.wrapping_add(2001).0),
+                (base.wrapping_add(3000).0, base.wrapping_add(3001).0),
+            ],
+        );
+        assert!(a.sack_fallback.is_some());
+        assert!(a.prr.is_none());
+        assert_eq!(a.congestion.ecn_prr_end(), None);
+        assert_eq!(a.congestion.cwnd(), 7000);
+    }
+}

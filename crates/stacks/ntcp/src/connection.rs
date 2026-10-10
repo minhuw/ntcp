@@ -1607,7 +1607,7 @@ impl Connection {
     //# congestion control actions taken upon the losses detected by RACK-
     //# TLP.
     //= https://www.rfc-editor.org/rfc/rfc9937#section-5
-    //= reason=Selected Reno target is fixed during each episode; strict_ack asserts target, flight snapshot and byte window. This optional permission does not claim CUBIC support or PRR-only ECN reduction.
+    //= reason=Selected target is fixed during each episode; strict_ack covers loss and cubic_ecn_prr tests cover ECN with a separate logical target and current SafeACK credit.
     //# PRR MAY be used in conjunction with any congestion control algorithm
     //# that intends to make a multiplicative decrease in its sending rate
     //# over approximately the time scale of one round-trip time, as long as
@@ -2610,6 +2610,7 @@ impl Connection {
                 // The exact reserved bytes/timers survive, but acceptance must
                 // not require or recreate this discarded timestamp evidence.
                 self.reserved_ledger = None;
+                self.congestion.end_ecn_prr();
                 self.prr = None;
                 self.rack_entry_delivery = None;
             }
@@ -3002,6 +3003,7 @@ impl Connection {
         self.pacer = Pacer::default();
         self.reset_tlp();
         self.rack.deadline = None;
+        self.congestion.end_ecn_prr();
         self.prr = None;
         self.rack_entry_delivery = None;
         self.sack_recovery = None;
@@ -3150,6 +3152,7 @@ impl Connection {
                 self.congestion.complete_prr();
                 self.sack_guard = self.sack_recovery.map(|r| r.recovery_point);
                 self.sack_recovery = None;
+                self.congestion.end_ecn_prr();
                 self.prr = None;
                 self.rack_entry_delivery = None;
                 self.congestion.cancel_prr_recovery();
@@ -4490,7 +4493,11 @@ impl Connection {
         }
         let ecn_one = ece
             && self.flight() != 0
-            && self.congestion.cwnd() <= self.mss as u32
+            && (if self.congestion.ecn_prr_end().is_some() {
+                self.congestion.unsuppressed_cwnd()
+            } else {
+                self.congestion.cwnd()
+            }) <= self.mss as u32
             && self.ecn_backoff.is_none_or(|(end, _)| after(ack, end));
         // A duplicate or reordered no-ECE ACK does not prove congestion ended.
         // Require new cumulative data delivery beyond the last marked flight.
@@ -4510,10 +4517,26 @@ impl Connection {
             self.ecn_cwr_pending = true;
             self.reset_limited_transmit();
         }
+        // Snapshot before ACK removal; start only after old loss recovery exits
+        // and this ACK's loss detection runs. ECE never fabricates lost bytes.
+        let ecn_prr_entry = (ecn_reduced
+            && self.config.congestion_algorithm == CongestionAlgorithm::Cubic
+            && self.config.prr
+            && self.config.prr_algorithm == PrrAlgorithm::Rfc9937
+            && self.rack.valid())
+        .then(|| {
+            (
+                self.snd_nxt,
+                self.scoreboard
+                    .unsacked_bytes(self.snd_una, self.data_high()),
+                self.congestion.unsuppressed_cwnd(),
+            )
+        });
+        let ecn_prr_was_active = self.congestion.ecn_prr_end().is_some();
         // Snapshot before this ACK: if it enters recovery, its entire current
         // delta belongs to the new epoch. Timer entry has no current ACK.
         let prr_was_active = self.prr.is_some();
-        let ordinary_prr = prr_was_active && self.sack_recovery.is_none();
+        let ordinary_prr = prr_was_active && !ecn_prr_was_active && self.sack_recovery.is_none();
         let mut further_loss = false;
         let delivery_una = self.snd_una;
         let sackd_before = self.flight()
@@ -4556,6 +4579,7 @@ impl Connection {
                 // SACK advice exhaustion disables inference, never timestamp
                 // retention: normal RTO still needs each latest wire boundary.
                 self.rack.deadline = None;
+                self.congestion.end_ecn_prr();
                 self.prr = None;
                 self.rack_entry_delivery = None;
                 let boundary = self.data_high();
@@ -4585,6 +4609,7 @@ impl Connection {
             rack_delivery = if self.rack.valid() {
                 ledger_delivery
             } else {
+                self.congestion.end_ecn_prr();
                 self.prr = None;
                 self.rack_entry_delivery = None;
                 cumulative_delivery.saturating_add(update.newly_sacked)
@@ -4652,6 +4677,18 @@ impl Connection {
                 },
             );
         }
+        if self
+            .congestion
+            .ecn_prr_end()
+            .is_some_and(|end| at_or_after(self.snd_una, end))
+        {
+            self.congestion.complete_prr();
+            #[cfg(test)]
+            {
+                self.prr_exit_trace = self.prr;
+            }
+            self.prr = None;
+        }
         if let Some(mut recovery) = self.sack_recovery {
             if at_or_after(self.snd_una, recovery.recovery_point) {
                 if self.prr.is_some() && self.config.prr_algorithm == PrrAlgorithm::Rfc9937 {
@@ -4662,6 +4699,7 @@ impl Connection {
                     }
                 }
                 self.sack_recovery = None;
+                self.congestion.end_ecn_prr();
                 self.prr = None;
                 self.rack_entry_delivery = None;
                 recovery_exited = true;
@@ -4676,6 +4714,7 @@ impl Connection {
             {
                 self.prr_exit_trace = self.prr;
             }
+            self.congestion.end_ecn_prr();
             self.prr = None;
             recovery_exited = true;
         }
@@ -4850,7 +4889,28 @@ impl Connection {
             self.congestion.reset_duplicate_acks();
         }
         let (new_response, rack_loss) = self.detect_rack();
+        let ecn_loss_takeover = ecn_prr_was_active
+            && self.congestion.ecn_prr_end().is_none()
+            && self.congestion.in_recovery();
+        let new_response = new_response || ecn_loss_takeover;
         further_loss |= rack_loss;
+        let mut started_ecn_prr = false;
+        if let Some((end, flight, target)) = ecn_prr_entry
+            && !self.congestion.in_recovery()
+            && self.rack.valid()
+            && self.sack_fallback.is_none()
+        {
+            self.congestion
+                .start_ecn_prr(end, self.data_flight(), target);
+            // The ending ACK is excluded even when it also caused the event.
+            if at_or_after(self.snd_una, end) {
+                self.congestion.complete_prr();
+                self.prr = None;
+            } else {
+                self.prr = Some(Prr::new(flight, self.mss as u32, PrrAlgorithm::Rfc9937));
+                started_ecn_prr = true;
+            }
+        }
         if self.config.prr_algorithm == PrrAlgorithm::LegacyInitialCredit
             && self.sack_recovery.is_none()
             && !advancing
@@ -4903,7 +4963,7 @@ impl Connection {
             } else {
                 rack_delivery
             };
-            if modern && sack_accounting && (!prr_was_active || new_response) {
+            if modern && sack_accounting && !started_ecn_prr && (!prr_was_active || new_response) {
                 prr.include_entry_delivery(delivered);
             }
             if modern && self.sack_recovery.is_none() && self.retx_pending {
@@ -7513,6 +7573,7 @@ impl Connection {
                 self.reserved_ledger = self.rack.departure_selection();
             }
             if !self.rack.valid() {
+                self.congestion.end_ecn_prr();
                 self.prr = None;
                 self.rack_entry_delivery = None;
             }
@@ -8105,6 +8166,7 @@ impl Connection {
             self.rto_deadline = head_sent.map(|sent| sent.saturating_add(self.rto()));
         } else if expired_loss == Some(LossTimer::Rto) {
             self.reset_tlp();
+            self.congestion.end_ecn_prr();
             self.prr = None;
             self.rack_entry_delivery = None;
             self.rack.rto(now, self.snd_una, self.rtt.srtt());
@@ -9210,6 +9272,10 @@ mod tests {
         (a, b)
     }
 
+    mod ecn_prr {
+        include!("connection_ecn_prr_tests.rs");
+    }
+
     #[test]
     fn transport_info_cubic_ecn_epoch_lifecycle() {
         for (enabled, timeout) in [(false, false), (true, false), (true, true)] {
@@ -9240,7 +9306,7 @@ mod tests {
                 &[],
             );
             assert_eq!(a.transport_info().ecn_response, enabled);
-            assert!(a.prr.is_none()); // ECN does not currently start PRR.
+            assert_eq!(a.prr.is_some(), enabled); // Modern CUBIC ECN starts PRR.
             if !enabled {
                 continue;
             }
@@ -9250,7 +9316,7 @@ mod tests {
                     a.transport_info().ssthresh,
                     a.data_flight()
                 ),
-                (2800, 2800, 3000)
+                (5000, 7000, 3000)
             );
             assert!(a.ecn_cwr_pending);
             // RTO clears the ECN epoch and the snapshot reports actual loss.
@@ -12667,7 +12733,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc9937#section-5
     //= type=test
-    //= reason=Selected Reno target is fixed during each episode; strict_ack asserts target, flight snapshot and byte window. This optional permission does not claim CUBIC support or PRR-only ECN reduction.
+    //= reason=Selected target is fixed during each episode; strict_ack covers loss and cubic_ecn_prr tests cover ECN with a separate logical target and current SafeACK credit.
     //# PRR MAY be used in conjunction with any congestion control algorithm
     //# that intends to make a multiplicative decrease in its sending rate
     //# over approximately the time scale of one round-trip time, as long as
@@ -23527,10 +23593,16 @@ mod tests {
     //# exponentially increases the transmission timer for each packet
     //# retransmission while congestion persists.
     fn persistent_ecn_wire_flights_backoff_reset_and_cap() {
-        for algorithm in [CongestionAlgorithm::Cubic, CongestionAlgorithm::Reno] {
+        for (algorithm, prr) in [
+            (CongestionAlgorithm::Cubic, false),
+            (CongestionAlgorithm::Reno, false),
+            (CongestionAlgorithm::Cubic, true),
+            (CongestionAlgorithm::Reno, true),
+        ] {
             for scale in [1, 1000] {
                 let mut cfg = config(4096, 64);
                 cfg.congestion_algorithm = algorithm;
+                cfg.prr = prr;
                 cfg.rto_min_us = 1000;
                 cfg.timebase.units_per_second = 1_000_000 * scale;
                 let (mut a, mut b) = pair(cfg, u32::MAX - 100);

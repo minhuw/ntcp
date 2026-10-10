@@ -1773,7 +1773,7 @@
         "reasons": [
           "Exact defaults.sh plus tcp_ecn=2 setup maps only this passive listener to ECN-enabled UpstreamCubicEcn. The client proposes ECN; no active open occurs. This profile would also propose ECN on active open and is not a global Linux mode 2 implementation.",
           "UpstreamCubicEcn retains UpstreamCubic defaults, RFC 9937 loss recovery, test-only unpaced output batches and a bounded 128 MiB aggregate buffer budget. Only ECN enablement differs; Linux defaults are not reproduced.",
-          "TCP_INFO CWR reports the active core ECN response epoch, below loss/recovery and above disorder. It is not inferred from negotiation or a pending CWR packet. ECN currently reduces cwnd immediately from actual flight without starting PRR; Linux temporary CWR admission-window equivalence is not claimed.",
+          "TCP_INFO CWR reports the active core ECN response epoch, below loss/recovery and above disorder. It is not inferred from negotiation or a pending CWR packet. CUBIC ECN uses prior logical cwnd with RFC9438 growth safeguards and RFC9937 PRR. This script expects historical CRB cwnd=4; modern SafeACK yields cwnd=5. Its original assertion remains unchanged and is not claimed to pass.",
           "Only the exact audited setup command is replaced. All packet, syscall, assertion and timing bytes remain unchanged; behavioral mismatches remain failures."
         ],
         "ecn_scope": "passive listener in this exact script only"

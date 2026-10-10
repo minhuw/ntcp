@@ -493,11 +493,11 @@ fn wire_partial_ack_gap_and_delayed_suffix_keep_historical_growth() {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc9438#section-4.1.2
 //= type=test
-//= reason=Small-flight loss/ECE vectors assert two/one-SMSS byte cwnd floors, two-SMSS threshold and saved pre-event cwnd/W_max; complements actual ten-MSS loss/PRR wire response.
+//= reason=Small-flight loss retains its two-SMSS floor; ECN uses prior logical cwnd (7000 from 10000) rather than underfilled flight. Successive-event test separately asserts the one-SMSS ECN floor. Saved pre-event cwnd/W_max are unchanged.
 //# *  _cwnd_: Current congestion window in segments.
 //= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
 //= type=test
-//= reason=Small-flight loss/ECE vectors assert two/one-SMSS byte cwnd floors, two-SMSS threshold and saved pre-event cwnd/W_max; complements actual ten-MSS loss/PRR wire response.
+//= reason=Small-flight loss retains its two-SMSS floor; ECN uses prior logical cwnd (7000 from 10000) rather than underfilled flight. Successive-event test separately asserts the one-SMSS ECN floor. Saved pre-event cwnd/W_max are unchanged.
 //# ssthresh =  flight_size * β      new  ssthresh
 //# cubic
 //# cwnd      = cwnd                 save  cwnd
@@ -516,8 +516,8 @@ fn cubic_loss_and_ecn_floors_save_pre_event_window() {
         } else {
             assert!(c.on_sack_recovery(Seq(1), 500, Seq(501)));
         }
-        assert_eq!(c.ssthresh, 2000);
-        assert_eq!(c.cwnd, if ecn { 1000 } else { 2000 });
+        assert_eq!(c.ssthresh, if ecn { 7000 } else { 2000 });
+        assert_eq!(c.cwnd, if ecn { 7000 } else { 2000 });
         let state = alloc::format!("{:?}", c.cubic.as_ref().unwrap());
         assert!(state.contains("cwnd_prior: 10000,"), "{state}");
         assert!(state.contains("w_max: 10000,"), "{state}");
