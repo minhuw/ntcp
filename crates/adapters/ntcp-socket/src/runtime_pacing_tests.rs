@@ -318,7 +318,8 @@ fn packet_profiles_ignore_native_socket_defaults() {
     for profile in [Profile::Baseline, Profile::UpstreamCubic, Profile::UpstreamCubicEcn] {
         let local = Ipv4Addr::new(10, 73, 0, 2);
         let mut owner = Owner::packet((local, profile)).unwrap();
-        assert_eq!(owner.batch_time().is_some(), profile != Profile::Baseline);
+        // Packet profiles now use production per-selection clock sampling.
+        assert!(owner.egress.is_some());
         owner.defaults.connection.send_capacity = 123;
         owner.defaults.connection.receive_capacity = 456;
         owner.defaults.connection.nagle = false;

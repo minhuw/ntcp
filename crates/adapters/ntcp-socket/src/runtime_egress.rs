@@ -394,10 +394,8 @@ impl Owner {
                         sources,
                         &slot.bytes,
                     )
-                } else if let Some(tun) = &mut self.tun {
-                    tun.transmit(&slot.bytes)
                 } else {
-                    return Err(EIO);
+                    self.transmit_ip_backend(&slot.bytes)
                 };
                 match submitted {
                     Ok(TxOutcome::Submitted) => {
@@ -408,7 +406,7 @@ impl Owner {
                         {
                             return Err(EIO);
                         }
-                        if self.tun.is_some() {
+                        if self.tun.is_some() || self.packet_backend() {
                             self.software_transmitted(entry.timestamp, timestamps::realtime());
                         }
                         egress

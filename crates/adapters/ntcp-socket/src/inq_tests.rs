@@ -478,3 +478,90 @@ fn lowat_shared_alias_partial_write() {
         assert_eq!(close(fd), 0);
     }
 }
+
+#[test]
+fn shared_abi_pipeline_capacity_one_and_real_clock_pacing() {
+    const CHILD: &str = "NTCP_TEST_PIPELINE_ABI_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        for profile in ["pipeline-gso", "pipeline-paced-gso"] {
+            assert!(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "inq_tests::shared_abi_pipeline_capacity_one_and_real_clock_pacing",
+                        "--test-threads=1"
+                    ])
+                    .env(CHILD, profile)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        return;
+    }
+    let profile = std::env::var(CHILD).unwrap();
+    packet_test::start_with_options(
+        packet_profile::profile(&format!("local=192.0.2.1,{profile}")).unwrap(),
+        packet_test::Options {
+            queue_capacity: 1,
+            egress_capacity: 1,
+        },
+    )
+    .unwrap();
+    let (first, _) = connected();
+    let (second, _) = connected();
+    let payload = vec![0x5au8; 1608]; // No peer MSS option: three 536-byte segments.
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64;
+    assert_eq!(
+        unsafe { write(first, payload.as_ptr().cast(), payload.len()) },
+        payload.len() as isize
+    );
+    // An unrelated socket stays usable while output and a selected segment are held.
+    let enabled = 1i32;
+    assert_eq!(
+        unsafe {
+            setsockopt(
+                second,
+                IPPROTO_TCP,
+                TCP_NODELAY,
+                (&enabled as *const i32).cast(),
+                4,
+            )
+        },
+        0
+    );
+    std::thread::sleep(Duration::from_millis(5));
+    let start = Instant::now();
+    let mut packets = Vec::new();
+    while packets.len() != 3 {
+        match packet_test::try_capture(65535) {
+            Ok((bytes, stamp)) => packets.push((bytes, stamp)),
+            Err(EAGAIN) if start.elapsed() < Duration::from_secs(2) => {
+                std::thread::sleep(Duration::from_millis(1))
+            }
+            result => panic!("capture: {result:?}"),
+        }
+    }
+    let mut next = header(&packets[0].0).sequence;
+    let mut total = 0;
+    for (bytes, stamp) in &packets {
+        let p = packet_profile::parse_frame(bytes).unwrap();
+        let segment = ntcp::wire::parse(p.ip, p.payload).unwrap();
+        assert_eq!(segment.header.sequence, next);
+        assert!(!segment.payload.is_empty() && segment.payload.len() <= 536);
+        assert!(segment.payload.iter().all(|&b| b == 0x5a));
+        next = next.wrapping_add(segment.payload.len() as u32);
+        total += segment.payload.len();
+        assert!(*stamp >= before);
+    }
+    assert_eq!(total, payload.len());
+    assert!(packets.windows(2).all(|w| w[0].1 <= w[1].1));
+    // Capacity-one backend retries cannot backdate acceptance to selection time.
+    assert!(packets[1].1 > packets[0].1);
+    assert!(packets[2].1 > packets[1].1);
+    assert_eq!(packet_test::try_capture(65535), Err(EAGAIN));
+    packet_test::stop();
+}

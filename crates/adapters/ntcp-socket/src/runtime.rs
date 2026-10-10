@@ -27,7 +27,10 @@ use std::{
 use timestamps::{ClockPair, Completion, TimestampState};
 
 #[cfg(feature = "packet-test")]
-use std::time::{SystemTime, UNIX_EPOCH};
+#[path = "runtime_memory.rs"]
+mod memory;
+#[cfg(feature = "packet-test")]
+use memory::PacketBackend;
 
 pub const LIMIT: usize = 512;
 pub const BYTES: usize = 65536;
@@ -109,6 +112,8 @@ pub struct Runtime {
     pub wake: i32,
     pub family: i32,
     pub io_limit: usize,
+    #[cfg(feature = "packet-test")]
+    packet: bool,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -139,6 +144,8 @@ impl Runtime {
             wake,
             family: AF_INET,
             io_limit: BYTES,
+            #[cfg(feature = "packet-test")]
+            packet: false,
             stop: Default::default(),
             worker: Mutex::new(None),
         }
@@ -154,9 +161,16 @@ impl Runtime {
             false,
         )
     }
-    #[cfg(feature = "packet-test")]
+    #[cfg(all(test, feature = "packet-test"))]
     pub fn packet(settings: (Ipv4Addr, crate::packet_profile::Profile)) -> Result<Self> {
-        Self::spawn(move || Owner::packet(settings), true)
+        Self::packet_with_options(settings, crate::packet_test::Options::default())
+    }
+    #[cfg(feature = "packet-test")]
+    pub fn packet_with_options(
+        settings: (Ipv4Addr, crate::packet_profile::Profile),
+        options: crate::packet_test::Options,
+    ) -> Result<Self> {
+        Self::spawn(move || Owner::packet_with_options(settings, options), true)
     }
     fn spawn(
         start: impl FnOnce() -> Result<Owner> + Send + 'static + std::panic::UnwindSafe,
@@ -210,6 +224,8 @@ impl Runtime {
             wake,
             family: AF_INET,
             io_limit: if packet { 65535 } else { BYTES },
+            #[cfg(feature = "packet-test")]
+            packet,
             stop,
             worker: Mutex::new(Some(worker)),
         })
@@ -224,6 +240,21 @@ impl Runtime {
         }
     }
     pub fn call(&self, id: u64, op: Op) -> Result<Reply> {
+        #[cfg(feature = "packet-test")]
+        if self.packet && matches!(op, Op::Close) {
+            // Last-close has removed the public fd already. Retry bounded owner
+            // admission rather than leaking its socket; do not block capture
+            // behind a channel parked on full deferred commands.
+            loop {
+                match self.call_once(id, Op::Close) {
+                    Err(EAGAIN) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                    result => return result,
+                }
+            }
+        }
+        self.call_once(id, op)
+    }
+    fn call_once(&self, id: u64, op: Op) -> Result<Reply> {
         if self.stop.load(Ordering::Acquire) {
             return Err(ECANCELED);
         }
@@ -404,11 +435,6 @@ pub(crate) fn unsupported_option(reason: &str) -> i32 {
         EOPNOTSUPP
     }
 }
-#[cfg(feature = "packet-test")]
-struct PacketBackend {
-    profile: crate::packet_profile::Profile,
-    output: VecDeque<Reply>,
-}
 type ChildOptionsSnapshot = (ConnectionId, u64, u64, u64, (bool, bool, bool, u32, bool));
 
 struct Owner {
@@ -425,7 +451,7 @@ struct Owner {
     next_id: u64,
     detached: Vec<ConnectionId>,
     egress: Option<egress::Egress>,
-    // Legacy direct-poll fixtures/packet-test only; native Egress never fills this carrier.
+    // Legacy direct-poll fixtures only; native Egress never fills this carrier.
     pending_packet: Option<Vec<u8>>,
     pending_token: Option<ntcp::TxTimestampToken>,
     reservations: bool,
@@ -595,8 +621,16 @@ impl Owner {
             packets: None,
         })
     }
+    #[cfg(all(test, feature = "packet-test"))]
+    fn packet(settings: (Ipv4Addr, crate::packet_profile::Profile)) -> Result<Self> {
+        Self::packet_with_options(settings, crate::packet_test::Options::default())
+    }
     #[cfg(feature = "packet-test")]
-    fn packet((local, profile): (Ipv4Addr, crate::packet_profile::Profile)) -> Result<Self> {
+    fn packet_with_options(
+        (local, profile): (Ipv4Addr, crate::packet_profile::Profile),
+        options: crate::packet_test::Options,
+    ) -> Result<Self> {
+        options.validate()?;
         // Deterministic key and synthetic address policy are explicit test-only
         // settings, never a production entropy source or TUN routing policy.
         let mut owner = Self::with_config(
@@ -620,10 +654,9 @@ impl Owner {
             },
         )
         .map_err(engine)?;
-        owner.packets = Some(PacketBackend {
-            profile,
-            output: VecDeque::new(),
-        });
+        owner.defaults = crate::packet_profile::config(profile);
+        owner.packets = Some(PacketBackend::new(profile, options.queue_capacity)?);
+        owner.enable_egress(options.egress_capacity, crate::packet_profile::gso(profile))?;
         Ok(owner)
     }
     fn socket_limit(&self) -> usize {
@@ -657,18 +690,24 @@ impl Owner {
         // TCP_USER_TIMEOUT is a separate application override, not core user_timeout_us.
         socket
     }
-    fn batch_time(&self) -> Option<u64> {
+    fn packet_backend(&self) -> bool {
         #[cfg(feature = "packet-test")]
-        if self.packets.as_ref().is_some_and(|p| {
-            matches!(
-                p.profile,
-                crate::packet_profile::Profile::UpstreamCubic
-                    | crate::packet_profile::Profile::UpstreamCubicEcn
-            )
-        }) {
-            return Some(self.now());
+        return self.packets.is_some();
+        #[cfg(not(feature = "packet-test"))]
+        false
+    }
+    fn admission_command(&self, op: &Op) -> bool {
+        #[cfg(feature = "packet-test")]
+        if self.packet_backend() && matches!(op, Op::Inject(_) | Op::Capture(_)) {
+            return true;
         }
-        None
+        let _ = op;
+        false
+    }
+    fn admission_full(&self, request: &Request) -> bool {
+        self.pending.len() == self.socket_limit()
+            && !self.admission_command(&request.op)
+            && (self.packet_backend() || !matches!(request.op, Op::Close))
     }
     fn frame(&self, tx: ntcp::Transmit, tcp: &[u8]) -> Result<Vec<u8>> {
         let mut packet = vec![0; 20 + tcp.len()];
@@ -792,14 +831,6 @@ impl Owner {
         if self.waiting_mtu {
             return Ok(false);
         }
-        #[cfg(feature = "packet-test")]
-        if self
-            .packets
-            .as_ref()
-            .is_some_and(|p| p.output.len() == crate::packet_profile::LIMIT)
-        {
-            return Ok(false);
-        }
         let mut packet = vec![0; self.output_packet_len()];
         let pair = ClockPair::sample(self);
         let now = transmit_now.unwrap_or_else(|| self.now());
@@ -864,14 +895,13 @@ impl Owner {
                     after_output.push((request, early));
                 }
             }
-            let transmit_now = self.batch_time();
             if self.egress.is_some() {
                 if self.service_egress().is_err() {
                     break 'run;
                 }
             } else {
                 for _ in 0..BUDGET {
-                    match self.prepare_packet(transmit_now) {
+                    match self.prepare_packet(None) {
                         Ok(true) => (),
                         Ok(false) => break,
                         Err(_) => break 'run,
@@ -883,22 +913,6 @@ impl Owner {
                             Ok(TxOutcome::WouldBlock) => break,
                             Err(_) => break 'run,
                         }
-                    }
-                    #[cfg(feature = "packet-test")]
-                    if self.packets.is_some() {
-                        let token = self.pending_token.take();
-                        self.software_transmitted(token, timestamps::realtime());
-                        let packets = self.packets.as_mut().unwrap();
-                        let bytes = self.pending_packet.take().unwrap();
-                        packets.output.push_back(Reply {
-                            value: bytes.len() as i32,
-                            bytes,
-                            stamp: SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_micros() as i64,
-                            ..Reply::default()
-                        });
                     }
                 }
             }
@@ -926,7 +940,10 @@ impl Owner {
             let wait = self.output_wait();
             // Leave excess commands in the bounded channel, including Close. Never
             // grow the deferred queue or leak OutputReserved to unrelated sockets.
-            if (self.reservation.is_some() || self.egress.as_ref().is_some_and(|e| e.has_held()))
+            // Memory backend admission must remain serviceable: capture frees TX.
+            if !self.packet_backend()
+                && (self.reservation.is_some()
+                    || self.egress.as_ref().is_some_and(|e| e.has_held()))
                 && self.pending.len() >= self.socket_limit()
             {
                 std::thread::sleep(wait);
@@ -934,7 +951,7 @@ impl Owner {
             }
             match rx.recv_timeout(wait) {
                 Ok(mut r) => {
-                    if self.pending.len() == self.socket_limit() && !matches!(r.op, Op::Close) {
+                    if self.admission_full(&r) {
                         let _ = r.reply.send(Err(EAGAIN));
                     } else if !self.service(&mut r) {
                         self.pending.push_back(r);
@@ -944,8 +961,9 @@ impl Owner {
                     #[cfg(not(feature = "packet-test"))]
                     let requests = BUDGET;
                     for _ in 1..requests {
-                        if (self.reservation.is_some()
-                            || self.egress.as_ref().is_some_and(|e| e.has_held()))
+                        if !self.packet_backend()
+                            && (self.reservation.is_some()
+                                || self.egress.as_ref().is_some_and(|e| e.has_held()))
                             && self.pending.len() >= self.socket_limit()
                         {
                             break;
@@ -953,7 +971,7 @@ impl Owner {
                         let Ok(mut r) = rx.try_recv() else {
                             break;
                         };
-                        if self.pending.len() == self.socket_limit() && !matches!(r.op, Op::Close) {
+                        if self.admission_full(&r) {
                             let _ = r.reply.send(Err(EAGAIN));
                         } else if !self.service(&mut r) {
                             self.pending.push_back(r);
@@ -987,7 +1005,7 @@ impl Owner {
         self.child_timestamps
             .retain(|(cid, _)| self.endpoint.connection_exists(*cid));
     }
-    #[cfg(any(test, feature = "packet-test"))]
+    #[cfg(test)]
     fn input(
         &mut self,
         now: u64,
@@ -1364,10 +1382,15 @@ impl Owner {
                 if self.packets.is_none() {
                     return Err(EOPNOTSUPP);
                 }
-                let packet = crate::packet_profile::parse_frame(bytes)?;
-                self.input(self.now(), packet.ip, packet.traffic_class, packet.payload)
-                    .map_err(engine)?;
-                self.events();
+                if bytes.len() > crate::packet_profile::BYTES {
+                    return Err(EMSGSIZE);
+                }
+                crate::packet_profile::parse_frame(bytes)?;
+                // Admission is not TCP processing: retained RX may delay delivery.
+                let Op::Inject(bytes) = op else {
+                    unreachable!()
+                };
+                self.packets.as_mut().unwrap().inject(bytes)?;
                 return Ok(out);
             }
             Op::Capture(capacity) => {
@@ -2930,6 +2953,8 @@ mod tests {
             wake: -1,
             family: AF_INET,
             io_limit: BYTES,
+            #[cfg(feature = "packet-test")]
+            packet: false,
             stop: Default::default(),
             worker: Mutex::new(None),
         };

@@ -312,6 +312,11 @@ impl Owner {
         };
         match self.inner.dispatch(r.fd, op) {
             Ok(mut p) => {
+                if r.op == 14 {
+                    // Inject now admits into PacketIo; fixtures explicitly service RX.
+                    self.inner.receive_batch(&mut vec![0; BYTES]).unwrap();
+                    self.inner.events();
+                }
                 if r.op == 18 {
                     p.bytes.truncate(r.capacity);
                     p.value = p.bytes.len() as i32;
@@ -954,7 +959,18 @@ fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
         ("upstream-window8", 8 * 1024 * 1024),
         ("upstream-sack", 8 * 1024 * 1024),
     ] {
-        let mut owner = Owner::new(profile(&format!("{name},local=192.0.2.1")).unwrap()).unwrap();
+        let settings = profile(&format!("{name},local=192.0.2.1")).unwrap();
+        let mut owner = Owner::new(settings).unwrap();
+        // Common egress reserves persistent storage in the original core budget.
+        let unreserved = Endpoint::new(
+            crate::packet_profile::config(settings.1),
+            [42; 32],
+            0,
+            |_| true,
+        )
+        .unwrap();
+        let reservation_bytes = owner.inner.endpoint.buffer_bytes() - unreserved.buffer_bytes();
+        drop(unreserved);
         // Learn the core's private metadata charge from the first connection;
         // verify it covers buffers and at least one timestamp per send octet.
         let first = owner
@@ -974,13 +990,13 @@ fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
                 .receive_capacity,
             receive_capacity
         );
-        let per_connection = owner.inner.endpoint.buffer_bytes();
+        let per_connection = owner.inner.endpoint.buffer_bytes() - reservation_bytes;
         assert!(
             per_connection
                 >= 3 * receive_capacity + 2 * 65536 + 1460 + 8 * (65536 + 2) + (65536 / 2 + 4) * 8
         );
         let max_bytes = 32 * 1024 * 1024;
-        let count = LIMIT.min(max_bytes / per_connection);
+        let count = LIMIT.min((max_bytes - reservation_bytes) / per_connection);
         for i in 1..count {
             owner
                 .endpoint
@@ -992,7 +1008,7 @@ fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
                 .unwrap();
             assert_eq!(
                 owner.inner.endpoint.buffer_bytes(),
-                (i + 1) * per_connection
+                reservation_bytes + (i + 1) * per_connection
             );
             assert!(owner.inner.endpoint.buffer_bytes() <= max_bytes);
         }
@@ -1004,7 +1020,10 @@ fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
             ),
             Err(EndpointError::LimitReached)
         );
-        assert_eq!(owner.inner.endpoint.buffer_bytes(), count * per_connection);
+        assert_eq!(
+            owner.inner.endpoint.buffer_bytes(),
+            reservation_bytes + count * per_connection
+        );
     }
 }
 
@@ -2295,7 +2314,7 @@ fn upstream_sack_profile_negotiates_combined_options_and_peer_fallback() {
 }
 
 #[test]
-fn owner_loop_cubic_initial_push_pairs_and_other_profiles_legacy_push() {
+fn owner_loop_profiles_preserve_terminal_push_without_frozen_batch_clock() {
     for selected in [
         Profile::UpstreamCubic,
         Profile::Baseline,
@@ -2349,9 +2368,8 @@ fn owner_loop_cubic_initial_push_pairs_and_other_profiles_legacy_push() {
         .unwrap();
         call(&adapter, 14, 0, 0, ack, 0).unwrap();
         let fd = call(&adapter, 4, listener, 0, vec![], 0).unwrap().value as u64;
-        // A single SEND gives CUBIC two pairs in one owner output turn and
-        // an explicit final PUSH on an unpaired segment. Legacy profiles use
-        // three MSS so the whole write fits their smaller initial window.
+        // A single SEND fits each profile's original initial window. CUBIC's
+        // frozen-batch PUSH pairing was removed with the scalar test bypass.
         let segments = if selected == Profile::UpstreamCubic {
             5
         } else {
@@ -2369,9 +2387,17 @@ fn owner_loop_cubic_initial_push_pairs_and_other_profiles_legacy_push() {
             assert_eq!(sent.header.sequence, base.wrapping_add((i * 1460) as u32));
             assert_eq!(sent.header.acknowledgment, 101);
             assert_eq!(sent.payload, &payload[i * 1460..(i + 1) * 1460]);
-            let push = i == segments - 1 || (selected == Profile::UpstreamCubic && i % 2 == 1);
+            // The removed frozen batch_time override paired CUBIC PUSH flags.
+            // Common egress samples time per selection, so only terminal PUSH is fixed.
+            let push = i == segments - 1;
+            let flags = if selected == Profile::UpstreamCubic && !push {
+                // Consecutive selections can still share a microsecond tick.
+                sent.header.flags & !ntcp::wire::PSH
+            } else {
+                sent.header.flags
+            };
             assert_eq!(
-                sent.header.flags,
+                flags,
                 ntcp::wire::ACK | if push { ntcp::wire::PSH } else { 0 },
                 "{selected:?} initial segment {i}"
             );
@@ -2633,6 +2659,7 @@ fn send_payload_faults_follow_owner_errors_and_shutdown() {
 #[test]
 fn ip_options_listener_snapshot_accept_detached_fin_and_fd_reuse() {
     let mut owner = Owner::new((local(), Profile::Sack)).unwrap();
+    let reservation_bytes = owner.inner.endpoint.buffer_bytes();
     let listener = owner.alloc(Socket::new(0)).unwrap();
     execute_value(&mut owner, 11, listener, 8, 1).unwrap();
     execute_value(&mut owner, 11, listener, 6, 187).unwrap();
@@ -2721,7 +2748,7 @@ fn ip_options_listener_snapshot_accept_detached_fin_and_fd_reuse() {
     assert!(!owner.inner.endpoint.connection_exists(id));
     owner.gc_ip_options();
     assert!(owner.connection_options.is_empty());
-    assert_eq!(owner.inner.endpoint.buffer_bytes(), 0);
+    assert_eq!(owner.inner.endpoint.buffer_bytes(), reservation_bytes);
     assert_eq!(execute_value(&mut owner, 12, fd, 6, 0), Ok(4));
     assert_eq!(
         execute_value(&mut owner, 12, fd, 7, 0),
@@ -2749,6 +2776,7 @@ fn saturated_options_preserve_time_wait_ack_and_listener_reset() {
         .execute(listener, Op::Listen(LIMIT as i32))
         .unwrap();
     owner.inner.execute(0, Op::Inject(syn(100, 8080))).unwrap();
+    owner.inner.receive_batch(&mut vec![0; BYTES]).unwrap();
     let (tx, bytes) = poll_frame(&mut owner).unwrap();
     let sent = packet_header(&bytes);
     let (ip, ack) = reverse_ack(tx, sent, sent.sequence.wrapping_add(1));
@@ -2820,10 +2848,9 @@ fn saturated_options_preserve_time_wait_ack_and_listener_reset() {
         &bytes[..len],
     )
     .unwrap();
-    assert_eq!(
-        owner.inner.execute(0, Op::Inject(packet)).unwrap_err(),
-        ENOBUFS
-    );
+    // PacketIo admission succeeds; the production RX path handles core rejection.
+    owner.inner.execute(0, Op::Inject(packet)).unwrap();
+    owner.inner.receive_batch(&mut vec![0; BYTES]).unwrap();
     bytes[16] ^= 1; // Invalid SYN must reach core validation, not reservation.
     assert_eq!(
         owner.inner.input(owner.inner.now(), ip, 0, &bytes[..len]),
@@ -2922,6 +2949,7 @@ fn descriptor_and_request_limits_fail_without_hanging() {
         wake: -1,
         family: AF_INET,
         io_limit: BYTES,
+        packet: true,
         stop: Default::default(),
         worker: Mutex::new(None),
     };

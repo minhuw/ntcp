@@ -17,6 +17,10 @@ pub fn unsupported(reason: &str) -> i32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Profile {
     Baseline,
+    Pipeline,
+    PipelinePaced,
+    PipelineGso,
+    PipelinePacedGso,
     UpstreamWindow8,
     Sack,
     UpstreamSack,
@@ -40,6 +44,10 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
         } else {
             let profile = match flag {
                 "baseline" => Profile::Baseline,
+                "pipeline" => Profile::Pipeline,
+                "pipeline-paced" => Profile::PipelinePaced,
+                "pipeline-gso" => Profile::PipelineGso,
+                "pipeline-paced-gso" => Profile::PipelinePacedGso,
                 "upstream-window8" => Profile::UpstreamWindow8,
                 "sack" => Profile::Sack,
                 "upstream-sack" => Profile::UpstreamSack,
@@ -61,6 +69,14 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
 }
 
 pub(crate) fn config(profile: Profile) -> EndpointConfig {
+    let pacing = matches!(profile, Profile::PipelinePaced | Profile::PipelinePacedGso);
+    let profile = match profile {
+        Profile::Pipeline
+        | Profile::PipelinePaced
+        | Profile::PipelineGso
+        | Profile::PipelinePacedGso => Profile::Baseline,
+        other => other,
+    };
     let cubic = matches!(profile, Profile::UpstreamCubic | Profile::UpstreamCubicEcn);
     let upstream = matches!(
         profile,
@@ -90,11 +106,13 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
         | Profile::UpstreamCubicEcn
         | Profile::UpstreamEcn
         | Profile::UpstreamBasic => 8 * 1024 * 1024,
+        _ => unreachable!(),
     };
     // Reserve owned receive storage before packetdrill starts timed events.
     // Its mlockall(MCL_FUTURE) makes first-touch allocation synchronous.
     config.preallocate_connections = usize::from(upstream);
     config.connection.mss = 1460;
+    config.connection.pacing = pacing.then(ntcp::PacingConfig::default);
     if matches!(profile, Profile::UpstreamWindow8 | Profile::UpstreamBasic) {
         // Immediate-ACK compatibility policy, not Linux quickACK emulation.
         config.connection.delayed_ack_us = 0;
@@ -143,6 +161,12 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
     config.connection.send_ip_payload_limit = 65515;
     config.connection.ecn = matches!(profile, Profile::UpstreamEcn | Profile::UpstreamCubicEcn);
     config
+}
+pub(crate) fn gso(profile: Profile) -> Option<ntcp::GsoLimits> {
+    matches!(profile, Profile::PipelineGso | Profile::PipelinePacedGso).then_some(ntcp::GsoLimits {
+        max_bytes: 65536,
+        max_segments: 16,
+    })
 }
 pub(crate) fn parse_frame(bytes: &[u8]) -> Result<ntcp_ip::Packet<'_>> {
     if bytes.len() < 20 {

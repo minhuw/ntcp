@@ -183,10 +183,7 @@ impl Owner {
             return backend.io.receive_with_metadata(out);
         }
         let software = self.software_rx_enabled();
-        let Some(tun) = &mut self.tun else {
-            return Ok(None);
-        };
-        let Some(len) = tun.receive(out)? else {
+        let Some(len) = self.receive_ip_backend(out)? else {
             return Ok(None);
         };
         Ok(Some(ReceivedPacket {
@@ -204,6 +201,26 @@ impl Owner {
                 hardware: None,
             },
         }))
+    }
+    fn receive_ip_backend(&mut self, out: &mut [u8]) -> std::io::Result<Option<usize>> {
+        #[cfg(feature = "packet-test")]
+        if let Some(packets) = &mut self.packets {
+            return packets.receive(out);
+        }
+        match &mut self.tun {
+            Some(tun) => tun.receive(out),
+            None => Ok(None),
+        }
+    }
+    pub(super) fn transmit_ip_backend(&mut self, bytes: &[u8]) -> std::io::Result<TxOutcome> {
+        #[cfg(feature = "packet-test")]
+        if let Some(packets) = &mut self.packets {
+            return packets.transmit(bytes);
+        }
+        match &mut self.tun {
+            Some(tun) => tun.transmit(bytes),
+            None => Err(std::io::Error::from_raw_os_error(EIO)),
+        }
     }
     // Each rejected frame consumes one iteration, just like an accepted frame.
     pub(super) fn receive_batch(&mut self, input: &mut [u8]) -> std::io::Result<()> {

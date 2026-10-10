@@ -3,12 +3,40 @@
 pub use crate::packet_profile::{Profile, profile};
 use crate::*;
 
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    pub queue_capacity: usize,
+    pub egress_capacity: usize,
+}
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            queue_capacity: packet_profile::LIMIT,
+            egress_capacity: crate::runtime::BUDGET,
+        }
+    }
+}
+impl Options {
+    pub(crate) fn validate(self) -> Result<()> {
+        if !(1..=packet_profile::LIMIT).contains(&self.queue_capacity)
+            || !(1..=packet_profile::LIMIT).contains(&self.egress_capacity)
+        {
+            return Err(EINVAL);
+        }
+        Ok(())
+    }
+}
+
 pub fn start(settings: (Ipv4Addr, Profile)) -> Result<()> {
+    start_with_options(settings, Options::default())
+}
+pub fn start_with_options(settings: (Ipv4Addr, Profile), options: Options) -> Result<()> {
     if RUNTIME.get().is_some() {
         return Err(EBUSY);
     }
     let old = set_internal(true);
-    let runtime = catch_unwind(|| Runtime::packet(settings)).unwrap_or(Err(EIO));
+    let runtime =
+        catch_unwind(|| Runtime::packet_with_options(settings, options)).unwrap_or(Err(EIO));
     set_internal(old);
     let runtime = runtime?;
     PID.store(unsafe { syscall(SYS_getpid) as i32 }, Ordering::Release);
