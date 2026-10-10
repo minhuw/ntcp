@@ -167,6 +167,53 @@ def adapt_source(directory, relative, manifest, so_flags):
         return source, dict(entry)
     command = entry['command_line'].encode()
     replacement = entry['replacement_line'].encode()
+    setup_profiles = {
+        'nagle/https_client.pkt': (
+            b'`../common/defaults.sh\nethtool -K tun0 tso off gso off\n'
+            b'../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n',
+            'upstream-https',
+            {'timestamps': False, 'sack': True, 'output_push_batch_segments': 2}),
+        'notsent_lowat/notsent-lowat-sysctl.pkt': (
+            b'`../../common/defaults.sh\nsysctl -q net.ipv4.tcp_notsent_lowat=4000`\n',
+            'upstream-global-lowat',
+            {'global_notsent_lowat': 4000, 'socket_notsent_lowat': 0}),
+    }
+    if relative in setup_profiles:
+        expected, token, settings = setup_profiles[relative]
+        settings.update(general_pacing=False, software_gso=False, hardware_tso=False)
+        commands = [command.rstrip(b'\n')]
+        replacements = [(command, replacement)]
+        if token == 'upstream-https':
+            restore = b'`/tmp/sysctl_restore_${PPID}.sh`\n'
+            restored = b'// ntcp profile is process-local; no host sysctls to restore.\n'
+            if (entry.get('restore_line', '').encode() != restore
+                    or entry.get('restore_sha256') != hashlib.sha256(restore).hexdigest()
+                    or entry.get('restore_replacement_line', '').encode() != restored
+                    or not any(extra['path'] == 'common/set_sysctls.py'
+                               for extra in entry.get('additional_setup_files', []))):
+                raise ValueError('expected exact audited HTTPS restore and setup helper')
+            commands.append(restore.rstrip(b'\n'))
+            replacements.append((restore, restored))
+        if (command != expected or so_flags != token + ',local=192.168.0.1'
+                or entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
+                or replacement != b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n'
+                or entry.get('command_sha256') != hashlib.sha256(command).hexdigest()
+                or entry['expected_command_count'] != len(commands)
+                or re.findall(rb'`[^`]*`', source) != commands
+                or any(entry['mapping']['ntcp_settings'].get(key) != value
+                       for key, value in settings.items())
+                or [(c['command'].encode(), c['sha256']) for c in entry['audited_shell_commands']]
+                   != [(c, hashlib.sha256(c).hexdigest()) for c in commands]):
+            raise ValueError('expected exact audited setup profile and commands')
+        generated = source
+        for old, new in replacements:
+            if source.count(old) != 1 or not (source.startswith(old) or b'\n' + old in source):
+                raise ValueError('expected one complete setup/restore line')
+            generated = generated.replace(old, new, 1)
+        reasons = preflight(generated.decode())
+        if reasons:
+            raise ValueError('; '.join(reasons))
+        return generated, {**entry, 'generated_sha256': hashlib.sha256(generated).hexdigest()}
     ecn_command = (b'`../common/defaults.sh\n'
                    b'sysctl -q net.ipv4.tcp_ecn=1  # fully enabled\n`\n')
     ecn_mapped = (command == ecn_command
@@ -326,6 +373,7 @@ def profile_metadata(so_flags):
     known = profile in {
         'baseline', 'sack', 'upstream-window8', 'upstream-sack', 'upstream-ecn',
         'upstream-basic', 'upstream-cubic', 'upstream-cubic-ecn',
+        'upstream-https', 'upstream-global-lowat',
         'pipeline', 'pipeline-paced', 'pipeline-gso', 'pipeline-paced-gso'}
     # Configuration/capture boundary only: not measured timing or Linux fq/TSO equivalence.
     return {

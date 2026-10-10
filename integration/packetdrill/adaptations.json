@@ -2899,27 +2899,24 @@
       "expected_command_count": 2,
       "command_line": "`../common/defaults.sh\nethtool -K tun0 tso off gso off\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "adapter_flags": "upstream-https,local=192.168.0.1",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
         "scope": "nagle/https_client.pkt; original packet/syscall/assertion/timing bytes preserved",
         "reasons": [
-          "LegacyInitialCredit explicitly retains the historical entry-MSS, deferred capped delivery and persist-bypass behavior for these unchanged assertions; it is not claimed to conform to RFC 6937 or RFC 9937. The 200 ms RTO floor is explicit Linux timing compatibility; the core default remains 1 s. One preallocated owned connection pool is charged to the same 32 MiB aggregate buffer budget.",
-          "Only hashed Linux setup is adapted. Linux CUBIC, buffer autotuning, metrics flushing, qdisc configuration and other defaults are not reproduced; Reno is used for non-SACK recovery. Profile mismatches remain test failures, not assertion edits.",
-          "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
-          "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
-          "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
-          "Linux ethtool TSO/GSO disablement and tcp_timestamps=0 setup/restore have no audited combined adapter mapping; no shell command is executed."
+          "Explicit Window8-derived profile adds SACK to match the original SYN; timestamps are disabled. TLS records are opaque TCP bytes. RFC 9293 section 3.7.4 requires an application option to disable Nagle; TCP_NODELAY must allow the partial tail without waiting for an ACK. RFC 7323 section 3.2 makes initial timestamp negotiation optional; no negotiated timestamp obligation applies here.",
+          "General pacing and software GSO are disabled; no hardware TSO exists at this capture boundary. No ethtool or sysctl command runs. The process-local profile needs no host restore. Explicit two-segment logical PUSH batching marks contiguous ordinary-data batch boundaries and preserves the application PUSH on the tail; this is profile wire-format policy, not hardware or Linux skb emulation. RFC 9293 section 3.9.1.2 requires PUSH on the last buffered segment but does not require these intermediate boundaries. With batching disabled the original assertion at 1543:2517 first fails on PSH, not Nagle.",
+          "Only hash-audited setup and restore are replaced. Linux defaults, CUBIC, autotuning and qdisc behavior are not reproduced."
         ],
         "ntcp_settings": {
           "sack": true,
-          "timestamps": true,
-          "initial_window": "Iw10",
-          "rack": true,
-          "prr": "LegacyInitialCredit",
-          "tlp": true,
-          "rto_min_us": 200000,
+          "timestamps": false,
+          "initial_window": "Rfc5681",
+          "rack": false,
+          "prr": false,
+          "tlp": false,
+          "rto_min_us": 1000000,
           "preallocate_connections": 1,
           "ecn": false,
           "mss": 1460,
@@ -2928,25 +2925,26 @@
           "endpoint_max_buffer_bytes": 33554432,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
-          "abort_with_ack": true,
-          "coalesce_read_window_updates": true,
-          "peer_max_ack_delay_us": 200000
+          "abort_with_ack": false,
+          "coalesce_read_window_updates": false,
+          "peer_max_ack_delay_us": 499999,
+          "general_pacing": false,
+          "software_gso": false,
+          "hardware_tso": false,
+          "output_push_batch_segments": 2
         },
-        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+        "claim": "Explicit process-local setup mapping; original behavior assertions remain diagnostic, not complete Linux defaults equivalence."
       },
-      "blocked_reasons": [
-        "Linux ethtool TSO/GSO disablement and tcp_timestamps=0 setup/restore have no audited combined adapter mapping; no shell command is executed."
-      ],
       "audited_shell_commands": [
         {
           "command": "`../common/defaults.sh\nethtool -K tun0 tso off gso off\n../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`",
           "sha256": "a91138417319b7b34fa75ef74630c768a892a64c69d393ec1eb0cba79c2b1845",
-          "semantic_mapping": "Unavailable: Linux ethtool TSO/GSO disablement and tcp_timestamps=0 setup/restore have no audited combined adapter mapping; no shell command is executed."
+          "semantic_mapping": "General pacing and software GSO are disabled; no hardware TSO exists at this capture boundary. No ethtool or sysctl command runs. The process-local profile needs no host restore. Explicit two-segment logical PUSH batching marks contiguous ordinary-data batch boundaries and preserves the application PUSH on the tail; this is profile wire-format policy, not hardware or Linux skb emulation. RFC 9293 section 3.9.1.2 requires PUSH on the last buffered segment but does not require these intermediate boundaries. With batching disabled the original assertion at 1543:2517 first fails on PSH, not Nagle."
         },
         {
           "command": "`/tmp/sysctl_restore_${PPID}.sh`",
           "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
-          "semantic_mapping": "Unavailable: Linux ethtool TSO/GSO disablement and tcp_timestamps=0 setup/restore have no audited combined adapter mapping; no shell command is executed."
+          "semantic_mapping": "General pacing and software GSO are disabled; no hardware TSO exists at this capture boundary. No ethtool or sysctl command runs. The process-local profile needs no host restore. Explicit two-segment logical PUSH batching marks contiguous ordinary-data batch boundaries and preserves the application PUSH on the tail; this is profile wire-format policy, not hardware or Linux skb emulation. RFC 9293 section 3.9.1.2 requires PUSH on the last buffered segment but does not require these intermediate boundaries. With batching disabled the original assertion at 1543:2517 first fails on PSH, not Nagle."
         }
       ],
       "additional_setup_files": [
@@ -2954,7 +2952,11 @@
           "path": "common/set_sysctls.py",
           "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
         }
-      ]
+      ],
+      "command_sha256": "72f2ea3446349076862b8543ee6df74c961f8d4c7544063dc04fa7e779efc186",
+      "restore_line": "`/tmp/sysctl_restore_${PPID}.sh`\n",
+      "restore_sha256": "60a62f306d37841760269f429facc4f42420d9a0f3331bcb8ac55a14f7e84b48",
+      "restore_replacement_line": "// ntcp profile is process-local; no host sysctls to restore.\n"
     },
     "nagle/sendmsg_msg_more.pkt": {
       "source_sha256": "41e0c81d6c501a17978eb7ad974850e52bc15016195d2dfd1a5b7dc299317ec2",
@@ -3158,7 +3160,7 @@
       "expected_command_count": 1,
       "command_line": "`../../common/defaults.sh\nsysctl -q net.ipv4.tcp_notsent_lowat=4000`\n",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "adapter_flags": "upstream-global-lowat,local=192.168.0.1",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
@@ -3169,7 +3171,7 @@
           "The upstream-basic profile uses immediate ACKs for these short scripted exchanges; TCP core delayed-ACK defaults remain unchanged.",
           "Explicit abort_with_ack emits RST|ACK with ACK=RCV.NXT only for handshake-completed synchronized local aborts; the core default remains bare RST. Negotiated timestamps echo TS.Recent when ACK is set (RFC 7323 section 3.2). Reactive reset formatting is unchanged.",
           "Single-packet PTO uses an explicit 200 ms peer ACK-delay budget; FIN probes retain the unarmed RTO reference and exponential RTO backoff.",
-          "Linux global net.ipv4.tcp_notsent_lowat=4000 has no adapter configuration equivalent; it cannot be replaced by a per-socket option because the script asserts the option remains zero. No shell command is executed."
+          "The runtime-global notsent LOWAT default is 4000, separate from the raw per-socket option zero/inherit. No host sysctl runs. Byte-based admission is retained: Linux skb accounting and 16 KiB admission chunks are not emulated; original write and POLLOUT assertions may fail."
         ],
         "ntcp_settings": {
           "sack": true,
@@ -3189,20 +3191,24 @@
           "delayed_ack_us": 0,
           "abort_with_ack": true,
           "coalesce_read_window_updates": true,
-          "peer_max_ack_delay_us": 200000
+          "peer_max_ack_delay_us": 200000,
+          "global_notsent_lowat": 4000,
+          "socket_notsent_lowat": 0,
+          "general_pacing": false,
+          "software_gso": false,
+          "hardware_tso": false,
+          "output_push_batch_segments": 0
         },
-        "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
+        "claim": "Explicit process-local setup mapping; original behavior assertions remain diagnostic, not complete Linux defaults equivalence."
       },
-      "blocked_reasons": [
-        "Linux global net.ipv4.tcp_notsent_lowat=4000 has no adapter configuration equivalent; it cannot be replaced by a per-socket option because the script asserts the option remains zero. No shell command is executed."
-      ],
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh\nsysctl -q net.ipv4.tcp_notsent_lowat=4000`",
           "sha256": "865f4fd5fad828a002c79d345198b72a15addbb39451c6df3978852de451e0fd",
-          "semantic_mapping": "Unavailable: Linux global net.ipv4.tcp_notsent_lowat=4000 has no adapter configuration equivalent; it cannot be replaced by a per-socket option because the script asserts the option remains zero. No shell command is executed."
+          "semantic_mapping": "The runtime-global notsent LOWAT default is 4000, separate from the raw per-socket option zero/inherit. No host sysctl runs. Byte-based admission is retained: Linux skb accounting and 16 KiB admission chunks are not emulated; original write and POLLOUT assertions may fail."
         }
-      ]
+      ],
+      "command_sha256": "7d3e3edf89106a7142d03a95fd3ee9c5e178810976180d6ed0db630624fc92dd"
     },
     "sendfile/sendfile-simple.pkt": {
       "fixture": "sendfile-five-zero-bytes",

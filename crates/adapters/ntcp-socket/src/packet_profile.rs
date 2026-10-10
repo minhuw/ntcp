@@ -22,6 +22,8 @@ pub enum Profile {
     PipelineGso,
     PipelinePacedGso,
     UpstreamWindow8,
+    UpstreamHttps,
+    UpstreamGlobalLowat,
     Sack,
     UpstreamSack,
     UpstreamCubic,
@@ -49,6 +51,8 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
                 "pipeline-gso" => Profile::PipelineGso,
                 "pipeline-paced-gso" => Profile::PipelinePacedGso,
                 "upstream-window8" => Profile::UpstreamWindow8,
+                "upstream-https" => Profile::UpstreamHttps,
+                "upstream-global-lowat" => Profile::UpstreamGlobalLowat,
                 "sack" => Profile::Sack,
                 "upstream-sack" => Profile::UpstreamSack,
                 "upstream-cubic" => Profile::UpstreamCubic,
@@ -69,6 +73,12 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
 }
 
 pub(crate) fn config(profile: Profile) -> EndpointConfig {
+    let https = profile == Profile::UpstreamHttps;
+    let profile = match profile {
+        Profile::UpstreamHttps => Profile::UpstreamWindow8,
+        Profile::UpstreamGlobalLowat => Profile::UpstreamBasic,
+        other => other,
+    };
     let pacing = matches!(profile, Profile::PipelinePaced | Profile::PipelinePacedGso);
     let profile = match profile {
         Profile::Pipeline
@@ -143,14 +153,15 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
     }
     // Both CUBIC profiles keep RFC 9937 accounting and exit cwnd.
     config.connection.prr_pacing = !cubic;
-    config.connection.output_push_batch_segments = if cubic { 2 } else { 0 };
+    // Explicit logical PUSH grouping for wire captures, independent of GSO/TSO.
+    config.connection.output_push_batch_segments = if cubic || https { 2 } else { 0 };
     config.connection.tlp = upstream;
     if upstream {
         // Explicit Linux timing compatibility; the core keeps RFC 6298's
         // recommended one-second floor as its default.
         config.connection.rto_min_us = 200_000;
     }
-    config.connection.sack = upstream || profile == Profile::Sack;
+    config.connection.sack = upstream || profile == Profile::Sack || https;
     config.connection.coalesce_read_window_updates = profile == Profile::UpstreamBasic;
     config.connection.recovery_algorithm = if profile == Profile::UpstreamBasic {
         ntcp::RecoveryAlgorithm::Reno
@@ -184,4 +195,52 @@ pub(crate) fn parse_frame(bytes: &[u8]) -> Result<ntcp_ip::Packet<'_>> {
     let packet = ntcp_ip::parse(bytes, false).map_err(|_| EINVAL)?;
     ntcp::wire::parse(packet.ip, packet.payload).map_err(|_| EINVAL)?;
     Ok(packet)
+}
+
+// Runtime-global default, deliberately separate from raw per-socket zero/inherit.
+pub(crate) fn notsent_lowat(profile: Profile) -> u32 {
+    if profile == Profile::UpstreamGlobalLowat {
+        4000
+    } else {
+        u32::MAX
+    }
+}
+
+#[cfg(test)]
+mod setup_profile_tests {
+    use super::*;
+
+    #[test]
+    fn audited_setup_profiles_keep_transport_and_global_options_separate() {
+        for (token, selected, lowat) in [
+            ("upstream-https", Profile::UpstreamHttps, u32::MAX),
+            ("upstream-global-lowat", Profile::UpstreamGlobalLowat, 4000),
+        ] {
+            assert_eq!(
+                profile(&format!("{token},local=192.0.2.1")).unwrap().1,
+                selected
+            );
+            assert_eq!(notsent_lowat(selected), lowat);
+            assert!(gso(selected).is_none());
+            let config = config(selected);
+            assert!(config.connection.pacing.is_none());
+            assert!(config.connection.sack);
+            assert_eq!(
+                config.connection.timestamps,
+                selected == Profile::UpstreamGlobalLowat
+            );
+            assert_eq!(
+                config.connection.output_push_batch_segments,
+                if selected == Profile::UpstreamHttps {
+                    2
+                } else {
+                    0
+                }
+            );
+            assert_eq!(config.connection.receive_capacity, 8 * 1024 * 1024);
+            assert_eq!(config.connection.delayed_ack_us, 0);
+        }
+        assert_eq!(notsent_lowat(Profile::UpstreamBasic), u32::MAX);
+        assert!(!config(Profile::UpstreamWindow8).connection.sack);
+    }
 }

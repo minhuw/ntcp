@@ -18,6 +18,8 @@ impl Adapter {
             Profile::PipelineGso => "pipeline-gso",
             Profile::PipelinePacedGso => "pipeline-paced-gso",
             Profile::UpstreamWindow8 => "upstream-window8",
+            Profile::UpstreamHttps => "upstream-https",
+            Profile::UpstreamGlobalLowat => "upstream-global-lowat",
             Profile::Sack => "sack",
             Profile::UpstreamSack => "upstream-sack",
             Profile::UpstreamCubic => "upstream-cubic",

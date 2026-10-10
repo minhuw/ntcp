@@ -452,6 +452,20 @@ class AdaptationChecks(unittest.TestCase):
         # Synthetic sources exercise runner behavior, independent of real scripts'
         # blocked capabilities and alternate defaults spellings.
         for name, entry in self.manifest['scripts'].items():
+            if name in ('nagle/https_client.pkt', 'notsent_lowat/notsent-lowat-sysctl.pkt'):
+                path = self.directory / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                source = self.source.replace(b'`../common/defaults.sh`\n', entry['command_line'].encode())
+                source += entry.get('restore_line', '').encode()
+                path.write_bytes(source)
+                entry['source_sha256'] = hashlib.sha256(source).hexdigest()
+                entry['setup_sha256'] = hashlib.sha256(self.setup).hexdigest()
+                for extra in entry.get('additional_setup_files', []):
+                    helper = self.directory / extra['path']
+                    helper.parent.mkdir(parents=True, exist_ok=True)
+                    helper.write_bytes(b'# synthetic helper\n')
+                    extra['sha256'] = hashlib.sha256(helper.read_bytes()).hexdigest()
+                continue
             entry.pop('blocked_reasons', None)
             entry.pop('additional_setup_files', None)
             entry.pop('fixture', None)
@@ -463,7 +477,7 @@ class AdaptationChecks(unittest.TestCase):
             entry['source_sha256'] = hashlib.sha256(self.source).hexdigest()
             entry['setup_sha256'] = hashlib.sha256(self.setup).hexdigest()
         setup = self.directory / 'common/defaults.sh'
-        setup.parent.mkdir(parents=True)
+        setup.parent.mkdir(parents=True, exist_ok=True)
         setup.write_bytes(self.setup)
         self.name = 'close/close-on-syn-sent.pkt'
         self.flags = self.manifest['scripts'][self.name]['adapter_flags']
@@ -472,9 +486,12 @@ class AdaptationChecks(unittest.TestCase):
         for name, entry in self.manifest['scripts'].items():
             generated, audit = adapt_source(self.directory, name, self.manifest,
                                              entry['adapter_flags'])
-            before, after = self.source.split(entry['command_line'].encode())
-            self.assertEqual(generated, before + entry['replacement_line'].encode() + after)
-            self.assertEqual((self.directory / name).read_bytes(), self.source)
+            source = (self.directory / name).read_bytes()
+            expected = source.replace(entry['command_line'].encode(), entry['replacement_line'].encode(), 1)
+            if 'restore_line' in entry:
+                expected = expected.replace(entry['restore_line'].encode(), entry['restore_replacement_line'].encode(), 1)
+            self.assertEqual(generated, expected)
+            self.assertEqual((self.directory / name).read_bytes(), source)
             self.assertEqual(audit['source_sha256'], entry['source_sha256'])
             self.assertEqual(audit['setup_sha256'], entry['setup_sha256'])
             self.assertEqual(audit['generated_sha256'], hashlib.sha256(generated).hexdigest())
@@ -1204,8 +1221,12 @@ class PublishedSelectionChecks(unittest.TestCase):
                 if entry.get('blocked_reasons'):
                     self.assertEqual(generated, source)
                 else:
-                    self.assertEqual(generated.replace(entry['replacement_line'].encode(),
-                                                       entry['command_line'].encode(), 1), source)
+                    restored = generated.replace(entry['replacement_line'].encode(),
+                                                 entry['command_line'].encode(), 1)
+                    if 'restore_line' in entry:
+                        restored = restored.replace(entry['restore_replacement_line'].encode(),
+                                                    entry['restore_line'].encode(), 1)
+                    self.assertEqual(restored, source)
                     self.assertIn('generated_sha256', audit)
                 self.assertFalse(entry['mapping']['linux_defaults_reproduced'])
 
@@ -1217,8 +1238,11 @@ class PublishedSelectionChecks(unittest.TestCase):
         self.assertNotIn('TCP_NOTSENT_LOWAT is also unavailable', stale)
         for name in SOCKET_FEATURE19:
             entry = self.manifest['scripts'][name]
-            self.assertEqual(entry['adapter_flags'], 'upstream-basic,local=192.168.0.1')
-            self.assertEqual(entry['mapping']['ntcp_settings']['prr'], 'LegacyInitialCredit')
+            token = {'nagle/https_client.pkt': 'upstream-https',
+                     'notsent_lowat/notsent-lowat-sysctl.pkt': 'upstream-global-lowat'}.get(name, 'upstream-basic')
+            self.assertEqual(entry['adapter_flags'], token + ',local=192.168.0.1')
+            self.assertEqual(entry['mapping']['ntcp_settings']['prr'],
+                             False if token == 'upstream-https' else 'LegacyInitialCredit')
             if name.startswith('tcp_info/'):
                 self.assertTrue(entry['embedded_tcp_info'])
                 self.assertNotIn('blocked_reasons', entry)
@@ -1237,7 +1261,7 @@ class PublishedSelectionChecks(unittest.TestCase):
                                 for name in self.manifest['scripts'])
             # The candidate fixture remains runtime-gated until integration is ready.
             sendfile_enabled = not self.manifest['scripts']['sendfile/sendfile-simple.pkt'].get('blocked_reasons')
-            for selection, eligible in ((SOCKET43, 33 + int(sendfile_enabled)), (SOCKET_FEATURE19, 13)):
+            for selection, eligible in ((SOCKET43, 35 + int(sendfile_enabled)), (SOCKET_FEATURE19, 15)):
                 executed = []
 
                 def execute(argv, cwd, timeout):
@@ -1269,8 +1293,7 @@ class PublishedSelectionChecks(unittest.TestCase):
                 self.assertFalse(data['all_passed'])
                 for row in data['results']:
                     flags = row['effective_flags']
-                    self.assertEqual(flags['profile'], 'upstream-basic' if row['script'] in SOCKET_FEATURE19
-                                     else self.manifest['scripts'][row['script']]['adapter_flags'].split(',')[0])
+                    self.assertEqual(flags['profile'], self.manifest['scripts'][row['script']]['adapter_flags'].split(',')[0])
                     self.assertTrue(flags['prr_pacing'])
                     self.assertEqual(flags['transport_clock'], 'monotonic Instant elapsed microseconds')
                     self.assertEqual(flags['transmit_batch_clock'], 'monotonic sample per selection/accept')
