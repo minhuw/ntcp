@@ -37,12 +37,44 @@ pub struct Header {
     pub urgent_pointer: u16,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FastOpenCookie {
+    bytes: [u8; 16],
+    len: u8,
+}
+
+impl FastOpenCookie {
+    pub fn new(bytes: &[u8]) -> Result<Self, WireError> {
+        // RFC 7413 section 4.1.1, with verified errata 4238/4239:
+        // length 2 requests a cookie; cookie-bearing lengths are even 6..=18.
+        if !matches!(bytes.len(), 0 | 4 | 6 | 8 | 10 | 12 | 14 | 16) {
+            return Err(WireError::InvalidOption);
+        }
+        let mut cookie = Self::request();
+        cookie.bytes[..bytes.len()].copy_from_slice(bytes);
+        cookie.len = bytes.len() as u8;
+        Ok(cookie)
+    }
+
+    pub const fn request() -> Self {
+        Self {
+            bytes: [0; 16],
+            len: 0,
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
     pub mss: Option<u16>,
     pub window_scale: Option<u8>,
     pub invalid_window_scale: Option<u8>,
     pub timestamps: Option<(u32, u32)>,
+    pub fast_open: Option<FastOpenCookie>,
     pub sack_permitted: bool,
     pub sack_blocks: [Option<(u32, u32)>; 4],
 }
@@ -145,6 +177,7 @@ pub fn checksum(ip: IpMetadata, segment: &[u8]) -> Result<u16, WireError> {
 //# Kind: 5
 fn read_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> {
     let mut options = Options::default();
+    let mut fast_open_seen = false;
     while let Some(&kind) = bytes.first() {
         // Codec support for EOL, NOP, and MSS; connection-level MSS negotiation is
         // separate.
@@ -236,6 +269,17 @@ fn read_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> 
                             u32::from_be_bytes(bytes[6..10].try_into().unwrap()),
                         ));
                     }
+                    34 => {
+                        let cookie = FastOpenCookie::new(&bytes[2..len]);
+                        if outgoing && (cookie.is_err() || fast_open_seen) {
+                            return Err(WireError::InvalidOption);
+                        }
+                        // Ignore bounded invalid cookie lengths (RFC 7413 4.1.1).
+                        // Duplicate kind 34 is ambiguous: discard all TFO metadata
+                        // on input, even if one occurrence has an invalid length.
+                        options.fast_open = if fast_open_seen { None } else { cookie.ok() };
+                        fast_open_seen = true;
+                    }
                     2 | 3 | 4 | 5 | 8 => return Err(WireError::InvalidOption),
                     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
                     //# A TCP implementation MUST (MUST-6) ignore without error any TCP
@@ -274,11 +318,13 @@ pub fn parse(ip: IpMetadata, bytes: &[u8]) -> Result<Segment<'_>, WireError> {
         return Err(WireError::InvalidChecksum);
     }
     let raw_options = &bytes[20..header_len];
-    // The codec parses options independently of flags; connection-state interpretation is
-    // separate.
+    // Other options remain flag-independent; Fast Open is only meaningful on SYN.
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
     //# A TCP implementation MUST be able to receive a TCP Option in any segment (MUST-5).
-    let options = read_options(raw_options, false)?;
+    let mut options = read_options(raw_options, false)?;
+    if bytes[13] & SYN == 0 {
+        options.fast_open = None;
+    }
     Ok(Segment {
         header: Header {
             source_port: u16::from_be_bytes([bytes[0], bytes[1]]),
@@ -322,7 +368,8 @@ pub fn encode(
     if header.flags & SYN == 0
         && (parsed_options.mss.is_some()
             || parsed_options.window_scale.is_some()
-            || parsed_options.sack_permitted)
+            || parsed_options.sack_permitted
+            || parsed_options.fast_open.is_some())
     {
         return Err(WireError::InvalidOption);
     }
@@ -1079,5 +1126,203 @@ mod tests {
             read_options(&duplicate, false),
             Err(WireError::InvalidOption)
         );
+    }
+
+    fn fast_open_option(cookie: &[u8]) -> Vec<u8> {
+        let mut raw = vec![34, (cookie.len() + 2) as u8];
+        raw.extend_from_slice(cookie);
+        raw
+    }
+
+    // Bypass output validation, placing raw options at the end of the header
+    // so zero padding cannot hide a truncated TLV.
+    fn incoming_options(ip: IpMetadata, raw: &[u8], flags: u8) -> Vec<u8> {
+        let prefix = (4 - raw.len() % 4) % 4;
+        let mut bytes = packet(ip, &vec![1; prefix + raw.len()], b"odd");
+        bytes[20 + prefix..20 + prefix + raw.len()].copy_from_slice(raw);
+        bytes[13] = flags;
+        seal(ip, &mut bytes);
+        bytes
+    }
+
+    #[test]
+    fn fast_open_cookie_checked_value() {
+        fn assert_value_traits<T: Copy + Eq + core::fmt::Debug>() {}
+        assert_value_traits::<FastOpenCookie>();
+        assert_value_traits::<Options>();
+        assert_eq!(FastOpenCookie::request().as_bytes(), &[]);
+        assert_eq!(FastOpenCookie::new(&[]), Ok(FastOpenCookie::request()));
+        for len in 0..=64 {
+            let bytes = vec![0xa5; len];
+            let cookie = FastOpenCookie::new(&bytes);
+            if len == 0 || ((4..=16).contains(&len) && len % 2 == 0) {
+                assert_eq!(cookie.unwrap().as_bytes(), bytes);
+                let copy = cookie.unwrap();
+                assert_eq!(copy, FastOpenCookie::new(&bytes).unwrap());
+            } else {
+                assert_eq!(cookie, Err(WireError::InvalidOption));
+            }
+        }
+    }
+
+    #[test]
+    fn fast_open_ipv4_ipv6_round_trip_and_syn_only() {
+        for ip in ips() {
+            for cookie_len in [0, 4, 6, 8, 10, 12, 14, 16] {
+                let cookie: Vec<u8> = (0..cookie_len).collect();
+                let option = fast_open_option(&cookie);
+                assert_eq!(option[1] as usize, cookie.len() + 2);
+                for prefix in 0..4 {
+                    let mut raw = vec![1; prefix];
+                    raw.extend_from_slice(&option);
+                    for flags in [SYN, SYN | ACK] {
+                        let mut h = header();
+                        h.flags = flags;
+                        let mut out = [0xa5; 80];
+                        let len = encode(ip, h, &raw, b"odd", &mut out).unwrap();
+                        assert_eq!(reference(ip, &out[..len]), 0);
+                        let parsed = parse(ip, &out[..len]).unwrap();
+                        assert_eq!(parsed.header, h);
+                        assert_eq!(
+                            parsed.options.fast_open,
+                            Some(FastOpenCookie::new(&cookie).unwrap())
+                        );
+                        assert_eq!(&parsed.raw_options[..raw.len()], raw);
+                        assert_eq!(parsed.payload, b"odd");
+                    }
+                }
+                for flags in [0, ACK, FIN | ACK, RST] {
+                    let bytes = incoming_options(ip, &option, flags);
+                    assert_eq!(parse(ip, &bytes).unwrap().options.fast_open, None);
+                    let mut h = header();
+                    h.flags = flags;
+                    let mut out = [0xa5; 80];
+                    assert_eq!(
+                        encode(ip, h, &option, &[], &mut out),
+                        Err(WireError::InvalidOption)
+                    );
+                    assert_eq!(out, [0xa5; 80]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fast_open_invalid_bounded_lengths_ignored() {
+        for ip in ips() {
+            for len in 2..=36 {
+                if matches!(len, 2 | 6 | 8 | 10 | 12 | 14 | 16 | 18) {
+                    continue;
+                }
+                let mut raw = vec![0xa5; len];
+                raw[..2].copy_from_slice(&[34, len as u8]);
+                // Ignoring kind 34 must still reach a subsequent valid option.
+                raw.extend_from_slice(&[2, 4, 5, 180]);
+                for flags in [SYN, ACK] {
+                    let bytes = incoming_options(ip, &raw, flags);
+                    let parsed = parse(ip, &bytes).unwrap();
+                    assert_eq!(parsed.options.fast_open, None);
+                    assert_eq!(parsed.options.mss, Some(1460));
+                    assert_eq!(parsed.payload, b"odd");
+                }
+                let mut out = [0xa5; 80];
+                assert_eq!(
+                    encode(ip, header(), &raw, &[], &mut out),
+                    Err(WireError::InvalidOption)
+                );
+                assert_eq!(out, [0xa5; 80]);
+            }
+        }
+    }
+
+    #[test]
+    fn fast_open_tlv_bounds_and_truncation() {
+        for declared in 0..=255u8 {
+            for available in 1..=40 {
+                let mut raw = vec![1; available];
+                raw[0] = 34;
+                if available > 1 {
+                    raw[1] = declared;
+                }
+                let bounded = available > 1 && declared >= 2 && declared as usize <= available;
+                assert_eq!(read_options(&raw, false).is_ok(), bounded);
+                let valid = bounded && matches!(declared, 2 | 6 | 8 | 10 | 12 | 14 | 16 | 18);
+                assert_eq!(read_options(&raw, true).is_ok(), valid);
+            }
+        }
+        for ip in ips() {
+            for raw in [&[34][..], &[34, 0], &[34, 1], &[34, 6, 1, 2, 3], &[34, 255]] {
+                for flags in [SYN, ACK] {
+                    let bytes = incoming_options(ip, raw, flags);
+                    parse_error(ip, &bytes, WireError::InvalidOption);
+                }
+                let mut out = [0xa5; 80];
+                assert_eq!(
+                    encode(ip, header(), raw, &[], &mut out),
+                    Err(WireError::InvalidOption)
+                );
+                assert_eq!(out, [0xa5; 80]);
+            }
+            let bytes = packet(ip, &fast_open_option(&[0xa5; 16]), &[]);
+            for end in 0..bytes.len() {
+                parse_error(ip, &bytes[..end], WireError::Truncated);
+            }
+        }
+    }
+
+    #[test]
+    fn fast_open_duplicates_discard_metadata_and_output_rejects() {
+        let variants = [
+            fast_open_option(&[]),
+            fast_open_option(&[1; 4]),
+            fast_open_option(&[2; 4]),
+            fast_open_option(&[3]),
+        ];
+        for ip in ips() {
+            for first in &variants {
+                for second in &variants {
+                    let mut raw = first.clone();
+                    raw.extend_from_slice(second);
+                    // A third valid occurrence must not restore metadata.
+                    for third in [false, true] {
+                        if third {
+                            raw.extend_from_slice(&[34, 2]);
+                        }
+                        let bytes = incoming_options(ip, &raw, SYN);
+                        assert_eq!(parse(ip, &bytes).unwrap().options.fast_open, None);
+                        let mut out = [0xa5; 80];
+                        assert_eq!(
+                            encode(ip, header(), &raw, &[], &mut out),
+                            Err(WireError::InvalidOption)
+                        );
+                        assert_eq!(out, [0xa5; 80]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fast_open_option_budget() {
+        for ip in ips() {
+            let mut raw = fast_open_option(&[0xa5; 16]);
+            raw.extend_from_slice(&[2, 4, 5, 180, 3, 3, 7, 4, 2, 8, 10, 0, 0, 0, 7, 0, 0, 0, 9]);
+            raw.resize(40, 1);
+            let bytes = packet(ip, &raw, b"odd");
+            let parsed = parse(ip, &bytes).unwrap();
+            assert_eq!(parsed.raw_options.len(), 40);
+            assert_eq!(parsed.options.fast_open.unwrap().as_bytes(), &[0xa5; 16]);
+            assert_eq!(parsed.options.mss, Some(1460));
+            assert_eq!(parsed.options.window_scale, Some(7));
+            assert!(parsed.options.sack_permitted);
+            assert_eq!(parsed.options.timestamps, Some((7, 9)));
+            raw.push(1);
+            let mut out = [0xa5; 80];
+            assert_eq!(
+                encode(ip, header(), &raw, &[], &mut out),
+                Err(WireError::TooLong)
+            );
+            assert_eq!(out, [0xa5; 80]);
+        }
     }
 }
