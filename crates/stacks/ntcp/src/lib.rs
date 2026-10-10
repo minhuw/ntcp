@@ -15,6 +15,9 @@ mod buffer;
 mod connection;
 mod cubic;
 mod endpoint;
+mod fast_open;
+#[cfg(test)]
+mod fast_open_tests;
 mod output_reservation;
 pub use output_reservation::{
     GsoLimits, TransmitAttempt, TransmitGroup, TransmitGroupLimits, TransmitGroupView,

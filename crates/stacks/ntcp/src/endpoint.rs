@@ -284,6 +284,8 @@ struct Slot {
     //# OPEN or an active OPEN (MUST-11).
     listener: Option<ListenerId>,
     accepted_ready: bool,
+    // Independent of accept-queue ownership: early accept must not free quota.
+    fast_open_owner: Option<ListenerId>,
     released: bool,
     closed_output_drained: bool,
     mapped: bool,
@@ -299,6 +301,7 @@ struct Slot {
     received_ipv4_options: Option<Ipv4Options>,
 }
 struct Listener {
+    fast_open_limit: usize,
     rx_timestamp_capacity: usize,
     buffer_capacities: (usize, usize),
     application_timeout_us: Option<u64>,
@@ -314,6 +317,7 @@ struct Listener {
 // Ambiguous overlapping ingress domains need separate endpoints, not implicit
 // context guessing from addresses.
 pub struct Endpoint {
+    fast_open: Option<crate::fast_open::FastOpen>,
     reservations: Vec<crate::output_reservation::OutputReservation>,
     address_policy: Box<dyn Fn(AddressValidation) -> bool>,
     config: EndpointConfig,
@@ -420,6 +424,7 @@ impl Endpoint {
             .try_reserve_exact(count)
             .map_err(|_| Error::NoMemory)?;
         Ok(Self {
+            fast_open: None,
             reservations: Vec::new(),
             address_policy: Box::new(address_policy),
             passive_errors,
@@ -629,6 +634,7 @@ impl Endpoint {
             .try_reserve_exact(backlog)
             .map_err(|_| Error::NoMemory)?;
         self.listeners[slot] = Some(Listener {
+            fast_open_limit: 0,
             rx_timestamp_capacity: 0,
             buffer_capacities: (
                 self.config.connection.send_capacity,
@@ -865,6 +871,68 @@ impl Endpoint {
         {
             connection_config.initial_window = crate::InitialWindow::Rfc5681;
         }
+        // Apply the same policy to ordinary passive opens and TIME-WAIT reuse.
+        let mut fast_open_response = None;
+        let mut early = false;
+        let mut filtered_syn = None;
+        if let Some(syn) = syn
+            && let Some(listener) = self.match_listener(tuple.local)
+            && self.listeners[listener.slot]
+                .as_ref()
+                .unwrap()
+                .fast_open_limit
+                != 0
+            && self.fast_open.is_some()
+        {
+            let limit = self.listeners[listener.slot]
+                .as_ref()
+                .unwrap()
+                .fast_open_limit;
+            // ponytail: scan at most max_connections on passive setup only;
+            // use a generation-bound counter if measured SYN load warrants it.
+            let pending = self
+                .slots
+                .iter()
+                .flatten()
+                .filter(|slot| {
+                    slot.fast_open_owner == Some(listener)
+                        && !slot.connection.handshake_complete()
+                        && slot.connection.state() != State::Closed
+                })
+                .count();
+            let epoch = self.now / self.fast_open_lifetime();
+            let valid = syn.options.fast_open.is_some_and(|cookie| {
+                crate::fast_open::valid(
+                    &self.secret,
+                    tuple.local.ip(),
+                    tuple.remote.ip(),
+                    epoch,
+                    cookie,
+                )
+            });
+            let accept_data = valid && pending < limit;
+            early = accept_data && !syn.payload.is_empty();
+            if syn.options.fast_open.is_some() {
+                fast_open_response = Some(crate::fast_open::issue(
+                    &self.secret,
+                    tuple.local.ip(),
+                    tuple.remote.ip(),
+                    epoch,
+                ));
+            }
+            let mut header = syn.header;
+            if !accept_data {
+                header.flags &= !(wire::FIN | wire::PSH | wire::URG);
+                header.urgent_pointer = 0;
+            }
+            filtered_syn = Some(wire::Segment {
+                header,
+                options: syn.options,
+                raw_options: syn.raw_options,
+                payload: if accept_data { syn.payload } else { &[] },
+            });
+        }
+        let syn = filtered_syn.as_ref().or(syn);
         let mut result = match syn {
             Some(syn) => Connection::passive_with_receive(
                 tuple,
@@ -901,6 +969,7 @@ impl Endpoint {
             return Err(Error::NoMemory);
         }
         if let Ok(connection) = &mut result {
+            connection.passive_fast_open(fast_open_response, early);
             let mut domain = *b"ntcp timestamp offset\0\0\0\0";
             let len = domain.len();
             domain[len - 4..].copy_from_slice(&iss.to_be_bytes());
@@ -979,7 +1048,13 @@ impl Endpoint {
             self.output.remove(old.slot);
         }
         self.free.pop();
+        let fast_open_owner = if connection.fast_open_early {
+            listener
+        } else {
+            None
+        };
         self.slots[index] = Some(Slot {
+            fast_open_owner,
             connection,
             listener,
             accepted_ready: false,
@@ -1005,6 +1080,79 @@ impl Endpoint {
         }
         self.refresh(index);
         Ok(id)
+    }
+
+    /// Enable the bounded cookie service. Cookies authenticate addresses, not
+    /// freshness of application operations; listeners must separately opt in.
+    pub fn enable_fast_open(&mut self) -> Result<(), EndpointError> {
+        if self.fast_open.is_none() {
+            self.fast_open = Some(crate::fast_open::FastOpen::new()?);
+        }
+        Ok(())
+    }
+
+    fn fast_open_lifetime(&self) -> u64 {
+        self.config
+            .connection
+            .timebase
+            .ticks_from_us(crate::fast_open::LIFETIME_US)
+    }
+
+    /// Opt this listener into replay-tolerant early delivery; zero disables it.
+    pub fn set_listener_fast_open(
+        &mut self,
+        id: ListenerId,
+        pending_limit: usize,
+    ) -> Result<(), EndpointError> {
+        self.listener(id)?;
+        if pending_limit > self.config.max_connections
+            || pending_limit != 0 && self.fast_open.is_none()
+        {
+            return Err(Error::InvalidArgument.into());
+        }
+        self.listeners[id.slot].as_mut().unwrap().fast_open_limit = pending_limit;
+        Ok(())
+    }
+
+    pub fn has_fast_open_cookie(
+        &self,
+        now: Instant,
+        local: IpAddr,
+        remote: IpAddr,
+    ) -> Result<bool, EndpointError> {
+        self.check_clock(now)?;
+        Ok(self.fast_open.as_ref().is_some_and(|service| {
+            service
+                .get(now, self.fast_open_lifetime(), local, remote)
+                .is_some()
+        }))
+    }
+
+    /// Copy initial data before publishing an active TFO connection. A cache
+    /// miss accepts zero bytes and sends a cookie request, not cookieless data.
+    pub fn connect_fast_open(
+        &mut self,
+        now: Instant,
+        local: SocketAddr,
+        remote: SocketAddr,
+        initial: &[u8],
+    ) -> Result<(ConnectionId, usize), EndpointError> {
+        self.check_clock(now)?;
+        let service = self.fast_open.as_ref().ok_or(Error::InvalidState)?;
+        let cached = service.get(now, self.fast_open_lifetime(), local.ip(), remote.ip());
+        let tuple = Tuple { local, remote };
+        self.admission(tuple)?;
+        self.clock(now)?;
+        let iss = self.isn(tuple);
+        let mut connection = self.new_connection(tuple, iss, None)?;
+        let accepted = match connection.prepare_fast_open(cached, initial) {
+            Ok(count) => count,
+            Err(error) => {
+                self.recycle_connection(connection);
+                return Err(error.into());
+            }
+        };
+        self.insert(connection, None, None).map(|id| (id, accepted))
     }
 
     pub fn connect(
@@ -1305,6 +1453,17 @@ impl Endpoint {
     }
 
     fn refresh(&mut self, index: usize) {
+        if let Some(slot) = self.slots[index].as_mut() {
+            if let Some((cookie, mss)) = slot.connection.fast_open_learned.take()
+                && let Some(service) = self.fast_open.as_mut()
+            {
+                let tuple = slot.connection.tuple();
+                service.learn(self.now, tuple.local.ip(), tuple.remote.ip(), cookie, mss);
+            }
+            if slot.connection.handshake_complete() || slot.connection.state() == State::Closed {
+                slot.fast_open_owner = None;
+            }
+        }
         if self.is_output_reserved(self.id(index)) {
             self.deadlines.set(index, None);
             return;
@@ -1360,8 +1519,9 @@ impl Endpoint {
         };
         let state = slot.connection.state();
         let parent = slot.listener;
-        let newly_established =
-            !slot.accepted_ready && slot.connection.handshake_complete() && state != State::Closed;
+        let newly_established = !slot.accepted_ready
+            && (slot.connection.handshake_complete() || slot.connection.fast_open_early)
+            && state != State::Closed;
         let failed_child = parent.is_some() && state == State::Closed;
         let reset_reserved = slot.connection.reset_pending() || slot.reset_deadline.is_some();
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.5.3

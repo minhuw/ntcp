@@ -161,6 +161,12 @@ impl OutputReservation {
         // one configured packet; cache parsed metadata if repair throughput matters.
         let original =
             wire::parse(r.packet.ip, &self.bytes[..r.packet.len]).map_err(Error::Wire)?;
+        // A SYN is one handshake, not a stream fragment. Splitting TFO data
+        // would repeat SYN at the wrong sequence and release ownership before
+        // the handshake can acknowledge the retained suffix. Keep it indivisible.
+        if original.header.flags & wire::SYN != 0 && r.packet.len > limit {
+            return Err(EndpointError::ReservationMtuTooSmall);
+        }
         let segmentation = r.departure.and_then(|d| d.segmentation);
         let payload = segmentation.map_or(original.payload, |s| &self.payload[..s.payload_len]);
         let mut header = original.header;

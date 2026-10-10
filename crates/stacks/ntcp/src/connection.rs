@@ -535,6 +535,11 @@ pub(crate) struct Connection {
     iss: Seq,
     irs: Option<Seq>,
     passive_open: bool,
+    fast_open: Option<wire::FastOpenCookie>,
+    fast_open_initial: usize,
+    fast_open_retry: Option<(Seq, Seq)>,
+    pub(crate) fast_open_early: bool,
+    pub(crate) fast_open_learned: Option<(wire::FastOpenCookie, u16)>,
     snd_una: Seq,
     snd_nxt: Seq,
     send_base: Seq,
@@ -808,6 +813,11 @@ impl Connection {
             iss: Seq(iss),
             irs: None,
             passive_open: false,
+            fast_open: None,
+            fast_open_initial: 0,
+            fast_open_retry: None,
+            fast_open_early: false,
+            fast_open_learned: None,
             snd_una: Seq(iss),
             snd_nxt: Seq(iss),
             send_base: Seq(iss).wrapping_add(1),
@@ -1176,6 +1186,39 @@ impl Connection {
         self.handshake_complete
     }
 
+    pub(crate) fn prepare_fast_open(
+        &mut self,
+        cached: Option<crate::fast_open::CachedCookie>,
+        initial: &[u8],
+    ) -> Result<usize, Error> {
+        self.fast_open = Some(cached.map_or(wire::FastOpenCookie::request(), |c| c.cookie));
+        let Some(cached) = cached else {
+            return Ok(0);
+        };
+        self.peer_mss = cached.mss;
+        // Reserve the entire option budget, including cookies up to 16 bytes.
+        // A changed path may clip the SYN further; all accepted bytes remain queued.
+        let limit = usize::from(cached.mss.min(self.config.mss))
+            .saturating_sub(40)
+            .min(self.path_payload_limit().saturating_sub(60))
+            .min(self.scratch.len());
+        let count = initial.len().min(limit).min(self.send.remaining());
+        if count == 0 {
+            return Ok(0);
+        }
+        let count = self.write(&initial[..count])?;
+        self.fast_open_initial = count;
+        Ok(count)
+    }
+
+    pub(crate) fn passive_fast_open(&mut self, cookie: Option<wire::FastOpenCookie>, early: bool) {
+        self.fast_open = cookie;
+        self.fast_open_early = early;
+        if early {
+            self.events.readable = self.receive.readable() != 0;
+        }
+    }
+
     pub(crate) fn reset_pending(&self) -> bool {
         self.state == State::Closed && self.pending_rst.is_some()
     }
@@ -1269,7 +1312,7 @@ impl Connection {
     }
 
     fn notsent_bytes(&self) -> usize {
-        let sent = if self.handshake_pending() || !at_or_after(self.snd_nxt, self.send_base) {
+        let sent = if !at_or_after(self.snd_nxt, self.send_base) {
             0
         } else {
             (self.snd_nxt.distance_from(self.send_base) as usize).min(self.send.len())
@@ -1845,7 +1888,7 @@ impl Connection {
     //# how much urgent data remains to be read from the connection, or at least to
     //# determine whether more urgent data remains to be read [19].
     pub(crate) fn urgent_remaining(&self) -> u64 {
-        if self.handshake_pending()
+        if self.handshake_pending() && !self.fast_open_early
             || self.state == State::Closed && self.reason != Some(CloseReason::Normal)
         {
             return 0;
@@ -1855,7 +1898,7 @@ impl Connection {
 
     pub(crate) fn readable_bytes(&self) -> usize {
         if self.read_closed
-            || self.handshake_pending()
+            || self.handshake_pending() && !self.fast_open_early
             || self.state == State::Closed
                 && (self.reason != Some(CloseReason::Normal) || !self.receive.eof())
         {
@@ -2153,7 +2196,7 @@ impl Connection {
             && count != 0
             && let Some(selection) = self.reserved_ledger
         {
-            let start = Seq(d.start).wrapping_add(offset as u32);
+            let start = Seq(d.start).wrapping_add(u32::from(d.syn) + offset as u32);
             if !self.rack.validate_departure(
                 selection,
                 start,
@@ -2227,7 +2270,7 @@ impl Connection {
             && count != 0
             && let Some(selection) = self.reserved_ledger
         {
-            let start = Seq(d.start).wrapping_add(offset as u32);
+            let start = Seq(d.start).wrapping_add(u32::from(d.syn) + offset as u32);
             let committed =
                 self.rack
                     .commit_departure(selection, start, start.wrapping_add(count as u32), now);
@@ -2239,7 +2282,7 @@ impl Connection {
         {
             // An aggregate is not a physical packet or PMTU observation. Record
             // only the actual accepted segment, including any reduced-MTU split.
-            let start = Seq(d.start).wrapping_add(offset as u32);
+            let start = Seq(d.start).wrapping_add(u32::from(d.syn) + offset as u32);
             p.sent(
                 start,
                 start.wrapping_add(count as u32),
@@ -3041,6 +3084,9 @@ impl Connection {
     }
 
     fn establish(&mut self) {
+        if self.fast_open_initial != 0 && after(self.snd_nxt, self.snd_una) {
+            self.fast_open_retry = Some((self.snd_una, self.snd_nxt));
+        }
         self.handshake_complete = true;
         self.last_data_received = self.now;
         if self.state == State::SynSent || self.state == State::SynReceived {
@@ -3104,6 +3150,7 @@ impl Connection {
         self.ecn_pause = None;
         self.ecn_backoff = None;
         self.ecn_sent_setup = false;
+        self.fast_open_retry = None;
         self.reason = Some(reason);
         self.events.closed = Some(reason);
         if reason != CloseReason::Aborted {
@@ -3511,7 +3558,7 @@ impl Connection {
         {
             return Err(Error::InvalidState);
         }
-        let sent = if self.handshake_pending() {
+        let sent = if !at_or_after(self.snd_nxt, self.send_base) {
             0
         } else {
             (self.snd_nxt.distance_from(self.send_base) as usize).min(self.send.len())
@@ -3614,7 +3661,7 @@ impl Connection {
         if out.is_empty() {
             return Err(Error::InvalidArgument);
         }
-        if self.handshake_pending() {
+        if self.handshake_pending() && !self.fast_open_early {
             return Err(Error::WouldBlock);
         }
         let count = self.receive.peek(out);
@@ -3639,7 +3686,7 @@ impl Connection {
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
         //# If there are other controls or text in the segment, queue them for
         //# processing after the ESTABLISHED state has been reached, return.
-        if self.handshake_pending() {
+        if self.handshake_pending() && !self.fast_open_early {
             return Err(Error::WouldBlock);
         }
         let count = self.receive.read(out);
@@ -3735,7 +3782,10 @@ impl Connection {
             )
             .then_some((
                 self.snd_nxt,
-                self.config.abort_with_ack && self.handshake_complete && self.synchronized(),
+                // An early-accepted peer can still be SYN-SENT: its reset
+                // validation requires an ACK covering the original SYN.
+                self.fast_open_early && self.handshake_pending()
+                    || self.config.abort_with_ack && self.handshake_complete && self.synchronized(),
             ));
             // This replaces any reactive reset; its TSval=0 echo override
             // must not escape on the newly scheduled local-abort reset.
@@ -4001,6 +4051,13 @@ impl Connection {
                     segment.options.timestamps.map(|ts| ts.1),
                     self.snd_wnd,
                 );
+                if self.fast_open.is_some() {
+                    self.fast_open_learned = segment
+                        .options
+                        .fast_open
+                        .filter(|cookie| !cookie.as_bytes().is_empty())
+                        .map(|cookie| (cookie, self.peer_mss));
+                }
                 self.establish();
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
                 //# Data or controls that were queued for transmission MAY be included.
@@ -4159,7 +4216,8 @@ impl Connection {
             && !self.passive_open
             && self.irs == Some(seq)
             && h.flags & (SYN | ACK | RST | FIN) == (SYN | ACK)
-            && ack == self.iss.wrapping_add(1)
+            && (ack == self.iss.wrapping_add(1)
+                || self.fast_open_initial != 0 && after(ack, self.iss))
             && at_or_after(self.snd_nxt, ack)
         {
             self.accepted_metadata = true;
@@ -5300,7 +5358,7 @@ impl Connection {
         // original qualifies. A scalar RTTM pending across a SACK must not
         // count that same transmission again on its later cumulative ACK.
         let startup_scalar_allowed = !self.rack.valid();
-        if !self.sack_receive {
+        if !self.sack_receive || self.handshake_pending() {
             self.rack.acknowledge(
                 ack,
                 self.data_high(),
@@ -5361,6 +5419,13 @@ impl Connection {
             }
         }
         self.snd_una = ack;
+        if let Some((start, end)) = self.fast_open_retry {
+            self.fast_open_retry = if at_or_after(ack, end) {
+                None
+            } else {
+                Some((if after(ack, start) { ack } else { start }, end))
+            };
+        }
         if self.sack_guard.is_some_and(|end| at_or_after(ack, end)) {
             self.sack_guard = None;
             self.sack_post_rto = None;
@@ -6490,6 +6555,26 @@ impl Connection {
             options[option_len..option_len + 4].copy_from_slice(&[1, 3, 3, self.local_scale]);
             option_len += 4;
         }
+        let fast_open_option = if syn && self.snd_nxt == self.iss && !self.syn_timed_out {
+            self.fast_open.filter(|cookie| {
+                let padded = (option_len + cookie.as_bytes().len() + 2 + 3) & !3;
+                padded <= 40 && 20 + padded <= self.path_payload_limit()
+            })
+        } else {
+            None
+        };
+        if let Some(cookie) = fast_open_option {
+            let bytes = cookie.as_bytes();
+            let length = bytes.len() + 2;
+            options[option_len] = 34;
+            options[option_len + 1] = length as u8;
+            options[option_len + 2..option_len + length].copy_from_slice(bytes);
+            option_len += length;
+            while option_len % 4 != 0 {
+                options[option_len] = 1;
+                option_len += 1;
+            }
+        }
         let mut sack_option_len = 0;
         let mut sack_first = None;
         let mut sack_limited = false;
@@ -6720,6 +6805,14 @@ impl Connection {
             seq = self.iss;
             flags = SYN | if self.irs.is_some() { ACK } else { 0 };
             retransmitted = self.snd_nxt != self.iss;
+            if self.state == State::SynSent && !retransmitted && fast_open_option.is_some() {
+                let limit = self
+                    .fast_open_initial
+                    .min(packet_mss)
+                    .min(timestamp_credit.saturating_sub(1) as usize)
+                    .min(usize::from(self.peer_mss).saturating_sub(option_len));
+                count = self.send.copy(0, &mut self.scratch[..limit]);
+            }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
         //# Probing of zero (offered) windows MUST be supported (MUST-36).
         } else if challenge {
@@ -6782,6 +6875,18 @@ impl Connection {
                     flags |= FIN;
                 }
             }
+        } else if data_live && self.fast_open_retry.is_some() && !retransmit && !probe {
+            let (start, end) = self.fast_open_retry.unwrap();
+            seq = start;
+            let limit = end.distance_from(start) as usize;
+            let window =
+                self.snd_wnd
+                    .saturating_sub(start.distance_from(self.snd_una)) as usize;
+            count = self.send.copy(
+                start.distance_from(self.send_base) as usize,
+                &mut self.scratch[..limit.min(packet_mss).min(window)],
+            );
+            retransmitted = count != 0;
         } else if retransmit || probe {
             seq = self.snd_una;
             let offset = seq.distance_from(self.send_base) as usize;
@@ -7219,7 +7324,9 @@ impl Connection {
                     .send
                     .pushed(offset, self.send.len().saturating_sub(offset));
         }
-        let offset = seq.distance_from(self.send_base) as usize;
+        let offset = seq
+            .wrapping_add(u32::from(syn))
+            .distance_from(self.send_base) as usize;
         let application_push = count != 0 && !keepalive && self.send.pushed(offset, count);
         let batch_limit = self.config.output_push_batch_segments;
         let output_push_batch = (batch_limit >= 2
@@ -7567,7 +7674,7 @@ impl Connection {
             selected_at: now,
             start: seq.0,
             payload: count,
-            stream: count != 0 && !syn && !keepalive,
+            stream: count != 0 && !keepalive,
             syn,
             fin: flags & FIN != 0,
             rto: !keepalive
@@ -7613,8 +7720,9 @@ impl Connection {
             }
         }
         self.resolve_probe_response();
-        self.last_output_range = if count != 0 && !syn && !keepalive {
-            let start = self.acknowledged + u64::from(seq.distance_from(self.send_base));
+        self.last_output_range = if count != 0 && !keepalive {
+            let data_seq = seq.wrapping_add(u32::from(syn));
+            let start = self.acknowledged + u64::from(data_seq.distance_from(self.send_base));
             let range = TxStreamRange {
                 start,
                 end: start + count as u64,
@@ -7719,7 +7827,8 @@ impl Connection {
             }
             self.sack_omit = false;
         }
-        if count != 0 && !syn && !keepalive {
+        if count != 0 && !keepalive {
+            let seq = seq.wrapping_add(u32::from(syn));
             // Strict recovery exits before persist; legacy probes retain their
             // separate policy. Record every real emission in the age ledger.
             if !probe && let Some(prr) = &mut self.prr {
@@ -7899,6 +8008,19 @@ impl Connection {
             } else {
                 State::FinWait1
             };
+        }
+        if !syn
+            && count != 0
+            && let Some((start, end)) = self.fast_open_retry
+        {
+            if seq == start {
+                let next = seq.wrapping_add(count as u32);
+                self.fast_open_retry = if at_or_after(next, end) {
+                    None
+                } else {
+                    Some((next, end))
+                };
+            }
         }
         if retransmit && length != 0 {
             self.retx_pending = false;
@@ -8084,6 +8206,7 @@ impl Connection {
             && self.timestamp_bytes >= self.config.timestamp_bytes_per_tick
             && (self.syn_pending
                 || self.retx_pending
+                || self.fast_open_retry.is_some()
                 || self.probe_pending
                 || self.keepalive_pending
                 || self.synchronized()
@@ -9441,6 +9564,10 @@ mod tests {
         assert!(a.take_events().connected);
         assert!(b.take_events().connected);
         (a, b)
+    }
+
+    mod fast_open_tests {
+        include!("fast_open_connection_tests.rs");
     }
 
     mod ecn_prr {

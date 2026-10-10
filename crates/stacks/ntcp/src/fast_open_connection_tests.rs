@@ -1,0 +1,189 @@
+use super::*;
+
+fn client(iss: u32, size: usize) -> Connection {
+    let mut cfg = config(8192, 536);
+    cfg.timestamps = true;
+    cfg.sack = true;
+    let mut a = Connection::active(tuple(), cfg, iss, 0).unwrap();
+    let mut cache = crate::fast_open::FastOpen::new().unwrap();
+    cache.learn(
+        0,
+        tuple().local.ip(),
+        tuple().remote.ip(),
+        wire::FastOpenCookie::new(&[7; 8]).unwrap(),
+        536,
+    );
+    let cached = cache.get(0, 100, tuple().local.ip(), tuple().remote.ip());
+    assert_eq!(a.prepare_fast_open(cached, &vec![42; size]).unwrap(), size);
+    a
+}
+
+fn synack(a: &mut Connection, acked: u32, now: u64) {
+    let mut options = wire::Options::default();
+    options.mss = Some(536);
+    options.sack_permitted = true;
+    options.timestamps = Some((0, a.timestamp_value(0)));
+    options.fast_open = Some(wire::FastOpenCookie::new(&[8; 8]).unwrap());
+    let segment = wire::Segment {
+        header: wire::Header {
+            source_port: tuple().remote.port(),
+            destination_port: tuple().local.port(),
+            sequence: 999,
+            acknowledgment: a.iss.wrapping_add(1 + acked).0,
+            flags: SYN | ACK,
+            window: 8192,
+            urgent_pointer: 0,
+        },
+        options,
+        raw_options: &[],
+        payload: &[],
+    };
+    a.input(now, &segment).unwrap();
+}
+
+#[test]
+fn syn_data_ack_bounds_wrap_partial_retry_and_flush() {
+    for iss in [100, u32::MAX - 4] {
+        for acked in [0, 3, 12] {
+            let mut a = client(iss, 12);
+            assert_eq!(a.transmit(0, &mut [0; 19]), Err(Error::OutputTooSmall));
+            assert_eq!(a.snd_nxt, a.iss);
+            let bytes = packet(&mut a, 0);
+            let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(syn.header.sequence, iss);
+            assert_eq!(syn.payload, &[42; 12]);
+            assert_eq!(a.flight(), 13);
+            assert_eq!(a.data_flight(), 12);
+            assert_eq!(
+                a.last_output_range,
+                Some(TxStreamRange { start: 0, end: 12 })
+            );
+            assert_eq!(a.flush().unwrap(), 0); // On-wire bytes cannot be discarded.
+            synack(&mut a, acked, 1000);
+            assert_eq!(a.state(), State::Established);
+            assert_eq!(a.acknowledged, acked as u64);
+            assert_eq!(a.send.len(), 12 - acked as usize);
+            assert_eq!(a.data_flight(), 12 - acked);
+            let bytes = packet(&mut a, 1000);
+            let repair = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(repair.header.flags & SYN, 0);
+            assert_eq!(repair.payload.len(), 12 - acked as usize);
+            if acked != 12 {
+                assert_eq!(repair.header.sequence, iss.wrapping_add(1 + acked));
+                assert_eq!(
+                    a.last_output_range,
+                    Some(TxStreamRange {
+                        start: acked as u64,
+                        end: 12
+                    })
+                );
+                assert!(a.sample.is_none());
+            }
+        }
+        let mut a = client(iss, 12);
+        packet(&mut a, 0);
+        synack(&mut a, 13, 1000);
+        assert_eq!(a.state(), State::SynSent);
+        assert_eq!(a.acknowledged, 0);
+        assert!(a.fast_open_learned.is_none());
+        assert_eq!(a.send.len(), 12);
+    }
+}
+
+#[test]
+fn timeout_bare_syn_retains_data_and_karn() {
+    let mut a = client(u32::MAX - 2, 12);
+    packet(&mut a, 0);
+    let timeout = a.next_deadline().unwrap();
+    a.timeout(timeout).unwrap();
+    let bytes = packet(&mut a, timeout);
+    let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+    assert_eq!(syn.header.flags & SYN, SYN);
+    assert!(syn.payload.is_empty());
+    assert!(syn.options.fast_open.is_none());
+    assert_eq!(a.send.len(), 12);
+    assert!(a.sample.is_none());
+    synack(&mut a, 0, timeout + 1000);
+    let bytes = packet(&mut a, timeout + 1000);
+    let repair = wire::parse(ip(tuple()), &bytes).unwrap();
+    assert_eq!(repair.payload, &[42; 12]);
+    assert_eq!(repair.header.sequence, a.iss.wrapping_add(1).0);
+}
+
+#[test]
+fn reserved_syn_exact_range_and_acceptance_rtt() {
+    let mut a = client(100, 12);
+    let mut bytes = [0; 2048];
+    a.transmit_selected(0, &mut bytes, true).unwrap().unwrap();
+    let mut departure = a.last_departure.unwrap();
+    assert!(departure.syn && departure.stream);
+    assert_eq!(departure.start, 100);
+    a.accept_reserved_output(10_000, &mut departure, 0, 12, true)
+        .unwrap();
+    assert_eq!(a.rack.head_transmission(Seq(101)).unwrap().0, Seq(113));
+    synack(&mut a, 12, 30_000);
+    assert_eq!(a.rtt.srtt(), Some(20_000));
+    assert_eq!(a.acknowledged, 12);
+}
+
+#[test]
+fn option_lengths_small_path_and_timestamp_credit() {
+    for len in [4, 6, 8, 10, 12, 14, 16] {
+        let mut a = client(100, 0);
+        let mut cache = crate::fast_open::FastOpen::new().unwrap();
+        cache.learn(
+            0,
+            tuple().local.ip(),
+            tuple().remote.ip(),
+            wire::FastOpenCookie::new(&[1; 16][..len]).unwrap(),
+            536,
+        );
+        a.prepare_fast_open(
+            cache.get(0, 100, tuple().local.ip(), tuple().remote.ip()),
+            &[1; 496],
+        )
+        .unwrap();
+        let bytes = packet(&mut a, 0);
+        let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(syn.options.fast_open.unwrap().as_bytes().len(), len);
+        assert!(syn.options.sack_permitted);
+        assert!(syn.raw_options.len() + syn.payload.len() <= 536);
+    }
+    let mut a = client(100, 12);
+    a.config.timestamp_bytes_per_tick = 1;
+    let bytes = packet(&mut a, 0);
+    assert!(wire::parse(ip(tuple()), &bytes).unwrap().payload.is_empty());
+    assert_eq!(a.send.len(), 12);
+    assert_eq!(a.snd_nxt, Seq(101));
+    let mut a = client(100, 12);
+    a.config.send_ip_payload_limit = 44;
+    let bytes = packet(&mut a, 0);
+    let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+    assert!(syn.payload.is_empty());
+    assert!(syn.options.fast_open.is_none()); // Never emit cookieless early data.
+    assert!(bytes.len() <= 44);
+    assert_eq!(a.send.len(), 12);
+}
+
+#[test]
+fn simultaneous_open_acknowledges_syn_data_without_early_passive_delivery() {
+    let mut a = client(u32::MAX - 4, 12);
+    let mut b = Connection::active(reverse(tuple()), a.config.clone(), 900, 0).unwrap();
+    let a_syn = packet(&mut a, 0);
+    let b_syn = packet(&mut b, 0);
+    a.input(10, &wire::parse(ip(b.tuple()), &b_syn).unwrap())
+        .unwrap();
+    b.input(10, &wire::parse(ip(a.tuple()), &a_syn).unwrap())
+        .unwrap();
+    assert_eq!(b.read(&mut [0; 32]), Err(Error::WouldBlock));
+    let a_synack = packet(&mut a, 20);
+    let b_synack = packet(&mut b, 20);
+    a.input(30, &wire::parse(ip(b.tuple()), &b_synack).unwrap())
+        .unwrap();
+    b.input(30, &wire::parse(ip(a.tuple()), &a_synack).unwrap())
+        .unwrap();
+    assert_eq!(a.state, State::Established);
+    assert_eq!(b.state, State::Established);
+    assert_eq!(a.acknowledged, 12);
+    assert_eq!(b.read(&mut [0; 32]).unwrap(), 12);
+}
