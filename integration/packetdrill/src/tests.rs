@@ -10,11 +10,26 @@ const BYTES: usize = 65535;
 const TCP_INFO_SIZE: usize = 280;
 struct Adapter;
 impl Adapter {
-    fn start(_: (Ipv4Addr, ntcp_socket::packet_test::Profile)) -> Result<Self, i32> {
+    fn start((local, profile): (Ipv4Addr, ntcp_socket::packet_test::Profile)) -> Result<Self, i32> {
+        let profile = match profile {
+            Profile::Baseline => "baseline",
+            Profile::Pipeline => "pipeline",
+            Profile::PipelinePaced => "pipeline-paced",
+            Profile::PipelineGso => "pipeline-gso",
+            Profile::PipelinePacedGso => "pipeline-paced-gso",
+            Profile::UpstreamWindow8 => "upstream-window8",
+            Profile::Sack => "sack",
+            Profile::UpstreamSack => "upstream-sack",
+            Profile::UpstreamCubic => "upstream-cubic",
+            Profile::UpstreamCubicEcn => "upstream-cubic-ecn",
+            Profile::UpstreamEcn => "upstream-ecn",
+            Profile::UpstreamBasic => "upstream-basic",
+        };
+        let flags = std::ffi::CString::new(format!("{profile},local={local}")).unwrap();
         let mut table = [0usize; 64];
         unsafe {
             packetdrill_interface_init(
-                c"baseline,local=192.0.2.1".as_ptr(),
+                flags.as_ptr(),
                 table.as_mut_ptr().cast(),
             );
         }
@@ -572,12 +587,24 @@ fn isolated(name: &str) -> bool {
     if std::env::var_os("NTCP_PACKET_ABI_CHILD").is_some() {
         return false;
     }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--test-threads=1"])
         .env("NTCP_PACKET_ABI_CHILD", "1")
-        .status()
+        .spawn()
         .unwrap();
-    assert!(status.success());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("isolated ABI test timed out: {name}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
     true
 }
 fn set_buffer(fd: i32, name: i32, value: i32) {
@@ -1112,4 +1139,193 @@ fn detached_fin_keeps_ip_policy_after_real_descriptor_reuse() {
     assert_eq!(bytes[6] & 0x40, 0);
     call(&adapter, 8, fd, 0, vec![], 0).unwrap();
     call(&adapter, 8, listener, 0, vec![], 0).unwrap();
+}
+
+
+// These are live raw-IP/ABI liveness checks, not precise pacing-rate tests.
+// Owner.test_now tests cover burst/deadline accounting without scheduler jitter.
+fn pipeline_wire_segments(profile: Profile, bounded: bool) {
+    let adapter = if bounded {
+        // The C initializer has no queue-size option. Exercise the public Rust
+        // constructor, then use the same plugin callbacks and teardown as C.
+        ntcp_socket::packet_test::start_with_options(
+            (local(), profile),
+            ntcp_socket::packet_test::Options {
+                queue_capacity: 1,
+                egress_capacity: 1,
+            },
+        )
+        .unwrap();
+        ACTIVE.store(true, Ordering::Release);
+        Adapter
+    } else {
+        Adapter::start((local(), profile)).unwrap()
+    };
+    let (_, fd, _, ack) = connect_listener(&adapter, 8080, false, None);
+    // No MSS option in this peer's SYN: RFC default IPv4 sender MSS is 536.
+    // Three full segments fit the baseline initial window; no ACK is injected
+    // to rescue a stalled egress/pacing timer or a software-GSO remainder.
+    let payload: Vec<u8> = (0..3 * 536).map(|i| (i % 251) as u8).collect();
+    let started = Instant::now();
+    unsafe {
+        assert_eq!(
+            ntcp_socket::send(fd, payload.as_ptr().cast(), payload.len(), MSG_NOSIGNAL),
+            payload.len() as isize
+        );
+    }
+    let deadline = started + Duration::from_secs(3);
+    loop {
+        match ntcp_socket::packet_test::try_capture(0) {
+            Err(EMSGSIZE) => break, // Peek failure must retain the first segment.
+            Err(EAGAIN) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+            other => panic!("output did not become capturable: {other:?}"),
+        }
+    }
+    // Also check the C ABI's non-consuming short-buffer path.
+    let mut byte = 0u8;
+    let mut n = 0;
+    let mut stamp = 0;
+    unsafe {
+        assert_eq!(
+            ntcp_net_receive(USERDATA, (&mut byte as *mut u8).cast(), &mut n, &mut stamp),
+            -1
+        );
+    }
+    assert_eq!(errno(), EMSGSIZE);
+    let (sent, received) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        loop {
+            let mut bytes = vec![0; BYTES];
+            let mut n = bytes.len();
+            let mut stamp = 0;
+            let result = unsafe {
+                ntcp_net_receive(USERDATA, bytes.as_mut_ptr().cast(), &mut n, &mut stamp)
+            };
+            let capture = if result == 0 {
+                bytes.truncate(n);
+                Ok((bytes, stamp, Instant::now()))
+            } else {
+                Err(errno())
+            };
+            let done = capture.is_err();
+            if sent.send(capture).is_err() || done {
+                break;
+            }
+        }
+    });
+    let mut previous = started;
+    for i in 0..3 {
+        let (bytes, stamp, observed) = received
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert!(observed >= previous);
+        previous = observed;
+        assert!(stamp > 0); // Epoch submission timestamp, NOT the pacing clock.
+        assert_eq!(
+            bytes.len(),
+            20 + 20 + 536,
+            "capture must not expose a GSO super-packet"
+        );
+        let (ip, tcp) = parse_frame(&bytes).unwrap();
+        assert_eq!(ip.source, IpAddr::V4(local()));
+        let segment = ntcp::wire::parse(ip, tcp).unwrap();
+        assert_eq!(
+            segment.header.sequence,
+            ack.acknowledgment.wrapping_add((i * 536) as u32)
+        );
+        assert_eq!(segment.header.acknowledgment, ack.sequence);
+        assert_eq!(
+            segment.header.flags
+                & (ntcp::wire::ACK | ntcp::wire::SYN | ntcp::wire::FIN | ntcp::wire::RST),
+            ntcp::wire::ACK
+        );
+        assert_eq!(segment.payload, &payload[i * 536..(i + 1) * 536]);
+    }
+    // Only a liveness bound, no Linux fq timing/tolerance assertion. In paced
+    // profiles this observes real monotonic delivery with no fake clock advance.
+    assert!(previous.duration_since(started) < Duration::from_secs(3));
+    assert!(received.recv_timeout(Duration::from_millis(10)).is_err());
+    drop(adapter); // Cancels the next blocking netdev receive, even with bounded queues.
+    let error = received
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, ECANCELED | EIO));
+    reader.join().unwrap();
+}
+
+#[test]
+fn pipeline_scalar_wire_segments() {
+    if isolated("tests::pipeline_scalar_wire_segments") {
+        return;
+    }
+    pipeline_wire_segments(Profile::Pipeline, false);
+}
+
+#[test]
+fn pipeline_gso_wire_segments() {
+    if isolated("tests::pipeline_gso_wire_segments") {
+        return;
+    }
+    pipeline_wire_segments(Profile::PipelineGso, false);
+}
+
+#[test]
+fn pipeline_paced_wire_segments() {
+    if isolated("tests::pipeline_paced_wire_segments") {
+        return;
+    }
+    pipeline_wire_segments(Profile::PipelinePaced, false);
+}
+
+#[test]
+fn pipeline_paced_gso_wire_segments() {
+    if isolated("tests::pipeline_paced_gso_wire_segments") {
+        return;
+    }
+    pipeline_wire_segments(Profile::PipelinePacedGso, false);
+}
+
+#[test]
+fn pipeline_gso_capacity_one_wire_segments_and_cancel() {
+    if isolated("tests::pipeline_gso_capacity_one_wire_segments_and_cancel") {
+        return;
+    }
+    pipeline_wire_segments(Profile::PipelineGso, true);
+}
+
+#[test]
+fn adapter_start_forwards_local_address_and_profile() {
+    if isolated("tests::adapter_start_forwards_local_address_and_profile") {
+        return;
+    }
+    let address = Ipv4Addr::new(192, 0, 2, 9);
+    let adapter = Adapter::start((address, Profile::Sack)).unwrap();
+    let fd = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+        .unwrap()
+        .value as i32;
+    assert_eq!(
+        call(
+            &adapter,
+            5,
+            fd,
+            0,
+            encode_addr("192.0.2.2:8080".parse().unwrap()),
+            0
+        )
+        .err(),
+        Some(EINPROGRESS)
+    );
+    let packet = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+    let (ip, tcp) = parse_frame(&packet).unwrap();
+    assert_eq!(ip.source, IpAddr::V4(address));
+    assert_ne!(packet_header(&packet).flags & ntcp::wire::SYN, 0);
+    let header_len = (tcp[12] >> 4) as usize * 4;
+    assert!(
+        tcp[20..header_len]
+            .windows(2)
+            .any(|option| option == [4, 2]),
+        "Sack profile must advertise SACK-permitted, unlike Baseline"
+    );
 }

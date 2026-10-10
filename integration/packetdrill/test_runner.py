@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from run import (FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
                  fixture_command, HERE, PIN, adapt_source, check_plugin_hash, invoke, main, outcome,
-                 preflight, select_cases, variants, verify_backend)
+                 preflight, profile_metadata, select_cases, variants, verify_backend)
 
 
 def mock_backend(test):
@@ -863,8 +863,7 @@ class AdaptationChecks(unittest.TestCase):
             self.assertEqual(row['effective_flags']['transport_clock'],
                              'monotonic Instant elapsed microseconds')
             self.assertEqual(row['effective_flags']['transmit_batch_clock'],
-                             'one monotonic sample per owner output batch' if cubic
-                             else 'monotonic sample per transmit')
+                             'monotonic sample per selection/accept')
             self.assertEqual(row['behavior_executed'], row['variant'] == 'ipv4')
             self.assertEqual(row['adapted'], row['variant'] == 'ipv4')
             if row['behavior_executed']:
@@ -1274,7 +1273,7 @@ class PublishedSelectionChecks(unittest.TestCase):
                                      else self.manifest['scripts'][row['script']]['adapter_flags'].split(',')[0])
                     self.assertTrue(flags['prr_pacing'])
                     self.assertEqual(flags['transport_clock'], 'monotonic Instant elapsed microseconds')
-                    self.assertEqual(flags['transmit_batch_clock'], 'monotonic sample per transmit')
+                    self.assertEqual(flags['transmit_batch_clock'], 'monotonic sample per selection/accept')
                     if row['status'] == 'unsupported':
                         self.assertFalse(row['behavior_executed'])
                         self.assertIsNone(row['syntax_returncode'])
@@ -1339,6 +1338,30 @@ class PublishedSelectionChecks(unittest.TestCase):
                     self.assertTrue(row['behavior_executed'])
                     self.assertEqual(row['effective_flags']['preload'], str(plugin))
                     self.assertEqual(row['status'], 'failed')
+
+
+class PipelineProfileTests(unittest.TestCase):
+    def test_explicit_profiles_describe_configuration_not_offloaded_captures(self):
+        for profile in ('pipeline', 'pipeline-paced', 'pipeline-gso', 'pipeline-paced-gso',
+                        'baseline', 'upstream-cubic', 'upstream-cubic-ecn'):
+            with self.subTest(profile=profile):
+                flags = profile_metadata(f'local=192.0.2.1,{profile}')
+                self.assertEqual(flags['profile'], profile)
+                self.assertEqual(flags['general_pacing'], 'paced' in profile)
+                self.assertEqual(flags['software_gso'], 'gso' in profile)
+                self.assertEqual(flags['prr_pacing'], not profile.startswith('upstream-cubic'))
+                self.assertEqual(flags['egress_pipeline'], 'shared production scheduler')
+                self.assertEqual(flags['transmit_batch_clock'], 'monotonic sample per selection/accept')
+                self.assertEqual(flags['capture_boundary'], 'individual raw IPv4 TCP wire segments')
+                self.assertEqual(flags['capture_clock'], 'realtime epoch microseconds at backend submission')
+                self.assertFalse(flags['hardware_tso'])
+                self.assertFalse(flags['gro'])
+
+    def test_unknown_or_conflicting_profiles_do_not_claim_pipeline_policy(self):
+        for flags in ('local=192.0.2.1', 'unknown,local=192.0.2.1',
+                      'baseline,pipeline-gso,local=192.0.2.1'):
+            metadata = profile_metadata(flags)
+            self.assertTrue(all(value is None for key, value in metadata.items() if key != 'profile'))
 
 
 if __name__ == '__main__':

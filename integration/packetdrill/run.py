@@ -320,6 +320,29 @@ def select_cases(scripts, directory, suite, selected_variants=None, selected_scr
     return selected, excluded
 
 
+def profile_metadata(so_flags):
+    profiles = [flag for flag in so_flags.split(',') if not flag.startswith('local=')]
+    profile = profiles[0] if len(profiles) == 1 else None
+    known = profile in {
+        'baseline', 'sack', 'upstream-window8', 'upstream-sack', 'upstream-ecn',
+        'upstream-basic', 'upstream-cubic', 'upstream-cubic-ecn',
+        'pipeline', 'pipeline-paced', 'pipeline-gso', 'pipeline-paced-gso'}
+    # Configuration/capture boundary only: not measured timing or Linux fq/TSO equivalence.
+    return {
+        'profile': profile,
+        'transport_clock': 'monotonic Instant elapsed microseconds' if known else None,
+        'prr_pacing': profile not in {'upstream-cubic', 'upstream-cubic-ecn'} if known else None,
+        'transmit_batch_clock': 'monotonic sample per selection/accept' if known else None,
+        'egress_pipeline': 'shared production scheduler' if known else None,
+        'general_pacing': profile in {'pipeline-paced', 'pipeline-paced-gso'} if known else None,
+        'software_gso': profile in {'pipeline-gso', 'pipeline-paced-gso'} if known else None,
+        'capture_boundary': 'individual raw IPv4 TCP wire segments' if known else None,
+        'capture_clock': 'realtime epoch microseconds at backend submission' if known else None,
+        'hardware_tso': False if known else None,
+        'gro': False if known else None,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkout', required=True, type=Path)
@@ -417,18 +440,7 @@ def main():
             if manifest is not None and so_flags is None:
                 so_flags = manifest['scripts'][row['script']]['adapter_flags']
             row['effective_flags']['adapter'] = so_flags
-            profiles = [flag for flag in so_flags.split(',') if not flag.startswith('local=')]
-            profile = profiles[0] if len(profiles) == 1 else None
-            row['effective_flags']['profile'] = profile
-            # ntcp-socket packet-test owner policy, not measured timing or a pass claim.
-            row['effective_flags']['transport_clock'] = 'monotonic Instant elapsed microseconds'
-            row['effective_flags']['prr_pacing'] = (
-                profile not in {'upstream-cubic', 'upstream-cubic-ecn'} if profile in {
-                    'baseline', 'sack', 'upstream-window8', 'upstream-sack',
-                    'upstream-ecn', 'upstream-basic', 'upstream-cubic', 'upstream-cubic-ecn'} else None)
-            row['effective_flags']['transmit_batch_clock'] = (
-                'one monotonic sample per owner output batch' if profile in {'upstream-cubic', 'upstream-cubic-ecn'}
-                else 'monotonic sample per transmit')
+            row['effective_flags'].update(profile_metadata(so_flags))
             execution_script = script
             if manifest is not None:
                 try:
