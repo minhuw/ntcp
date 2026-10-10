@@ -656,6 +656,9 @@ pub(crate) struct Connection {
     last_output_ecn: u8,
     pub(crate) accepted_metadata: bool,
     sample: Option<(Seq, Instant)>,
+    // Reserved control RTT uses physical departure; sample's time still names
+    // the immutable wire TSval for ordinary RTTM echo validation.
+    sample_departure: Option<Instant>,
     rtt_sample_after: Option<Instant>,
     syn_timed_out: bool,
     consecutive_timeouts: u32,
@@ -904,6 +907,7 @@ impl Connection {
             last_output_ecn: 0,
             accepted_metadata: false,
             sample: None,
+            sample_departure: None,
             rtt_sample_after: None,
             syn_timed_out: false,
             consecutive_timeouts: 0,
@@ -2244,11 +2248,18 @@ impl Connection {
             );
         }
         self.update_time(now)?;
-        // The encoded TSval names selection, not departure. A scalar covering
-        // this output is unsuitable even when it shares a tick with other output.
+        // Payload has accepted-departure evidence in RACK. Control-only
+        // originals do not: retain their existing Karn-eligible sample, but
+        // measure from acceptance, never from the encoded TSval's selection.
+        // A retransmission already invalidated sample during selection; an
+        // earlier flight's sample must not acquire this output's departure.
         let end = Seq(d.start).wrapping_add(d.payload as u32 + u32::from(d.syn) + u32::from(d.fin));
-        if self.sample.is_some_and(|(edge, _)| edge == end) {
-            self.sample = None;
+        if (d.payload != 0 || d.syn || d.fin) && self.sample.is_some_and(|(edge, _)| edge == end) {
+            if d.payload != 0 {
+                self.sample = None;
+            } else if d.syn || (d.fin && finished) {
+                self.sample_departure = Some(now);
+            }
         }
         let sequence = count != 0 || d.syn || (d.fin && finished);
         if d.stream && count != 0 {
@@ -5389,7 +5400,9 @@ impl Connection {
             //# to update the RTT estimator, an implementation SHOULD try to adhere
             //# to the spirit of the history specified in [RFC6298].
             if !self.timestamps || echo == Some(self.timestamp_value(sent)) {
-                let sample = self.now.saturating_sub(sent);
+                let sample = self
+                    .now
+                    .saturating_sub(self.sample_departure.unwrap_or(sent));
                 startup_rtt = Some(sample);
                 let updated = self.update_rtt(sample);
                 self.rack.sample(sample, self.now);
@@ -7851,6 +7864,7 @@ impl Connection {
                 self.sample = None;
             } else if self.sample.is_none() {
                 self.sample = Some((end, now));
+                self.sample_departure = None;
             }
             if after(end, self.snd_nxt) {
                 self.snd_nxt = end;
@@ -28003,6 +28017,9 @@ mod tests {
         }
     }
 
+    mod reservation_rtt {
+        include!("connection_reservation_rtt_tests.rs");
+    }
     mod output_reservation_policy {
         include!("connection_reservation_tests.rs");
     }

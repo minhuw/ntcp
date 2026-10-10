@@ -203,7 +203,8 @@ fn reserved_control_departure_owns_only_its_timers() {
     assert_eq!(a.rto_deadline, Some(2_000_000 + a.rto()));
     a.timeout(2_000_000).unwrap();
     assert_eq!(a.syn_retransmissions, 0);
-    assert!(a.sample.is_none());
+    assert_eq!(a.sample, Some((Seq(101), 0)));
+    assert_eq!(a.sample_departure, Some(2_000_000));
 
     let (mut a, _) = pair(cfg.clone(), 100);
     a.shutdown().unwrap();
