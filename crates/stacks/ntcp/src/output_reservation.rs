@@ -54,6 +54,41 @@ pub struct TransmitAttempt {
     pub(crate) connection: Option<ConnectionId>,
 }
 
+/// Explicit backend bounds and support for terminal PSH / first-segment CWR.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransmitGroupLimits {
+    /// Maximum payload bytes (excludes all repeated protocol headers).
+    pub max_bytes: usize,
+    /// Maximum number of full-sized physical segments; fewer than two falls back.
+    pub max_segments: usize,
+    pub allow_psh: bool,
+    pub allow_cwr: bool,
+}
+
+/// One prepared, indivisible backend submission; never a scalar attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransmitGroup(pub(crate) TransmitAttempt);
+
+/// Logical aggregate, not a checksummed jumbo wire packet. `packet.len` is the
+/// original scalar packet length; its timestamp observation token is cleared.
+/// PSH applies only to the last segment and CWR
+/// only to the first. The caller must implement those semantics or decline them.
+pub struct TransmitGroupView<'a> {
+    pub packet: Transmit,
+    pub header: wire::Header,
+    pub options: &'a [u8],
+    pub payload: &'a [u8],
+    pub segment_payload_len: usize,
+    pub segment_count: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedGroup {
+    pub token: TransmitGroup,
+    pub segments: usize,
+    pub bytes: usize,
+}
+
 pub(crate) struct OutputReservation {
     pub index: usize,
     pub bytes: Vec<u8>,
@@ -66,6 +101,7 @@ pub(crate) struct OutputReservation {
 pub(crate) struct ReservedOutput {
     pub packet: Transmit,
     pub attempt: Option<TransmitAttempt>,
+    pub group: Option<PreparedGroup>,
     pub abandon_attempt: TransmitAttempt,
     pub offset: usize,
     pub sacks: usize,
@@ -102,6 +138,7 @@ impl OutputReservation {
         self.current = Some(ReservedOutput {
             packet,
             attempt: Some(attempt),
+            group: None,
             abandon_attempt: attempt,
             offset: 0,
             sacks: 0,

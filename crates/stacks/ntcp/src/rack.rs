@@ -415,6 +415,36 @@ impl Rack {
         true
     }
 
+    // Count all distinct splits before submitting an indivisible hardware group.
+    pub(crate) fn validate_departure_group(
+        &self,
+        selection: DepartureSelection,
+        start: Seq,
+        size: u32,
+        segments: usize,
+        now: u64,
+    ) -> bool {
+        let Some(bytes) = (size as usize).checked_mul(segments) else {
+            return false;
+        };
+        if size == 0 || segments < 2 || bytes >= 1 << 31 {
+            return false;
+        }
+        let end = start.wrapping_add(bytes as u32);
+        if !self.validate_departure(selection, start, end, now) {
+            return false;
+        }
+        let splits = (0..=segments)
+            .filter(|&i| {
+                let edge = start.wrapping_add((i * size as usize) as u32);
+                self.intervals
+                    .iter()
+                    .any(|r| after(edge, r.start) && after(r.end, edge))
+            })
+            .count();
+        splits <= self.capacity.saturating_sub(self.intervals.len())
+    }
+
     pub(crate) fn commit_departure(
         &mut self,
         selection: DepartureSelection,
@@ -1290,6 +1320,68 @@ mod tests {
         assert!(!rack.commit_departure(retry, Seq(4), Seq(6), 60));
         assert_eq!(alloc::format!("{rack:?}"), before);
         assert_eq!(rack.departure_selection(), None);
+    }
+
+    #[test]
+    fn group_departure_preflight_capacity_wrap_and_distinct_physical_identity() {
+        for base in [Seq(100), Seq(u32::MAX - 15)] {
+            for capacity in [3, 4] {
+                let mut rack = Rack::with_capacity(capacity).unwrap();
+                rack.transmit(base, base.wrapping_add(32), 10, false);
+                let token = rack.departure_selection().unwrap();
+                let before = alloc::format!("{rack:?}");
+                for (size, count, now) in [
+                    (0, 3, 20),
+                    (8, 1, 20),
+                    (8, usize::MAX, 20),
+                    (8, 3, 9),
+                    (u32::MAX, 3, 20),
+                ] {
+                    assert!(!rack.validate_departure_group(token, base, size, count, now));
+                }
+                assert_eq!(
+                    rack.validate_departure_group(token, base, 8, 3, 20),
+                    capacity == 4
+                );
+                assert_eq!(alloc::format!("{rack:?}"), before);
+                if capacity == 3 {
+                    // Scalar fallback still works when the whole prefix cannot.
+                    assert!(rack.commit_departure(token, base, base.wrapping_add(8), 20));
+                    continue;
+                }
+                crate::allocation_tests::fail_after(0, || {
+                    for n in 0..3 {
+                        assert!(rack.commit_departure(
+                            token,
+                            base.wrapping_add(n * 8),
+                            base.wrapping_add((n + 1) * 8),
+                            20
+                        ));
+                    }
+                });
+                for n in 0..3 {
+                    let start = base.wrapping_add(n * 8);
+                    let end = base.wrapping_add((n + 1) * 8);
+                    assert_eq!(rack.head_transmission(start), Some((end, 20)));
+                    assert_eq!(
+                        rack.original_transmission(start),
+                        Some((start, end, 20, false))
+                    );
+                }
+                assert!(!rack.intervals.last().unwrap().departure_committed);
+                assert!(!rack.validate_departure_group(token, base, 8, 3, 20));
+                assert!(rack.commit_departure(
+                    token,
+                    base.wrapping_add(24),
+                    base.wrapping_add(32),
+                    30
+                ));
+                assert_eq!(
+                    rack.head_transmission(base.wrapping_add(24)),
+                    Some((base.wrapping_add(32), 30))
+                );
+            }
+        }
     }
 
     #[test]

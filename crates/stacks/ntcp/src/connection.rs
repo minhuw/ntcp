@@ -2161,6 +2161,54 @@ impl Connection {
         Ok(())
     }
 
+    pub(crate) fn reserved_group_mss(&self, header_len: usize) -> usize {
+        self.mss
+            .min(self.path_payload_limit().saturating_sub(header_len))
+    }
+
+    pub(crate) fn validate_reserved_group(
+        &self,
+        now: Instant,
+        d: &Departure,
+        offset: usize,
+        segments: usize,
+    ) -> Result<(), Error> {
+        let s = d.segmentation.ok_or(Error::InvalidArgument)?;
+        let count = s
+            .segment_payload_len
+            .checked_mul(segments)
+            .ok_or(Error::InvalidArgument)?;
+        self.validate_reserved_output(now, d, offset, count)?;
+        // update_time must not discard the ledger part way through group commit.
+        let granularity = if self.config.timestamps {
+            self.config.timestamp_granularity
+        } else {
+            TimestampGranularity::Milliseconds
+        };
+        let stale = |sent| {
+            granularity
+                .tick_in(now, self.config.timebase)
+                .saturating_sub(granularity.tick_in(sent, self.config.timebase))
+                >= 1 << 31
+        };
+        if self.sample.is_some_and(|(_, sent)| stale(sent))
+            || self.last_timestamp_sent_at.is_some_and(stale)
+        {
+            return Err(Error::AmbiguousTimeJump);
+        }
+        let selection = self.reserved_ledger.ok_or(Error::InvalidArgument)?;
+        if !self.rack.validate_departure_group(
+            selection,
+            Seq(d.start).wrapping_add(offset as u32),
+            s.segment_payload_len as u32,
+            segments,
+            now,
+        ) {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
+    }
+
     pub(crate) fn accept_reserved_output(
         &mut self,
         now: Instant,

@@ -2351,6 +2351,10 @@ impl Endpoint {
         id: ConnectionId,
         policy: crate::PmtudPolicy,
     ) -> Result<(), EndpointError> {
+        // A prepared backend object keeps its ledger immutable until rejection.
+        if self.is_group_reserved(id) {
+            return Err(EndpointError::OutputReserved);
+        }
         // Existing authorized policy repair changes search aging, not selected bytes.
         self.slot(id)?
             .connection
@@ -2369,6 +2373,9 @@ impl Endpoint {
         id: ConnectionId,
         mtu: u32,
     ) -> Result<(), EndpointError> {
+        if self.is_group_reserved(id) {
+            return Err(EndpointError::OutputReserved);
+        }
         self.slot(id)?.connection.validate_first_hop_mtu(now, mtu)?;
         self.clock(now)?;
         if self.is_output_reserved(id) {
@@ -2387,6 +2394,13 @@ impl Endpoint {
         now: Instant,
         mtu: u32,
     ) -> Result<(), EndpointError> {
+        if self
+            .reservations
+            .iter()
+            .any(|slot| slot.current.as_ref().is_some_and(|r| r.group.is_some()))
+        {
+            return Err(EndpointError::OutputReserved);
+        }
         if self.config.connection.pmtud.is_none()
             || !(68..=65575).contains(&mtu)
             || mtu > 65535
@@ -2832,6 +2846,203 @@ impl Endpoint {
             .flatten()
     }
 
+    /// Prepare a full-MSS prefix without allocating or changing sender credit.
+    /// The scalar attempt must be certainly unsubmitted, not an unknown result.
+    /// None/error leaves the scalar attempt intact. Successful preparation
+    /// invalidates it; only the returned group can accept/reject this submission.
+    pub fn prepare_transmit_group(
+        &mut self,
+        attempt: crate::TransmitAttempt,
+        limits: crate::TransmitGroupLimits,
+    ) -> Result<Option<crate::TransmitGroup>, EndpointError> {
+        let Some(slot) = self.reservations.get(attempt.reservation) else {
+            return Ok(None);
+        };
+        let Some(r) = slot
+            .current
+            .as_ref()
+            .filter(|r| r.attempt == Some(attempt) && r.group.is_none())
+        else {
+            return Ok(None);
+        };
+        let Some(d) = r.departure.filter(|d| d.segmentation.is_some()) else {
+            return Ok(None);
+        };
+        let s = d.segmentation.unwrap();
+        let owner = &self
+            .retained_slot(attempt.connection.ok_or(EndpointError::InvalidHandle)?)?
+            .connection;
+        if s.segment_payload_len == 0
+            || owner.reserved_group_mss(s.tcp_header_len) != s.segment_payload_len
+            || r.offset % s.segment_payload_len != 0
+            || !limits.allow_cwr && r.offset == 0 && s.terminal_flags & wire::CWR != 0
+        {
+            return Ok(None);
+        }
+        let remaining = s
+            .payload_len
+            .checked_sub(r.offset)
+            .ok_or(Error::InvalidArgument)?;
+        let mut segments = (remaining / s.segment_payload_len)
+            .min(limits.max_segments)
+            .min(limits.max_bytes / s.segment_payload_len);
+        if !limits.allow_psh
+            && s.terminal_flags & wire::PSH != 0
+            && segments * s.segment_payload_len == remaining
+        {
+            segments = segments.saturating_sub(1);
+        }
+        if segments < 2 {
+            return Ok(None);
+        }
+        let bytes = segments
+            .checked_mul(s.segment_payload_len)
+            .ok_or(Error::InvalidArgument)?;
+        // Validate the borrowed header as well as every RACK boundary before
+        // issuing a token that the backend may submit as one indivisible object.
+        wire::parse(r.packet.ip, &slot.bytes[..r.packet.len]).map_err(Error::Wire)?;
+        owner.validate_reserved_group(self.now, &d, r.offset, segments)?;
+        let token =
+            crate::TransmitGroup(self.reservations[attempt.reservation].token(attempt.connection)?);
+        let r = self.reservations[attempt.reservation]
+            .current
+            .as_mut()
+            .unwrap();
+        r.group = Some(crate::output_reservation::PreparedGroup {
+            token,
+            segments,
+            bytes,
+        });
+        // A private scalar-shaped identity preserves all existing owner barriers.
+        r.attempt = Some(token.0);
+        r.abandon_attempt = token.0;
+        Ok(Some(token))
+    }
+
+    pub fn transmit_group(
+        &self,
+        token: crate::TransmitGroup,
+    ) -> Option<crate::TransmitGroupView<'_>> {
+        let slot = self.reservations.get(token.0.reservation)?;
+        let r = slot.current.as_ref()?;
+        let group = r.group.filter(|g| g.token == token)?;
+        let s = r.departure?.segmentation?;
+        let original = wire::parse(r.packet.ip, &slot.bytes[..r.packet.len]).ok()?;
+        let mut header = original.header;
+        header.sequence = header.sequence.wrapping_add(r.offset as u32);
+        header.flags = s.terminal_flags;
+        if r.offset + group.bytes != s.payload_len {
+            header.flags &= !wire::PSH;
+        }
+        if r.offset != 0 {
+            header.flags &= !wire::CWR;
+        }
+        Some(crate::TransmitGroupView {
+            packet: Transmit {
+                tx_timestamp: None,
+                ..r.packet
+            },
+            header,
+            options: original.raw_options,
+            payload: &slot.payload[r.offset..r.offset + group.bytes],
+            segment_payload_len: s.segment_payload_len,
+            segment_count: group.segments,
+        })
+    }
+
+    /// Commit one accepted backend object as N distinct physical spans. `now`
+    /// is the monotonic submission time, NOT a per-segment hardware timestamp.
+    /// Preflight errors do not mutate state; after backend acceptance callers
+    /// must quarantine integration errors, never resubmit the object.
+    pub fn accept_transmit_group(
+        &mut self,
+        now: Instant,
+        token: crate::TransmitGroup,
+    ) -> Result<bool, EndpointError> {
+        let index = token.0.reservation;
+        let Some(r) = self
+            .reservations
+            .get(index)
+            .and_then(|slot| slot.current.as_ref())
+        else {
+            return Ok(false);
+        };
+        let Some(group) = r.group.filter(|g| g.token == token) else {
+            return Ok(false);
+        };
+        let mut departure = r.departure.unwrap();
+        let size = departure.segmentation.unwrap().segment_payload_len;
+        let offset = r.offset;
+        let finished = offset + group.bytes == departure.payload;
+        let id = token.0.connection.ok_or(EndpointError::InvalidHandle)?;
+        self.retained_slot(id)?.connection.validate_reserved_group(
+            now,
+            &departure,
+            offset,
+            group.segments,
+        )?;
+        self.clock(now)?;
+        let owner = &mut self.retained_slot_mut(id)?.connection;
+        for n in 0..group.segments {
+            // Collective preflight proves split capacity for the entire prefix;
+            // no external mutation can interleave these commits.
+            owner
+                .accept_reserved_output(
+                    now,
+                    &mut departure,
+                    offset + n * size,
+                    size,
+                    finished && n + 1 == group.segments,
+                )
+                .expect("preflighted group departure");
+        }
+        let r = self.reservations[index].current.as_mut().unwrap();
+        r.emitted_bytes = group.bytes;
+        r.emitted_sacks = 0;
+        r.group = None;
+        self.complete_reserved_accept(index, Some(departure), finished);
+        Ok(true)
+    }
+
+    /// Only for a backend's synchronous, certainly-unsubmitted rejection.
+    /// Unknown submission outcomes must remain quarantined, never retried.
+    pub fn reject_unsubmitted_group(
+        &mut self,
+        token: crate::TransmitGroup,
+    ) -> Result<bool, EndpointError> {
+        let Some(r) = self
+            .reservations
+            .get_mut(token.0.reservation)
+            .and_then(|slot| slot.current.as_mut())
+        else {
+            return Ok(false);
+        };
+        if !r.group.is_some_and(|g| g.token == token) {
+            return Ok(false);
+        }
+        r.group = None;
+        r.attempt = None;
+        Ok(true)
+    }
+
+    /// Same certified-unsubmitted precondition as `abandon_transmit`. The latest
+    /// handle also survives rejection or accepted prefixes to abandon only the
+    /// remaining suffix, until another scalar/group token replaces it.
+    pub fn abandon_transmit_group(
+        &mut self,
+        token: crate::TransmitGroup,
+    ) -> Result<bool, EndpointError> {
+        self.abandon_transmit(token.0)
+    }
+
+    fn is_group_reserved(&self, id: ConnectionId) -> bool {
+        self.reservations.iter().any(|slot| {
+            slot.current
+                .as_ref()
+                .is_some_and(|r| r.packet.connection == Some(id) && r.group.is_some())
+        })
+    }
+
     // ponytail: bounded linear pool lookup; add a slot index if measured flow counts warrant it.
     pub fn is_output_reserved(&self, id: ConnectionId) -> bool {
         self.reservations.iter().any(|slot| {
@@ -3071,7 +3282,7 @@ impl Endpoint {
         else {
             return Ok(false);
         };
-        if r.attempt != Some(attempt) {
+        if r.attempt != Some(attempt) || r.group.is_some() {
             return Ok(false);
         }
         let connection = r.packet.connection;
@@ -3100,7 +3311,18 @@ impl Endpoint {
                 .connection
                 .accept_reserved_output(now, d, offset, count, finished)?;
         }
+        self.complete_reserved_accept(index, departure, finished);
+        Ok(true)
+    }
+
+    fn complete_reserved_accept(
+        &mut self,
+        index: usize,
+        departure: Option<crate::output_reservation::Departure>,
+        finished: bool,
+    ) {
         let r = self.reservations[index].current.as_mut().unwrap();
+        let connection = r.packet.connection;
         if finished {
             self.reservations[index].current = None;
         } else {
@@ -3123,7 +3345,6 @@ impl Endpoint {
                 self.events.push(self.config.max_connections + parent.slot);
             }
         }
-        Ok(true)
     }
 
     // Caller certifies this attempt was synchronously rejected before submission;
@@ -3140,7 +3361,7 @@ impl Endpoint {
         else {
             return Ok(false);
         };
-        if r.attempt != Some(attempt) {
+        if r.attempt != Some(attempt) || r.group.is_some() {
             return Ok(false);
         }
         let Some(connection) = r.packet.connection else {

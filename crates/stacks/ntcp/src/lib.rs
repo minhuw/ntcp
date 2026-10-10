@@ -16,7 +16,10 @@ mod connection;
 mod cubic;
 mod endpoint;
 mod output_reservation;
-pub use output_reservation::{GsoLimits, TransmitAttempt, TransmitSegmentation};
+pub use output_reservation::{
+    GsoLimits, TransmitAttempt, TransmitGroup, TransmitGroupLimits, TransmitGroupView,
+    TransmitSegmentation,
+};
 #[cfg(test)]
 mod endpoint_tests;
 mod hystart;

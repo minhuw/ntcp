@@ -772,3 +772,62 @@ fn gso_pmtu_probe_sack_and_timestamp_credit_fallbacks() {
     assert_eq!(s.payload_len, 176); // Two option-adjusted 88-byte segments.
     assert!(a.timestamp_bytes <= 220);
 }
+
+#[test]
+fn group_preflight_and_same_submit_time_keep_rack_spans_and_first_timer_across_wrap() {
+    for iss in [100, u32::MAX - 150] {
+        let cfg = ConnectionConfig {
+            nagle: false,
+            sack: true,
+            rack: true,
+            initial_window: InitialWindow::Iw10,
+            ..config(4096, 100)
+        };
+        let (mut a, _) = pair(cfg, iss);
+        a.write(&[3; 400]).unwrap();
+        let mut bytes = [0; 2048];
+        let mut payload = [0; 1000];
+        gso_select(&mut a, 40, &mut payload, &mut bytes).unwrap();
+        let mut departure = a.last_departure.unwrap();
+        let start = Seq(departure.start);
+        let nxt = a.snd_nxt;
+        let snapshot = alloc::format!("{:?}", a.rack);
+        assert_eq!(
+            a.validate_reserved_group(39, &departure, 0, 3),
+            Err(Error::TimeWentBackwards)
+        );
+        assert_eq!(
+            a.validate_reserved_group(50, &departure, 0, usize::MAX),
+            Err(Error::InvalidArgument)
+        );
+        assert_eq!(alloc::format!("{:?}", a.rack), snapshot);
+        crate::allocation_tests::fail_after(0, || {
+            a.validate_reserved_group(50, &departure, 0, 3).unwrap();
+            for n in 0..3 {
+                a.accept_reserved_output(50, &mut departure, n * 100, 100, false)
+                    .unwrap();
+            }
+        });
+        let timer = a.rto_deadline;
+        assert_eq!(timer, Some(50 + a.rto()));
+        for n in 0..3 {
+            let left = start.wrapping_add(n * 100);
+            let right = start.wrapping_add((n + 1) * 100);
+            assert_eq!(
+                a.rack.original_transmission(left),
+                Some((left, right, 50, false))
+            );
+            assert_eq!(a.rack.head_transmission(left), Some((right, 50)));
+        }
+        assert_eq!(a.snd_nxt, nxt);
+        assert!(!departure.rto);
+        a.accept_reserved_output(70, &mut departure, 300, 100, true)
+            .unwrap();
+        assert_eq!(a.rto_deadline, timer);
+        assert_eq!(a.snd_nxt, nxt);
+        assert_eq!(
+            a.rack.head_transmission(start.wrapping_add(300)),
+            Some((start.wrapping_add(400), 70))
+        );
+    }
+}
