@@ -1098,9 +1098,11 @@ impl Congestion {
         self.fast_recovery
     }
 
-    // ECN response epoch, independent of the next fresh packet's CWR signal.
-    pub(crate) fn in_ecn_response(&self) -> bool {
-        self.ecn_end.is_some()
+    // The deduplication marker can outlive the active epoch after recovery/FIN ACKs.
+    // Equality remains active, independently of the next fresh packet's CWR signal.
+    pub(crate) fn in_ecn_response(&self, snd_una: Seq) -> bool {
+        self.ecn_end
+            .is_some_and(|end| snd_una.serial_cmp(end) != Some(Ordering::Greater))
     }
 
     pub(crate) fn in_recovery(&self) -> bool {

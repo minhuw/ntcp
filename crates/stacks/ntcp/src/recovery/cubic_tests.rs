@@ -75,18 +75,18 @@ fn cubic_ecn_loss_tlp_and_rto_share_existing_epoch_guards() {
         for base in [Seq(1), Seq(u32::MAX - 4999)] {
             let end = base.wrapping_add(10_000);
             let mut c = controller(recovery, 1000);
-            assert!(!c.in_ecn_response());
+            assert!(!c.in_ecn_response(base));
             assert!(c.on_ecn(base, 10_000, end));
-            assert!(c.in_ecn_response());
+            assert!(c.in_ecn_response(base));
             assert_eq!((c.cwnd, c.ssthresh), (7000, 7000));
             assert!(!c.on_ecn(end, 7000, end));
             // Real loss still enters recovery but shares the ECN reduction.
             assert!(c.on_sack_recovery(base, 7000, end));
             assert_eq!(c.ssthresh, 7000);
-            assert!(c.in_recovery() && c.in_ecn_response());
+            assert!(c.in_recovery() && c.in_ecn_response(base));
             c.on_timeout(7000, end);
             assert_eq!((c.cwnd, c.ssthresh), (1000, 7000));
-            assert!(!c.in_ecn_response());
+            assert!(!c.in_ecn_response(base));
             c.on_timeout(3000, end);
             assert_eq!(c.ssthresh, 7000);
 
@@ -521,5 +521,29 @@ fn cubic_loss_and_ecn_floors_save_pre_event_window() {
         let state = alloc::format!("{:?}", c.cubic.as_ref().unwrap());
         assert!(state.contains("cwnd_prior: 10000,"), "{state}");
         assert!(state.contains("w_max: 10000,"), "{state}");
+    }
+}
+
+#[test]
+fn ecn_export_checks_cumulative_ack_without_clearing_marker() {
+    for end in [Seq(100), Seq(u32::MAX), Seq(0)] {
+        let base = Seq(end.0.wrapping_sub(100));
+        let mut c = controller(RecoveryAlgorithm::NewReno, 1000);
+        assert!(!c.in_ecn_response(base));
+        assert!(c.on_ecn(base, 10_000, end));
+        for (ack, active) in [
+            (base, true),
+            (end, true),
+            (end.wrapping_add(1), false),
+            (end.wrapping_add(1 << 31), true), // Ambiguous is not unambiguously after.
+        ] {
+            assert_eq!(c.in_ecn_response(ack), active);
+            assert_eq!(c.ecn_end, Some(end));
+        }
+        assert!(c.on_sack_recovery(base, 7000, end.wrapping_add(1)));
+        c.on_ack(end.wrapping_add(1), 101, 0);
+        assert!(!c.in_recovery());
+        assert_eq!(c.ecn_end, Some(end)); // The early-return dedup marker stays intact.
+        assert!(!c.in_ecn_response(end.wrapping_add(1)));
     }
 }

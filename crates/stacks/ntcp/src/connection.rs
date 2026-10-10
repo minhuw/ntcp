@@ -1229,7 +1229,7 @@ impl Connection {
         TransportInfo {
             state: self.state,
             recovery: self.congestion.in_recovery(),
-            ecn_response: self.congestion.in_ecn_response(),
+            ecn_response: self.congestion.in_ecn_response(self.snd_una),
             loss: self.sack_post_rto.is_some() || self.consecutive_timeouts != 0,
             ledger_valid: self.rack.valid(),
             unacked: counts.unacked,
@@ -9272,6 +9272,102 @@ mod tests {
             assert!(!a.ecn_cwr_pending);
             assert!(a.transport_info().ecn_response); // Not the pending packet flag.
             inject(&mut a, 70, next, base.wrapping_add(5000), ACK, 8192, &[]);
+            assert!(!a.transport_info().ecn_response);
+        }
+    }
+
+    #[test]
+    fn transport_info_ecn_epoch_ends_on_recovery_exit() {
+        for (recovery, sack) in [
+            (RecoveryAlgorithm::Reno, false),
+            (RecoveryAlgorithm::NewReno, false),
+            (RecoveryAlgorithm::NewReno, true),
+        ] {
+            for iss in [100, u32::MAX - 5999] {
+                let mut cfg = config(32_000, 1000);
+                cfg.ecn = true;
+                cfg.initial_window = InitialWindow::Iw10;
+                cfg.congestion_algorithm = CongestionAlgorithm::Cubic;
+                cfg.recovery_algorithm = recovery;
+                cfg.sack = sack;
+                let (mut a, _) = pair(cfg, iss);
+                let base = a.snd_una;
+                let next = a.receive.next();
+                a.write(&[1; 6000]).unwrap();
+                for _ in 0..6 {
+                    packet(&mut a, 40);
+                }
+                let ack = base.wrapping_add(3000);
+                inject(&mut a, 50, next, ack, ACK | ECE, 32_000, &[]);
+                assert!(a.transport_info().ecn_response);
+                // Extend the flight beyond the ECN boundary before loss entry.
+                a.write(&[2; 1000]).unwrap();
+                packet(&mut a, 60);
+                let end = base.wrapping_add(7000);
+                assert_eq!(a.snd_nxt, end);
+                if sack {
+                    inject_sack(
+                        &mut a,
+                        70,
+                        next,
+                        ack,
+                        ACK,
+                        32_000,
+                        &[],
+                        &[(base.wrapping_add(4000).0, end.0)],
+                    );
+                } else {
+                    for _ in 0..3 {
+                        inject(&mut a, 70, next, ack, ACK, 32_000, &[]);
+                    }
+                }
+                let info = a.transport_info();
+                assert!(info.recovery && info.ecn_response);
+                inject(&mut a, 80, next, end, ACK, 32_000, &[]);
+                let info = a.transport_info();
+                assert!(!info.recovery && !info.loss);
+                assert!(!info.ecn_response, "{recovery:?}, sack={sack}, iss={iss}");
+                assert_eq!(a.transport_info(), info); // Sampling is read-only.
+            }
+        }
+    }
+
+    #[test]
+    fn transport_info_ecn_epoch_ends_on_fin_only_ack() {
+        for iss in [100, u32::MAX - 4000] {
+            let mut cfg = config(8192, 1000);
+            cfg.ecn = true;
+            cfg.initial_window = InitialWindow::Iw10;
+            cfg.congestion_algorithm = CongestionAlgorithm::Cubic;
+            let (mut a, _) = pair(cfg, iss);
+            let base = a.snd_una;
+            let next = a.receive.next();
+            a.write(&[1; 4000]).unwrap();
+            for _ in 0..4 {
+                packet(&mut a, 40);
+            }
+            inject(
+                &mut a,
+                50,
+                next,
+                base.wrapping_add(1000),
+                ACK | ECE,
+                8192,
+                &[],
+            );
+            let end = base.wrapping_add(4000);
+            inject(&mut a, 60, next, end, ACK, 8192, &[]);
+            assert!(a.transport_info().ecn_response); // Equality remains active, including wrap.
+            assert_eq!(a.send_base, end);
+            a.shutdown().unwrap();
+            let bytes = packet(&mut a, 70);
+            let fin = wire::parse(ip(a.tuple()), &bytes).unwrap();
+            assert_ne!(fin.header.flags & FIN, 0);
+            assert!(fin.payload.is_empty());
+            inject(&mut a, 80, next, end.wrapping_add(1), ACK, 8192, &[]);
+            assert_eq!(a.state(), State::FinWait2);
+            assert_eq!(a.send_base, end); // DATA edge did not advance; SND.UNA did.
+            assert_eq!(a.snd_una, end.wrapping_add(1));
             assert!(!a.transport_info().ecn_response);
         }
     }

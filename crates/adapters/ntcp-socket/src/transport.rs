@@ -76,6 +76,131 @@ pub(crate) fn transport_option(info: ntcp::TransportInfo, option: i32) -> Result
 mod tests {
     use super::*;
     #[test]
+    fn linux_info_ecn_epoch_exit_reports_open() {
+        use ntcp::wire::{self, ACK, ECE, SYN};
+        use ntcp::{
+            CongestionAlgorithm, ConnectionConfig, Endpoint, EndpointConfig, InitialWindow,
+        };
+
+        for mode in ["fast", "sack", "fin", "timeout"] {
+            let config = EndpointConfig {
+                connection: ConnectionConfig {
+                    ecn: true,
+                    sack: mode == "sack",
+                    mss: 1000,
+                    initial_window: InitialWindow::Iw10,
+                    congestion_algorithm: CongestionAlgorithm::Cubic,
+                    prr_pacing: false,
+                    ..ConnectionConfig::default()
+                },
+                ..EndpointConfig::default()
+            };
+            let mut endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
+            let id = endpoint
+                .connect(
+                    0,
+                    "192.0.2.1:1000".parse().unwrap(),
+                    "192.0.2.2:2000".parse().unwrap(),
+                )
+                .unwrap();
+            let mut out = [0; 2048];
+            let tx = endpoint
+                .poll_transmit(0, &mut out, 16)
+                .unwrap()
+                .packet
+                .unwrap();
+            let syn = wire::parse(tx.ip, &out[..tx.len]).unwrap().header;
+            let base = syn.sequence.wrapping_add(1);
+            let ip = ntcp::IpMetadata {
+                source: tx.ip.destination,
+                destination: tx.ip.source,
+            };
+            let mut ack = wire::Header {
+                source_port: syn.destination_port,
+                destination_port: syn.source_port,
+                sequence: 100,
+                acknowledgment: base,
+                flags: SYN | ACK | ECE,
+                window: 32_000,
+                urgent_pointer: 0,
+            };
+            let input = |endpoint: &mut Endpoint, now, header, options: &[u8]| {
+                let mut bytes = [0; 64];
+                let len = wire::encode(ip, header, options, &[], &mut bytes).unwrap();
+                endpoint.input(now, ip, &bytes[..len]).unwrap();
+            };
+            let state = |endpoint: &Endpoint| {
+                transport_option(endpoint.transport_info(id).unwrap(), 1).unwrap()[1]
+            };
+            input(&mut endpoint, 10, ack, &[2, 4, 3, 232, 1, 1, 4, 2]);
+            endpoint.poll_transmit(20, &mut out, 16).unwrap();
+            assert_eq!(state(&endpoint), 0);
+            endpoint.write(id, &[1; 6000]).unwrap();
+            for _ in 0..6 {
+                let tx = endpoint
+                    .poll_transmit(30, &mut out, 16)
+                    .unwrap()
+                    .packet
+                    .unwrap();
+                assert_eq!(
+                    wire::parse(tx.ip, &out[..tx.len]).unwrap().payload.len(),
+                    1000
+                );
+            }
+            ack.sequence = 101;
+            ack.acknowledgment = base.wrapping_add(3000);
+            ack.flags = ACK | ECE;
+            input(&mut endpoint, 40, ack, &[]);
+            assert_eq!(state(&endpoint), 2); // CWR, not just ECN negotiation.
+            ack.flags = ACK;
+            if mode == "fin" {
+                ack.acknowledgment = base.wrapping_add(6000);
+                input(&mut endpoint, 50, ack, &[]);
+                assert_eq!(state(&endpoint), 2); // Equality retains the epoch.
+                endpoint.shutdown(id).unwrap();
+                let tx = endpoint
+                    .poll_transmit(60, &mut out, 16)
+                    .unwrap()
+                    .packet
+                    .unwrap();
+                let fin = wire::parse(tx.ip, &out[..tx.len]).unwrap();
+                assert!(fin.payload.is_empty());
+                assert_ne!(fin.header.flags & wire::FIN, 0);
+                ack.acknowledgment = ack.acknowledgment.wrapping_add(1);
+                input(&mut endpoint, 70, ack, &[]);
+            } else if mode == "timeout" {
+                let deadline = 40 + endpoint.transport_info(id).unwrap().rto_us;
+                endpoint.on_timeout(deadline, 16).unwrap();
+                assert_eq!(state(&endpoint), 4); // Loss supersedes CWR.
+                ack.acknowledgment = base.wrapping_add(6000);
+                input(&mut endpoint, deadline + 1, ack, &[]);
+            } else {
+                endpoint.write(id, &[2; 1000]).unwrap();
+                endpoint
+                    .poll_transmit(50, &mut out, 16)
+                    .unwrap()
+                    .packet
+                    .unwrap();
+                if mode == "sack" {
+                    let mut sack = vec![5, 10];
+                    sack.extend_from_slice(&base.wrapping_add(4000).to_be_bytes());
+                    sack.extend_from_slice(&base.wrapping_add(7000).to_be_bytes());
+                    sack.extend_from_slice(&[1, 1]);
+                    input(&mut endpoint, 60, ack, &sack);
+                } else {
+                    for _ in 0..3 {
+                        input(&mut endpoint, 60, ack, &[]);
+                    }
+                }
+                assert_eq!(state(&endpoint), 3); // Recovery supersedes overlapping CWR.
+                ack.acknowledgment = base.wrapping_add(7000);
+                input(&mut endpoint, 70, ack, &[]);
+            }
+            assert_eq!(state(&endpoint), 0, "{mode}: Open, not stale CWR");
+        }
+    }
+
+    #[test]
     fn linux_info_metrics_offsets_preserve_existing_fields() {
         let info = ntcp::TransportInfo {
             state: State::Established,
