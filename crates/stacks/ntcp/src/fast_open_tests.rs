@@ -760,3 +760,89 @@ fn fast_open_cache_charge_constrains_subsequent_admission_with_pool_credit() {
         }
     }
 }
+
+fn rejected_syn_data_duplicate(quota: bool) {
+    let (local, remote) = addresses(false, 40001);
+    let mut b = endpoint(2, false);
+    b.enable_fast_open().unwrap();
+    let listener = b.listen(remote, 8).unwrap();
+    b.set_listener_fast_open(listener, 1).unwrap();
+    let cookie = if quota {
+        crate::fast_open::issue(&[2; 32], remote.ip(), local.ip(), 0)
+    } else {
+        wire::FastOpenCookie::new(&[7; 8]).unwrap()
+    };
+    let mut options = [1; 12];
+    options[..2].copy_from_slice(&[34, 10]);
+    options[2..10].copy_from_slice(cookie.as_bytes());
+    let ip = IpMetadata {
+        source: local.ip(),
+        destination: remote.ip(),
+    };
+    let header = wire::Header {
+        source_port: local.port(),
+        destination_port: remote.port(),
+        sequence: 100,
+        acknowledgment: 0,
+        flags: wire::SYN,
+        window: 8192,
+        urgent_pointer: 0,
+    };
+    let mut bytes = [0; 2048];
+    if quota {
+        let holder = wire::Header {
+            source_port: 39999,
+            sequence: 50,
+            ..header
+        };
+        let n = wire::encode(ip, holder, &options, b"hold", &mut bytes).unwrap();
+        b.input(0, ip, &bytes[..n]).unwrap();
+        let held = b.accept(listener).unwrap();
+        assert_eq!(b.state(held).unwrap(), State::SynReceived);
+        packet(&mut b, 0);
+    }
+    let n = wire::encode(ip, header, &options, b"abc", &mut bytes).unwrap();
+    let syn = bytes[..n].to_vec();
+    b.input(10, ip, &syn).unwrap();
+    let first = b.poll_transmit(20, &mut bytes, 64).unwrap().packet.unwrap();
+    let child = first.connection.unwrap();
+    let response = wire::parse(first.ip, &bytes[..first.len]).unwrap();
+    assert_eq!(response.header.acknowledgment, 101);
+    let server_sequence = response.header.sequence;
+    assert_eq!(b.readable_bytes(child).unwrap(), 0);
+    b.input(30, ip, &syn).unwrap();
+    assert_eq!(b.state(child).unwrap(), State::SynReceived);
+    let second = b.poll_transmit(40, &mut bytes, 64).unwrap().packet.unwrap();
+    assert_eq!(second.connection, Some(child));
+    let response = wire::parse(second.ip, &bytes[..second.len]).unwrap();
+    assert_eq!(
+        response.header.flags & (wire::SYN | wire::ACK | wire::RST),
+        wire::SYN | wire::ACK
+    );
+    assert_eq!(response.header.sequence, server_sequence);
+    assert_eq!(response.header.acknowledgment, 101);
+    assert_eq!(b.readable_bytes(child).unwrap(), 0);
+    assert!(b.accept(listener).is_err());
+    let ack = wire::Header {
+        sequence: 101,
+        acknowledgment: server_sequence.wrapping_add(1),
+        flags: wire::ACK,
+        ..header
+    };
+    let n = wire::encode(ip, ack, &[], b"abc", &mut bytes).unwrap();
+    b.input(50, ip, &bytes[..n]).unwrap();
+    assert_eq!(b.accept(listener).unwrap(), child);
+    assert_eq!(b.state(child).unwrap(), State::Established);
+    assert_eq!(b.read(child, &mut bytes).unwrap(), 3);
+    assert_eq!(&bytes[..3], b"abc");
+}
+
+#[test]
+fn fast_open_invalid_cookie_duplicate_syn_data_keeps_child() {
+    rejected_syn_data_duplicate(false);
+}
+
+#[test]
+fn fast_open_quota_rejected_duplicate_syn_data_keeps_child() {
+    rejected_syn_data_duplicate(true);
+}

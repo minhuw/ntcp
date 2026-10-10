@@ -4208,6 +4208,19 @@ impl Connection {
             return Ok(());
         }
 
+        // Match the original handshake SYN before payload/window overlap can
+        // classify it as a conflicting SYN. Rejected TFO text stays rejected;
+        // a retry only repeats our existing SYN-ACK and receive commitment.
+        if self.handshake_pending()
+            && self.irs == Some(seq)
+            && h.flags & (SYN | ACK | RST | FIN) == SYN
+        {
+            self.learn_ecn(h.flags);
+            self.sack_send |= self.config.sack && segment.options.sack_permitted;
+            self.syn_pending = true;
+            return Ok(());
+        }
+
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.5
         //# A TCP implementation MUST support simultaneous open attempts (MUST- 10).
         // Simultaneous open: the SYN has already consumed receive sequence
@@ -4366,10 +4379,6 @@ impl Connection {
             }
             if h.flags & RST == 0 {
                 if self.handshake_pending() && h.flags & SYN != 0 && self.irs == Some(seq) {
-                    if h.flags & (ACK | FIN) == 0 {
-                        self.learn_ecn(h.flags);
-                        self.sack_send |= self.config.sack && segment.options.sack_permitted;
-                    }
                     self.syn_pending = true;
                 } else {
                     self.immediate_ack();
@@ -6879,12 +6888,21 @@ impl Connection {
             let (start, end) = self.fast_open_retry.unwrap();
             seq = start;
             let limit = end.distance_from(start) as usize;
-            let window =
-                self.snd_wnd
-                    .saturating_sub(start.distance_from(self.snd_una)) as usize;
+            // The SYN flight may exceed the newly negotiated cwnd. Bound the
+            // repair cursor relative to UNA, not the entire original flight:
+            // subtracting that flight would prevent even the first repair.
+            let mut credit = self
+                .snd_wnd
+                .min(self.congestion.cwnd())
+                .saturating_sub(start.distance_from(self.snd_una));
+            if let Some(prr) = self.prr {
+                credit = credit.min(prr.credit());
+            } else if let Some(recovery) = self.sack_recovery {
+                credit = credit.min(self.recovery_credit(recovery));
+            }
             count = self.send.copy(
                 start.distance_from(self.send_base) as usize,
-                &mut self.scratch[..limit.min(packet_mss).min(window)],
+                &mut self.scratch[..limit.min(packet_mss).min(credit as usize)],
             );
             retransmitted = count != 0;
         } else if retransmit || probe {

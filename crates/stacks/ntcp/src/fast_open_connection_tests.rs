@@ -187,3 +187,144 @@ fn simultaneous_open_acknowledges_syn_data_without_early_passive_delivery() {
     assert_eq!(a.acknowledged, 12);
     assert_eq!(b.read(&mut [0; 32]).unwrap(), 12);
 }
+
+fn selected_packet(a: &mut Connection, now: &mut u64, reserved: bool) -> Option<Vec<u8>> {
+    let mut bytes = vec![0; 2048];
+    let len = a.transmit_selected(*now, &mut bytes, reserved).unwrap()?;
+    if reserved {
+        let mut departure = a.last_departure.unwrap();
+        let payload = departure.payload;
+        a.accept_reserved_output(*now + 10, &mut departure, 0, payload, true)
+            .unwrap();
+    }
+    *now += 100;
+    bytes.truncate(len);
+    Some(bytes)
+}
+
+fn repair_obeys_negotiated_window(reserved: bool) {
+    for iss in [100, u32::MAX - 100] {
+        for acked in [0, 13] {
+            let mut a = client(iss, 496);
+            assert_eq!(a.config.initial_window, InitialWindow::Rfc5681);
+            let mut now = 0;
+            selected_packet(&mut a, &mut now, reserved).unwrap();
+            let synack = wire::Segment {
+                header: wire::Header {
+                    source_port: tuple().remote.port(),
+                    destination_port: tuple().local.port(),
+                    sequence: 999,
+                    acknowledgment: iss.wrapping_add(1 + acked),
+                    flags: SYN | ACK,
+                    window: 8192,
+                    urgent_pointer: 0,
+                },
+                options: wire::Options {
+                    mss: Some(64),
+                    timestamps: Some((0, a.timestamp_value(0))),
+                    sack_permitted: true,
+                    ..wire::Options::default()
+                },
+                raw_options: &[],
+                payload: &[],
+            };
+            a.input(1000, &synack).unwrap();
+            assert_eq!(a.mss, 52);
+            assert_eq!(a.congestion.cwnd(), 208);
+            now = 2000;
+            let mut sent = 0;
+            while let Some(bytes) = selected_packet(&mut a, &mut now, reserved) {
+                let p = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(p.header.sequence, iss.wrapping_add(1 + acked + sent));
+                sent += p.payload.len() as u32;
+            }
+            assert_eq!(sent, 208);
+            assert_eq!(
+                a.fast_open_retry,
+                Some((
+                    Seq(iss.wrapping_add(1 + acked + 208)),
+                    Seq(iss.wrapping_add(497))
+                ))
+            );
+            assert_eq!(a.data_flight(), 496 - acked);
+            let seq = a.receive.next();
+            let ack = a.snd_una.wrapping_add(52);
+            inject_sack(&mut a, now, seq, ack, ACK, 8192, &[], &[]);
+            now += 100;
+            let credit = a.congestion.cwnd().saturating_sub(156);
+            let mut resumed = 0;
+            while let Some(bytes) = selected_packet(&mut a, &mut now, reserved) {
+                let p = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(
+                    p.header.sequence,
+                    iss.wrapping_add(1 + acked + 208 + resumed)
+                );
+                resumed += p.payload.len() as u32;
+            }
+            assert_eq!(resumed, credit.min(496 - acked - 208));
+            assert!(resumed > 0);
+            assert!(a.sample.is_none()); // Repair does not create a Karn-ambiguous sample.
+        }
+    }
+}
+
+#[test]
+fn scalar_fast_open_repair_stops_at_negotiated_cwnd() {
+    repair_obeys_negotiated_window(false);
+}
+
+#[test]
+fn reserved_fast_open_repair_stops_at_negotiated_cwnd() {
+    repair_obeys_negotiated_window(true);
+}
+
+#[test]
+fn rejected_syn_data_retry_keeps_timestamp_reset_and_conflicting_syn_guards() {
+    for (sequence, flags, timestamp, state, retry) in [
+        (100, SYN, Some((10, 0)), State::SynReceived, true),
+        (100, SYN, Some((9, 0)), State::SynReceived, false),
+        (100, SYN, None, State::SynReceived, false),
+        (102, SYN, Some((10, 0)), State::Closed, false),
+        (101, SYN | RST, None, State::Closed, false),
+    ] {
+        let mut cfg = config(8192, 536);
+        cfg.timestamps = true;
+        let initial = wire::Segment {
+            header: wire::Header {
+                source_port: tuple().local.port(),
+                destination_port: tuple().remote.port(),
+                sequence: 100,
+                acknowledgment: 0,
+                flags: SYN,
+                window: 8192,
+                urgent_pointer: 0,
+            },
+            options: wire::Options {
+                timestamps: Some((10, 0)),
+                ..wire::Options::default()
+            },
+            raw_options: &[],
+            payload: &[], // Endpoint rejected the initial SYN data.
+        };
+        let mut b = Connection::passive(reverse(tuple()), cfg, 900, 0, &initial).unwrap();
+        packet(&mut b, 10);
+        let duplicate = wire::Segment {
+            header: wire::Header {
+                sequence,
+                flags,
+                ..initial.header
+            },
+            options: wire::Options {
+                timestamps: timestamp,
+                ..initial.options
+            },
+            raw_options: &[],
+            payload: b"abc",
+        };
+        b.input(20, &duplicate).unwrap();
+        assert_eq!(b.state, state);
+        assert_eq!(b.syn_pending, retry);
+        assert_eq!(b.receive.next(), Seq(101));
+        assert_eq!(b.receive_used, 0);
+    }
+}
