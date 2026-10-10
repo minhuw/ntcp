@@ -219,6 +219,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ntcp-tx"
+version = "0.0.1"
+dependencies = [
+ "ntcp",
+ "ntcp-io",
+ "ntcp-ip",
+ "ntcp-ip6",
+]
+
+[[package]]
 name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
