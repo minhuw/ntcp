@@ -21,7 +21,21 @@ pub enum Backend {
 #[derive(Clone, Debug)]
 pub struct SocketConfig {
     pub tcp: ntcp::EndpointConfig,
+    pub socket: SocketPolicy,
     pub io: IoConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocketPolicy {
+    pub notsent_lowat: u32,
+}
+
+impl Default for SocketPolicy {
+    fn default() -> Self {
+        Self {
+            notsent_lowat: u32::MAX,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +70,7 @@ impl SocketConfig {
         tcp.connection.receive_ip_payload_limit = 65515;
         Self {
             tcp,
+            socket: SocketPolicy::default(),
             io: IoConfig {
                 backend: Backend::Tun,
                 interface: interface.into(),
@@ -153,6 +168,7 @@ impl SocketConfig {
                 return Err(invalid());
             }
             match key {
+                "socket.notsent_lowat" => config.socket.notsent_lowat = number(value)?,
                 "io.backend" => {
                     config.io.backend = match value {
                         "tun" => Backend::Tun,

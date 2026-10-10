@@ -30,7 +30,7 @@ macro_rules! boundary_entry {
 }
 
 mod config;
-pub use config::{Backend, IoConfig, SocketConfig};
+pub use config::{Backend, IoConfig, SocketConfig, SocketPolicy};
 mod file_transfer;
 #[cfg(feature = "packet-test")]
 pub mod packet_profile;

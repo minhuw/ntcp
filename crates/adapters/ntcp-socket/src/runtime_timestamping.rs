@@ -394,7 +394,10 @@ impl Owner {
         }
         let progress = self.endpoint.send_progress(cid).map_err(engine)?;
         let lowat = self.sockets[&id].notsent_lowat;
-        let lowat = Some(effective_notsent_lowat(lowat));
+        let lowat = Some(effective_notsent_lowat(
+            lowat,
+            self.socket_policy.notsent_lowat,
+        ));
         let room = if capacity == 0 {
             0
         } else {

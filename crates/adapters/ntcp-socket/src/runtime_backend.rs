@@ -165,6 +165,7 @@ impl Owner {
             None,
             backend_config(config.tcp.clone(), &io)?,
         )?;
+        owner.socket_policy = config.socket;
         owner.ethernet = Some(EthernetBackend {
             io: Box::new(io),
             local: hardware,

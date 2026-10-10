@@ -3,13 +3,14 @@
 // rustc --edition=2024 --test socket_options.rs -o /tmp/socket-options && /tmp/socket-options
 pub(crate) const EDGE_BITS: [i32; 5] = [1, 4, 8, 16, 0x2000]; // Linux EPOLL{IN,OUT,ERR,HUP,RDHUP}
 
-// Linux v6.12 include/net/tcp.h: zero selects the namespace default, UINT_MAX.
-pub(crate) fn effective_notsent_lowat(value: u32) -> u32 {
-    if value == 0 { u32::MAX } else { value }
+// Linux v6.12 include/net/tcp.h: raw zero selects the default once.
+// This adapter owns a startup policy, not a host network-namespace sysctl.
+pub(crate) fn effective_notsent_lowat(value: u32, default: u32) -> u32 {
+    if value == 0 { default } else { value }
 }
 pub(crate) fn notsent_writable(notsent: usize, lowat: u32) -> bool {
     // tcp_poll uses tcp_stream_memory_free(wake=1): half-lowwater hysteresis.
-    (notsent as u64).saturating_mul(2) < u64::from(effective_notsent_lowat(lowat))
+    (notsent as u64).saturating_mul(2) < u64::from(lowat)
 }
 pub(crate) fn edge_changed(ready: u32, seen: Option<[u64; 5]>, observed: [u64; 5]) -> bool {
     ready != 0
@@ -61,9 +62,13 @@ mod tests {
     use super::*;
     #[test]
     fn lowwater_uint_and_wake_hysteresis() {
-        assert_eq!(effective_notsent_lowat(0), u32::MAX);
-        assert_eq!(effective_notsent_lowat((-1i32) as u32), u32::MAX);
-        assert_eq!(effective_notsent_lowat(i32::MIN as u32), 1 << 31);
+        assert_eq!(effective_notsent_lowat(0, u32::MAX), u32::MAX);
+        assert_eq!(effective_notsent_lowat((-1i32) as u32, 4000), u32::MAX);
+        assert_eq!(effective_notsent_lowat(i32::MIN as u32, 4000), 1 << 31);
+        assert_eq!(effective_notsent_lowat(0, 4000), 4000);
+        assert_eq!(effective_notsent_lowat(0, 0), 0);
+        assert_eq!(effective_notsent_lowat(1, 0), 1);
+        assert!(!notsent_writable(0, 0));
         assert!(notsent_writable(1999, 4000));
         assert!(!notsent_writable(2000, 4000));
         assert!(notsent_writable(0, 1));

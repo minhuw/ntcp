@@ -565,3 +565,163 @@ fn shared_abi_pipeline_capacity_one_and_real_clock_pacing() {
     assert_eq!(packet_test::try_capture(65535), Err(EAGAIN));
     packet_test::stop();
 }
+
+#[test]
+fn global_lowat_alias_writes_poll_epoll_and_drain() {
+    const CHILD: &str = "NTCP_TEST_GLOBAL_LOWAT_ABI_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        assert!(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "inq_tests::global_lowat_alias_writes_poll_epoll_and_drain",
+                    "--test-threads=1"
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap()
+                .success()
+        );
+        return;
+    }
+    packet_test::start((
+        Ipv4Addr::new(192, 0, 2, 1),
+        packet_profile::Profile::UpstreamGlobalLowat,
+    ))
+    .unwrap();
+    unsafe {
+        let (fd, mut h) = connected();
+        h.window = 0;
+        inject(h, TS, b"x");
+        assert_eq!(header(&capture()).acknowledgment, 102);
+        h.sequence = 102;
+        let alias = dup(fd);
+        assert!(alias >= 0);
+        let mut raw = u32::MAX;
+        let mut len = 4;
+        assert_eq!(
+            getsockopt(
+                alias,
+                IPPROTO_TCP,
+                TCP_NOTSENT_LOWAT,
+                (&mut raw as *mut u32).cast(),
+                &mut len
+            ),
+            0
+        );
+        assert_eq!(raw, 0); // The runtime default is not the raw socket value.
+        let epfd = readiness::epoll_create1(EPOLL_CLOEXEC);
+        assert!(epfd >= 0);
+        for registered in [fd, alias] {
+            let mut event = epoll_event {
+                events: (EPOLLOUT | EPOLLET) as u32,
+                u64: registered as u64,
+            };
+            assert_eq!(
+                readiness::epoll_ctl(epfd, EPOLL_CTL_ADD, registered, &mut event),
+                0
+            );
+        }
+        let poll = |expected| {
+            let mut p = [
+                pollfd {
+                    fd,
+                    events: POLLOUT,
+                    revents: 0,
+                },
+                pollfd {
+                    fd: alias,
+                    events: POLLOUT,
+                    revents: 0,
+                },
+            ];
+            assert_eq!(readiness::poll(p.as_mut_ptr(), 2, 0), expected);
+            for entry in p {
+                assert_eq!(entry.revents, if expected == 0 { 0 } else { POLLOUT });
+            }
+        };
+        let edges = |expected| {
+            let mut events = [epoll_event { events: 0, u64: 0 }; 2];
+            assert_eq!(
+                readiness::epoll_wait(epfd, events.as_mut_ptr(), 2, 0),
+                expected
+            );
+            if expected == 2 {
+                let mut ids = events.map(|event| event.u64);
+                ids.sort();
+                let mut expected_ids = [fd as u64, alias as u64];
+                expected_ids.sort();
+                assert_eq!(ids, expected_ids);
+            }
+        };
+        poll(2);
+        edges(2);
+        edges(0);
+        let bytes = vec![7u8; 9000];
+        assert_eq!(write(fd, bytes.as_ptr().cast(), 1999), 1999);
+        poll(2);
+        let iov = iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: 1,
+        };
+        assert_eq!(writev(alias, &iov, 1), 1);
+        poll(0); // Half-threshold hysteresis starts at exactly 2000.
+        edges(0);
+        let mut iov = iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        };
+        let mut message: msghdr = std::mem::zeroed();
+        message.msg_iov = &mut iov;
+        message.msg_iovlen = 1;
+        assert_eq!(sendmsg(fd, &message, MSG_MORE), 2000);
+        assert_eq!(send(alias, bytes.as_ptr().cast(), 1, MSG_MORE), -1);
+        assert_eq!(errno(), EAGAIN);
+        poll(0);
+        for (value, expected) in [(u32::MAX, 2), (0, 0)] {
+            assert_eq!(
+                setsockopt(
+                    alias,
+                    IPPROTO_TCP,
+                    TCP_NOTSENT_LOWAT,
+                    (&value as *const u32).cast(),
+                    4
+                ),
+                0
+            );
+            assert_eq!(
+                getsockopt(
+                    fd,
+                    IPPROTO_TCP,
+                    TCP_NOTSENT_LOWAT,
+                    (&mut raw as *mut u32).cast(),
+                    &mut len
+                ),
+                0
+            );
+            assert_eq!(raw, value);
+            poll(expected);
+            edges(expected);
+            edges(0);
+        }
+        h.window = 65535;
+        inject(h, TS, &[]);
+        let mut sent = 0;
+        while sent < 4000 {
+            let packet = capture();
+            let frame = packet_profile::parse_frame(&packet).unwrap();
+            sent += ntcp::wire::parse(frame.ip, frame.payload)
+                .unwrap()
+                .payload
+                .len();
+        }
+        assert_eq!(sent, 4000);
+        poll(2); // Transmit progress, without an ACK, restores both aliases.
+        edges(2);
+        edges(0);
+        assert_eq!(close(epfd), 0);
+        assert_eq!(close(alias), 0);
+        assert_eq!(close(fd), 0);
+    }
+    packet_test::stop();
+}

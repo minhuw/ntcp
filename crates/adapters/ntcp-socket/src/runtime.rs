@@ -433,6 +433,7 @@ type ChildOptionsSnapshot = (ConnectionId, u64, u64, u64, (bool, bool, bool, u32
 struct Owner {
     endpoint: Endpoint,
     defaults: EndpointConfig,
+    socket_policy: crate::SocketPolicy,
     tun: Option<Tun>,
     ethernet: Option<backend::EthernetBackend>,
     sockets: BTreeMap<u64, Socket>,
@@ -550,6 +551,7 @@ impl Owner {
         }
         let tcp = backend::backend_config(config.tcp.clone(), &tun)?;
         let mut owner = Self::with_config(local, subnet, secret, Some(tun), tcp)?;
+        owner.socket_policy = config.socket;
         owner.enable_reservations(&config.io, index)?;
         Ok(owner)
     }
@@ -585,6 +587,7 @@ impl Owner {
         Ok(Self {
             endpoint,
             defaults,
+            socket_policy: crate::SocketPolicy::default(),
             tun,
             ethernet: None,
             sockets: BTreeMap::new(),
@@ -648,6 +651,7 @@ impl Owner {
         )
         .map_err(engine)?;
         owner.defaults = crate::packet_profile::config(profile);
+        owner.socket_policy.notsent_lowat = crate::packet_profile::notsent_lowat(profile);
         owner.packets = Some(PacketBackend::new(profile, options.queue_capacity)?);
         owner.enable_egress(options.egress_capacity, crate::packet_profile::gso(profile))?;
         Ok(owner)
@@ -1336,7 +1340,13 @@ impl Owner {
                     || matches!(state, State::Closed | State::TimeWait)
                     || (matches!(state, State::Established | State::CloseWait)
                         && info.send_used < info.send_capacity
-                        && notsent_writable(info.notsent_bytes, s.notsent_lowat))
+                        && notsent_writable(
+                            info.notsent_bytes,
+                            effective_notsent_lowat(
+                                s.notsent_lowat,
+                                self.socket_policy.notsent_lowat,
+                            ),
+                        ))
                 {
                     bits |= EPOLLOUT;
                 }
@@ -2203,6 +2213,7 @@ mod tests {
     include!("large_write_tests.rs");
     include!("file_transfer_tests.rs");
     include!("runtime_pacing_tests.rs");
+    include!("runtime_lowat_tests.rs");
     fn owner(last: u8) -> Owner {
         owner_with_config(
             last,

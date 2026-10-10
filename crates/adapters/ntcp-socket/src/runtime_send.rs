@@ -95,7 +95,10 @@ impl Owner {
             self.endpoint
                 .send_admission_room(
                     cid,
-                    Some(effective_notsent_lowat(self.sockets[&id].notsent_lowat)),
+                    Some(effective_notsent_lowat(
+                        self.sockets[&id].notsent_lowat,
+                        self.socket_policy.notsent_lowat,
+                    )),
                 )
                 .map_err(engine)?
         } else {
@@ -240,7 +243,13 @@ impl Owner {
             {
                 let room = self
                     .endpoint
-                    .send_admission_room(cid, Some(effective_notsent_lowat(s.notsent_lowat)))
+                    .send_admission_room(
+                        cid,
+                        Some(effective_notsent_lowat(
+                            s.notsent_lowat,
+                            self.socket_policy.notsent_lowat,
+                        )),
+                    )
                     .unwrap_or(0);
                 if room == 0 || matches!(result, Err(EAGAIN)) {
                     let _ = self.endpoint.finish_send(cid, send.end, true, false, true);

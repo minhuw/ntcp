@@ -575,3 +575,35 @@ fn software_gso_bounds_are_optional_paired_and_fail_closed() {
         assert!(config.validate().is_err());
     }
 }
+
+#[test]
+fn socket_notsent_lowat_full_unsigned_range_and_strict_keys() {
+    assert_eq!(
+        SocketConfig::parse(BASE).unwrap().socket.notsent_lowat,
+        u32::MAX
+    );
+    for value in [0, 1, 4000, i32::MAX as u32 + 1, u32::MAX] {
+        let config = SocketConfig::parse(&format!("{BASE}socket.notsent_lowat={value}")).unwrap();
+        assert_eq!(config.socket.notsent_lowat, value);
+        config.validate().unwrap();
+    }
+    for suffix in [
+        "socket.notsent_lowat=-1",
+        "socket.notsent_lowat=+1",
+        "socket.notsent_lowat=4294967296",
+        "socket.notsent_lowat=1.0",
+        "socket.notsent_lowat=0xffffffff",
+        "socket.notsent_lowat=",
+        "socket.notsent_lowat=4000\nsocket.notsent_lowat=4000",
+        "socket.notsent_lowat=0\nsocket.notsent_lowat=1",
+        "notsent_lowat=4000",
+        "tcp.notsent_lowat=4000",
+        "io.notsent_lowat=4000",
+        "socket.unknown=4000",
+    ] {
+        assert!(
+            SocketConfig::parse(&format!("{BASE}{suffix}")).is_err(),
+            "{suffix}"
+        );
+    }
+}
