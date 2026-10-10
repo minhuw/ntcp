@@ -28,6 +28,7 @@ struct State {
     capacity: usize,
     block: bool,
     block_port: Option<u16>,
+    block_after: Option<(u16, usize)>,
     rx_stamps: PacketTimestamps,
     interrupted: bool,
     cancel_error: Option<i32>,
@@ -84,6 +85,9 @@ impl PacketIo for Fixture {
         // Model native packet syscall EINTR: no packet or timestamp consumed.
         if state.interrupted
             || state.block
+            || state.block_after.is_some_and(|(port, limit)| {
+                state.sent.len() >= limit && bytes.get(34..36) == Some(&port.to_be_bytes())
+            })
             || state
                 .block_port
                 .is_some_and(|port| bytes.get(34..36) == Some(&port.to_be_bytes()))
@@ -118,6 +122,9 @@ impl PacketIo for Fixture {
         // Model native packet syscall EINTR: no packet or timestamp consumed.
         if state.interrupted
             || state.block
+            || state.block_after.is_some_and(|(port, limit)| {
+                state.sent.len() >= limit && bytes.get(34..36) == Some(&port.to_be_bytes())
+            })
             || state
                 .block_port
                 .is_some_and(|port| bytes.get(34..36) == Some(&port.to_be_bytes()))
@@ -1688,6 +1695,117 @@ fn deliver_scheduled(a: &mut Owner, b: &mut Owner, state: &Arc<Mutex<State>>) {
 }
 
 #[test]
+fn scheduled_unpaced_refills_within_one_service_even_at_capacity_one() {
+    for capacity in [1, 32] {
+        let (mut a, _, clients, _, state) = scheduled_pair(capacity);
+        let cid = connection(&a, clients[0]);
+        a.execute(clients[0], Op::Write(vec![7; 17000])).unwrap();
+        // The unpaced jumbo-MSS initial window admits two segments without ACKs.
+        a.service_egress().unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!(state.sent.len(), 2, "capacity {capacity}");
+        assert!(state.output_calls <= BUDGET);
+        let progress = a.endpoint.send_progress(cid).unwrap();
+        assert_eq!(
+            progress
+                .next_write_sequence
+                .wrapping_sub(progress.unacknowledged_sequence),
+            17000
+        );
+        assert!(a.output_wait() > std::time::Duration::ZERO);
+    }
+}
+
+#[test]
+fn scheduled_refill_after_accepting_a_held_retry() {
+    let (mut a, _, clients, _, state) = scheduled_pair(1);
+    a.execute(clients[0], Op::Write(vec![7; 17000])).unwrap();
+    state.lock().unwrap().block = true;
+    a.service_egress().unwrap();
+    assert!(state.lock().unwrap().sent.is_empty());
+    state.lock().unwrap().block = false;
+    advance(&mut a, 1000);
+    a.service_egress().unwrap();
+    assert_eq!(state.lock().unwrap().sent.len(), 2);
+    assert!(a.output_wait() > std::time::Duration::ZERO);
+}
+
+#[test]
+fn scheduled_refill_budget_leaves_eligible_work_awake_but_not_blocked_work() {
+    for capacity in [1, 32] {
+        let (mut a, _, clients, _, state) = scheduled_pair(capacity);
+        // Repair one already-selected jumbo obligation into > BUDGET frames.
+        state.lock().unwrap().enforce_mtu = true;
+        state.lock().unwrap().mtu = Some(200);
+        a.execute(clients[0], Op::Write(vec![7; 8000])).unwrap();
+        a.service_egress().unwrap();
+        a.endpoint.set_endpoint_first_hop_mtu(a.now(), 200).unwrap();
+        a.egress.as_mut().unwrap().mtu_refreshed();
+        state.lock().unwrap().output_calls = 0;
+        a.service_egress().unwrap();
+        assert_eq!(state.lock().unwrap().sent.len(), BUDGET);
+        assert_eq!(state.lock().unwrap().output_calls, BUDGET);
+        assert_eq!(a.output_wait(), std::time::Duration::ZERO);
+        state.lock().unwrap().block = true;
+        a.service_egress().unwrap();
+        assert_eq!(state.lock().unwrap().output_calls, BUDGET + 1);
+        assert!(a.output_wait() > std::time::Duration::ZERO);
+        a.service_egress().unwrap();
+        assert_eq!(state.lock().unwrap().output_calls, BUDGET + 1);
+    }
+}
+
+#[test]
+fn scheduled_refill_rotates_healthy_owners_at_capacity_one() {
+    let (mut a, _, clients, _, state) = scheduled_pair(1);
+    for id in clients {
+        a.execute(id, Op::Write(vec![7; 17000])).unwrap();
+    }
+    a.service_egress().unwrap();
+    let state = state.lock().unwrap();
+    assert_eq!(state.sent.len(), 4);
+    let ports: Vec<_> = state.sent.iter().map(|bytes| &bytes[34..36]).collect();
+    assert_ne!(ports[0], ports[1]);
+    assert_eq!(ports[0], ports[2]);
+    assert_eq!(ports[1], ports[3]);
+}
+
+#[test]
+fn scheduled_refill_shares_service_with_healthy_owner_while_one_is_blocked() {
+    let (mut a, _, clients, _, state) = scheduled_pair(2);
+    let held = connection(&a, clients[0]);
+    state.lock().unwrap().block_port = Some(a.endpoint.tuple(held).unwrap().local.port());
+    for id in clients {
+        a.execute(id, Op::Write(vec![7; 17000])).unwrap();
+    }
+    a.service_egress().unwrap();
+    assert!(a.endpoint.is_output_reserved(held));
+    assert_eq!(state.lock().unwrap().sent.len(), 2);
+    assert_eq!(state.lock().unwrap().output_calls, 3);
+    assert!(a.output_wait() > std::time::Duration::ZERO);
+}
+
+#[test]
+fn scheduled_refill_does_not_spin_on_pacing_candidates() {
+    let (mut a, _, client, _, state) = pmtud_paced_pair(
+        None,
+        Some(ntcp::PacingConfig {
+            max_burst_segments: 1,
+            max_bytes_per_second: Some(1_000_000),
+            ..Default::default()
+        }),
+    );
+    a.enable_egress(1).unwrap();
+    a.execute(client, Op::Write(vec![7; 17000])).unwrap();
+    a.service_egress().unwrap();
+    assert_eq!(state.lock().unwrap().sent.len(), 1);
+    assert!(a.output_wait() > std::time::Duration::ZERO);
+    a.service_egress().unwrap();
+    assert_eq!(state.lock().unwrap().output_calls, 1);
+    assert!(a.output_wait() > std::time::Duration::ZERO);
+}
+
+#[test]
 fn scheduled_blocked_owner_does_not_freeze_input_commands_timer_or_output() {
     let (mut a, mut b, clients, servers, state) = scheduled_pair(32);
     let held = connection(&a, clients[0]);
@@ -1840,6 +1958,14 @@ fn scheduled_mtu_prefix_repair_keeps_deadline_and_other_owner_alive() {
     );
     result.send(Ok(Some(1400))).unwrap();
     a.poll_mtu_refresh();
+    // Interleaved refill also attempts the suffix: block it after one prefix.
+    {
+        let mut state = state.lock().unwrap();
+        state.block_after = Some((
+            a.endpoint.tuple(held).unwrap().local.port(),
+            state.sent.len() + 1,
+        ));
+    }
     a.service_egress().unwrap();
     assert!(a.endpoint.is_output_reserved(held)); // Prefix accepted, suffix retained.
     assert!(state.lock().unwrap().sent.iter().all(|p| p.len() <= 1414));

@@ -9,6 +9,7 @@ struct Entry {
     timestamp: Option<ntcp::TxTimestampToken>,
     packet: Option<PacketId>,
     deadline: Option<u64>,
+    not_before: u64,
     waiting_mtu: bool,
 }
 struct TxSlot {
@@ -105,7 +106,10 @@ impl Egress {
     }
     pub(super) fn wait(&self, now: u64, core: Option<u64>) -> std::time::Duration {
         core.into_iter()
-            .chain(self.scheduler.next_wakeup())
+            .chain(self.tx.iter().filter_map(|s| {
+                let entry = s.entry.as_ref()?;
+                entry.packet.map(|_| entry.not_before)
+            }))
             .chain(self.tx.iter().filter_map(|s| s.entry.as_ref()?.deadline))
             .min()
             .map(|d| std::time::Duration::from_micros(d.saturating_sub(now)))
@@ -272,6 +276,7 @@ impl Owner {
                 timestamp: tx.tx_timestamp,
                 packet: None,
                 deadline: None,
+                not_before: now,
                 waiting_mtu: false,
             });
         }
@@ -279,6 +284,7 @@ impl Owner {
         let entry = slot.entry.as_mut().unwrap();
         entry.attempt = attempt;
         entry.timestamp = tx.tx_timestamp;
+        entry.not_before = now;
         entry.packet = Some(
             egress
                 .scheduler
@@ -300,22 +306,44 @@ impl Owner {
         let result = (|| {
             egress.candidates.clear();
             egress.candidates.extend(self.endpoint.ready_connections());
+            // Outstanding tickets are excluded from core readiness, but their
+            // owners can become ready as soon as this call accepts a retry.
+            for slot in &egress.tx {
+                if let Some(owner) = slot.entry.as_ref().and_then(|entry| entry.owner)
+                    && !egress.candidates.contains(&owner)
+                {
+                    egress.candidates.push(owner);
+                }
+            }
             // Rotate admission too: pacing/MTU-blocked candidates and stateless
             // traffic must not monopolize a full pool, even at capacity one.
             let lanes = egress.candidates.len() + 1;
-            for _ in 0..lanes.min(BUDGET) {
-                let at = egress.cursor % lanes;
-                egress.cursor = (at + 1) % lanes;
-                let owner = egress.candidates.get(at).copied();
-                self.select_egress(&mut egress, owner)?;
-            }
-            // A complete scan otherwise returns to the same first candidate:
-            // continuously ready TCP owners could starve the stateless lane.
-            if lanes <= BUDGET {
-                egress.cursor = (egress.cursor + 1) % lanes;
-            }
-            let mut visits = BUDGET;
-            for _ in 0..BUDGET {
+            // Bound both submission count and scheduler slot visits. Sparse pools
+            // need a full slot rotation between refills of the same flow.
+            let mut visits = BUDGET * egress.tx.len();
+            for submitted in 0..=BUDGET {
+                // One bounded admission scan per submission, plus one lookahead.
+                // Keep the cursor after the admitted lane so refill cannot jump
+                // ahead of another connection or the stateless lane.
+                for scanned in 0..lanes {
+                    let at = egress.cursor % lanes;
+                    egress.cursor = (at + 1) % lanes;
+                    let owner = egress.candidates.get(at).copied();
+                    let packets = egress.scheduler.usage().packets;
+                    self.select_egress(&mut egress, owner)?;
+                    if egress.scheduler.usage().packets > packets {
+                        break;
+                    }
+                    if scanned + 1 == lanes {
+                        egress.cursor = (egress.cursor + 1) % lanes;
+                    }
+                }
+                // Actually select the lookahead: ready_connections is only a
+                // candidate hint (pacing may veto it). wait sees queued EDTs,
+                // including immediately eligible work after either budget ends.
+                if submitted == BUDGET {
+                    break;
+                }
                 let now = self.now();
                 let (token, index) = match egress
                     .scheduler
@@ -372,12 +400,13 @@ impl Owner {
                         entry
                             .deadline
                             .get_or_insert(now.saturating_add(self.reservation_timeout_us));
+                        entry.not_before = now.saturating_add(1000);
                         egress
                             .scheduler
                             .resolve(
                                 token,
                                 Outcome::Retry {
-                                    not_before: now.saturating_add(1000),
+                                    not_before: entry.not_before,
                                 },
                             )
                             .map_err(|_| EIO)?;
