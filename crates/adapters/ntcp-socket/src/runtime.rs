@@ -112,8 +112,6 @@ pub struct Runtime {
     pub wake: i32,
     pub family: i32,
     pub io_limit: usize,
-    #[cfg(feature = "packet-test")]
-    packet: bool,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -144,8 +142,6 @@ impl Runtime {
             wake,
             family: AF_INET,
             io_limit: BYTES,
-            #[cfg(feature = "packet-test")]
-            packet: false,
             stop: Default::default(),
             worker: Mutex::new(None),
         }
@@ -224,8 +220,6 @@ impl Runtime {
             wake,
             family: AF_INET,
             io_limit: if packet { 65535 } else { BYTES },
-            #[cfg(feature = "packet-test")]
-            packet,
             stop,
             worker: Mutex::new(Some(worker)),
         })
@@ -240,8 +234,7 @@ impl Runtime {
         }
     }
     pub fn call(&self, id: u64, op: Op) -> Result<Reply> {
-        #[cfg(feature = "packet-test")]
-        if self.packet && matches!(op, Op::Close) {
+        if matches!(op, Op::Close) {
             // Last-close has removed the public fd already. Retry bounded owner
             // admission rather than leaking its socket; do not block capture
             // behind a channel parked on full deferred commands.
@@ -705,9 +698,18 @@ impl Owner {
         false
     }
     fn admission_full(&self, request: &Request) -> bool {
-        self.pending.len() == self.socket_limit()
-            && !self.admission_command(&request.op)
-            && (self.packet_backend() || !matches!(request.op, Op::Close))
+        if self.admission_command(&request.op) {
+            return false;
+        }
+        // Reserve a separate, bounded allowance for teardown: ordinary waiters
+        // may need Close to cancel them. Both classes stay within socket_limit,
+        // including closes deferred by held output or awaiting FIN submission.
+        let closing = matches!(request.op, Op::Close);
+        self.pending
+            .iter()
+            .filter(|r| matches!(r.op, Op::Close) == closing)
+            .count()
+            >= self.socket_limit()
     }
     fn frame(&self, tx: ntcp::Transmit, tcp: &[u8]) -> Result<Vec<u8>> {
         let mut packet = vec![0; 20 + tcp.len()];
@@ -938,13 +940,12 @@ impl Owner {
             }
             // Bounded owner work and a 1ms ceiling also cover shared wakefd consumers.
             let wait = self.output_wait();
-            // Leave excess commands in the bounded channel, including Close. Never
-            // grow the deferred queue or leak OutputReserved to unrelated sockets.
-            // Memory backend admission must remain serviceable: capture frees TX.
+            // Keep admission open while teardown has room; packet capture must
+            // always remain reachable to free held output.
             if !self.packet_backend()
+                && self.pending.len() >= 2 * self.socket_limit()
                 && (self.reservation.is_some()
                     || self.egress.as_ref().is_some_and(|e| e.has_held()))
-                && self.pending.len() >= self.socket_limit()
             {
                 std::thread::sleep(wait);
                 continue;
@@ -961,13 +962,6 @@ impl Owner {
                     #[cfg(not(feature = "packet-test"))]
                     let requests = BUDGET;
                     for _ in 1..requests {
-                        if !self.packet_backend()
-                            && (self.reservation.is_some()
-                                || self.egress.as_ref().is_some_and(|e| e.has_held()))
-                            && self.pending.len() >= self.socket_limit()
-                        {
-                            break;
-                        }
                         let Ok(mut r) = rx.try_recv() else {
                             break;
                         };
@@ -2953,8 +2947,6 @@ mod tests {
             wake: -1,
             family: AF_INET,
             io_limit: BYTES,
-            #[cfg(feature = "packet-test")]
-            packet: false,
             stop: Default::default(),
             worker: Mutex::new(None),
         };
@@ -3139,3 +3131,7 @@ mod tests {
 #[cfg(all(test, feature = "packet-test"))]
 #[path = "packet_tests.rs"]
 mod packet_tests;
+
+#[cfg(test)]
+#[path = "runtime_admission_tests.rs"]
+mod admission_tests;

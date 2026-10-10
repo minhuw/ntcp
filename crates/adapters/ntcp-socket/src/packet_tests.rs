@@ -2949,7 +2949,6 @@ fn descriptor_and_request_limits_fail_without_hanging() {
         wake: -1,
         family: AF_INET,
         io_limit: BYTES,
-        packet: true,
         stop: Default::default(),
         worker: Mutex::new(None),
     };

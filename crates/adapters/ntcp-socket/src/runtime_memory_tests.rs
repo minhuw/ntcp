@@ -303,7 +303,6 @@ fn last_close_retries_full_admission_instead_of_leaking_removed_fd() {
         wake,
         family: AF_INET,
         io_limit: 65535,
-        packet: true,
         stop: Default::default(),
         worker: Mutex::new(None),
     };
