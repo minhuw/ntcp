@@ -512,3 +512,177 @@ fn fast_open_reserved_syn_preserves_last_close_output_barrier() {
     assert!(a.service(&mut request));
     rx.recv().unwrap().unwrap();
 }
+
+#[test]
+fn fast_open_early_child_snapshots_zerocopy_and_completes_both_handshake_sides() {
+    let (mut a, mut b, listener) = tfo_setup(true);
+    b.execute(listener, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 1))
+        .unwrap();
+    b.execute(listener, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
+        .unwrap();
+    let client = new(&mut a, SOCK_NONBLOCK);
+    assert_eq!(
+        a.execute(client, tfo_send(b"request", MSG_FASTOPEN))
+            .unwrap()
+            .value,
+        7
+    );
+    tfo_deliver(&mut b, tfo_capture(&mut a));
+    // Changing the listener after early eligibility must not change the snapshot.
+    b.execute(listener, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 0))
+        .unwrap();
+    let server = b
+        .execute(listener, Op::Accept(SOCK_NONBLOCK))
+        .unwrap()
+        .value as u64;
+    let connection = cid(&b, server);
+    assert_eq!(b.endpoint.state(connection).unwrap(), State::SynReceived);
+    assert_eq!(
+        b.execute(server, Op::Get(SOL_SOCKET, SO_ZEROCOPY))
+            .unwrap()
+            .value,
+        1
+    );
+    assert_eq!(
+        b.connection_options
+            .iter()
+            .find(|p| p.0 == connection)
+            .unwrap()
+            .3,
+        Some(true)
+    );
+    assert_eq!(b.execute(server, Op::Read(7)).unwrap().bytes, b"request");
+    assert_eq!(
+        b.execute(
+            server,
+            Op::Send(vec![(b"early".as_ptr() as usize, 5)], MSG_ZEROCOPY)
+        )
+        .unwrap()
+        .value,
+        5
+    );
+    assert_eq!(b.sockets[&server].zc_next, 1);
+    assert_eq!(b.sockets[&server].zc_reserved, 0);
+    assert_eq!(
+        b.sockets[&server]
+            .completions
+            .iter()
+            .filter_map(Completion::range)
+            .collect::<Vec<_>>(),
+        [(0, 0)]
+    );
+    assert_ne!(b.execute(server, Op::Ready).unwrap().value & EPOLLERR, 0);
+    assert_eq!(b.endpoint.transport_info(connection).unwrap().send_used, 5);
+    let early_end = b.endpoint.send_progress(connection).unwrap().queued_end;
+    let syn_ack = tfo_capture(&mut b);
+    assert!(segment(&syn_ack).payload.is_empty());
+    tfo_no_output(&mut b);
+    tfo_deliver(&mut a, syn_ack);
+    let ack = tfo_capture(&mut a);
+    assert_eq!(segment(&ack).header.flags & ntcp::wire::SYN, 0);
+    tfo_no_output(&mut b);
+    tfo_deliver(&mut b, ack);
+    assert_eq!(b.endpoint.state(connection).unwrap(), State::Established);
+    exchange(&mut a, &mut b);
+    assert_eq!(a.execute(client, Op::Read(5)).unwrap().bytes, b"early");
+    assert_eq!(
+        b.execute(
+            server,
+            Op::Send(vec![(b"later!".as_ptr() as usize, 6)], MSG_ZEROCOPY)
+        )
+        .unwrap()
+        .value,
+        6
+    );
+    assert_eq!(
+        b.execute(server, Op::Get(SOL_SOCKET, SO_ZEROCOPY))
+            .unwrap()
+            .value,
+        1
+    );
+    assert_eq!(b.sockets[&server].zc_next, 2);
+    assert_eq!(b.sockets[&server].zc_reserved, 0);
+    assert_eq!(
+        b.sockets[&server]
+            .completions
+            .iter()
+            .filter_map(Completion::range)
+            .collect::<Vec<_>>(),
+        [(0, 1)]
+    );
+    assert_eq!(
+        b.endpoint.send_progress(connection).unwrap().queued_end,
+        early_end + 6
+    );
+    exchange(&mut a, &mut b);
+    assert_eq!(a.execute(client, Op::Read(6)).unwrap().bytes, b"later!");
+}
+
+#[test]
+fn fast_open_listener_keeps_ordinary_zerocopy_snapshot_at_final_ack() {
+    for initial in [0, 1] {
+        let (mut a, mut b, listener) = tfo_setup(false);
+        b.execute(listener, Op::Set(SOL_SOCKET, SO_ZEROCOPY, initial))
+            .unwrap();
+        let client = new(&mut a, SOCK_NONBLOCK);
+        assert_eq!(
+            a.execute(client, Op::Connect("192.0.2.2:8080".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        tfo_deliver(&mut b, tfo_capture(&mut a));
+        assert!(b.connection_options.iter().all(|p| p.3.is_none()));
+        b.execute(listener, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 1 - initial))
+            .unwrap();
+        exchange(&mut a, &mut b);
+        b.execute(listener, Op::Set(SOL_SOCKET, SO_ZEROCOPY, initial))
+            .unwrap();
+        let server = b
+            .execute(listener, Op::Accept(SOCK_NONBLOCK))
+            .unwrap()
+            .value as u64;
+        assert_eq!(
+            b.execute(server, Op::Get(SOL_SOCKET, SO_ZEROCOPY))
+                .unwrap()
+                .value,
+            1 - initial
+        );
+    }
+}
+
+#[test]
+fn fast_open_blocking_send_reset_finishes_with_error_or_accepted_prefix() {
+    for warm in [false, true] {
+        let (mut a, mut b, listener) = tfo_setup(warm);
+        let client = new(&mut a, 0);
+        let (reply, rx) = mpsc::sync_channel(1);
+        let mut request = Request {
+            id: client,
+            op: Op::Wait(Box::new(tfo_send(b"hi", MSG_FASTOPEN)), None),
+            reply,
+            deadline: None,
+            send: None,
+            closing: None,
+        };
+        assert!(!a.service(&mut request));
+        assert_eq!(
+            request.send.as_ref().unwrap().accepted,
+            if warm { 2 } else { 0 }
+        );
+        // A closed destination produces the valid RST+ACK required in SynSent.
+        b.execute(listener, Op::Close).unwrap();
+        tfo_deliver(&mut b, tfo_capture(&mut a));
+        let reset = tfo_capture(&mut b);
+        assert_ne!(segment(&reset).header.flags & ntcp::wire::RST, 0);
+        tfo_deliver(&mut a, reset);
+        assert!(a.service(&mut request));
+        assert!(request.send.is_none());
+        let result = rx.try_recv().expect("reset must finish the blocked send");
+        if warm {
+            // The copied SYN prefix was already accepted before the reset.
+            assert_eq!(result.unwrap().value, 2);
+        } else {
+            assert_eq!(result.unwrap_err(), ECONNREFUSED);
+        }
+    }
+}

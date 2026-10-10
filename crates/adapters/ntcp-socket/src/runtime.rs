@@ -1139,10 +1139,13 @@ impl Owner {
                 self.endpoint.set_dscp(cid, tos >> 2)?;
                 self.connection_options.push((cid, tos, discover, None));
             }
-            if matches!(
-                self.endpoint.state(cid),
-                Ok(State::Established | State::CloseWait)
-            ) && let Some(p) = self.connection_options.iter_mut().find(|p| p.0 == cid)
+            // Snapshot at accept eligibility, before the adapter publishes the
+            // child. Only authenticated TFO data is readable in SynReceived;
+            // ordinary children retain their final-handshake-ACK snapshot.
+            let state = self.endpoint.state(cid);
+            if (matches!(state, Ok(State::Established | State::CloseWait))
+                || state == Ok(State::SynReceived) && self.endpoint.readable_bytes(cid)? != 0)
+                && let Some(p) = self.connection_options.iter_mut().find(|p| p.0 == cid)
                 && p.3.is_none()
             {
                 p.3 = listener_options.map(|p| p.2);
