@@ -1,0 +1,60 @@
+--- a/gtests/net/packetdrill/code.c
++++ b/gtests/net/packetdrill/code.c
+@@ -761,43 +761,20 @@
+ 	int fd = state->socket_under_test->fd.live_fd;
+ 	struct code_state *code = state->code;
+ 
+-	void *data = NULL;
+-	void *data_ext = NULL;
+-	void *data_meminfo = NULL;
+-	int  data_len = 0;
+-#if HAVE_TCP_INFO
+-	code->data_type = DATA_TCP_INFO;
+-	data = get_data(state, event, fd, code->data_type, &data_len);
+-	if (data)
+-		append_data(code, code->data_type, data, data_len);
+-#endif  /* HAVE_TCP_INFO */
+-	if (data == NULL && data_ext == NULL) {
+-		asprintf(&error,
+-			 "can't find getsockopt to get TCP info");
+-		goto error_out;
+-	}
+-#if HAVE_TCP_CC_INFO
+-	code->data_type = DATA_TCP_CC_INFO;
+-	data = get_data(state, event, fd, code->data_type, &data_len);
+-	if (data) {
+-		append_data(code, code->data_type, data, data_len);
+-	} else {
+-		asprintf(&error,
+-			 "can't find getsockopt to get TCP_CC_INFO");
+-		goto error_out;
+-	}
+-#endif  /* HAVE_TCP_CC_INFO */
+-#if HAVE_SO_MEMINFO
+-	code->data_type = DATA_SO_MEMINFO;
+-	data_meminfo = get_data(state, event, fd, code->data_type, &data_len);
+-	if (data_meminfo)
+-		append_data(code, code->data_type, data_meminfo, data_len);
+-	if (data_meminfo == NULL) {
+-		asprintf(&error,
+-			 "can't find getsockopt to get sk_meminfo");
+-		goto error_out;
+-	}
+-#endif
++	/* data_type is the user's selection, not the last collected metric. */
++	for (enum code_data_t type = DATA_NONE + 1;
++	     type < DATA_NUM_TYPES; ++type) {
++		if (code->data_type != DATA_NONE && code->data_type != type)
++			continue;
++		int data_len = 0;
++		void *data = get_data(state, event, fd, type, &data_len);
++		if (data == NULL) {
++			asprintf(&error, "can't get requested code socket data (type %d)",
++				 type);
++			goto error_out;
++		}
++		append_data(code, type, data, data_len);
++	}
+ 
+ 	append_text(code, state->config->script_path, event->line_number,
+ 		    strdup(text));

@@ -599,6 +599,69 @@ class AdaptationChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'unsupported TCP_INFO'):
             adapt_source(self.directory, self.name, self.manifest, self.flags)
 
+    def test_explicit_runner_selection_and_checks_around_execution(self):
+        checkout = Path(self.temporary.name)
+        runner = checkout / PIN['runner']
+        runner.parent.mkdir(parents=True)
+        runner.write_text('default runner')
+        runner.chmod(0o700)
+        patched = checkout / 'patched-runner'
+        patched.write_text('audited runner')
+        patched.chmod(0o700)
+        plugin = checkout / 'plugin.so'
+        plugin.write_text('plugin')
+        manifest_dir = checkout / 'manifest'
+        manifest_dir.mkdir()
+        report = checkout / 'report.json'
+        entry = self.manifest['scripts'][self.name]
+        entry['embedded_tcp_info'] = True
+        tracked = '\0'.join(str(Path(PIN['tcp_tests']) / name)
+                            for name in self.manifest['scripts'])
+        argv = ['run.py', '--checkout', str(checkout), '--plugin', str(plugin),
+                '--suite', 'adapted', '--variant', 'ipv4', '--script', self.name,
+                '--report', str(report)]
+        provenance = {'audited': True}
+        with patch('run.HERE', manifest_dir), \
+                patch('run.check_checkout', return_value=PIN['revision']), \
+                patch('run.subprocess.check_output', return_value=tracked):
+            for override, snippet in ((False, b'assert tcpi_lost == 0'),
+                                      (True, b'assert tcpi_lost == 0'),
+                                      (True, b'assert SK_MEMINFO_RMEM_ALLOC == 0')):
+                original = self.source + b'0 %{ ' + snippet + b' }%\n'
+                (self.directory / self.name).write_bytes(original)
+                entry['source_sha256'] = hashlib.sha256(original).hexdigest()
+                (manifest_dir / 'adaptations.json').write_text(json.dumps(self.manifest))
+                omitted = b'SK_MEMINFO' in snippet
+                with patch.object(sys, 'argv', argv + (
+                        ['--runner', str(patched)] if override else [])), \
+                        patch('run.runner_provenance', return_value=provenance) as audit, \
+                        patch('run.invoke', return_value=(0, False, '')) as execute:
+                    self.assertEqual(main(), 1 if omitted else 0)
+                data = json.loads(report.read_text())
+                self.assertEqual(data['runner_path'], str(patched if override else runner))
+                self.assertEqual(data['runner_provenance'], provenance if override else None)
+                if omitted:
+                    execute.assert_not_called()
+                    self.assertFalse(data['all_passed'])
+                else:
+                    self.assertEqual('--code_sockopt=TCP_INFO' in execute.call_args.args[0], override)
+                if not override:
+                    audit.assert_not_called()
+            # A changed artifact must abort before/after both dry-run and behavior.
+            original = self.source + b'0 %{ assert tcpi_lost == 0 }%\n'
+            (self.directory / self.name).write_bytes(original)
+            entry['source_sha256'] = hashlib.sha256(original).hexdigest()
+            (manifest_dir / 'adaptations.json').write_text(json.dumps(self.manifest))
+            for changed_at, invocations in ((2, 0), (3, 1), (4, 1), (5, 2)):
+                with patch.object(sys, 'argv', argv + ['--runner', str(patched)]), \
+                        patch('run.runner_provenance', side_effect=(
+                            [provenance] * (changed_at - 1) + [ValueError('artifact changed')])), \
+                        patch('run.invoke', return_value=(0, False, '')) as execute:
+                    with self.assertRaises(SystemExit) as error:
+                        main()
+                    self.assertEqual(error.exception.code, 2)
+                    self.assertEqual(execute.call_count, invocations)
+
     def test_source_and_setup_changes_rejected_with_same_revision(self):
         for relative in (self.name, 'common/defaults.sh'):
             path = self.directory / relative

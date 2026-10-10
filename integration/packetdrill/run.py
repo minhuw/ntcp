@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import ast
 import collections
 import hashlib
 import json
@@ -72,6 +73,47 @@ TCP_INFO_FIELDS = {'tcpi_ca_state', 'tcpi_unacked', 'tcpi_sacked',
                    'tcpi_rwnd_limited', 'tcpi_sndbuf_limited'}
 
 
+TCP_INFO_SYMBOLS = {'TCP_CA_Open', 'TCP_CA_Disorder', 'TCP_CA_CWR',
+                    'TCP_CA_Recovery', 'TCP_CA_Loss'}
+
+
+def tcp_info_only(text):
+    # Fail closed: only simple assertions over audited fields/constants. No
+    # calls, imports, assignments, dynamic lookup or exception suppression.
+    snippets = re.findall(r'%\{(.*?)\}%', text, re.S)
+    if not snippets or text.count('%{') != len(snippets) or text.count('}%') != len(snippets):
+        return False
+    allowed = (ast.Module, ast.Assert, ast.Compare, ast.Name, ast.Load,
+               ast.Constant, ast.BinOp, ast.UnaryOp, ast.BoolOp,
+               ast.cmpop, ast.operator, ast.unaryop, ast.boolop)
+    for snippet in snippets:
+        try:
+            tree = ast.parse(snippet.strip() + "\n\n")
+        except SyntaxError:
+            return False
+        if not tree.body or any(not isinstance(node, ast.Assert) for node in tree.body):
+            return False
+        for node in ast.walk(tree):
+            if not isinstance(node, allowed):
+                return False
+            if isinstance(node, ast.Name) and node.id not in TCP_INFO_FIELDS | TCP_INFO_SYMBOLS:
+                return False
+    return True
+
+
+def runner_provenance(runner):
+    provenance = json.loads(runner.with_suffix('.provenance.json').read_bytes())
+    expected = {
+        'source_revision': PIN['revision'],
+        'patch_sha256': hashlib.sha256((HERE / 'code-sockopt.patch').read_bytes()).hexdigest(),
+        'build_helper_sha256': hashlib.sha256((HERE / 'build_runner.py').read_bytes()).hexdigest(),
+        'executable_sha256': hashlib.sha256(runner.read_bytes()).hexdigest(),
+    }
+    if provenance != expected:
+        raise ValueError('patched runner provenance differs from audited build')
+    return provenance
+
+
 def preflight(text, embedded_tcp_info=False):
     # Conservative safety/capability screening, NOT a second packetdrill parser.
     # Upstream --dry_run remains the authority for script syntax.
@@ -82,6 +124,8 @@ def preflight(text, embedded_tcp_info=False):
         reasons.append('shell setup/assertions target Linux, not the ntcp backend')
     if '%{' in text or '}%' in text:
         if embedded_tcp_info:
+            if not tcp_info_only(text):
+                reasons.append('embedded code is not limited to audited TCP_INFO assertions')
             unknown = set(re.findall(r'\btcpi_\w+\b', text)) - TCP_INFO_FIELDS
             if unknown:
                 reasons.append('embedded code requires unsupported TCP_INFO fields: '
@@ -270,6 +314,8 @@ def select_cases(scripts, directory, suite, selected_variants=None, selected_scr
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkout', required=True, type=Path)
+    parser.add_argument('--runner', type=Path,
+                        help='explicit patched executable produced by build_runner.py')
     parser.add_argument('--plugin', type=Path,
                         default=ROOT / 'target/debug/libntcp_packetdrill.so')
     parser.add_argument('--suite', choices=['smoke', 'sack', 'upstream', 'adapted'], default='smoke')
@@ -295,7 +341,24 @@ def main():
         revision = check_checkout(checkout)
     except (ValueError, subprocess.SubprocessError, OSError) as error:
         parser.error(str(error))
-    runner = checkout / PIN['runner']
+    runner = args.runner.resolve() if args.runner else checkout / PIN['runner']
+    try:
+        provenance = runner_provenance(runner) if args.runner else None
+    except (ValueError, OSError) as error:
+        parser.error(str(error))
+
+    def check_runner():
+        try:
+            if provenance is not None and runner_provenance(runner) != provenance:
+                raise ValueError('patched runner changed during execution')
+        except (ValueError, OSError) as error:
+            parser.error(str(error))
+
+    def invoke_runner(argv, cwd, timeout):
+        check_runner()
+        result = invoke(argv, cwd, timeout)
+        check_runner()
+        return result
     if not runner.is_file() or not os.access(runner, os.X_OK):
         parser.error(f'build the pinned external runner first: {runner}')
     if not plugin.is_file():
@@ -376,7 +439,7 @@ def main():
                     row.update(status='adaptation_rejected', reasons=[str(error)])
             if 'status' not in row:
                 row['stage'] = 'syntax'
-                code, expired, log = invoke(
+                code, expired, log = invoke_runner(
                     [str(runner), '--dry_run', *flags, str(execution_script)],
                     execution_script.parent, args.timeout)
                 row['syntax_returncode'] = code
@@ -398,9 +461,13 @@ def main():
                         # Teardown and direct libc calls must share the plugin's socket registry.
                         preload = ['env', 'PYTHONOPTIMIZE=0', f'LD_PRELOAD={plugin}']
                         row['effective_flags']['preload'] = str(plugin)
+                        code_flags = (['--code_sockopt=TCP_INFO']
+                                      if provenance is not None and embedded_tcp_info
+                                      and tcp_info_only(text) else [])
+                        row['effective_flags']['packetdrill'] = [*flags, *code_flags]
                         argv = ['unshare', '--user', '--map-root-user', '--net',
                                 *preload, str(runner), f'--so_filename={plugin}',
-                                f'--so_flags={so_flags}', *flags, str(execution_script)]
+                                f'--so_flags={so_flags}', *flags, *code_flags, str(execution_script)]
                         fixture = row.get('adaptation', {}).get('fixture')
                         if fixture:
                             try:
@@ -414,7 +481,7 @@ def main():
                             row['effective_flags']['fixture'] = fixture
                         try:
                             check_plugin_hash(plugin, plugin_sha256)
-                            code, expired, log = invoke(argv, execution_script.parent, args.timeout)
+                            code, expired, log = invoke_runner(argv, execution_script.parent, args.timeout)
                             check_plugin_hash(plugin, plugin_sha256)
                         except (ValueError, OSError) as error:
                             parser.error(str(error))
@@ -434,6 +501,7 @@ def main():
         check_plugin_hash(plugin, plugin_sha256)
     except (ValueError, OSError) as error:
         parser.error(str(error))
+    check_runner()
     counts = dict(collections.Counter(row['status'] for row in results))
     report = {'upstream_revision': revision, 'suite': args.suite,
               'adapter_flags': args.so_flags, 'script_files': selected_script_files,
@@ -445,6 +513,7 @@ def main():
               'syntax_valid': sum(row['syntax_returncode'] == 0 for row in results),
               'behavior_executed': sum(row['behavior_executed'] for row in results),
               'runner_path': str(runner),
+              'runner_provenance': provenance,
               'runner_sha256': hashlib.sha256(runner.read_bytes()).hexdigest(),
               'plugin_path': str(plugin),
               'plugin_sha256': plugin_sha256,
