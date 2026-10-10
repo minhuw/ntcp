@@ -315,9 +315,10 @@ fn typed_core_settings_reach_native_connections() {
 #[test]
 fn packet_profiles_ignore_native_socket_defaults() {
     use crate::packet_profile::Profile;
-    for profile in [Profile::Baseline, Profile::UpstreamCubic] {
+    for profile in [Profile::Baseline, Profile::UpstreamCubic, Profile::UpstreamCubicEcn] {
         let local = Ipv4Addr::new(10, 73, 0, 2);
         let mut owner = Owner::packet((local, profile)).unwrap();
+        assert_eq!(owner.batch_time().is_some(), profile != Profile::Baseline);
         owner.defaults.connection.send_capacity = 123;
         owner.defaults.connection.receive_capacity = 456;
         owner.defaults.connection.nagle = false;

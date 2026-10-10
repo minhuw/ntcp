@@ -1098,6 +1098,11 @@ impl Congestion {
         self.fast_recovery
     }
 
+    // ECN response epoch, independent of the next fresh packet's CWR signal.
+    pub(crate) fn in_ecn_response(&self) -> bool {
+        self.ecn_end.is_some()
+    }
+
     pub(crate) fn in_recovery(&self) -> bool {
         self.sack_recovery || self.fast_recovery
     }

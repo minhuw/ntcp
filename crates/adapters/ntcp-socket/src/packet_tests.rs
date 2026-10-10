@@ -703,7 +703,14 @@ fn profiles_require_one_selection_and_one_ipv4_address() {
         profile("upstream-cubic,local=192.0.2.1").unwrap(),
         (local(), Profile::UpstreamCubic)
     );
+    assert_eq!(
+        profile("upstream-cubic-ecn,local=192.0.2.1").unwrap(),
+        (local(), Profile::UpstreamCubicEcn)
+    );
     for flags in [
+        "upstream-cubic-ecn",
+        "upstream-cubic-ecn,upstream-cubic,local=192.0.2.1",
+        "upstream-cubic-ecn,upstream-cubic-ecn,local=192.0.2.1",
         "upstream-cubic",
         "upstream-cubic,upstream-sack,local=192.0.2.1",
         "upstream-cubic,upstream-cubic,local=192.0.2.1",
@@ -3016,4 +3023,14 @@ fn owner_loop_preserves_pending_send_read_fifo_on_refused_handshake() {
             .err(),
         Some(ENOTCONN)
     );
+}
+
+#[test]
+fn cubic_ecn_profile_changes_only_ecn_enablement() {
+    let cubic = crate::packet_profile::config(Profile::UpstreamCubic);
+    let mut ecn = crate::packet_profile::config(Profile::UpstreamCubicEcn);
+    assert!(!cubic.connection.ecn);
+    assert!(ecn.connection.ecn);
+    ecn.connection.ecn = false;
+    assert_eq!(format!("{ecn:?}"), format!("{cubic:?}"));
 }

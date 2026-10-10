@@ -173,6 +173,15 @@ def adapt_source(directory, relative, manifest, so_flags):
                   and so_flags == 'upstream-ecn,local=192.168.0.1'
                   and entry['mapping']['ntcp_settings'].get('ecn') is True
                   and entry.get('command_sha256') == hashlib.sha256(command).hexdigest())
+    passive_ecn_command = (b'`../common/defaults.sh\n'
+                           b'sysctl -q net.ipv4.tcp_ecn=2    # server agrees to ECN if client proposes it\n`\n')
+    passive_ecn_mapped = (
+        relative == 'cwnd_moderation/cwnd-moderation-ecn-enter-cwr-no-moderation-700.pkt'
+        and command == passive_ecn_command
+        and so_flags == 'upstream-cubic-ecn,local=192.168.0.1'
+        and entry['mapping']['ntcp_settings'].get('ecn') is True
+        and entry['mapping'].get('ecn_scope') == 'passive listener in this exact script only'
+        and entry.get('command_sha256') == hashlib.sha256(command).hexdigest())
     fixture_mapped = (relative == 'sendfile/sendfile-simple.pkt'
                       and command == SENDFILE_SETUP
                       and entry.get('fixture') == SENDFILE_FIXTURE
@@ -185,7 +194,7 @@ def adapt_source(directory, relative, manifest, so_flags):
             or not (command in (b'`../common/defaults.sh`\n',
                                 b'`../common/defaults.sh\n`\n',
                                 b'`../../common/defaults.sh`\n',
-                                b'`../../common/defaults.sh\n`\n') or ecn_mapped or fixture_mapped)
+                                b'`../../common/defaults.sh\n`\n') or ecn_mapped or passive_ecn_mapped or fixture_mapped)
             or replacement != b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n'
             or entry['expected_command_count'] != 1
             or source.count(command) != 1
@@ -414,11 +423,11 @@ def main():
             # ntcp-socket packet-test owner policy, not measured timing or a pass claim.
             row['effective_flags']['transport_clock'] = 'monotonic Instant elapsed microseconds'
             row['effective_flags']['prr_pacing'] = (
-                profile != 'upstream-cubic' if profile in {
+                profile not in {'upstream-cubic', 'upstream-cubic-ecn'} if profile in {
                     'baseline', 'sack', 'upstream-window8', 'upstream-sack',
-                    'upstream-ecn', 'upstream-basic', 'upstream-cubic'} else None)
+                    'upstream-ecn', 'upstream-basic', 'upstream-cubic', 'upstream-cubic-ecn'} else None)
             row['effective_flags']['transmit_batch_clock'] = (
-                'one monotonic sample per owner output batch' if profile == 'upstream-cubic'
+                'one monotonic sample per owner output batch' if profile in {'upstream-cubic', 'upstream-cubic-ecn'}
                 else 'monotonic sample per transmit')
             execution_script = script
             if manifest is not None:

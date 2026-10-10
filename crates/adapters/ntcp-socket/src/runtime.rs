@@ -650,11 +650,13 @@ impl Owner {
     }
     fn batch_time(&self) -> Option<u64> {
         #[cfg(feature = "packet-test")]
-        if self
-            .packets
-            .as_ref()
-            .is_some_and(|p| p.profile == crate::packet_profile::Profile::UpstreamCubic)
-        {
+        if self.packets.as_ref().is_some_and(|p| {
+            matches!(
+                p.profile,
+                crate::packet_profile::Profile::UpstreamCubic
+                    | crate::packet_profile::Profile::UpstreamCubicEcn
+            )
+        }) {
             return Some(self.now());
         }
         None

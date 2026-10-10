@@ -75,14 +75,18 @@ fn cubic_ecn_loss_tlp_and_rto_share_existing_epoch_guards() {
         for base in [Seq(1), Seq(u32::MAX - 4999)] {
             let end = base.wrapping_add(10_000);
             let mut c = controller(recovery, 1000);
+            assert!(!c.in_ecn_response());
             assert!(c.on_ecn(base, 10_000, end));
+            assert!(c.in_ecn_response());
             assert_eq!((c.cwnd, c.ssthresh), (7000, 7000));
             assert!(!c.on_ecn(end, 7000, end));
             // Real loss still enters recovery but shares the ECN reduction.
             assert!(c.on_sack_recovery(base, 7000, end));
             assert_eq!(c.ssthresh, 7000);
+            assert!(c.in_recovery() && c.in_ecn_response());
             c.on_timeout(7000, end);
             assert_eq!((c.cwnd, c.ssthresh), (1000, 7000));
+            assert!(!c.in_ecn_response());
             c.on_timeout(3000, end);
             assert_eq!(c.ssthresh, 7000);
 

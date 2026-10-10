@@ -1743,7 +1743,7 @@
       "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
       "variant": "ipv4",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-cubic,local=192.168.0.1",
+      "adapter_flags": "upstream-cubic-ecn,local=192.168.0.1",
       "source_sha256": "dca2ea623ec4a480e24a2eb522a6b982741ae663e21a46a53f9cc3e477ea4d9d",
       "expected_command_count": 1,
       "command_line": "`../common/defaults.sh\nsysctl -q net.ipv4.tcp_ecn=2    # server agrees to ECN if client proposes it\n`\n",
@@ -1762,32 +1762,31 @@
           "rto_min_us": 200000,
           "preallocate_connections": 1,
           "receive_capacity": 8388608,
-          "ecn": false,
+          "ecn": true,
           "congestion_control": "Cubic",
           "output_push_batch_segments": 2,
           "cubic_hystart": true,
           "cubic_fast_convergence": true,
           "endpoint_max_buffer_bytes": 134217728
         },
-        "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
+        "claim": "Passive ECN negotiation with actual CUBIC; Linux mode 2 active-open equivalence and CWR PRR equivalence are not claimed.",
         "reasons": [
-          "Linux tcp_ecn=2 passive-only ECN negotiation and CUBIC CWR/PRR behavior have no audited adapter setup mapping; UpstreamCubic disables ECN and upstream-ecn is not CUBIC.",
-          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained.",
-          "Selected CUBIC uses RFC 9406 HyStart++ initial startup and RFC 9438 fast convergence. Legacy Linux HyStart exit and application-limited growth expectations remain unchanged in the script.",
-          "UpstreamCubic alone uses a bounded 128 MiB aggregate buffer budget, including retained storage, staged SO_SNDBUF growth and preallocation. The three diagnostic scripts requesting SO_SNDBUF=200000 receive a doubled 400000-byte send quota; their resize peak fits this budget. Other packetdrill profiles remain at 32 MiB; core and normal socket defaults are unchanged. This is not Linux skb memory accounting; larger or concurrent requests can still fail with ENOBUFS."
-        ]
+          "Exact defaults.sh plus tcp_ecn=2 setup maps only this passive listener to ECN-enabled UpstreamCubicEcn. The client proposes ECN; no active open occurs. This profile would also propose ECN on active open and is not a global Linux mode 2 implementation.",
+          "UpstreamCubicEcn retains UpstreamCubic defaults, RFC 9937 loss recovery, test-only unpaced output batches and a bounded 128 MiB aggregate buffer budget. Only ECN enablement differs; Linux defaults are not reproduced.",
+          "TCP_INFO CWR reports the active core ECN response epoch, below loss/recovery and above disorder. It is not inferred from negotiation or a pending CWR packet. ECN currently reduces cwnd immediately from actual flight without starting PRR; Linux temporary CWR admission-window equivalence is not claimed.",
+          "Only the exact audited setup command is replaced. All packet, syscall, assertion and timing bytes remain unchanged; behavioral mismatches remain failures."
+        ],
+        "ecn_scope": "passive listener in this exact script only"
       },
-      "blocked_reasons": [
-        "Linux tcp_ecn=2 passive-only ECN negotiation and CUBIC CWR/PRR behavior have no audited adapter setup mapping; UpstreamCubic disables ECN and upstream-ecn is not CUBIC.",
-        "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
-      ],
       "audited_shell_commands": [
         {
           "command": "`../common/defaults.sh\nsysctl -q net.ipv4.tcp_ecn=2    # server agrees to ECN if client proposes it\n`",
           "sha256": "b3129d03166005497c2af76dc82a9566db861fb7e88eb3c655a3ed67bd376fa4",
-          "semantic_mapping": "Unavailable: Linux tcp_ecn=2 passive-only ECN negotiation and CUBIC CWR/PRR behavior have no audited adapter setup mapping; UpstreamCubic disables ECN and upstream-ecn is not CUBIC. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "semantic_mapping": "Exact defaults.sh plus tcp_ecn=2 setup maps only this passive listener to ECN-enabled UpstreamCubicEcn. The client proposes ECN; no active open occurs. This profile would also propose ECN on active open and is not a global Linux mode 2 implementation."
         }
-      ]
+      ],
+      "command_sha256": "ec7b46c7c0de6e190ae6a18ce8c47e3eb2a5a59942900615e0e2168b0b3a9514",
+      "embedded_tcp_info": true
     },
     "slow_start/slow-start-ack-per-1pkt.pkt": {
       "setup_path": "common/defaults.sh",

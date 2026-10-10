@@ -62,6 +62,8 @@ pub(crate) fn transport_option(info: ntcp::TransportInfo, option: i32) -> Result
         4
     } else if info.recovery {
         3
+    } else if info.ecn_response {
+        2 // TCP_CA_CWR; loss/recovery supersede overlapping ECN epochs.
     } else if info.sacked > 0 {
         1
     } else {
@@ -78,6 +80,7 @@ mod tests {
         let info = ntcp::TransportInfo {
             state: State::Established,
             recovery: false,
+            ecn_response: false,
             loss: false,
             ledger_valid: true,
             unacked: 3,
@@ -101,6 +104,24 @@ mod tests {
             receive_used: 42,
             receive_capacity: 65536,
         };
+        for (loss, recovery, ecn_response, sacked, state) in [
+            (false, false, false, 0, 0),
+            (false, false, false, 1, 1),
+            (false, false, true, 0, 2),
+            (false, false, true, 1, 2),
+            (false, true, true, 1, 3),
+            (true, true, true, 1, 4),
+            (true, false, true, 0, 4),
+        ] {
+            let sample = ntcp::TransportInfo {
+                loss,
+                recovery,
+                ecn_response,
+                sacked,
+                ..info
+            };
+            assert_eq!(transport_option(sample, 1).unwrap()[1], state);
+        }
         let error = if cfg!(feature = "packet-test") {
             ENOSYS
         } else {

@@ -21,6 +21,7 @@ pub enum Profile {
     Sack,
     UpstreamSack,
     UpstreamCubic,
+    UpstreamCubicEcn,
     UpstreamEcn,
     UpstreamBasic,
 }
@@ -43,6 +44,7 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
                 "sack" => Profile::Sack,
                 "upstream-sack" => Profile::UpstreamSack,
                 "upstream-cubic" => Profile::UpstreamCubic,
+                "upstream-cubic-ecn" => Profile::UpstreamCubicEcn,
                 "upstream-ecn" => Profile::UpstreamEcn,
                 "upstream-basic" => Profile::UpstreamBasic,
                 _ => return Err(unsupported("unknown so_flags token")),
@@ -59,10 +61,12 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
 }
 
 pub(crate) fn config(profile: Profile) -> EndpointConfig {
+    let cubic = matches!(profile, Profile::UpstreamCubic | Profile::UpstreamCubicEcn);
     let upstream = matches!(
         profile,
         Profile::UpstreamSack
             | Profile::UpstreamCubic
+            | Profile::UpstreamCubicEcn
             | Profile::UpstreamEcn
             | Profile::UpstreamBasic
     );
@@ -70,7 +74,7 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
         max_connections: LIMIT,
         max_listeners: LIMIT,
         max_control_packets: LIMIT,
-        max_buffer_bytes: if profile == Profile::UpstreamCubic {
+        max_buffer_bytes: if cubic {
             128 * 1024 * 1024
         } else {
             32 * 1024 * 1024
@@ -83,6 +87,7 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
         Profile::UpstreamWindow8
         | Profile::UpstreamSack
         | Profile::UpstreamCubic
+        | Profile::UpstreamCubicEcn
         | Profile::UpstreamEcn
         | Profile::UpstreamBasic => 8 * 1024 * 1024,
     };
@@ -107,7 +112,7 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
     };
     // Explicit synchronized local-abort formatting, not a reactive RST policy.
     config.connection.abort_with_ack = profile == Profile::UpstreamBasic;
-    config.connection.congestion_algorithm = if profile == Profile::UpstreamCubic {
+    config.connection.congestion_algorithm = if cubic {
         ntcp::CongestionAlgorithm::Cubic
     } else {
         ntcp::CongestionAlgorithm::Reno
@@ -115,16 +120,12 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
     config.connection.timestamps = upstream;
     config.connection.rack = upstream;
     config.connection.prr = upstream;
-    if upstream && profile != Profile::UpstreamCubic {
+    if upstream && !cubic {
         config.connection.prr_algorithm = ntcp::PrrAlgorithm::LegacyInitialCredit;
     }
-    // UpstreamCubic keeps RFC 9937 accounting and exit cwnd.
-    config.connection.prr_pacing = profile != Profile::UpstreamCubic;
-    config.connection.output_push_batch_segments = if profile == Profile::UpstreamCubic {
-        2
-    } else {
-        0
-    };
+    // Both CUBIC profiles keep RFC 9937 accounting and exit cwnd.
+    config.connection.prr_pacing = !cubic;
+    config.connection.output_push_batch_segments = if cubic { 2 } else { 0 };
     config.connection.tlp = upstream;
     if upstream {
         // Explicit Linux timing compatibility; the core keeps RFC 6298's
@@ -140,7 +141,7 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
     };
     config.connection.receive_ip_payload_limit = 65515;
     config.connection.send_ip_payload_limit = 65515;
-    config.connection.ecn = profile == Profile::UpstreamEcn;
+    config.connection.ecn = matches!(profile, Profile::UpstreamEcn | Profile::UpstreamCubicEcn);
     config
 }
 pub(crate) fn parse_frame(bytes: &[u8]) -> Result<ntcp_ip::Packet<'_>> {

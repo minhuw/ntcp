@@ -64,6 +64,7 @@ CONGESTION18 = (
     'slow_start/slow-start-app-limited.pkt',
     'slow_start/slow-start-fq-ack-per-2pkt.pkt',
 )
+PASSIVE_CUBIC_ECN = 'cwnd_moderation/cwnd-moderation-ecn-enter-cwr-no-moderation-700.pkt'
 DEFAULTS_ONLY_CUBIC = {
     'cubic/cubic-rto-ss-ca-cwnd-bump.pkt',
     'cwnd_moderation/cwnd-moderation-disorder-no-moderation.pkt',
@@ -731,7 +732,7 @@ class AdaptationChecks(unittest.TestCase):
 
     def test_only_cubic_mappings_use_128_mib_budget(self):
         for entry in self.manifest['scripts'].values():
-            cubic = entry['adapter_flags'].startswith('upstream-cubic,')
+            cubic = entry['adapter_flags'].split(',')[0] in {'upstream-cubic', 'upstream-cubic-ecn'}
             settings = entry['mapping']['ntcp_settings']
             if cubic or 'endpoint_max_buffer_bytes' in settings:
                 self.assertEqual(settings['endpoint_max_buffer_bytes'],
@@ -761,7 +762,7 @@ class AdaptationChecks(unittest.TestCase):
             self.assertTrue(entry['mapping']['assertions_preserved'])
             self.assertFalse(entry['mapping']['linux_defaults_reproduced'])
         blocked = {name for name in selection if manifest['scripts'][name].get('blocked_reasons')}
-        self.assertEqual(blocked, (set(CONGESTION18) - DEFAULTS_ONLY_CUBIC) | {
+        self.assertEqual(blocked, (set(CONGESTION18) - DEFAULTS_ONLY_CUBIC - {PASSIVE_CUBIC_ECN}) | {
             'blocking/blocking-write.pkt', 'syscall_bad_arg/fastopen-invalid-buf-ptr.pkt',
         })
         copied = manifest['scripts']['syscall_bad_arg/sendmsg-empty-iov.pkt']
@@ -857,7 +858,7 @@ class AdaptationChecks(unittest.TestCase):
             self.assertEqual(row['effective_flags']['profile'],
                              row['effective_flags']['adapter'].split(',')[0])
             self.assertIn('generated_sha256', row['adaptation'])
-            cubic = row['effective_flags']['profile'] == 'upstream-cubic'
+            cubic = row['effective_flags']['profile'] in {'upstream-cubic', 'upstream-cubic-ecn'}
             self.assertEqual(row['effective_flags']['prr_pacing'], not cubic)
             self.assertEqual(row['effective_flags']['transport_clock'],
                              'monotonic Instant elapsed microseconds')
@@ -1130,6 +1131,30 @@ class PublishedSelectionChecks(unittest.TestCase):
             else:
                 self.assertNotIn('fixture', audit)
 
+    def test_passive_cubic_ecn_mapping_is_exact_and_not_global_mode2(self):
+        entry = self.manifest['scripts'][PASSIVE_CUBIC_ECN]
+        settings = copy.deepcopy(entry['mapping']['ntcp_settings'])
+        self.assertTrue(settings.pop('ecn'))
+        cubic = copy.deepcopy(self.manifest['scripts'][next(iter(DEFAULTS_ONLY_CUBIC))]['mapping']['ntcp_settings'])
+        self.assertFalse(cubic.pop('ecn'))
+        self.assertEqual(settings, cubic)
+        self.assertIn('active-open equivalence', entry['mapping']['claim'])
+        self.assertEqual(entry['mapping']['ecn_scope'], 'passive listener in this exact script only')
+        generated, _ = adapt_source(self.directory, PASSIVE_CUBIC_ECN, self.manifest, entry['adapter_flags'])
+        source = (self.directory / PASSIVE_CUBIC_ECN).read_bytes()
+        self.assertEqual(generated, source.replace(entry['command_line'].encode(),
+                                                  entry['replacement_line'].encode(), 1))
+        for key, value in [('command_sha256', 'bad'), ('command_line', entry['command_line'].replace('tcp_ecn=2', 'tcp_ecn=1'))]:
+            manifest = copy.deepcopy(self.manifest)
+            manifest['scripts'][PASSIVE_CUBIC_ECN][key] = value
+            with self.assertRaises(ValueError):
+                adapt_source(self.directory, PASSIVE_CUBIC_ECN, manifest, entry['adapter_flags'])
+        for key, value in [('ecn_scope', 'global mode 2'), ('ntcp_settings', {**entry['mapping']['ntcp_settings'], 'ecn': False})]:
+            manifest = copy.deepcopy(self.manifest)
+            manifest['scripts'][PASSIVE_CUBIC_ECN]['mapping'][key] = value
+            with self.assertRaises(ValueError):
+                adapt_source(self.directory, PASSIVE_CUBIC_ECN, manifest, entry['adapter_flags'])
+
     def test_all_35_published_hashes_commands_and_nonsetup_bytes(self):
         for name in BASIC17 + CONGESTION18:
             with self.subTest(script=name):
@@ -1300,7 +1325,7 @@ class PublishedSelectionChecks(unittest.TestCase):
             self.assertEqual(data['script_files'], 35)
             self.assertEqual({row['script'] for row in data['results']}, set(selection))
             self.assertFalse(data['all_passed'])
-            self.assertEqual(len(executed), 21)
+            self.assertEqual(len(executed), 22)
             self.assertIn('syscall_bad_arg/sendmsg-empty-iov.pkt', executed)
             for row in data['results']:
                 entry = self.manifest['scripts'][row['script']]

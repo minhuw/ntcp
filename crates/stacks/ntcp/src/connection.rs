@@ -398,6 +398,8 @@ pub enum State {
 pub struct TransportInfo {
     pub state: State,
     pub recovery: bool,
+    // Active ECN congestion-response epoch, not negotiation or pending CWR output.
+    pub ecn_response: bool,
     pub loss: bool,
     // False only after explicit diagnostic abandonment; capacity-backed production flights retain every byte interval.
     pub ledger_valid: bool,
@@ -1227,6 +1229,7 @@ impl Connection {
         TransportInfo {
             state: self.state,
             recovery: self.congestion.in_recovery(),
+            ecn_response: self.congestion.in_ecn_response(),
             loss: self.sack_post_rto.is_some() || self.consecutive_timeouts != 0,
             ledger_valid: self.rack.valid(),
             unacked: counts.unacked,
@@ -9205,6 +9208,72 @@ mod tests {
         assert!(a.take_events().connected);
         assert!(b.take_events().connected);
         (a, b)
+    }
+
+    #[test]
+    fn transport_info_cubic_ecn_epoch_lifecycle() {
+        for (enabled, timeout) in [(false, false), (true, false), (true, true)] {
+            let mut cfg = config(8192, 1000);
+            cfg.ecn = enabled;
+            cfg.initial_window = InitialWindow::Iw10;
+            cfg.congestion_algorithm = CongestionAlgorithm::Cubic;
+            cfg.sack = true;
+            cfg.rack = true;
+            cfg.prr = true;
+            let (_, mut a) = pair(cfg, 0); // Passive sender, as in the CC19 case.
+            assert!(!a.transport_info().ecn_response);
+            a.write(&[1; 4000]).unwrap();
+            for _ in 0..4 {
+                packet(&mut a, 40);
+            }
+            assert_eq!(a.transport_info().cwnd, 10000);
+            assert!(!a.transport_info().ecn_response); // Negotiation is not CWR.
+            let base = a.snd_una;
+            let next = a.receive.next();
+            inject(
+                &mut a,
+                50,
+                next,
+                base.wrapping_add(1000),
+                ACK | ECE,
+                8192,
+                &[],
+            );
+            assert_eq!(a.transport_info().ecn_response, enabled);
+            assert!(a.prr.is_none()); // ECN does not currently start PRR.
+            if !enabled {
+                continue;
+            }
+            assert_eq!(
+                (
+                    a.transport_info().cwnd,
+                    a.transport_info().ssthresh,
+                    a.data_flight()
+                ),
+                (2800, 2800, 3000)
+            );
+            assert!(a.ecn_cwr_pending);
+            // RTO clears the ECN epoch and the snapshot reports actual loss.
+            if timeout {
+                a.timeout(a.rto_deadline.unwrap()).unwrap();
+                assert!(a.transport_info().loss);
+                assert!(!a.transport_info().ecn_response);
+                continue;
+            }
+            // Equality does not end the existing core epoch.
+            inject(&mut a, 60, next, base.wrapping_add(4000), ACK, 8192, &[]);
+            assert!(a.transport_info().ecn_response);
+            a.write(&[2; 1000]).unwrap();
+            let bytes = packet(&mut a, 61);
+            assert_ne!(
+                wire::parse(ip(a.tuple()), &bytes).unwrap().header.flags & CWR,
+                0
+            );
+            assert!(!a.ecn_cwr_pending);
+            assert!(a.transport_info().ecn_response); // Not the pending packet flag.
+            inject(&mut a, 70, next, base.wrapping_add(5000), ACK, 8192, &[]);
+            assert!(!a.transport_info().ecn_response);
+        }
     }
 
     #[test]
