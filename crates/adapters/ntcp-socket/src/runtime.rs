@@ -1469,8 +1469,15 @@ impl Owner {
                 child.probes = s.probes;
                 child.user_timeout_ms = s.user_timeout_ms;
                 let accepted = self.endpoint.accept(listener);
-                if matches!(accepted, Err(EndpointError::Connection(Error::WouldBlock))) {
+                if matches!(
+                    accepted,
+                    Err(EndpointError::Connection(Error::WouldBlock) | EndpointError::OutputReserved)
+                ) {
+                    // All pending children may be held by backend output. Treat
+                    // that accept-only pressure like an empty queue; final child
+                    // resolution restores Acceptable and blocking requests retry.
                     self.sockets.get_mut(&id).unwrap().acceptable = false;
+                    return Err(EAGAIN);
                 }
                 let cid = accepted.map_err(engine)?;
                 (child.send_capacity, child.receive_capacity) =
