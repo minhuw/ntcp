@@ -282,7 +282,7 @@ fn cubic_ecn_prr_rack_timer_replaces_episode_without_ack_replay() {
 
 #[test]
 fn cubic_ecn_prr_loss_ending_ack_starts_new_logical_event() {
-    for sack in [false, true] {
+    for (sack, rollback) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut a = sender(sack, false, 0, 10_000);
         let base = a.snd_una;
         // Advancing original ACK clears NewReno's initial guard.
@@ -309,12 +309,22 @@ fn cubic_ecn_prr_loss_ending_ack_starts_new_logical_event() {
             packet(&mut a, 71);
         }
         assert!(after(a.snd_nxt, end.wrapping_add(1000)));
-        ack(&mut a, 80, end.wrapping_add(1000), true, &[]);
+        let now = if rollback {
+            pending_verification_rollback(&mut a, 500)
+        } else {
+            80
+        };
+        ack(&mut a, now, end.wrapping_add(1000), true, &[]);
+        let target = (loss_target * 7 / 10) / if rollback { 2 } else { 1 };
         assert!(!a.congestion.in_recovery());
         assert!(a.congestion.ecn_prr_end().is_some());
-        assert_eq!(a.congestion.ssthresh(), loss_target * 7 / 10);
-        assert_eq!(a.congestion.unsuppressed_cwnd(), loss_target * 7 / 10);
+        assert_eq!(a.congestion.ssthresh(), target);
+        assert_eq!(a.congestion.unsuppressed_cwnd(), target);
         assert_eq!(a.prr.unwrap().counters().1, if sack { 1000 } else { 4000 });
+        let end = a.snd_nxt;
+        ack(&mut a, now + 1, end, true, &[]);
+        assert!(a.prr.is_none());
+        assert_eq!(a.congestion.cwnd(), target);
     }
 }
 
@@ -373,16 +383,16 @@ fn cubic_ecn_prr_one_mss_partial_ack_pause_and_last_ack() {
     let base = a.snd_una;
     ack(&mut a, now, base.wrapping_add(500), true, &[]);
     assert_eq!(a.congestion.ssthresh(), 2000);
-    assert_eq!(a.congestion.recovery_target(), 1000);
+    assert_eq!(a.congestion.recovery_target(), 2000);
     assert_eq!(a.congestion.unsuppressed_cwnd(), 1000);
-    assert_eq!(a.prr.unwrap().credit(), 500);
+    assert_eq!(a.congestion.cwnd(), 1000);
+    assert!(a.prr.is_none());
+    assert_eq!(a.congestion.ecn_prr_end(), None);
     let pause = a.ecn_pause.unwrap();
     a.write(&[3; 1000]).unwrap();
     assert!(a.transmit(now, &mut [0; 1500]).unwrap().is_none());
-    let counters = a.prr.unwrap().counters();
     ack(&mut a, now + 1, base.wrapping_add(1000), true, &[]);
     assert!(a.prr.is_none());
-    assert_eq!(a.prr_exit_trace.unwrap().counters(), counters);
     assert_eq!(a.congestion.cwnd(), 1000); // Completion must not restore ssthresh=2000.
     assert_eq!(a.ecn_pause, Some(pause));
     ack(&mut a, now + 2, base.wrapping_add(1000), true, &[]);
@@ -438,5 +448,212 @@ fn cubic_ecn_prr_scoreboard_fallback_cannot_recreate_episode() {
         assert!(a.prr.is_none());
         assert_eq!(a.congestion.ecn_prr_end(), None);
         assert_eq!(a.congestion.cwnd(), 7000);
+    }
+}
+
+// Seed the PMTU verifier through its probe/sent/ACK interface. The connection's
+// next real ACK, not a test-side MSS setter, must expire the lossy observation.
+fn pending_verification_rollback(a: &mut Connection, baseline_mss: u32) -> u64 {
+    assert!(!a.timestamps);
+    let headers = u32::from(a.ip_header_len) + 20;
+    let mtu = a.mss as u32 + headers;
+    let mut p = crate::pmtud::Pmtud::new(crate::PmtudConfig::new(mtu), mtu, true, 600_000_000);
+    p.info.current_mtu = baseline_mss + headers;
+    let start = Seq(a.snd_una.0.wrapping_sub(a.mss as u32));
+    p.start_probe(start, a.mss as u32, 0, mtu);
+    p.sent(start, a.snd_una, mtu, 20, false);
+    p.ack(a.snd_una, 40, 1000, a.rto());
+    assert_eq!(p.info.current_mtu, mtu);
+    p.sent(a.snd_una, a.snd_nxt, mtu, 20, false);
+    p.sent(a.snd_una, a.snd_nxt, mtu, 20, true);
+    a.pmtud = Some(p);
+    40 + 2 * a.rto()
+}
+
+#[test]
+fn cubic_ecn_prr_entry_ack_pmtu_verification_rollback() {
+    for ending in [false, true] {
+        let mut a = sender(true, false, 0, 4000);
+        let base = a.snd_una;
+        let end = a.snd_nxt;
+        let now = pending_verification_rollback(&mut a, 500);
+        ack(
+            &mut a,
+            now,
+            if ending { end } else { base.wrapping_add(1000) },
+            true,
+            &[],
+        );
+        assert_eq!(a.mss, 500);
+        assert_eq!(a.path_mtu_info().unwrap().current_mtu, 540);
+        assert_eq!(a.congestion.ssthresh(), 3500);
+        assert_eq!(a.congestion.unsuppressed_cwnd(), 3500);
+        assert_eq!(a.congestion.cwnd(), 3500);
+        if !ending {
+            assert_eq!(a.congestion.ecn_prr_end(), Some(end));
+            assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 0));
+            assert_eq!(a.prr.unwrap().credit(), 500);
+            a.write(&[2; 2000]).unwrap();
+            let bytes = packet(&mut a, now + 1);
+            let seg = wire::parse(ip(a.tuple()), &bytes).unwrap();
+            assert_eq!(seg.header.sequence, end.0);
+            assert_eq!(seg.payload.len(), 500);
+            assert_ne!(seg.header.flags & CWR, 0);
+            assert_eq!(a.prr.unwrap().credit(), 0);
+            assert!(a.transmit(now + 1, &mut [0; 1500]).unwrap().is_none());
+            let counters = a.prr.unwrap().counters();
+            ack(&mut a, now + 2, end, true, &[]);
+            assert_eq!(a.prr_exit_trace.unwrap().counters(), counters);
+        }
+        assert!(a.prr.is_none());
+        assert_eq!(a.congestion.ecn_prr_end(), None);
+        assert_eq!(a.congestion.cwnd(), a.congestion.ssthresh());
+        assert_eq!(a.congestion.cwnd(), 3500);
+    }
+}
+
+#[test]
+fn cubic_ecn_prr_rollback_below_threshold_uses_direct_window() {
+    for basis in [1000, 2000] {
+        for ending in [false, true] {
+            let mut a = sender(true, false, 0, 1000);
+            a.congestion.prr_window(basis);
+            let base = a.snd_una;
+            let end = a.snd_nxt;
+            let now = pending_verification_rollback(&mut a, 500);
+            ack(
+                &mut a,
+                now,
+                if ending { end } else { base.wrapping_add(500) },
+                true,
+                &[],
+            );
+            let target = (basis * 7 / 10).max(1000) / 2;
+            assert_eq!(a.mss, 500);
+            assert_eq!(a.congestion.unsuppressed_cwnd(), target);
+            assert_eq!(a.congestion.cwnd(), target);
+            assert_eq!(a.congestion.ssthresh(), 1000);
+            assert!(a.prr.is_none());
+            assert_eq!(a.congestion.ecn_prr_end(), None);
+            if !ending {
+                ack(&mut a, now + 1, end, true, &[]);
+                assert_eq!(a.congestion.cwnd(), target);
+                assert!(a.prr.is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn cubic_ecn_prr_mss_divergence_drops_admission_without_inflation() {
+    let mut a = sender(true, false, 0, 1000);
+    a.set_path_mss(500);
+    a.congestion.prr_window(2000);
+    // Enabled path growth preserves byte windows, even below the new MSS floors.
+    a.pmtud = Some(crate::pmtud::Pmtud::new(
+        crate::PmtudConfig::new(1040),
+        1040,
+        true,
+        600_000_000,
+    ));
+    a.pmtud.as_mut().unwrap().info.current_mtu = 540;
+    let base = a.snd_una;
+    ack(&mut a, 50, base.wrapping_add(250), true, &[]);
+    assert_eq!(a.congestion.unsuppressed_cwnd(), 1400);
+    assert_eq!(a.congestion.ssthresh(), 1400);
+    assert!(a.prr.is_some());
+    a.set_path_mss(1000);
+    assert_eq!(a.congestion.unsuppressed_cwnd(), 1400);
+    assert_eq!(a.congestion.ssthresh(), 1400);
+    assert!(a.prr.is_some());
+    a.set_path_mss(500);
+    assert_eq!(a.congestion.unsuppressed_cwnd(), 700);
+    assert_eq!(a.congestion.ssthresh(), 1000);
+    assert_eq!(a.congestion.cwnd(), 700);
+    assert!(a.prr.is_none());
+    assert_eq!(a.congestion.ecn_prr_end(), None);
+    let end = a.snd_nxt;
+    ack(&mut a, 60, end, true, &[]);
+    assert_eq!(a.congestion.cwnd(), 700);
+    assert!(a.prr.is_none());
+}
+
+#[test]
+fn cubic_ecn_prr_entry_ack_pmtu_growth_does_not_inflate_target() {
+    for basis in [1000, 6000] {
+        let mut a = sender(true, false, 0, 1000);
+        a.set_path_mss(500);
+        a.congestion.prr_window(basis);
+        let mut p =
+            crate::pmtud::Pmtud::new(crate::PmtudConfig::new(1040), 1040, true, 600_000_000);
+        p.info.current_mtu = 540;
+        p.start_probe(a.snd_una, 1000, 0, 1040);
+        p.sent(a.snd_una, a.snd_nxt, 1040, 20, false);
+        a.pmtud = Some(p);
+        let end = a.snd_nxt;
+        ack(&mut a, 50, end, true, &[]);
+        assert_eq!(a.mss, 1000);
+        assert_eq!(a.congestion.cwnd(), basis * 7 / 10);
+        assert_eq!(a.congestion.ssthresh(), (basis * 7 / 10).max(1000));
+        assert!(a.prr.is_none());
+        assert_eq!(a.congestion.ecn_prr_end(), None);
+    }
+}
+
+#[test]
+fn cubic_ecn_prr_new_ece_below_threshold_cancels_old_admission() {
+    let mut a = sender(true, false, 0, 1000);
+    a.congestion.prr_window(3000);
+    let base = a.snd_una;
+    ack(&mut a, 50, base.wrapping_add(500), true, &[]);
+    assert_eq!(a.congestion.unsuppressed_cwnd(), 2100);
+    assert!(a.prr.is_some());
+    a.write(&[2; 1000]).unwrap();
+    packet(&mut a, 51);
+    ack(&mut a, 60, base.wrapping_add(1500), true, &[]);
+    assert_eq!(a.congestion.cwnd(), 1470);
+    assert_eq!(a.congestion.ssthresh(), 2000);
+    assert!(a.prr.is_none());
+    assert_eq!(a.congestion.ecn_prr_end(), None);
+    let end = a.snd_nxt;
+    ack(&mut a, 61, end, true, &[]);
+    assert_eq!(a.congestion.cwnd(), 1470);
+}
+
+#[test]
+fn cubic_ecn_prr_loss_exit_below_threshold_preserves_direct_target() {
+    for rollback in [false, true] {
+        let mut a = sender(true, false, 0, 4000);
+        let base = a.snd_una;
+        ack(&mut a, 50, base.wrapping_add(1000), false, &[]);
+        for delivered in [3333, 3666, 4000] {
+            ack(
+                &mut a,
+                60,
+                base.wrapping_add(1000),
+                false,
+                &[(base.wrapping_add(3000).0, base.wrapping_add(delivered).0)],
+            );
+        }
+        assert!(a.congestion.in_recovery());
+        assert_eq!(a.congestion.ssthresh(), 2100);
+        a.write(&[2; 2000]).unwrap();
+        packet(&mut a, 61); // Repair the head.
+        ack(&mut a, 70, base.wrapping_add(3000), false, &[]);
+        for _ in 0..2 {
+            packet(&mut a, 71); // Fresh data beyond the loss boundary.
+        }
+        assert_eq!(a.snd_nxt, base.wrapping_add(6000));
+        let now = if rollback {
+            pending_verification_rollback(&mut a, 500)
+        } else {
+            80
+        };
+        ack(&mut a, now, base.wrapping_add(5000), true, &[]);
+        assert!(!a.congestion.in_recovery());
+        assert_eq!(a.congestion.cwnd(), if rollback { 735 } else { 1470 });
+        assert_eq!(a.congestion.ssthresh(), if rollback { 1000 } else { 2000 });
+        assert!(a.prr.is_none());
+        assert_eq!(a.congestion.ecn_prr_end(), None);
     }
 }

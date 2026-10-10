@@ -466,19 +466,9 @@ impl Congestion {
         }
     }
 
-    // RFC9438 ECN can reduce cwnd below the two-MSS ssthresh floor. PRR must
-    // converge to that reduced logical window, not undo persistent ECN backoff.
+    // ECN uses optional PRR only when its logical target equals ssthresh.
     pub(crate) fn recovery_target(&self) -> u32 {
-        self.probe_response.map_or_else(
-            || {
-                if self.ecn_prr.is_some() {
-                    self.cwnd
-                } else {
-                    self.ssthresh
-                }
-            },
-            |p| p.target,
-        )
+        self.probe_response.map_or(self.ssthresh, |p| p.target)
     }
 
     pub(crate) fn unsuppressed_cwnd(&self) -> u32 {
@@ -522,10 +512,30 @@ impl Congestion {
         }
     }
 
-    pub(crate) fn start_ecn_prr(&mut self, end: Seq, flight: u32, target: u32) {
+    pub(crate) fn start_ecn_prr(
+        &mut self,
+        end: Seq,
+        flight: u32,
+        target: u32,
+        target_mss: u32,
+    ) -> bool {
         debug_assert!(self.cubic.is_some() && !self.in_recovery());
-        self.cwnd = target;
+        // accept_ack may roll back PMTU verification before loss recovery exits.
+        // Carry the reduced target in its original MSS units, not a stale byte
+        // window or the loss-exit admission. Match set_mss's decrease and floor;
+        // an upward path-MSS change must not inflate the saved byte target.
+        self.cwnd = if self.mss < target_mss {
+            ((u64::from(target) * u64::from(self.mss) / u64::from(target_mss)) as u32).max(self.mss)
+        } else {
+            target
+        };
+        // RFC9937 requires ssthresh as its target and completion window. Keep
+        // CUBIC's sub-two-MSS ECN response direct rather than changing PRR.
+        if self.cwnd != self.ssthresh {
+            return false;
+        }
         self.ecn_prr = Some((end, flight));
+        true
     }
 
     pub(crate) fn ecn_prr_end(&self) -> Option<Seq> {
@@ -537,14 +547,13 @@ impl Congestion {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.4
-    //= reason=Loss PRR restores ssthresh; ECN restores its logical target, preserving RFC9438's one-SMSS ECN cwnd floor independently of the two-SMSS ssthresh floor.
+    //= reason=Loss and eligible ECN PRR restore ssthresh literally. Optional ECN PRR is omitted/cancelled when the logical ECN window differs from ssthresh; direct CUBIC preserves its independent one-SMSS floor.
     //# On the completion of a PRR episode, PRR executes the following:
     //#
     //#    cwnd = ssthresh
     pub(crate) fn complete_prr(&mut self) {
-        if self.ecn_prr.take().is_none() {
-            self.prr_window(self.recovery_target());
-        }
+        self.end_ecn_prr();
+        self.prr_window(self.recovery_target());
         if self.probe_response.is_none() {
             self.congestion_avoidance = true;
         }

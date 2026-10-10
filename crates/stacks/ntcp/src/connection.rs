@@ -1607,7 +1607,7 @@ impl Connection {
     //# congestion control actions taken upon the losses detected by RACK-
     //# TLP.
     //= https://www.rfc-editor.org/rfc/rfc9937#section-5
-    //= reason=Selected target is fixed during each episode; strict_ack covers loss and cubic_ecn_prr tests cover ECN with a separate logical target and current SafeACK credit.
+    //= reason=PRR uses the ssthresh target; strict_ack covers loss and cubic_ecn_prr covers eligible ECN and SafeACK credit. Optional ECN PRR is omitted/cancelled if the post-MSS logical target differs from ssthresh, preserving direct CUBIC below the threshold floor.
     //# PRR MAY be used in conjunction with any congestion control algorithm
     //# that intends to make a multiplicative decrease in its sending rate
     //# over approximately the time scale of one round-trip time, as long as
@@ -2544,6 +2544,18 @@ impl Connection {
         Ok(())
     }
 
+    // MSS changes or a new congestion event can separate CUBIC's direct ECN
+    // window from ssthresh. Drop only optional PRR admission/credit, never
+    // complete it by raising the logical window to the threshold floor.
+    fn cancel_divergent_ecn_prr(&mut self) {
+        if self.congestion.ecn_prr_end().is_some()
+            && self.congestion.unsuppressed_cwnd() != self.congestion.ssthresh()
+        {
+            self.congestion.end_ecn_prr();
+            self.prr = None;
+        }
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.3
     //= reason=Connection::set_path_mss creates retx_pending/SYN retry work only on decreases; growth leaves legitimate pending work and timers intact. Tests from 742e320 exercise MSS-only growth with remaining flight and no output, actual RTO retry preservation, SYN work, and real upward-probe ACKs followed by new data rather than trailing-byte retransmission (both families and wrap).
     //# An upper layer MUST not retransmit datagrams in response to an increase in the
@@ -2562,6 +2574,7 @@ impl Connection {
         } else {
             self.congestion.set_mss(effective as u32);
         }
+        self.cancel_divergent_ecn_prr();
         if let Some(prr) = &mut self.prr {
             prr.set_mss(effective as u32);
         }
@@ -4530,6 +4543,7 @@ impl Connection {
                 self.scoreboard
                     .unsacked_bytes(self.snd_una, self.data_high()),
                 self.congestion.unsuppressed_cwnd(),
+                self.mss as u32,
             )
         });
         let ecn_prr_was_active = self.congestion.ecn_prr_end().is_some();
@@ -4662,6 +4676,7 @@ impl Connection {
             }
             self.ecn_cwr_pending |= self.ecn_feedback();
         }
+        self.cancel_divergent_ecn_prr();
         let was_rto_recovery = self.sack_post_rto.is_some();
         let mut recovery_exited = false;
         if advancing {
@@ -4895,13 +4910,14 @@ impl Connection {
         let new_response = new_response || ecn_loss_takeover;
         further_loss |= rack_loss;
         let mut started_ecn_prr = false;
-        if let Some((end, flight, target)) = ecn_prr_entry
+        if let Some((end, flight, target, target_mss)) = ecn_prr_entry
             && !self.congestion.in_recovery()
             && self.rack.valid()
             && self.sack_fallback.is_none()
+            && self
+                .congestion
+                .start_ecn_prr(end, self.data_flight(), target, target_mss)
         {
-            self.congestion
-                .start_ecn_prr(end, self.data_flight(), target);
             // The ending ACK is excluded even when it also caused the event.
             if at_or_after(self.snd_una, end) {
                 self.congestion.complete_prr();
@@ -12733,7 +12749,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc9937#section-5
     //= type=test
-    //= reason=Selected target is fixed during each episode; strict_ack covers loss and cubic_ecn_prr tests cover ECN with a separate logical target and current SafeACK credit.
+    //= reason=PRR uses the ssthresh target; strict_ack covers loss and cubic_ecn_prr covers eligible ECN and SafeACK credit. Optional ECN PRR is omitted/cancelled if the post-MSS logical target differs from ssthresh, preserving direct CUBIC below the threshold floor.
     //# PRR MAY be used in conjunction with any congestion control algorithm
     //# that intends to make a multiplicative decrease in its sending rate
     //# over approximately the time scale of one round-trip time, as long as
