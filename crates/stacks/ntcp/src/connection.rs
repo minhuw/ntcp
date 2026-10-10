@@ -160,7 +160,8 @@ pub struct ConnectionConfig {
     // only when a queued application PUSH covers it. Trailing singletons keep
     // only application marks. Input, timeout, application work, idle/control,
     // sequence/category changes end a batch; poll budget splits do not.
-    // Batches share one caller instant; paced outputs are singleton batches.
+    // Clock advance/acceptance delay alone does not end a run; a no-output
+    // selection does. Paced outputs are excluded from these batches.
     // This is not GSO emulation and does not change packetization/admission.
     pub output_push_batch_segments: u16,
     pub timestamps: bool,
@@ -692,9 +693,9 @@ pub(crate) struct Connection {
     // Successful data output only; ACKs and keepalives do not restart data-idle time.
     last_sent: Instant,
     retransmit_burst: Option<(Seq, u32)>,
-    // End sequence, retry category, successful segment count, caller instant.
+    // End sequence, retry category, successful segment count.
     // Never stores wire hints in the application SendBuffer PUSH marks.
-    output_push_batch: Option<(Seq, bool, u16, Instant)>,
+    output_push_batch: Option<(Seq, bool, u16)>,
     keepalive_deadline: Option<Instant>,
     keepalive_probes: u32,
 }
@@ -7233,9 +7234,9 @@ impl Connection {
         .then(|| {
             let previous = self
                 .output_push_batch
-                .filter(|&(end, retry, _, at)| end == seq && retry == retransmitted && at == now);
-            let segments = previous.map_or(0, |(_, _, segments, _)| segments) + 1;
-            (seq.wrapping_add(count as u32), retransmitted, segments, now)
+                .filter(|&(end, retry, _)| end == seq && retry == retransmitted);
+            let segments = previous.map_or(0, |(_, _, segments)| segments) + 1;
+            (seq.wrapping_add(count as u32), retransmitted, segments)
         });
         if batch_limit >= 2 {
             // RFC9293 section3.9.1.2: intermediate flush hints are separate
@@ -7243,7 +7244,7 @@ impl Connection {
             // Linux tcp_output.c __tcp_transmit_skb hints GSO pcount>1;
             // tcp_tso_autosize/tcp_cwnd_test define its actual groups. Here
             // these are bounded logical batches, not Linux GSO packetization.
-            burst_push = output_push_batch.is_some_and(|(_, _, n, _)| n == batch_limit)
+            burst_push = output_push_batch.is_some_and(|(_, _, n)| n == batch_limit)
                 && (self.send.pushed(self.send.len().saturating_sub(1), 1)
                     || self
                         .send
@@ -7669,7 +7670,7 @@ impl Connection {
             self.retransmit_burst = retransmit_burst;
         }
         self.output_push_batch =
-            output_push_batch.filter(|&(_, _, n, _)| n < batch_limit && !application_push);
+            output_push_batch.filter(|&(_, _, n)| n < batch_limit && !application_push);
         // Commit only the encoded (possibly clamped) urgent coverage, and only
         // after successful output. Retransmissions must not move it backwards.
         if flags & URG != 0 {

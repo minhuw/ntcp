@@ -1134,27 +1134,88 @@ fn output_push_batch_fresh_prr_two_mss_wire() {
     }
 }
 
+// The scalar path samples departure time; the reserved path samples selection
+// and acceptance separately. Neither sampling cadence defines a PUSH run.
+fn advancing_batch_departures(retry: bool) {
+    for iss in [0, u32::MAX - 4999] {
+        let mut scalar = rack_flight(iss);
+        let mut reserved = rack_flight(iss);
+        for c in [&mut scalar, &mut reserved] {
+            c.config.output_push_batch_segments = 2;
+            rack_sack(c, 200_000, 10_000, &[]);
+            c.write(&[0x55; 6000]).unwrap();
+            if retry {
+                for _ in 0..6 {
+                    packet(c, 200_000);
+                }
+                c.write(&[0x66; 6000]).unwrap();
+                rack_sack(c, 300_000, 10_000, &[(11_000, 12_000), (14_000, 16_000)]);
+            }
+        }
+        let base = scalar.send_base;
+        // Retry gaps must reset a pending singleton, not merely an already
+        // completed pair. Fresh output also reaches the final application PUSH.
+        let offsets: &[u32] = if retry {
+            &[0, 2000, 3000]
+        } else {
+            &[0, 1000, 2000, 3000, 4000, 5000]
+        };
+        for (i, &offset) in offsets.iter().enumerate() {
+            let selected = 300_010 + i as u64 * 10;
+            let accepted = selected + 3;
+            let before = (reserved.output_push_batch, reserved.snd_nxt, reserved.now);
+            assert_eq!(
+                reserved.transmit_selected(selected, &mut [0; 19], true),
+                Err(Error::OutputTooSmall)
+            );
+            assert_eq!((reserved.output_push_batch, reserved.snd_nxt, reserved.now), before);
+            let mut bytes = [0; 1500];
+            let n = reserved.transmit_selected(selected, &mut bytes, true).unwrap().unwrap();
+            let mut departure = reserved.last_departure.unwrap();
+            let count = departure.payload;
+            reserved.accept_reserved_output(accepted, &mut departure, 0, count, true).unwrap();
+            assert_eq!(&bytes[..n], packet(&mut scalar, accepted));
+            let segment = wire::parse(ip(tuple()), &bytes[..n]).unwrap();
+            assert_eq!(segment.header.sequence, base.wrapping_add(offset).0);
+            assert_eq!(segment.payload, &[0x55; 1000]);
+            assert_eq!(segment.header.flags & PSH != 0, if retry { i == 2 } else { i % 2 == 1 });
+            assert_eq!(reserved.now, accepted);
+            assert_eq!(reserved.last_sent, accepted);
+        }
+    }
+}
+
+#[test]
+fn output_push_batch_advancing_new_data_departures() {
+    advancing_batch_departures(false);
+}
+
+#[test]
+fn output_push_batch_advancing_retry_departures() {
+    advancing_batch_departures(true);
+}
+
 #[test]
 fn output_push_batch_failed_output_budgets_and_boundaries() {
-    for boundary in 0..7 {
+    for boundary in 0..10 {
         let (mut a, mut legacy) = batch_pair(0, true, 15_000);
         let base = a.send_base;
         batch_wire(&mut a, &mut legacy, 40, base, false);
         let before = (a.output_push_batch, a.snd_nxt, a.now);
         // Endpoint polls return at most one packet, regardless of budget.
         // These separate calls exercise that budget split at the core boundary.
-        assert_eq!(a.transmit(40, &mut [0; 19]), Err(Error::OutputTooSmall));
+        assert_eq!(a.transmit(41, &mut [0; 19]), Err(Error::OutputTooSmall));
         assert_eq!((a.output_push_batch, a.snd_nxt, a.now), before);
         match boundary {
             0 => {} // successful second output completes the retained pair
             1 => {
                 for c in [&mut a, &mut legacy] {
-                    c.timeout(40).unwrap();
+                    c.timeout(42).unwrap();
                 }
             }
             2 => {
                 for c in [&mut a, &mut legacy] {
-                    rack_sack(c, 40, 0, &[]);
+                    rack_sack(c, 42, 0, &[]);
                 }
             }
             3 => {
@@ -1171,36 +1232,58 @@ fn output_push_batch_failed_output_budgets_and_boundaries() {
                 for c in [&mut a, &mut legacy] {
                     c.challenge_ack_pending = true;
                 }
-                let p = packet(&mut a, 40);
-                assert_eq!(p, packet(&mut legacy, 40));
+                let p = packet(&mut a, 42);
+                assert_eq!(p, packet(&mut legacy, 42));
                 assert!(wire::parse(ip(tuple()), &p).unwrap().payload.is_empty());
             }
             6 => {
                 for c in [&mut a, &mut legacy] {
                     c.probe_pending = true;
                 }
-                let p = packet(&mut a, 40);
-                assert_eq!(p, packet(&mut legacy, 40));
+                let p = packet(&mut a, 42);
+                assert_eq!(p, packet(&mut legacy, 42));
                 assert_eq!(wire::parse(ip(tuple()), &p).unwrap().payload.len(), 1);
+            }
+            7 => {
+                for c in [&mut a, &mut legacy] {
+                    c.write(&[0x66; 1000]).unwrap();
+                }
+            }
+            8 => {
+                for c in [&mut a, &mut legacy] {
+                    // Isolate a no-output pause without an input reset.
+                    let window = c.snd_wnd;
+                    c.snd_wnd = c.flight();
+                    assert_eq!(c.transmit(42, &mut [0; 1500]), Ok(None));
+                    assert!(c.output_push_batch.is_none());
+                    c.snd_wnd = window;
+                }
+            }
+            9 => {
+                for c in [&mut a, &mut legacy] {
+                    c.set_path_mss(900);
+                    c.set_path_mss(1000);
+                    c.retx_pending = false;
+                }
             }
             _ => unreachable!(),
         }
         batch_wire(
             &mut a,
             &mut legacy,
-            40,
+            43,
             base.wrapping_add(1000),
             boundary == 0,
         );
         if boundary != 0 {
-            batch_wire(&mut a, &mut legacy, 40, base.wrapping_add(2000), true);
+            batch_wire(&mut a, &mut legacy, 44, base.wrapping_add(2000), true);
         }
     }
-    // Changing the caller instant is an idle boundary, even without a None poll.
+    // Clock sampling alone is not an idle boundary without a None poll.
     let (mut a, mut legacy) = batch_pair(0, true, 15_000);
     let base = a.send_base;
     batch_wire(&mut a, &mut legacy, 40, base, false);
-    batch_wire(&mut a, &mut legacy, 41, base.wrapping_add(1000), false);
+    batch_wire(&mut a, &mut legacy, 41, base.wrapping_add(1000), true);
 }
 
 #[test]
@@ -1243,6 +1326,33 @@ fn output_push_batch_explicit_push_flush_and_pacing() {
         assert!(a.output_push_batch.is_none());
         assert_eq!(a.transmit(now, &mut [0; 1500]), Ok(None));
     }
+}
+
+#[test]
+fn output_push_batch_preserves_record_and_final_push() {
+    let (mut a, _) = batch_pair(0, false, 0);
+    a.set_nagle(false);
+    a.write_with_options(&[0x55; 1500], true, true).unwrap();
+    a.write(&[0x66; 2000]).unwrap();
+    let base = a.send_base;
+    for (i, (offset, len, byte, push)) in [
+        (0, 1000, 0x55, false),
+        (1000, 500, 0x55, true),
+        (1500, 1000, 0x66, false),
+        (2500, 1000, 0x66, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let bytes = packet(&mut a, 40 + i as u64);
+        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(segment.header.sequence, base.wrapping_add(offset).0);
+        assert_eq!(segment.payload, vec![byte; len]);
+        assert_eq!(segment.header.flags & PSH != 0, push);
+    }
+    assert!(!a.send.pushed(0, 2500));
+    assert!(a.send.pushed(2500, 1000));
+    assert!(a.output_push_batch.is_none());
 }
 
 #[test]
@@ -1320,7 +1430,7 @@ fn output_push_batch_retry_discontinuity_and_category() {
     batch_wire(&mut a, &mut legacy, 40, base.wrapping_add(1000), false);
     assert_eq!(
         a.output_push_batch,
-        Some((base.wrapping_add(2000), true, 1, 40))
+        Some((base.wrapping_add(2000), true, 1))
     );
     batch_wire(&mut a, &mut legacy, 40, base.wrapping_add(2000), false);
     batch_wire(&mut a, &mut legacy, 40, base.wrapping_add(3000), true);
@@ -1361,9 +1471,9 @@ fn output_push_batch_endpoint_poll_budgets() {
         a.write(id, &[0x55; 15_000]).unwrap();
         let mut base = None;
         for i in 0..10 {
-            assert!(a.poll_transmit(40, &mut out, 0).unwrap().packet.is_none());
+            assert!(a.poll_transmit(40 + i as u64, &mut out, 0).unwrap().packet.is_none());
             let tx = a
-                .poll_transmit(40, &mut out, budget)
+                .poll_transmit(40 + i as u64, &mut out, budget)
                 .unwrap()
                 .packet
                 .unwrap();
