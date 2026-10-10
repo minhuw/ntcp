@@ -499,3 +499,19 @@ fn reservation_timeout_parser_and_typed_bounds() {
     c.io.output_reservation_timeout_ms = 0;
     assert!(c.validate().is_err());
 }
+
+#[test]
+fn egress_capacity_is_a_positive_resource_bound() {
+    assert_eq!(SocketConfig::parse(BASE).unwrap().io.egress_capacity, 32);
+    for capacity in [1, 2, 32, 128] {
+        let config = SocketConfig::parse(&format!("{BASE}io.egress_capacity={capacity}")).unwrap();
+        assert_eq!(config.io.egress_capacity, capacity);
+        assert_eq!(config.tcp.max_buffer_bytes, 128 * 1024 * 1024);
+    }
+    for value in ["0", "-1", "+1", "1.5", "18446744073709551615"] {
+        assert!(SocketConfig::parse(&format!("{BASE}io.egress_capacity={value}")).is_err());
+    }
+    let mut config = SocketConfig::parse(BASE).unwrap();
+    config.io.egress_capacity = 0;
+    assert!(config.validate().is_err());
+}

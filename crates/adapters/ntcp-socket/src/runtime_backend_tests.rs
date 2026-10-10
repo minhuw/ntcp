@@ -27,6 +27,8 @@ struct State {
     receives: usize,
     capacity: usize,
     block: bool,
+    block_port: Option<u16>,
+    rx_stamps: PacketTimestamps,
     interrupted: bool,
     cancel_error: Option<i32>,
     error: Option<io::ErrorKind>,
@@ -63,6 +65,13 @@ impl PacketIo for Fixture {
         out[..packet.len()].copy_from_slice(&packet);
         Ok(Some(packet.len()))
     }
+    fn receive_with_metadata(&mut self, out: &mut [u8]) -> io::Result<Option<ReceivedPacket>> {
+        let len = self.receive(out)?;
+        Ok(len.map(|len| ReceivedPacket {
+            len,
+            timestamps: self.0.lock().unwrap().rx_stamps,
+        }))
+    }
     fn transmit(&mut self, bytes: &[u8]) -> io::Result<TxOutcome> {
         let mut state = self.0.lock().unwrap();
         state.output_calls += 1;
@@ -73,7 +82,12 @@ impl PacketIo for Fixture {
             return Err(error.into());
         }
         // Model native packet syscall EINTR: no packet or timestamp consumed.
-        if state.interrupted || state.block {
+        if state.interrupted
+            || state.block
+            || state
+                .block_port
+                .is_some_and(|port| bytes.get(34..36) == Some(&port.to_be_bytes()))
+        {
             return Ok(TxOutcome::WouldBlock);
         }
         state.sent.push_back(bytes.to_vec());
@@ -102,7 +116,12 @@ impl PacketIo for Fixture {
             return Err(error.into());
         }
         // Model native packet syscall EINTR: no packet or timestamp consumed.
-        if state.interrupted || state.block {
+        if state.interrupted
+            || state.block
+            || state
+                .block_port
+                .is_some_and(|port| bytes.get(34..36) == Some(&port.to_be_bytes()))
+        {
             return Ok(TxOutcome::WouldBlock);
         }
         let reserved: usize = state
@@ -578,6 +597,7 @@ fn output_error_finalizes_logical_send_parked_after_output_once() {
         reply,
         deadline: None,
         send: None,
+        closing: None,
     };
     assert!(!a.service(&mut request));
     assert_eq!(request.send.as_ref().unwrap().accepted, 4608);
@@ -1122,6 +1142,7 @@ fn reserved_commands_producers_and_rx_are_deferred_before_admission() {
             reply,
             deadline: None,
             send: None,
+            closing: None,
         };
         assert!(!a.service(&mut request));
         assert!(response.try_recv().is_err());
@@ -1159,6 +1180,7 @@ fn reserved_commands_producers_and_rx_are_deferred_before_admission() {
         reply,
         deadline: None,
         send: None,
+        closing: None,
     };
     assert!(!a.service(&mut request));
     assert!(response.try_recv().is_err());
@@ -1183,6 +1205,7 @@ fn reserved_commands_producers_and_rx_are_deferred_before_admission() {
         reply,
         deadline: None,
         send: None,
+        closing: None,
     };
     assert!(!a.service(&mut file_request));
     assert!(file_response.try_recv().is_err());
@@ -1193,10 +1216,8 @@ fn reserved_commands_producers_and_rx_are_deferred_before_admission() {
     ingress(&mut a, &state, &packet);
     assert_eq!(state.lock().unwrap().incoming.len(), 1);
     assert_eq!(state.lock().unwrap().receives, 0);
-    assert_eq!(
-        a.endpoint.on_timeout(a.now(), 0),
-        Err(EndpointError::OutputReserved)
-    );
+    // Multi-owner core timers no longer use the legacy global barrier probe.
+    assert_eq!(a.endpoint.on_timeout(a.now(), 0), Ok(false));
     assert_eq!(a.submit_reserved_packet(), Ok(TxOutcome::Submitted));
     a.receive_batch(&mut vec![0; 65549]).unwrap();
     assert!(state.lock().unwrap().incoming.is_empty());
@@ -1524,6 +1545,7 @@ fn reserved_repeated_interrupted_expires_only_owner_and_releases_commands() {
             reply,
             deadline: None,
             send: None,
+            closing: None,
         };
         let (reply, closed) = mpsc::sync_channel(1);
         let mut close = Request {
@@ -1532,6 +1554,7 @@ fn reserved_repeated_interrupted_expires_only_owner_and_releases_commands() {
             reply,
             deadline: None,
             send: None,
+            closing: None,
         };
         for _ in 0..4 {
             advance(&mut a, 200_000);
@@ -1619,4 +1642,489 @@ fn reserved_unknown_interrupted_and_wrapped_cancellation_do_not_certify_rejectio
         assert_eq!(state.lock().unwrap().sent.len(), 1);
         assert_eq!(state.lock().unwrap().requests.len(), 1);
     }
+}
+
+// Two connections share one native-runtime owner and one copying backend.
+fn scheduled_pair(capacity: usize) -> (Owner, Owner, [u64; 2], [u64; 2], Arc<Mutex<State>>) {
+    let (mut a, mut b, first, server, state) = pmtud_pair(None);
+    let listener = b
+        .sockets
+        .iter()
+        .find(|(_, s)| matches!(s.handle, Handle::Listener(_)))
+        .unwrap()
+        .0
+        .to_owned();
+    let second = new(&mut a, SOCK_NONBLOCK);
+    assert_eq!(
+        a.execute(second, Op::Connect("10.73.0.3:16379".parse().unwrap()))
+            .unwrap_err(),
+        EINPROGRESS
+    );
+    pump(&mut a, &mut b);
+    let accepted = b
+        .execute(listener, Op::Accept(SOCK_NONBLOCK))
+        .unwrap()
+        .value as u64;
+    for id in [first, second] {
+        a.execute(id, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1)).unwrap();
+    }
+    a.enable_egress(capacity).unwrap();
+    (a, b, [first, second], [server, accepted], state)
+}
+fn deliver_scheduled(a: &mut Owner, b: &mut Owner, state: &Arc<Mutex<State>>) {
+    while let Some(frame) = state.lock().unwrap().sent.pop_front() {
+        let frame = ntcp_ethernet::parse_ethernet(&frame).unwrap();
+        b.input_ip(frame.payload, ntcp::RxPacketTimestamps::default());
+    }
+    for _ in 0..BUDGET {
+        if !b.prepare_packet(None).unwrap() {
+            break;
+        }
+        let bytes = b.pending_packet.take().unwrap();
+        ingress(a, state, &bytes);
+    }
+    a.events();
+    b.events();
+}
+
+#[test]
+fn scheduled_blocked_owner_does_not_freeze_input_commands_timer_or_output() {
+    let (mut a, mut b, clients, servers, state) = scheduled_pair(32);
+    let held = connection(&a, clients[0]);
+    let healthy = connection(&a, clients[1]);
+    let port = a.endpoint.tuple(held).unwrap().local.port();
+    state.lock().unwrap().block_port = Some(port);
+    a.execute(clients[0], Op::Write(vec![1; 200])).unwrap();
+    a.service_egress().unwrap();
+    assert!(a.endpoint.is_output_reserved(held));
+    assert_eq!(
+        a.execute(clients[0], Op::Write(vec![2; 1])).unwrap_err(),
+        EAGAIN
+    );
+    a.execute(clients[1], Op::Write(vec![3; 200])).unwrap();
+    a.service_egress().unwrap();
+    deliver_scheduled(&mut a, &mut b, &state);
+    assert_eq!(
+        b.execute(servers[1], Op::Read(200)).unwrap().bytes,
+        vec![3; 200]
+    );
+    b.execute(servers[1], Op::Write(vec![4; 100])).unwrap();
+    deliver_scheduled(&mut a, &mut b, &state);
+    assert_eq!(
+        a.execute(clients[1], Op::Read(100)).unwrap().bytes,
+        vec![4; 100]
+    );
+    // Healthy delayed ACK/RTO timers remain serviceable with A's timer removed.
+    advance(&mut a, 100_000);
+    b.test_now = Some(a.now());
+    a.endpoint.on_timeout(a.now(), BUDGET).unwrap();
+    b.endpoint.on_timeout(b.now(), BUDGET).unwrap();
+    a.service_egress().unwrap();
+    deliver_scheduled(&mut a, &mut b, &state);
+    assert!(!a.endpoint.is_output_reserved(healthy));
+    assert_eq!(
+        a.endpoint
+            .send_progress(healthy)
+            .unwrap()
+            .unacknowledged_sequence,
+        a.endpoint
+            .send_progress(healthy)
+            .unwrap()
+            .next_write_sequence
+    );
+    assert!(a.output_wait() > std::time::Duration::ZERO);
+    let socket = new(&mut a, SOCK_NONBLOCK);
+    a.execute(socket, Op::Bind("10.73.0.2:16400".parse().unwrap()))
+        .unwrap();
+    a.execute(socket, Op::Listen(2)).unwrap();
+    a.execute(socket, Op::Close).unwrap();
+    a.test_now = Some(1_001_000);
+    a.expire_reservation(a.now()).unwrap();
+    assert!(!a.endpoint.is_output_reserved(held));
+    assert_eq!(a.endpoint.state(held), Ok(ntcp::State::Closed));
+    assert_eq!(a.endpoint.state(healthy), Ok(ntcp::State::Established));
+    assert!(a.execute(clients[1], Op::Write(vec![5; 20])).is_ok());
+}
+
+#[test]
+fn scheduled_rx_retains_observed_timestamp_and_full_queue_stops_reading() {
+    let (mut a, mut b, clients, servers, state) = scheduled_pair(2);
+    let held = connection(&a, clients[0]);
+    a.endpoint.set_rx_timestamp_capacity(held, 8).unwrap();
+    state.lock().unwrap().block_port = Some(a.endpoint.tuple(held).unwrap().local.port());
+    state.lock().unwrap().rx_stamps.software = Some(PacketTimestamp {
+        value: 123456789,
+        source: TimestampSource::Software,
+        point: TimestampPoint::UserReceive,
+        clock: ntcp_io::ClockDescriptor {
+            domain: ClockDomain::Realtime,
+            unit: TimestampUnit::Nanoseconds,
+        },
+    });
+    a.execute(clients[0], Op::Write(vec![1; 10])).unwrap();
+    a.service_egress().unwrap();
+    b.execute(servers[0], Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
+        .unwrap();
+    b.execute(servers[0], Op::Write(vec![7; 10])).unwrap();
+    assert!(b.prepare_packet(None).unwrap());
+    let bytes = b.pending_packet.take().unwrap();
+    ingress(&mut a, &state, &bytes);
+    // Duplicate also retained; no premature ACK/SACK processing on the held TCB.
+    ingress(&mut a, &state, &bytes);
+    assert_eq!(a.endpoint.readable_bytes(held).unwrap(), 0);
+    ingress(&mut a, &state, &bytes);
+    let receives = state.lock().unwrap().receives;
+    assert_eq!(state.lock().unwrap().incoming.len(), 1);
+    a.receive_batch(&mut vec![0; 65549]).unwrap();
+    assert_eq!(state.lock().unwrap().receives, receives);
+    // Clear only A; replay at current protocol time, not observation time.
+    state.lock().unwrap().block_port = None;
+    advance(&mut a, 50_000);
+    a.endpoint.on_timeout(a.now(), BUDGET).unwrap();
+    a.service_egress().unwrap();
+    a.receive_batch(&mut vec![0; 65549]).unwrap();
+    assert!(state.lock().unwrap().incoming.is_empty());
+    let stamp = a.endpoint.peek_rx_timestamps(held, 10).unwrap().unwrap();
+    assert_eq!(stamp.timestamps.software.unwrap().value, 123456789);
+    assert_eq!(
+        a.execute(clients[0], Op::Read(10)).unwrap().bytes,
+        vec![7; 10]
+    );
+}
+
+#[test]
+fn scheduled_capacity_one_backpressures_output_not_other_commands_and_expiry_is_per_owner() {
+    let (mut a, mut b, clients, servers, state) = scheduled_pair(1);
+    state.lock().unwrap().block_port = Some(
+        a.endpoint
+            .tuple(connection(&a, clients[0]))
+            .unwrap()
+            .local
+            .port(),
+    );
+    a.execute(clients[0], Op::Write(vec![1; 10])).unwrap();
+    a.service_egress().unwrap();
+    a.execute(clients[1], Op::Write(vec![2; 10])).unwrap();
+    a.service_egress().unwrap();
+    assert!(state.lock().unwrap().sent.is_empty());
+    a.test_now = Some(1_001_000);
+    a.expire_reservation(a.now()).unwrap();
+    for _ in 0..4 {
+        a.service_egress().unwrap();
+    }
+    deliver_scheduled(&mut a, &mut b, &state);
+    assert_eq!(
+        b.execute(servers[1], Op::Read(10)).unwrap().bytes,
+        vec![2; 10]
+    );
+}
+
+#[test]
+fn scheduled_mtu_prefix_repair_keeps_deadline_and_other_owner_alive() {
+    let (mut a, mut b, clients, servers, state) = scheduled_pair(4);
+    let held = connection(&a, clients[0]);
+    let (refresh, request, result) = super::super::output::MtuRefresh::fixture();
+    a.mtu_refresh = Some(refresh);
+    state.lock().unwrap().enforce_mtu = true;
+    state.lock().unwrap().mtu = Some(1400);
+    a.execute(clients[0], Op::Write(vec![7; 8000])).unwrap();
+    a.service_egress().unwrap();
+    request.try_recv().unwrap();
+    assert!(a.endpoint.is_output_reserved(held));
+    a.execute(clients[1], Op::Write(vec![4; 20])).unwrap();
+    a.service_egress().unwrap();
+    deliver_scheduled(&mut a, &mut b, &state);
+    assert_eq!(
+        b.execute(servers[1], Op::Read(20)).unwrap().bytes,
+        vec![4; 20]
+    );
+    result.send(Ok(Some(1400))).unwrap();
+    a.poll_mtu_refresh();
+    a.service_egress().unwrap();
+    assert!(a.endpoint.is_output_reserved(held)); // Prefix accepted, suffix retained.
+    assert!(state.lock().unwrap().sent.iter().all(|p| p.len() <= 1414));
+    state.lock().unwrap().block_port = Some(a.endpoint.tuple(held).unwrap().local.port());
+    advance(&mut a, 500_000);
+    a.service_egress().unwrap();
+    a.test_now = Some(1_001_000);
+    a.expire_reservation(a.now()).unwrap();
+    assert_eq!(a.endpoint.state(held), Ok(ntcp::State::Closed));
+    assert_eq!(
+        a.endpoint.state(connection(&a, clients[1])),
+        Ok(ntcp::State::Established)
+    );
+}
+
+#[test]
+fn scheduled_guard_precedes_foreign_buffers_close_and_options() {
+    let (mut a, _, clients, _, state) = scheduled_pair(2);
+    let cid = connection(&a, clients[0]);
+    state.lock().unwrap().block_port = Some(a.endpoint.tuple(cid).unwrap().local.port());
+    a.execute(clients[0], Op::Write(vec![7; 50])).unwrap();
+    a.service_egress().unwrap();
+    for op in [
+        Op::Send(vec![(usize::MAX, 4)], 0),
+        Op::Set(IPPROTO_TCP, TCP_CORK, 1),
+        Op::Close,
+    ] {
+        let (reply, response) = mpsc::sync_channel(1);
+        let mut request = Request {
+            id: clients[0],
+            op,
+            reply,
+            deadline: None,
+            send: None,
+            closing: None,
+        };
+        assert!(!a.service(&mut request));
+        assert!(request.send.is_none());
+        assert!(response.try_recv().is_err());
+    }
+    assert!(!a.sockets[&clients[0]].cork);
+    // Readiness scans must not wait for A before querying B.
+    assert_eq!(a.execute(clients[0], Op::Ready).unwrap().value, 0);
+    assert_ne!(
+        a.execute(clients[1], Op::Ready).unwrap().value & EPOLLOUT,
+        0
+    );
+    a.execute(clients[1], Op::Set(IPPROTO_TCP, TCP_CORK, 1))
+        .unwrap();
+    assert!(a.sockets[&clients[1]].cork);
+}
+
+#[test]
+fn scheduled_unknown_error_is_fatal_without_rejection_or_retry() {
+    let (mut a, _, clients, _, state) = scheduled_pair(2);
+    let cid = connection(&a, clients[0]);
+    a.execute(clients[0], Op::Write(vec![1; 100])).unwrap();
+    state.lock().unwrap().output_error = Some(io::ErrorKind::Interrupted);
+    assert_eq!(a.service_egress(), Err(EIO));
+    assert!(a.endpoint.is_output_reserved(cid));
+    assert_eq!(state.lock().unwrap().output_calls, 1);
+    assert_eq!(a.endpoint.state(cid), Ok(ntcp::State::Established));
+    assert!(state.lock().unwrap().sent.is_empty());
+    assert!(state.lock().unwrap().cancelled.is_empty());
+}
+
+#[test]
+fn scheduled_stateless_lane_is_bounded_and_expires_without_aborting_connections() {
+    let (mut a, _, clients, _, state) = scheduled_pair(2);
+    let ip = ntcp::IpMetadata {
+        source: "10.73.0.3".parse().unwrap(),
+        destination: "10.73.0.2".parse().unwrap(),
+    };
+    let mut tcp = [0; 64];
+    let len = ntcp::wire::encode(
+        ip,
+        ntcp::wire::Header {
+            source_port: 6550,
+            destination_port: 6551,
+            sequence: 1,
+            acknowledgment: 1,
+            flags: ntcp::wire::ACK,
+            window: 100,
+            urgent_pointer: 0,
+        },
+        &[],
+        &[],
+        &mut tcp,
+    )
+    .unwrap();
+    state.lock().unwrap().block_port = Some(6551);
+    a.input(a.now(), ip, 0, &tcp[..len]).unwrap();
+    a.service_egress().unwrap();
+    for _ in 0..8 {
+        a.input(a.now(), ip, 0, &tcp[..len]).unwrap();
+    }
+    a.execute(clients[0], Op::Write(vec![8; 20])).unwrap();
+    a.service_egress().unwrap();
+    assert_eq!(state.lock().unwrap().sent.len(), 1);
+    assert!(a.output_wait() > std::time::Duration::ZERO);
+    a.test_now = Some(1_001_000);
+    a.expire_reservation(a.now()).unwrap();
+    assert_eq!(
+        a.endpoint.state(connection(&a, clients[0])),
+        Ok(ntcp::State::Established)
+    );
+    state.lock().unwrap().block_port = None;
+    a.service_egress().unwrap();
+    assert!(state.lock().unwrap().sent.len() > 1);
+}
+
+#[test]
+fn scheduled_out_of_order_replay_keeps_tcp_options_and_original_range_timestamps() {
+    let (mut a, mut b, clients, servers, state) = scheduled_pair(4);
+    let cid = connection(&a, clients[0]);
+    a.endpoint.set_rx_timestamp_capacity(cid, 8).unwrap();
+    state.lock().unwrap().block_port = Some(a.endpoint.tuple(cid).unwrap().local.port());
+    a.execute(clients[0], Op::Write(vec![1; 10])).unwrap();
+    a.service_egress().unwrap();
+    b.execute(servers[0], Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
+        .unwrap();
+    b.execute(servers[0], Op::Write(vec![9; 16000])).unwrap();
+    assert!(b.prepare_packet(None).unwrap());
+    let first = b.pending_packet.take().unwrap();
+    assert!(b.prepare_packet(None).unwrap());
+    let second = b.pending_packet.take().unwrap();
+    for (packet, observed) in [(&second, 222), (&first, 333)] {
+        state.lock().unwrap().rx_stamps.software = Some(PacketTimestamp {
+            value: observed,
+            source: TimestampSource::Software,
+            point: TimestampPoint::UserReceive,
+            clock: ntcp_io::ClockDescriptor {
+                domain: ClockDomain::Realtime,
+                unit: TimestampUnit::Nanoseconds,
+            },
+        });
+        ingress(&mut a, &state, packet);
+    }
+    assert_eq!(a.endpoint.readable_bytes(cid).unwrap(), 0);
+    state.lock().unwrap().block_port = None;
+    advance(&mut a, 100_000);
+    a.service_egress().unwrap();
+    a.receive_batch(&mut vec![0; 65549]).unwrap();
+    assert_eq!(
+        a.endpoint
+            .peek_rx_timestamps(cid, 16000)
+            .unwrap()
+            .unwrap()
+            .timestamps
+            .software
+            .unwrap()
+            .value,
+        222
+    );
+    assert_eq!(
+        a.execute(clients[0], Op::Read(16000)).unwrap().bytes,
+        vec![9; 16000]
+    );
+}
+
+#[test]
+fn scheduled_timestamp_rejection_and_late_completion_are_owner_local() {
+    let (mut a, _, clients, _, state) = scheduled_pair(4);
+    state.lock().unwrap().capacity = 8;
+    for id in clients {
+        flags(&mut a, id, ts::TX_SCHED | ts::TX_SOFTWARE | ts::TX_HARDWARE);
+    }
+    a.execute(clients[0], Op::Write(vec![1; 100])).unwrap();
+    a.service_egress().unwrap();
+    let cookie = state.lock().unwrap().requests[0].cookie;
+    a.execute(clients[0], Op::Write(vec![2; 8000])).unwrap();
+    let port = a
+        .endpoint
+        .tuple(connection(&a, clients[0]))
+        .unwrap()
+        .local
+        .port();
+    state.lock().unwrap().block_port = Some(port);
+    a.service_egress().unwrap();
+    a.execute(clients[1], Op::Write(vec![3; 100])).unwrap();
+    a.service_egress().unwrap();
+    state
+        .lock()
+        .unwrap()
+        .completions
+        .push_back(completion(cookie, TimestampSource::Software));
+    a.poll_backend_timestamps().unwrap();
+    assert_eq!(stage_count(&a, clients[0], 0), 1);
+    assert_eq!(stage_count(&a, clients[0], 1), 2);
+    state.lock().unwrap().enforce_mtu = true;
+    state.lock().unwrap().mtu = Some(1400);
+    advance(&mut a, 1000);
+    a.service_egress().unwrap();
+    assert_eq!(a.sockets[&clients[0]].timestamps.reserved(), 1); // Earlier HW only.
+    assert_eq!(a.sockets[&clients[1]].timestamps.reserved(), 2);
+    a.test_now = Some(1_001_000);
+    a.expire_reservation(a.now()).unwrap();
+    assert_eq!(a.sockets[&clients[0]].timestamps.reserved(), 0);
+    assert_eq!(a.sockets[&clients[1]].timestamps.reserved(), 2);
+    state
+        .lock()
+        .unwrap()
+        .completions
+        .push_back(completion(cookie, TimestampSource::Hardware));
+    a.poll_backend_timestamps().unwrap();
+    assert_eq!(stage_count(&a, clients[0], 0), 1); // Cancelled late HW not fabricated.
+}
+
+#[test]
+fn scheduled_full_admission_rotates_stateless_with_continuously_ready_tcp() {
+    let (mut a, _, clients, _, state) = scheduled_pair(1);
+    for id in clients {
+        a.execute(id, Op::Write(vec![1; 50000])).unwrap();
+    }
+    let ip = ntcp::IpMetadata {
+        source: "10.73.0.3".parse().unwrap(),
+        destination: "10.73.0.2".parse().unwrap(),
+    };
+    let mut tcp = [0; 64];
+    let len = ntcp::wire::encode(
+        ip,
+        ntcp::wire::Header {
+            source_port: 6550,
+            destination_port: 6551,
+            sequence: 1,
+            acknowledgment: 1,
+            flags: ntcp::wire::ACK,
+            window: 100,
+            urgent_pointer: 0,
+        },
+        &[],
+        &[],
+        &mut tcp,
+    )
+    .unwrap();
+    a.input(a.now(), ip, 0, &tcp[..len]).unwrap();
+    for _ in 0..3 {
+        a.service_egress().unwrap();
+    }
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .sent
+            .iter()
+            .any(|bytes| bytes[34..36] == 6551u16.to_be_bytes())
+    );
+}
+
+#[test]
+fn scheduled_last_close_waits_for_its_fin_submission_not_other_owners() {
+    let (mut a, mut b, clients, servers, state) = scheduled_pair(2);
+    let cid = connection(&a, clients[0]);
+    state.lock().unwrap().block_port = Some(a.endpoint.tuple(cid).unwrap().local.port());
+    let (reply, response) = mpsc::sync_channel(1);
+    let mut close = Request {
+        id: clients[0],
+        op: Op::Close,
+        reply,
+        deadline: None,
+        send: None,
+        closing: None,
+    };
+    assert!(!a.service(&mut close));
+    assert!(!a.sockets.contains_key(&clients[0]));
+    assert_eq!(close.closing, Some(cid));
+    a.service_egress().unwrap();
+    assert!(a.endpoint.is_output_reserved(cid));
+    assert!(!a.service(&mut close));
+    assert!(response.try_recv().is_err());
+    a.execute(clients[1], Op::Write(vec![4; 20])).unwrap();
+    a.service_egress().unwrap();
+    deliver_scheduled(&mut a, &mut b, &state);
+    assert_eq!(
+        b.execute(servers[1], Op::Read(20)).unwrap().bytes,
+        vec![4; 20]
+    );
+    state.lock().unwrap().block_port = None;
+    advance(&mut a, 1000);
+    a.service_egress().unwrap();
+    // Acceptance refreshes readiness; the following bounded poll clears the
+    // now-idle candidate without selecting a duplicate FIN.
+    a.service_egress().unwrap();
+    assert!(a.service(&mut close));
+    assert_eq!(response.recv().unwrap().unwrap().value, 0);
+    deliver_scheduled(&mut a, &mut b, &state);
+    assert_eq!(b.execute(servers[0], Op::Read(1)).unwrap().value, 0);
 }

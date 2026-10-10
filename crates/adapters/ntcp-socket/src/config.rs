@@ -32,6 +32,7 @@ pub struct IoConfig {
     pub prefix: Option<u8>,
     pub next_hop_mac: Option<[u8; 6]>,
     pub output_reservation_timeout_ms: u32,
+    pub egress_capacity: usize,
 }
 
 fn invalid() -> io::Error {
@@ -61,12 +62,15 @@ impl SocketConfig {
                 prefix: None,
                 next_hop_mac: None,
                 output_reservation_timeout_ms: 1000,
+                egress_capacity: crate::runtime::BUDGET,
             },
         }
     }
 
     pub fn validate(&self) -> io::Result<()> {
-        if self.io.output_reservation_timeout_ms == 0
+        if self.io.egress_capacity == 0
+            || self.io.egress_capacity.checked_mul(65535 + 14).is_none()
+            || self.io.output_reservation_timeout_ms == 0
             || self.io.interface.is_empty()
             || self.io.interface.len() >= libc::IFNAMSIZ
             || self.io.interface.bytes().any(|b| {
@@ -143,6 +147,7 @@ impl SocketConfig {
                 "io.interface" => config.io.interface = value.into(),
                 "io.address" => config.io.address = value.parse().map_err(|_| invalid())?,
                 "io.prefix" => config.io.prefix = Some(number(value)?),
+                "io.egress_capacity" => config.io.egress_capacity = number(value)?,
                 "io.output_reservation_timeout_ms" => {
                     config.io.output_reservation_timeout_ms = number(value)?;
                 }

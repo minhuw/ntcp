@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 #[path = "runtime_backend.rs"]
 mod backend;
+#[path = "runtime_egress.rs"]
+mod egress;
 #[path = "runtime_output.rs"]
 mod output;
 #[path = "runtime_send.rs"]
@@ -29,7 +31,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const LIMIT: usize = 512;
 pub const BYTES: usize = 65536;
-const BUDGET: usize = 32;
+pub(crate) const BUDGET: usize = 32;
 // Linux sock_setsockopt clamps the unsigned request before doubling. Fixed
 // project cap, not host sysctls: RACK's per-byte ledger also consumes the budget.
 const BUFFER_REQUEST_CAP: u32 = 1024 * 1024;
@@ -100,6 +102,7 @@ struct Request {
     reply: SyncSender<Result<Reply>>,
     deadline: Option<Instant>,
     send: Option<LogicalSend>,
+    closing: Option<ConnectionId>,
 }
 pub struct Runtime {
     tx: SyncSender<Request>,
@@ -237,6 +240,7 @@ impl Runtime {
             reply,
             deadline,
             send: None,
+            closing: None,
         };
         if closing {
             // Descriptor teardown must not strand an Endpoint socket when the
@@ -420,10 +424,13 @@ struct Owner {
     next_port: u16,
     next_id: u64,
     detached: Vec<ConnectionId>,
+    egress: Option<egress::Egress>,
+    // Legacy direct-poll fixtures/packet-test only; native Egress never fills this carrier.
     pending_packet: Option<Vec<u8>>,
     pending_token: Option<ntcp::TxTimestampToken>,
     reservations: bool,
     reservation: Option<ntcp::TransmitAttempt>,
+    reservation_owner: Option<ConnectionId>,
     reservation_deadline: Option<u64>,
     reservation_timeout_us: u64,
     waiting_mtu: bool,
@@ -569,10 +576,12 @@ impl Owner {
             next_port: 40000,
             next_id: 1,
             detached: Vec::new(),
+            egress: None,
             pending_packet: None,
             pending_token: None,
             reservations: false,
             reservation: None,
+            reservation_owner: None,
             reservation_deadline: None,
             reservation_timeout_us: 1_000_000,
             waiting_mtu: false,
@@ -694,8 +703,20 @@ impl Owner {
         false
     }
     fn service(&mut self, request: &mut Request) -> bool {
+        // Last-close must give its already-queued FIN/RST a submission turn
+        // before waking a caller that may immediately exit the process. This
+        // retained generation survives socket removal; other requests progress.
+        if let Some(cid) = request.closing {
+            if self.endpoint.is_output_reserved(cid)
+                || self.endpoint.ready_connections().any(|id| id == cid)
+            {
+                return false;
+            }
+            let _ = request.reply.send(Ok(Reply::default()));
+            return true;
+        }
         // Defer before inspecting foreign buffers or consuming file/pipe producers.
-        if self.reservation.is_some() {
+        if self.command_held(request.id, &request.op) {
             return false;
         }
         let (op, wait) = if let Op::Wait(op, _) = &request.op {
@@ -722,8 +743,20 @@ impl Owner {
             }
             return self.service_send(request, wait);
         }
+        let closing = if self.egress.is_some() && matches!(op, Op::Close) {
+            self.sockets.get(&request.id).and_then(|s| match s.handle {
+                Handle::Connection(cid) => Some(cid),
+                _ => None,
+            })
+        } else {
+            None
+        };
         let op = op.clone();
         let result = self.execute(request.id, op);
+        if result.is_ok() && closing.is_some() {
+            request.closing = closing;
+            return false;
+        }
         if matches!(result, Err(EAGAIN))
             && wait
             && (self
@@ -796,6 +829,9 @@ impl Owner {
         let Some(tx) = tx else {
             return Ok(false);
         };
+        if self.reservations {
+            self.reservation_owner = tx.connection;
+        }
         packet = self.frame(tx, &packet[20..20 + tx.len])?;
         self.timestamp_packet(tx.tx_timestamp, &packet);
         self.drain_timestamps(pair);
@@ -829,35 +865,41 @@ impl Owner {
                 }
             }
             let transmit_now = self.batch_time();
-            for _ in 0..BUDGET {
-                match self.prepare_packet(transmit_now) {
-                    Ok(true) => (),
-                    Ok(false) => break,
-                    Err(_) => break 'run,
+            if self.egress.is_some() {
+                if self.service_egress().is_err() {
+                    break 'run;
                 }
-                // Backend acceptance is the only success boundary, including late accepts.
-                if self.tun.is_some() || self.ethernet.is_some() {
-                    match self.submit_reserved_packet() {
-                        Ok(TxOutcome::Submitted) => (),
-                        Ok(TxOutcome::WouldBlock) => break,
+            } else {
+                for _ in 0..BUDGET {
+                    match self.prepare_packet(transmit_now) {
+                        Ok(true) => (),
+                        Ok(false) => break,
                         Err(_) => break 'run,
                     }
-                }
-                #[cfg(feature = "packet-test")]
-                if self.packets.is_some() {
-                    let token = self.pending_token.take();
-                    self.software_transmitted(token, timestamps::realtime());
-                    let packets = self.packets.as_mut().unwrap();
-                    let bytes = self.pending_packet.take().unwrap();
-                    packets.output.push_back(Reply {
-                        value: bytes.len() as i32,
-                        bytes,
-                        stamp: SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_micros() as i64,
-                        ..Reply::default()
-                    });
+                    // Backend acceptance is the only success boundary, including late accepts.
+                    if self.tun.is_some() || self.ethernet.is_some() {
+                        match self.submit_reserved_packet() {
+                            Ok(TxOutcome::Submitted) => (),
+                            Ok(TxOutcome::WouldBlock) => break,
+                            Err(_) => break 'run,
+                        }
+                    }
+                    #[cfg(feature = "packet-test")]
+                    if self.packets.is_some() {
+                        let token = self.pending_token.take();
+                        self.software_transmitted(token, timestamps::realtime());
+                        let packets = self.packets.as_mut().unwrap();
+                        let bytes = self.pending_packet.take().unwrap();
+                        packets.output.push_back(Reply {
+                            value: bytes.len() as i32,
+                            bytes,
+                            stamp: SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_micros() as i64,
+                            ..Reply::default()
+                        });
+                    }
                 }
             }
             self.events();
@@ -870,7 +912,9 @@ impl Owner {
                 .retain(|p| self.endpoint.connection_exists(p.0));
             if self.reservation.is_none() {
                 self.detached.retain(|&id| {
-                    if matches!(self.endpoint.state(id), Ok(State::Closed | State::TimeWait)) {
+                    if !self.endpoint.is_output_reserved(id)
+                        && matches!(self.endpoint.state(id), Ok(State::Closed | State::TimeWait))
+                    {
                         let _ = self.endpoint.release(id);
                         false
                     } else {
@@ -882,7 +926,9 @@ impl Owner {
             let wait = self.output_wait();
             // Leave excess commands in the bounded channel, including Close. Never
             // grow the deferred queue or leak OutputReserved to unrelated sockets.
-            if self.reservation.is_some() && self.pending.len() >= self.socket_limit() {
+            if (self.reservation.is_some() || self.egress.as_ref().is_some_and(|e| e.has_held()))
+                && self.pending.len() >= self.socket_limit()
+            {
                 std::thread::sleep(wait);
                 continue;
             }
@@ -898,7 +944,10 @@ impl Owner {
                     #[cfg(not(feature = "packet-test"))]
                     let requests = BUDGET;
                     for _ in 1..requests {
-                        if self.reservation.is_some() && self.pending.len() >= self.socket_limit() {
+                        if (self.reservation.is_some()
+                            || self.egress.as_ref().is_some_and(|e| e.has_held()))
+                            && self.pending.len() >= self.socket_limit()
+                        {
                             break;
                         }
                         let Ok(mut r) = rx.try_recv() else {
@@ -1231,6 +1280,11 @@ impl Owner {
     }
     fn readiness_bits(&self, id: u64) -> Result<i32> {
         let s = self.sockets.get(&id).ok_or(EBADF)?;
+        // A held native owner cannot service its I/O yet, but querying it must
+        // not block a poll/epoll scan of unrelated descriptors.
+        if self.egress.is_some() && self.command_held(id, &Op::Read(0)) {
+            return Ok(0);
+        }
         let mut bits = 0;
         if s.error != 0 || !s.completions.is_empty() {
             bits |= EPOLLERR;
@@ -1293,7 +1347,7 @@ impl Owner {
         Ok(bits)
     }
     fn execute(&mut self, id: u64, op: Op) -> Result<Reply> {
-        if self.reservation.is_some() {
+        if self.command_held(id, &op) {
             return Err(EAGAIN);
         }
         self.endpoint.on_timeout(self.now(), 0).map_err(engine)?;
@@ -2517,6 +2571,7 @@ mod tests {
             reply,
             deadline: None,
             send: None,
+            closing: None,
         };
         assert!(!a.service(&mut request));
         pump(&mut a, &mut b);
@@ -2858,6 +2913,7 @@ mod tests {
                 reply,
                 deadline: None,
                 send: None,
+                closing: None,
             })
             .unwrap();
         }

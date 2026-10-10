@@ -11,9 +11,9 @@ use std::{
 };
 
 pub(super) struct EthernetBackend {
-    io: Box<dyn PacketIo + Send>,
-    local: [u8; 6],
-    next_hop: [u8; 6],
+    pub(super) io: Box<dyn PacketIo + Send>,
+    pub(super) local: [u8; 6],
+    pub(super) next_hop: [u8; 6],
     next_cookie: u64,
     pending: Vec<(u64, ntcp::TxTimestampToken, bool, bool)>,
 }
@@ -165,7 +165,6 @@ impl Owner {
             None,
             backend_config(config.tcp.clone(), &io)?,
         )?;
-        owner.enable_reservations(&config.io, index)?;
         owner.ethernet = Some(EthernetBackend {
             io: Box::new(io),
             local: hardware,
@@ -173,6 +172,7 @@ impl Owner {
             next_cookie: 1,
             pending: Vec::with_capacity(timestamps::PHASES),
         });
+        owner.enable_reservations(&config.io, index)?;
         Ok(owner)
     }
     pub(super) fn receive_backend(
@@ -207,6 +207,9 @@ impl Owner {
     }
     // Each rejected frame consumes one iteration, just like an accepted frame.
     pub(super) fn receive_batch(&mut self, input: &mut [u8]) -> std::io::Result<()> {
+        if self.egress.is_some() {
+            return self.receive_scheduled(input);
+        }
         // Keep RX in the backend's bounded queue while the endpoint is reserved.
         if self.reservation.is_some() {
             return Ok(());
@@ -242,7 +245,7 @@ impl Owner {
     //= reason=Native IPv4 input validates codec output then dispatches quoted tuple/sequence to endpoint policy; tests reject wrong checksum/tuple/window and observe bounded output after valid PTB.
     //# Upon receipt of such a message (henceforth called a "Datagram Too Big" message), the
     //# source host reduces its assumed PMTU for the path.
-    fn input_ip(&mut self, bytes: &[u8], stamps: ntcp::RxPacketTimestamps) {
+    pub(super) fn input_ip(&mut self, bytes: &[u8], stamps: ntcp::RxPacketTimestamps) {
         let Ok(p) = ntcp_ip::parse(bytes, false) else {
             return;
         };
@@ -386,9 +389,18 @@ impl EthernetBackend {
             packet,
         )
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        self.transmit_frame(endpoint, token, sources, &frame[..n])
+    }
+    pub(super) fn transmit_frame(
+        &mut self,
+        endpoint: &mut Endpoint,
+        token: Option<ntcp::TxTimestampToken>,
+        sources: (bool, bool),
+        frame: &[u8],
+    ) -> std::io::Result<TxOutcome> {
         let requested = usize::from(sources.0) + usize::from(sources.1);
         if requested == 0 {
-            return self.io.transmit(&frame[..n]);
+            return self.io.transmit(frame);
         }
         let token = token.unwrap();
         let capabilities = self.io.timestamp_capabilities();
@@ -414,7 +426,7 @@ impl EthernetBackend {
             }
             let cookie = self.next_cookie;
             match self.io.transmit_with_timestamp(
-                &frame[..n],
+                frame,
                 ntcp_io::TxTimestampRequest {
                     cookie,
                     software: sources.0,
@@ -434,7 +446,7 @@ impl EthernetBackend {
             }
         }
         Self::cancel_sources(endpoint, token, sources.0, sources.1);
-        self.io.transmit(&frame[..n])
+        self.io.transmit(frame)
     }
 }
 

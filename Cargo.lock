@@ -208,6 +208,7 @@ dependencies = [
  "cc",
  "libc",
  "ntcp",
+ "ntcp-egress",
  "ntcp-ethernet",
  "ntcp-icmp",
  "ntcp-io",

@@ -9,6 +9,7 @@ fn logical_request(a: &mut Owner, id: u64, op: Op) -> (Request, Receiver<Result<
             reply,
             deadline: None,
             send: None,
+            closing: None,
         },
         rx,
     )

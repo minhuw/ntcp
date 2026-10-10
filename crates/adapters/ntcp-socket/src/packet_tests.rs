@@ -122,6 +122,7 @@ impl Submission {
             .tx
             .try_send(super::Request {
                 send: None,
+                closing: None,
                 id: r.fd,
                 op,
                 reply,
@@ -2909,6 +2910,7 @@ fn descriptor_and_request_limits_fail_without_hanging() {
     let (reply, _) = mpsc::sync_channel(1);
     tx.send(super::Request {
         send: None,
+        closing: None,
         id: 0,
         op: Op::New(0),
         reply,

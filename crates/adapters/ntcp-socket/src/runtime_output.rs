@@ -47,7 +47,7 @@ impl MtuRefresh {
             outstanding: false,
         })
     }
-    fn request(&mut self) {
+    pub(super) fn request(&mut self) {
         if !self.outstanding && self.request.try_send(()).is_ok() {
             self.outstanding = true;
         }
@@ -60,7 +60,7 @@ impl Owner {
         config: &crate::IoConfig,
         index: u32,
     ) -> Result<()> {
-        self.endpoint.enable_output_reservations().map_err(engine)?;
+        self.enable_egress(config.egress_capacity)?;
         self.mtu_refresh = Some(MtuRefresh::spawn(move || {
             ntcp_io::linux::local_ip_mtu(index)
         })?);
@@ -71,18 +71,18 @@ impl Owner {
 
     fn clear_reservation(&mut self) {
         self.reservation = None;
+        self.reservation_owner = None;
         self.reservation_deadline = None;
         self.waiting_mtu = false;
     }
 
-    // The acceptance result certifies the token, not completion of the whole
-    // obligation. A zero-budget timeout is the existing barrier probe; it does
-    // no protocol work and advances time only once the reservation is complete.
+    // Legacy single-slot fixtures still use this path; native owners use Egress.
     fn completed_reservation(&mut self) -> Result<()> {
-        match self.endpoint.on_timeout(self.now(), 0) {
-            Ok(_) => self.clear_reservation(),
-            Err(EndpointError::OutputReserved) => (),
-            Err(e) => return Err(engine(e)),
+        if self
+            .reservation_owner
+            .is_none_or(|id| !self.endpoint.is_output_reserved(id))
+        {
+            self.clear_reservation();
         }
         Ok(())
     }
@@ -111,6 +111,9 @@ impl Owner {
     }
 
     pub(super) fn expire_reservation(&mut self, now: u64) -> Result<()> {
+        if self.egress.is_some() {
+            return self.expire_egress(now);
+        }
         if self
             .reservation_deadline
             .is_some_and(|deadline| now >= deadline)
@@ -148,6 +151,9 @@ impl Owner {
         {
             self.defaults.connection.pmtud = Some(ntcp::PmtudConfig::new(mtu));
             self.waiting_mtu = false;
+            if let Some(egress) = &mut self.egress {
+                egress.mtu_refreshed();
+            }
         }
     }
 
@@ -209,6 +215,9 @@ impl Owner {
 
     pub(super) fn output_wait(&self) -> std::time::Duration {
         let now = self.now();
+        if let Some(egress) = &self.egress {
+            return egress.wait(now, self.endpoint.next_deadline());
+        }
         // A parked MTU query has no useful pacing deadline; a pending backend
         // packet must be retried at a bounded cadence, not an overdue TCP timer.
         let core = if self.waiting_mtu || self.pending_packet.is_some() {
