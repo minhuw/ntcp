@@ -1319,3 +1319,301 @@ fn check_listener_reservation_readiness(consume_event: bool, repair: bool) {
     assert_eq!(b.next_event(), None);
     assert_eq!(b.accept(listener).unwrap(), held);
 }
+
+fn gso_pair(ipv6: bool, gso: bool) -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
+    let mut a = endpoint();
+    let mut b = endpoint();
+    for e in [&mut a, &mut b] {
+        e.config
+            .connection
+            .pmtud
+            .as_mut()
+            .unwrap()
+            .initial_search_low = Some(if ipv6 { 1280 } else { 1040 });
+        e.config.connection.timestamps = true;
+        e.config.connection.prr_pacing = false;
+        e.config.connection.initial_window = crate::InitialWindow::Iw10;
+        e.config.connection.send_capacity = 16_384;
+        e.config.connection.receive_capacity = 16_384;
+    }
+    let local = if ipv6 {
+        "[2001:db8::1]:40000"
+    } else {
+        "192.0.2.1:40000"
+    }
+    .parse()
+    .unwrap();
+    let remote = if ipv6 {
+        "[2001:db8::2]:8080"
+    } else {
+        "192.0.2.2:8080"
+    }
+    .parse()
+    .unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let client = a.connect(0, local, remote).unwrap();
+    let mut bytes = [0; 2048];
+    for i in 0..3 {
+        let (src, dst) = if i == 1 {
+            (&mut b, &mut a)
+        } else {
+            (&mut a, &mut b)
+        };
+        let p = src
+            .poll_transmit(1, &mut bytes, 16)
+            .unwrap()
+            .packet
+            .unwrap();
+        dst.input(1, p.ip, &bytes[..p.len]).unwrap();
+    }
+    let server = b.accept(listener).unwrap();
+    if gso {
+        a.enable_output_reservations_with_gso(
+            1,
+            crate::GsoLimits {
+                max_bytes: 5000,
+                max_segments: 4,
+            },
+        )
+        .unwrap();
+    } else {
+        a.enable_output_reservations_with_capacity(2).unwrap();
+    }
+    (a, b, client, server)
+}
+
+#[test]
+fn gso_ipv4_ipv6_exact_scalar_wire_equivalence_and_options() {
+    for ipv6 in [false, true] {
+        let (mut a, mut peer, id, server) = gso_pair(ipv6, true);
+        let (mut scalar, _, scalar_id, _) = gso_pair(ipv6, false);
+        let payload: std::vec::Vec<u8> = (0..6500).map(|i| i as u8).collect();
+        a.write(id, &payload).unwrap();
+        scalar.write(scalar_id, &payload).unwrap();
+        let mut bytes = [0; 2048];
+        let mut expected = [0; 2048];
+        let mut total = 0;
+        let mut groups = 0;
+        while total < payload.len() {
+            let (out, token) = a.poll_reserved_transmit_for(2, id, &mut bytes, 1).unwrap();
+            let token = token.unwrap();
+            let packet = out.packet.unwrap();
+            let (out, scalar_token) = scalar
+                .poll_reserved_transmit_for(2, scalar_id, &mut expected, 1)
+                .unwrap();
+            let reference = out.packet.unwrap();
+            assert_eq!(packet.len, reference.len);
+            assert_eq!(&bytes[..packet.len], &expected[..reference.len]);
+            let parsed = wire::parse(packet.ip, &bytes[..packet.len]).unwrap();
+            assert!(parsed.options.timestamps.is_some());
+            total += parsed.payload.len();
+            if let Some(s) = a.transmit_segmentation(token) {
+                groups += 1;
+                assert!(s.payload_len <= 5000);
+                assert!(s.payload_len / s.segment_payload_len <= 4);
+                assert_eq!(s.tcp_header_len, 32);
+                assert!(s.segment_payload_len < 1000); // TS options consume peer MSS.
+                assert_eq!(a.write(id, b"blocked"), Err(EndpointError::OutputReserved));
+            }
+            assert!(a.accept_transmit(2, token).unwrap());
+            assert!(!a.accept_transmit(2, token).unwrap());
+            assert_eq!(a.transmit_segmentation(token), None);
+            scalar.accept_transmit(2, scalar_token.unwrap()).unwrap();
+            peer.input(2, packet.ip, &bytes[..packet.len]).unwrap();
+        }
+        assert!(groups >= 4, "ipv6={ipv6}, groups={groups}");
+        assert!(!a.is_output_reserved(id));
+        let mut received = [0; 6500];
+        assert_eq!(peer.read(server, &mut received).unwrap(), 6500);
+        assert_eq!(&received[..], &payload);
+    }
+}
+
+#[test]
+fn gso_prefix_wouldblock_mtu_shrink_and_failed_encoding_are_atomic() {
+    let (mut a, _, id, _) = gso_pair(false, true);
+    a.write(id, &[3; 5000]).unwrap();
+    let mut bytes = [0; 2048];
+    a.clock(2).unwrap();
+    let before = a.transport_info(id).unwrap();
+    assert!(
+        a.poll_reserved_transmit_for(2, id, &mut [0; 31], 1)
+            .is_err()
+    );
+    assert_eq!(a.transport_info(id).unwrap(), before);
+    assert!(!a.is_output_reserved(id));
+    assert_eq!(a.reservations[0].payload.len(), 5000);
+    let (out, token) = a.poll_reserved_transmit_for(2, id, &mut bytes, 1).unwrap();
+    let token = token.unwrap();
+    let s = a.transmit_segmentation(token).unwrap();
+    let parsed = wire::parse(out.packet.unwrap().ip, &bytes[..out.packet.unwrap().len]).unwrap();
+    let start = parsed.header.sequence;
+    let mut accepted = parsed.payload.len();
+    // WouldBlock: the exact attempt remains outstanding, no re-selection.
+    assert_eq!(
+        a.poll_reserved_transmit_for(3, id, &mut bytes, 1),
+        Err(EndpointError::OutputReserved)
+    );
+    assert!(a.accept_transmit(4, token).unwrap());
+    assert!(a.is_output_reserved(id));
+    let (out, token) = a.poll_reserved_transmit_for(5, id, &mut bytes, 1).unwrap();
+    let token = token.unwrap();
+    assert_eq!(out.packet.unwrap().len, 32 + s.segment_payload_len);
+    a.reject_unsubmitted(token).unwrap();
+    a.set_first_hop_mtu(6, id, 552).unwrap();
+    assert!(
+        a.poll_reserved_transmit_for(6, id, &mut [0; 31], 1)
+            .is_err()
+    );
+    assert!(!a.accept_transmit(6, token).unwrap());
+    while a.is_output_reserved(id) {
+        let (out, token) = a.poll_reserved_transmit_for(7, id, &mut bytes, 1).unwrap();
+        let p = out.packet.unwrap();
+        let segment = wire::parse(p.ip, &bytes[..p.len]).unwrap();
+        assert!(p.len + 20 <= 552);
+        assert_eq!(segment.header.sequence, start.wrapping_add(accepted as u32));
+        assert_eq!(segment.header.flags & wire::CWR, 0);
+        accepted += segment.payload.len();
+        assert!(a.accept_transmit(7, token.unwrap()).unwrap());
+    }
+    assert_eq!(accepted, s.payload_len);
+    assert!(accepted < 5000); // Unselected tail is still separate TCP work.
+}
+
+#[test]
+fn gso_enable_budget_bounds_and_full_pool_are_atomic() {
+    let mut a = endpoint();
+    let before = a.buffer_bytes();
+    let limits = crate::GsoLimits {
+        max_bytes: 4096,
+        max_segments: 4,
+    };
+    let charge = 2
+        * (a.config.connection.send_ip_payload_limit as usize
+            + 4096
+            + core::mem::size_of::<crate::output_reservation::OutputReservation>());
+    a.config.max_buffer_bytes = before + charge - 1;
+    assert_eq!(
+        a.enable_output_reservations_with_gso(2, limits),
+        Err(Error::NoMemory.into())
+    );
+    assert!(a.reservations.is_empty());
+    assert_eq!(a.buffer_bytes(), before);
+    a.config.max_buffer_bytes += 1;
+    a.enable_output_reservations_with_gso(2, limits).unwrap();
+    a.enable_output_reservations_with_gso(2, limits).unwrap();
+    assert_eq!(a.buffer_bytes(), before + charge);
+    assert_eq!(
+        a.enable_output_reservations_with_capacity(2),
+        Err(Error::InvalidArgument.into())
+    );
+    for limits in [
+        crate::GsoLimits {
+            max_bytes: 0,
+            max_segments: 2,
+        },
+        crate::GsoLimits {
+            max_bytes: usize::MAX,
+            max_segments: 2,
+        },
+        crate::GsoLimits {
+            max_bytes: 4096,
+            max_segments: 1,
+        },
+    ] {
+        assert_eq!(
+            endpoint().enable_output_reservations_with_gso(1, limits),
+            Err(Error::InvalidArgument.into())
+        );
+    }
+    // Existing pool-full test covers scalar selection; aggregate backing must
+    // likewise remain untouched when no owner slot is available.
+    let (mut a, _, id, _) = gso_pair(false, true);
+    a.write(id, &[1; 5000]).unwrap();
+    let (_, token) = a
+        .poll_reserved_transmit_for(2, id, &mut [0; 2048], 1)
+        .unwrap();
+    let held = a.transmit_segmentation(token.unwrap());
+    assert_eq!(
+        a.poll_reserved_transmit_for(2, id, &mut [0; 2048], 1),
+        Err(EndpointError::OutputReserved)
+    );
+    assert_eq!(a.transmit_segmentation(token.unwrap()), held);
+}
+
+#[test]
+fn gso_allocator_failure_leaves_pool_and_budget_unchanged() {
+    for failure in 0..5 {
+        let mut a = endpoint();
+        let before = a.buffer_bytes();
+        let result = crate::allocation_tests::fail_after(failure, || {
+            a.enable_output_reservations_with_gso(
+                2,
+                crate::GsoLimits {
+                    max_bytes: 4096,
+                    max_segments: 4,
+                },
+            )
+        });
+        assert_eq!(result, Err(Error::NoMemory.into()));
+        assert!(a.reservations.is_empty());
+        assert_eq!(a.buffer_bytes(), before);
+    }
+    let (mut a, _, id, _) = gso_pair(false, true);
+    let other = a
+        .connect(
+            2,
+            "192.0.2.1:40001".parse().unwrap(),
+            "192.0.2.2:8080".parse().unwrap(),
+        )
+        .unwrap();
+    a.write(id, &[1; 5000]).unwrap();
+    let (_, token) = a
+        .poll_reserved_transmit_for(2, id, &mut [0; 2048], 1)
+        .unwrap();
+    let held = a.transmit_segmentation(token.unwrap());
+    assert!(held.is_some());
+    let before = a.transport_info(other).unwrap();
+    assert_eq!(
+        a.poll_reserved_transmit_for(2, other, &mut [0; 2048], 1),
+        Err(EndpointError::OutputReserved)
+    );
+    assert_eq!(a.transport_info(other).unwrap(), before);
+    assert_eq!(a.transmit_segmentation(token.unwrap()), held);
+}
+
+#[test]
+fn gso_pmtu_evidence_is_physical_not_aggregate() {
+    let (mut a, _, id, _) = gso_pair(false, true);
+    a.write(id, &[1; 5000]).unwrap();
+    let mut bytes = [0; 2048];
+    let (out, token) = a.poll_reserved_transmit_for(2, id, &mut bytes, 1).unwrap();
+    let token = token.unwrap();
+    let descriptor = a.transmit_segmentation(token).unwrap();
+    let packet = out.packet.unwrap();
+    let start = wire::parse(packet.ip, &bytes[..packet.len])
+        .unwrap()
+        .header
+        .sequence;
+    a.accept_transmit(3, token).unwrap();
+    while a.is_output_reserved(id) {
+        let (_, token) = a.poll_reserved_transmit_for(3, id, &mut bytes, 1).unwrap();
+        a.accept_transmit(3, token.unwrap()).unwrap();
+    }
+    let tuple = a.retained_slot(id).unwrap().connection.tuple();
+    assert!(
+        !a.pmtu_feedback(
+            4,
+            tuple,
+            start,
+            (descriptor.payload_len + descriptor.tcp_header_len + 20) as u32,
+            20,
+            552
+        )
+        .unwrap()
+    );
+    assert!(
+        a.pmtu_feedback(4, tuple, start, (packet.len + 20) as u32, 20, 552)
+            .unwrap()
+    );
+}

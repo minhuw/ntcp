@@ -5,6 +5,7 @@ use crate::{ConnectionId, EndpointError, Error, Instant, Transmit, wire};
 // Only physical-departure work; sequence, recovery and PRR charges stay selected.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Departure {
+    pub segmentation: Option<TransmitSegmentation>,
     pub selected_at: Instant,
     pub start: u32,
     pub payload: usize,
@@ -24,6 +25,28 @@ pub(crate) struct Departure {
     pub legacy_rate: Option<(u64, u32)>,
 }
 
+/// Opt-in bounds for immutable fresh-data reservations, not wire packet sizes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GsoLimits {
+    pub max_bytes: usize,
+    pub max_segments: usize,
+}
+
+/// Segmentation of the entire selected range. Polling still returns one actual
+/// segment; this descriptor does not authorize hardware/group submission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransmitSegmentation {
+    pub payload_len: usize,
+    pub segment_payload_len: usize,
+    pub tcp_header_len: usize,
+    pub terminal_flags: u8,
+}
+
+pub(crate) struct GsoBuffer<'a> {
+    pub limits: GsoLimits,
+    pub payload: &'a mut [u8],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransmitAttempt {
     pub(crate) ordinal: u64,
@@ -34,6 +57,8 @@ pub struct TransmitAttempt {
 pub(crate) struct OutputReservation {
     pub index: usize,
     pub bytes: Vec<u8>,
+    pub payload: Vec<u8>,
+    pub gso: Option<GsoLimits>,
     pub current: Option<ReservedOutput>,
     pub ordinal: u64,
 }
@@ -56,6 +81,8 @@ impl OutputReservation {
         Self {
             index: 0,
             bytes: Vec::new(),
+            payload: Vec::new(),
+            gso: None,
             current: None,
             ordinal: 0,
         }
@@ -97,7 +124,12 @@ impl OutputReservation {
         // one configured packet; cache parsed metadata if repair throughput matters.
         let original =
             wire::parse(r.packet.ip, &self.bytes[..r.packet.len]).map_err(Error::Wire)?;
+        let segmentation = r.departure.and_then(|d| d.segmentation);
+        let payload = segmentation.map_or(original.payload, |s| &self.payload[..s.payload_len]);
         let mut header = original.header;
+        if let Some(s) = segmentation {
+            header.flags = s.terminal_flags;
+        }
         let mut options = [0; 40];
         let mut used = 0;
         let mut sack_data = &[][..];
@@ -149,16 +181,24 @@ impl OutputReservation {
         if used > option_budget || remaining_sacks != 0 && emitted_sacks == 0 {
             return Err(EndpointError::ReservationMtuTooSmall);
         }
-        let count = original
-            .payload
+        if segmentation.is_some() {
+            // GSO admission excludes SACK-bearing output; preserve negotiated TS
+            // padding and all other option bytes, rather than repacking them.
+            used = original.raw_options.len();
+            options[..used].copy_from_slice(original.raw_options);
+            if used > option_budget {
+                return Err(EndpointError::ReservationMtuTooSmall);
+            }
+        }
+        let count = payload
             .len()
             .saturating_sub(r.offset)
-            .min(limit.saturating_sub(20 + used));
-        if count == 0 && r.offset < original.payload.len() && emitted_sacks == 0 {
+            .min(limit.saturating_sub(20 + used))
+            .min(segmentation.map_or(usize::MAX, |s| s.segment_payload_len));
+        if count == 0 && r.offset < payload.len() && emitted_sacks == 0 {
             return Err(EndpointError::ReservationMtuTooSmall);
         }
-        let finished =
-            r.offset + count == original.payload.len() && emitted_sacks == remaining_sacks;
+        let finished = r.offset + count == payload.len() && emitted_sacks == remaining_sacks;
         header.sequence = header.sequence.wrapping_add(r.offset as u32);
         if !finished {
             header.flags &= !(wire::FIN | wire::PSH);
@@ -178,7 +218,7 @@ impl OutputReservation {
             r.packet.ip,
             header,
             &options[..used],
-            &original.payload[r.offset..r.offset + count],
+            &payload[r.offset..r.offset + count],
             out,
         )
         .map_err(Error::Wire)?;

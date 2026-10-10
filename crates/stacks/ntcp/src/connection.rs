@@ -2180,6 +2180,21 @@ impl Connection {
                     .commit_departure(selection, start, start.wrapping_add(count as u32), now);
             debug_assert!(committed); // Identical read-only preflight above.
         }
+        if count != 0
+            && let Some(s) = d.segmentation
+            && let Some(p) = &mut self.pmtud
+        {
+            // An aggregate is not a physical packet or PMTU observation. Record
+            // only the actual accepted segment, including any reduced-MTU split.
+            let start = Seq(d.start).wrapping_add(offset as u32);
+            p.sent(
+                start,
+                start.wrapping_add(count as u32),
+                (count + s.tcp_header_len) as u32 + u32::from(self.ip_header_len),
+                self.ip_header_len,
+                false,
+            );
+        }
         self.update_time(now)?;
         // The encoded TSval names selection, not departure. A scalar covering
         // this output is unsuitable even when it shares a tick with other output.
@@ -6182,7 +6197,18 @@ impl Connection {
         out: &mut [u8],
         reserve: bool,
     ) -> Result<Option<usize>, Error> {
+        self.transmit_selected_with_gso(now, out, reserve, None)
+    }
+
+    pub(crate) fn transmit_selected_with_gso(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        reserve: bool,
+        mut gso: Option<crate::output_reservation::GsoBuffer<'_>>,
+    ) -> Result<Option<usize>, Error> {
         self.check_time(now)?;
+        let mut segmentation = None;
         // Plan entirely before encode. Even timer/clock/accounting changes
         // are committed only once the adapter has sufficient output space.
         let reset = self.pending_rst;
@@ -7016,10 +7042,65 @@ impl Connection {
             if self.ecn_pause.is_some_and(|deadline| now < deadline) {
                 count = 0;
             }
+            // Extend only an already-admissible full-sized ordinary segment.
+            // Keep protocol scratch/MTU unchanged: only the first segment is
+            // encoded here; separately reserved storage retains the whole range.
+            if count == wire_mss
+                && count != 0
+                && packet_mss == wire_mss
+                && reserve
+                && !self.shutdown
+                && !urgent
+                && !self.retx_pending
+                && !self.tlp_pending
+                && !self.probe_pending
+                && self.pmtud.as_ref().is_none_or(|p| p.probe.is_none())
+                && candidate.is_none()
+                && !self.congestion.in_recovery()
+                && self.prr.is_none()
+                && self.congestion.ecn_prr_end().is_none()
+                && self.sack_recovery.is_none()
+                && self.sack_post_rto.is_none()
+                && self.sack_fallback.is_none()
+                && self.consecutive_timeouts == 0
+                && self.rack.valid()
+                && self.rack.counts().lost == 0
+                && !self.limited_pending
+                && self.ecn_pause.is_none()
+                && !self.pacing_enabled()
+                && self.tx_timestamps.is_empty()
+                && sack_option_len == 0
+                && self.config.output_push_batch_segments < 2
+                && let Some(buffer) = &gso
+            {
+                let bounded = unsent
+                    .min(usable)
+                    .min(timestamp_credit as usize)
+                    .min(buffer.limits.max_bytes)
+                    .min(buffer.payload.len());
+                let segments = (self.send.record_len(offset, bounded) / wire_mss)
+                    .min(buffer.limits.max_segments);
+                let total = segments * wire_mss;
+                // A PUSH in an intermediate physical segment must not migrate.
+                // Leave such selections scalar, including successive PUSH writes.
+                if segments >= 2 && !self.send.pushed(offset, total - wire_mss) {
+                    count = total;
+                    segmentation = Some(crate::TransmitSegmentation {
+                        payload_len: total,
+                        segment_payload_len: wire_mss,
+                        tcp_header_len: 20 + option_len,
+                        terminal_flags: 0,
+                    });
+                }
+            }
             burst_push = count != 0
                 && self.flight().saturating_add(count as u32) == self.snd_wnd.min(cwnd)
                 && self.send.pushed(offset, unsent);
-            count = self.send.copy(offset, &mut self.scratch[..count]);
+            if segmentation.is_none() {
+                count = self.send.copy(offset, &mut self.scratch[..count]);
+            } else {
+                self.send.copy(offset, &mut self.scratch[..wire_mss]);
+            }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
             //# Queue this until all preceding SENDs have been segmentized, then form a
             //# FIN segment and send it.
@@ -7386,7 +7467,8 @@ impl Connection {
         let path_limit = pmtu_probe.map_or(self.path_payload_limit(), |(size, _, _)| {
             size.saturating_sub(u32::from(self.ip_header_len)) as usize
         });
-        if 20 + option_len + count > path_limit {
+        let wire_count = segmentation.map_or(count, |s| s.segment_payload_len);
+        if 20 + option_len + wire_count > path_limit {
             return Err(Error::InvalidArgument);
         }
         let timestamp_cost =
@@ -7394,11 +7476,16 @@ impl Connection {
         if timestamp_cost > timestamp_credit {
             return Err(Error::TimestampBudgetExceeded);
         }
+        let mut wire_header = header;
+        if let Some(s) = &mut segmentation {
+            s.terminal_flags = flags;
+            wire_header.flags &= !PSH;
+        }
         let size = wire::encode(
             ip,
-            header,
+            wire_header,
             &options[..option_len],
-            &self.scratch[..count],
+            &self.scratch[..wire_count],
             out,
         )
         .map_err(|error| {
@@ -7408,8 +7495,13 @@ impl Connection {
                 Error::Wire(error)
             }
         })?;
+        if segmentation.is_some() {
+            let buffer = gso.as_mut().unwrap();
+            self.send.copy(offset, &mut buffer.payload[..count]);
+        }
         self.reserved_ledger = None;
         self.last_departure = reserve.then_some(Departure {
+            segmentation,
             selected_at: now,
             start: seq.0,
             payload: count,
@@ -7447,7 +7539,7 @@ impl Connection {
                 p.start_probe(seq, payload as u32, trailing as u32, size);
             }
             let length = count as u32 + u32::from(flags & SYN != 0) + u32::from(flags & FIN != 0);
-            if length != 0 && !keepalive {
+            if length != 0 && !keepalive && segmentation.is_none() {
                 self.last_pmtu_output = Some((seq, seq.wrapping_add(length)));
                 p.sent(
                     seq,

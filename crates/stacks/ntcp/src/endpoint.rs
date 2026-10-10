@@ -2748,6 +2748,29 @@ impl Endpoint {
         &mut self,
         count: usize,
     ) -> Result<(), EndpointError> {
+        self.enable_output_pool(count, None)
+    }
+
+    pub fn enable_output_reservations_with_gso(
+        &mut self,
+        count: usize,
+        limits: crate::GsoLimits,
+    ) -> Result<(), EndpointError> {
+        if limits.max_bytes == 0
+            || limits.max_bytes > u32::MAX as usize / 2
+            || limits.max_segments < 2
+            || limits.max_segments > limits.max_bytes
+        {
+            return Err(Error::InvalidArgument.into());
+        }
+        self.enable_output_pool(count, Some(limits))
+    }
+
+    fn enable_output_pool(
+        &mut self,
+        count: usize,
+        gso: Option<crate::GsoLimits>,
+    ) -> Result<(), EndpointError> {
         if self.reservations.iter().any(|slot| slot.current.is_some()) {
             return Err(EndpointError::OutputReserved);
         }
@@ -2755,14 +2778,17 @@ impl Endpoint {
             return Err(Error::InvalidArgument.into());
         }
         if !self.reservations.is_empty() {
-            return if count == self.reservations.len() {
+            return if count == self.reservations.len() && self.reservations[0].gso == gso {
                 Ok(())
             } else {
                 Err(Error::InvalidArgument.into())
             };
         }
         let size = self.config.connection.send_ip_payload_limit as usize;
+        let payload_size = gso.map_or(0, |limits| limits.max_bytes);
         let charge = size
+            .checked_add(payload_size)
+            .ok_or(Error::NoMemory)?
             .checked_add(core::mem::size_of::<
                 crate::output_reservation::OutputReservation,
             >())
@@ -2782,11 +2808,28 @@ impl Endpoint {
             slot.index = index;
             slot.bytes = reserved_vec(size)?;
             slot.bytes.resize(size, 0);
+            slot.payload = reserved_vec(payload_size)?;
+            slot.payload.resize(payload_size, 0);
+            slot.gso = gso;
             slots.push(slot);
         }
         self.reservations = slots;
         self.buffer_bytes += charge;
         Ok(())
+    }
+
+    pub fn transmit_segmentation(
+        &self,
+        attempt: crate::TransmitAttempt,
+    ) -> Option<crate::TransmitSegmentation> {
+        let r = self
+            .reservations
+            .get(attempt.reservation)?
+            .current
+            .as_ref()?;
+        (r.attempt == Some(attempt))
+            .then_some(r.departure?.segmentation)
+            .flatten()
     }
 
     // ponytail: bounded linear pool lookup; add a slot index if measured flow counts warrant it.
@@ -2979,14 +3022,34 @@ impl Endpoint {
         // Reserve identity before selection: exhaustion must not consume output.
         let mut attempt = self.reservations[index].token(None)?;
         let capacity = out.len().min(self.reservations[index].bytes.len());
+        // Move the preallocated payload backing temporarily to avoid aliasing
+        // the endpoint during selection; restore it on every result, no allocation.
+        let mut payload = core::mem::take(&mut self.reservations[index].payload);
+        let gso = self.reservations[index]
+            .gso
+            .map(|limits| crate::output_reservation::GsoBuffer {
+                limits,
+                payload: &mut payload[..],
+            });
         let output =
-            self.poll_transmit_inner(now, &mut out[..capacity], budget, true, Some(selected))?;
+            self.poll_transmit_inner(now, &mut out[..capacity], budget, true, Some(selected), gso);
+        self.reservations[index].payload = payload;
+        let output = output?;
         if let Some(packet) = output.packet {
             attempt.connection = packet.connection;
             self.reservations[index].capture(packet, out, attempt);
             if let Some(id) = packet.connection {
                 let departure = self.retained_slot(id)?.connection.last_departure;
-                self.reservations[index].current.as_mut().unwrap().departure = departure;
+                let r = self.reservations[index].current.as_mut().unwrap();
+                r.departure = departure;
+                if let Some(s) = departure.and_then(|d| d.segmentation) {
+                    // Use the same exact-prefix acceptance path as MTU repair.
+                    // GSO has no selected PMTU packet or timestamp observation
+                    // to cancel on rejection; physical evidence commits at accept.
+                    r.repaired = true;
+                    r.finished = false;
+                    r.emitted_bytes = s.segment_payload_len;
+                }
                 self.refresh(id.slot);
             }
             Ok((output, Some(attempt)))
@@ -3140,7 +3203,7 @@ impl Endpoint {
         out: &mut [u8],
         budget: usize,
     ) -> Result<PollTransmit, EndpointError> {
-        self.poll_transmit_inner(now, out, budget, false, None)
+        self.poll_transmit_inner(now, out, budget, false, None, None)
     }
 
     fn poll_transmit_inner(
@@ -3150,6 +3213,7 @@ impl Endpoint {
         budget: usize,
         reserve: bool,
         selected: Option<Option<ConnectionId>>,
+        mut gso: Option<crate::output_reservation::GsoBuffer<'_>>,
     ) -> Result<PollTransmit, EndpointError> {
         self.clock(now)?;
         for _ in 0..budget {
@@ -3219,7 +3283,16 @@ impl Endpoint {
             let tuple = slot.connection.tuple();
             let terminal_reset = slot.connection.reset_pending();
             let output = if reserve {
-                slot.connection.transmit_selected(now, out, true)
+                slot.connection.transmit_selected_with_gso(
+                    now,
+                    out,
+                    true,
+                    gso.as_mut()
+                        .map(|buffer| crate::output_reservation::GsoBuffer {
+                            limits: buffer.limits,
+                            payload: &mut *buffer.payload,
+                        }),
+                )
             } else {
                 slot.connection.transmit(now, out)
             };

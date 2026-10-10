@@ -469,3 +469,306 @@ fn reserved_stale_history_discards_evidence_not_departure_obligation() {
     a.timeout(deadline.unwrap()).unwrap();
     assert_eq!(a.consecutive_timeouts, 1);
 }
+
+fn gso_select(
+    a: &mut Connection,
+    now: Instant,
+    payload: &mut [u8],
+    bytes: &mut [u8],
+) -> Option<usize> {
+    a.transmit_selected_with_gso(
+        now,
+        bytes,
+        true,
+        Some(crate::output_reservation::GsoBuffer {
+            limits: crate::GsoLimits {
+                max_bytes: payload.len(),
+                max_segments: 4,
+            },
+            payload,
+        }),
+    )
+    .unwrap()
+}
+
+#[test]
+fn gso_wrap_eor_cwr_rack_physical_segments_and_no_hotpath_allocation() {
+    for iss in [100, u32::MAX - 150] {
+        let cfg = ConnectionConfig {
+            nagle: false,
+            sack: true,
+            rack: true,
+            ecn: true,
+            initial_window: InitialWindow::Iw10,
+            ..config(4096, 100)
+        };
+        let (mut a, _) = pair(cfg.clone(), iss);
+        let (mut scalar, _) = pair(cfg, iss);
+        for c in [&mut a, &mut scalar] {
+            c.write_with_options(&[3; 300], false, true).unwrap();
+            c.write(&[4; 100]).unwrap();
+            c.ecn_cwr_pending = true;
+        }
+        let mut reservation = crate::output_reservation::OutputReservation::new();
+        reservation.bytes.resize(2048, 0);
+        reservation.payload.resize(1000, 0);
+        let mut bytes = [0; 2048];
+        let n = crate::allocation_tests::fail_after(0, || {
+            gso_select(&mut a, 40, &mut reservation.payload, &mut bytes).unwrap()
+        });
+        let mut departure = a.last_departure.unwrap();
+        let s = departure.segmentation.unwrap();
+        assert_eq!(s.payload_len, 300); // Never crosses the EOR.
+        assert_eq!(s.segment_payload_len, 100);
+        let start = Seq(departure.start);
+        assert_eq!(a.snd_nxt, start.wrapping_add(300));
+        let token = reservation.token(None).unwrap();
+        reservation.capture(
+            crate::Transmit {
+                connection: None,
+                tx_timestamp: None,
+                ipv4_options: Default::default(),
+                ecn: 2,
+                ip: ip(tuple()),
+                len: n,
+                hop_limit: 64,
+                dscp: 0,
+            },
+            &bytes,
+            token,
+        );
+        reservation.current.as_mut().unwrap().departure = Some(departure);
+        crate::allocation_tests::fail_after(0, || {
+            for segment in 0..3 {
+                let p = reservation.fragment(120, &mut bytes).unwrap();
+                let parsed = wire::parse(p.ip, &bytes[..p.len]).unwrap();
+                assert_eq!(parsed.header.sequence, start.wrapping_add(segment * 100).0);
+                assert_eq!(parsed.header.flags & CWR != 0, segment == 0);
+                assert_eq!(parsed.header.flags & PSH != 0, segment == 2);
+                let mut expected = [0; 2048];
+                let n = scalar.transmit(40, &mut expected).unwrap().unwrap();
+                assert_eq!(&bytes[..p.len], &expected[..n]);
+                let r = reservation.current.as_mut().unwrap();
+                a.accept_reserved_output(
+                    50 + segment as u64,
+                    &mut departure,
+                    r.offset,
+                    r.emitted_bytes,
+                    r.finished,
+                )
+                .unwrap();
+                // Each accepted segment has its own sequence end and actual time;
+                // neither earlier acceptance nor the selection's aggregate end wins.
+                assert_eq!(
+                    a.rack.head_transmission(start.wrapping_add(segment * 100)),
+                    Some((start.wrapping_add((segment + 1) * 100), 50 + segment as u64))
+                );
+                r.offset += r.emitted_bytes;
+            }
+        });
+        assert_eq!(a.snd_nxt, start.wrapping_add(300)); // Acceptance never recharges.
+        assert_eq!(a.rack.counts().retransmitted, 0);
+        assert_eq!(a.rack.counts().lost, 0);
+        assert_eq!(
+            a.rack.head_transmission(start),
+            Some((start.wrapping_add(100), 50))
+        );
+    }
+}
+
+#[test]
+fn gso_full_range_credit_bounds_and_scalar_nagle_cork_tail() {
+    for (window, byte_limit, expected) in [(250, 1000, 200), (1000, 250, 200), (1000, 1000, 400)] {
+        let (mut a, _) = pair(
+            ConnectionConfig {
+                initial_window: InitialWindow::Iw10,
+                ..config(4096, 100)
+            },
+            0,
+        );
+        a.snd_wnd = window;
+        a.write(&[1; 1000]).unwrap();
+        let mut payload = vec![0; byte_limit];
+        gso_select(&mut a, 40, &mut payload, &mut [0; 2048]).unwrap();
+        let d = a.last_departure.unwrap();
+        assert_eq!(d.segmentation.unwrap().payload_len, expected);
+        assert_eq!(a.flight() as usize, expected);
+    }
+    // Real initial cwnd=10*MSS, aggregate bounds must not extend it.
+    let (mut a, _) = pair(config(4096, 100), 0);
+    let cwnd = a.congestion.cwnd() as usize;
+    a.write(&[1; 2000]).unwrap();
+    let mut payload = [0; 2000];
+    a.transmit_selected_with_gso(
+        40,
+        &mut [0; 2048],
+        true,
+        Some(crate::output_reservation::GsoBuffer {
+            limits: crate::GsoLimits {
+                max_bytes: 2000,
+                max_segments: 20,
+            },
+            payload: &mut payload,
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(a.last_departure.unwrap().payload, cwnd / 100 * 100);
+    for cork in [false, true] {
+        let (mut a, _) = pair(config(4096, 100), 0);
+        a.set_cork(cork);
+        a.write(&[1; 250]).unwrap();
+        gso_select(&mut a, 40, &mut payload, &mut [0; 2048]).unwrap();
+        assert_eq!(
+            a.last_departure.unwrap().segmentation.unwrap().payload_len,
+            200
+        );
+        assert_eq!(gso_select(&mut a, 41, &mut payload, &mut [0; 2048]), None);
+    }
+}
+
+#[test]
+fn gso_conservative_fallbacks_keep_scalar_paths() {
+    for case in 0..12 {
+        let cfg = ConnectionConfig {
+            initial_window: InitialWindow::Iw10,
+            congestion_algorithm: if case == 11 {
+                CongestionAlgorithm::Cubic
+            } else {
+                CongestionAlgorithm::Reno
+            },
+            ..config(4096, 100)
+        };
+        let (mut a, _) = pair(cfg, 0);
+        a.write(&[1; 1000]).unwrap();
+        match case {
+            0 => a.shutdown = true,
+            1 => a.snd_up = Some(a.snd_nxt.wrapping_add(900)),
+            2 => a.retx_pending = true,
+            3 => a.probe_pending = true,
+            4 => a.tlp_pending = true,
+            5 => a.prr = Some(Prr::new(100, 100, PrrAlgorithm::Rfc9937)),
+            6 => a.config.pacing = Some(crate::PacingConfig::default()),
+            7 => {
+                a.config.prr = true;
+                a.config.prr_pacing = true;
+            }
+            8 => a.config.output_push_batch_segments = 2,
+            9 => a.consecutive_timeouts = 1,
+            10 => {
+                a.tx_timestamps.resize(1, usize::MAX).unwrap();
+                a.tx_timestamps.insert(
+                    crate::TxTimestampRequest {
+                        cookie: 1,
+                        software_transmit: true,
+                        ..Default::default()
+                    },
+                    999,
+                );
+            }
+            11 => {
+                assert!(a.congestion.start_ecn_prr(
+                    a.snd_nxt.wrapping_add(1000),
+                    1000,
+                    a.congestion.ssthresh(),
+                    100
+                ));
+            }
+            _ => unreachable!(),
+        }
+        let mut payload = [0; 1000];
+        let out = gso_select(&mut a, 40, &mut payload, &mut [0; 2048]);
+        if out.is_some() {
+            assert_eq!(a.last_departure.unwrap().segmentation, None, "case {case}");
+            assert!(a.last_departure.unwrap().payload <= 100, "case {case}");
+        }
+    }
+    // Fresh writes with earlier application PUSH marks must not move those marks.
+    let (mut a, _) = pair(config(4096, 100), 0);
+    a.write(&[1; 100]).unwrap();
+    a.write(&[2; 300]).unwrap();
+    gso_select(&mut a, 40, &mut [0; 1000], &mut [0; 2048]);
+    assert_eq!(a.last_departure.unwrap().segmentation, None);
+    // A real SACK loss-recovery selection stays on its existing PRR path.
+    let mut a = strict_flight(0);
+    strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
+    gso_select(&mut a, 200_000, &mut [0; 4000], &mut [0; 2048]).unwrap();
+    assert_eq!(a.last_departure.unwrap().segmentation, None);
+}
+
+#[test]
+fn gso_pmtu_probe_sack_and_timestamp_credit_fallbacks() {
+    let (mut a, _) = pair(
+        ConnectionConfig {
+            pmtud: Some(crate::PmtudConfig::new(1500)),
+            initial_window: InitialWindow::Iw10,
+            ..config(8192, 1000)
+        },
+        0,
+    );
+    a.write(&[1; 6000]).unwrap();
+    gso_select(&mut a, 40, &mut [0; 6000], &mut [0; 2048]).unwrap();
+    assert!(a.pmtud.as_ref().unwrap().probe.is_some());
+    assert_eq!(a.last_departure.unwrap().segmentation, None);
+
+    let (mut a, _) = pair(
+        ConnectionConfig {
+            sack: true,
+            ..config(4096, 100)
+        },
+        0,
+    );
+    let (next, ack) = (a.receive.next(), a.snd_una);
+    inject(&mut a, 35, next.wrapping_add(10), ack, ACK, 4096, b"gap");
+    a.write(&[1; 1000]).unwrap();
+    let mut bytes = [0; 2048];
+    let n = gso_select(&mut a, 40, &mut [0; 1000], &mut bytes).unwrap();
+    let parsed = wire::parse(ip(tuple()), &bytes[..n]).unwrap();
+    assert!(parsed.options.sack_blocks.iter().any(Option::is_some));
+    assert_eq!(a.last_departure.unwrap().segmentation, None);
+
+    let (mut a, _) = pair(
+        ConnectionConfig {
+            timestamps: true,
+            timestamp_bytes_per_tick: 220,
+            initial_window: InitialWindow::Iw10,
+            ..config(4096, 100)
+        },
+        0,
+    );
+    a.write(&[1; 1000]).unwrap();
+    let before = (
+        a.snd_nxt,
+        a.timestamp_bytes,
+        a.rack.counts().unacked,
+        a.send.len(),
+    );
+    assert_eq!(
+        a.transmit_selected_with_gso(
+            40,
+            &mut [0; 31],
+            true,
+            Some(crate::output_reservation::GsoBuffer {
+                limits: crate::GsoLimits {
+                    max_bytes: 1000,
+                    max_segments: 4
+                },
+                payload: &mut [0; 1000]
+            })
+        ),
+        Err(Error::OutputTooSmall)
+    );
+    assert_eq!(
+        (
+            a.snd_nxt,
+            a.timestamp_bytes,
+            a.rack.counts().unacked,
+            a.send.len()
+        ),
+        before
+    );
+    gso_select(&mut a, 40, &mut [0; 1000], &mut bytes).unwrap();
+    let s = a.last_departure.unwrap().segmentation.unwrap();
+    assert_eq!(s.payload_len, 176); // Two option-adjusted 88-byte segments.
+    assert!(a.timestamp_bytes <= 220);
+}

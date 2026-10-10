@@ -108,6 +108,10 @@ impl TxTimestampRequest {
 }
 
 impl TxTimestamps {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
     pub(crate) fn storage_bytes(&self) -> usize {
         self.records.capacity() * core::mem::size_of::<Record>()
     }
