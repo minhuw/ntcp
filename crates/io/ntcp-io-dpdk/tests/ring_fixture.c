@@ -169,3 +169,54 @@ int ntcp_test_mtu(uint16_t port) {
     return result < 0 ? result : mtu;
 }
 int ntcp_test_emsgsize(void) { return EMSGSIZE; }
+
+#include <rte_ip.h>
+#include <rte_tcp.h>
+extern int ntcp_dpdk_tso_gate(uint64_t, uint64_t, uint64_t, uint16_t, uint16_t, uint16_t, uint16_t *);
+void ntcp_test_tso_gate(void) {
+    const uint64_t req = RTE_ETH_TX_OFFLOAD_TCP_TSO | RTE_ETH_TX_OFFLOAD_TCP_CKSUM |
+        RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
+    uint16_t limit = 0;
+    assert(ntcp_dpdk_tso_gate(req, req, 0, 8, 4, 16, &limit) == 0 && limit == 1);
+    uint64_t multi = req | RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
+    assert(ntcp_dpdk_tso_gate(multi, 0, multi, 8, 4, 16, &limit) == 0 && limit == 4);
+    for (unsigned i = 0; i < 64; ++i) {
+        uint64_t bit = UINT64_C(1) << i;
+        if (!(req & bit)) continue;
+        assert(ntcp_dpdk_tso_gate(req & ~bit, req, 0, 8, 4, 16, &limit) == -ENOTSUP);
+        assert(ntcp_dpdk_tso_gate(req, req & ~bit, 0, 8, 4, 16, &limit) == -ENOTSUP);
+    }
+    assert(ntcp_dpdk_tso_gate(multi, multi, 0, 0, 4, 16, &limit) == -ENOTSUP);
+    assert(ntcp_dpdk_tso_gate(multi, multi, 0, 8, 0, 16, &limit) == -ENOTSUP);
+    assert(ntcp_dpdk_tso_gate(multi, multi, 0, 8, 4, 0, &limit) == -ENOTSUP);
+}
+void ntcp_test_check_tso(unsigned l3, unsigned mss, unsigned length) {
+    struct rte_mbuf *m;
+    assert(rte_ring_dequeue(tx, (void **)&m) == 0);
+    assert(m->pkt_len == length && m->l2_len == 14 && m->l3_len == l3);
+    assert(m->l4_len == 20 && m->tso_segsz == mss);
+    uint64_t expected = RTE_MBUF_F_TX_TCP_SEG | RTE_MBUF_F_TX_TCP_CKSUM |
+        (l3 == 20 ? RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM : RTE_MBUF_F_TX_IPV6);
+    assert(m->ol_flags == expected);
+    struct rte_tcp_hdr *tcp = rte_pktmbuf_mtod_offset(m, struct rte_tcp_hdr *, 14 + l3);
+    uint16_t seed;
+    // Independently zero pseudo-header length (the SDK helper omits it for TSO).
+    if (l3 == 20) {
+        struct rte_ipv4_hdr ip = *rte_pktmbuf_mtod_offset(m, struct rte_ipv4_hdr *, 14);
+        assert(ip.hdr_checksum == 0);
+        ip.total_length = rte_cpu_to_be_16(20);
+        seed = rte_ipv4_phdr_cksum(&ip, 0);
+    } else {
+        struct rte_ipv6_hdr ip = *rte_pktmbuf_mtod_offset(m, struct rte_ipv6_hdr *, 14);
+        ip.payload_len = 0;
+        seed = rte_ipv6_phdr_cksum(&ip, 0);
+    }
+    assert(tcp->cksum == seed);
+    unsigned bytes = 0, segments = 0;
+    for (struct rte_mbuf *s = m; s; s = s->next) {
+        if (s != m) assert(s->ol_flags == 0);
+        bytes += s->data_len; segments++;
+    }
+    assert(bytes == length && segments == m->nb_segs);
+    rte_pktmbuf_free(m);
+}

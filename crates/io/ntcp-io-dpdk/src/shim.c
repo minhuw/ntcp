@@ -174,3 +174,98 @@ int ntcp_dpdk_transmit(uint16_t port, uint16_t queue, void *pool,
     rte_pktmbuf_free(head);
     return 0;
 }
+
+#include <rte_ip.h>
+#include <rte_tcp.h>
+
+// Pure gate also exercised with injected configuration in the C fixture.
+int ntcp_dpdk_tso_gate(uint64_t supported, uint64_t port_flags, uint64_t queue_flags,
+                      uint16_t nb_seg, uint16_t nb_mtu_seg, uint16_t queue_desc,
+                      uint16_t *limit) {
+    const uint64_t required = RTE_ETH_TX_OFFLOAD_TCP_TSO |
+        RTE_ETH_TX_OFFLOAD_TCP_CKSUM | RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
+    uint64_t enabled = port_flags | queue_flags;
+    if ((supported & required) != required || (enabled & required) != required ||
+        !nb_seg || !nb_mtu_seg || !queue_desc) return -ENOTSUP;
+    // ponytail: bound the whole chain by the per-MTU descriptor limit too.
+    // This is conservative; count per-output-segment spans if needed later.
+    *limit = RTE_MIN(RTE_MIN(nb_seg, nb_mtu_seg), queue_desc);
+    if (!(supported & enabled & RTE_ETH_TX_OFFLOAD_MULTI_SEGS)) *limit = 1;
+    return 0;
+}
+
+int ntcp_dpdk_tso_check(uint16_t port, uint16_t queue, void *pool,
+                        struct ntcp_tso_config *config) {
+    struct rte_eth_dev_info info;
+    int result = rte_eth_dev_info_get(port, &info);
+    if (result < 0) return result;
+    if (queue >= info.nb_tx_queues) return -EINVAL;
+    struct rte_eth_conf conf;
+    result = rte_eth_dev_conf_get(port, &conf);
+    if (result < 0) return result;
+    struct rte_eth_txq_info qinfo;
+    result = rte_eth_tx_queue_info_get(port, queue, &qinfo);
+    if (result < 0) return result; // Unknown actual configuration fails closed.
+    result = ntcp_dpdk_tso_gate(info.tx_offload_capa, conf.txmode.offloads,
+        qinfo.conf.offloads, info.tx_desc_lim.nb_seg_max,
+        info.tx_desc_lim.nb_mtu_seg_max, qinfo.nb_desc, &config->max_descriptors);
+    if (result < 0) return result;
+    result = rte_eth_dev_get_mtu(port, &config->mtu);
+    if (result < 0) return result;
+    uint16_t room = rte_pktmbuf_data_room_size(pool);
+    if (!config->mtu || room <= RTE_PKTMBUF_HEADROOM + 74) return -ENOTSUP;
+    config->room = room - RTE_PKTMBUF_HEADROOM;
+    return 0;
+}
+
+int ntcp_dpdk_tso_transmit(uint16_t port, uint16_t queue, void *pool,
+    const uint8_t *packet, size_t length, uint16_t l3, uint16_t mss,
+    const struct ntcp_tso_config *config) {
+    // Rust validates bytes before this internal ABI. Recheck allocation geometry
+    // before allocating, including contiguous complete headers in the head mbuf.
+    if ((l3 != 20 && l3 != 40) || !mss || !config->room ||
+        length <= 14u + l3 + 20u || length > NTCP_DPDK_MAX_PACKET_LEN ||
+        config->room < 14u + l3 + 20u ||
+        (length + config->room - 1) / config->room > config->max_descriptors)
+        return -EINVAL;
+    struct rte_mbuf *head = NULL, *tail = NULL;
+    size_t offset = 0;
+    while (offset < length) {
+        struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
+        if (!m) { rte_pktmbuf_free(head); return 0; }
+        size_t chunk = RTE_MIN(length - offset, config->room);
+        void *dst = rte_pktmbuf_append(m, (uint16_t)chunk);
+        if (!dst) { rte_pktmbuf_free(m); rte_pktmbuf_free(head); return -EINVAL; }
+        memcpy(dst, packet + offset, chunk);
+        if (!head) head = m;
+        else { tail->next = m; head->nb_segs++; head->pkt_len += (uint32_t)chunk; }
+        tail = m;
+        offset += chunk;
+    }
+    head->l2_len = 14;
+    head->l3_len = l3;
+    head->l4_len = 20;
+    head->tso_segsz = mss;
+    head->ol_flags = RTE_MBUF_F_TX_TCP_SEG | RTE_MBUF_F_TX_TCP_CKSUM;
+    struct rte_tcp_hdr *tcp = rte_pktmbuf_mtod_offset(head, struct rte_tcp_hdr *, 14 + l3);
+    if (l3 == 20) {
+        head->ol_flags |= RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM;
+        struct rte_ipv4_hdr *ip = rte_pktmbuf_mtod_offset(head, struct rte_ipv4_hdr *, 14);
+        ip->hdr_checksum = 0;
+        tcp->cksum = rte_ipv4_phdr_cksum(ip, head->ol_flags);
+    } else {
+        head->ol_flags |= RTE_MBUF_F_TX_IPV6;
+        struct rte_ipv6_hdr *ip = rte_pktmbuf_mtod_offset(head, struct rte_ipv6_hdr *, 14);
+        tcp->cksum = rte_ipv6_phdr_cksum(ip, head->ol_flags);
+    }
+    // tx_prepare is optional PMD assistance, not proof of offload support.
+    // Capability/configuration proof comes from the control-plane gate above.
+    if (rte_eth_tx_prepare(port, queue, &head, 1) != 1) {
+        int error = rte_errno ? -rte_errno : -EIO;
+        rte_pktmbuf_free(head);
+        return error;
+    }
+    if (rte_eth_tx_burst(port, queue, &head, 1) == 1) return 1;
+    rte_pktmbuf_free(head);
+    return 0;
+}

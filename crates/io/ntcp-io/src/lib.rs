@@ -16,6 +16,42 @@ pub enum TxOutcome {
     WouldBlock,
 }
 
+// Explicit aggregate submission; all maxima are in layer() bytes, not IP MTU.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TcpSegmentationCapabilities {
+    pub max_aggregate_len: usize,
+    pub max_segments: usize,
+    // Sum of emitted layer bytes, including repeated headers and L2 padding,
+    // excluding FCS/preamble.
+    pub max_wire_bytes: usize,
+    pub local_ip_mtu: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TcpSegmentationRequest {
+    pub segment_payload_len: usize,
+}
+
+#[derive(Debug)]
+pub enum TcpSegmentationError {
+    // Both typed rejections certify no submission; software fallback is safe.
+    Unsupported,
+    InvalidInput,
+    // Unknown failure: MUST NOT authorize fallback or retransmit on its own.
+    Other(io::Error),
+}
+
+impl std::fmt::Display for TcpSegmentationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported => f.write_str("TCP segmentation unsupported (not submitted)"),
+            Self::InvalidInput => f.write_str("invalid TCP aggregate (not submitted)"),
+            Self::Other(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for TcpSegmentationError {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TimestampSource {
     Software,
@@ -166,6 +202,22 @@ pub trait PacketIo {
     // scheduling errors are observations, not synchronous TX rejections.
     fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome>;
 
+    fn tcp_segmentation_capabilities(&self) -> Option<TcpSegmentationCapabilities> {
+        None
+    }
+
+    // Contiguous normal-length aggregate headers plus payload, not a wire packet.
+    // Backend-specific header/checksum restrictions apply. No scheduling or TX
+    // timestamp combination. Submitted transfers the WHOLE aggregate copy;
+    // WouldBlock transfers NONE. Only typed rejections certify safe fallback.
+    fn transmit_segmented(
+        &mut self,
+        _packet: &[u8],
+        _request: TcpSegmentationRequest,
+    ) -> Result<TxOutcome, TcpSegmentationError> {
+        Err(TcpSegmentationError::Unsupported)
+    }
+
     fn tx_scheduling_capabilities(&self) -> Option<TxSchedulingCapabilities> {
         None
     }
@@ -288,6 +340,16 @@ mod tests {
         let io: &mut dyn PacketIo = &mut mock;
         assert_eq!(io.local_ip_mtu().unwrap(), None);
         assert_eq!(io.max_packet_len(), None);
+        assert_eq!(io.tcp_segmentation_capabilities(), None);
+        assert!(matches!(
+            io.transmit_segmented(
+                &[],
+                TcpSegmentationRequest {
+                    segment_payload_len: 0,
+                }
+            ),
+            Err(TcpSegmentationError::Unsupported)
+        ));
         assert_eq!(
             io.timestamp_capabilities(),
             TimestampCapabilities::default()

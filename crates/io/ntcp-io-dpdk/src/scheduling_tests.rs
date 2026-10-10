@@ -1,6 +1,8 @@
 use super::*;
 
 unsafe extern "C" {
+    fn ntcp_test_tso_gate();
+    fn ntcp_test_check_tso(l3: u32, mss: u32, length: u32);
     fn ntcp_test_init() -> i32;
     fn ntcp_test_pool() -> *mut c_void;
     fn ntcp_test_available() -> u32;
@@ -26,6 +28,74 @@ fn scheduled_mbuf_encoding_and_rejection_not_live_launch() {
         }
         let _host = Host;
         let mut io = Dpdk::from_borrowed(port as u16, 0, 0, ntcp_test_pool()).unwrap();
+        ntcp_test_tso_gate();
+        assert_eq!(io.tcp_segmentation_capabilities(), None);
+        let request = TcpSegmentationRequest {
+            segment_payload_len: 100,
+        };
+        assert!(matches!(
+            io.transmit_segmented(&[], request),
+            Err(TcpSegmentationError::Unsupported)
+        ));
+        assert!(io.enable_tcp_segmentation().is_err()); // ring PMD has no TSO.
+        assert_eq!(io.tcp_segmentation_capabilities(), None);
+        // Inject cached configuration only inside this private fixture. Real
+        // ring mbufs exercise encoding/ownership, NOT actual NIC segmentation.
+        io.tso = Some(TsoConfig {
+            mtu: 1500,
+            room: 128,
+            max_descriptors: 512,
+        });
+        for v6 in [false, true] {
+            let l3 = if v6 { 40 } else { 20 };
+            let mut packet = vec![0; 14 + l3 + 20 + 300];
+            packet[12..14].copy_from_slice(&(if v6 { 0x86ddu16 } else { 0x0800 }).to_be_bytes());
+            if v6 {
+                packet[14] = 0x60;
+                packet[20] = 6;
+                packet[18..20].copy_from_slice(&320u16.to_be_bytes());
+            } else {
+                packet[14] = 0x45;
+                packet[23] = 6;
+                packet[16..18].copy_from_slice(&340u16.to_be_bytes());
+            }
+            packet[14 + l3 + 12] = 0x50;
+            packet[14 + l3 + 13] = 0x10;
+            for _ in 0..7 {
+                assert_eq!(
+                    io.transmit_segmented(&packet, request).unwrap(),
+                    TxOutcome::Submitted
+                );
+            }
+            let available = ntcp_test_available();
+            assert_eq!(
+                io.transmit_segmented(&packet, request).unwrap(),
+                TxOutcome::WouldBlock
+            );
+            assert_eq!(ntcp_test_available(), available);
+            for _ in 0..7 {
+                ntcp_test_check_tso(l3 as u32, 100, packet.len() as u32);
+            }
+            assert_eq!(ntcp_test_available(), 1023);
+            for leave in [0, 1, 2] {
+                ntcp_test_hold(leave);
+                assert_eq!(
+                    io.transmit_segmented(&packet, request).unwrap(),
+                    TxOutcome::WouldBlock
+                );
+                assert_eq!(ntcp_test_available(), leave);
+                ntcp_test_release();
+            }
+            io.tso.as_mut().unwrap().max_descriptors = 1;
+            assert!(matches!(
+                io.transmit_segmented(&packet, request),
+                Err(TcpSegmentationError::InvalidInput)
+            ));
+            assert_eq!(ntcp_test_tx_count(), 0);
+            assert_eq!(ntcp_test_available(), 1023);
+            io.tso.as_mut().unwrap().max_descriptors = 512;
+        }
+        io.tso = None;
         let clock = ClockDescriptor {
             domain: ClockDomain::Device(17),
             unit: TimestampUnit::RawTicks { identity: 23 },
