@@ -481,3 +481,152 @@ fn fast_open_early_child_reservation_protects_accept_and_listener_close() {
     b.close_listener(listener).unwrap();
     assert_eq!(b.state(child).unwrap(), State::SynReceived);
 }
+
+#[test]
+fn fast_open_explicit_capacities_bound_initial_data_before_publication() {
+    for v6 in [false, true] {
+        for send in [17, 2048] {
+            let (mut a, mut b, listener) = warm(v6);
+            let (local, remote) = addresses(v6, 40001);
+            let (id, accepted) = a
+                .connect_fast_open_with_buffer_capacities(100, local, remote, &[7; 4096], send, 257)
+                .unwrap();
+            assert_eq!(accepted, send.min(if v6 { 1180 } else { 496 }));
+            assert_eq!(a.buffer_capacities(id).unwrap(), (send, 257));
+            assert_eq!(a.transport_info(id).unwrap().send_used, accepted);
+            if send == 17 {
+                assert_eq!(
+                    a.write(id, b"full"),
+                    Err(EndpointError::Connection(Error::WouldBlock))
+                );
+            }
+            let p = packet(&mut a, 100);
+            let syn = wire::parse(p.0, &p.1).unwrap();
+            assert_eq!(syn.header.window, 257);
+            assert_eq!(syn.payload, &[7; 4096][..accepted]);
+            assert!(syn.raw_options.len() + accepted <= if v6 { 1220 } else { 536 });
+            deliver(&mut b, 110, &p);
+            let child = b.accept(listener).unwrap();
+            assert_eq!(b.readable_bytes(child).unwrap(), accepted);
+        }
+    }
+}
+
+#[test]
+fn fast_open_explicit_capacity_admission_failure_preserves_tuple_and_budget() {
+    for (send, receive, error) in [
+        (0, 257, EndpointError::Connection(Error::InvalidArgument)),
+        (31, 0, EndpointError::Connection(Error::InvalidArgument)),
+        (
+            1 << 30,
+            257,
+            EndpointError::Connection(Error::InvalidArgument),
+        ),
+        (
+            31,
+            (65535 << 14) + 1,
+            EndpointError::Connection(Error::InvalidArgument),
+        ),
+        (1 << 29, 257, EndpointError::LimitReached),
+    ] {
+        let (mut a, _, _) = warm(false);
+        let (local, remote) = addresses(false, 40001);
+        let before = a.buffer_bytes();
+        assert_eq!(
+            a.connect_fast_open_with_buffer_capacities(
+                100, local, remote, &[7; 128], send, receive,
+            ),
+            Err(error)
+        );
+        assert_eq!(a.buffer_bytes(), before);
+        assert!(
+            a.poll_transmit(100, &mut [0; 2048], 64)
+                .unwrap()
+                .packet
+                .is_none()
+        );
+        let (id, accepted) = a
+            .connect_fast_open_with_buffer_capacities(100, local, remote, &[7; 128], 31, 257)
+            .unwrap();
+        assert_eq!(accepted, 31);
+        assert_eq!(a.buffer_capacities(id).unwrap(), (31, 257));
+    }
+}
+
+#[test]
+fn fast_open_explicit_capacity_allocation_rollback_preserves_receive_pool() {
+    use crate::allocation_tests::fail_after;
+    let (local, remote) = addresses(false, 40001);
+    for preallocate in [0, 1] {
+        let mut completed = false;
+        for failure in 0..32 {
+            let mut cfg = EndpointConfig::default();
+            cfg.connection.send_capacity = 64;
+            cfg.connection.receive_capacity = 257;
+            cfg.connection.mss = 536;
+            cfg.preallocate_connections = preallocate;
+            cfg.max_buffer_bytes =
+                crate::connection::Connection::allocation_bytes(64, 257, 536).unwrap();
+            let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+            a.enable_fast_open().unwrap();
+            let before = a.buffer_bytes();
+            let result = fail_after(failure, || {
+                a.connect_fast_open_with_buffer_capacities(0, local, remote, b"cache miss", 31, 257)
+            });
+            if let Ok((id, accepted)) = result {
+                assert_eq!(accepted, 0);
+                assert_eq!(a.buffer_capacities(id).unwrap(), (31, 257));
+                completed = true;
+                break;
+            }
+            assert_eq!(result, Err(EndpointError::Connection(Error::NoMemory)));
+            assert_eq!(a.buffer_bytes(), before);
+            assert!(
+                a.poll_transmit(0, &mut [0; 2048], 64)
+                    .unwrap()
+                    .packet
+                    .is_none()
+            );
+            let (id, accepted) = a
+                .connect_fast_open_with_buffer_capacities(
+                    0,
+                    local,
+                    remote,
+                    b"cache miss retry",
+                    31,
+                    257,
+                )
+                .unwrap();
+            assert_eq!(accepted, 0);
+            assert_eq!(a.buffer_capacities(id).unwrap(), (31, 257));
+        }
+        assert!(completed);
+    }
+    // Cached-cookie setup also rolls back before accepting/publishing payload.
+    let mut completed = false;
+    for failure in 0..32 {
+        let (mut a, _, _) = warm(false);
+        let before = a.buffer_bytes();
+        let result = fail_after(failure, || {
+            a.connect_fast_open_with_buffer_capacities(100, local, remote, &[7; 128], 31, 257)
+        });
+        if let Ok((id, accepted)) = result {
+            assert_eq!(accepted, 31);
+            assert_eq!(a.buffer_capacities(id).unwrap(), (31, 257));
+            completed = true;
+            break;
+        }
+        assert_eq!(a.buffer_bytes(), before);
+        assert!(
+            a.poll_transmit(100, &mut [0; 2048], 64)
+                .unwrap()
+                .packet
+                .is_none()
+        );
+        let (_, accepted) = a
+            .connect_fast_open_with_buffer_capacities(100, local, remote, &[7; 128], 31, 257)
+            .unwrap();
+        assert_eq!(accepted, 31);
+    }
+    assert!(completed);
+}

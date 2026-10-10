@@ -1137,14 +1137,42 @@ impl Endpoint {
         remote: SocketAddr,
         initial: &[u8],
     ) -> Result<(ConnectionId, usize), EndpointError> {
+        self.connect_fast_open_with_buffer_capacities(
+            now,
+            local,
+            remote,
+            initial,
+            self.config.connection.send_capacity,
+            self.config.connection.receive_capacity,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_fast_open_with_buffer_capacities(
+        &mut self,
+        now: Instant,
+        local: SocketAddr,
+        remote: SocketAddr,
+        initial: &[u8],
+        send_capacity: usize,
+        receive_capacity: usize,
+    ) -> Result<(ConnectionId, usize), EndpointError> {
         self.check_clock(now)?;
         let service = self.fast_open.as_ref().ok_or(Error::InvalidState)?;
         let cached = service.get(now, self.fast_open_lifetime(), local.ip(), remote.ip());
         let tuple = Tuple { local, remote };
-        self.admission(tuple)?;
+        Connection::validate_buffer_capacities(send_capacity, receive_capacity)?;
+        self.admission_with_buffers(tuple, (send_capacity, receive_capacity))?;
         self.clock(now)?;
         let iss = self.isn(tuple);
-        let mut connection = self.new_connection(tuple, iss, None)?;
+        let mut connection = self.new_connection_with_buffers(
+            tuple,
+            iss,
+            None,
+            (send_capacity, receive_capacity),
+            0,
+            RxPacketTimestamps::default(),
+        )?;
         let accepted = match connection.prepare_fast_open(cached, initial) {
             Ok(count) => count,
             Err(error) => {
