@@ -168,6 +168,12 @@ def adapt_source(directory, relative, manifest, so_flags):
     command = entry['command_line'].encode()
     replacement = entry['replacement_line'].encode()
     setup_profiles = {
+        'syscall_bad_arg/fastopen-invalid-buf-ptr.pkt': (
+            b'`../common/defaults.sh\n'
+            b' ../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n',
+            'upstream-fastopen',
+            {'timestamps': False, 'fast_open_client_default': False,
+             'fast_open_listener_default': False, 'fast_open_cache': 'fresh runtime'}),
         'nagle/https_client.pkt': (
             b'`../common/defaults.sh\nethtool -K tun0 tso off gso off\n'
             b'../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n',
@@ -183,7 +189,7 @@ def adapt_source(directory, relative, manifest, so_flags):
         settings.update(general_pacing=False, software_gso=False, hardware_tso=False)
         commands = [command.rstrip(b'\n')]
         replacements = [(command, replacement)]
-        if token == 'upstream-https':
+        if token in ('upstream-https', 'upstream-fastopen'):
             restore = b'`/tmp/sysctl_restore_${PPID}.sh`\n'
             restored = b'// ntcp profile is process-local; no host sysctls to restore.\n'
             if (entry.get('restore_line', '').encode() != restore
@@ -191,7 +197,7 @@ def adapt_source(directory, relative, manifest, so_flags):
                     or entry.get('restore_replacement_line', '').encode() != restored
                     or not any(extra['path'] == 'common/set_sysctls.py'
                                for extra in entry.get('additional_setup_files', []))):
-                raise ValueError('expected exact audited HTTPS restore and setup helper')
+                raise ValueError('expected exact audited restore and setup helper')
             commands.append(restore.rstrip(b'\n'))
             replacements.append((restore, restored))
         if (command != expected or so_flags != token + ',local=192.168.0.1'
@@ -373,7 +379,7 @@ def profile_metadata(so_flags):
     known = profile in {
         'baseline', 'sack', 'upstream-window8', 'upstream-sack', 'upstream-ecn',
         'upstream-basic', 'upstream-cubic', 'upstream-cubic-ecn',
-        'upstream-https', 'upstream-global-lowat',
+        'upstream-https', 'upstream-global-lowat', 'upstream-fastopen',
         'pipeline', 'pipeline-paced', 'pipeline-gso', 'pipeline-paced-gso'}
     # Configuration/capture boundary only: not measured timing or Linux fq/TSO equivalence.
     return {

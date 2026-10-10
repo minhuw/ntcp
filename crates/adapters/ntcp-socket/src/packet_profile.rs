@@ -30,6 +30,7 @@ pub enum Profile {
     UpstreamCubicEcn,
     UpstreamEcn,
     UpstreamBasic,
+    UpstreamFastOpen,
 }
 pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
     let mut local = None;
@@ -59,6 +60,7 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
                 "upstream-cubic-ecn" => Profile::UpstreamCubicEcn,
                 "upstream-ecn" => Profile::UpstreamEcn,
                 "upstream-basic" => Profile::UpstreamBasic,
+                "upstream-fastopen" => Profile::UpstreamFastOpen,
                 _ => return Err(unsupported("unknown so_flags token")),
             };
             if selected.replace(profile).is_some() {
@@ -74,9 +76,10 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
 
 pub(crate) fn config(profile: Profile) -> EndpointConfig {
     let https = profile == Profile::UpstreamHttps;
+    let fast_open = profile == Profile::UpstreamFastOpen;
     let profile = match profile {
         Profile::UpstreamHttps => Profile::UpstreamWindow8,
-        Profile::UpstreamGlobalLowat => Profile::UpstreamBasic,
+        Profile::UpstreamGlobalLowat | Profile::UpstreamFastOpen => Profile::UpstreamBasic,
         other => other,
     };
     let pacing = matches!(profile, Profile::PipelinePaced | Profile::PipelinePacedGso);
@@ -145,7 +148,8 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
     } else {
         ntcp::CongestionAlgorithm::Reno
     };
-    config.connection.timestamps = upstream;
+    // Only setup policy: clients/listeners still opt in through socket options/flags.
+    config.connection.timestamps = upstream && !fast_open;
     config.connection.rack = upstream;
     config.connection.prr = upstream;
     if upstream && !cubic {
@@ -209,6 +213,21 @@ pub(crate) fn notsent_lowat(profile: Profile) -> u32 {
 #[cfg(test)]
 mod setup_profile_tests {
     use super::*;
+
+    #[test]
+    fn fast_open_setup_changes_only_timestamps() {
+        let selected = profile("upstream-fastopen,local=192.0.2.1").unwrap().1;
+        assert_eq!(selected, Profile::UpstreamFastOpen);
+        let mut actual = config(selected);
+        assert!(!actual.connection.timestamps);
+        actual.connection.timestamps = true;
+        assert_eq!(
+            format!("{actual:?}"),
+            format!("{:?}", config(Profile::UpstreamBasic))
+        );
+        assert_eq!(notsent_lowat(selected), u32::MAX);
+        assert!(gso(selected).is_none());
+    }
 
     #[test]
     fn audited_setup_profiles_keep_transport_and_global_options_separate() {

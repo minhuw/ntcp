@@ -2313,17 +2313,17 @@
       "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
       "variant": "ipv4",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream-basic,local=192.168.0.1",
+      "adapter_flags": "upstream-fastopen,local=192.168.0.1",
       "source_sha256": "1f2c1ab6dab023fb2aa37ae26b80c130c71df34376d6b54b9bb4ef39ab98f330",
       "expected_command_count": 2,
       "command_line": "`../common/defaults.sh\n ../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n",
       "mapping": {
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
-        "scope": "Diagnostic audit of syscall_bad_arg/fastopen-invalid-buf-ptr.pkt; all original non-setup bytes and timing preserved",
+        "scope": "syscall_bad_arg/fastopen-invalid-buf-ptr.pkt; original packet/syscall/assertion/timing bytes preserved",
         "ntcp_settings": {
           "sack": true,
-          "timestamps": true,
+          "timestamps": false,
           "initial_window": "Iw10",
           "rack": true,
           "prr": "LegacyInitialCredit",
@@ -2339,28 +2339,31 @@
           "delayed_ack_us": 0,
           "abort_with_ack": true,
           "coalesce_read_window_updates": true,
-          "peer_max_ack_delay_us": 200000
+          "peer_max_ack_delay_us": 200000,
+          "general_pacing": false,
+          "software_gso": false,
+          "hardware_tso": false,
+          "fast_open_client_default": false,
+          "fast_open_listener_default": false,
+          "fast_open_cache": "fresh runtime"
         },
-        "claim": "Audit-only blocked source; no Linux setup equivalence or behavioral success is claimed.",
+        "claim": "Explicit process-local setup mapping; original behavior assertions remain diagnostic, not complete Linux defaults equivalence.",
         "reasons": [
-          "TCP Fast Open cookie caching, TCP_FASTOPEN_CONNECT and MSG_FASTOPEN are unsupported by the adapter; NULL-buffer Fast Open assertions cannot execute. The tcp_timestamps=0 set_sysctls.py setup and generated restore command are not executed.",
-          "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "UpstreamBasic-derived profile disables timestamps for the exact tcp_timestamps=0 setup; all other protocol, buffer and preallocation settings are unchanged.",
+          "TFO is opt-in via TCP_FASTOPEN_CONNECT and MSG_FASTOPEN in the original script; ordinary clients and listeners remain disabled. A fresh runtime starts with an empty cookie cache, replacing the defaults.sh cache flush without host mutation. The cookie acquired from the peer survives socket close within that runtime.",
+          "Only hash-audited setup and restore are replaced. No host sysctl, key, qdisc or restore file is read or written. Linux defaults, autotuning, global tcp_fastopen=0x70403 and fixed TCP_FASTOPEN_KEY behavior are not reproduced. No experimental-option compatibility is claimed."
         ]
       },
-      "blocked_reasons": [
-        "TCP Fast Open cookie caching, TCP_FASTOPEN_CONNECT and MSG_FASTOPEN are unsupported by the adapter; NULL-buffer Fast Open assertions cannot execute. The tcp_timestamps=0 set_sysctls.py setup and generated restore command are not executed.",
-        "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
-      ],
       "audited_shell_commands": [
         {
           "command": "`../common/defaults.sh\n ../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`",
           "sha256": "ba92a9193093da1759b3f8060d685f9a43f7c942586dc9037f06dc4c0ebe5ba6",
-          "semantic_mapping": "Unavailable: TCP Fast Open cookie caching, TCP_FASTOPEN_CONNECT and MSG_FASTOPEN are unsupported by the adapter; NULL-buffer Fast Open assertions cannot execute. The tcp_timestamps=0 set_sysctls.py setup and generated restore command are not executed. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "semantic_mapping": "UpstreamBasic-derived profile disables timestamps for the exact tcp_timestamps=0 setup; all other protocol, buffer and preallocation settings are unchanged. TFO is opt-in via TCP_FASTOPEN_CONNECT and MSG_FASTOPEN in the original script; ordinary clients and listeners remain disabled. A fresh runtime starts with an empty cookie cache, replacing the defaults.sh cache flush without host mutation. The cookie acquired from the peer survives socket close within that runtime. Only hash-audited setup and restore are replaced. No host sysctl, key, qdisc or restore file is read or written. Linux defaults, autotuning, global tcp_fastopen=0x70403 and fixed TCP_FASTOPEN_KEY behavior are not reproduced. No experimental-option compatibility is claimed."
         },
         {
           "command": "`/tmp/sysctl_restore_${PPID}.sh`",
           "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
-          "semantic_mapping": "Unavailable: TCP Fast Open cookie caching, TCP_FASTOPEN_CONNECT and MSG_FASTOPEN are unsupported by the adapter; NULL-buffer Fast Open assertions cannot execute. The tcp_timestamps=0 set_sysctls.py setup and generated restore command are not executed. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "semantic_mapping": "Process-local runtime ends with the runner; no host sysctls or restore file to restore."
         }
       ],
       "additional_setup_files": [
@@ -2368,7 +2371,11 @@
           "path": "common/set_sysctls.py",
           "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
         }
-      ]
+      ],
+      "command_sha256": "1c99680aeabb549f7af24ffe6b990884b1e67e6ac9d1ded6257c3955137780f8",
+      "restore_line": "`/tmp/sysctl_restore_${PPID}.sh`\n",
+      "restore_sha256": "60a62f306d37841760269f429facc4f42420d9a0f3331bcb8ac55a14f7e84b48",
+      "restore_replacement_line": "// ntcp profile is process-local; no host sysctls to restore.\n"
     },
     "syscall_bad_arg/sendmsg-empty-iov.pkt": {
       "setup_path": "common/defaults.sh",

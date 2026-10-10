@@ -452,7 +452,8 @@ class AdaptationChecks(unittest.TestCase):
         # Synthetic sources exercise runner behavior, independent of real scripts'
         # blocked capabilities and alternate defaults spellings.
         for name, entry in self.manifest['scripts'].items():
-            if name in ('nagle/https_client.pkt', 'notsent_lowat/notsent-lowat-sysctl.pkt'):
+            if name in ('nagle/https_client.pkt', 'notsent_lowat/notsent-lowat-sysctl.pkt',
+                        'syscall_bad_arg/fastopen-invalid-buf-ptr.pkt'):
                 path = self.directory / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 source = self.source.replace(b'`../common/defaults.sh`\n', entry['command_line'].encode())
@@ -780,7 +781,7 @@ class AdaptationChecks(unittest.TestCase):
             self.assertFalse(entry['mapping']['linux_defaults_reproduced'])
         blocked = {name for name in selection if manifest['scripts'][name].get('blocked_reasons')}
         self.assertEqual(blocked, (set(CONGESTION18) - DEFAULTS_ONLY_CUBIC - {PASSIVE_CUBIC_ECN}) | {
-            'blocking/blocking-write.pkt', 'syscall_bad_arg/fastopen-invalid-buf-ptr.pkt',
+            'blocking/blocking-write.pkt',
         })
         copied = manifest['scripts']['syscall_bad_arg/sendmsg-empty-iov.pkt']
         self.assertEqual(copied['adapter_flags'], 'upstream-basic,local=192.168.0.1')
@@ -1193,7 +1194,11 @@ class PublishedSelectionChecks(unittest.TestCase):
                     command = entry['command_line'].encode()
                     self.assertEqual(source.count(command), 1)
                     before, after = source.split(command)
-                    self.assertEqual(generated, before + entry['replacement_line'].encode() + after)
+                    expected = before + entry['replacement_line'].encode() + after
+                    if 'restore_line' in entry:
+                        expected = expected.replace(entry['restore_line'].encode(),
+                                                    entry['restore_replacement_line'].encode(), 1)
+                    self.assertEqual(generated, expected)
                     self.assertEqual(preflight(generated.decode(), entry.get('embedded_tcp_info') is True), [])
                     self.assertEqual(audit['generated_sha256'], hashlib.sha256(generated).hexdigest())
                 self.assertEqual((self.directory / name).read_bytes(), source)
@@ -1261,7 +1266,7 @@ class PublishedSelectionChecks(unittest.TestCase):
                                 for name in self.manifest['scripts'])
             # The candidate fixture remains runtime-gated until integration is ready.
             sendfile_enabled = not self.manifest['scripts']['sendfile/sendfile-simple.pkt'].get('blocked_reasons')
-            for selection, eligible in ((SOCKET43, 35 + int(sendfile_enabled)), (SOCKET_FEATURE19, 15)):
+            for selection, eligible in ((SOCKET43, 36 + int(sendfile_enabled)), (SOCKET_FEATURE19, 15)):
                 executed = []
 
                 def execute(argv, cwd, timeout):
@@ -1347,7 +1352,7 @@ class PublishedSelectionChecks(unittest.TestCase):
             self.assertEqual(data['script_files'], 35)
             self.assertEqual({row['script'] for row in data['results']}, set(selection))
             self.assertFalse(data['all_passed'])
-            self.assertEqual(len(executed), 22)
+            self.assertEqual(len(executed), 23)
             self.assertIn('syscall_bad_arg/sendmsg-empty-iov.pkt', executed)
             for row in data['results']:
                 entry = self.manifest['scripts'][row['script']]

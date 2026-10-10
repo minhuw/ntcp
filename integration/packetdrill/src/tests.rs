@@ -26,6 +26,7 @@ impl Adapter {
             Profile::UpstreamCubicEcn => "upstream-cubic-ecn",
             Profile::UpstreamEcn => "upstream-ecn",
             Profile::UpstreamBasic => "upstream-basic",
+            Profile::UpstreamFastOpen => "upstream-fastopen",
         };
         let flags = std::ffi::CString::new(format!("{profile},local={local}")).unwrap();
         let mut table = [0usize; 64];
@@ -1326,4 +1327,101 @@ fn adapter_start_forwards_local_address_and_profile() {
             .any(|option| option == [4, 2]),
         "Sack profile must advertise SACK-permitted, unlike Baseline"
     );
+}
+
+#[test]
+fn fast_open_profile_keeps_socket_opt_in_and_disables_timestamps() {
+    if isolated("tests::fast_open_profile_keeps_socket_opt_in_and_disables_timestamps") {
+        return;
+    }
+    let adapter = Adapter::start((local(), Profile::UpstreamFastOpen)).unwrap();
+    // Enabling one client must not enable the next ordinary client or listener.
+    for enabled in [true, false] {
+        let fd = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+            .unwrap()
+            .value as i32;
+        for option in [TCP_FASTOPEN, TCP_FASTOPEN_CONNECT] {
+            let mut value = -1i32;
+            let mut len = 4;
+            unsafe {
+                assert_eq!(
+                    ntcp_socket::getsockopt(
+                        fd,
+                        IPPROTO_TCP,
+                        option,
+                        (&mut value as *mut i32).cast(),
+                        &mut len
+                    ),
+                    0
+                );
+            }
+            assert_eq!((value, len), (0, 4));
+        }
+        if enabled {
+            let value = 1i32;
+            unsafe {
+                assert_eq!(
+                    ntcp_socket::setsockopt(
+                        fd,
+                        IPPROTO_TCP,
+                        TCP_FASTOPEN_CONNECT,
+                        (&value as *const i32).cast(),
+                        4
+                    ),
+                    0
+                );
+            }
+        }
+        assert_eq!(
+            call(
+                &adapter,
+                5,
+                fd,
+                0,
+                encode_addr("192.0.2.2:8080".parse().unwrap()),
+                0
+            )
+            .err(),
+            Some(EINPROGRESS)
+        );
+        let packet = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+        let (ip, tcp) = parse_frame(&packet).unwrap();
+        let parsed = ntcp::wire::parse(ip, tcp).unwrap();
+        assert!(parsed.options.timestamps.is_none());
+        assert!(parsed.options.sack_permitted);
+        assert_eq!(parsed.options.window_scale, Some(8));
+        assert_eq!(parsed.options.fast_open.is_some(), enabled);
+        if enabled {
+            assert!(parsed.options.fast_open.unwrap().as_bytes().is_empty());
+        }
+        call(&adapter, 8, fd, 0, vec![], 0).unwrap();
+    }
+    let listener = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+        .unwrap()
+        .value as i32;
+    call(
+        &adapter,
+        2,
+        listener,
+        0,
+        encode_addr(SocketAddr::new(local().into(), 8081)),
+        0,
+    )
+    .unwrap();
+    call(&adapter, 3, listener, 1, vec![], 0).unwrap();
+    call(
+        &adapter,
+        14,
+        0,
+        0,
+        syn_with_options(100, 8081, &[34, 2, 1, 1]),
+        0,
+    )
+    .unwrap();
+    let packet = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+    let (ip, tcp) = parse_frame(&packet).unwrap();
+    let parsed = ntcp::wire::parse(ip, tcp).unwrap();
+    assert_eq!(parsed.header.source_port, 8081);
+    assert!(parsed.options.timestamps.is_none());
+    assert!(parsed.options.fast_open.is_none());
 }

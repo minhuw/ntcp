@@ -12,7 +12,8 @@ class SetupProfiles(unittest.TestCase):
         if not directory.is_dir():
             self.skipTest('pinned checkout unavailable')
         manifest = json.loads((HERE / 'adaptations.json').read_text())
-        for name in ('nagle/https_client.pkt', 'notsent_lowat/notsent-lowat-sysctl.pkt'):
+        for name in ('nagle/https_client.pkt', 'notsent_lowat/notsent-lowat-sysctl.pkt',
+                     'syscall_bad_arg/fastopen-invalid-buf-ptr.pkt'):
             entry = manifest['scripts'][name]
             source = (directory / name).read_bytes()
             generated, audit = adapt_source(directory, name, manifest, entry['adapter_flags'])
@@ -30,13 +31,20 @@ class SetupProfiles(unittest.TestCase):
                          ('expected_command_count', 3), ('audited_shell_commands', [])]
             if 'restore_line' in entry:
                 mutations += [('restore_sha256', 'bad'), ('restore_line', '`false`\n'),
+                              ('restore_replacement_line', '`false`\n'),
                               ('additional_setup_files', [])]
             for key, value in mutations:
                 changed = copy.deepcopy(manifest)
                 changed['scripts'][name][key] = value
                 with self.subTest(name=name, key=key), self.assertRaises(ValueError):
                     adapt_source(directory, name, changed, changed['scripts'][name]['adapter_flags'])
-            policy_keys = ('timestamps', 'sack', 'output_push_batch_segments') if name.startswith('nagle/') else ('global_notsent_lowat', 'socket_notsent_lowat')
+            if name.startswith('nagle/'):
+                policy_keys = ('timestamps', 'sack', 'output_push_batch_segments')
+            elif name.startswith('syscall_bad_arg/'):
+                policy_keys = ('timestamps', 'fast_open_client_default',
+                               'fast_open_listener_default', 'fast_open_cache')
+            else:
+                policy_keys = ('global_notsent_lowat', 'socket_notsent_lowat')
             for key in ('general_pacing', 'software_gso', 'hardware_tso', *policy_keys):
                 changed = copy.deepcopy(manifest)
                 changed['scripts'][name]['mapping']['ntcp_settings'][key] = 'incorrect'
