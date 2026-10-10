@@ -317,6 +317,7 @@ impl<P> Scheduler<P> {
         if now == u64::MAX || now < self.now {
             return Err(Error::InvalidClock);
         }
+        let attempt = self.attempt.checked_add(1).ok_or(Error::Exhausted)?;
         self.now = now;
         let mut inactive = 0;
         // ponytail: bounded slot scan; use an active ring if sparse flow tables become costly.
@@ -349,7 +350,6 @@ impl<P> Scheduler<P> {
                     continue;
                 }
             }
-            let attempt = self.attempt.checked_add(1).ok_or(Error::Exhausted)?;
             self.attempt = attempt;
             if !packet.paid {
                 flow.deficit -= u128::from(packet.metadata.wire_bytes);
@@ -449,6 +449,9 @@ impl<P> Scheduler<P> {
         if flow.head.is_none() {
             flow.deficit = 0;
             flow.in_turn = false;
+            if self.cursor == id.flow.slot {
+                self.advance();
+            }
         }
         let packet = self.packets[id.slot].packet.take().unwrap();
         self.packets[id.slot].next = self.free;

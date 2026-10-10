@@ -512,3 +512,108 @@ fn immediate_retry_keeps_retained_charge_without_hogging_other_flows() {
     );
     assert_eq!(scheduler.usage().retained_bytes, 0);
 }
+
+#[test]
+fn continuously_refilled_flow_does_not_starve_backlogged_flow() {
+    let mut scheduler = Scheduler::new(1, config()).unwrap();
+    let a = scheduler.open_flow(1).unwrap();
+    let b = scheduler.open_flow(2).unwrap();
+    scheduler.enqueue(a, metadata(1000, 1, 0), (0, 0)).unwrap();
+    for ordinal in 0..8 {
+        scheduler
+            .enqueue(b, metadata(1000, 1, 0), (1, ordinal))
+            .unwrap();
+    }
+    let mut counts = [0_usize; 2];
+    for _ in 0..16 {
+        let token = ready(&mut scheduler, 0);
+        let (flow, ordinal) = returned(&mut scheduler, token, Outcome::Accepted).payload;
+        assert_eq!(ordinal, counts[flow]);
+        counts[flow] += 1;
+        if flow == 0 {
+            assert!(scheduler.flows[a.slot].head.is_none());
+            scheduler
+                .enqueue(a, metadata(1000, 1, 0), (0, counts[0]))
+                .unwrap();
+        }
+        assert!(counts[0].abs_diff(counts[1]) <= 1, "{counts:?}");
+    }
+    assert_eq!(counts, [8, 8]);
+}
+
+#[test]
+fn exhausted_poll_preserves_all_state_and_previous_clock() {
+    let mut scheduler = Scheduler::new(1, config()).unwrap();
+    let a = scheduler.open_flow(1).unwrap();
+    let b = scheduler.open_flow(2).unwrap();
+    let payload = Rc::new(());
+    scheduler
+        .enqueue(a, metadata(100, 3, 0), payload.clone())
+        .unwrap();
+    let lease = ready(&mut scheduler, 5);
+    scheduler
+        .enqueue(b, metadata(1500, 7, 0), payload.clone())
+        .unwrap();
+    scheduler
+        .enqueue(b, metadata(100, 9, 30), payload.clone())
+        .unwrap();
+    scheduler.attempt = u64::MAX;
+    // Snapshot every scheduler field, including FIFO/free links and payload ownership.
+    let snapshot = |s: &Scheduler<Rc<()>>| {
+        (
+            (
+                s.namespace,
+                s.config,
+                s.free,
+                s.usage,
+                s.generation,
+                s.ordinal,
+                s.attempt,
+                s.now,
+                s.cursor,
+            ),
+            s.flows
+                .iter()
+                .map(|f| (f.key, f.head, f.tail, f.deficit, f.in_turn))
+                .collect::<Vec<_>>(),
+            s.packets
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.next,
+                        slot.packet.as_ref().map(|p| {
+                            (
+                                p.id,
+                                Rc::as_ptr(&p.payload),
+                                Rc::strong_count(&p.payload),
+                                p.metadata,
+                                p.lease,
+                                p.paid,
+                            )
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    let before = snapshot(&scheduler);
+    let mut budget = 20;
+    assert!(matches!(
+        scheduler.poll_ready(10, &mut budget),
+        Err(Error::Exhausted)
+    ));
+    assert_eq!(budget, 20);
+    assert_eq!(snapshot(&scheduler), before);
+    assert!(scheduler.view(lease).is_ok());
+    assert!(matches!(
+        scheduler.poll_ready(5, &mut budget),
+        Err(Error::Exhausted)
+    ));
+    assert_eq!(snapshot(&scheduler), before);
+    assert_eq!(budget, 20);
+    // Restore only the test-injected exhaustion to demonstrate the old clock still works.
+    scheduler.attempt = 1;
+    let token = ready(&mut scheduler, 5);
+    assert_eq!(token.packet_id().flow(), b);
+    assert!(scheduler.view(lease).is_ok());
+}
