@@ -172,7 +172,8 @@ def adapt_source(directory, relative, manifest, so_flags):
             b'`../common/defaults.sh\n'
             b' ../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n',
             'upstream-fastopen',
-            {'timestamps': False, 'fast_open_client_default': False,
+            {'timestamps': False, 'endpoint_max_buffer_bytes': 234881024,
+             'fast_open_client_default': False,
              'fast_open_listener_default': False, 'fast_open_cache': 'fresh runtime'}),
         'nagle/https_client.pkt': (
             b'`../common/defaults.sh\nethtool -K tun0 tso off gso off\n'

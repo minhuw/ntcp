@@ -103,7 +103,12 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
         max_connections: LIMIT,
         max_listeners: LIMIT,
         max_control_packets: LIMIT,
-        max_buffer_bytes: if cubic {
+        max_buffer_bytes: if fast_open {
+            // Seven retained connections in valid-cookie-format; each charges
+            // receive, send, scoreboard and RACK storage. Keep a bounded budget
+            // in 32 MiB units without changing per-connection wire policy.
+            224 * 1024 * 1024
+        } else if cubic {
             128 * 1024 * 1024
         } else {
             32 * 1024 * 1024
@@ -215,18 +220,54 @@ mod setup_profile_tests {
     use super::*;
 
     #[test]
-    fn fast_open_setup_changes_only_timestamps() {
+    fn fast_open_setup_changes_only_timestamps_and_aggregate_budget() {
         let selected = profile("upstream-fastopen,local=192.0.2.1").unwrap().1;
         assert_eq!(selected, Profile::UpstreamFastOpen);
         let mut actual = config(selected);
         assert!(!actual.connection.timestamps);
         actual.connection.timestamps = true;
+        assert_eq!(actual.max_buffer_bytes, 224 * 1024 * 1024);
+        assert_eq!(
+            config(Profile::UpstreamBasic).max_buffer_bytes,
+            32 * 1024 * 1024
+        );
+        actual.max_buffer_bytes = 32 * 1024 * 1024;
         assert_eq!(
             format!("{actual:?}"),
             format!("{:?}", config(Profile::UpstreamBasic))
         );
         assert_eq!(notsent_lowat(selected), u32::MAX);
         assert!(gso(selected).is_none());
+    }
+
+    #[test]
+    fn fast_open_budget_admits_seven_retained_connections_but_not_eight() {
+        let config = config(Profile::UpstreamFastOpen);
+        assert_eq!(config.preallocate_connections, 1);
+        let budget = config.max_buffer_bytes;
+        let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+        let charge = endpoint.buffer_bytes();
+        // The smallest 32 MiB budget step that covers the corpus maximum.
+        assert!(7 * charge > budget - 32 * 1024 * 1024);
+        assert!(7 * charge <= budget);
+        assert!(8 * charge > budget);
+        endpoint.enable_fast_open().unwrap();
+        let cache_charge = endpoint.buffer_bytes() - charge;
+        let remote = "192.0.2.2:8080".parse().unwrap();
+        for index in 0..7 {
+            let local = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 40000 + index);
+            let (_, accepted) = endpoint.connect_fast_open(0, local, remote, &[]).unwrap();
+            assert_eq!(accepted, 0);
+            assert_eq!(
+                endpoint.buffer_bytes(),
+                (usize::from(index) + 1) * charge + cache_charge
+            );
+        }
+        assert_eq!(
+            endpoint.connect_fast_open(0, "192.0.2.1:40007".parse().unwrap(), remote, &[]),
+            Err(ntcp::EndpointError::LimitReached)
+        );
+        assert_eq!(endpoint.buffer_bytes(), 7 * charge + cache_charge);
     }
 
     #[test]

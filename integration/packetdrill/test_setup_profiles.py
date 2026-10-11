@@ -41,7 +41,7 @@ class SetupProfiles(unittest.TestCase):
             if name.startswith('nagle/'):
                 policy_keys = ('timestamps', 'sack', 'output_push_batch_segments')
             elif name.startswith('syscall_bad_arg/'):
-                policy_keys = ('timestamps', 'fast_open_client_default',
+                policy_keys = ('timestamps', 'endpoint_max_buffer_bytes', 'fast_open_client_default',
                                'fast_open_listener_default', 'fast_open_cache')
             else:
                 policy_keys = ('global_notsent_lowat', 'socket_notsent_lowat')

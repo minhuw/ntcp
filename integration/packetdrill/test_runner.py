@@ -754,7 +754,8 @@ class AdaptationChecks(unittest.TestCase):
             settings = entry['mapping']['ntcp_settings']
             if cubic or 'endpoint_max_buffer_bytes' in settings:
                 self.assertEqual(settings['endpoint_max_buffer_bytes'],
-                                 134217728 if cubic else 33554432)
+                                 134217728 if cubic else 234881024
+                                 if entry['adapter_flags'].startswith('upstream-fastopen,') else 33554432)
             if cubic:
                 self.assertTrue(any('bounded 128 MiB aggregate buffer budget' in reason
                                     for reason in entry['mapping']['reasons']))

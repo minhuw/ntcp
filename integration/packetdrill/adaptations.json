@@ -2334,7 +2334,7 @@
           "mss": 1460,
           "receive_capacity": 8388608,
           "window_scale": 8,
-          "endpoint_max_buffer_bytes": 33554432,
+          "endpoint_max_buffer_bytes": 234881024,
           "congestion_control": "Reno",
           "delayed_ack_us": 0,
           "abort_with_ack": true,
@@ -2349,7 +2349,7 @@
         },
         "claim": "Explicit process-local setup mapping; original behavior assertions remain diagnostic, not complete Linux defaults equivalence.",
         "reasons": [
-          "UpstreamBasic-derived profile disables timestamps for the exact tcp_timestamps=0 setup; all other protocol, buffer and preallocation settings are unchanged.",
+          "UpstreamBasic-derived profile disables timestamps for the exact tcp_timestamps=0 setup; aggregate test storage is 224 MiB for up to seven retained corpus connections, while per-connection buffers, wire policy and preallocation are unchanged.",
           "TFO is opt-in via TCP_FASTOPEN_CONNECT and MSG_FASTOPEN in the original script; ordinary clients and listeners remain disabled. A fresh runtime starts with an empty cookie cache, replacing the defaults.sh cache flush without host mutation. The cookie acquired from the peer survives socket close within that runtime.",
           "Only hash-audited setup and restore are replaced. No host sysctl, key, qdisc or restore file is read or written. Linux defaults, autotuning, global tcp_fastopen=0x70403 and fixed TCP_FASTOPEN_KEY behavior are not reproduced. No experimental-option compatibility is claimed."
         ]
@@ -2358,7 +2358,7 @@
         {
           "command": "`../common/defaults.sh\n ../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`",
           "sha256": "ba92a9193093da1759b3f8060d685f9a43f7c942586dc9037f06dc4c0ebe5ba6",
-          "semantic_mapping": "UpstreamBasic-derived profile disables timestamps for the exact tcp_timestamps=0 setup; all other protocol, buffer and preallocation settings are unchanged. TFO is opt-in via TCP_FASTOPEN_CONNECT and MSG_FASTOPEN in the original script; ordinary clients and listeners remain disabled. A fresh runtime starts with an empty cookie cache, replacing the defaults.sh cache flush without host mutation. The cookie acquired from the peer survives socket close within that runtime. Only hash-audited setup and restore are replaced. No host sysctl, key, qdisc or restore file is read or written. Linux defaults, autotuning, global tcp_fastopen=0x70403 and fixed TCP_FASTOPEN_KEY behavior are not reproduced. No experimental-option compatibility is claimed."
+          "semantic_mapping": "UpstreamBasic-derived profile disables timestamps for the exact tcp_timestamps=0 setup; aggregate test storage is 224 MiB for up to seven retained corpus connections, while per-connection buffers, wire policy and preallocation are unchanged. TFO is opt-in via TCP_FASTOPEN_CONNECT and MSG_FASTOPEN in the original script; ordinary clients and listeners remain disabled. A fresh runtime starts with an empty cookie cache, replacing the defaults.sh cache flush without host mutation. The cookie acquired from the peer survives socket close within that runtime. Only hash-audited setup and restore are replaced. No host sysctl, key, qdisc or restore file is read or written. Linux defaults, autotuning, global tcp_fastopen=0x70403 and fixed TCP_FASTOPEN_KEY behavior are not reproduced. No experimental-option compatibility is claimed."
         },
         {
           "command": "`/tmp/sysctl_restore_${PPID}.sh`",
