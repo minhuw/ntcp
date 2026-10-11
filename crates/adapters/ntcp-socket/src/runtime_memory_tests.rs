@@ -52,7 +52,9 @@ fn exchange(a: &mut Owner, b: &mut Owner) {
     }
 }
 fn pair(profile: Profile, capacity: usize) -> (Owner, Owner, [u64; 2], [u64; 2]) {
-    let mut a = owner(1, profile, capacity);
+    pair_with_owner(owner(1, profile, capacity))
+}
+fn pair_with_owner(mut a: Owner) -> (Owner, Owner, [u64; 2], [u64; 2]) {
     let mut b = owner(2, Profile::Pipeline, 128);
     let listener = new(&mut b, SOCK_NONBLOCK);
     b.execute(listener, Op::Bind("192.0.2.2:8080".parse().unwrap()))
@@ -319,3 +321,177 @@ fn last_close_retries_full_admission_instead_of_leaking_removed_fd() {
 }
 
 include!("runtime_fast_open_tests.rs");
+
+// PMTUD is opt-in independently of packet admission; keep profile defaults intact.
+fn ptb_pair(capacity: usize) -> (Owner, Owner, [u64; 2], [u64; 2]) {
+    let mut a = owner(1, Profile::PipelineGso, capacity);
+    let mut config = crate::packet_profile::config(Profile::PipelineGso);
+    config.connection.pmtud = Some(ntcp::PmtudConfig::new(1500));
+    a.endpoint = Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+    a.enable_egress(2, crate::packet_profile::gso(Profile::PipelineGso))
+        .unwrap();
+    pair_with_owner(a)
+}
+fn ptb_checksums(bytes: &mut [u8]) {
+    bytes[10..12].fill(0);
+    let sum = ntcp_ip::checksum(&bytes[..20]);
+    bytes[10..12].copy_from_slice(&sum.to_be_bytes());
+    bytes[22..24].fill(0);
+    let sum = ntcp_icmp::checksum(&bytes[20..]);
+    bytes[22..24].copy_from_slice(&sum.to_be_bytes());
+}
+fn ptb_frame(packet: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0; 56];
+    bytes[0] = 0x45;
+    bytes[2..4].copy_from_slice(&56u16.to_be_bytes());
+    bytes[8] = 64;
+    bytes[9] = 1;
+    bytes[12..16].copy_from_slice(&[192, 0, 2, 254]); // Intermediate router.
+    bytes[16..20].copy_from_slice(&packet[12..16]);
+    bytes[20] = 3;
+    bytes[21] = 4;
+    bytes[26..28].copy_from_slice(&1200u16.to_be_bytes());
+    bytes[28..].copy_from_slice(&packet[..28]);
+    ptb_checksums(&mut bytes);
+    bytes
+}
+fn path_mtu(a: &Owner, fd: u64) -> u32 {
+    a.endpoint
+        .path_mtu_info(cid(a, fd))
+        .unwrap()
+        .unwrap()
+        .current_mtu
+}
+
+#[test]
+fn packet_ptb_validation_precedes_bounded_queue_admission() {
+    let (mut a, _, clients, _) = ptb_pair(1);
+    a.execute(clients[0], Op::Write(vec![7; 1460])).unwrap();
+    a.service_egress().unwrap();
+    let packet = a.execute(0, Op::Capture(65535)).unwrap().bytes;
+    let valid = ptb_frame(&packet);
+    assert_eq!(
+        ntcp_icmp::decode_icmp(&valid).unwrap().kind,
+        ntcp_icmp::FeedbackKind::PacketTooBig
+    );
+    // Keep the TCP-only parser's contract for its other callers.
+    assert_eq!(
+        crate::packet_profile::parse_frame(&valid).unwrap_err(),
+        ENOSYS
+    );
+    for (index, value, fix, errno) in [
+        (10, valid[10] ^ 1, false, EINVAL), // Outer checksum.
+        (22, valid[22] ^ 1, false, EINVAL), // ICMP checksum.
+        (30, 0, true, EINVAL),              // Quoted total length, invalid header checksum.
+        (48, 0, true, EINVAL),              // Zero quoted source port (both bytes below).
+        (6, 0x20, true, ENOSYS),            // Outer fragment.
+        (6, 0x80, true, ENOSYS),            // Reserved flag.
+        (7, 1, true, ENOSYS),               // Fragment offset.
+        (34, 0x20, true, EINVAL),           // Fragmented quote, even with valid checksum.
+        (2, 1, true, EINVAL),               // Outer length exceeds supplied bytes.
+        (0, 0x65, true, ENOSYS),            // IPv6 is not admitted.
+        (0, 0x46, true, ENOSYS),            // Outer options remain unsupported.
+        (9, 17, true, ENOSYS),              // UDP is not admitted.
+        (21, 3, true, ENOSYS),              // Other destination-unreachable code.
+        (20, 8, true, ENOSYS),              // Echo is not admitted.
+        (16, 203, true, EINVAL),            // Destination must match quoted sender.
+    ] {
+        let mut bad = valid.clone();
+        bad[index] = value;
+        if index == 48 {
+            bad[49] = 0;
+        }
+        if index == 34 {
+            bad[38..40].fill(0);
+            let sum = ntcp_ip::checksum(&bad[28..48]);
+            bad[38..40].copy_from_slice(&sum.to_be_bytes());
+        }
+        if fix {
+            ptb_checksums(&mut bad);
+        }
+        assert_eq!(
+            a.execute(0, Op::Inject(bad)).unwrap_err(),
+            errno,
+            "index {index}"
+        );
+        assert!(a.packets.as_ref().unwrap().input.is_empty());
+    }
+    let mut truncated = valid[..55].to_vec();
+    truncated[2..4].copy_from_slice(&55u16.to_be_bytes());
+    ptb_checksums(&mut truncated);
+    assert_eq!(a.execute(0, Op::Inject(truncated)).unwrap_err(), EINVAL);
+    a.execute(0, Op::Inject(valid.clone())).unwrap();
+    assert_eq!(a.packets.as_ref().unwrap().input.len(), 1);
+    assert_eq!(path_mtu(&a, clients[0]), 1500); // Admission is not delivery.
+    assert_eq!(a.execute(0, Op::Inject(valid)).unwrap_err(), EAGAIN);
+    receive(&mut a);
+    assert_eq!(path_mtu(&a, clients[0]), 1200);
+    assert_eq!(path_mtu(&a, clients[1]), 1500);
+}
+
+#[test]
+fn packet_ptb_retained_owner_does_not_block_other_flow() {
+    let (mut a, mut b, clients, servers) = ptb_pair(1);
+    let held = cid(&a, clients[0]);
+    a.execute(clients[0], Op::Write(vec![7; 4380])).unwrap();
+    a.service_egress().unwrap();
+    assert!(a.endpoint.is_output_reserved(held));
+    let packet = a.execute(0, Op::Capture(65535)).unwrap().bytes;
+    a.execute(0, Op::Inject(ptb_frame(&packet))).unwrap();
+    receive(&mut a);
+    assert!(a.packets.as_ref().unwrap().input.is_empty());
+    assert_eq!(path_mtu(&a, clients[0]), 1500);
+    b.execute(servers[1], Op::Write(b"other flow".to_vec()))
+        .unwrap();
+    b.service_egress().unwrap();
+    let packet = b.execute(0, Op::Capture(65535)).unwrap().bytes;
+    a.execute(0, Op::Inject(packet)).unwrap();
+    receive(&mut a);
+    assert_eq!(
+        a.execute(clients[1], Op::Read(64)).unwrap().bytes,
+        b"other flow"
+    );
+    assert!(a.endpoint.is_output_reserved(held));
+    assert_eq!(path_mtu(&a, clients[0]), 1500);
+    // Drain the remaining software segments, releasing the exact held owner.
+    for _ in 0..2 {
+        a.test_now = Some(a.now() + 1000);
+        a.service_egress().unwrap();
+        let packet = a.execute(0, Op::Capture(65535)).unwrap().bytes;
+        assert_eq!(segment(&packet).payload, vec![7; 1460]);
+    }
+    assert!(!a.endpoint.is_output_reserved(held));
+    receive(&mut a);
+    assert_eq!(path_mtu(&a, clients[0]), 1200);
+    assert_eq!(path_mtu(&a, clients[1]), 1500);
+}
+
+#[test]
+fn packet_ptb_queued_feedback_still_checks_target_tuple_and_sequence() {
+    let (mut a, _, clients, _) = ptb_pair(1);
+    a.execute(clients[0], Op::Write(vec![7; 1460])).unwrap();
+    a.service_egress().unwrap();
+    let packet = a.execute(0, Op::Capture(65535)).unwrap().bytes;
+    let valid = ptb_frame(&packet);
+    for index in [16, 44, 50, 52] {
+        let mut wrong = valid.clone();
+        wrong[index] ^= 0x40;
+        if index == 16 {
+            // Structurally consistent feedback, but not addressed to this owner.
+            wrong[40] = wrong[16];
+        }
+        wrong[38..40].fill(0);
+        let sum = ntcp_ip::checksum(&wrong[28..48]);
+        wrong[38..40].copy_from_slice(&sum.to_be_bytes());
+        ptb_checksums(&mut wrong);
+        ntcp_icmp::decode_icmp(&wrong).unwrap();
+        a.execute(0, Op::Inject(wrong)).unwrap();
+        receive(&mut a);
+        assert_eq!(path_mtu(&a, clients[0]), 1500, "index {index}");
+        assert_eq!(path_mtu(&a, clients[1]), 1500);
+    }
+    a.execute(0, Op::Inject(valid)).unwrap();
+    receive(&mut a);
+    assert_eq!(path_mtu(&a, clients[0]), 1200);
+    assert_eq!(path_mtu(&a, clients[1]), 1500);
+}

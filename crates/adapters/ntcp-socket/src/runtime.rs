@@ -1422,7 +1422,7 @@ impl Owner {
                 if bytes.len() > crate::packet_profile::BYTES {
                     return Err(EMSGSIZE);
                 }
-                crate::packet_profile::parse_frame(bytes)?;
+                crate::packet_profile::validate_injection(bytes)?;
                 // Admission is not TCP processing: retained RX may delay delivery.
                 let Op::Inject(bytes) = op else {
                     unreachable!()

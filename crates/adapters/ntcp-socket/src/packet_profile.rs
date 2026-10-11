@@ -214,6 +214,22 @@ pub(crate) fn gso(profile: Profile) -> Option<ntcp::GsoLimits> {
         max_segments: 16,
     })
 }
+// Injection admits only the ICMP feedback understood by production input_ip.
+// Keep parse_frame TCP-only: its callers consume the payload as TCP.
+pub(crate) fn validate_injection(bytes: &[u8]) -> Result<()> {
+    if bytes.get(9) != Some(&1) {
+        return parse_frame(bytes).map(|_| ());
+    }
+    parse_ipv4(bytes)?;
+    let feedback = ntcp_icmp::decode_icmp(bytes).map_err(|error| match error {
+        ntcp_icmp::Error::ProtocolUnsupported => unsupported("packet: only ICMP PacketTooBig"),
+        _ => EINVAL,
+    })?;
+    if feedback.kind != ntcp_icmp::FeedbackKind::PacketTooBig {
+        return Err(unsupported("packet: only ICMP PacketTooBig"));
+    }
+    Ok(())
+}
 pub(crate) fn parse_frame(bytes: &[u8]) -> Result<ntcp_ip::Packet<'_>> {
     if bytes.len() < 20 {
         return Err(EINVAL);
@@ -221,15 +237,24 @@ pub(crate) fn parse_frame(bytes: &[u8]) -> Result<ntcp_ip::Packet<'_>> {
     if bytes[0] >> 4 != 4 || bytes[9] != 6 {
         return Err(unsupported("packet: only IPv4 TCP"));
     }
+    let packet = parse_ipv4(bytes)?;
+    ntcp::wire::parse(packet.ip, packet.payload).map_err(|_| EINVAL)?;
+    Ok(packet)
+}
+fn parse_ipv4(bytes: &[u8]) -> Result<ntcp_ip::Packet<'_>> {
+    if bytes.len() < 20 {
+        return Err(EINVAL);
+    }
+    if bytes[0] >> 4 != 4 {
+        return Err(unsupported("packet: only IPv4"));
+    }
     if bytes[0] & 15 != 5 {
         return Err(unsupported("IPv4 options"));
     }
     if u16::from_be_bytes([bytes[6], bytes[7]]) & 0xbfff != 0 {
         return Err(unsupported("IPv4 fragmentation/reserved flag"));
     }
-    let packet = ntcp_ip::parse(bytes, false).map_err(|_| EINVAL)?;
-    ntcp::wire::parse(packet.ip, packet.payload).map_err(|_| EINVAL)?;
-    Ok(packet)
+    ntcp_ip::parse(bytes, false).map_err(|_| EINVAL)
 }
 
 // Runtime-global default, deliberately separate from raw per-socket zero/inherit.
