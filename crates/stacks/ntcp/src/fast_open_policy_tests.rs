@@ -880,3 +880,105 @@ fn passive_repair_reserved_rejected_admission_never_sets_syn_data() {
         }
     }
 }
+
+#[test]
+fn passive_abandon_rearms_consumed_listener_event_after_sibling_accept() {
+    for early in [false, true] {
+        for consume_event in [false, true] {
+            let mut endpoint = endpoint();
+            endpoint.enable_fast_open().unwrap();
+            endpoint.enable_output_reservations().unwrap();
+            let (local, remote) = addresses(8080);
+            let listener = endpoint.listen(local, 8).unwrap();
+            endpoint.set_listener_fast_open(listener, 2).unwrap();
+            let cookie = crate::fast_open::issue(&[42; 32], local.ip(), remote.ip(), 0);
+            send_syn(
+                &mut endpoint,
+                local,
+                remote,
+                early.then_some(cookie),
+                b"early",
+            );
+            let held = endpoint.connection_id(Tuple { local, remote }).unwrap();
+            let mut bytes = [0; 2048];
+            let (_, attempt) = endpoint
+                .poll_reserved_transmit_for(0, held, &mut bytes, 64)
+                .unwrap();
+            let attempt = attempt.unwrap();
+            syn(&mut endpoint, 8080, 40001, cookie);
+            let sibling = endpoint
+                .connection_id(Tuple {
+                    local,
+                    remote: SocketAddr::new(remote.ip(), 40001),
+                })
+                .unwrap();
+            if consume_event {
+                assert_eq!(endpoint.next_event(), Some(Event::Acceptable(listener)));
+            }
+            assert_eq!(endpoint.accept(listener).unwrap(), sibling);
+            if consume_event {
+                while let Some(event) = endpoint.next_event() {
+                    assert!(!matches!(event, Event::Acceptable(_)));
+                }
+            }
+            assert_eq!(
+                endpoint.close_listener(listener),
+                Err(EndpointError::OutputReserved)
+            );
+            assert!(endpoint.abandon_transmit(attempt).unwrap());
+            if early {
+                assert_eq!(endpoint.next_event(), Some(Event::Acceptable(listener)));
+            }
+            while let Some(event) = endpoint.next_event() {
+                assert!(!matches!(event, Event::Acceptable(_)));
+            }
+            assert!(!endpoint.abandon_transmit(attempt).unwrap());
+            assert_eq!(endpoint.next_event(), None);
+            if early {
+                assert_eq!(endpoint.accept(listener).unwrap(), held);
+                assert_eq!(endpoint.state(held).unwrap(), State::Closed);
+                assert_eq!(endpoint.read_terminal(held, &mut bytes).unwrap(), 5);
+                assert_eq!(&bytes[..5], b"early");
+                endpoint.release(held).unwrap();
+            }
+            assert!(!endpoint.connection_exists(held));
+            assert_eq!(
+                endpoint.accept(listener),
+                Err(EndpointError::Connection(Error::WouldBlock))
+            );
+        }
+    }
+}
+
+#[test]
+fn passive_abandon_listener_cleanup_does_not_rearm_closed_or_reused_listener() {
+    let mut endpoint = endpoint();
+    endpoint.enable_fast_open().unwrap();
+    endpoint.enable_output_reservations().unwrap();
+    let (local, remote) = addresses(8080);
+    let listener = endpoint.listen(local, 8).unwrap();
+    endpoint.set_listener_fast_open(listener, 1).unwrap();
+    let cookie = crate::fast_open::issue(&[42; 32], local.ip(), remote.ip(), 0);
+    syn(&mut endpoint, 8080, 40000, cookie);
+    let child = endpoint.connection_id(Tuple { local, remote }).unwrap();
+    assert_eq!(endpoint.next_event(), Some(Event::Acceptable(listener)));
+    endpoint.close_listener(listener).unwrap();
+    let mut bytes = [0; 2048];
+    let (output, attempt) = endpoint.poll_reserved_transmit(0, &mut bytes, 64).unwrap();
+    assert_eq!(output.packet.unwrap().connection, Some(child));
+    assert!(endpoint.abandon_transmit(attempt.unwrap()).unwrap());
+    assert!(!endpoint.connection_exists(child));
+    assert_eq!(endpoint.next_event(), None);
+    for _ in 0..4 {
+        endpoint.poll_transmit(0, &mut bytes, 64).unwrap();
+    }
+    let replacement = endpoint.listen(local, 8).unwrap();
+    assert_ne!(replacement, listener);
+    assert!(!endpoint.abandon_transmit(attempt.unwrap()).unwrap());
+    assert_eq!(endpoint.accept(listener), Err(EndpointError::InvalidHandle));
+    assert_eq!(
+        endpoint.accept(replacement),
+        Err(EndpointError::Connection(Error::WouldBlock))
+    );
+    assert_eq!(endpoint.next_event(), None);
+}

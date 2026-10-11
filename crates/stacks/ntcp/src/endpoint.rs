@@ -3592,17 +3592,22 @@ impl Endpoint {
         }
         if let Some(id) = connection {
             self.refresh(id.slot);
-            // A prior Acceptable may have been consumed for an unheld sibling.
-            // Re-arm only after the final fragment releases this pending child.
-            if finished
-                && let Ok(slot) = self.retained_slot(id)
-                && let Some(parent) = slot.listener
-                && self
-                    .listener(parent)
-                    .is_ok_and(|listener| listener.pending.contains(&id))
-            {
-                self.events.push(self.config.max_connections + parent.slot);
+            // Intermediate fragments must keep the pending child held.
+            if finished {
+                self.rearm_pending_accept(id);
             }
+        }
+    }
+
+    fn rearm_pending_accept(&mut self, id: ConnectionId) {
+        // A prior Acceptable may have been consumed for an unheld sibling.
+        if let Ok(slot) = self.retained_slot(id)
+            && let Some(parent) = slot.listener
+            && self
+                .listener(parent)
+                .is_ok_and(|listener| listener.pending.contains(&id))
+        {
+            self.events.push(self.config.max_connections + parent.slot);
         }
     }
 
@@ -3671,6 +3676,7 @@ impl Endpoint {
             slot.closed_output_drained = true;
             self.reservations[index].current = None;
             self.refresh(id.slot);
+            self.rearm_pending_accept(id);
         } else {
             self.reservations[index].current = None;
         }
