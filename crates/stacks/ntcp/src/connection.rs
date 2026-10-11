@@ -404,6 +404,23 @@ pub struct TransportInfo {
     pub loss: bool,
     // False only after explicit diagnostic abandonment; capacity-backed production flights retain every byte interval.
     pub ledger_valid: bool,
+    pub timestamps_negotiated: bool,
+    pub sack_negotiated: bool,
+    pub window_scaling_negotiated: bool,
+    // Effective peer/local shifts, zero when window scaling was not negotiated.
+    pub send_window_scale: u8,
+    pub receive_window_scale: u8,
+    // Bilateral setup permitting ECN sending, independent of the CWR epoch.
+    pub ecn_negotiated: bool,
+    // Initial handshake acknowledged a positive prefix actually sent in SYN.
+    pub syn_data_acked: bool,
+    // Saturating one-shot ACK/SACK packet delivery, including SYN/standalone
+    // FIN, not bytes. Incomplete evidence when delivered_segments_valid is false.
+    pub delivered_segments: u64,
+    // Sticky false after lost packet identity (overlapping partial retry,
+    // mixed delivered/undelivered replacement, or ledger/inference abandonment).
+    // Recovery's ledger_valid is independent and can remain true.
+    pub delivered_segments_valid: bool,
     pub unacked: u32,
     pub sacked: u32,
     // Original loss attribution persists through retransmission until delivery.
@@ -537,6 +554,12 @@ pub(crate) struct Connection {
     passive_open: bool,
     fast_open: Option<wire::FastOpenCookie>,
     fast_open_initial: usize,
+    // Physical SYN acceptance, separate from attempted/queued Fast Open data.
+    syn_payload_sent: usize,
+    syn_data_acked: bool,
+    syn_delivered: bool,
+    standalone_fin_sent: bool,
+    fin_delivered: bool,
     deferred_tfo_push: bool,
     fast_open_retry: Option<(Seq, Seq)>,
     pub(crate) fast_open_early: bool,
@@ -816,6 +839,11 @@ impl Connection {
             passive_open: false,
             fast_open: None,
             fast_open_initial: 0,
+            syn_payload_sent: 0,
+            syn_data_acked: false,
+            syn_delivered: false,
+            standalone_fin_sent: false,
+            fin_delivered: false,
             deferred_tfo_push: false,
             fast_open_retry: None,
             fast_open_early: false,
@@ -1285,6 +1313,18 @@ impl Connection {
             ecn_response: self.congestion.in_ecn_response(self.snd_una),
             loss: self.sack_post_rto.is_some() || self.consecutive_timeouts != 0,
             ledger_valid: self.rack.valid(),
+            timestamps_negotiated: self.timestamps,
+            sack_negotiated: self.sack_send,
+            window_scaling_negotiated: self.scaling,
+            send_window_scale: if self.scaling { self.peer_scale } else { 0 },
+            receive_window_scale: if self.scaling { self.local_scale } else { 0 },
+            ecn_negotiated: self.ecn_send(),
+            syn_data_acked: self.syn_data_acked,
+            delivered_segments: self
+                .rack
+                .delivered_segments
+                .saturating_add(u64::from(self.syn_delivered) + u64::from(self.fin_delivered)),
+            delivered_segments_valid: self.rack.delivered_segments_valid,
             unacked: counts.unacked,
             sacked: counts.sacked,
             lost: counts.lost,
@@ -2300,14 +2340,25 @@ impl Connection {
             );
         }
         self.update_time(now)?;
-        // Payload has accepted-departure evidence in RACK. Control-only
-        // originals do not: retain their existing Karn-eligible sample, but
+        // Payload has accepted-departure evidence in RACK. SYN (including
+        // SYN+data) and standalone FIN retain their Karn-eligible sample, but
         // measure from acceptance, never from the encoded TSval's selection.
         // A retransmission already invalidated sample during selection; an
         // earlier flight's sample must not acquire this output's departure.
-        let end = Seq(d.start).wrapping_add(d.payload as u32 + u32::from(d.syn) + u32::from(d.fin));
+        let end = Seq(d.start).wrapping_add(if d.syn {
+            1
+        } else {
+            d.payload as u32 + u32::from(d.fin)
+        });
+        if d.syn {
+            self.syn_payload_sent = self.syn_payload_sent.max(count);
+            self.rack.record_syn_payload(
+                Seq(d.start).wrapping_add(1),
+                Seq(d.start).wrapping_add(1 + count as u32),
+            );
+        }
         if (d.payload != 0 || d.syn || d.fin) && self.sample.is_some_and(|(edge, _)| edge == end) {
-            if d.payload != 0 {
+            if d.payload != 0 && !d.syn {
                 self.sample = None;
             } else if d.syn || (d.fin && finished) {
                 self.sample_departure = Some(now);
@@ -2333,6 +2384,7 @@ impl Connection {
             }
         }
         if d.fin && finished {
+            self.standalone_fin_sent |= count == 0;
             self.fin_sent_at = Some(now);
         }
         if sequence && d.rto {
@@ -5398,6 +5450,15 @@ impl Connection {
         // original qualifies. A scalar RTTM pending across a SACK must not
         // count that same transmission again on its later cumulative ACK.
         let startup_scalar_allowed = !self.rack.valid();
+        let syn_ack = self.snd_una == self.iss && self.handshake_pending();
+        if syn_ack {
+            self.syn_delivered = true;
+            self.syn_data_acked =
+                self.syn_payload_sent != 0 && after(ack, self.iss.wrapping_add(1));
+        }
+        if self.standalone_fin_sent && self.fin_sequence.is_some_and(|fin| after(ack, fin)) {
+            self.fin_delivered = true;
+        }
         if !self.sack_receive || self.handshake_pending() {
             self.rack.acknowledge(
                 ack,
@@ -5422,7 +5483,6 @@ impl Connection {
             self.limited_end = Some(end);
             self.limited_sent = bytes;
         }
-        let syn_ack = self.snd_una == self.iss && self.handshake_pending();
         if !syn_ack && let Some(epoch) = &mut self.iw_epoch {
             epoch.open = false;
         }
@@ -5522,9 +5582,11 @@ impl Connection {
         // The ledger candidate is a complete, never-retransmitted original
         // measured on the local clock, regardless of the loss-recovery algorithm.
         // Unlike RTTM above, it uses no peer echo, valid or otherwise.
+        // The SYN scalar owns handshake RTT: payload must not sample twice or
+        // bypass a rejected echo/Karn gate when that ACK also covers SYN data.
         if let Some(sample) = self.rack.ack_sample
-            && self.update_rtt(sample)
             && !syn_ack
+            && self.update_rtt(sample)
         {
             self.syn_timed_out = false;
         }
@@ -7899,6 +7961,9 @@ impl Connection {
             }
             if reserve {
                 self.reserved_ledger = self.rack.departure_selection();
+            } else if let Some(selection) = self.rack.departure_selection() {
+                let committed = self.rack.commit_departure(selection, seq, end, now);
+                debug_assert!(committed);
             }
             if !self.rack.valid() {
                 self.congestion.end_ecn_prr();
@@ -8007,6 +8072,11 @@ impl Connection {
             return Ok(Some(size));
         }
         let length = count as u32 + u32::from(flags & SYN != 0) + u32::from(flags & FIN != 0);
+        if syn && !reserve {
+            self.syn_payload_sent = self.syn_payload_sent.max(count);
+            self.rack
+                .record_syn_payload(seq.wrapping_add(1), seq.wrapping_add(1 + count as u32));
+        }
         if length != 0 && !keepalive {
             let end = seq.wrapping_add(length);
             if retransmitted {
@@ -8022,7 +8092,7 @@ impl Connection {
                 // its ACK cannot predate its first transmission.
                 self.sample = None;
             } else if self.sample.is_none() {
-                self.sample = Some((end, now));
+                self.sample = Some((if syn { seq.wrapping_add(1) } else { end }, now));
                 self.sample_departure = None;
             }
             if after(end, self.snd_nxt) {
@@ -8047,6 +8117,9 @@ impl Connection {
             self.last_timestamp_sent_at = Some(now);
         }
         if flags & FIN != 0 {
+            if !reserve {
+                self.standalone_fin_sent |= count == 0;
+            }
             self.fin_sent_at = Some(now);
         }
         if new_fin {
@@ -9612,6 +9685,10 @@ mod tests {
         assert!(a.take_events().connected);
         assert!(b.take_events().connected);
         (a, b)
+    }
+
+    mod statistics {
+        include!("connection_statistics_tests.rs");
     }
 
     mod fast_open_tests {

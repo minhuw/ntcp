@@ -43,6 +43,9 @@ struct Interval {
     original_retransmitted: bool,
     // One-shot byte delivery attribution is independent of transmission state.
     delivered: bool,
+    // Independent of byte/PRR delivery: survives RTO SACK reneging.
+    packet_delivered: bool,
+    syn_payload: bool,
     sacked: bool,
     original_lost: bool,
     needs_retransmit: bool,
@@ -60,6 +63,7 @@ pub(crate) struct DepartureSelection {
     end: Seq,
     selected: u64,
     retransmit: bool,
+    packet_layout_valid: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +107,8 @@ pub(crate) struct Rack {
     dsack_round: Option<Seq>,
     pub(crate) deadline: Option<u64>,
     pub(crate) ack_sample: Option<u64>,
+    pub(crate) delivered_segments: u64,
+    pub(crate) delivered_segments_valid: bool,
 }
 
 fn after(a: Seq, b: Seq) -> bool {
@@ -170,6 +176,8 @@ impl Rack {
             dsack_round: None,
             deadline: None,
             ack_sample: None,
+            delivered_segments: 0,
+            delivered_segments_valid: true,
         })
     }
 
@@ -316,6 +324,9 @@ impl Rack {
     pub(crate) fn trim_cumulative(&mut self, ack: Seq) {
         self.intervals.retain_mut(|r| {
             if !after(r.end, ack) {
+                if !r.packet_delivered && r.end == r.transmission_end && !r.syn_payload {
+                    self.delivered_segments_valid = false;
+                }
                 return false;
             }
             if after(ack, r.start) {
@@ -331,6 +342,7 @@ impl Rack {
 
     pub(crate) fn abandon(&mut self, boundary: Seq) {
         self.intervals.clear();
+        self.delivered_segments_valid = false;
         self.departure_selection = None;
         self.fallback = Some(boundary);
         self.latest = None;
@@ -455,6 +467,7 @@ impl Rack {
         if !self.validate_departure(selection, start, end, now) {
             return false;
         }
+        self.delivered_segments_valid &= selection.packet_layout_valid;
         // Preflight above guarantees these cannot fail or allocate.
         let left = self.split(start);
         let right = self.split(end);
@@ -499,6 +512,7 @@ impl Rack {
                 end,
                 selected: now,
                 retransmit,
+                packet_layout_valid: true,
             }
         });
         if let Some(boundary) = self.fallback {
@@ -509,6 +523,31 @@ impl Rack {
             return;
         }
         if retransmit {
+            // The bounded ledger retains only the latest copy. Replacing part
+            // of an outstanding packet loses the earlier overlapping identity;
+            // don't manufacture a packet count from the surviving byte pieces.
+            let low = self.intervals.first().map_or(start, |r| r.start);
+            let mut counted = false;
+            let mut uncounted = false;
+            for r in &self.intervals {
+                if after(end, r.start) && after(r.end, start) {
+                    counted |= r.packet_delivered;
+                    uncounted |= !r.packet_delivered;
+                    if !r.packet_delivered
+                        && ((after(start, r.transmission_start) && after(start, low))
+                            || after(r.transmission_end, end))
+                        && let Some(selection) = &mut self.departure_selection
+                    {
+                        selection.packet_layout_valid = false;
+                    }
+                }
+            }
+            if counted
+                && uncounted
+                && let Some(selection) = &mut self.departure_selection
+            {
+                selection.packet_layout_valid = false;
+            }
             if !self.split(start) || !self.split(end) {
                 let boundary = self.intervals.last().map_or(end, |r| r.end);
                 self.abandon(boundary);
@@ -529,6 +568,7 @@ impl Rack {
             }
             for r in &mut self.intervals {
                 if !after(start, r.start) && !after(r.end, end) {
+                    r.syn_payload = false;
                     r.transmission_start = start;
                     r.transmission_end = end;
                     r.sent = now;
@@ -559,6 +599,8 @@ impl Rack {
                 departure_committed: false,
                 original_retransmitted: false,
                 delivered: false,
+                packet_delivered: false,
+                syn_payload: false,
                 sacked: false,
                 original_lost: false,
                 needs_retransmit: false,
@@ -566,6 +608,16 @@ impl Rack {
             });
         } else {
             self.abandon(end);
+        }
+    }
+
+    // SYN and its payload share one wire packet, counted by Connection when
+    // the SYN is acknowledged. A subsequent data repair is a distinct packet.
+    pub(crate) fn record_syn_payload(&mut self, start: Seq, end: Seq) {
+        for r in &mut self.intervals {
+            if !after(start, r.start) && !after(r.end, end) {
+                r.syn_payload = true;
+            }
         }
     }
 
@@ -683,6 +735,21 @@ impl Rack {
         for r in &mut self.intervals {
             let cumulative = !after(r.end, ack);
             let covered = cumulative || scoreboard.unsacked_bytes(r.start, r.end) == 0;
+            let packet_complete = !after(r.transmission_end, ack)
+                || scoreboard.unsacked_bytes(
+                    if after(r.transmission_start, ack) {
+                        r.transmission_start
+                    } else {
+                        ack
+                    },
+                    r.transmission_end,
+                ) == 0;
+            if covered && packet_complete && r.departure_committed && !r.packet_delivered {
+                if r.end == r.transmission_end && !r.syn_payload && self.delivered_segments_valid {
+                    self.delivered_segments = self.delivered_segments.saturating_add(1);
+                }
+                r.packet_delivered = true;
+            }
             if covered && !r.sacked {
                 if !r.delivered {
                     delivered += r.end.distance_from(r.start);
@@ -701,16 +768,7 @@ impl Rack {
                     self.fack = Some(r.end);
                 }
                 let rtt = now.saturating_sub(r.sent);
-                let complete = !after(r.transmission_end, ack)
-                    || scoreboard.unsacked_bytes(
-                        if after(r.transmission_start, ack) {
-                            r.transmission_start
-                        } else {
-                            ack
-                        },
-                        r.transmission_end,
-                    ) == 0;
-                let eligible = complete
+                let eligible = packet_complete
                     && (r.retransmitted || !r.original_retransmitted)
                     && (!r.retransmitted
                         || (rtt >= self.min_rtt.unwrap_or(u64::MAX)
@@ -999,6 +1057,10 @@ impl Rack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod statistics {
+        include!("rack_statistics_tests.rs");
+    }
 
     fn sack(
         rack: &mut Rack,

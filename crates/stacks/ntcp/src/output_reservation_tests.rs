@@ -105,6 +105,7 @@ fn reserved_data_fin_partial_acceptance_and_mutation_barrier() {
         Err(EndpointError::OutputReserved)
     );
     let progress = a.send_progress(id).unwrap();
+    let mut accepted_packets = 0;
     crate::allocation_tests::fail_after(0, || {
         a.set_endpoint_first_hop_mtu(3, 100).unwrap();
         assert!(a.reject_unsubmitted(attempt).unwrap());
@@ -132,6 +133,7 @@ fn reserved_data_fin_partial_acceptance_and_mutation_barrier() {
                 assert!(a.accept_transmit(a.now, token).unwrap());
                 assert!(!a.accept_transmit(a.now, token).unwrap());
                 total += count;
+                accepted_packets += 1;
             }
             n += 1;
             assert!(n < 30);
@@ -141,6 +143,12 @@ fn reserved_data_fin_partial_acceptance_and_mutation_barrier() {
     assert_eq!(a.send_progress(id).unwrap(), progress);
     assert_eq!(b.readable_bytes(peer).unwrap(), 300);
     assert!(a.poll_transmit(3, &mut bytes, 16).unwrap().packet.is_none());
+    assert_eq!(a.transport_info(id).unwrap().delivered_segments, 1);
+    let ack = b.poll_transmit(4, &mut bytes, 16).unwrap().packet.unwrap();
+    a.input(4, ack.ip, &bytes[..ack.len]).unwrap();
+    let info = a.transport_info(id).unwrap();
+    assert_eq!(info.delivered_segments, 1 + accepted_packets);
+    assert!(info.delivered_segments_valid);
 }
 
 #[test]
@@ -1662,6 +1670,7 @@ fn group_exact_bounded_prefix_views_match_scalar_ipv4_ipv6_with_and_without_opti
             for prefix in [2, 4] {
                 let (mut a, mut peer, id, server) = gso_pair_options(ipv6, true, timestamps);
                 let (mut scalar, _, sid, _) = gso_pair_options(ipv6, false, timestamps);
+                let (mut direct, _, did, _) = gso_pair_options(ipv6, false, timestamps);
                 let size = a
                     .slot(id)
                     .unwrap()
@@ -1670,6 +1679,7 @@ fn group_exact_bounded_prefix_views_match_scalar_ipv4_ipv6_with_and_without_opti
                 let payload: std::vec::Vec<_> = (0..size * 4).map(|i| i as u8).collect();
                 a.write(id, &payload).unwrap();
                 scalar.write(sid, &payload).unwrap();
+                direct.write(did, &payload).unwrap();
                 let mut bytes = [0; 2048];
                 let mut expected = [0; 2048];
                 let (_, attempt) = a.poll_reserved_transmit_for(2, id, &mut bytes, 1).unwrap();
@@ -1726,6 +1736,12 @@ fn group_exact_bounded_prefix_views_match_scalar_ipv4_ipv6_with_and_without_opti
                     assert_eq!(&bytes[..len], &expected[..p.len]);
                     peer.input(3, p.ip, &bytes[..len]).unwrap();
                     scalar.accept_transmit(2, scalar_token.unwrap()).unwrap();
+                    let p = direct
+                        .poll_transmit(2, &mut expected, 1)
+                        .unwrap()
+                        .packet
+                        .unwrap();
+                    assert_eq!(&bytes[..len], &expected[..p.len]);
                 }
                 let info = a.transport_info(id).unwrap();
                 let timer_before = a.slot(id).unwrap().connection.next_deadline();
@@ -1776,6 +1792,19 @@ fn group_exact_bounded_prefix_views_match_scalar_ipv4_ipv6_with_and_without_opti
                 let mut received = [0; 4000];
                 assert_eq!(peer.read(server, &mut received).unwrap(), prefix * size);
                 assert_eq!(&received[..prefix * size], &payload[..prefix * size]);
+                let ack = peer
+                    .poll_transmit(6, &mut bytes, 16)
+                    .unwrap()
+                    .packet
+                    .unwrap();
+                a.input(6, ack.ip, &bytes[..ack.len]).unwrap();
+                scalar.input(6, ack.ip, &bytes[..ack.len]).unwrap();
+                direct.input(6, ack.ip, &bytes[..ack.len]).unwrap();
+                for (endpoint, id) in [(&a, id), (&scalar, sid), (&direct, did)] {
+                    let info = endpoint.transport_info(id).unwrap();
+                    assert_eq!(info.delivered_segments, 1 + prefix as u64);
+                    assert!(info.delivered_segments_valid);
+                }
             }
         }
     }
