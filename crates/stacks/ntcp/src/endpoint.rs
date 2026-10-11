@@ -1591,7 +1591,11 @@ impl Endpoint {
         let newly_established = !slot.accepted_ready
             && (slot.connection.handshake_complete() || slot.connection.fast_open_early)
             && state != State::Closed;
-        let failed_child = parent.is_some() && state == State::Closed;
+        // Early accept readiness already transfers terminal delivery to the app.
+        // Explicit release/listener cleanup still abandons that ownership.
+        let retained_early =
+            slot.accepted_ready && slot.connection.fast_open_early && !slot.released;
+        let failed_child = parent.is_some() && state == State::Closed && !retained_early;
         let reset_reserved = slot.connection.reset_pending() || slot.reset_deadline.is_some();
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.5.3
         //# If the receiver was

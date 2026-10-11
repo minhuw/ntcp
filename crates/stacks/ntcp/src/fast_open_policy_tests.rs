@@ -200,6 +200,10 @@ fn response_cookie_does_not_change_authentication_or_quota() {
                         let (child, cookie, ack) = response(&mut endpoint);
                         let valid = incoming == Some(issued);
                         let early = valid && !full && !payload.is_empty();
+                        assert_eq!(
+                            endpoint.transport_info(child).unwrap().syn_data_acked,
+                            early
+                        );
                         let expected = if incoming.is_some() && (!valid || refresh_valid) {
                             Some(issued)
                         } else {
@@ -571,6 +575,308 @@ mod linux {
             syn(&mut endpoint, 8080, 40004, new);
             assert!(endpoint.accept(listener).is_ok());
             assert_eq!(response(&mut endpoint).2, 106);
+        }
+    }
+}
+
+fn passive_reset(endpoint: &mut Endpoint, local: SocketAddr, remote: SocketAddr, ack: u32) {
+    let ip = IpMetadata {
+        source: remote.ip(),
+        destination: local.ip(),
+    };
+    let mut bytes = [0; 128];
+    let n = wire::encode(
+        ip,
+        wire::Header {
+            source_port: remote.port(),
+            destination_port: local.port(),
+            sequence: ack,
+            acknowledgment: 0,
+            flags: wire::RST,
+            window: 8192,
+            urgent_pointer: 0,
+        },
+        &[],
+        &[],
+        &mut bytes,
+    )
+    .unwrap();
+    endpoint.input(0, ip, &bytes[..n]).unwrap();
+}
+
+#[test]
+fn passive_repair_syn_data_requires_physical_ack() {
+    for v6 in [false, true] {
+        for reserved in [false, true] {
+            for accept_first in [false, true] {
+                for capacity in [2, 8192] {
+                    let mut endpoint = Endpoint::new(
+                        EndpointConfig {
+                            connection: ConnectionConfig {
+                                receive_capacity: capacity,
+                                ..ConnectionConfig::default()
+                            },
+                            ..EndpointConfig::default()
+                        },
+                        [42; 32],
+                        0,
+                        |_| true,
+                    )
+                    .unwrap();
+                    endpoint.enable_fast_open().unwrap();
+                    if reserved {
+                        endpoint.enable_output_reservations().unwrap();
+                    }
+                    let (local, remote) = if v6 {
+                        (
+                            "[2001:db8::1]:8080".parse().unwrap(),
+                            "[2001:db8::2]:40000".parse().unwrap(),
+                        )
+                    } else {
+                        addresses(8080)
+                    };
+                    let listener = endpoint.listen(local, 8).unwrap();
+                    endpoint.set_listener_fast_open(listener, 1).unwrap();
+                    let cookie = crate::fast_open::issue(&[42; 32], local.ip(), remote.ip(), 0);
+                    send_syn(&mut endpoint, local, remote, Some(cookie), b"early");
+                    let child = endpoint.connection_id(Tuple { local, remote }).unwrap();
+                    assert!(!endpoint.transport_info(child).unwrap().syn_data_acked);
+                    if accept_first {
+                        assert_eq!(endpoint.accept(listener).unwrap(), child);
+                        assert_eq!(endpoint.read(child, &mut [0; 5]).unwrap(), capacity.min(5));
+                    }
+                    assert!(endpoint.poll_transmit(0, &mut [0; 1], 64).is_err());
+                    assert!(!endpoint.transport_info(child).unwrap().syn_data_acked);
+                    let mut bytes = [0; 2048];
+                    if reserved {
+                        let (output, attempt) =
+                            endpoint.poll_reserved_transmit(0, &mut bytes, 64).unwrap();
+                        let tx = output.packet.unwrap();
+                        assert_eq!(
+                            wire::parse(tx.ip, &bytes[..tx.len])
+                                .unwrap()
+                                .header
+                                .acknowledgment,
+                            101 + capacity.min(5) as u32
+                        );
+                        assert!(!endpoint.transport_info(child).unwrap().syn_data_acked);
+                        if !accept_first {
+                            assert_eq!(
+                                endpoint.accept(listener),
+                                Err(EndpointError::OutputReserved)
+                            );
+                            assert_eq!(
+                                endpoint.close_listener(listener),
+                                Err(EndpointError::OutputReserved)
+                            );
+                        }
+                        let old = attempt.unwrap();
+                        assert!(endpoint.reject_unsubmitted(old).unwrap());
+                        assert!(!endpoint.transport_info(child).unwrap().syn_data_acked);
+                        let (_, retry) = endpoint
+                            .poll_reserved_transmit_for(0, child, &mut bytes, 64)
+                            .unwrap();
+                        assert!(!endpoint.accept_transmit(0, old).unwrap());
+                        assert!(!endpoint.transport_info(child).unwrap().syn_data_acked);
+                        assert!(endpoint.accept_transmit(0, retry.unwrap()).unwrap());
+                    } else {
+                        assert_eq!(response(&mut endpoint).0, child);
+                    }
+                    assert!(endpoint.transport_info(child).unwrap().syn_data_acked);
+                    if !accept_first {
+                        assert_eq!(endpoint.accept(listener).unwrap(), child);
+                    }
+                    passive_reset(&mut endpoint, local, remote, 101 + capacity.min(5) as u32);
+                    assert_eq!(endpoint.state(child).unwrap(), State::Closed);
+                    assert!(endpoint.transport_info(child).unwrap().syn_data_acked);
+                    endpoint.read_terminal(child, &mut bytes).unwrap();
+                    assert!(endpoint.transport_info(child).unwrap().syn_data_acked);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn passive_repair_terminal_before_accept_retains_only_early_children() {
+    for terminal in [0, 1, 2, 3] {
+        // reset, timeout, abort, abandoned SYNACK
+        for cleanup in [false, true] {
+            let mut endpoint = endpoint();
+            endpoint.enable_fast_open().unwrap();
+            endpoint.enable_output_reservations().unwrap();
+            let (local, remote) = addresses(8080);
+            let listener = endpoint.listen(local, 8).unwrap();
+            endpoint.set_listener_fast_open(listener, 1).unwrap();
+            let baseline = endpoint.buffer_bytes();
+            let cookie = crate::fast_open::issue(&[42; 32], local.ip(), remote.ip(), 0);
+            send_syn(&mut endpoint, local, remote, Some(cookie), b"early");
+            let child = endpoint.connection_id(Tuple { local, remote }).unwrap();
+            let mut bytes = [0; 2048];
+            if terminal == 3 {
+                let (_, attempt) = endpoint.poll_reserved_transmit(0, &mut bytes, 64).unwrap();
+                assert!(endpoint.abandon_transmit(attempt.unwrap()).unwrap());
+            } else {
+                response(&mut endpoint);
+                match terminal {
+                    0 => passive_reset(&mut endpoint, local, remote, 106),
+                    1 => {
+                        endpoint.on_timeout(400_000_000, 64).unwrap();
+                    }
+                    _ => endpoint.abort(child).unwrap(),
+                }
+            }
+            let now = if terminal == 1 { 400_000_000 } else { 0 };
+            for _ in 0..4 {
+                endpoint.poll_transmit(now, &mut bytes, 64).unwrap();
+            }
+            assert_eq!(endpoint.state(child).unwrap(), State::Closed);
+            assert_eq!(
+                endpoint.transport_info(child).unwrap().syn_data_acked,
+                terminal != 3
+            );
+            assert_eq!(endpoint.next_event(), Some(Event::Acceptable(listener)));
+            assert_eq!(endpoint.next_event(), None);
+            if cleanup {
+                endpoint.close_listener(listener).unwrap();
+            } else {
+                assert_eq!(endpoint.accept(listener).unwrap(), child);
+                assert_eq!(
+                    endpoint.accept(listener),
+                    Err(EndpointError::Connection(Error::WouldBlock))
+                );
+                assert_eq!(endpoint.read_terminal(child, &mut bytes).unwrap(), 5);
+                assert_eq!(&bytes[..5], b"early");
+                endpoint.release(child).unwrap();
+            }
+            for _ in 0..32 {
+                endpoint.poll_transmit(now, &mut bytes, 64).unwrap();
+            }
+            // Local abort retains the reset tuple for the configured 2MSL.
+            if terminal == 2 {
+                assert!(endpoint.connection_exists(child));
+                endpoint.on_timeout(now + 400_000_000, 64).unwrap();
+                endpoint
+                    .poll_transmit(now + 400_000_000, &mut bytes, 64)
+                    .unwrap();
+            }
+            assert!(
+                !endpoint.connection_exists(child),
+                "terminal={terminal} cleanup={cleanup}"
+            );
+            assert_eq!(endpoint.buffer_bytes(), baseline);
+            if cleanup {
+                let replacement = endpoint.listen(local, 8).unwrap();
+                assert_ne!(listener, replacement);
+                assert_eq!(endpoint.accept(listener), Err(EndpointError::InvalidHandle));
+            }
+        }
+    }
+    // An ordinary failed passive handshake must never become acceptable.
+    let mut endpoint = endpoint();
+    let (local, remote) = addresses(8080);
+    let listener = endpoint.listen(local, 8).unwrap();
+    send_syn(&mut endpoint, local, remote, None, b"");
+    let (child, _, ack) = response(&mut endpoint);
+    passive_reset(&mut endpoint, local, remote, ack);
+    for _ in 0..4 {
+        endpoint.poll_transmit(0, &mut [0; 2048], 64).unwrap();
+    }
+    assert!(!endpoint.connection_exists(child));
+    assert_eq!(
+        endpoint.accept(listener),
+        Err(EndpointError::Connection(Error::WouldBlock))
+    );
+    assert_eq!(endpoint.next_event(), None);
+}
+
+#[test]
+fn passive_repair_terminal_pending_releases_quota_not_ownership() {
+    for release in [false, true] {
+        let mut endpoint = endpoint();
+        endpoint.enable_fast_open().unwrap();
+        let (local, remote) = addresses(8080);
+        let listener = endpoint.listen(local, 8).unwrap();
+        endpoint.set_listener_fast_open(listener, 1).unwrap();
+        let baseline = endpoint.buffer_bytes();
+        let cookie = crate::fast_open::issue(&[42; 32], local.ip(), remote.ip(), 0);
+        send_syn(&mut endpoint, local, remote, Some(cookie), b"early");
+        let (first, _, _) = response(&mut endpoint);
+        passive_reset(&mut endpoint, local, remote, 106);
+        if release {
+            endpoint.release(first).unwrap();
+        }
+        let mut other = remote;
+        other.set_port(40001);
+        send_syn(&mut endpoint, local, other, Some(cookie), b"early");
+        let (second, _, ack) = response(&mut endpoint);
+        assert_eq!(ack, 106); // A terminal pending child no longer charges TFO quota.
+        assert!(endpoint.transport_info(second).unwrap().syn_data_acked);
+        passive_reset(&mut endpoint, local, other, ack);
+        if release {
+            assert_eq!(endpoint.accept(listener).unwrap(), second);
+            endpoint.release(second).unwrap();
+        }
+        // Without explicit release neither closed child was reclaimed or dequeued.
+        if !release {
+            assert!(endpoint.connection_exists(first));
+            assert!(endpoint.connection_exists(second));
+        }
+        endpoint.close_listener(listener).unwrap();
+        for _ in 0..32 {
+            endpoint.poll_transmit(0, &mut [0; 2048], 64).unwrap();
+        }
+        assert!(!endpoint.connection_exists(first));
+        assert!(!endpoint.connection_exists(second));
+        assert_eq!(endpoint.buffer_bytes(), baseline);
+    }
+}
+
+#[test]
+fn passive_repair_reserved_rejected_admission_never_sets_syn_data() {
+    for policy in [
+        FastOpenCookiePolicy::HmacSha256,
+        #[cfg(feature = "tfo-linux-cookie")]
+        linux::policy(),
+    ] {
+        for full in [false, true] {
+            let mut endpoint = endpoint();
+            endpoint.enable_fast_open().unwrap();
+            endpoint.enable_output_reservations().unwrap();
+            endpoint.set_fast_open_cookie_policy(policy.clone());
+            let (local, remote) = addresses(8080);
+            let listener = endpoint.listen(local, 8).unwrap();
+            endpoint.set_listener_fast_open(listener, 1).unwrap();
+            let cookie = policy.issue(&[42; 32], local.ip(), remote.ip(), 0).unwrap();
+            if full {
+                syn(&mut endpoint, 8080, 40001, cookie);
+                response(&mut endpoint);
+            }
+            syn(
+                &mut endpoint,
+                8080,
+                40000,
+                if full {
+                    cookie
+                } else {
+                    FastOpenCookie::new(&[0; 8]).unwrap()
+                },
+            );
+            let mut bytes = [0; 2048];
+            let (output, attempt) = endpoint.poll_reserved_transmit(0, &mut bytes, 64).unwrap();
+            let tx = output.packet.unwrap();
+            let child = tx.connection.unwrap();
+            assert_eq!(
+                wire::parse(tx.ip, &bytes[..tx.len])
+                    .unwrap()
+                    .header
+                    .acknowledgment,
+                101
+            );
+            assert!(!endpoint.transport_info(child).unwrap().syn_data_acked);
+            assert!(endpoint.accept_transmit(0, attempt.unwrap()).unwrap());
+            assert!(!endpoint.transport_info(child).unwrap().syn_data_acked);
+            assert_eq!(endpoint.readable_bytes(child).unwrap(), 0);
         }
     }
 }

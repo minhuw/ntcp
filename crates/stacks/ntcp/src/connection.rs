@@ -557,6 +557,9 @@ pub(crate) struct Connection {
     // Physical SYN acceptance, separate from attempted/queued Fast Open data.
     syn_payload_sent: usize,
     syn_data_acked: bool,
+    // First actually stored authenticated passive SYN byte, independent of reads.
+    // Its exclusive ACK is sufficient proof; no per-byte receive ledger is needed.
+    passive_syn_data_start: Option<Seq>,
     syn_delivered: bool,
     // Current accepted FIN-bearing packet, not a historical standalone latch.
     fin_packet_has_payload: Option<bool>,
@@ -842,6 +845,7 @@ impl Connection {
             fast_open_initial: 0,
             syn_payload_sent: 0,
             syn_data_acked: false,
+            passive_syn_data_start: None,
             syn_delivered: false,
             fin_packet_has_payload: None,
             fin_delivered: false,
@@ -1250,6 +1254,9 @@ impl Connection {
         self.fast_open_early = early;
         if early {
             self.events.readable = self.receive.readable() != 0;
+            if self.events.readable {
+                self.passive_syn_data_start = self.irs.map(|irs| irs.wrapping_add(1));
+            }
         }
     }
 
@@ -2349,6 +2356,7 @@ impl Connection {
             );
         }
         self.update_time(now)?;
+        self.syn_data_acked |= d.passive_syn_data_acked;
         // Payload has accepted-departure evidence in RACK. SYN (including
         // SYN+data) and standalone FIN retain their Karn-eligible sample, but
         // measure from acceptance, never from the encoded TSval's selection.
@@ -5462,7 +5470,7 @@ impl Connection {
         let syn_ack = self.snd_una == self.iss && self.handshake_pending();
         if syn_ack {
             self.syn_delivered = true;
-            self.syn_data_acked =
+            self.syn_data_acked |=
                 self.syn_payload_sent != 0 && after(ack, self.iss.wrapping_add(1));
         }
         if self.fin_packet_has_payload == Some(false)
@@ -7790,8 +7798,16 @@ impl Connection {
             let buffer = gso.as_mut().unwrap();
             self.send.copy(offset, &mut buffer.payload[..count]);
         }
+        let passive_syn_data_acked = flags & ACK != 0
+            && self
+                .passive_syn_data_start
+                .is_some_and(|start| after(Seq(header.acknowledgment), start));
+        if !reserve {
+            self.syn_data_acked |= passive_syn_data_acked;
+        }
         self.reserved_ledger = None;
         self.last_departure = reserve.then_some(Departure {
+            passive_syn_data_acked,
             segmentation,
             selected_at: now,
             start: seq.0,

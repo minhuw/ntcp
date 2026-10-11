@@ -812,3 +812,131 @@ fn fast_open_early_terminal_socket_read_shutdown_reports_reset_after_drain() {
     assert_eq!(b.execute(server, Op::Peek(3)).unwrap().value, 0);
     assert_eq!(b.execute(server, Op::Read(3)).unwrap().value, 0);
 }
+
+#[test]
+fn passive_repair_reset_before_accept_wakes_and_drains() {
+    for blocking in [false, true] {
+        for shutdown in [false, true] {
+            let (mut a, mut b, listener) = tfo_setup(true);
+            b.sockets.get_mut(&listener).unwrap().flags = if blocking { 0 } else { SOCK_NONBLOCK };
+            let (reply, rx) = mpsc::sync_channel(1);
+            let mut request = Request {
+                id: listener,
+                op: Op::Wait(Box::new(Op::Accept(SOCK_NONBLOCK)), None),
+                reply,
+                deadline: None,
+                send: None,
+                closing: None,
+            };
+            if blocking {
+                assert!(!b.service(&mut request));
+                assert!(rx.try_recv().is_err());
+            } else {
+                assert_eq!(
+                    b.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap_err(),
+                    EAGAIN
+                );
+            }
+            let client = new(&mut a, SOCK_NONBLOCK);
+            assert_eq!(
+                a.execute(client, tfo_send(b"early", MSG_FASTOPEN))
+                    .unwrap()
+                    .value,
+                5
+            );
+            let syn = tfo_capture(&mut a);
+            tfo_deliver(&mut b, syn.clone());
+            let synack = tfo_capture(&mut b);
+            assert_eq!(
+                segment(&synack).header.acknowledgment,
+                segment(&syn).header.sequence.wrapping_add(6)
+            );
+            tfo_early_terminal_input(&mut b, &syn, ntcp::wire::RST);
+            assert_ne!(b.execute(listener, Op::Ready).unwrap().value & EPOLLIN, 0);
+            assert!(b.service(&mut request));
+            let server = rx.try_recv().unwrap().unwrap().value as u64;
+            assert_eq!(b.endpoint.state(cid(&b, server)).unwrap(), State::Closed);
+            assert_ne!(
+                b.execute(server, Op::Transport(1)).unwrap().bytes[5] & 32,
+                0
+            );
+            if shutdown {
+                assert_eq!(
+                    b.execute(server, Op::Shutdown(SHUT_RD)).unwrap_err(),
+                    ENOTCONN
+                );
+            }
+            assert_eq!(b.execute(server, Op::Read(20)).unwrap().bytes, b"early");
+            assert_eq!(b.execute(server, Op::Read(1)).unwrap_err(), ECONNRESET);
+            assert_eq!(b.execute(server, Op::Read(1)).unwrap().value, 0);
+            assert_ne!(
+                b.execute(server, Op::Transport(1)).unwrap().bytes[5] & 32,
+                0
+            );
+            assert_eq!(
+                b.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap_err(),
+                EAGAIN
+            );
+            b.execute(server, Op::Close).unwrap();
+            b.execute(listener, Op::Close).unwrap();
+            b.service_egress().unwrap();
+            assert!(!b.sockets.contains_key(&server));
+            assert!(!b.sockets.contains_key(&listener));
+        }
+    }
+}
+
+#[test]
+fn passive_repair_socket_stat_commit_and_listener_cleanup() {
+    for accept_first in [false, true] {
+        let (mut a, mut b, listener) = tfo_setup(true);
+        let baseline = b.endpoint.buffer_bytes();
+        let client = new(&mut a, SOCK_NONBLOCK);
+        a.execute(client, tfo_send(b"early", MSG_FASTOPEN)).unwrap();
+        let syn = tfo_capture(&mut a);
+        tfo_deliver(&mut b, syn.clone());
+        let ip = ntcp_ip::parse(&syn, false).unwrap().ip;
+        let header = segment(&syn).header;
+        let child = b
+            .endpoint
+            .connection_id(ntcp::Tuple {
+                local: SocketAddr::new(ip.destination, header.destination_port),
+                remote: SocketAddr::new(ip.source, header.source_port),
+            })
+            .unwrap();
+        assert!(!b.endpoint.transport_info(child).unwrap().syn_data_acked);
+        let server = if accept_first {
+            let server = b
+                .execute(listener, Op::Accept(SOCK_NONBLOCK))
+                .unwrap()
+                .value as u64;
+            assert_eq!(
+                b.execute(server, Op::Transport(1)).unwrap().bytes[5] & 32,
+                0
+            );
+            Some(server)
+        } else {
+            None
+        };
+        tfo_capture(&mut b);
+        assert!(b.endpoint.transport_info(child).unwrap().syn_data_acked);
+        tfo_early_terminal_input(&mut b, &syn, ntcp::wire::RST);
+        if let Some(server) = server {
+            assert_ne!(
+                b.execute(server, Op::Transport(1)).unwrap().bytes[5] & 32,
+                0
+            );
+            b.execute(server, Op::Close).unwrap();
+            // execute() stages accepted closes; the owner loop releases detached handles.
+            assert!(b.detached.contains(&child));
+            b.endpoint.release(child).unwrap();
+            b.detached.retain(|&id| id != child);
+        }
+        b.execute(listener, Op::Close).unwrap();
+        for _ in 0..16 {
+            b.service_egress().unwrap();
+        }
+        assert!(!b.endpoint.connection_exists(child));
+        assert_eq!(b.endpoint.buffer_bytes(), baseline);
+    }
+}

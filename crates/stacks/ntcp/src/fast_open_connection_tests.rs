@@ -534,3 +534,45 @@ fn deferred_tfo_push_simultaneous_open_and_terminal_cleanup() {
         assert!(!client(iss, 0).deferred_tfo_push);
     }
 }
+
+#[test]
+fn passive_repair_ack_provenance_and_handshake_latch() {
+    for iss in [100, u32::MAX] {
+        for payload in [b"".as_slice(), b"early"] {
+            for early in [false, true] {
+                let mut a = client(iss, 5);
+                let bytes = packet(&mut a, 0);
+                let mut syn = wire::parse(ip(tuple()), &bytes).unwrap();
+                syn.payload = payload;
+                let mut b =
+                    Connection::passive(reverse(tuple()), config(8192, 536), 900, 0, &syn).unwrap();
+                b.passive_fast_open(None, early);
+                assert!(!b.transport_info().syn_data_acked);
+                let bytes = packet(&mut b, 0);
+                let response = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
+                assert_eq!(
+                    response.header.acknowledgment,
+                    iss.wrapping_add(1 + payload.len() as u32)
+                );
+                let eligible = early && !payload.is_empty();
+                assert_eq!(b.transport_info().syn_data_acked, eligible);
+                let ack = wire::Segment {
+                    header: wire::Header {
+                        sequence: response.header.acknowledgment,
+                        acknowledgment: 901,
+                        flags: ACK,
+                        ..syn.header
+                    },
+                    options: wire::Options::default(),
+                    raw_options: &[],
+                    payload: &[],
+                };
+                b.input(1, &ack).unwrap();
+                assert_eq!(b.state(), State::Established);
+                assert_eq!(b.transport_info().syn_data_acked, eligible);
+                b.abort();
+                assert_eq!(b.transport_info().syn_data_acked, eligible);
+            }
+        }
+    }
+}
