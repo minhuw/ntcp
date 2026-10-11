@@ -348,6 +348,9 @@ struct Socket {
     probes: i32,
     error: i32,
     connected: bool,
+    // Linux SS_CONNECTING is independent of transport establishment. All fd
+    // aliases address this socket; an API connect completion consumes it once.
+    connect_pending: bool,
     // Actual half-close history, independent of consumable socket errors.
     peer_fin: bool,
     acceptable: bool,
@@ -390,6 +393,7 @@ impl Socket {
             probes: 9,
             error: 0,
             connected: false,
+            connect_pending: false,
             peer_fin: false,
             acceptable: false,
             write_shutdown: false,
@@ -1634,7 +1638,9 @@ impl Owner {
                 // Core emits Acceptable on empty->nonempty; stay readable until accept returns EAGAIN.
             }
             Op::Connect(remote) => {
-                self.check_connect(id)?;
+                if !self.check_connect(id)? {
+                    return Ok(out);
+                }
                 if remote.port() == 0 {
                     return Err(EINVAL);
                 }
@@ -2258,22 +2264,7 @@ impl Owner {
                 }
                 return self.dispatch(id, Op::FinishConnect);
             }
-            Op::FinishConnect => {
-                let Handle::Connection(cid) = s.handle else {
-                    return Err(ENOTCONN);
-                };
-                if s.error != 0 {
-                    let s = self.sockets.get_mut(&id).unwrap();
-                    let e = s.error;
-                    s.error = 0;
-                    return Err(e);
-                }
-                match self.endpoint.state(cid).map_err(engine)? {
-                    State::Established | State::CloseWait => (),
-                    State::Closed => return Err(ECONNREFUSED),
-                    _ => return Err(EAGAIN),
-                }
-            }
+            Op::FinishConnect => self.complete_connect(id)?,
             Op::Wait(_, _) => unreachable!(),
             Op::New(_) => unreachable!(),
             #[cfg(feature = "packet-test")]

@@ -217,19 +217,24 @@ fn fast_open_deferred_fault_retry_partial_and_server_early_response_barrier() {
     tfo_deliver(&mut b, ack);
     exchange(&mut a, &mut b);
     assert_eq!(a.execute(client, Op::Read(5)).unwrap().bytes, b"reply");
-    assert_eq!(
-        a.execute(client, tfo_send(b"again", MSG_FASTOPEN))
-            .unwrap_err(),
-        EISCONN
-    );
+    // Linux __inet_stream_connect completes SS_CONNECTING here, even though
+    // TCP already established. Only the next flagged call sees SS_CONNECTED.
     assert_eq!(
         a.execute(
             client,
-            Op::Send(vec![(bytes[n..].as_ptr() as usize, bytes.len() - n)], 0)
+            Op::Send(
+                vec![(bytes[n..].as_ptr() as usize, bytes.len() - n)],
+                MSG_FASTOPEN
+            )
         )
         .unwrap()
         .value as usize,
         bytes.len() - n
+    );
+    assert_eq!(
+        a.execute(client, tfo_send(b"again", MSG_FASTOPEN))
+            .unwrap_err(),
+        EISCONN
     );
     exchange(&mut a, &mut b);
     assert_eq!(
@@ -243,6 +248,8 @@ fn fast_open_miss_nonblocking_and_dontwait_retries_do_not_accept_payload() {
     for flags in [0, MSG_DONTWAIT] {
         let (mut a, mut b, listener) = tfo_setup(false);
         let client = new(&mut a, if flags == 0 { SOCK_NONBLOCK } else { 0 });
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
+            .unwrap();
         assert_eq!(
             a.execute(
                 client,
@@ -292,6 +299,20 @@ fn fast_open_miss_nonblocking_and_dontwait_retries_do_not_accept_payload() {
         );
         exchange(&mut a, &mut b);
         assert_eq!(b.execute(server, Op::Read(9)).unwrap().bytes, b"hello");
+        // An ordinary retry does not complete the implicit connect API state.
+        assert_eq!(
+            a.execute(client, tfo_send(b"again", flags | MSG_FASTOPEN))
+                .unwrap()
+                .value,
+            5
+        );
+        assert_eq!(
+            a.execute(client, tfo_send(b"done", MSG_FASTOPEN))
+                .unwrap_err(),
+            EISCONN
+        );
+        exchange(&mut a, &mut b);
+        assert_eq!(b.execute(server, Op::Read(9)).unwrap().bytes, b"again");
     }
 }
 
@@ -331,6 +352,11 @@ fn fast_open_blocking_hit_and_miss_wait_handshake_and_complete_iovecs() {
         exchange(&mut a, &mut b);
         assert!(a.service(&mut request));
         assert_eq!(rx.recv().unwrap().unwrap().value, 3000);
+        assert_eq!(
+            a.execute(client, tfo_send(b"done", MSG_FASTOPEN))
+                .unwrap_err(),
+            EISCONN
+        );
         exchange(&mut a, &mut b);
         let server = b
             .execute(listener, Op::Accept(SOCK_NONBLOCK))
@@ -422,24 +448,45 @@ fn fast_open_empty_payload_destination_and_lowwater() {
 
 #[test]
 fn fast_open_small_blocking_send_waits_even_when_all_bytes_fit_syn() {
-    let (mut a, mut b, _) = tfo_setup(true);
-    let client = new(&mut a, 0);
-    let (reply, rx) = mpsc::sync_channel(1);
-    let mut request = Request {
-        id: client,
-        op: Op::Wait(Box::new(tfo_send(b"hi", MSG_FASTOPEN)), None),
-        reply,
-        deadline: None,
-        send: None,
-        closing: None,
-    };
-    assert!(!a.service(&mut request));
-    assert_eq!(request.send.as_ref().unwrap().accepted, 2);
-    assert!(!a.service(&mut request));
-    assert!(rx.try_recv().is_err());
-    exchange(&mut a, &mut b);
-    assert!(a.service(&mut request));
-    assert_eq!(rx.recv().unwrap().unwrap().value, 2);
+    for deferred in [false, true] {
+        let (mut a, mut b, _) = tfo_setup(true);
+        let client = new(&mut a, 0);
+        if deferred {
+            a.execute(client, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
+                .unwrap();
+            assert_eq!(
+                a.execute(client, Op::Connect("192.0.2.2:8080".parse().unwrap()))
+                    .unwrap()
+                    .value,
+                0
+            );
+            tfo_no_output(&mut a);
+        }
+        let (reply, rx) = mpsc::sync_channel(1);
+        let mut request = Request {
+            id: client,
+            op: Op::Wait(
+                Box::new(tfo_send(b"hi", if deferred { 0 } else { MSG_FASTOPEN })),
+                None,
+            ),
+            reply,
+            deadline: None,
+            send: None,
+            closing: None,
+        };
+        assert!(!a.service(&mut request));
+        assert_eq!(request.send.as_ref().unwrap().accepted, 2);
+        assert!(!a.service(&mut request));
+        assert!(rx.try_recv().is_err());
+        exchange(&mut a, &mut b);
+        assert!(a.service(&mut request));
+        assert_eq!(rx.recv().unwrap().unwrap().value, 2);
+        assert_eq!(
+            a.execute(client, tfo_send(b"done", MSG_FASTOPEN))
+                .unwrap_err(),
+            EISCONN
+        );
+    }
 }
 
 #[test]
@@ -677,6 +724,8 @@ fn fast_open_blocking_send_reset_finishes_with_error_or_accepted_prefix() {
         tfo_deliver(&mut a, reset);
         assert!(a.service(&mut request));
         assert!(request.send.is_none());
+        assert!(!a.sockets[&client].connect_pending);
+        assert!(matches!(a.sockets[&client].handle, Handle::Fresh));
         let result = rx.try_recv().expect("reset must finish the blocked send");
         if warm {
             // The copied SYN prefix was already accepted before the reset.
@@ -938,5 +987,312 @@ fn passive_repair_socket_stat_commit_and_listener_cleanup() {
         }
         assert!(!b.endpoint.connection_exists(child));
         assert_eq!(b.endpoint.buffer_bytes(), baseline);
+    }
+}
+
+// Synthetic peer keeps the cached MSS and handshake boundary deterministic.
+fn tfo_client_synack(a: &mut Owner, syn: &[u8], mss: u16) {
+    let incoming = ntcp_ip::parse(syn, false).unwrap().ip;
+    let ip = ntcp::IpMetadata {
+        source: incoming.destination,
+        destination: incoming.source,
+    };
+    let syn = segment(syn);
+    let mut bytes = [0; 128];
+    let [hi, lo] = mss.to_be_bytes();
+    let n = ntcp::wire::encode(
+        ip,
+        ntcp::wire::Header {
+            source_port: syn.header.destination_port,
+            destination_port: syn.header.source_port,
+            sequence: 100,
+            acknowledgment: syn
+                .header
+                .sequence
+                .wrapping_add(1 + syn.payload.len() as u32),
+            flags: ntcp::wire::SYN | ntcp::wire::ACK,
+            window: 65535,
+            urgent_pointer: 0,
+        },
+        &[2, 4, hi, lo, 34, 10, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0],
+        &[],
+        &mut bytes,
+    )
+    .unwrap();
+    a.input(a.now(), ip, 0, &bytes[..n]).unwrap();
+    a.events();
+    assert_eq!(segment(&tfo_capture(a)).header.flags & ntcp::wire::SYN, 0);
+}
+
+#[test]
+fn fast_open_multi_iov_flagged_retry_completes_api_once() {
+    let mut a = owner(1, Profile::Pipeline, 8);
+    let warm = new(&mut a, SOCK_NONBLOCK);
+    assert_eq!(
+        a.execute(warm, tfo_send(&[], MSG_FASTOPEN)).unwrap_err(),
+        EINPROGRESS
+    );
+    let syn = tfo_capture(&mut a);
+    tfo_client_synack(&mut a, &syn, 940);
+    a.execute(warm, Op::Close).unwrap();
+    let _fin = tfo_capture(&mut a);
+
+    let client = new(&mut a, SOCK_NONBLOCK);
+    let mut first = [1u8; 500];
+    let second = [2u8; 1000];
+    let third = [3u8; 400];
+    let flags = MSG_FASTOPEN | MSG_DONTWAIT | MSG_NOSIGNAL;
+    assert_eq!(
+        a.execute(
+            client,
+            Op::SendTo(
+                vec![
+                    (first.as_ptr() as usize, 500),
+                    (second.as_ptr() as usize, 1000),
+                    (third.as_ptr() as usize, 400)
+                ],
+                flags,
+                Some("192.0.2.2:8080".parse().unwrap()),
+                None,
+            )
+        )
+        .unwrap()
+        .value,
+        900
+    );
+    let connection = cid(&a, client);
+    first.fill(9); // Accepted SYN bytes are owned, not retained foreign pointers.
+    let syn = tfo_capture(&mut a);
+    assert_eq!(
+        segment(&syn).payload,
+        [&[1; 500][..], &second[..400]].concat()
+    );
+    assert_eq!(
+        a.execute(client, tfo_send(b"pending", flags)).unwrap_err(),
+        EALREADY
+    );
+    tfo_no_output(&mut a);
+    tfo_client_synack(&mut a, &syn, 1460);
+    assert_eq!(
+        a.execute(
+            client,
+            Op::SendTo(
+                vec![
+                    (second[400..].as_ptr() as usize, 600),
+                    (third.as_ptr() as usize, 400)
+                ],
+                flags,
+                Some("192.0.2.2:8080".parse().unwrap()),
+                None,
+            )
+        )
+        .unwrap()
+        .value,
+        1000
+    );
+    assert_eq!(cid(&a, client), connection);
+    let data = tfo_capture(&mut a);
+    assert_eq!(segment(&data).header.flags & ntcp::wire::SYN, 0);
+    assert_eq!(
+        segment(&data).header.sequence,
+        segment(&syn).header.sequence.wrapping_add(901)
+    );
+    assert_eq!(
+        segment(&data).payload,
+        [&second[400..], &third[..]].concat()
+    );
+    assert_eq!(
+        a.execute(client, tfo_send(b"done", flags)).unwrap_err(),
+        EISCONN
+    );
+    tfo_no_output(&mut a);
+}
+
+#[test]
+fn fast_open_completed_retry_uses_ordinary_fault_and_completion_admission() {
+    for fault in [false, true] {
+        let (mut a, mut b, listener) = tfo_setup(false);
+        let client = new(&mut a, SOCK_NONBLOCK);
+        assert_eq!(
+            a.execute(client, tfo_send(b"hello", MSG_FASTOPEN))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        exchange(&mut a, &mut b);
+        let server = b
+            .execute(listener, Op::Accept(SOCK_NONBLOCK))
+            .unwrap()
+            .value as u64;
+        let connection = cid(&a, client);
+        a.execute(client, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 1))
+            .unwrap();
+        a.execute(
+            client,
+            Op::Set(
+                SOL_SOCKET,
+                crate::timestamping::OLD,
+                (crate::timestamping::TX_SOFTWARE | crate::timestamping::SOFTWARE) as i32,
+            ),
+        )
+        .unwrap();
+        let before = a.endpoint.send_progress(connection).unwrap().queued_end;
+        if fault {
+            assert_eq!(
+                a.execute(client, Op::Send(vec![(1, 5)], MSG_FASTOPEN | MSG_ZEROCOPY))
+                    .unwrap_err(),
+                EFAULT
+            );
+            assert_eq!(
+                a.endpoint.send_progress(connection).unwrap().queued_end,
+                before
+            );
+            assert_eq!(a.sockets[&client].zc_next, 0);
+            assert_eq!(a.sockets[&client].timestamps.reserved(), 0);
+            tfo_no_output(&mut a);
+        } else {
+            assert_eq!(
+                a.execute(client, tfo_send(b"hello", MSG_FASTOPEN | MSG_ZEROCOPY))
+                    .unwrap()
+                    .value,
+                5
+            );
+            assert_eq!(
+                a.endpoint.send_progress(connection).unwrap().queued_end,
+                before + 5
+            );
+            assert_eq!(a.sockets[&client].zc_next, 1);
+            exchange(&mut a, &mut b);
+            assert_eq!(b.execute(server, Op::Read(9)).unwrap().bytes, b"hello");
+            assert!(
+                a.sockets[&client]
+                    .completions
+                    .iter()
+                    .any(|c| matches!(c, Completion::ZeroCopy(0, 0)))
+            );
+            assert!(
+                a.sockets[&client]
+                    .completions
+                    .iter()
+                    .any(|c| matches!(c, Completion::Timestamp { .. }))
+            );
+        }
+        // API completion precedes ordinary payload admission, including EFAULT.
+        assert_eq!(
+            a.execute(client, tfo_send(b"done", MSG_FASTOPEN))
+                .unwrap_err(),
+            EISCONN
+        );
+        assert_eq!(cid(&a, client), connection);
+    }
+}
+
+#[test]
+fn fast_open_connect_option_and_explicit_completion_share_api_state() {
+    for fast_open_connect in [false, true] {
+        for explicit_completion in [false, true] {
+            let (mut a, mut b, listener) = tfo_setup(false);
+            let client = new(&mut a, SOCK_NONBLOCK);
+            let remote = "192.0.2.2:8080".parse().unwrap();
+            a.execute(
+                client,
+                Op::Set(
+                    IPPROTO_TCP,
+                    TCP_FASTOPEN_CONNECT,
+                    i32::from(fast_open_connect),
+                ),
+            )
+            .unwrap();
+            assert_eq!(
+                a.execute(client, Op::Connect(remote)).unwrap_err(),
+                EINPROGRESS
+            );
+            assert_eq!(
+                a.execute(client, tfo_send(b"pending", MSG_FASTOPEN))
+                    .unwrap_err(),
+                EALREADY
+            );
+            exchange(&mut a, &mut b);
+            let server = b
+                .execute(listener, Op::Accept(SOCK_NONBLOCK))
+                .unwrap()
+                .value as u64;
+            if explicit_completion {
+                assert_eq!(a.execute(client, Op::Connect(remote)).unwrap().value, 0);
+            } else {
+                assert_eq!(
+                    a.execute(client, tfo_send(b"retry", MSG_FASTOPEN))
+                        .unwrap()
+                        .value,
+                    5
+                );
+                exchange(&mut a, &mut b);
+                assert_eq!(b.execute(server, Op::Read(9)).unwrap().bytes, b"retry");
+            }
+            assert_eq!(
+                a.execute(client, tfo_send(b"done", MSG_FASTOPEN))
+                    .unwrap_err(),
+                EISCONN
+            );
+            assert_eq!(a.execute(client, Op::Connect(remote)).unwrap_err(), EISCONN);
+            // Accepted sockets are already API-connected, never pending.
+            assert_eq!(
+                b.execute(server, tfo_send(b"done", MSG_FASTOPEN))
+                    .unwrap_err(),
+                EISCONN
+            );
+        }
+    }
+}
+
+#[test]
+fn fast_open_failed_implicit_completion_rolls_back_for_retry() {
+    for warm in [false, true] {
+        for consume_error in [false, true] {
+            let (mut a, mut b, listener) = tfo_setup(warm);
+            let client = new(&mut a, SOCK_NONBLOCK);
+            let result = a.execute(client, tfo_send(b"hello", MSG_FASTOPEN));
+            if warm {
+                assert_eq!(result.unwrap().value, 5);
+            } else {
+                assert_eq!(result.unwrap_err(), EINPROGRESS);
+            }
+            let failed = cid(&a, client);
+            b.execute(listener, Op::Close).unwrap();
+            tfo_deliver(&mut b, tfo_capture(&mut a));
+            let reset = tfo_capture(&mut b);
+            assert_ne!(segment(&reset).header.flags & ntcp::wire::RST, 0);
+            tfo_deliver(&mut a, reset);
+            if consume_error {
+                assert_eq!(
+                    a.execute(client, Op::Get(SOL_SOCKET, SO_ERROR))
+                        .unwrap()
+                        .value,
+                    ECONNREFUSED
+                );
+            }
+            assert_eq!(
+                a.execute(client, tfo_send(b"retry", MSG_FASTOPEN))
+                    .unwrap_err(),
+                if consume_error {
+                    ECONNABORTED
+                } else {
+                    ECONNREFUSED
+                }
+            );
+            assert!(matches!(a.sockets[&client].handle, Handle::Fresh));
+            assert!(!a.sockets[&client].connect_pending);
+            assert!(!a.sockets[&client].connected);
+            tfo_no_output(&mut a);
+            let _listener = tfo_listener(&mut b);
+            let result = a.execute(client, tfo_send(b"retry", MSG_FASTOPEN));
+            match result {
+                Ok(reply) => assert_eq!(reply.value, 5),
+                Err(error) => assert_eq!(error, EINPROGRESS),
+            }
+            assert_ne!(cid(&a, client), failed);
+            exchange(&mut a, &mut b);
+            assert!(a.sockets[&client].connected);
+            assert!(a.sockets[&client].connect_pending);
+        }
     }
 }

@@ -277,8 +277,48 @@ mod packets {
                 segment(&syn).options.fast_open.unwrap().as_bytes(),
                 &[1, 2, 3, 4]
             );
+            let alias = dup(fd);
+            assert!(alias >= 0);
+            assert_eq!(
+                send(
+                    alias,
+                    c"pending".as_ptr().cast(),
+                    7,
+                    MSG_FASTOPEN | MSG_DONTWAIT
+                ),
+                -1
+            );
+            assert_eq!(errno(), EALREADY);
             reply(&segment(&syn));
+            assert_eq!(
+                send(
+                    alias,
+                    c"retry".as_ptr().cast(),
+                    5,
+                    MSG_FASTOPEN | MSG_DONTWAIT
+                ),
+                5
+            );
+            let data = capture();
+            assert_eq!(segment(&data).header.flags & SYN, 0);
+            assert_eq!(segment(&data).payload, b"retry");
+            assert_eq!(
+                send(fd, c"done".as_ptr().cast(), 4, MSG_FASTOPEN | MSG_DONTWAIT),
+                -1
+            );
+            assert_eq!(errno(), EISCONN);
             assert_eq!(close(fd), 0);
+            assert_eq!(
+                send(
+                    alias,
+                    c"done".as_ptr().cast(),
+                    4,
+                    MSG_FASTOPEN | MSG_DONTWAIT
+                ),
+                -1
+            );
+            assert_eq!(errno(), EISCONN);
+            assert_eq!(close(alias), 0);
             let _fin = capture();
 
             let fd = socket();

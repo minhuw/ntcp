@@ -121,13 +121,14 @@ impl Owner {
     // One bounded copy/admission per service turn. No foreign data survives a
     // turn except bytes already owned by TCP; the cursor advances only on write.
     fn send_step(&mut self, id: u64, send: &mut LogicalSend, blocking: bool) -> Result<()> {
-        let socket = self.sockets.get(&id).ok_or(EBADF)?;
-        if !send.fast_open_started
-            && (send.flags & MSG_FASTOPEN != 0 || socket.deferred_peer.is_some())
-        {
-            if socket.deferred_peer.is_none() {
-                self.check_connect(id)?;
-            }
+        let deferred = self.sockets.get(&id).ok_or(EBADF)?.deferred_peer.is_some();
+        if !send.fast_open_started && send.flags & MSG_FASTOPEN != 0 && !deferred {
+            // Completing SS_CONNECTING is an ordinary send, not another SYN
+            // copy: retain normal timestamp/zerocopy admission on this retry.
+            send.fast_open_started = !self.check_connect(id)?;
+        }
+        if !send.fast_open_started && (send.flags & MSG_FASTOPEN != 0 || deferred) {
+            let socket = &self.sockets[&id];
             let remote = socket.deferred_peer.or(send.destination).ok_or(EINVAL)?;
             if remote.port() == 0 {
                 return Err(EINVAL);
@@ -161,7 +162,7 @@ impl Owner {
             return Ok(());
         }
         if send.wait_handshake {
-            self.send_state(id)?;
+            self.complete_connect(id)?;
             send.wait_handshake = false;
         }
         let connected = matches!(

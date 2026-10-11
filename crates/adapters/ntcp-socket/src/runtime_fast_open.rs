@@ -2,25 +2,52 @@
 use super::*;
 
 impl Owner {
-    pub(super) fn check_connect(&self, id: u64) -> Result<()> {
+    // True starts a new open; false completes Linux SS_CONNECTING on the
+    // existing transport. TCP establishment alone must not imply SS_CONNECTED.
+    pub(super) fn check_connect(&mut self, id: u64) -> Result<bool> {
         let s = self.sockets.get(&id).ok_or(EBADF)?;
-        if s.deferred_peer.is_some() || s.connected {
+        if s.deferred_peer.is_some() {
             return Err(EISCONN);
         }
         match s.handle {
-            Handle::Fresh => Ok(()),
+            Handle::Fresh => Ok(true),
             Handle::Listener(_) => Err(EINVAL),
-            Handle::Connection(cid) => Err(
-                if matches!(
-                    self.endpoint.state(cid),
-                    Ok(State::SynSent | State::SynReceived)
-                ) {
-                    EALREADY
-                } else {
-                    EISCONN
-                },
-            ),
+            Handle::Connection(_) if !s.connect_pending => Err(EISCONN),
+            Handle::Connection(_) => self
+                .complete_connect(id)
+                .map(|()| false)
+                .map_err(|e| if e == EAGAIN { EALREADY } else { e }),
         }
+    }
+
+    pub(super) fn complete_connect(&mut self, id: u64) -> Result<()> {
+        let s = self.sockets.get_mut(&id).ok_or(EBADF)?;
+        let Handle::Connection(cid) = s.handle else {
+            return Err(ENOTCONN);
+        };
+        match self.endpoint.state(cid).map_err(engine)? {
+            State::SynSent | State::SynReceived => return Err(EAGAIN),
+            State::Closed => {
+                // __inet_stream_connect's sock_error path returns to
+                // SS_UNCONNECTED; do not leave a failed implicit open pending.
+                let error = if s.error != 0 { s.error } else { ECONNABORTED };
+                s.error = 0;
+                s.handle = Handle::Fresh;
+                s.connect_pending = false;
+                s.connected = false;
+                s.peer_fin = false;
+                s.write_shutdown = false;
+                s.read_shutdown = false;
+                let options = s.timestamps.options;
+                s.timestamps = TimestampState::default();
+                s.timestamps.options = options;
+                self.rollback_connection(cid);
+                return Err(error);
+            }
+            _ => (),
+        }
+        s.connect_pending = false;
+        Ok(())
     }
 
     pub(super) fn connect_local(&mut self, id: u64) -> Result<SocketAddr> {
@@ -86,6 +113,7 @@ impl Owner {
             .push((cid, options.tos, options.discover, Some(options.zerocopy)));
         let s = self.sockets.get_mut(&id).unwrap();
         s.handle = Handle::Connection(cid);
+        s.connect_pending = true;
         s.local = Some(local);
         s.deferred_peer = None;
         Ok(accepted)
