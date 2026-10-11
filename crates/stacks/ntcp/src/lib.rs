@@ -16,6 +16,11 @@ mod connection;
 mod cubic;
 mod endpoint;
 mod fast_open;
+pub use fast_open::FastOpenCookiePolicy;
+#[cfg(feature = "tfo-linux-cookie")]
+pub use fast_open::LinuxSipHash24Key;
+#[cfg(test)]
+mod fast_open_policy_tests;
 #[cfg(test)]
 mod fast_open_tests;
 mod output_reservation;

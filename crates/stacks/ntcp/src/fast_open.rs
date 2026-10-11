@@ -5,6 +5,99 @@ use sha2::Sha256;
 
 use crate::{Error, Instant, wire::FastOpenCookie};
 
+/// Server cookie authentication policy. Selecting a policy does not enable TFO.
+#[derive(Clone, Debug, Default)]
+pub enum FastOpenCookiePolicy {
+    /// Address-bound HMAC with current and previous epoch acceptance.
+    #[default]
+    HmacSha256,
+    /// Linux v5.3+ address cookies: a single key, without epochs or backup keys.
+    #[cfg(feature = "tfo-linux-cookie")]
+    LinuxSipHash24(LinuxSipHash24Key),
+}
+
+/// Raw Linux socket key bytes, not textual sysctl words.
+#[cfg(feature = "tfo-linux-cookie")]
+#[derive(Clone)]
+pub struct LinuxSipHash24Key([u8; 16]);
+
+#[cfg(feature = "tfo-linux-cookie")]
+impl LinuxSipHash24Key {
+    pub const fn new(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Result<Self, Error> {
+        Ok(Self(bytes.try_into().map_err(|_| Error::InvalidArgument)?))
+    }
+
+    fn cookie(&self, local: IpAddr, remote: IpAddr) -> Option<FastOpenCookie> {
+        use core::hash::Hasher;
+        use siphasher::sip::SipHasher24;
+
+        // new_with_key interprets each raw 8-byte key half as little endian.
+        let mut hash = SipHasher24::new_with_key(&self.0);
+        match (remote, local) {
+            (IpAddr::V4(remote), IpAddr::V4(local)) => {
+                hash.write(&remote.octets());
+                hash.write(&local.octets());
+            }
+            (IpAddr::V6(remote), IpAddr::V6(local)) => {
+                hash.write(&remote.octets());
+                hash.write(&local.octets());
+            }
+            _ => return None,
+        }
+        Some(FastOpenCookie::new(&hash.finish().to_le_bytes()).unwrap())
+    }
+}
+
+#[cfg(feature = "tfo-linux-cookie")]
+impl core::fmt::Debug for LinuxSipHash24Key {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("LinuxSipHash24Key([REDACTED])")
+    }
+}
+
+impl FastOpenCookiePolicy {
+    pub(crate) fn issue(
+        &self,
+        secret: &[u8; 32],
+        local: IpAddr,
+        remote: IpAddr,
+        epoch: u64,
+    ) -> Option<FastOpenCookie> {
+        match self {
+            Self::HmacSha256 => Some(issue(secret, local, remote, epoch)),
+            #[cfg(feature = "tfo-linux-cookie")]
+            Self::LinuxSipHash24(key) => key.cookie(local, remote),
+        }
+    }
+
+    pub(crate) fn valid(
+        &self,
+        secret: &[u8; 32],
+        local: IpAddr,
+        remote: IpAddr,
+        epoch: u64,
+        cookie: FastOpenCookie,
+    ) -> bool {
+        match self {
+            Self::HmacSha256 => valid(secret, local, remote, epoch, cookie),
+            #[cfg(feature = "tfo-linux-cookie")]
+            Self::LinuxSipHash24(key) => {
+                use subtle::ConstantTimeEq;
+                if cookie.as_bytes().len() != 8 {
+                    return false;
+                }
+                key.cookie(local, remote).is_some_and(|expected| {
+                    bool::from(expected.as_bytes().ct_eq(cookie.as_bytes()))
+                })
+            }
+        }
+    }
+}
+
 const CAPACITY: usize = 64;
 pub(crate) const LIFETIME_US: u64 = 3_600_000_000;
 

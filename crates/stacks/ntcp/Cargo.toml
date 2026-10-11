@@ -10,9 +10,14 @@ keywords = ["tcp", "networking", "event-driven"]
 categories = ["network-programming"]
 include = ["/src/**", "/examples/**", "/tests/**", "/Cargo.toml", "/README.md", "/LICENSE"]
 
+[features]
+tfo-linux-cookie = ["dep:siphasher", "dep:subtle"]
+
 [dependencies]
 hmac = { version = "0.12", default-features = false }
 sha2 = { version = "0.10", default-features = false }
+siphasher = { version = "1", default-features = false, optional = true }
+subtle = { version = "2.6", default-features = false, optional = true }
 
 [dev-dependencies]
 libc = "0.2"

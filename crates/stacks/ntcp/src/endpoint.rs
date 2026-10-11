@@ -6,9 +6,10 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::{
-    Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options, RxPacketTimestamps, RxReadTimestamps,
-    RxTimestampStatus, SendProgress, SourceRoute, TimestampRequest, TxTimestampClock,
-    TxTimestampEvent, TxTimestampRequest, TxTimestampSource, TxTimestampStage, TxTimestampToken,
+    FastOpenCookiePolicy, Ipv4Options, Ipv4OptionsError, OutgoingIpv4Options, RxPacketTimestamps,
+    RxReadTimestamps, RxTimestampStatus, SendProgress, SourceRoute, TimestampRequest,
+    TxTimestampClock, TxTimestampEvent, TxTimestampRequest, TxTimestampSource, TxTimestampStage,
+    TxTimestampToken,
     buffer::ReceiveBuffer,
     connection::{Connection, ConnectionConfig, ConnectionEvents, Error, Instant, State, Tuple},
     rx_timestamp::RxTimestamps,
@@ -301,6 +302,7 @@ struct Slot {
     received_ipv4_options: Option<Ipv4Options>,
 }
 struct Listener {
+    fast_open_cookie_policy: Option<FastOpenCookiePolicy>,
     fast_open_limit: usize,
     rx_timestamp_capacity: usize,
     buffer_capacities: (usize, usize),
@@ -317,6 +319,7 @@ struct Listener {
 // Ambiguous overlapping ingress domains need separate endpoints, not implicit
 // context guessing from addresses.
 pub struct Endpoint {
+    fast_open_cookie_policy: FastOpenCookiePolicy,
     fast_open: Option<crate::fast_open::FastOpen>,
     reservations: Vec<crate::output_reservation::OutputReservation>,
     address_policy: Box<dyn Fn(AddressValidation) -> bool>,
@@ -425,6 +428,7 @@ impl Endpoint {
             .map_err(|_| Error::NoMemory)?;
         Ok(Self {
             fast_open: None,
+            fast_open_cookie_policy: FastOpenCookiePolicy::default(),
             reservations: Vec::new(),
             address_policy: Box::new(address_policy),
             passive_errors,
@@ -635,6 +639,7 @@ impl Endpoint {
             .map_err(|_| Error::NoMemory)?;
         self.listeners[slot] = Some(Listener {
             fast_open_limit: 0,
+            fast_open_cookie_policy: None,
             rx_timestamp_capacity: 0,
             buffer_capacities: (
                 self.config.connection.send_capacity,
@@ -900,9 +905,15 @@ impl Endpoint {
                         && slot.connection.state() != State::Closed
                 })
                 .count();
+            let policy = self.listeners[listener.slot]
+                .as_ref()
+                .unwrap()
+                .fast_open_cookie_policy
+                .as_ref()
+                .unwrap_or(&self.fast_open_cookie_policy);
             let epoch = self.now / self.fast_open_lifetime();
             let valid = syn.options.fast_open.is_some_and(|cookie| {
-                crate::fast_open::valid(
+                policy.valid(
                     &self.secret,
                     tuple.local.ip(),
                     tuple.remote.ip(),
@@ -913,12 +924,8 @@ impl Endpoint {
             let accept_data = valid && pending < limit;
             early = accept_data && !syn.payload.is_empty();
             if syn.options.fast_open.is_some() {
-                fast_open_response = Some(crate::fast_open::issue(
-                    &self.secret,
-                    tuple.local.ip(),
-                    tuple.remote.ip(),
-                    epoch,
-                ));
+                fast_open_response =
+                    policy.issue(&self.secret, tuple.local.ip(), tuple.remote.ip(), epoch);
             }
             let mut header = syn.header;
             if !accept_data {
@@ -1080,6 +1087,27 @@ impl Endpoint {
         }
         self.refresh(index);
         Ok(id)
+    }
+
+    /// Replace the default server cookie policy for future passive opens.
+    /// Does not enable TFO, change quotas/cache/ISN secrets, or alter existing children.
+    pub fn set_fast_open_cookie_policy(&mut self, policy: FastOpenCookiePolicy) {
+        self.fast_open_cookie_policy = policy;
+    }
+
+    /// Override one live listener's policy; `None` inherits the endpoint policy.
+    /// Does not enable TFO or alter already-created children or held output.
+    pub fn set_listener_fast_open_cookie_policy(
+        &mut self,
+        id: ListenerId,
+        policy: Option<FastOpenCookiePolicy>,
+    ) -> Result<(), EndpointError> {
+        self.listener(id)?;
+        self.listeners[id.slot]
+            .as_mut()
+            .unwrap()
+            .fast_open_cookie_policy = policy;
+        Ok(())
     }
 
     /// Enable the bounded cookie service. Cookies authenticate addresses, not
