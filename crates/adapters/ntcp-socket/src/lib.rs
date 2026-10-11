@@ -31,6 +31,9 @@ macro_rules! boundary_entry {
 
 mod config;
 pub use config::{Backend, IoConfig, SocketConfig, SocketPolicy};
+pub use ntcp::FastOpenCookiePolicy;
+#[cfg(feature = "tfo-linux-cookie")]
+pub use ntcp::LinuxSipHash24Key;
 mod file_transfer;
 #[cfg(feature = "packet-test")]
 pub mod packet_profile;
@@ -1631,6 +1634,19 @@ pub unsafe extern "C" fn ntcp_managed_setsockopt(
         let Some(id) = owned(fd)? else {
             return raw(unsafe { syscall(SYS_setsockopt, fd, level, name, p, len) });
         };
+        if (level, name) == (IPPROTO_TCP, TCP_FASTOPEN_KEY) {
+            #[cfg(feature = "tfo-linux-cookie")]
+            {
+                if len != 16 {
+                    return Err(EINVAL);
+                }
+                let key = LinuxSipHash24Key::new(load(p.cast::<[u8; 16]>())?);
+                call(id, Op::SetFastOpenKey(key))?;
+                return Ok(0);
+            }
+            #[cfg(not(feature = "tfo-linux-cookie"))]
+            return Err(ENOPROTOOPT);
+        }
         if matches!(
             (level, name),
             (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF | 37 | 65)
@@ -1692,6 +1708,10 @@ pub unsafe extern "C" fn ntcp_managed_getsockopt(
         let Some(id) = owned(fd)? else {
             return raw(unsafe { syscall(SYS_getsockopt, fd, level, name, p, len) });
         };
+        // No key export: never route this binary option through the integer ABI.
+        if (level, name) == (IPPROTO_TCP, TCP_FASTOPEN_KEY) {
+            return Err(ENOPROTOOPT);
+        }
         if matches!(
             (level, name),
             (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF)
@@ -3067,3 +3087,6 @@ mod stream_read_tests;
 
 #[cfg(test)]
 mod fast_open_abi_tests;
+
+#[cfg(test)]
+mod cookie_policy_tests;

@@ -22,6 +22,7 @@ pub enum Backend {
 pub struct SocketConfig {
     pub tcp: ntcp::EndpointConfig,
     pub socket: SocketPolicy,
+    pub fast_open_cookie_policy: ntcp::FastOpenCookiePolicy,
     pub io: IoConfig,
 }
 
@@ -71,6 +72,7 @@ impl SocketConfig {
         Self {
             tcp,
             socket: SocketPolicy::default(),
+            fast_open_cookie_policy: ntcp::FastOpenCookiePolicy::default(),
             io: IoConfig {
                 backend: Backend::Tun,
                 interface: interface.into(),
@@ -152,6 +154,8 @@ impl SocketConfig {
             return Err(invalid());
         }
         let mut config = Self::new("", Ipv4Addr::UNSPECIFIED);
+        let mut cookie_mode = "hmac-sha256";
+        let mut cookie_key = None;
         let mut gso_bytes = None;
         let mut gso_segments = None;
         let mut pacing_enabled = false;
@@ -168,6 +172,8 @@ impl SocketConfig {
                 return Err(invalid());
             }
             match key {
+                "socket.fast_open_cookie" => cookie_mode = value,
+                "socket.fast_open_key" => cookie_key = Some(value),
                 "socket.notsent_lowat" => config.socket.notsent_lowat = number(value)?,
                 "io.backend" => {
                     config.io.backend = match value {
@@ -221,6 +227,22 @@ impl SocketConfig {
                 _ => return Err(invalid()),
             }
         }
+        config.fast_open_cookie_policy = match (cookie_mode, cookie_key) {
+            ("hmac-sha256", None) => ntcp::FastOpenCookiePolicy::HmacSha256,
+            #[cfg(feature = "tfo-linux-cookie")]
+            ("linux-siphash24", Some(key)) => {
+                if key.len() != 32 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(invalid());
+                }
+                let mut bytes = [0; 16];
+                for (i, byte) in bytes.iter_mut().enumerate() {
+                    *byte =
+                        u8::from_str_radix(&key[i * 2..i * 2 + 2], 16).map_err(|_| invalid())?;
+                }
+                ntcp::FastOpenCookiePolicy::LinuxSipHash24(ntcp::LinuxSipHash24Key::new(bytes))
+            }
+            _ => return Err(invalid()),
+        };
         if tuned && !pacing_enabled {
             return Err(invalid());
         }

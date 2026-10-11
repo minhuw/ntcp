@@ -87,6 +87,8 @@ pub enum Op {
     Shutdown(i32),
     Flags(i32, i32),
     Set(i32, i32, i32),
+    #[cfg(feature = "tfo-linux-cookie")]
+    SetFastOpenKey(LinuxSipHash24Key),
     Get(i32, i32),
     Name(bool),
     Ready,
@@ -335,6 +337,7 @@ struct Socket {
     inq: bool,
     notsent_lowat: u32,
     fast_open_limit: i32,
+    fast_open_cookie_policy: Option<FastOpenCookiePolicy>,
     fast_open_connect: bool,
     deferred_peer: Option<SocketAddr>,
     readiness: i32,
@@ -376,6 +379,7 @@ impl Socket {
             inq: false,
             notsent_lowat: 0,
             fast_open_limit: 0,
+            fast_open_cookie_policy: None,
             fast_open_connect: false,
             deferred_peer: None,
             readiness: 0,
@@ -561,9 +565,14 @@ impl Owner {
         }
         let tcp = backend::backend_config(config.tcp.clone(), &tun)?;
         let mut owner = Self::with_config(local, subnet, secret, Some(tun), tcp)?;
-        owner.socket_policy = config.socket;
+        owner.apply_socket_config(config);
         owner.enable_reservations(&config.io, index)?;
         Ok(owner)
+    }
+    fn apply_socket_config(&mut self, config: &SocketConfig) {
+        self.socket_policy = config.socket;
+        self.endpoint
+            .set_fast_open_cookie_policy(config.fast_open_cookie_policy.clone());
     }
     fn with_config(
         local: Ipv4Addr,
@@ -1435,6 +1444,21 @@ impl Owner {
         }
         let s = self.sockets.get(&id).ok_or(EBADF)?;
         match op {
+            #[cfg(feature = "tfo-linux-cookie")]
+            Op::SetFastOpenKey(key) => {
+                if s.deferred_peer.is_some()
+                    || !matches!(s.handle, Handle::Fresh | Handle::Listener(_))
+                {
+                    return Err(EINVAL);
+                }
+                let policy = FastOpenCookiePolicy::LinuxSipHash24(key);
+                if let Handle::Listener(listener) = s.handle {
+                    self.endpoint
+                        .set_listener_fast_open_cookie_policy(listener, Some(policy.clone()))
+                        .map_err(engine)?;
+                }
+                self.sockets.get_mut(&id).unwrap().fast_open_cookie_policy = Some(policy);
+            }
             Op::Bind(mut addr) => {
                 if !matches!(s.handle, Handle::Fresh)
                     || s.local.is_some()
@@ -1464,6 +1488,7 @@ impl Owner {
                     return Err(EOPNOTSUPP);
                 }
                 let fast_open_limit = s.fast_open_limit;
+                let cookie_policy = s.fast_open_cookie_policy.clone();
                 let capacities = (s.send_capacity, s.receive_capacity);
                 let application_timeout = user_timeout_us(s.user_timeout_ms)?;
                 let local = match s.local {
@@ -1500,6 +1525,13 @@ impl Owner {
                 if let Err(e) = self
                     .endpoint
                     .set_listener_fast_open(listener, fast_open_limit as usize)
+                {
+                    let _ = self.endpoint.close_listener(listener);
+                    return Err(engine(e));
+                }
+                if let Err(e) = self
+                    .endpoint
+                    .set_listener_fast_open_cookie_policy(listener, cookie_policy)
                 {
                     let _ = self.endpoint.close_listener(listener);
                     return Err(engine(e));
@@ -3327,3 +3359,7 @@ mod packet_tests;
 #[cfg(test)]
 #[path = "runtime_admission_tests.rs"]
 mod admission_tests;
+
+#[cfg(all(test, feature = "tfo-linux-cookie"))]
+#[path = "runtime_cookie_policy_tests.rs"]
+mod cookie_policy_tests;

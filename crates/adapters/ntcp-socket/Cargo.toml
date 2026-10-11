@@ -9,6 +9,7 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 packet-test = []
+tfo-linux-cookie = ["ntcp/tfo-linux-cookie"]
 
 [dependencies]
 ntcp-egress = { path = "../../net/ntcp-egress" }
