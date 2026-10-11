@@ -1034,3 +1034,39 @@ fn fast_open_early_terminal_read_close_discards_data_and_preserves_abort() {
     );
     assert_eq!(reset.header.acknowledgment, 104);
 }
+
+#[test]
+fn fast_open_syn_push_is_explicit_for_both_families_and_output_paths() {
+    for v6 in [false, true] {
+        for reserved in [false, true] {
+            // No mark, explicit PUSH, PUSH+EOR, EOR alone, explicit SEND PUSH.
+            for mark in 0..5 {
+                let (mut a, _, _) = warm(v6);
+                let (local, remote) = addresses(v6, 40001);
+                let (id, n) = a.connect_fast_open(100, local, remote, b"hello").unwrap();
+                assert_eq!(n, 5);
+                match mark {
+                    1..=3 => a.finish_send(id, 5, mark == 3, mark != 1, false).unwrap(),
+                    4 => assert_eq!(a.write_with_push(id, b"", true).unwrap(), 0),
+                    _ => {}
+                }
+                let (ip, bytes) = if reserved {
+                    a.enable_output_reservations().unwrap();
+                    let mut bytes = [0; 2048];
+                    let (output, attempt) = a
+                        .poll_reserved_transmit_for(100, id, &mut bytes, 16)
+                        .unwrap();
+                    let tx = output.packet.unwrap();
+                    assert!(a.accept_transmit(110, attempt.unwrap()).unwrap());
+                    (tx.ip, bytes[..tx.len].to_vec())
+                } else {
+                    packet(&mut a, 100)
+                };
+                let syn = wire::parse(ip, &bytes).unwrap();
+                assert_ne!(syn.header.flags & wire::SYN, 0);
+                assert_eq!(syn.payload, b"hello");
+                assert_eq!(syn.header.flags & wire::PSH != 0, matches!(mark, 1 | 2 | 4));
+            }
+        }
+    }
+}

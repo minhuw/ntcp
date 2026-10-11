@@ -54,6 +54,7 @@ fn syn_data_ack_bounds_wrap_partial_retry_and_flush() {
             let syn = wire::parse(ip(tuple()), &bytes).unwrap();
             assert_eq!(syn.header.sequence, iss);
             assert_eq!(syn.payload, &[42; 12]);
+            assert_eq!(syn.header.flags & PSH, 0);
             assert_eq!(a.flight(), 13);
             assert_eq!(a.data_flight(), 12);
             assert_eq!(
@@ -70,6 +71,7 @@ fn syn_data_ack_bounds_wrap_partial_retry_and_flush() {
             let repair = wire::parse(ip(tuple()), &bytes).unwrap();
             assert_eq!(repair.header.flags & SYN, 0);
             assert_eq!(repair.payload.len(), 12 - acked as usize);
+            assert_eq!(repair.header.flags & PSH != 0, acked != 12);
             if acked != 12 {
                 assert_eq!(repair.header.sequence, iss.wrapping_add(1 + acked));
                 assert_eq!(
@@ -109,6 +111,7 @@ fn timeout_bare_syn_retains_data_and_karn() {
     let bytes = packet(&mut a, timeout + 1000);
     let repair = wire::parse(ip(tuple()), &bytes).unwrap();
     assert_eq!(repair.payload, &[42; 12]);
+    assert_ne!(repair.header.flags & PSH, 0);
     assert_eq!(repair.header.sequence, a.iss.wrapping_add(1).0);
 }
 
@@ -368,5 +371,166 @@ fn ordinary_syn_data_remains_hidden_after_terminal_reset() {
         assert_eq!(b.terminal_readable_bytes(), 0);
         assert_eq!(b.peek_terminal(&mut [0; 3]), Ok(0));
         assert_eq!(b.read_terminal(&mut [0; 3]), Ok(0));
+    }
+}
+
+#[test]
+fn automatic_tfo_push_must_not_mark_flushed_replacement() {
+    for iss in [100, u32::MAX - 4] {
+        for retained in [0, 6] {
+            let mut a = client(iss, 12);
+            // No offered window discards all; a clipped SYN retains its flight.
+            if retained != 0 {
+                a.config.timestamp_bytes_per_tick = 7;
+                let bytes = packet(&mut a, 0);
+                assert_eq!(
+                    wire::parse(ip(tuple()), &bytes).unwrap().payload.len(),
+                    retained
+                );
+                a.config.timestamp_bytes_per_tick = 1 << 20;
+            }
+            assert_eq!(a.flush(), Ok(12 - retained));
+            assert_eq!(a.write_with_push(b"replacement!", false), Ok(12));
+            if retained == 0 {
+                let bytes = packet(&mut a, 0);
+                let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(syn.payload, b"replacement!");
+                assert_eq!(syn.header.flags & PSH, 0);
+            }
+            synack(&mut a, 0, 1000);
+            assert!(!a.send.pushed(0, a.send.len()));
+            let bytes = packet(&mut a, 1000);
+            let repair = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(
+                repair.payload,
+                if retained == 0 {
+                    &b"replacement!"[..]
+                } else {
+                    &[42; 6]
+                }
+            );
+            assert_eq!(repair.header.flags & PSH, 0);
+        }
+    }
+}
+
+#[test]
+fn deferred_tfo_push_stays_at_original_end_after_ack_and_later_writes() {
+    for iss in [100, u32::MAX - 4] {
+        for reserved in [false, true] {
+            for acked in [0, 3, 12] {
+                let mut a = client(iss, 12);
+                a.config.nagle = false;
+                a.write_with_push(b"later", false).unwrap();
+                let mut now = 0;
+                let bytes = selected_packet(&mut a, &mut now, reserved).unwrap();
+                let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(syn.payload, &[42; 12]);
+                assert_eq!(syn.header.flags & PSH, 0);
+                synack(&mut a, acked, 1000);
+                assert!(!a.deferred_tfo_push);
+                let remaining = 12 - acked as usize;
+                for offset in 0..a.send.len() {
+                    assert_eq!(
+                        a.send.pushed(offset, 1),
+                        remaining != 0 && offset + 1 == remaining
+                    );
+                }
+                now = 2000;
+                let bytes = selected_packet(&mut a, &mut now, reserved).unwrap();
+                let output = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(output.header.flags & PSH != 0, remaining != 0);
+                assert_eq!(output.payload, &[42; 12][..remaining]);
+                if remaining == 0 {
+                    now = a.sws_deadline.unwrap();
+                    a.timeout(now).unwrap();
+                    let bytes = selected_packet(&mut a, &mut now, reserved).unwrap();
+                    let later = wire::parse(ip(tuple()), &bytes).unwrap();
+                    assert_eq!(later.payload, b"later");
+                    assert_eq!(later.header.flags & PSH, 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_tfo_push_survives_clipping_eor_resize_and_flush_of_only_later_data() {
+    for iss in [100, u32::MAX - 4] {
+        for clipped in [false, true] {
+            let mut a = client(iss, 12);
+            a.config.nagle = false;
+            a.finish_send(12, true, true, false); // EOR alone must not PUSH the SYN.
+            if clipped {
+                a.config.timestamp_bytes_per_tick = 7;
+            }
+            let bytes = packet(&mut a, 0);
+            let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(syn.payload.len(), if clipped { 6 } else { 12 });
+            assert_eq!(syn.header.flags & PSH, 0);
+            a.config.timestamp_bytes_per_tick = 1 << 20;
+            a.write_with_push(b"later", false).unwrap();
+            // Keep the original endpoint even when the SYN was clipped.
+            a.snd_wnd = 13;
+            assert_eq!(a.flush(), Ok(5));
+            a.write_with_push(b"after", false).unwrap();
+            a.set_buffer_capacities(16384, 8192, usize::MAX).unwrap();
+            a.set_buffer_capacities(8, 8192, usize::MAX).unwrap(); // Limit shrink preserves bytes.
+            synack(&mut a, 3, 1000);
+            assert_eq!(a.send.record_len(0, a.send.len()), 9);
+            assert!(a.send.pushed(8, 1));
+            assert!(!a.send.pushed(9, 5));
+            let bytes = packet(&mut a, 1000);
+            let repair = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(repair.payload.len(), if clipped { 3 } else { 9 });
+            assert_eq!(repair.header.flags & PSH != 0, !clipped);
+            if clipped {
+                let bytes = packet(&mut a, 2000);
+                let suffix = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(suffix.payload, &[42; 6]);
+                assert_ne!(suffix.header.flags & PSH, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_tfo_push_simultaneous_open_and_terminal_cleanup() {
+    for iss in [100, u32::MAX - 4] {
+        for acked in [0, 3, 12] {
+            let mut a = client(iss, 12);
+            packet(&mut a, 0);
+            let syn = wire::Segment {
+                header: wire::Header {
+                    source_port: tuple().remote.port(),
+                    destination_port: tuple().local.port(),
+                    sequence: 999,
+                    acknowledgment: 0,
+                    flags: SYN,
+                    window: 8192,
+                    urgent_pointer: 0,
+                },
+                options: wire::Options::default(),
+                raw_options: &[],
+                payload: &[],
+            };
+            a.input(100, &syn).unwrap();
+            assert_eq!(a.state(), State::SynReceived);
+            packet(&mut a, 200);
+            synack(&mut a, acked, 1000);
+            assert_eq!(a.state(), State::Established);
+            assert!(!a.deferred_tfo_push);
+            assert_eq!(a.send.pushed(0, a.send.len()), acked != 12);
+            let bytes = packet(&mut a, 1000);
+            let repair = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!(repair.payload, &[42; 12][acked as usize..]);
+            assert_eq!(repair.header.flags & PSH != 0, acked != 12);
+        }
+        let mut a = client(iss, 12);
+        assert!(a.deferred_tfo_push);
+        a.terminal(CloseReason::Reset);
+        assert!(!a.deferred_tfo_push);
+        assert_eq!(a.state(), State::Closed);
+        assert!(!client(iss, 0).deferred_tfo_push);
     }
 }

@@ -537,6 +537,7 @@ pub(crate) struct Connection {
     passive_open: bool,
     fast_open: Option<wire::FastOpenCookie>,
     fast_open_initial: usize,
+    deferred_tfo_push: bool,
     fast_open_retry: Option<(Seq, Seq)>,
     pub(crate) fast_open_early: bool,
     pub(crate) fast_open_learned: Option<(wire::FastOpenCookie, u16)>,
@@ -815,6 +816,7 @@ impl Connection {
             passive_open: false,
             fast_open: None,
             fast_open_initial: 0,
+            deferred_tfo_push: false,
             fast_open_retry: None,
             fast_open_early: false,
             fast_open_learned: None,
@@ -1206,8 +1208,11 @@ impl Connection {
         if count == 0 {
             return Ok(0);
         }
-        let count = self.write(&initial[..count])?;
+        // Defer the internal automatic PUSH; explicit application marks still
+        // apply to SYN data and are never suppressed by the output path.
+        let count = self.write_with_push(&initial[..count], false)?;
         self.fast_open_initial = count;
+        self.deferred_tfo_push = true;
         Ok(count)
     }
 
@@ -3087,6 +3092,16 @@ impl Connection {
     }
 
     fn establish(&mut self) {
+        if self.deferred_tfo_push {
+            self.deferred_tfo_push = false;
+            let end = self.iss.wrapping_add(1 + self.fast_open_initial as u32);
+            let remaining = end.distance_from(self.send_base) as usize;
+            // ACK processing has already reclaimed accepted SYN data. Promote
+            // only its still-buffered original endpoint, not later queued data.
+            if after(end, self.send_base) && remaining <= self.send.len() {
+                self.send.finish_send(remaining - 1, true, false);
+            }
+        }
         if self.fast_open_initial != 0 && after(self.snd_nxt, self.snd_una) {
             self.fast_open_retry = Some((self.snd_una, self.snd_nxt));
         }
@@ -3154,6 +3169,7 @@ impl Connection {
         self.ecn_backoff = None;
         self.ecn_sent_setup = false;
         self.fast_open_retry = None;
+        self.deferred_tfo_push = false;
         self.reason = Some(reason);
         self.events.closed = Some(reason);
         if reason != CloseReason::Aborted {
@@ -3581,6 +3597,15 @@ impl Connection {
         };
         let retained = sent.max(advertised).max(window_prefix).min(self.send.len());
         let discarded = self.send.len() - retained;
+        if self.deferred_tfo_push {
+            let end = self.iss.wrapping_add(1 + self.fast_open_initial as u32);
+            let remaining = end.distance_from(self.send_base) as usize;
+            // Discarding the original mark must not let replacement bytes at
+            // the same sequence numbers inherit the deferred PUSH.
+            if after(end, self.send_base) && remaining > retained && remaining <= self.send.len() {
+                self.deferred_tfo_push = false;
+            }
+        }
         self.output_push_batch = None;
         self.tx_timestamps
             .cancel_from(self.acknowledged + retained as u64);
