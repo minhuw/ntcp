@@ -171,26 +171,51 @@ fn option_lengths_small_path_and_timestamp_credit() {
 }
 
 #[test]
-fn simultaneous_open_acknowledges_syn_data_without_early_passive_delivery() {
-    let mut a = client(u32::MAX - 4, 12);
-    let mut b = Connection::active(reverse(tuple()), a.config.clone(), 900, 0).unwrap();
-    let a_syn = packet(&mut a, 0);
-    let b_syn = packet(&mut b, 0);
-    a.input(10, &wire::parse(ip(b.tuple()), &b_syn).unwrap())
-        .unwrap();
-    b.input(10, &wire::parse(ip(a.tuple()), &a_syn).unwrap())
-        .unwrap();
-    assert_eq!(b.read(&mut [0; 32]), Err(Error::WouldBlock));
-    let a_synack = packet(&mut a, 20);
-    let b_synack = packet(&mut b, 20);
-    a.input(30, &wire::parse(ip(b.tuple()), &b_synack).unwrap())
-        .unwrap();
-    b.input(30, &wire::parse(ip(a.tuple()), &a_synack).unwrap())
-        .unwrap();
-    assert_eq!(a.state, State::Established);
-    assert_eq!(b.state, State::Established);
-    assert_eq!(a.acknowledged, 12);
-    assert_eq!(b.read(&mut [0; 32]).unwrap(), 12);
+fn simultaneous_open_rejects_recognized_syn_data_until_retransmitted() {
+    for iss in [1234, u32::MAX - 4] {
+        let mut a = client(iss, 496);
+        let mut b = Connection::active(reverse(tuple()), a.config.clone(), 900, 0).unwrap();
+        let a_syn = packet(&mut a, 0);
+        let b_syn = packet(&mut b, 0);
+        a.input(10, &wire::parse(ip(b.tuple()), &b_syn).unwrap())
+            .unwrap();
+        b.input(10, &wire::parse(ip(a.tuple()), &a_syn).unwrap())
+            .unwrap();
+        assert_eq!(b.read(&mut [0; 512]), Err(Error::WouldBlock));
+        assert_eq!(b.receive_used, 0);
+        let a_synack = packet(&mut a, 20);
+        let b_synack = packet(&mut b, 20);
+        // RFC 7413 §4.2.2 applies the same receive admission to simultaneous open.
+        assert_eq!(
+            wire::parse(ip(b.tuple()), &b_synack)
+                .unwrap()
+                .header
+                .acknowledgment,
+            iss.wrapping_add(1)
+        );
+        // A duplicate crossing SYN cannot sneak the rejected data into receive.
+        b.input(25, &wire::parse(ip(a.tuple()), &a_syn).unwrap())
+            .unwrap();
+        assert_eq!(b.receive_used, 0);
+        a.input(30, &wire::parse(ip(b.tuple()), &b_synack).unwrap())
+            .unwrap();
+        b.input(30, &wire::parse(ip(a.tuple()), &a_synack).unwrap())
+            .unwrap();
+        assert_eq!(a.state, State::Established);
+        assert_eq!(b.state, State::Established);
+        assert_eq!(a.acknowledged, 0);
+        assert_eq!(b.read(&mut [0; 512]), Err(Error::WouldBlock));
+        let retry = packet(&mut a, 40);
+        let retry = wire::parse(ip(a.tuple()), &retry).unwrap();
+        assert_eq!(retry.header.sequence, iss.wrapping_add(1));
+        assert_eq!(retry.payload, &[42; 496]);
+        b.input(50, &retry).unwrap();
+        let mut out = [0; 512];
+        assert_eq!(b.read(&mut out), Ok(496));
+        assert_eq!(&out[..496], &[42; 496]);
+        b.input(60, &retry).unwrap();
+        assert_eq!(b.read(&mut out), Err(Error::WouldBlock));
+    }
 }
 
 fn selected_packet(a: &mut Connection, now: &mut u64, reserved: bool) -> Option<Vec<u8>> {
@@ -572,6 +597,86 @@ fn passive_repair_ack_provenance_and_handshake_latch() {
                 assert_eq!(b.transport_info().syn_data_acked, eligible);
                 b.abort();
                 assert_eq!(b.transport_info().syn_data_acked, eligible);
+            }
+        }
+    }
+}
+
+#[test]
+fn recognized_crossing_syn_admission_preserves_synack_and_ordinary_data() {
+    for sequence in [1234, u32::MAX - 4] {
+        for cookie in [
+            None,
+            Some(wire::FastOpenCookie::request()),
+            Some(wire::FastOpenCookie::new(&[7; 8]).unwrap()),
+        ] {
+            for ack in [false, true] {
+                for controls in [0, FIN | PSH | URG] {
+                    let mut a = client(100, 12); // Has an outgoing cookie, not receive authorization.
+                    packet(&mut a, 0);
+                    let fallback = !ack && cookie.is_some();
+                    let syn = wire::Segment {
+                        header: wire::Header {
+                            source_port: tuple().remote.port(),
+                            destination_port: tuple().local.port(),
+                            sequence,
+                            acknowledgment: 101,
+                            flags: SYN
+                                | if ack { ACK } else { 0 }
+                                | if fallback { controls } else { 0 },
+                            window: 8192,
+                            urgent_pointer: if fallback { 501 } else { 0 },
+                        },
+                        options: wire::Options {
+                            mss: Some(536),
+                            window_scale: Some(2),
+                            sack_permitted: true,
+                            timestamps: Some((7, 0)),
+                            fast_open: cookie,
+                            ..Default::default()
+                        },
+                        raw_options: &[],
+                        payload: &[42; 500],
+                    };
+                    a.input(10, &syn).unwrap();
+                    assert_eq!(
+                        a.receive.next(),
+                        Seq(sequence.wrapping_add(if fallback { 1 } else { 501 }))
+                    );
+                    assert_eq!(a.receive_used, if fallback { 0 } else { 500 });
+                    assert_eq!(a.rcv_up, None);
+                    assert!(a.timestamps && a.sack_send && a.scaling);
+                    assert_eq!(a.peer_scale, 2);
+                    assert_eq!(a.peer_mss, 536);
+                    assert_eq!(a.ts_recent, 7);
+                    let reply = packet(&mut a, 20);
+                    let reply = wire::parse(ip(tuple()), &reply).unwrap();
+                    // Recognized crossing SYN: ACK 1235, never 1735; normal SYN-ACK data is retained.
+                    assert_eq!(
+                        reply.header.acknowledgment,
+                        sequence.wrapping_add(if fallback { 1 } else { 501 })
+                    );
+                    assert_eq!(
+                        a.read(&mut [0; 512]),
+                        if ack { Ok(500) } else { Err(Error::WouldBlock) }
+                    );
+                    if fallback {
+                        assert!(!a.receive.eof());
+                        let reset = wire::Segment {
+                            header: wire::Header {
+                                sequence: sequence.wrapping_add(1),
+                                flags: RST,
+                                ..syn.header
+                            },
+                            options: wire::Options::default(),
+                            raw_options: &[],
+                            payload: &[],
+                        };
+                        a.input(30, &reset).unwrap();
+                        assert_eq!(a.state(), State::Closed);
+                        assert_eq!(a.terminal_readable_bytes(), 0);
+                    }
+                }
             }
         }
     }

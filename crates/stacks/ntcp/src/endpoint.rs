@@ -879,6 +879,9 @@ impl Endpoint {
         // Apply the same policy to ordinary passive opens and TIME-WAIT reuse.
         let mut fast_open_response = None;
         let mut early = false;
+        // RFC 7413 §4.2.2 step 5: recognized TFO needs receive authorization,
+        // even when the listener or endpoint service is disabled.
+        let mut accept_syn_data = syn.is_none_or(|syn| syn.options.fast_open.is_none());
         let mut filtered_syn = None;
         if let Some(syn) = syn
             && let Some(listener) = self.match_listener(tuple.local)
@@ -921,24 +924,26 @@ impl Endpoint {
                     cookie,
                 )
             });
-            let accept_data = valid && pending < limit;
-            early = accept_data && !syn.payload.is_empty();
+            accept_syn_data = valid && pending < limit;
+            early = accept_syn_data && !syn.payload.is_empty();
             // RFC 7413 §4.2.2 permits omission; Linux does not refresh valid cookies.
             // This decision is independent of payload admission and pending quota.
             if syn.options.fast_open.is_some() && (!valid || policy.refresh_valid_cookie()) {
                 fast_open_response =
                     policy.issue(&self.secret, tuple.local.ip(), tuple.remote.ip(), epoch);
             }
+        }
+        if let Some(syn) = syn
+            && !accept_syn_data
+        {
             let mut header = syn.header;
-            if !accept_data {
-                header.flags &= !(wire::FIN | wire::PSH | wire::URG);
-                header.urgent_pointer = 0;
-            }
+            header.flags &= !(wire::FIN | wire::PSH | wire::URG);
+            header.urgent_pointer = 0;
             filtered_syn = Some(wire::Segment {
                 header,
                 options: syn.options,
                 raw_options: syn.raw_options,
-                payload: if accept_data { syn.payload } else { &[] },
+                payload: &[],
             });
         }
         let syn = filtered_syn.as_ref().or(syn);

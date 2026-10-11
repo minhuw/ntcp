@@ -149,14 +149,16 @@ fn fast_open_positive_early_read_delayed_write_quota_survives_accept() {
 
 #[test]
 fn fast_open_default_off_invalid_cookie_and_endpoint_opt_in() {
-    for enabled in [false, true] {
+    for (service, enabled) in [(false, false), (true, false), (true, true)] {
         let (local, remote) = addresses(false, 40000);
         let mut b = endpoint(2, false);
         let listener = b.listen(remote, 8).unwrap();
         assert!(b.set_listener_fast_open(listener, 1).is_err());
         assert!(b.connect_fast_open(0, remote, local, b"x").is_err());
-        if enabled {
+        if service {
             b.enable_fast_open().unwrap();
+        }
+        if enabled {
             b.set_listener_fast_open(listener, 1).unwrap();
         }
         let ip = IpMetadata {
@@ -185,13 +187,11 @@ fn fast_open_default_off_invalid_cookie_and_endpoint_opt_in() {
         assert!(b.accept(listener).is_err());
         let p = packet(&mut b, 10);
         let synack = wire::parse(p.0, &p.1).unwrap();
-        assert_eq!(
-            synack.header.acknowledgment,
-            if enabled { 101 } else { 104 }
-        );
+        // RFC 7413 §4.2.2 step 5: without FastOpened, ACK only the SYN.
+        assert_eq!(synack.header.acknowledgment, 101);
         assert_eq!(synack.options.fast_open.is_some(), enabled);
         let ack = wire::Header {
-            sequence: if enabled { 101 } else { 104 },
+            sequence: 101,
             acknowledgment: synack.header.sequence.wrapping_add(1),
             flags: wire::ACK,
             ..header
@@ -211,10 +211,15 @@ fn fast_open_default_off_invalid_cookie_and_endpoint_opt_in() {
         .unwrap();
         b.input(20, ip, &bytes[..n]).unwrap();
         let child = b.accept(listener).unwrap();
-        assert_eq!(
-            b.readable_bytes(child).unwrap(),
-            if enabled { 0 } else { 3 }
-        );
+        assert_eq!(b.readable_bytes(child).unwrap(), 0);
+        assert_eq!(b.read(child, &mut bytes), Err(Error::WouldBlock.into()));
+        let n = wire::encode(ip, ack, &[], b"abc", &mut bytes).unwrap();
+        let retry = bytes[..n].to_vec();
+        b.input(30, ip, &retry).unwrap();
+        assert_eq!(b.read(child, &mut bytes).unwrap(), 3);
+        assert_eq!(&bytes[..3], b"abc");
+        b.input(40, ip, &retry).unwrap();
+        assert_eq!(b.read(child, &mut bytes), Err(Error::WouldBlock.into()));
     }
 }
 
@@ -1298,6 +1303,125 @@ fn fast_open_mss_only_wire_learning_does_not_create_or_extend_credentials() {
                     let syn = wire::parse(syn.0, &syn.1).unwrap();
                     assert!(syn.payload.is_empty());
                     assert_eq!(syn.options.fast_open, Some(wire::FastOpenCookie::request()));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fast_open_disabled_listener_recognized_options_only_fallback() {
+    for v6 in [false, true] {
+        for service in [false, true] {
+            for sequence in [0, u32::MAX] {
+                let (local, remote) = addresses(v6, 40000);
+                let cookie = crate::fast_open::issue(&[2; 32], remote.ip(), local.ip(), 0);
+                let mut valid = vec![34, 10];
+                valid.extend_from_slice(cookie.as_bytes());
+                valid.extend_from_slice(&[1, 1]);
+                for (fo, recognized) in [
+                    (valid.as_slice(), true),
+                    (&[34, 2, 1, 1][..], true), // Cookie request is recognized too.
+                    (&[][..], false),
+                    (&[254, 4, 0xf9, 0x89][..], false), // FOEXP is not implemented.
+                    (&[34, 3, 0, 1][..], false),        // Bounded invalid option.
+                    (&[34, 2, 34, 2][..], false),       // Duplicate option ignored by wire.
+                ] {
+                    let config = EndpointConfig {
+                        max_connections: 16,
+                        max_listeners: 2,
+                        connection: ConnectionConfig {
+                            sack: true,
+                            timestamps: true,
+                            ..ConnectionConfig::default()
+                        },
+                        ..EndpointConfig::default()
+                    };
+                    let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+                    let listener = b.listen(remote, 8).unwrap();
+                    if service {
+                        b.enable_fast_open().unwrap(); // Limit remains zero.
+                    }
+                    let ip = IpMetadata {
+                        source: local.ip(),
+                        destination: remote.ip(),
+                    };
+                    // Keep ordinary SYN-data controls out of this policy regression.
+                    let controls = if recognized {
+                        wire::FIN | wire::PSH | wire::URG
+                    } else {
+                        0
+                    };
+                    let header = wire::Header {
+                        source_port: local.port(),
+                        destination_port: remote.port(),
+                        sequence,
+                        acknowledgment: 0,
+                        flags: wire::SYN | controls,
+                        window: 8192,
+                        urgent_pointer: if recognized { 3 } else { 0 },
+                    };
+                    let mut options = vec![
+                        2, 4, 2, 24, 3, 3, 2, 1, 4, 2, 1, 1, 8, 10, 0, 0, 0, 7, 0, 0, 0, 0, 1, 1,
+                    ];
+                    // Encode padding first: output rightly rejects malformed/duplicate TFO.
+                    let fo_start = 20 + options.len();
+                    options.resize(options.len() + fo.len(), 1);
+                    let mut bytes = [0; 2048];
+                    let n = wire::encode(ip, header, &options, b"abc", &mut bytes).unwrap();
+                    bytes[fo_start..fo_start + fo.len()].copy_from_slice(fo);
+                    bytes[16..18].fill(0);
+                    let checksum = wire::checksum(ip, &bytes[..n]).unwrap();
+                    bytes[16..18].copy_from_slice(&checksum.to_be_bytes());
+                    assert_eq!(
+                        wire::parse(ip, &bytes[..n])
+                            .unwrap()
+                            .options
+                            .fast_open
+                            .is_some(),
+                        recognized
+                    );
+                    b.input(0, ip, &bytes[..n]).unwrap();
+                    assert!(b.accept(listener).is_err());
+                    let tx = b.poll_transmit(10, &mut bytes, 64).unwrap().packet.unwrap();
+                    let child = tx.connection.unwrap();
+                    let reply = wire::parse(tx.ip, &bytes[..tx.len]).unwrap();
+                    let next = sequence.wrapping_add(if recognized { 1 } else { 4 });
+                    assert_eq!(reply.header.acknowledgment, next);
+                    assert!(reply.options.fast_open.is_none()); // Disabled listeners issue no cookies.
+                    assert!(reply.options.sack_permitted);
+                    assert!(reply.options.window_scale.is_some());
+                    let (ts, echo) = reply.options.timestamps.unwrap();
+                    assert_eq!(echo, 7);
+                    assert_eq!(b.read(child, &mut [0; 8]), Err(Error::WouldBlock.into()));
+                    assert_eq!(b.readable_bytes(child).unwrap(), 0);
+                    assert_eq!(b.urgent_remaining(child).unwrap(), 0);
+                    let ack = wire::Header {
+                        sequence: next,
+                        acknowledgment: reply.header.sequence.wrapping_add(1),
+                        flags: wire::ACK,
+                        urgent_pointer: 0,
+                        ..header
+                    };
+                    let mut timestamps = [1, 1, 8, 10, 0, 0, 0, 8, 0, 0, 0, 0];
+                    timestamps[8..].copy_from_slice(&ts.to_be_bytes());
+                    let n = wire::encode(ip, ack, &timestamps, &[], &mut bytes).unwrap();
+                    b.input(20, ip, &bytes[..n]).unwrap();
+                    assert_eq!(b.accept(listener).unwrap(), child);
+                    assert_eq!(b.state(child).unwrap(), State::Established); // No rejected FIN.
+                    if recognized {
+                        assert_eq!(b.read(child, &mut bytes), Err(Error::WouldBlock.into()));
+                        let n = wire::encode(ip, ack, &timestamps, b"abc", &mut bytes).unwrap();
+                        let retry = bytes[..n].to_vec();
+                        b.input(30, ip, &retry).unwrap();
+                        assert_eq!(b.read(child, &mut bytes), Ok(3));
+                        assert_eq!(&bytes[..3], b"abc");
+                        b.input(40, ip, &retry).unwrap();
+                        assert_eq!(b.read(child, &mut bytes), Err(Error::WouldBlock.into()));
+                    } else {
+                        assert_eq!(b.read(child, &mut bytes), Ok(3));
+                        assert_eq!(&bytes[..3], b"abc");
+                    }
                 }
             }
         }

@@ -4139,7 +4139,21 @@ impl Connection {
                 return Ok(());
             }
             self.accepted_metadata = true;
-            self.learn_syn(segment);
+            // RFC 7413 §4.2.2 also governs simultaneous open. An outgoing
+            // cookie is not receive authorization; normal SYN-ACK data is allowed.
+            if !valid_ack && segment.options.fast_open.is_some() {
+                let mut header = segment.header;
+                header.flags &= !(FIN | PSH | URG);
+                header.urgent_pointer = 0;
+                self.learn_syn(&Segment {
+                    header,
+                    options: segment.options,
+                    raw_options: segment.raw_options,
+                    payload: &[],
+                });
+            } else {
+                self.learn_syn(segment);
+            }
             self.last_received = now;
             if valid_ack {
                 self.accept_ack(
