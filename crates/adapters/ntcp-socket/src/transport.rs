@@ -23,9 +23,18 @@ pub(crate) fn transport_option(info: ntcp::TransportInfo, option: i32) -> Result
             "TCP_INFO segment counts: bounded transport ledger invalid",
         ));
     }
+    if !info.delivered_segments_valid {
+        return Err(unsupported(
+            "TCP_INFO delivered segments: metric unavailable",
+        ));
+    }
+    if info.send_window_scale > 14 || info.receive_window_scale > 14 {
+        return Err(EIO);
+    }
     if info.mss == 0 {
         return Err(EIO);
     }
+    put(192, info.delivered_segments);
     put(8, info.rto_us);
     put(16, info.mss as u64);
     put(24, info.unacked as u64);
@@ -45,6 +54,14 @@ pub(crate) fn transport_option(info: ntcp::TransportInfo, option: i32) -> Result
         (184, info.sndbuf_limited_us),
     ] {
         bytes[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
+    }
+    bytes[5] = u8::from(info.timestamps_negotiated)
+        | (u8::from(info.sack_negotiated) << 1)
+        | (u8::from(info.window_scaling_negotiated) << 2)
+        | (u8::from(info.ecn_negotiated) << 3)
+        | (u8::from(info.syn_data_acked) << 5);
+    if info.window_scaling_negotiated {
+        bytes[6] = info.send_window_scale | (info.receive_window_scale << 4);
     }
     bytes[0] = match info.state {
         State::Established => 1,
@@ -75,6 +92,98 @@ pub(crate) fn transport_option(info: ntcp::TransportInfo, option: i32) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn linux_info_handshake_evidence_not_configuration_or_tfo_attempt() {
+        use ntcp::wire::{self, ACK, ECE, SYN};
+        use ntcp::{ConnectionConfig, Endpoint, EndpointConfig};
+
+        for negotiated in [false, true] {
+            for ack_payload in [false, true] {
+                let mut endpoint = Endpoint::new(
+                    EndpointConfig {
+                        connection: ConnectionConfig {
+                            timestamps: true,
+                            sack: true,
+                            ecn: true,
+                            receive_capacity: 1 << 20,
+                            ..ConnectionConfig::default()
+                        },
+                        ..EndpointConfig::default()
+                    },
+                    [1; 32],
+                    0,
+                    |_| true,
+                )
+                .unwrap();
+                endpoint.enable_fast_open().unwrap();
+                // First handshake obtains a cookie; second really sends SYN data.
+                for attempt in 0..2 {
+                    let now = attempt * 100_000;
+                    let (id, accepted) = endpoint
+                        .connect_fast_open(
+                            now,
+                            format!("192.0.2.1:{}", 1000 + attempt).parse().unwrap(),
+                            "192.0.2.2:2000".parse().unwrap(),
+                            &[42; 100],
+                        )
+                        .unwrap();
+                    assert_eq!(accepted, if attempt == 0 { 0 } else { 100 });
+                    let before = transport_option(endpoint.transport_info(id).unwrap(), 1).unwrap();
+                    assert_eq!(&before[5..7], &[0, 0]);
+                    let mut out = [0; 2048];
+                    let tx = endpoint
+                        .poll_transmit(now, &mut out, 16)
+                        .unwrap()
+                        .packet
+                        .unwrap();
+                    let syn = wire::parse(tx.ip, &out[..tx.len]).unwrap();
+                    assert_eq!(syn.payload.len(), accepted);
+                    let mut options = vec![34, 10, 7, 7, 7, 7, 7, 7, 7, 7];
+                    if negotiated {
+                        options.extend_from_slice(&[4, 2, 3, 3, 3, 1, 8, 10]);
+                        options.extend_from_slice(&123u32.to_be_bytes());
+                        options.extend_from_slice(&syn.options.timestamps.unwrap().0.to_be_bytes());
+                    }
+                    while !options.len().is_multiple_of(4) {
+                        options.push(1);
+                    }
+                    let ip = ntcp::IpMetadata {
+                        source: tx.ip.destination,
+                        destination: tx.ip.source,
+                    };
+                    let header = wire::Header {
+                        source_port: syn.header.destination_port,
+                        destination_port: syn.header.source_port,
+                        sequence: 100,
+                        acknowledgment: syn
+                            .header
+                            .sequence
+                            .wrapping_add(1 + if ack_payload { accepted as u32 } else { 0 }),
+                        flags: SYN | ACK | if negotiated { ECE } else { 0 },
+                        window: 32000,
+                        urgent_pointer: 0,
+                    };
+                    let local_scale = syn.options.window_scale.unwrap();
+                    let mut input = [0; 128];
+                    let len = wire::encode(ip, header, &options, &[], &mut input).unwrap();
+                    endpoint.input(now + 20_000, ip, &input[..len]).unwrap();
+                    let info = endpoint.transport_info(id).unwrap();
+                    let bytes = transport_option(info, 1).unwrap();
+                    assert_eq!(
+                        bytes[5],
+                        if negotiated { 15 } else { 0 }
+                            | if attempt == 1 && ack_payload { 32 } else { 0 }
+                    );
+                    assert_eq!(bytes[6], if negotiated { 3 | local_scale << 4 } else { 0 });
+                    assert_eq!(&bytes[68..72], &20_000u32.to_ne_bytes());
+                    assert_eq!(&bytes[192..196], &1u32.to_ne_bytes());
+                    // Drain the handshake ACK before creating another connection.
+                    endpoint.poll_transmit(now + 20_000, &mut out, 16).unwrap();
+                }
+            }
+        }
+    }
+
     #[test]
     fn linux_info_ecn_epoch_exit_reports_open() {
         use ntcp::wire::{self, ACK, ECE, SYN};
@@ -208,6 +317,15 @@ mod tests {
             ecn_response: false,
             loss: false,
             ledger_valid: true,
+            timestamps_negotiated: true,
+            sack_negotiated: true,
+            window_scaling_negotiated: true,
+            send_window_scale: 3,
+            receive_window_scale: 14,
+            ecn_negotiated: true,
+            syn_data_acked: true,
+            delivered_segments: 0x12345678,
+            delivered_segments_valid: true,
             unacked: 3,
             sacked: 1,
             lost: 1,
@@ -267,6 +385,7 @@ mod tests {
             (68, 12000),
             (80, 10),
             (144, 4000),
+            (192, 0x12345678),
         ] {
             assert_eq!(&bytes[offset..offset + 4], &value.to_ne_bytes());
         }
@@ -277,5 +396,58 @@ mod tests {
         ] {
             assert_eq!(&bytes[offset..offset + 8], &value.to_ne_bytes());
         }
+        assert_eq!(bytes[5], 1 | 2 | 4 | 8 | 32);
+        assert_eq!(bytes[6], 0xe3);
+        let supported = [
+            0..2,
+            5..7,
+            8..12,
+            16..20,
+            24..40,
+            52..56,
+            68..84,
+            88..92,
+            144..148,
+            168..196,
+        ];
+        for (offset, byte) in bytes.iter().enumerate() {
+            if !supported.iter().any(|range| range.contains(&offset)) {
+                assert_eq!(*byte, 0, "unsupported byte {offset}");
+            }
+        }
+        let mut sample = info;
+        sample.timestamps_negotiated = false;
+        sample.sack_negotiated = false;
+        sample.window_scaling_negotiated = false;
+        sample.ecn_negotiated = false;
+        sample.syn_data_acked = false;
+        assert_eq!(&transport_option(sample, 1).unwrap()[5..7], &[0, 0]);
+        for bit in [1, 2, 4, 8, 32] {
+            let single = ntcp::TransportInfo {
+                timestamps_negotiated: bit == 1,
+                sack_negotiated: bit == 2,
+                window_scaling_negotiated: bit == 4,
+                ecn_negotiated: bit == 8,
+                syn_data_acked: bit == 32,
+                ..sample
+            };
+            assert_eq!(transport_option(single, 1).unwrap()[5], bit);
+        }
+        for count in [0, u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX] {
+            sample.delivered_segments = count;
+            assert_eq!(
+                &transport_option(sample, 1).unwrap()[192..196],
+                &(count.min(u32::MAX as u64) as u32).to_ne_bytes()
+            );
+        }
+        for (send, receive) in [(15, 0), (0, 15), (255, 255)] {
+            sample.send_window_scale = send;
+            sample.receive_window_scale = receive;
+            assert_eq!(transport_option(sample, 1).err(), Some(EIO));
+        }
+        sample = info;
+        sample.delivered_segments_valid = false;
+        assert_eq!(transport_option(sample, 1).err(), Some(error));
+        assert!(transport_option(sample, 2).unwrap().is_empty());
     }
 }

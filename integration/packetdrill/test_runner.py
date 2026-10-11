@@ -126,6 +126,28 @@ class RunnerChecks(unittest.TestCase):
         self.assertTrue(preflight('0 %{ assert tcpi_pacing_rate == 0 }%', True))
         self.assertTrue(preflight('`sysctl something`\n' + text, True))
 
+    def test_options_only_audited_masks_and_delivery_fields(self):
+        for expression in ('tcpi_delivered == 1', 'tcpi_snd_wscale == 3',
+                           'tcpi_rcv_wscale == 14',
+                           '(tcpi_options & TCPI_OPT_SYN_DATA) != 0',
+                           '(TCPI_OPT_ECN & tcpi_options) == 0',
+                           'tcpi_options & (TCPI_OPT_TIMESTAMPS | TCPI_OPT_SACK | TCPI_OPT_WSCALE)',
+                           '(tcpi_options & 47) == 15'):
+            text = '0 %{ assert ' + expression + ' }%'
+            self.assertEqual(preflight(text, True), [], expression)
+            self.assertTrue(preflight(text), expression)
+        for expression in ('tcpi_options == 0', 'tcpi_options',
+                           '(tcpi_options & 255) == 0', '(tcpi_options & -1) == 0',
+                           'tcpi_options & (1 << 4)', 'tcpi_options & tcpi_lost',
+                           '(tcpi_options >> 4) & 1', '(tcpi_options | 16) == 16',
+                           '(tcpi_options & (47 | 16)) == 0',
+                           'tcpi_options & TCPI_OPT_ECN_SEEN',
+                           'tcpi_options & TCPI_OPT_USEC_TS',
+                           'tcpi_options & TCPI_OPT_TFO_CHILD',
+                           'tcpi_delivered_ce == 0', 'tcpi_delivered_ce_bytes == 0',
+                           'tcpi_bytes_acked == 0', 'tcpi_total_retrans == 0'):
+            self.assertTrue(preflight('0 %{ assert ' + expression + ' }%', True), expression)
+
     def test_upstream_variants_preserve_wrapper_parameters(self):
         both = dict(variants(Path('basic.pkt'), True))
         self.assertEqual(set(both), {'ipv4', 'ipv6', 'ipv4-mapped-v6'})

@@ -70,11 +70,30 @@ TCP_INFO_FIELDS = {'tcpi_ca_state', 'tcpi_unacked', 'tcpi_sacked',
                    'tcpi_lost', 'tcpi_retrans', 'tcpi_reordering',
                    'tcpi_snd_cwnd', 'tcpi_snd_ssthresh', 'tcpi_rtt',
                    'tcpi_notsent_bytes', 'tcpi_last_data_recv', 'tcpi_busy_time',
-                   'tcpi_rwnd_limited', 'tcpi_sndbuf_limited'}
+                   'tcpi_rwnd_limited', 'tcpi_sndbuf_limited', 'tcpi_delivered',
+                   'tcpi_options', 'tcpi_snd_wscale', 'tcpi_rcv_wscale'}
+
+
+TCP_INFO_OPTION_BITS = {'TCPI_OPT_TIMESTAMPS': 1, 'TCPI_OPT_SACK': 2,
+                        'TCPI_OPT_WSCALE': 4, 'TCPI_OPT_ECN': 8,
+                        'TCPI_OPT_SYN_DATA': 32}
 
 
 TCP_INFO_SYMBOLS = {'TCP_CA_Open', 'TCP_CA_Disorder', 'TCP_CA_CWR',
-                    'TCP_CA_Recovery', 'TCP_CA_Loss'}
+                    'TCP_CA_Recovery', 'TCP_CA_Loss'} | TCP_INFO_OPTION_BITS.keys()
+
+
+def tcp_info_option_mask(node):
+    # Deliberately only literal/symbol OR masks, not arbitrary computation.
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value if 0 <= node.value <= 47 and node.value & ~47 == 0 else None
+    if isinstance(node, ast.Name):
+        return TCP_INFO_OPTION_BITS.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        left, right = tcp_info_option_mask(node.left), tcp_info_option_mask(node.right)
+        if left is not None and right is not None:
+            return left | right
+    return None
 
 
 def tcp_info_only(text):
@@ -93,7 +112,15 @@ def tcp_info_only(text):
             return False
         if not tree.body or any(not isinstance(node, ast.Assert) for node in tree.body):
             return False
+        parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
         for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == 'tcpi_options':
+                parent = parents[node]
+                if not isinstance(parent, ast.BinOp) or not isinstance(parent.op, ast.BitAnd):
+                    return False
+                mask = parent.right if parent.left is node else parent.left
+                if tcp_info_option_mask(mask) is None:
+                    return False
             if not isinstance(node, allowed):
                 return False
             if isinstance(node, ast.Name) and node.id not in TCP_INFO_FIELDS | TCP_INFO_SYMBOLS:
