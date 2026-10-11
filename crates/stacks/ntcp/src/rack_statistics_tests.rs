@@ -214,15 +214,15 @@ fn statistics_fin_credit_follows_the_credited_packet_not_an_uncredited_old_copy(
         rack.rto(1000, Seq(0), Some(100));
         scoreboard.clear();
         rack.transmit(Seq(0), Seq(10), 1100, true);
-        assert!(rack.intervals[0].packet_includes_fin); // Selection cannot change attribution.
+        assert!(rack.intervals[0].stats_flag(PACKET_INCLUDES_FIN)); // Selection cannot change attribution.
         let token = rack.departure_selection().unwrap();
         assert!(!rack.commit_departure(token, Seq(0), Seq(11), 1200));
-        assert!(rack.intervals[0].packet_includes_fin);
+        assert!(rack.intervals[0].stats_flag(PACKET_INCLUDES_FIN));
         assert!(rack.commit_departure(token, Seq(0), Seq(10), 1200)); // No FIN in this copy.
         sack(&mut rack, &mut scoreboard, 0, 10, 1300, &[(0, 10)]);
         assert_eq!(rack.delivered_segments, 1);
         assert_eq!(
-            rack.intervals[0].packet_includes_fin,
+            rack.intervals[0].stats_flag(PACKET_INCLUDES_FIN),
             credited_before_data_only_replacement
         );
         rack.rto(2000, Seq(0), Some(100));
@@ -235,5 +235,64 @@ fn statistics_fin_credit_follows_the_credited_packet_not_an_uncredited_old_copy(
         );
         sack(&mut rack, &mut scoreboard, 10, 10, 2200, &[]);
         assert_eq!(rack.delivered_segments, 1);
+    }
+}
+
+#[test]
+fn statistics_interval_fits_original_allocation_budget() {
+    let size = core::mem::size_of::<Interval>();
+    assert!(size <= 64, "Interval grew to {size} bytes");
+    assert_eq!(Rack::storage_bytes(400_000), Some(400_002 * size));
+    assert!(Rack::storage_bytes(400_000).unwrap() <= 25_600_128);
+}
+
+#[test]
+fn statistics_flags_split_and_update_independently() {
+    for base in [Seq(0), Seq(u32::MAX - 5)] {
+        for flags in 0..8 {
+            let mut rack = Rack::with_capacity(2).unwrap();
+            commit(&mut rack, base, base.wrapping_add(10), 10, false);
+            rack.intervals[0].stats_flags = flags;
+            let original = rack.intervals[0];
+            assert!(rack.split(base.wrapping_add(5)));
+            assert_eq!(
+                rack.intervals[0],
+                Interval {
+                    end: base.wrapping_add(5),
+                    ..original
+                }
+            );
+            assert_eq!(
+                rack.intervals[1],
+                Interval {
+                    start: base.wrapping_add(5),
+                    ..original
+                }
+            );
+            for bit in [PACKET_DELIVERED, PACKET_INCLUDES_FIN, SYN_PAYLOAD] {
+                assert_eq!(original.stats_flag(bit), flags & bit != 0);
+                for index in 0..2 {
+                    let before = rack.intervals[index];
+                    let sibling = rack.intervals[1 - index];
+                    for value in [true, false] {
+                        rack.intervals[index].set_stats_flag(bit, value);
+                        assert_eq!(rack.intervals[index].stats_flag(bit), value);
+                        assert_eq!(
+                            rack.intervals[index],
+                            Interval {
+                                stats_flags: if value {
+                                    before.stats_flags | bit
+                                } else {
+                                    before.stats_flags & !bit
+                                },
+                                ..before
+                            }
+                        );
+                        assert_eq!(rack.intervals[1 - index], sibling);
+                    }
+                    rack.intervals[index] = before;
+                }
+            }
+        }
     }
 }

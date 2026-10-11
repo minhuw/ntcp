@@ -43,18 +43,35 @@ struct Interval {
     original_retransmitted: bool,
     // One-shot byte delivery attribution is independent of transmission state.
     delivered: bool,
-    // Independent of byte/PRR delivery: survives RTO SACK reneging.
-    packet_delivered: bool,
-    // Current accepted packet carries FIN; once credited, retain whether that
-    // credit already represented FIN even when a later copy replaces it.
-    packet_includes_fin: bool,
-    syn_payload: bool,
+    // Compact statistics only; leave byte delivery and recovery independent.
+    stats_flags: u8,
     sacked: bool,
     original_lost: bool,
     needs_retransmit: bool,
     // This committed retransmission copy has not shared an extra loss response.
     // Splits copy the marker; only successful retransmit commits renew it.
     loss_response_pending: bool,
+}
+
+// Independent of byte/PRR delivery: survives RTO SACK reneging.
+const PACKET_DELIVERED: u8 = 1 << 0;
+// Current accepted packet carries FIN; once credited, retain whether that
+// credit already represented FIN even when a later copy replaces it.
+const PACKET_INCLUDES_FIN: u8 = 1 << 1;
+const SYN_PAYLOAD: u8 = 1 << 2;
+
+impl Interval {
+    fn stats_flag(&self, bit: u8) -> bool {
+        self.stats_flags & bit != 0
+    }
+
+    fn set_stats_flag(&mut self, bit: u8, value: bool) {
+        if value {
+            self.stats_flags |= bit;
+        } else {
+            self.stats_flags &= !bit;
+        }
+    }
 }
 
 // Scoped to one Rack instance by the owning connection's generation. Never
@@ -327,7 +344,10 @@ impl Rack {
     pub(crate) fn trim_cumulative(&mut self, ack: Seq) {
         self.intervals.retain_mut(|r| {
             if !after(r.end, ack) {
-                if !r.packet_delivered && r.end == r.transmission_end && !r.syn_payload {
+                if !r.stats_flag(PACKET_DELIVERED)
+                    && r.end == r.transmission_end
+                    && !r.stats_flag(SYN_PAYLOAD)
+                {
                     self.delivered_segments_valid = false;
                 }
                 return false;
@@ -479,10 +499,10 @@ impl Rack {
         let mut uncounted = false;
         for r in &mut self.intervals {
             if !after(start, r.start) && !after(r.end, end) {
-                counted |= r.packet_delivered;
-                uncounted |= !r.packet_delivered;
-                if !r.packet_delivered {
-                    r.packet_includes_fin = false;
+                counted |= r.stats_flag(PACKET_DELIVERED);
+                uncounted |= !r.stats_flag(PACKET_DELIVERED);
+                if !r.stats_flag(PACKET_DELIVERED) {
+                    r.set_stats_flag(PACKET_INCLUDES_FIN, false);
                 }
                 r.sent = now;
                 // Even a sub-TS-tick delay separates encoding from departure.
@@ -543,7 +563,7 @@ impl Rack {
             for r in &self.intervals {
                 if after(end, r.start)
                     && after(r.end, start)
-                    && !r.packet_delivered
+                    && !r.stats_flag(PACKET_DELIVERED)
                     && ((after(start, r.transmission_start) && after(start, low))
                         || after(r.transmission_end, end))
                     && let Some(selection) = &mut self.departure_selection
@@ -571,7 +591,7 @@ impl Rack {
             }
             for r in &mut self.intervals {
                 if !after(start, r.start) && !after(r.end, end) {
-                    r.syn_payload = false;
+                    r.set_stats_flag(SYN_PAYLOAD, false);
                     r.transmission_start = start;
                     r.transmission_end = end;
                     r.sent = now;
@@ -602,9 +622,7 @@ impl Rack {
                 departure_committed: false,
                 original_retransmitted: false,
                 delivered: false,
-                packet_delivered: false,
-                packet_includes_fin: false,
-                syn_payload: false,
+                stats_flags: 0,
                 sacked: false,
                 original_lost: false,
                 needs_retransmit: false,
@@ -620,8 +638,9 @@ impl Rack {
             if !after(start, r.start) && !after(r.end, end) {
                 // Credited data+FIN already represents this control. Adding a
                 // separate/new FIN to data-only credit is genuinely mixed.
-                self.delivered_segments_valid &= !r.packet_delivered || r.packet_includes_fin;
-                r.packet_includes_fin = true;
+                self.delivered_segments_valid &=
+                    !r.stats_flag(PACKET_DELIVERED) || r.stats_flag(PACKET_INCLUDES_FIN);
+                r.set_stats_flag(PACKET_INCLUDES_FIN, true);
             }
         }
     }
@@ -631,7 +650,7 @@ impl Rack {
     pub(crate) fn record_syn_payload(&mut self, start: Seq, end: Seq) {
         for r in &mut self.intervals {
             if !after(start, r.start) && !after(r.end, end) {
-                r.syn_payload = true;
+                r.set_stats_flag(SYN_PAYLOAD, true);
             }
         }
     }
@@ -759,11 +778,18 @@ impl Rack {
                     },
                     r.transmission_end,
                 ) == 0;
-            if covered && packet_complete && r.departure_committed && !r.packet_delivered {
-                if r.end == r.transmission_end && !r.syn_payload && self.delivered_segments_valid {
+            if covered
+                && packet_complete
+                && r.departure_committed
+                && !r.stats_flag(PACKET_DELIVERED)
+            {
+                if r.end == r.transmission_end
+                    && !r.stats_flag(SYN_PAYLOAD)
+                    && self.delivered_segments_valid
+                {
                     self.delivered_segments = self.delivered_segments.saturating_add(1);
                 }
-                r.packet_delivered = true;
+                r.set_stats_flag(PACKET_DELIVERED, true);
             }
             if covered && !r.sacked {
                 if !r.delivered {
