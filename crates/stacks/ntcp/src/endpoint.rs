@@ -923,7 +923,9 @@ impl Endpoint {
             });
             let accept_data = valid && pending < limit;
             early = accept_data && !syn.payload.is_empty();
-            if syn.options.fast_open.is_some() {
+            // RFC 7413 §4.2.2 permits omission; Linux does not refresh valid cookies.
+            // This decision is independent of payload admission and pending quota.
+            if syn.options.fast_open.is_some() && (!valid || policy.refresh_valid_cookie()) {
                 fast_open_response =
                     policy.issue(&self.secret, tuple.local.ip(), tuple.remote.ip(), epoch);
             }

@@ -49,28 +49,49 @@ fn addresses(port: u16) -> (SocketAddr, SocketAddr) {
 
 fn syn(endpoint: &mut Endpoint, port: u16, client_port: u16, cookie: FastOpenCookie) {
     let (local, remote) = addresses(port);
+    send_syn(
+        endpoint,
+        local,
+        SocketAddr::new(remote.ip(), client_port),
+        Some(cookie),
+        b"early",
+    );
+}
+
+fn send_syn(
+    endpoint: &mut Endpoint,
+    local: SocketAddr,
+    remote: SocketAddr,
+    cookie: Option<FastOpenCookie>,
+    payload: &[u8],
+) {
     let ip = IpMetadata {
         source: remote.ip(),
         destination: local.ip(),
     };
     let mut options = [1; 20];
-    let n = cookie.as_bytes().len();
-    options[..2].copy_from_slice(&[34, (n + 2) as u8]);
-    options[2..2 + n].copy_from_slice(cookie.as_bytes());
+    let option_len = if let Some(cookie) = cookie {
+        let n = cookie.as_bytes().len();
+        options[..2].copy_from_slice(&[34, (n + 2) as u8]);
+        options[2..2 + n].copy_from_slice(cookie.as_bytes());
+        (n + 2).next_multiple_of(4)
+    } else {
+        0
+    };
     let mut bytes = [0; 128];
     let n = wire::encode(
         ip,
         wire::Header {
-            source_port: client_port,
-            destination_port: port,
+            source_port: remote.port(),
+            destination_port: local.port(),
             sequence: 100,
             acknowledgment: 0,
             flags: wire::SYN,
             window: 8192,
             urgent_pointer: 0,
         },
-        &options[..(n + 2).next_multiple_of(4)],
-        b"early",
+        &options[..option_len],
+        payload,
         &mut bytes,
     )
     .unwrap();
@@ -135,6 +156,76 @@ fn setters_do_not_enable_service_or_listeners_and_reject_stale_handles() {
     }
 }
 
+#[test]
+fn response_cookie_does_not_change_authentication_or_quota() {
+    for (policy, refresh_valid) in [
+        (FastOpenCookiePolicy::HmacSha256, true),
+        #[cfg(feature = "tfo-linux-cookie")]
+        (linux::policy(), false),
+    ] {
+        for (local, remote) in [
+            ("192.168.0.1:8080", "192.0.2.1:40000"),
+            ("[fd3d:0a0b:17d6::1]:8080", "[fd3d:fa7b:d17d::1]:40000"),
+        ] {
+            let local: SocketAddr = local.parse().unwrap();
+            let remote: SocketAddr = remote.parse().unwrap();
+            let issued = policy.issue(&[42; 32], local.ip(), remote.ip(), 0).unwrap();
+            let mut bad = [0; 8];
+            bad.copy_from_slice(issued.as_bytes());
+            bad[0] ^= 1;
+            for incoming in [
+                None,
+                Some(FastOpenCookie::request()),
+                Some(FastOpenCookie::new(&bad).unwrap()),
+                Some(issued),
+            ] {
+                for payload in [b"".as_slice(), b"early"] {
+                    for full in [false, true] {
+                        let mut endpoint = endpoint();
+                        endpoint.enable_fast_open().unwrap();
+                        endpoint.set_fast_open_cookie_policy(policy.clone());
+                        let listener = endpoint.listen(local, 8).unwrap();
+                        endpoint.set_listener_fast_open(listener, 1).unwrap();
+                        if full {
+                            let mut other = remote;
+                            other.set_port(40001);
+                            send_syn(&mut endpoint, local, other, Some(issued), b"early");
+                            let (child, _, ack) = response(&mut endpoint);
+                            assert_eq!(ack, 106);
+                            assert_eq!(endpoint.accept(listener).unwrap(), child);
+                            // Accept/read does not release the unacknowledged TFO quota.
+                            assert_eq!(endpoint.read(child, &mut [0; 5]).unwrap(), 5);
+                        }
+                        send_syn(&mut endpoint, local, remote, incoming, payload);
+                        let (child, cookie, ack) = response(&mut endpoint);
+                        let valid = incoming == Some(issued);
+                        let early = valid && !full && !payload.is_empty();
+                        let expected = if incoming.is_some() && (!valid || refresh_valid) {
+                            Some(issued)
+                        } else {
+                            None
+                        };
+                        assert_eq!(cookie, expected);
+                        assert_eq!(ack, if early { 106 } else { 101 });
+                        assert_eq!(
+                            endpoint.readable_bytes(child).unwrap(),
+                            if early { 5 } else { 0 }
+                        );
+                        if early {
+                            assert_eq!(endpoint.accept(listener).unwrap(), child);
+                            let mut data = [0; 5];
+                            assert_eq!(endpoint.read(child, &mut data).unwrap(), 5);
+                            assert_eq!(&data, b"early");
+                        } else {
+                            assert!(endpoint.accept(listener).is_err());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(feature = "tfo-linux-cookie")]
 mod linux {
     use super::*;
@@ -148,7 +239,7 @@ mod linux {
         ])
     }
 
-    fn policy() -> FastOpenCookiePolicy {
+    pub(super) fn policy() -> FastOpenCookiePolicy {
         FastOpenCookiePolicy::LinuxSipHash24(key())
     }
 
@@ -267,7 +358,7 @@ mod linux {
         let hmac = cookie(&FastOpenCookiePolicy::HmacSha256);
         syn(&mut endpoint, 8080, 40000, linux);
         assert!(endpoint.accept(a).is_ok());
-        assert_eq!(response(&mut endpoint).1, Some(linux));
+        assert_eq!(response(&mut endpoint).1, None);
         syn(&mut endpoint, 8081, 40000, linux);
         assert!(endpoint.accept(b).is_err());
         let (_, issued, ack) = response(&mut endpoint);
@@ -280,14 +371,14 @@ mod linux {
             .unwrap();
         syn(&mut endpoint, 8081, 40002, linux);
         assert!(endpoint.accept(b).is_ok());
-        assert_eq!(response(&mut endpoint).1, Some(linux));
+        assert_eq!(response(&mut endpoint).1, None);
         endpoint
             .set_listener_fast_open_cookie_policy(a, Some(policy()))
             .unwrap();
         endpoint.set_fast_open_cookie_policy(FastOpenCookiePolicy::HmacSha256);
         syn(&mut endpoint, 8080, 40003, linux);
         assert!(endpoint.accept(a).is_ok());
-        assert_eq!(response(&mut endpoint).1, Some(linux));
+        assert_eq!(response(&mut endpoint).1, None);
         syn(&mut endpoint, 8081, 40003, linux);
         assert!(endpoint.accept(b).is_err());
         assert_eq!(response(&mut endpoint).1, Some(hmac));
@@ -313,6 +404,75 @@ mod linux {
         syn(&mut other, 8080, 40000, linux);
         assert!(other.accept(listener).is_err());
         assert_eq!(response(&mut other).1, Some(hmac));
+    }
+
+    #[test]
+    fn rotation_preserves_issued_responses_and_retransmission_omission() {
+        let old = cookie(&policy());
+        for incoming in [
+            FastOpenCookie::request(),
+            FastOpenCookie::new(&[0; 8]).unwrap(),
+            old,
+        ] {
+            let mut endpoint = endpoint();
+            endpoint.enable_fast_open().unwrap();
+            endpoint.enable_output_reservations().unwrap();
+            let listener = endpoint.listen(addresses(8080).0, 8).unwrap();
+            endpoint.set_listener_fast_open(listener, 1).unwrap();
+            endpoint.set_fast_open_cookie_policy(policy());
+            syn(&mut endpoint, 8080, 40000, incoming);
+            endpoint.set_fast_open_cookie_policy(FastOpenCookiePolicy::HmacSha256);
+            let mut bytes = [0; 2048];
+            let (output, attempt) = endpoint.poll_reserved_transmit(0, &mut bytes, 64).unwrap();
+            let tx = output.packet.unwrap();
+            let child = tx.connection.unwrap();
+            let first = bytes[..tx.len].to_vec();
+            let segment = wire::parse(tx.ip, &first).unwrap();
+            assert_eq!(
+                segment.options.fast_open,
+                if incoming == old { None } else { Some(old) }
+            );
+            assert_eq!(
+                segment.header.acknowledgment,
+                if incoming == old { 106 } else { 101 }
+            );
+            endpoint.set_fast_open_cookie_policy(FastOpenCookiePolicy::LinuxSipHash24(
+                LinuxSipHash24Key::new([9; 16]),
+            ));
+            assert_eq!(&bytes[..tx.len], first.as_slice());
+            assert!(endpoint.reject_unsubmitted(attempt.unwrap()).unwrap());
+            let (output, attempt) = endpoint
+                .poll_reserved_transmit_for(0, child, &mut bytes, 64)
+                .unwrap();
+            let tx = output.packet.unwrap();
+            let retry = wire::parse(tx.ip, &bytes[..tx.len]).unwrap();
+            assert_eq!(retry.header, segment.header);
+            assert_eq!(retry.options, segment.options);
+            assert_eq!(retry.payload, segment.payload);
+            assert!(endpoint.accept_transmit(0, attempt.unwrap()).unwrap());
+            // Existing children do not reauthenticate or issue under the new policy.
+            // Retransmitted SYN-ACKs omit FO under the existing RFC 7413 fallback.
+            syn(&mut endpoint, 8080, 40000, incoming);
+            let (retry_child, cookie, ack) = response(&mut endpoint);
+            assert_eq!(retry_child, child);
+            assert_eq!(cookie, None);
+            assert_eq!(ack, segment.header.acknowledgment);
+            let deadline = endpoint.next_deadline().unwrap();
+            endpoint.on_timeout(deadline, 64).unwrap();
+            let tx = endpoint
+                .poll_transmit(deadline, &mut bytes, 64)
+                .unwrap()
+                .packet
+                .unwrap();
+            let retry = wire::parse(tx.ip, &bytes[..tx.len]).unwrap();
+            assert_eq!(tx.connection, Some(child));
+            assert_eq!(retry.options.fast_open, None);
+            assert_eq!(retry.header.acknowledgment, segment.header.acknowledgment);
+            assert_eq!(
+                endpoint.readable_bytes(child).unwrap(),
+                if incoming == old { 5 } else { 0 }
+            );
+        }
     }
 
     #[test]
@@ -355,7 +515,7 @@ mod linux {
                     .unwrap()
                     .options
                     .fast_open,
-                Some(old)
+                None
             );
             let original = bytes[..tx.len].to_vec();
             assert_eq!(
@@ -401,7 +561,7 @@ mod linux {
             // The accepted old child still occupies the one-child quota.
             syn(&mut endpoint, 8080, 40002, new);
             let (_, issued, ack) = response(&mut endpoint);
-            assert_eq!((issued, ack), (Some(new), 101));
+            assert_eq!((issued, ack), (None, 101));
             assert!(endpoint.accept(listener).is_err());
             endpoint.abort(child).unwrap();
             response(&mut endpoint); // Reset releases quota, not key replacement.

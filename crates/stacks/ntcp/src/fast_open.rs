@@ -60,6 +60,10 @@ impl core::fmt::Debug for LinuxSipHash24Key {
 }
 
 impl FastOpenCookiePolicy {
+    pub(crate) fn refresh_valid_cookie(&self) -> bool {
+        matches!(self, Self::HmacSha256)
+    }
+
     pub(crate) fn issue(
         &self,
         secret: &[u8; 32],
