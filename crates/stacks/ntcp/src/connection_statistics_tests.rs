@@ -317,3 +317,177 @@ fn statistics_standalone_fin_and_data_fin_are_not_double_counted() {
         }
     }
 }
+
+#[test]
+fn statistics_fin_current_replacement_not_historical_standalone() {
+    for (reserved, prefix) in [(false, 0), (true, 0), (true, 40), (true, 100)] {
+        let (mut a, _) = pair(
+            ConnectionConfig {
+                sack: false,
+                tlp: false,
+                nagle: false,
+                ..config(8192, 1000)
+            },
+            0,
+        );
+        a.write(&[0; 100]).unwrap();
+        output(&mut a, 100, 100, reserved);
+        a.shutdown().unwrap();
+        output(&mut a, 100, 100, reserved); // Same departure permits data+FIN RTO.
+        assert_eq!(a.fin_packet_has_payload, Some(false));
+        assert_eq!(a.transport_info().delivered_segments, 1);
+        let timeout = a.next_deadline().unwrap();
+        a.timeout(timeout).unwrap();
+        assert_eq!(
+            a.transmit_selected(timeout, &mut [0; 19], reserved),
+            Err(Error::OutputTooSmall)
+        );
+        assert_eq!(a.fin_packet_has_payload, Some(false));
+        let mut bytes = [0; 2048];
+        let n = a
+            .transmit_selected(timeout, &mut bytes, reserved)
+            .unwrap()
+            .unwrap();
+        let packet = wire::parse(ip(a.tuple), &bytes[..n]).unwrap();
+        assert_eq!(packet.payload.len(), 100);
+        assert_ne!(packet.header.flags & FIN, 0);
+        if reserved {
+            assert_eq!(a.fin_packet_has_payload, Some(false)); // Selection is not acceptance.
+            a.reject_reserved_output();
+            assert_eq!(a.fin_packet_has_payload, Some(false));
+            let mut d = a.last_departure.unwrap();
+            if prefix != 0 {
+                a.accept_reserved_output(timeout + 50, &mut d, 0, prefix, false)
+                    .unwrap();
+                assert_eq!(a.fin_packet_has_payload, Some(false)); // Prefix carries no FIN.
+            }
+            assert_eq!(
+                a.accept_reserved_output(timeout + 100, &mut d, prefix, 101, true),
+                Err(Error::InvalidArgument)
+            );
+            assert_eq!(a.fin_packet_has_payload, Some(false));
+            a.accept_reserved_output(timeout + 100, &mut d, prefix, 100 - prefix, true)
+                .unwrap();
+        }
+        assert_eq!(a.fin_packet_has_payload, Some(prefix != 100));
+        let next = a.receive.next();
+        let end = a.snd_nxt;
+        timestamp_input(&mut a, timeout + 200, next, end, ACK, None, b"");
+        assert_eq!(
+            a.transport_info().delivered_segments,
+            2 + u64::from(prefix != 0),
+            "reserved={reserved}"
+        );
+        assert!(a.transport_info().delivered_segments_valid);
+    }
+}
+
+#[test]
+fn statistics_fin_payload_credit_distinguishes_combined_from_separate_fin() {
+    for reserved in [false, true] {
+        for initially_combined in [false, true] {
+            let (mut a, _) = pair(
+                ConnectionConfig {
+                    sack: true,
+                    tlp: false,
+                    nagle: false,
+                    ..config(8192, 1000)
+                },
+                0,
+            );
+            a.write(&[0; 100]).unwrap();
+            if !initially_combined {
+                output(&mut a, 100, 100, reserved);
+            }
+            a.shutdown().unwrap();
+            output(&mut a, 100, 100, reserved);
+            rack_sack(&mut a, 200, 0, &[(0, 100)]);
+            assert_eq!(a.transport_info().delivered_segments, 2);
+            assert!(a.transport_info().delivered_segments_valid);
+            let timeout = a.next_deadline().unwrap();
+            a.timeout(timeout).unwrap();
+            let mut bytes = [0; 2048];
+            let n = a
+                .transmit_selected(timeout, &mut bytes, reserved)
+                .unwrap()
+                .unwrap();
+            let packet = wire::parse(ip(a.tuple), &bytes[..n]).unwrap();
+            assert_eq!(packet.payload.len(), 100);
+            assert_ne!(packet.header.flags & FIN, 0);
+            if reserved {
+                assert!(a.transport_info().delivered_segments_valid);
+                a.reject_reserved_output();
+                assert!(a.transport_info().delivered_segments_valid);
+                let mut d = a.last_departure.unwrap();
+                a.accept_reserved_output(timeout + 100, &mut d, 0, 100, true)
+                    .unwrap();
+            }
+            assert_eq!(
+                a.transport_info().delivered_segments_valid,
+                initially_combined
+            );
+            let next = a.receive.next();
+            let end = a.snd_nxt;
+            timestamp_input(&mut a, timeout + 200, next, end, ACK, None, b"");
+            assert_eq!(a.transport_info().delivered_segments, 2); // No extra FIN or data credit.
+            assert_eq!(
+                a.transport_info().delivered_segments_valid,
+                initially_combined
+            );
+            assert!(a.transport_info().ledger_valid);
+        }
+    }
+}
+
+#[test]
+fn statistics_combined_fin_can_be_replaced_by_accepted_standalone_fin() {
+    for reserved in [false, true] {
+        let (mut a, _) = pair(
+            ConnectionConfig {
+                sack: false,
+                tlp: false,
+                nagle: false,
+                ..config(8192, 1000)
+            },
+            0,
+        );
+        a.write(&[0; 100]).unwrap();
+        a.shutdown().unwrap();
+        output(&mut a, 100, 100, reserved);
+        assert_eq!(a.fin_packet_has_payload, Some(true));
+        let next = a.receive.next();
+        let fin = a.fin_sequence.unwrap();
+        timestamp_input(&mut a, 200, next, fin, ACK, None, b""); // Payload only.
+        assert_eq!(a.transport_info().delivered_segments, 2);
+        let timeout = a.next_deadline().unwrap();
+        a.timeout(timeout).unwrap();
+        let mut bytes = [0; 2048];
+        let n = a
+            .transmit_selected(timeout, &mut bytes, reserved)
+            .unwrap()
+            .unwrap();
+        let packet = wire::parse(ip(a.tuple), &bytes[..n]).unwrap();
+        assert!(packet.payload.is_empty());
+        assert_ne!(packet.header.flags & FIN, 0);
+        if reserved {
+            assert_eq!(a.fin_packet_has_payload, Some(true));
+            a.reject_reserved_output();
+            assert_eq!(a.fin_packet_has_payload, Some(true));
+            let mut d = a.last_departure.unwrap();
+            a.accept_reserved_output(timeout + 100, &mut d, 0, 0, true)
+                .unwrap();
+        }
+        assert_eq!(a.fin_packet_has_payload, Some(false));
+        timestamp_input(
+            &mut a,
+            timeout + 200,
+            next,
+            fin.wrapping_add(1),
+            ACK,
+            None,
+            b"",
+        );
+        assert_eq!(a.transport_info().delivered_segments, 3);
+        assert!(a.transport_info().delivered_segments_valid);
+    }
+}

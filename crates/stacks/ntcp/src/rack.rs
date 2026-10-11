@@ -45,6 +45,9 @@ struct Interval {
     delivered: bool,
     // Independent of byte/PRR delivery: survives RTO SACK reneging.
     packet_delivered: bool,
+    // Current accepted packet carries FIN; once credited, retain whether that
+    // credit already represented FIN even when a later copy replaces it.
+    packet_includes_fin: bool,
     syn_payload: bool,
     sacked: bool,
     original_lost: bool,
@@ -472,8 +475,15 @@ impl Rack {
         let left = self.split(start);
         let right = self.split(end);
         debug_assert!(left && right);
+        let mut counted = false;
+        let mut uncounted = false;
         for r in &mut self.intervals {
             if !after(start, r.start) && !after(r.end, end) {
+                counted |= r.packet_delivered;
+                uncounted |= !r.packet_delivered;
+                if !r.packet_delivered {
+                    r.packet_includes_fin = false;
+                }
                 r.sent = now;
                 // Even a sub-TS-tick delay separates encoding from departure.
                 r.timestamp_eligible &= now == selection.selected;
@@ -487,6 +497,9 @@ impl Rack {
                 }
             }
         }
+        // An envelope can contain both kinds of credit without any physical
+        // packet mixing them (GSO groups and MTU repair use this same commit).
+        self.delivered_segments_valid &= !(counted && uncounted);
         true
     }
 
@@ -527,26 +540,16 @@ impl Rack {
             // of an outstanding packet loses the earlier overlapping identity;
             // don't manufacture a packet count from the surviving byte pieces.
             let low = self.intervals.first().map_or(start, |r| r.start);
-            let mut counted = false;
-            let mut uncounted = false;
             for r in &self.intervals {
-                if after(end, r.start) && after(r.end, start) {
-                    counted |= r.packet_delivered;
-                    uncounted |= !r.packet_delivered;
-                    if !r.packet_delivered
-                        && ((after(start, r.transmission_start) && after(start, low))
-                            || after(r.transmission_end, end))
-                        && let Some(selection) = &mut self.departure_selection
-                    {
-                        selection.packet_layout_valid = false;
-                    }
+                if after(end, r.start)
+                    && after(r.end, start)
+                    && !r.packet_delivered
+                    && ((after(start, r.transmission_start) && after(start, low))
+                        || after(r.transmission_end, end))
+                    && let Some(selection) = &mut self.departure_selection
+                {
+                    selection.packet_layout_valid = false;
                 }
-            }
-            if counted
-                && uncounted
-                && let Some(selection) = &mut self.departure_selection
-            {
-                selection.packet_layout_valid = false;
             }
             if !self.split(start) || !self.split(end) {
                 let boundary = self.intervals.last().map_or(end, |r| r.end);
@@ -600,6 +603,7 @@ impl Rack {
                 original_retransmitted: false,
                 delivered: false,
                 packet_delivered: false,
+                packet_includes_fin: false,
                 syn_payload: false,
                 sacked: false,
                 original_lost: false,
@@ -608,6 +612,17 @@ impl Rack {
             });
         } else {
             self.abandon(end);
+        }
+    }
+
+    pub(crate) fn record_fin_payload(&mut self, start: Seq, end: Seq) {
+        for r in &mut self.intervals {
+            if !after(start, r.start) && !after(r.end, end) {
+                // Credited data+FIN already represents this control. Adding a
+                // separate/new FIN to data-only credit is genuinely mixed.
+                self.delivered_segments_valid &= !r.packet_delivered || r.packet_includes_fin;
+                r.packet_includes_fin = true;
+            }
         }
     }
 

@@ -165,3 +165,75 @@ fn statistics_abandonment_and_skipped_inference_are_sticky_and_count_saturates()
     assert!(rack.valid());
     assert!(!rack.delivered_segments_valid);
 }
+
+#[test]
+fn statistics_mixed_credit_is_checked_per_accepted_packet_not_reservation() {
+    for ends in [&[10, 20][..], &[4, 10, 20][..], &[20][..]] {
+        let fragmented = ends.len() != 1;
+        let mut rack = Rack::with_capacity(64).unwrap();
+        let mut scoreboard = Scoreboard::with_capacity(64).unwrap();
+        commit(&mut rack, Seq(0), Seq(10), 0, false);
+        commit(&mut rack, Seq(10), Seq(20), 0, false);
+        sack(&mut rack, &mut scoreboard, 0, 20, 100, &[(10, 20)]);
+        assert_eq!(rack.delivered_segments, 1);
+        rack.rto(1000, Seq(0), Some(100));
+        scoreboard.clear();
+        rack.transmit(Seq(0), Seq(20), 1100, true);
+        let token = rack.departure_selection().unwrap();
+        assert!(rack.delivered_segments_valid); // Selection alone is not evidence.
+        assert!(!rack.commit_departure(token, Seq(0), Seq(21), 1200));
+        assert!(rack.delivered_segments_valid);
+        if ends == [10, 20] {
+            assert!(rack.validate_departure_group(token, Seq(0), 10, 2, 1200));
+        }
+        let mut start = Seq(0);
+        for &end in ends {
+            assert!(rack.commit_departure(token, start, Seq(end), 1200));
+            assert_eq!(rack.delivered_segments_valid, fragmented);
+            start = Seq(end);
+        }
+        assert_eq!(sack(&mut rack, &mut scoreboard, 20, 20, 2000, &[]), 20);
+        assert_eq!(
+            rack.delivered_segments,
+            if fragmented { ends.len() as u64 } else { 1 }
+        );
+        assert!(rack.valid());
+    }
+}
+
+#[test]
+fn statistics_fin_credit_follows_the_credited_packet_not_an_uncredited_old_copy() {
+    for credited_before_data_only_replacement in [false, true] {
+        let mut rack = Rack::with_capacity(64).unwrap();
+        let mut scoreboard = Scoreboard::with_capacity(64).unwrap();
+        commit(&mut rack, Seq(0), Seq(10), 0, false);
+        rack.record_fin_payload(Seq(0), Seq(10));
+        if credited_before_data_only_replacement {
+            sack(&mut rack, &mut scoreboard, 0, 10, 100, &[(0, 10)]);
+        }
+        rack.rto(1000, Seq(0), Some(100));
+        scoreboard.clear();
+        rack.transmit(Seq(0), Seq(10), 1100, true);
+        assert!(rack.intervals[0].packet_includes_fin); // Selection cannot change attribution.
+        let token = rack.departure_selection().unwrap();
+        assert!(!rack.commit_departure(token, Seq(0), Seq(11), 1200));
+        assert!(rack.intervals[0].packet_includes_fin);
+        assert!(rack.commit_departure(token, Seq(0), Seq(10), 1200)); // No FIN in this copy.
+        sack(&mut rack, &mut scoreboard, 0, 10, 1300, &[(0, 10)]);
+        assert_eq!(rack.delivered_segments, 1);
+        assert_eq!(
+            rack.intervals[0].packet_includes_fin,
+            credited_before_data_only_replacement
+        );
+        rack.rto(2000, Seq(0), Some(100));
+        scoreboard.clear();
+        commit(&mut rack, Seq(0), Seq(10), 2100, true);
+        rack.record_fin_payload(Seq(0), Seq(10));
+        assert_eq!(
+            rack.delivered_segments_valid,
+            credited_before_data_only_replacement
+        );
+        sack(&mut rack, &mut scoreboard, 10, 10, 2200, &[]);
+        assert_eq!(rack.delivered_segments, 1);
+    }
+}

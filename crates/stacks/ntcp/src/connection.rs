@@ -558,7 +558,8 @@ pub(crate) struct Connection {
     syn_payload_sent: usize,
     syn_data_acked: bool,
     syn_delivered: bool,
-    standalone_fin_sent: bool,
+    // Current accepted FIN-bearing packet, not a historical standalone latch.
+    fin_packet_has_payload: Option<bool>,
     fin_delivered: bool,
     deferred_tfo_push: bool,
     fast_open_retry: Option<(Seq, Seq)>,
@@ -842,7 +843,7 @@ impl Connection {
             syn_payload_sent: 0,
             syn_data_acked: false,
             syn_delivered: false,
-            standalone_fin_sent: false,
+            fin_packet_has_payload: None,
             fin_delivered: false,
             deferred_tfo_push: false,
             fast_open_retry: None,
@@ -2305,6 +2306,14 @@ impl Connection {
         Ok(())
     }
 
+    fn record_fin_departure(&mut self, start: Seq, payload: usize) {
+        if payload != 0 {
+            self.rack
+                .record_fin_payload(start, start.wrapping_add(payload as u32));
+        }
+        self.fin_packet_has_payload = Some(payload != 0);
+    }
+
     pub(crate) fn accept_reserved_output(
         &mut self,
         now: Instant,
@@ -2384,7 +2393,7 @@ impl Connection {
             }
         }
         if d.fin && finished {
-            self.standalone_fin_sent |= count == 0;
+            self.record_fin_departure(Seq(d.start).wrapping_add(offset as u32), count);
             self.fin_sent_at = Some(now);
         }
         if sequence && d.rto {
@@ -5456,7 +5465,9 @@ impl Connection {
             self.syn_data_acked =
                 self.syn_payload_sent != 0 && after(ack, self.iss.wrapping_add(1));
         }
-        if self.standalone_fin_sent && self.fin_sequence.is_some_and(|fin| after(ack, fin)) {
+        if self.fin_packet_has_payload == Some(false)
+            && self.fin_sequence.is_some_and(|fin| after(ack, fin))
+        {
             self.fin_delivered = true;
         }
         if !self.sack_receive || self.handshake_pending() {
@@ -8118,7 +8129,7 @@ impl Connection {
         }
         if flags & FIN != 0 {
             if !reserve {
-                self.standalone_fin_sent |= count == 0;
+                self.record_fin_departure(seq, count);
             }
             self.fin_sent_at = Some(now);
         }
