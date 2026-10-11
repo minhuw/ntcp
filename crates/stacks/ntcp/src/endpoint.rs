@@ -1522,12 +1522,23 @@ impl Endpoint {
     }
 
     fn refresh(&mut self, index: usize) {
+        let fast_open_lifetime = self.fast_open_lifetime();
         if let Some(slot) = self.slots[index].as_mut() {
             if let Some((cookie, mss)) = slot.connection.fast_open_learned.take()
                 && let Some(service) = self.fast_open.as_mut()
             {
                 let tuple = slot.connection.tuple();
-                service.learn(self.now, tuple.local.ip(), tuple.remote.ip(), cookie, mss);
+                if let Some(cookie) = cookie {
+                    service.learn(self.now, tuple.local.ip(), tuple.remote.ip(), cookie, mss);
+                } else {
+                    service.update_mss(
+                        self.now,
+                        fast_open_lifetime,
+                        tuple.local.ip(),
+                        tuple.remote.ip(),
+                        mss,
+                    );
+                }
             }
             if slot.connection.handshake_complete() || slot.connection.state() == State::Closed {
                 slot.fast_open_owner = None;

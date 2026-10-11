@@ -1070,3 +1070,236 @@ fn fast_open_syn_push_is_explicit_for_both_families_and_output_paths() {
         }
     }
 }
+
+// Build ingress bytes directly: the output encoder rightly rejects invalid FO lengths.
+fn cache_reply(
+    syn: &(IpMetadata, Vec<u8>),
+    mss: u16,
+    cookie: Option<&[u8]>,
+) -> (IpMetadata, Vec<u8>) {
+    let sent = wire::parse(syn.0, &syn.1).unwrap();
+    let ip = IpMetadata {
+        source: syn.0.destination,
+        destination: syn.0.source,
+    };
+    let mut options = vec![2, 4, (mss >> 8) as u8, mss as u8];
+    if let Some(cookie) = cookie {
+        options.extend_from_slice(&[34, (cookie.len() + 2) as u8]);
+        options.extend_from_slice(cookie);
+    }
+    let mut bytes = vec![0; 64];
+    let len = wire::encode(
+        ip,
+        wire::Header {
+            source_port: sent.header.destination_port,
+            destination_port: sent.header.source_port,
+            sequence: 123,
+            acknowledgment: sent
+                .header
+                .sequence
+                .wrapping_add(1 + sent.payload.len() as u32),
+            flags: wire::SYN | wire::ACK,
+            window: 8192,
+            urgent_pointer: 0,
+        },
+        &vec![1; options.len()],
+        &[],
+        &mut bytes,
+    )
+    .unwrap();
+    bytes.truncate(len);
+    bytes[20..20 + options.len()].copy_from_slice(&options);
+    repair_cache_checksum(ip, &mut bytes);
+    (ip, bytes)
+}
+
+fn repair_cache_checksum(ip: IpMetadata, bytes: &mut [u8]) {
+    bytes[16..18].fill(0);
+    let sum = wire::checksum(ip, bytes).unwrap();
+    bytes[16..18].copy_from_slice(&sum.to_be_bytes());
+}
+
+#[test]
+fn fast_open_validated_mss_without_cookie_replacement() {
+    for v6 in [false, true] {
+        for explicit in [false, true] {
+            for cookie in [
+                Some(&[0x11, 0x22][..]),
+                None,
+                Some(&[][..]),
+                Some(&[1; 3][..]),
+                Some(&[1; 18][..]),
+                Some(&[2; 16][..]),
+            ] {
+                let mut cfg = EndpointConfig::default();
+                cfg.connection.mss = 1460;
+                let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+                a.enable_fast_open().unwrap();
+                let mut expected_cookie = wire::FastOpenCookie::new(&[0; 4]).unwrap();
+                for (round, expected) in [(0, 0), (1, 1000), (2, 900)] {
+                    let now = round * 10;
+                    let (local, remote) = addresses(v6, 40000 + round as u16);
+                    let (id, accepted) = if explicit {
+                        a.connect_fast_open_with_buffer_capacities(
+                            now, local, remote, &[7; 1000], 8192, 8192,
+                        )
+                    } else {
+                        a.connect_fast_open(now, local, remote, &[7; 1000])
+                    }
+                    .unwrap();
+                    assert_eq!(accepted, expected, "round {round}, cookie {cookie:?}");
+                    assert_eq!(a.transport_info(id).unwrap().send_used, expected);
+                    let syn = packet(&mut a, now);
+                    let parsed = wire::parse(syn.0, &syn.1).unwrap();
+                    assert_eq!(parsed.payload, &[7; 1000][..expected]);
+                    if round != 0 {
+                        assert_eq!(parsed.options.fast_open, Some(expected_cookie));
+                    }
+                    let response = cache_reply(
+                        &syn,
+                        if round == 1 { 940 } else { 1460 },
+                        if round == 1 { cookie } else { Some(&[0; 4]) },
+                    );
+                    if round == 1 {
+                        assert_eq!(
+                            wire::parse(response.0, &response.1)
+                                .unwrap()
+                                .options
+                                .fast_open,
+                            cookie.and_then(|c| wire::FastOpenCookie::new(c).ok())
+                        );
+                        if let Some(c) = cookie
+                            .and_then(|c| wire::FastOpenCookie::new(c).ok())
+                            .filter(|c| !c.as_bytes().is_empty())
+                        {
+                            expected_cookie = c;
+                        }
+                    }
+                    deliver(&mut a, now + 1, &response);
+                    assert_eq!(a.transport_info(id).unwrap().send_used, 0);
+                    let ack = packet(&mut a, now + 1);
+                    assert!(wire::parse(ack.0, &ack.1).unwrap().payload.is_empty());
+                    assert!(
+                        a.poll_transmit(now + 1, &mut [0; 2048], 64)
+                            .unwrap()
+                            .packet
+                            .is_none()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fast_open_cache_learning_requires_valid_synack() {
+    for mode in 0..4 {
+        let mut cfg = EndpointConfig::default();
+        cfg.connection.mss = 1460;
+        let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+        a.enable_fast_open().unwrap();
+        let (local, remote) = addresses(false, 40000);
+        a.connect_fast_open(0, local, remote, &[]).unwrap();
+        let syn = packet(&mut a, 0);
+        deliver(&mut a, 1, &cache_reply(&syn, 1460, Some(&[0; 4])));
+        packet(&mut a, 1);
+        let (local, _) = addresses(false, 40001);
+        let (id, n) = a.connect_fast_open(2, local, remote, &[7; 1000]).unwrap();
+        assert_eq!(n, 1000);
+        let syn = packet(&mut a, 2);
+        let mut reply = cache_reply(&syn, 940, Some(&[2; 8]));
+        match mode {
+            0 => {
+                // ACK beyond everything actually sent.
+                let ack = wire::parse(reply.0, &reply.1)
+                    .unwrap()
+                    .header
+                    .acknowledgment;
+                reply.1[8..12].copy_from_slice(&ack.wrapping_add(1).to_be_bytes());
+            }
+            1 => reply.1[13] = wire::ACK, // Valid ACK, but not a SYN-ACK.
+            2 => reply.1[13] = wire::SYN, // No validated ACK.
+            _ => {
+                // Established non-SYN must not learn either cookie or MSS.
+                deliver(&mut a, 3, &cache_reply(&syn, 1460, None));
+                packet(&mut a, 3);
+                reply.1[13] = wire::ACK;
+                reply.1[4..8].copy_from_slice(&124u32.to_be_bytes());
+            }
+        }
+        repair_cache_checksum(reply.0, &mut reply.1);
+        deliver(&mut a, 4, &reply);
+        if mode == 0 || mode == 1 {
+            assert_eq!(a.state(id).unwrap(), State::SynSent);
+        }
+        // Drain any reset, ACK or simultaneous-open response first.
+        while a
+            .poll_transmit(4, &mut [0; 2048], 64)
+            .unwrap()
+            .packet
+            .is_some()
+        {}
+        let (local, _) = addresses(false, 40002);
+        let (_, n) = a.connect_fast_open(5, local, remote, &[7; 1000]).unwrap();
+        assert_eq!(n, 1000);
+        let syn = packet(&mut a, 5);
+        assert_eq!(
+            wire::parse(syn.0, &syn.1).unwrap().options.fast_open,
+            Some(wire::FastOpenCookie::new(&[0; 4]).unwrap())
+        );
+    }
+}
+
+#[test]
+fn fast_open_mss_only_wire_learning_does_not_create_or_extend_credentials() {
+    for units_per_second in [1_000_000, 1_000_000_000] {
+        for warm_cache in [false, true] {
+            for at_expiry in [false, true] {
+                for cookie in [None, Some(&[1, 2][..]), Some(&[][..])] {
+                    let mut cfg = EndpointConfig::default();
+                    cfg.connection.timestamps = false;
+                    cfg.connection.timebase.units_per_second = units_per_second;
+                    let lifetime = cfg
+                        .connection
+                        .timebase
+                        .ticks_from_us(crate::fast_open::LIFETIME_US);
+                    let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+                    a.enable_fast_open().unwrap();
+                    let (local, remote) = addresses(false, 40000);
+                    if warm_cache {
+                        a.connect_fast_open(0, local, remote, &[]).unwrap();
+                        let syn = packet(&mut a, 0);
+                        deliver(&mut a, 1, &cache_reply(&syn, 1460, Some(&[0; 4])));
+                        packet(&mut a, 1);
+                    }
+                    let expiry = lifetime + 1;
+                    let now = if at_expiry { expiry } else { expiry - 1 };
+                    let (local, _) = addresses(false, 40001);
+                    a.connect_fast_open(now - 1, local, remote, &[]).unwrap();
+                    let syn = packet(&mut a, now - 1);
+                    deliver(&mut a, now, &cache_reply(&syn, 940, cookie));
+                    packet(&mut a, now);
+                    assert_eq!(
+                        a.has_fast_open_cookie(now, local.ip(), remote.ip())
+                            .unwrap(),
+                        warm_cache && !at_expiry
+                    );
+                    assert!(
+                        !a.has_fast_open_cookie(expiry, local.ip(), remote.ip())
+                            .unwrap()
+                    );
+                    let (local, _) = addresses(false, 40002);
+                    let (id, accepted) = a
+                        .connect_fast_open(expiry, local, remote, &[7; 1000])
+                        .unwrap();
+                    assert_eq!(accepted, 0);
+                    assert_eq!(a.transport_info(id).unwrap().send_used, 0);
+                    let syn = packet(&mut a, expiry);
+                    let syn = wire::parse(syn.0, &syn.1).unwrap();
+                    assert!(syn.payload.is_empty());
+                    assert_eq!(syn.options.fast_open, Some(wire::FastOpenCookie::request()));
+                }
+            }
+        }
+    }
+}

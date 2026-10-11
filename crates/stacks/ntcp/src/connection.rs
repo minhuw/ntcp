@@ -567,7 +567,7 @@ pub(crate) struct Connection {
     deferred_tfo_push: bool,
     fast_open_retry: Option<(Seq, Seq)>,
     pub(crate) fast_open_early: bool,
-    pub(crate) fast_open_learned: Option<(wire::FastOpenCookie, u16)>,
+    pub(crate) fast_open_learned: Option<(Option<wire::FastOpenCookie>, u16)>,
     snd_una: Seq,
     snd_nxt: Seq,
     send_base: Seq,
@@ -4149,11 +4149,13 @@ impl Connection {
                     self.snd_wnd,
                 );
                 if self.fast_open.is_some() {
-                    self.fast_open_learned = segment
-                        .options
-                        .fast_open
-                        .filter(|cookie| !cookie.as_bytes().is_empty())
-                        .map(|cookie| (cookie, self.peer_mss));
+                    self.fast_open_learned = Some((
+                        segment
+                            .options
+                            .fast_open
+                            .filter(|cookie| !cookie.as_bytes().is_empty()),
+                        self.peer_mss,
+                    ));
                 }
                 self.establish();
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3

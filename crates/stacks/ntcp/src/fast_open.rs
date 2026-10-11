@@ -144,6 +144,23 @@ impl FastOpen {
         })
     }
 
+    // A validated SYN-ACK can update MSS without supplying a replacement credential.
+    // Keep the original cookie age; MSS-only learning cannot create or revive one.
+    pub fn update_mss(
+        &mut self,
+        now: Instant,
+        lifetime: u64,
+        local: IpAddr,
+        remote: IpAddr,
+        mss: u16,
+    ) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| {
+            e.local == local && e.remote == remote && now >= e.learned && now - e.learned < lifetime
+        }) {
+            entry.mss = mss;
+        }
+    }
+
     pub fn learn(
         &mut self,
         now: Instant,
@@ -228,6 +245,50 @@ pub(crate) fn valid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mss_only_update_preserves_credential_age_and_address_scope() {
+        for (local, remote, other) in [
+            ("192.0.2.1", "192.0.2.2", "192.0.2.3"),
+            ("2001:db8::1", "2001:db8::2", "2001:db8::3"),
+        ] {
+            let local = local.parse().unwrap();
+            let remote = remote.parse().unwrap();
+            let other = other.parse().unwrap();
+            let cookie = FastOpenCookie::new(&[0; 4]).unwrap();
+            let replacement = FastOpenCookie::new(&[2; 16]).unwrap();
+            for now in [9, 10, 109, 110, 111] {
+                let mut cache = FastOpen::new().unwrap();
+                cache.update_mss(now, 100, local, remote, 940);
+                assert!(cache.entries.is_empty());
+                cache.learn(10, local, remote, cookie, 1460);
+                cache.learn(10, other, remote, cookie, 1220);
+                cache.learn(10, local, other, cookie, 536);
+                cache.update_mss(now, 100, local, remote, 940);
+                let entry = cache.get(109, 100, local, remote).unwrap();
+                assert_eq!(entry.mss, if (10..110).contains(&now) { 940 } else { 1460 });
+                assert_eq!(entry.cookie, cookie);
+                assert_eq!(entry.learned, 10);
+                assert!(cache.get(110, 100, local, remote).is_none());
+                assert_eq!(cache.get(109, 100, other, remote).unwrap().mss, 1220);
+                assert_eq!(cache.get(109, 100, local, other).unwrap().mss, 536);
+                assert_eq!(cache.next, 0);
+                assert_eq!(cache.entries.len(), 3);
+                cache.learn(110, local, remote, replacement, 1000);
+                let entry = cache.get(209, 100, local, remote).unwrap();
+                assert_eq!(entry.cookie, replacement);
+                assert_eq!(entry.mss, 1000);
+                assert_eq!(entry.learned, 110);
+                assert!(cache.get(210, 100, local, remote).is_none());
+            }
+            let mut cache = FastOpen::new().unwrap();
+            cache.learn(u64::MAX - 10, local, remote, cookie, 1460);
+            cache.update_mss(u64::MAX, 10, local, remote, 940);
+            assert_eq!(cache.entries[0].mss, 1460);
+            cache.update_mss(u64::MAX, 11, local, remote, 940);
+            assert_eq!(cache.get(u64::MAX, 11, local, remote).unwrap().mss, 940);
+        }
+    }
 
     #[test]
     fn address_epoch_cache_bounds() {
