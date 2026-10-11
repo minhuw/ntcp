@@ -31,6 +31,8 @@ pub enum Profile {
     UpstreamEcn,
     UpstreamBasic,
     UpstreamFastOpen,
+    #[cfg(feature = "tfo-linux-cookie")]
+    UpstreamFastOpenLinuxCookie,
 }
 pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
     let mut local = None;
@@ -61,6 +63,12 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
                 "upstream-ecn" => Profile::UpstreamEcn,
                 "upstream-basic" => Profile::UpstreamBasic,
                 "upstream-fastopen" => Profile::UpstreamFastOpen,
+                #[cfg(feature = "tfo-linux-cookie")]
+                "upstream-fastopen-linux-cookie" => Profile::UpstreamFastOpenLinuxCookie,
+                #[cfg(not(feature = "tfo-linux-cookie"))]
+                "upstream-fastopen-linux-cookie" => {
+                    return Err(unsupported("profile requires tfo-linux-cookie feature"));
+                }
                 _ => return Err(unsupported("unknown so_flags token")),
             };
             if selected.replace(profile).is_some() {
@@ -75,6 +83,11 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
 }
 
 pub(crate) fn config(profile: Profile) -> EndpointConfig {
+    let profile = match profile {
+        #[cfg(feature = "tfo-linux-cookie")]
+        Profile::UpstreamFastOpenLinuxCookie => Profile::UpstreamFastOpen,
+        other => other,
+    };
     let https = profile == Profile::UpstreamHttps;
     let fast_open = profile == Profile::UpstreamFastOpen;
     let profile = match profile {
@@ -182,6 +195,19 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
     config.connection.ecn = matches!(profile, Profile::UpstreamEcn | Profile::UpstreamCubicEcn);
     config
 }
+// Fixed upstream defaults key is confined to this explicit test profile.
+pub(crate) fn cookie_policy(profile: Profile) -> ntcp::FastOpenCookiePolicy {
+    match profile {
+        #[cfg(feature = "tfo-linux-cookie")]
+        Profile::UpstreamFastOpenLinuxCookie => {
+            ntcp::FastOpenCookiePolicy::LinuxSipHash24(ntcp::LinuxSipHash24Key::new([
+                0xa1, 0xa1, 0xa1, 0xa1, 0xb2, 0xb2, 0xb2, 0xb2, 0xc3, 0xc3, 0xc3, 0xc3, 0xd4, 0xd4,
+                0xd4, 0xd4,
+            ]))
+        }
+        _ => ntcp::FastOpenCookiePolicy::HmacSha256,
+    }
+}
 pub(crate) fn gso(profile: Profile) -> Option<ntcp::GsoLimits> {
     matches!(profile, Profile::PipelineGso | Profile::PipelinePacedGso).then_some(ntcp::GsoLimits {
         max_bytes: 65536,
@@ -218,6 +244,38 @@ pub(crate) fn notsent_lowat(profile: Profile) -> u32 {
 #[cfg(test)]
 mod setup_profile_tests {
     use super::*;
+
+    #[test]
+    fn linux_cookie_profile_is_opt_in() {
+        let selected = profile("upstream-fastopen-linux-cookie,local=192.168.0.1");
+        #[cfg(not(feature = "tfo-linux-cookie"))]
+        assert_eq!(selected, Err(ENOSYS));
+        #[cfg(feature = "tfo-linux-cookie")]
+        {
+            let selected = selected.unwrap().1;
+            assert_eq!(selected, Profile::UpstreamFastOpenLinuxCookie);
+            assert_eq!(
+                format!("{:?}", config(selected)),
+                format!("{:?}", config(Profile::UpstreamFastOpen))
+            );
+            assert!(matches!(
+                cookie_policy(selected),
+                ntcp::FastOpenCookiePolicy::LinuxSipHash24(_)
+            ));
+            assert_eq!(notsent_lowat(selected), u32::MAX);
+            assert!(gso(selected).is_none());
+        }
+        for selected in [
+            Profile::Baseline,
+            Profile::UpstreamBasic,
+            Profile::UpstreamFastOpen,
+        ] {
+            assert!(matches!(
+                cookie_policy(selected),
+                ntcp::FastOpenCookiePolicy::HmacSha256
+            ));
+        }
+    }
 
     #[test]
     fn fast_open_setup_changes_only_timestamps_and_aggregate_budget() {

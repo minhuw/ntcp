@@ -8,6 +8,10 @@ license = "GPL-2.0-or-later"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+tfo-linux-cookie = ["ntcp-socket/tfo-linux-cookie"]
+
 [dependencies]
 libc = "0.2"
 ntcp-socket = { path = "../../crates/adapters/ntcp-socket", version = "0.0.1", features = ["packet-test"] }

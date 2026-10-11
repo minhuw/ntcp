@@ -18,6 +18,21 @@ ROOT = HERE.parent.parent
 PIN = json.loads((HERE / 'upstream.json').read_text())
 
 
+LINUX_COOKIE_PROFILE = 'upstream-fastopen-linux-cookie'
+LINUX_COOKIE_SCRIPTS = {
+    'fastopen/server/opt34/' + name + '.pkt'
+    for name in ('fin-close-socket', 'reset-after-accept', 'reset-before-accept')}
+LINUX_COOKIE_SETTINGS = {
+    'timestamps': False, 'endpoint_max_buffer_bytes': 234881024,
+    'fast_open_client_default': False, 'fast_open_listener_default': False,
+    'fast_open_cache': 'fresh runtime', 'fast_open_cookie_policy': 'linux-siphash24',
+    'fast_open_key_hex': 'a1a1a1a1b2b2b2b2c3c3c3c3d4d4d4d4',
+    'fast_open_cookie_input': 'remote address bytes + local address bytes',
+    'fast_open_cookie_epoch': False, 'fast_open_option_kind': 34,
+    'required_feature': 'tfo-linux-cookie',
+    'implicit_listener_enablement': False, 'cookieless': False, 'foexp': False}
+
+
 SENDFILE_FIXTURE = 'sendfile-five-zero-bytes'
 SENDFILE_SETUP = (b'`../../common/defaults.sh\n'
                   b'/bin/rm -f /tmp/testfile\n'
@@ -116,6 +131,8 @@ def tcp_info_only(text):
         for node in ast.walk(tree):
             if isinstance(node, ast.Name) and node.id == 'tcpi_options':
                 parent = parents[node]
+                if isinstance(parent, ast.Assert) and parent.msg is node:
+                    continue  # Diagnostic value only; condition must still mask options.
                 if not isinstance(parent, ast.BinOp) or not isinstance(parent.op, ast.BitAnd):
                     return False
                 mask = parent.right if parent.left is node else parent.left
@@ -212,6 +229,11 @@ def adapt_source(directory, relative, manifest, so_flags):
             'upstream-global-lowat',
             {'global_notsent_lowat': 4000, 'socket_notsent_lowat': 0}),
     }
+    if LINUX_COOKIE_PROFILE in so_flags.split(',') and relative not in LINUX_COOKIE_SCRIPTS:
+        raise ValueError('Linux cookie setup is limited to audited explicit listeners')
+    for name in LINUX_COOKIE_SCRIPTS:
+        setup_profiles[name] = (b'`../../../common/defaults.sh`\n',
+                                LINUX_COOKIE_PROFILE, dict(LINUX_COOKIE_SETTINGS))
     if relative in setup_profiles:
         expected, token, settings = setup_profiles[relative]
         settings.update(general_pacing=False, software_gso=False, hardware_tso=False)
@@ -244,7 +266,7 @@ def adapt_source(directory, relative, manifest, so_flags):
             if source.count(old) != 1 or not (source.startswith(old) or b'\n' + old in source):
                 raise ValueError('expected one complete setup/restore line')
             generated = generated.replace(old, new, 1)
-        reasons = preflight(generated.decode())
+        reasons = preflight(generated.decode(), entry.get('embedded_tcp_info') is True)
         if reasons:
             raise ValueError('; '.join(reasons))
         return generated, {**entry, 'generated_sha256': hashlib.sha256(generated).hexdigest()}
@@ -407,11 +429,12 @@ def profile_metadata(so_flags):
     known = profile in {
         'baseline', 'sack', 'upstream-window8', 'upstream-sack', 'upstream-ecn',
         'upstream-basic', 'upstream-cubic', 'upstream-cubic-ecn',
-        'upstream-https', 'upstream-global-lowat', 'upstream-fastopen',
+        'upstream-https', 'upstream-global-lowat', 'upstream-fastopen', LINUX_COOKIE_PROFILE,
         'pipeline', 'pipeline-paced', 'pipeline-gso', 'pipeline-paced-gso'}
     # Configuration/capture boundary only: not measured timing or Linux fq/TSO equivalence.
     return {
         'profile': profile,
+        **(LINUX_COOKIE_SETTINGS if profile == LINUX_COOKIE_PROFILE else {}),
         'transport_clock': 'monotonic Instant elapsed microseconds' if known else None,
         'prr_pacing': profile not in {'upstream-cubic', 'upstream-cubic-ecn'} if known else None,
         'transmit_batch_clock': 'monotonic sample per selection/accept' if known else None,
@@ -565,8 +588,9 @@ def main():
                         preload = ['env', 'PYTHONOPTIMIZE=0', f'LD_PRELOAD={plugin}']
                         row['effective_flags']['preload'] = str(plugin)
                         code_flags = (['--code_sockopt=TCP_INFO']
-                                      if provenance is not None and embedded_tcp_info
-                                      and tcp_info_only(text) else [])
+                                      if provenance is not None and (
+                                          (embedded_tcp_info and tcp_info_only(text))
+                                          or so_flags.split(',')[0] == LINUX_COOKIE_PROFILE) else [])
                         row['effective_flags']['packetdrill'] = [*flags, *code_flags]
                         argv = ['unshare', '--user', '--map-root-user', '--net',
                                 *preload, str(runner), f'--so_filename={plugin}',

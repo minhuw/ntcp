@@ -3583,6 +3583,195 @@
         "claim": "Diagnostic syscall and packet assertions under the existing upstream-basic test profile; not complete Linux defaults equivalence."
       },
       "embedded_tcp_info": true
+    },
+    "fastopen/server/opt34/fin-close-socket.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "fastopen/server/opt34/fin-close-socket.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": false,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 234881024,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000,
+          "general_pacing": false,
+          "software_gso": false,
+          "hardware_tso": false,
+          "fast_open_client_default": false,
+          "fast_open_listener_default": false,
+          "fast_open_cache": "fresh runtime",
+          "fast_open_cookie_policy": "linux-siphash24",
+          "fast_open_key_hex": "a1a1a1a1b2b2b2b2c3c3c3c3d4d4d4d4",
+          "fast_open_cookie_input": "remote address bytes + local address bytes",
+          "fast_open_cookie_epoch": false,
+          "fast_open_option_kind": 34,
+          "required_feature": "tfo-linux-cookie",
+          "implicit_listener_enablement": false,
+          "cookieless": false,
+          "foexp": false
+        },
+        "claim": "Explicit process-local setup mapping; original behavior assertions remain diagnostic, not complete Linux defaults equivalence.",
+        "reasons": [
+          "Exact defaults key maps to optional Linux SipHash-2-4 over source and destination address bytes, no epoch. Only these explicit TCP_FASTOPEN listeners are mapped; no global 0x400 implicit listener, cookieless, FOEXP, or host setup execution. Same upstream-fastopen transport policy and 224 MiB budget; timestamps are not negotiated by these SYNs. No claim of complete Linux defaults equivalence."
+        ]
+      },
+      "source_sha256": "0419be4fce74da4680a909dc484499b0b7db85e516b12a836f1c8956bd6a13a5",
+      "expected_command_count": 1,
+      "command_line": "`../../../common/defaults.sh`\n",
+      "command_sha256": "43540040bb5213e3f94b916314167629484f7326159c993604ef18c48bc434eb",
+      "adapter_flags": "upstream-fastopen-linux-cookie,local=192.168.0.1",
+      "embedded_tcp_info": true,
+      "audited_shell_commands": [
+        {
+          "command": "`../../../common/defaults.sh`",
+          "sha256": "516fc4b2f557c07a5ba4729c301204a51b6eb79aac00c73af4bed73be5081987",
+          "semantic_mapping": "Exact defaults key maps to optional Linux SipHash-2-4 over source and destination address bytes, no epoch. Only these explicit TCP_FASTOPEN listeners are mapped; no global 0x400 implicit listener, cookieless, FOEXP, or host setup execution. Same upstream-fastopen transport policy and 224 MiB budget; timestamps are not negotiated by these SYNs. No claim of complete Linux defaults equivalence."
+        }
+      ]
+    },
+    "fastopen/server/opt34/reset-after-accept.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "fastopen/server/opt34/reset-after-accept.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": false,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 234881024,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000,
+          "general_pacing": false,
+          "software_gso": false,
+          "hardware_tso": false,
+          "fast_open_client_default": false,
+          "fast_open_listener_default": false,
+          "fast_open_cache": "fresh runtime",
+          "fast_open_cookie_policy": "linux-siphash24",
+          "fast_open_key_hex": "a1a1a1a1b2b2b2b2c3c3c3c3d4d4d4d4",
+          "fast_open_cookie_input": "remote address bytes + local address bytes",
+          "fast_open_cookie_epoch": false,
+          "fast_open_option_kind": 34,
+          "required_feature": "tfo-linux-cookie",
+          "implicit_listener_enablement": false,
+          "cookieless": false,
+          "foexp": false
+        },
+        "claim": "Explicit process-local setup mapping; original behavior assertions remain diagnostic, not complete Linux defaults equivalence.",
+        "reasons": [
+          "Exact defaults key maps to optional Linux SipHash-2-4 over source and destination address bytes, no epoch. Only these explicit TCP_FASTOPEN listeners are mapped; no global 0x400 implicit listener, cookieless, FOEXP, or host setup execution. Same upstream-fastopen transport policy and 224 MiB budget; timestamps are not negotiated by these SYNs. No claim of complete Linux defaults equivalence."
+        ]
+      },
+      "source_sha256": "4f002423579db051a1e6ade9b5527d183915282334f12dd6661a1a743f21e7fc",
+      "expected_command_count": 1,
+      "command_line": "`../../../common/defaults.sh`\n",
+      "command_sha256": "43540040bb5213e3f94b916314167629484f7326159c993604ef18c48bc434eb",
+      "adapter_flags": "upstream-fastopen-linux-cookie,local=192.168.0.1",
+      "embedded_tcp_info": false,
+      "audited_shell_commands": [
+        {
+          "command": "`../../../common/defaults.sh`",
+          "sha256": "516fc4b2f557c07a5ba4729c301204a51b6eb79aac00c73af4bed73be5081987",
+          "semantic_mapping": "Exact defaults key maps to optional Linux SipHash-2-4 over source and destination address bytes, no epoch. Only these explicit TCP_FASTOPEN listeners are mapped; no global 0x400 implicit listener, cookieless, FOEXP, or host setup execution. Same upstream-fastopen transport policy and 224 MiB budget; timestamps are not negotiated by these SYNs. No claim of complete Linux defaults equivalence."
+        }
+      ]
+    },
+    "fastopen/server/opt34/reset-before-accept.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "fastopen/server/opt34/reset-before-accept.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": false,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 1,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 234881024,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000,
+          "general_pacing": false,
+          "software_gso": false,
+          "hardware_tso": false,
+          "fast_open_client_default": false,
+          "fast_open_listener_default": false,
+          "fast_open_cache": "fresh runtime",
+          "fast_open_cookie_policy": "linux-siphash24",
+          "fast_open_key_hex": "a1a1a1a1b2b2b2b2c3c3c3c3d4d4d4d4",
+          "fast_open_cookie_input": "remote address bytes + local address bytes",
+          "fast_open_cookie_epoch": false,
+          "fast_open_option_kind": 34,
+          "required_feature": "tfo-linux-cookie",
+          "implicit_listener_enablement": false,
+          "cookieless": false,
+          "foexp": false
+        },
+        "claim": "Explicit process-local setup mapping; original behavior assertions remain diagnostic, not complete Linux defaults equivalence.",
+        "reasons": [
+          "Exact defaults key maps to optional Linux SipHash-2-4 over source and destination address bytes, no epoch. Only these explicit TCP_FASTOPEN listeners are mapped; no global 0x400 implicit listener, cookieless, FOEXP, or host setup execution. Same upstream-fastopen transport policy and 224 MiB budget; timestamps are not negotiated by these SYNs. No claim of complete Linux defaults equivalence."
+        ]
+      },
+      "source_sha256": "cd195d6d7f030a8ecca61c3897ec27465eba2b955b080d70e2b91f45cc929c0f",
+      "expected_command_count": 1,
+      "command_line": "`../../../common/defaults.sh`\n",
+      "command_sha256": "43540040bb5213e3f94b916314167629484f7326159c993604ef18c48bc434eb",
+      "adapter_flags": "upstream-fastopen-linux-cookie,local=192.168.0.1",
+      "embedded_tcp_info": true,
+      "audited_shell_commands": [
+        {
+          "command": "`../../../common/defaults.sh`",
+          "sha256": "516fc4b2f557c07a5ba4729c301204a51b6eb79aac00c73af4bed73be5081987",
+          "semantic_mapping": "Exact defaults key maps to optional Linux SipHash-2-4 over source and destination address bytes, no epoch. Only these explicit TCP_FASTOPEN listeners are mapped; no global 0x400 implicit listener, cookieless, FOEXP, or host setup execution. Same upstream-fastopen transport policy and 224 MiB budget; timestamps are not negotiated by these SYNs. No claim of complete Linux defaults equivalence."
+        }
+      ]
     }
   }
 }

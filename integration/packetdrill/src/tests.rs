@@ -27,6 +27,8 @@ impl Adapter {
             Profile::UpstreamEcn => "upstream-ecn",
             Profile::UpstreamBasic => "upstream-basic",
             Profile::UpstreamFastOpen => "upstream-fastopen",
+            #[cfg(feature = "tfo-linux-cookie")]
+            Profile::UpstreamFastOpenLinuxCookie => "upstream-fastopen-linux-cookie",
         };
         let flags = std::ffi::CString::new(format!("{profile},local={local}")).unwrap();
         let mut table = [0usize; 64];
@@ -430,6 +432,8 @@ fn host_bridge_preloaded_process_and_lifecycle() {
     build
         .args(["build", "-p", "ntcp-packetdrill", "--manifest-path"])
         .arg(root.join("Cargo.toml"));
+    #[cfg(feature = "tfo-linux-cookie")]
+    build.args(["--features", "tfo-linux-cookie"]);
     if library
         .parent()
         .unwrap()
@@ -1424,4 +1428,100 @@ fn fast_open_profile_keeps_socket_opt_in_and_disables_timestamps() {
     assert_eq!(parsed.header.source_port, 8081);
     assert!(parsed.options.timestamps.is_none());
     assert!(parsed.options.fast_open.is_none());
+}
+
+fn profile_cookie_response(profile: Profile, linux: bool) {
+    let local = Ipv4Addr::new(192, 168, 0, 1);
+    let adapter = Adapter::start((local, profile)).unwrap();
+    // Check default-off both before and after the cookie service is enabled.
+    for (port, enabled) in [(8080, false), (8081, true), (8082, false)] {
+        let fd = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+            .unwrap()
+            .value as i32;
+        call(
+            &adapter,
+            2,
+            fd,
+            0,
+            encode_addr(SocketAddr::new(local.into(), port)),
+            0,
+        )
+        .unwrap();
+        call(&adapter, 3, fd, 2, vec![], 0).unwrap();
+        if enabled {
+            let limit = 2i32;
+            unsafe {
+                assert_eq!(
+                    ntcp_socket::setsockopt(
+                        fd,
+                        IPPROTO_TCP,
+                        TCP_FASTOPEN,
+                        (&limit as *const i32).cast(),
+                        4
+                    ),
+                    0
+                );
+            }
+        }
+        let ip = IpMetadata {
+            source: Ipv4Addr::new(192, 0, 2, 1).into(),
+            destination: local.into(),
+        };
+        let header = ntcp::wire::Header {
+            source_port: 50000,
+            destination_port: port,
+            sequence: 100,
+            acknowledgment: 0,
+            flags: ntcp::wire::SYN,
+            window: 65535,
+            urgent_pointer: 0,
+        };
+        let mut tcp = [0; 64];
+        let n = ntcp::wire::encode(ip, header, &[34, 2, 1, 1], &[], &mut tcp).unwrap();
+        let packet = frame(
+            ntcp::Transmit {
+                tx_timestamp: None,
+                connection: None,
+                ip,
+                len: n,
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+                ipv4_options: Default::default(),
+            },
+            &tcp[..n],
+        )
+        .unwrap();
+        call(&adapter, 14, 0, 0, packet, 0).unwrap();
+        let packet = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+        let (ip, tcp) = parse_frame(&packet).unwrap();
+        let parsed = ntcp::wire::parse(ip, tcp).unwrap();
+        assert_eq!(parsed.options.fast_open.is_some(), enabled);
+        if enabled {
+            assert_eq!(
+                parsed.options.fast_open.unwrap().as_bytes()
+                    == [0x30, 0x21, 0xb9, 0xd8, 0x89, 0x01, 0x7e, 0xeb],
+                linux
+            );
+        }
+    }
+}
+
+#[test]
+fn original_fast_open_profile_retains_hmac_default() {
+    if isolated("tests::original_fast_open_profile_retains_hmac_default") {
+        return;
+    }
+    profile_cookie_response(Profile::UpstreamFastOpen, false);
+}
+
+#[test]
+#[cfg(feature = "tfo-linux-cookie")]
+fn linux_cookie_profile_applies_key_after_endpoint_replacement_without_enabling_listeners() {
+    if isolated(
+        "tests::linux_cookie_profile_applies_key_after_endpoint_replacement_without_enabling_listeners",
+    ) {
+        return;
+    }
+    profile_cookie_response(Profile::UpstreamFastOpenLinuxCookie, true);
 }

@@ -669,6 +669,9 @@ impl Owner {
             },
         )
         .map_err(engine)?;
+        owner
+            .endpoint
+            .set_fast_open_cookie_policy(crate::packet_profile::cookie_policy(profile));
         owner.defaults = crate::packet_profile::config(profile);
         owner.socket_policy.notsent_lowat = crate::packet_profile::notsent_lowat(profile);
         owner.packets = Some(PacketBackend::new(profile, options.queue_capacity)?);
