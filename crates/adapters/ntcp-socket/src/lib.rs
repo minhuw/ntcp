@@ -1737,8 +1737,14 @@ pub unsafe extern "C" fn ntcp_managed_getsockopt(
             (IPPROTO_TCP, TCP_CC_INFO) => Some(2),
             _ => None,
         } {
-            let bytes = call(id, Op::Transport(option))?.bytes;
-            let n = (load(len)? as usize).min(bytes.len());
+            let requested = load(len)? as usize;
+            let op = if option == 1 {
+                Op::TransportPrefix(option, requested)
+            } else {
+                Op::Transport(option)
+            };
+            let bytes = call(id, op)?.bytes;
+            let n = requested.min(bytes.len());
             copy_out(p.cast(), &bytes[..n])?;
             store(len, &(n as u32))?;
             return Ok(0);
@@ -2014,6 +2020,154 @@ pub unsafe extern "C" fn ntcp_managed_dup3(fd: i32, new: i32, flags: i32) -> i32
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tcp_info_prefix_abi_lengths_and_faults() {
+        const CHILD: &str = "NTCP_TEST_INFO_ABI_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::tcp_info_prefix_abi_lengths_and_faults",
+                        "--test-threads=1"
+                    ])
+                    .env(CHILD, "1")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            return;
+        }
+        assert!(RUNTIME.set(Ok(Runtime::in_memory_test())).is_ok());
+        let id = call(0, Op::New(SOCK_NONBLOCK)).unwrap().value as u64;
+        let (fd, token) = token(SOCK_CLOEXEC).unwrap();
+        install(fd, token, id).unwrap();
+        assert_eq!(
+            call(id, Op::Connect("10.73.0.3:2000".parse().unwrap())).unwrap_err(),
+            EINPROGRESS
+        );
+        let full = call(id, Op::Transport(1)).unwrap().bytes;
+        assert_eq!(full.len(), 280);
+        assert_eq!(full[0], 2); // SYN_SENT; no timer or external packets needed.
+        let assert_prefix = |bytes: &[u8]| {
+            for (offset, &byte) in bytes.iter().enumerate() {
+                // last_data_recv advances with the in-memory runtime's wall clock.
+                if !(52..56).contains(&offset) {
+                    assert_eq!(byte, full[offset], "offset {offset}");
+                }
+            }
+        };
+        unsafe {
+            for requested in [0, 1, 6, 7, 9, 191, 192, 193, 195, 196, 280, 512] {
+                let mut bytes = [0xa5; 512];
+                let mut len: socklen_t = requested;
+                assert_eq!(
+                    ntcp_managed_getsockopt(
+                        fd,
+                        IPPROTO_TCP,
+                        TCP_INFO,
+                        bytes.as_mut_ptr().cast(),
+                        &mut len
+                    ),
+                    0
+                );
+                assert_eq!(len, requested.min(280));
+                assert_prefix(&bytes[..len as usize]);
+                assert!(bytes[len as usize..].iter().all(|&b| b == 0xa5));
+            }
+            for requested in [1 << 31, u32::MAX] {
+                let mut bytes = [0xa5; 280];
+                let mut len = requested;
+                assert_eq!(
+                    ntcp_managed_getsockopt(
+                        fd,
+                        IPPROTO_TCP,
+                        TCP_INFO,
+                        bytes.as_mut_ptr().cast(),
+                        &mut len
+                    ),
+                    -1
+                );
+                assert_eq!(errno(), EINVAL);
+                assert_eq!(len, requested);
+                assert_eq!(bytes, [0xa5; 280]);
+            }
+            for requested in [0, 1, 192, 280] {
+                let mut len = requested;
+                assert_eq!(
+                    ntcp_managed_getsockopt(fd, IPPROTO_TCP, TCP_INFO, ptr::null_mut(), &mut len),
+                    -1
+                );
+                assert_eq!(errno(), EFAULT);
+                assert_eq!(len, requested);
+                assert_eq!(
+                    ntcp_managed_getsockopt(
+                        fd,
+                        IPPROTO_TCP,
+                        TCP_INFO,
+                        ptr::dangling_mut::<c_void>(),
+                        &mut len
+                    ),
+                    if requested == 0 { 0 } else { -1 }
+                );
+                if requested != 0 {
+                    assert_eq!(errno(), EFAULT);
+                }
+                assert_eq!(len, requested);
+            }
+            let mut bytes = [0xa5; 280];
+            for len in [ptr::null_mut(), ptr::dangling_mut::<socklen_t>()] {
+                assert_eq!(
+                    ntcp_managed_getsockopt(
+                        fd,
+                        IPPROTO_TCP,
+                        TCP_INFO,
+                        bytes.as_mut_ptr().cast(),
+                        len
+                    ),
+                    -1
+                );
+                assert_eq!(errno(), EFAULT);
+                assert_eq!(bytes, [0xa5; 280]);
+            }
+            // The value copies out before an unwritable optlen reports EFAULT.
+            let page = mmap(
+                ptr::null_mut(),
+                4096,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert_ne!(page, MAP_FAILED);
+            let len = page.cast::<socklen_t>();
+            *len = 193;
+            assert_eq!(mprotect(page, 4096, PROT_READ), 0);
+            assert_eq!(
+                ntcp_managed_getsockopt(fd, IPPROTO_TCP, TCP_INFO, bytes.as_mut_ptr().cast(), len),
+                -1
+            );
+            assert_eq!(errno(), EFAULT);
+            assert_eq!(*len, 193);
+            assert_prefix(&bytes[..193]);
+            assert_eq!(&bytes[193..], &[0xa5; 87]);
+            assert_eq!(munmap(page, 4096), 0);
+            let mut len = 280;
+            assert_eq!(
+                ntcp_managed_getsockopt(
+                    fd,
+                    IPPROTO_TCP,
+                    TCP_CC_INFO,
+                    bytes.as_mut_ptr().cast(),
+                    &mut len
+                ),
+                0
+            );
+            assert_eq!(len, 0);
+            assert_eq!(close(fd), 0);
+        }
+    }
+
     #[test]
     fn socket_buffer_abi_native_differential_and_shared_aliases() {
         const CHILD: &str = "NTCP_TEST_BUFFER_ABI_CHILD";

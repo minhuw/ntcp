@@ -78,6 +78,7 @@ pub enum Op {
     RxTimestamp(usize),
     ErrorQueueTo(usize),
     Transport(i32),
+    TransportPrefix(i32, usize),
     #[cfg(feature = "packet-test")]
     Inject(Vec<u8>),
     #[cfg(feature = "packet-test")]
@@ -1812,14 +1813,16 @@ impl Owner {
                 };
                 self.sockets.get_mut(&id).unwrap().completions.pop_front();
             }
-            Op::Transport(option) => {
+            Op::Transport(option) | Op::TransportPrefix(option, _) => {
                 let Handle::Connection(cid) = s.handle else {
                     return Err(ENOTCONN);
                 };
-                out.bytes = crate::transport::transport_option(
-                    self.endpoint.transport_info(cid).map_err(engine)?,
-                    option,
-                )?;
+                let info = self.endpoint.transport_info(cid).map_err(engine)?;
+                out.bytes = if let Op::TransportPrefix(_, requested) = op {
+                    crate::transport::transport_option_prefix(info, option, requested)?
+                } else {
+                    crate::transport::transport_option(info, option)?
+                };
             }
             Op::Close => {
                 match s.handle {
@@ -2327,6 +2330,145 @@ mod tests {
         let server = b.execute(listen, Op::Accept(SOCK_NONBLOCK)).unwrap().value as u64;
         (a, b, client, server, listen)
     }
+    #[test]
+    fn tcp_info_prefix_survives_ambiguous_data_fin_delivery() {
+        use ntcp::wire::{self, ACK, FIN, SYN};
+        let mut config = SocketConfig::new("test", Ipv4Addr::new(10, 73, 0, 2)).tcp;
+        config.connection.sack = true;
+        config.connection.tlp = false;
+        config.connection.timestamps = false;
+        let mut owner = owner_with_config(2, config);
+        owner.test_now = Some(0);
+        let id = new(&mut owner, SOCK_NONBLOCK);
+        assert_eq!(
+            owner
+                .execute(id, Op::Connect("10.73.0.3:2000".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        let Handle::Connection(cid) = owner.sockets[&id].handle else {
+            panic!()
+        };
+        let mut out = [0; 2048];
+        let tx = owner
+            .endpoint
+            .poll_transmit(0, &mut out, 16)
+            .unwrap()
+            .packet
+            .unwrap();
+        let syn = wire::parse(tx.ip, &out[..tx.len]).unwrap().header;
+        let base = syn.sequence.wrapping_add(1);
+        let ip = ntcp::IpMetadata {
+            source: tx.ip.destination,
+            destination: tx.ip.source,
+        };
+        let mut ack = wire::Header {
+            source_port: syn.destination_port,
+            destination_port: syn.source_port,
+            sequence: 100,
+            acknowledgment: base,
+            flags: SYN | ACK,
+            window: 32000,
+            urgent_pointer: 0,
+        };
+        let input = |owner: &mut Owner, now, header, options: &[u8]| {
+            let mut bytes = [0; 64];
+            let len = wire::encode(ip, header, options, &[], &mut bytes).unwrap();
+            owner.endpoint.input(now, ip, &bytes[..len]).unwrap();
+        };
+        input(&mut owner, 10, ack, &[1, 1, 4, 2]);
+        owner.endpoint.poll_transmit(20, &mut out, 16).unwrap();
+        owner.test_now = Some(20);
+        let full = owner.execute(id, Op::Transport(1)).unwrap().bytes;
+        assert_eq!(full.len(), 280);
+        for requested in [0, 1, 192, 193, 280, 512] {
+            assert_eq!(
+                owner
+                    .execute(id, Op::TransportPrefix(1, requested))
+                    .unwrap()
+                    .bytes,
+                full[..requested.min(280)]
+            );
+        }
+        // SACK data sent separately from FIN, then retransmit them together.
+        // The core cannot attribute the combined retry to one delivery packet.
+        owner.endpoint.write(cid, &[0; 100]).unwrap();
+        let tx = owner
+            .endpoint
+            .poll_transmit(100, &mut out, 16)
+            .unwrap()
+            .packet
+            .unwrap();
+        assert_eq!(
+            wire::parse(tx.ip, &out[..tx.len]).unwrap().payload.len(),
+            100
+        );
+        owner.endpoint.shutdown(cid).unwrap();
+        let tx = owner
+            .endpoint
+            .poll_transmit(100, &mut out, 16)
+            .unwrap()
+            .packet
+            .unwrap();
+        let fin = wire::parse(tx.ip, &out[..tx.len]).unwrap();
+        assert!(fin.payload.is_empty());
+        assert_ne!(fin.header.flags & FIN, 0);
+        ack.sequence = 101;
+        ack.flags = ACK;
+        let mut sack = vec![5, 10];
+        sack.extend_from_slice(&base.to_be_bytes());
+        sack.extend_from_slice(&base.wrapping_add(100).to_be_bytes());
+        sack.extend_from_slice(&[1, 1]);
+        input(&mut owner, 200, ack, &sack);
+        let deadline = owner.endpoint.next_deadline().unwrap();
+        owner.endpoint.on_timeout(deadline, 16).unwrap();
+        let tx = owner
+            .endpoint
+            .poll_transmit(deadline, &mut out, 16)
+            .unwrap()
+            .packet
+            .unwrap();
+        let retry = wire::parse(tx.ip, &out[..tx.len]).unwrap();
+        assert_eq!(retry.payload.len(), 100);
+        assert_ne!(retry.header.flags & FIN, 0);
+        owner.test_now = Some(deadline);
+        let info = owner.endpoint.transport_info(cid).unwrap();
+        assert!(info.ledger_valid);
+        assert!(!info.delivered_segments_valid);
+        let prefix = owner
+            .execute(id, Op::TransportPrefix(1, 192))
+            .unwrap()
+            .bytes;
+        assert_eq!(prefix.len(), 192);
+        assert_eq!(prefix[0], 4); // FIN_WAIT1
+        for requested in [0, 1, 7, 191] {
+            assert_eq!(
+                owner
+                    .execute(id, Op::TransportPrefix(1, requested))
+                    .unwrap()
+                    .bytes,
+                prefix[..requested]
+            );
+        }
+        let error = unsupported_option("test");
+        for requested in [193, 280, 512] {
+            assert_eq!(
+                owner
+                    .execute(id, Op::TransportPrefix(1, requested))
+                    .unwrap_err(),
+                error
+            );
+        }
+        assert_eq!(owner.execute(id, Op::Transport(1)).unwrap_err(), error);
+        assert!(
+            owner
+                .execute(id, Op::Transport(2))
+                .unwrap()
+                .bytes
+                .is_empty()
+        );
+    }
+
     #[test]
     fn errorqueue_fault_preserves_entry_and_short_control_consumes() {
         let (mut owner, _peer, client, _, _) = pair();

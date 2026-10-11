@@ -7,6 +7,14 @@ use ntcp::State;
 // Embedded-code assertions require the runner's field capability allowlist.
 const TCP_INFO_SIZE: usize = 280;
 pub(crate) fn transport_option(info: ntcp::TransportInfo, option: i32) -> Result<Vec<u8>> {
+    transport_option_prefix(info, option, TCP_INFO_SIZE)
+}
+
+pub(crate) fn transport_option_prefix(
+    info: ntcp::TransportInfo,
+    option: i32,
+    requested: usize,
+) -> Result<Vec<u8>> {
     if option == 2 {
         return Ok(Vec::new());
     } // Reno/NewReno have no CC-specific data.
@@ -23,7 +31,7 @@ pub(crate) fn transport_option(info: ntcp::TransportInfo, option: i32) -> Result
             "TCP_INFO segment counts: bounded transport ledger invalid",
         ));
     }
-    if !info.delivered_segments_valid {
+    if requested > 192 && !info.delivered_segments_valid {
         return Err(unsupported(
             "TCP_INFO delivered segments: metric unavailable",
         ));
@@ -34,7 +42,9 @@ pub(crate) fn transport_option(info: ntcp::TransportInfo, option: i32) -> Result
     if info.mss == 0 {
         return Err(EIO);
     }
-    put(192, info.delivered_segments);
+    if info.delivered_segments_valid {
+        put(192, info.delivered_segments);
+    }
     put(8, info.rto_us);
     put(16, info.mss as u64);
     put(24, info.unacked as u64);
@@ -86,6 +96,8 @@ pub(crate) fn transport_option(info: ntcp::TransportInfo, option: i32) -> Result
     } else {
         0
     };
+    // Never return unavailable delivery bytes, even as reserved zero.
+    bytes.truncate(requested.min(TCP_INFO_SIZE));
     Ok(bytes)
 }
 
@@ -449,5 +461,30 @@ mod tests {
         sample.delivered_segments_valid = false;
         assert_eq!(transport_option(sample, 1).err(), Some(error));
         assert!(transport_option(sample, 2).unwrap().is_empty());
+        for requested in [0, 1, 6, 7, 9, 191, 192] {
+            assert_eq!(
+                transport_option_prefix(sample, 1, requested).unwrap(),
+                bytes[..requested]
+            );
+        }
+        for requested in [193, 195, 196, 280, 512, usize::MAX] {
+            assert_eq!(transport_option_prefix(sample, 1, requested), Err(error));
+            assert_eq!(
+                transport_option_prefix(info, 1, requested).unwrap(),
+                bytes[..requested.min(TCP_INFO_SIZE)]
+            );
+        }
+        for delivered_valid in [false, true] {
+            sample.ledger_valid = false;
+            sample.delivered_segments_valid = delivered_valid;
+            for requested in [0, 1, 192, 193, 280] {
+                assert_eq!(transport_option_prefix(sample, 1, requested), Err(error));
+                assert!(
+                    transport_option_prefix(sample, 2, requested)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
     }
 }
