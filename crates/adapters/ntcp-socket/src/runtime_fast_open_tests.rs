@@ -686,3 +686,129 @@ fn fast_open_blocking_send_reset_finishes_with_error_or_accepted_prefix() {
         }
     }
 }
+
+fn tfo_early_terminal_socket(payload: &[u8]) -> (Owner, u64, Vec<u8>) {
+    let (mut a, mut b, listener) = tfo_setup(true);
+    let client = new(&mut a, SOCK_NONBLOCK);
+    assert_eq!(
+        a.execute(client, tfo_send(payload, MSG_FASTOPEN))
+            .unwrap()
+            .value as usize,
+        payload.len()
+    );
+    let syn = tfo_capture(&mut a);
+    tfo_deliver(&mut b, syn.clone());
+    let server = b
+        .execute(listener, Op::Accept(SOCK_NONBLOCK))
+        .unwrap()
+        .value as u64;
+    assert_eq!(
+        b.endpoint.state(cid(&b, server)).unwrap(),
+        State::SynReceived
+    );
+    (b, server, syn)
+}
+
+fn tfo_early_terminal_input(b: &mut Owner, syn: &[u8], flags: u8) {
+    let ip = ntcp_ip::parse(syn, false).unwrap().ip;
+    let initial = segment(syn);
+    let mut bytes = [0; 128];
+    let n = ntcp::wire::encode(
+        ip,
+        ntcp::wire::Header {
+            sequence: initial
+                .header
+                .sequence
+                .wrapping_add(1 + initial.payload.len() as u32),
+            flags,
+            ..initial.header
+        },
+        &[],
+        &[],
+        &mut bytes,
+    )
+    .unwrap();
+    b.input(b.now(), ip, 0, &bytes[..n]).unwrap();
+    b.events();
+}
+
+#[test]
+fn fast_open_early_terminal_reset_reaches_read_and_so_error() {
+    for flags in [ntcp::wire::RST, ntcp::wire::SYN] {
+        for via_so_error in [false, true] {
+            let (mut b, server, syn) = tfo_early_terminal_socket(b"hello");
+            assert_eq!(b.execute(server, Op::Read(5)).unwrap().bytes, b"hello");
+            let synack = tfo_capture(&mut b);
+            assert_eq!(
+                segment(&synack).header.acknowledgment,
+                segment(&syn).header.sequence.wrapping_add(6)
+            );
+            tfo_early_terminal_input(&mut b, &syn, flags);
+            assert_eq!(b.endpoint.state(cid(&b, server)).unwrap(), State::Closed);
+            assert_ne!(b.execute(server, Op::Ready).unwrap().value & EPOLLERR, 0);
+            if via_so_error {
+                assert_eq!(
+                    b.execute(server, Op::Get(SOL_SOCKET, SO_ERROR))
+                        .unwrap()
+                        .value,
+                    ECONNRESET
+                );
+            } else {
+                assert_eq!(b.execute(server, Op::Read(1)).unwrap_err(), ECONNRESET);
+            }
+            assert_eq!(b.execute(server, Op::Read(1)).unwrap().value, 0);
+            assert_eq!(
+                b.execute(server, Op::Get(SOL_SOCKET, SO_ERROR))
+                    .unwrap()
+                    .value,
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn fast_open_early_terminal_socket_drains_before_reset_or_timeout_error() {
+    for timeout in [true, false] {
+        let (mut b, server, syn) = tfo_early_terminal_socket(b"abc");
+        assert_eq!(b.execute(server, Op::Read(1)).unwrap().bytes, b"a");
+        tfo_capture(&mut b);
+        let error = if timeout {
+            b.test_now = Some(b.now() + 400_000_000);
+            b.endpoint.on_timeout(b.now(), BUDGET).unwrap();
+            b.events();
+            ETIMEDOUT
+        } else {
+            tfo_early_terminal_input(&mut b, &syn, ntcp::wire::RST);
+            ECONNRESET
+        };
+        assert_eq!(b.endpoint.state(cid(&b, server)).unwrap(), State::Closed);
+        for _ in 0..2 {
+            assert_eq!(b.execute(server, Op::Peek(9)).unwrap().bytes, b"bc");
+        }
+        assert_eq!(b.execute(server, Op::Read(1)).unwrap().bytes, b"b");
+        assert_eq!(b.execute(server, Op::Read(9)).unwrap().bytes, b"c");
+        assert_eq!(b.execute(server, Op::Read(1)).unwrap_err(), error);
+        assert_eq!(b.execute(server, Op::Read(1)).unwrap().value, 0);
+        assert_eq!(
+            b.execute(server, Op::Get(SOL_SOCKET, SO_ERROR))
+                .unwrap()
+                .value,
+            0
+        );
+        tfo_no_output(&mut b);
+    }
+}
+
+#[test]
+fn fast_open_early_terminal_socket_read_shutdown_reports_reset_after_drain() {
+    let (mut b, server, syn) = tfo_early_terminal_socket(b"abc");
+    tfo_capture(&mut b);
+    b.execute(server, Op::Shutdown(SHUT_RD)).unwrap();
+    // SHUT_RD retains already buffered bytes under the existing socket contract.
+    assert_eq!(b.execute(server, Op::Read(3)).unwrap().bytes, b"abc");
+    tfo_early_terminal_input(&mut b, &syn, ntcp::wire::RST);
+    assert_eq!(b.execute(server, Op::Read(3)).unwrap_err(), ECONNRESET);
+    assert_eq!(b.execute(server, Op::Peek(3)).unwrap().value, 0);
+    assert_eq!(b.execute(server, Op::Read(3)).unwrap().value, 0);
+}

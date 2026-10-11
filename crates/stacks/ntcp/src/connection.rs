@@ -1908,7 +1908,10 @@ impl Connection {
     }
 
     pub(crate) fn terminal_readable_bytes(&self) -> usize {
-        if self.state == State::Closed && self.handshake_complete && !self.read_closed {
+        if self.state == State::Closed
+            && (self.handshake_complete || self.fast_open_early)
+            && !self.read_closed
+        {
             self.receive.readable()
         } else {
             0
@@ -4403,7 +4406,8 @@ impl Connection {
         //# prescribed below according to the connection state.
         if h.flags & RST != 0 {
             if seq == next {
-                let passive = self.handshake_pending() && self.passive_open;
+                let passive =
+                    self.handshake_pending() && self.passive_open && !self.fast_open_early;
                 self.terminal(CloseReason::Reset);
                 if passive {
                     self.events = ConnectionEvents::default();
@@ -4423,10 +4427,12 @@ impl Connection {
         //# drop the unacceptable segment and stop processing further.
         if h.flags & SYN != 0 {
             if self.handshake_pending() && self.passive_open {
-                // Endpoint owns LISTEN independently; closing this unaccepted
-                // child releases its slot without notifying the application.
+                // Ordinary unaccepted children close silently; authenticated
+                // early children may already be application-owned.
                 self.terminal(CloseReason::Reset);
-                self.events = ConnectionEvents::default();
+                if !self.fast_open_early {
+                    self.events = ConnectionEvents::default();
+                }
             } else {
                 self.challenge_ack();
             }

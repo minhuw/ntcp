@@ -330,3 +330,43 @@ fn rejected_syn_data_retry_keeps_timestamp_reset_and_conflicting_syn_guards() {
         assert_eq!(b.receive_used, 0);
     }
 }
+
+#[test]
+fn ordinary_syn_data_remains_hidden_after_terminal_reset() {
+    for flags in [RST, SYN] {
+        let initial = wire::Segment {
+            header: wire::Header {
+                source_port: tuple().local.port(),
+                destination_port: tuple().remote.port(),
+                sequence: 100,
+                acknowledgment: 0,
+                flags: SYN,
+                window: 8192,
+                urgent_pointer: 0,
+            },
+            options: wire::Options::default(),
+            raw_options: &[],
+            payload: b"abc",
+        };
+        let mut b =
+            Connection::passive(reverse(tuple()), config(8192, 536), 900, 0, &initial).unwrap();
+        packet(&mut b, 10);
+        assert_eq!(b.receive.readable(), 3);
+        assert_eq!(b.read(&mut [0; 3]), Err(Error::WouldBlock));
+        let reset = wire::Segment {
+            header: wire::Header {
+                sequence: 104,
+                flags,
+                ..initial.header
+            },
+            payload: &[],
+            ..initial
+        };
+        b.input(20, &reset).unwrap();
+        assert_eq!(b.state(), State::Closed);
+        assert!(b.take_events().is_empty());
+        assert_eq!(b.terminal_readable_bytes(), 0);
+        assert_eq!(b.peek_terminal(&mut [0; 3]), Ok(0));
+        assert_eq!(b.read_terminal(&mut [0; 3]), Ok(0));
+    }
+}

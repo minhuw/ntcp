@@ -846,3 +846,191 @@ fn fast_open_invalid_cookie_duplicate_syn_data_keeps_child() {
 fn fast_open_quota_rejected_duplicate_syn_data_keeps_child() {
     rejected_syn_data_duplicate(true);
 }
+
+fn early_terminal_child(
+    payload: &[u8],
+) -> (Endpoint, ListenerId, ConnectionId, IpMetadata, wire::Header) {
+    let (local, remote) = addresses(false, 40001);
+    let mut b = endpoint(2, false);
+    b.enable_fast_open().unwrap();
+    let listener = b.listen(remote, 8).unwrap();
+    b.set_listener_fast_open(listener, 1).unwrap();
+    let cookie = crate::fast_open::issue(&[2; 32], remote.ip(), local.ip(), 0);
+    let mut options = [1; 12];
+    options[..2].copy_from_slice(&[34, 10]);
+    options[2..10].copy_from_slice(cookie.as_bytes());
+    let ip = IpMetadata {
+        source: local.ip(),
+        destination: remote.ip(),
+    };
+    let header = wire::Header {
+        source_port: local.port(),
+        destination_port: remote.port(),
+        sequence: 100,
+        acknowledgment: 0,
+        flags: wire::SYN,
+        window: 8192,
+        urgent_pointer: 0,
+    };
+    let mut bytes = [0; 128];
+    let n = wire::encode(ip, header, &options, payload, &mut bytes).unwrap();
+    b.input(0, ip, &bytes[..n]).unwrap();
+    let child = b.accept(listener).unwrap();
+    assert_eq!(b.state(child).unwrap(), State::SynReceived);
+    (b, listener, child, ip, header)
+}
+
+#[test]
+fn fast_open_early_terminal_reset_event_and_quota() {
+    for flags in [wire::RST, wire::SYN] {
+        let (mut b, listener, child, ip, header) = early_terminal_child(b"hello");
+        let mut bytes = [0; 128];
+        assert_eq!(b.read(child, &mut bytes).unwrap(), 5);
+        assert_eq!(&bytes[..5], b"hello");
+        while b.next_event().is_some() {}
+        let response = packet(&mut b, 10);
+        assert_eq!(
+            wire::parse(response.0, &response.1)
+                .unwrap()
+                .header
+                .acknowledgment,
+            106
+        );
+        // An in-window, nonexact RST still challenges instead of terminating.
+        let n = wire::encode(
+            ip,
+            wire::Header {
+                sequence: 107,
+                flags: wire::RST,
+                ..header
+            },
+            &[],
+            &[],
+            &mut bytes,
+        )
+        .unwrap();
+        b.input(20, ip, &bytes[..n]).unwrap();
+        assert_eq!(b.state(child).unwrap(), State::SynReceived);
+        assert!(b.next_event().is_none());
+        let challenge = packet(&mut b, 20);
+        assert_eq!(
+            wire::parse(challenge.0, &challenge.1).unwrap().header.flags,
+            wire::ACK
+        );
+        let n = wire::encode(
+            ip,
+            wire::Header {
+                sequence: 106,
+                flags,
+                ..header
+            },
+            &[],
+            &[],
+            &mut bytes,
+        )
+        .unwrap();
+        b.input(30, ip, &bytes[..n]).unwrap();
+        assert_eq!(b.state(child).unwrap(), State::Closed);
+        assert!(
+            matches!(b.next_event(), Some(Event::Connection(id, events)) if id == child && events.closed == Some(CloseReason::Reset))
+        );
+        assert!(b.next_event().is_none());
+        // Terminal cleanup releases the one-child quota without releasing the handle.
+        let cookie = crate::fast_open::issue(&[2; 32], ip.destination, ip.source, 0);
+        let mut options = [1; 12];
+        options[..2].copy_from_slice(&[34, 10]);
+        options[2..10].copy_from_slice(cookie.as_bytes());
+        let n = wire::encode(
+            ip,
+            wire::Header {
+                source_port: 40002,
+                ..header
+            },
+            &options,
+            b"next",
+            &mut bytes,
+        )
+        .unwrap();
+        b.input(40, ip, &bytes[..n]).unwrap();
+        let next = b.accept(listener).unwrap();
+        assert_ne!(next, child);
+        assert_eq!(b.read(next, &mut bytes).unwrap(), 4);
+    }
+}
+
+#[test]
+fn fast_open_early_terminal_drains_authenticated_prefix_after_reset_and_timeout() {
+    for timeout in [true, false] {
+        let (mut b, _, child, ip, header) = early_terminal_child(b"abc");
+        let mut bytes = [0; 128];
+        assert_eq!(b.read(child, &mut bytes[..1]).unwrap(), 1);
+        assert_eq!(bytes[0], b'a');
+        packet(&mut b, 10);
+        while b.next_event().is_some() {}
+        let reason = if timeout {
+            b.on_timeout(400_000_000, 64).unwrap();
+            CloseReason::TimedOut
+        } else {
+            let n = wire::encode(
+                ip,
+                wire::Header {
+                    sequence: 104,
+                    flags: wire::RST,
+                    ..header
+                },
+                &[],
+                &[],
+                &mut bytes,
+            )
+            .unwrap();
+            b.input(20, ip, &bytes[..n]).unwrap();
+            CloseReason::Reset
+        };
+        assert_eq!(b.state(child).unwrap(), State::Closed);
+        assert_eq!(
+            b.read(child, &mut bytes),
+            Err(EndpointError::Connection(Error::InvalidState))
+        );
+        assert_eq!(b.terminal_readable_bytes(child).unwrap(), 2);
+        for _ in 0..2 {
+            assert_eq!(b.peek_terminal(child, &mut bytes).unwrap(), 2);
+            assert_eq!(&bytes[..2], b"bc");
+        }
+        assert_eq!(b.read_terminal(child, &mut bytes[..1]).unwrap(), 1);
+        assert_eq!(bytes[0], b'b');
+        assert_eq!(b.read_terminal(child, &mut bytes).unwrap(), 1);
+        assert_eq!(bytes[0], b'c');
+        assert_eq!(b.read_terminal(child, &mut bytes).unwrap(), 0);
+        assert!(
+            matches!(b.next_event(), Some(Event::Connection(id, events)) if id == child && events.closed == Some(reason))
+        );
+        assert!(
+            b.poll_transmit(if timeout { 400_000_000 } else { 30 }, &mut bytes, 64)
+                .unwrap()
+                .packet
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn fast_open_early_terminal_read_close_discards_data_and_preserves_abort() {
+    let (mut b, _, child, _, _) = early_terminal_child(b"abc");
+    packet(&mut b, 10);
+    while b.next_event().is_some() {}
+    b.close(child).unwrap();
+    assert_eq!(b.state(child).unwrap(), State::Closed);
+    assert_eq!(b.terminal_readable_bytes(child).unwrap(), 0);
+    assert_eq!(b.peek_terminal(child, &mut [0; 3]).unwrap(), 0);
+    assert_eq!(b.read_terminal(child, &mut [0; 3]).unwrap(), 0);
+    assert!(
+        matches!(b.next_event(), Some(Event::Connection(id, events)) if id == child && events.closed == Some(CloseReason::Aborted))
+    );
+    let reset = packet(&mut b, 20);
+    let reset = wire::parse(reset.0, &reset.1).unwrap();
+    assert_eq!(
+        reset.header.flags & (wire::RST | wire::ACK),
+        wire::RST | wire::ACK
+    );
+    assert_eq!(reset.header.acknowledgment, 104);
+}
