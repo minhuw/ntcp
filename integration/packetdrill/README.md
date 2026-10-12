@@ -19,6 +19,16 @@ After two 100-ms RTT samples, [RFC 6298 §2.3](https://www.rfc-editor.org/rfc/rf
 
 A diagnostic run with adjusted timing subsequently reaches the 200,000-byte write, which exceeds the current 65,535-byte packet-backend I/O limit. That interface limit remains separate from this accepted timing difference.
 
+### `fastopen/client/nonblocking-sendto-over-mss.pkt`
+
+**Accepted Nagle timing mismatch: the 660-byte tail arrives ~20 ms later than expected.**
+
+ntcp uses original Nagle: a short segment waits while any previously sent data remains unacknowledged. After two full-sized segments, this test's 660-byte tail is held until TLP releases it roughly 20 ms later. Tracing confirmed Nagle as the blocking condition and TLP firing on time.
+
+Linux uses Minshall's variant, which holds a short segment only when a previously sent **short** segment remains unacknowledged. Outstanding full-sized segments therefore do not block this tail. [RFC 9293 §3.7.4](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.7.4) describes original Nagle; [Appendix A.3](https://www.rfc-editor.org/rfc/rfc9293.html#appendix-A.3) discusses Minshall's modification without incorporating it into the standard algorithm.
+
+This exception covers only the observed short-tail timing difference, not initial SYN allocation delays or other failures in this script.
+
 ### `inq/client.pkt`
 
 **Accepted timeout: the script waits for an ACK to data missing negotiated timestamps.**
