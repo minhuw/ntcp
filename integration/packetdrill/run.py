@@ -33,6 +33,18 @@ LINUX_COOKIE_SETTINGS = {
     'implicit_listener_enablement': False, 'cookieless': False, 'foexp': False}
 
 
+FASTOPEN_PMTUD_PROFILE = 'upstream-fastopen-pmtud'
+FASTOPEN_PMTUD_SCRIPTS = {
+    'fastopen/client/syn-data-icmp-unreach-frag-needed' + suffix + '.pkt'
+    for suffix in ('', '-with-seq')}
+FASTOPEN_PMTUD_SETTINGS = {
+    'timestamps': False, 'endpoint_max_buffer_bytes': 234881024,
+    'preallocate_connections': 3, 'pmtud_first_hop_mtu': 1500,
+    'mss': 1460, 'fast_open_client_default': False,
+    'fast_open_listener_default': False, 'fast_open_cache': 'fresh runtime',
+    'fast_open_cookie_policy': 'hmac-sha256'}
+
+
 SENDFILE_FIXTURE = 'sendfile-five-zero-bytes'
 SENDFILE_SETUP = (b'`../../common/defaults.sh\n'
                   b'/bin/rm -f /tmp/testfile\n'
@@ -231,6 +243,13 @@ def adapt_source(directory, relative, manifest, so_flags):
     }
     if LINUX_COOKIE_PROFILE in so_flags.split(',') and relative not in LINUX_COOKIE_SCRIPTS:
         raise ValueError('Linux cookie setup is limited to audited explicit listeners')
+    if FASTOPEN_PMTUD_PROFILE in so_flags.split(',') and relative not in FASTOPEN_PMTUD_SCRIPTS:
+        raise ValueError('Fast Open PMTUD setup is limited to two audited ICMP cases')
+    for name in FASTOPEN_PMTUD_SCRIPTS:
+        setup_profiles[name] = (
+            b'`../../common/defaults.sh\n'
+            b' ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n',
+            FASTOPEN_PMTUD_PROFILE, dict(FASTOPEN_PMTUD_SETTINGS))
     for name in LINUX_COOKIE_SCRIPTS:
         setup_profiles[name] = (b'`../../../common/defaults.sh`\n',
                                 LINUX_COOKIE_PROFILE, dict(LINUX_COOKIE_SETTINGS))
@@ -239,7 +258,7 @@ def adapt_source(directory, relative, manifest, so_flags):
         settings.update(general_pacing=False, software_gso=False, hardware_tso=False)
         commands = [command.rstrip(b'\n')]
         replacements = [(command, replacement)]
-        if token in ('upstream-https', 'upstream-fastopen'):
+        if token in ('upstream-https', 'upstream-fastopen', FASTOPEN_PMTUD_PROFILE):
             restore = b'`/tmp/sysctl_restore_${PPID}.sh`\n'
             restored = b'// ntcp profile is process-local; no host sysctls to restore.\n'
             if (entry.get('restore_line', '').encode() != restore
@@ -250,9 +269,12 @@ def adapt_source(directory, relative, manifest, so_flags):
                 raise ValueError('expected exact audited restore and setup helper')
             commands.append(restore.rstrip(b'\n'))
             replacements.append((restore, restored))
+        expected_replacement = b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n'
+        if token == FASTOPEN_PMTUD_PROFILE:
+            expected_replacement += b'\n'  # Keep the audited two-line setup's line numbers.
         if (command != expected or so_flags != token + ',local=192.168.0.1'
                 or entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
-                or replacement != b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n'
+                or replacement != expected_replacement
                 or entry.get('command_sha256') != hashlib.sha256(command).hexdigest()
                 or entry['expected_command_count'] != len(commands)
                 or re.findall(rb'`[^`]*`', source) != commands
@@ -430,11 +452,13 @@ def profile_metadata(so_flags):
         'baseline', 'sack', 'upstream-window8', 'upstream-sack', 'upstream-ecn',
         'upstream-basic', 'upstream-cubic', 'upstream-cubic-ecn',
         'upstream-https', 'upstream-global-lowat', 'upstream-fastopen', LINUX_COOKIE_PROFILE,
+        FASTOPEN_PMTUD_PROFILE,
         'pipeline', 'pipeline-paced', 'pipeline-gso', 'pipeline-paced-gso'}
     # Configuration/capture boundary only: not measured timing or Linux fq/TSO equivalence.
     return {
         'profile': profile,
         **(LINUX_COOKIE_SETTINGS if profile == LINUX_COOKIE_PROFILE else {}),
+        **(FASTOPEN_PMTUD_SETTINGS if profile == FASTOPEN_PMTUD_PROFILE else {}),
         'transport_clock': 'monotonic Instant elapsed microseconds' if known else None,
         'prr_pacing': profile not in {'upstream-cubic', 'upstream-cubic-ecn'} if known else None,
         'transmit_batch_clock': 'monotonic sample per selection/accept' if known else None,

@@ -27,6 +27,7 @@ impl Adapter {
             Profile::UpstreamEcn => "upstream-ecn",
             Profile::UpstreamBasic => "upstream-basic",
             Profile::UpstreamFastOpen => "upstream-fastopen",
+            Profile::UpstreamFastOpenPmtud => "upstream-fastopen-pmtud",
             #[cfg(feature = "tfo-linux-cookie")]
             Profile::UpstreamFastOpenLinuxCookie => "upstream-fastopen-linux-cookie",
         };
@@ -1524,4 +1525,12 @@ fn linux_cookie_profile_applies_key_after_endpoint_replacement_without_enabling_
         return;
     }
     profile_cookie_response(Profile::UpstreamFastOpenLinuxCookie, true);
+}
+
+#[test]
+fn pmtud_fast_open_profile_retains_hmac_default() {
+    if isolated("tests::pmtud_fast_open_profile_retains_hmac_default") {
+        return;
+    }
+    profile_cookie_response(Profile::UpstreamFastOpenPmtud, false);
 }

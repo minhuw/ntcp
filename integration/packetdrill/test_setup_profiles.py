@@ -97,3 +97,51 @@ class SetupProfiles(unittest.TestCase):
         self.assertTrue(tcp_info_only('0 %{ assert (tcpi_options & TCPI_OPT_SYN_DATA) != 0, tcpi_options }%'))
         self.assertFalse(tcp_info_only('0 %{ assert tcpi_options != 0, tcpi_options }%'))
         self.assertFalse(tcp_info_only('0 %{ assert (tcpi_options & TCPI_OPT_SYN_DATA) != 0, print(tcpi_options) }%'))
+
+    def test_fastopen_pmtud_only_two_exact_setup_mappings(self):
+        from run import (FASTOPEN_PMTUD_PROFILE, FASTOPEN_PMTUD_SCRIPTS,
+                         FASTOPEN_PMTUD_SETTINGS, preflight)
+        manifest = json.loads((HERE / 'adaptations.json').read_text())
+        self.assertEqual({name for name, entry in manifest['scripts'].items()
+                          if entry['adapter_flags'].startswith(FASTOPEN_PMTUD_PROFILE + ',')},
+                         FASTOPEN_PMTUD_SCRIPTS)
+        self.assertEqual(len(FASTOPEN_PMTUD_SCRIPTS), 2)
+        directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
+        if not directory.is_dir():
+            self.skipTest('pinned checkout unavailable')
+        for name in sorted(FASTOPEN_PMTUD_SCRIPTS):
+            entry = manifest['scripts'][name]
+            source = (directory / name).read_bytes()
+            generated, audit = adapt_source(directory, name, manifest, entry['adapter_flags'])
+            expected = source.replace(entry['command_line'].encode(), entry['replacement_line'].encode(), 1)
+            expected = expected.replace(entry['restore_line'].encode(), entry['restore_replacement_line'].encode(), 1)
+            self.assertEqual(generated, expected)
+            self.assertNotIn(b'`', generated)
+            self.assertEqual(audit['generated_sha256'], hashlib.sha256(expected).hexdigest())
+            self.assertEqual(preflight(generated.decode(), entry['embedded_tcp_info']), [])
+            self.assertEqual(source, (directory / name).read_bytes())
+            metadata = profile_metadata(entry['adapter_flags'])
+            for key, value in {**FASTOPEN_PMTUD_SETTINGS, 'general_pacing': False,
+                               'software_gso': False, 'hardware_tso': False}.items():
+                self.assertEqual(metadata[key], value)
+                changed = copy.deepcopy(manifest)
+                changed['scripts'][name]['mapping']['ntcp_settings'][key] = 'incorrect'
+                with self.subTest(name=name, key=key), self.assertRaises(ValueError):
+                    adapt_source(directory, name, changed, entry['adapter_flags'])
+            for key, value in [('source_sha256', 'bad'), ('setup_sha256', 'bad'),
+                               ('command_sha256', 'bad'), ('audited_shell_commands', []),
+                               ('expected_command_count', 1), ('additional_setup_files', []),
+                               ('restore_sha256', 'bad'), ('restore_line', '`false`\n'),
+                               ('restore_replacement_line', '`false`\n'),
+                               ('adapter_flags', 'upstream-fastopen,local=192.168.0.1')]:
+                changed = copy.deepcopy(manifest)
+                changed['scripts'][name][key] = value
+                with self.subTest(name=name, key=key), self.assertRaises(ValueError):
+                    adapt_source(directory, name, changed, changed['scripts'][name]['adapter_flags'])
+        # The new policy cannot silently extend another existing mapping.
+        name = 'syscall_bad_arg/fastopen-invalid-buf-ptr.pkt'
+        changed = copy.deepcopy(manifest)
+        changed['scripts'][name]['adapter_flags'] = FASTOPEN_PMTUD_PROFILE + ',local=192.168.0.1'
+        with self.assertRaises(ValueError):
+            adapt_source(directory, name, changed, changed['scripts'][name]['adapter_flags'])
+        self.assertNotIn('pmtud_first_hop_mtu', profile_metadata('upstream-fastopen,local=192.168.0.1'))

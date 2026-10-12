@@ -495,3 +495,5 @@ fn packet_ptb_queued_feedback_still_checks_target_tuple_and_sequence() {
     assert_eq!(path_mtu(&a, clients[0]), 1200);
     assert_eq!(path_mtu(&a, clients[1]), 1500);
 }
+
+include!("runtime_pmtud_profile_tests.rs");

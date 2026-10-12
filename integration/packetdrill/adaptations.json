@@ -3772,6 +3772,150 @@
           "semantic_mapping": "Exact defaults key maps to optional Linux SipHash-2-4 over source and destination address bytes, no epoch. Only these explicit TCP_FASTOPEN listeners are mapped; no global 0x400 implicit listener, cookieless, FOEXP, or host setup execution. Same upstream-fastopen transport policy and 224 MiB budget; timestamps are not negotiated by these SYNs. No claim of complete Linux defaults equivalence."
         }
       ]
+    },
+    "fastopen/client/syn-data-icmp-unreach-frag-needed-with-seq.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n",
+      "adapter_flags": "upstream-fastopen-pmtud,local=192.168.0.1",
+      "source_sha256": "a32b255a9c2e56468419a8e0e4736368df22e4a46c77b9c2ce30e4cb819ab6da",
+      "expected_command_count": 2,
+      "command_line": "`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "fastopen/client/syn-data-icmp-unreach-frag-needed-with-seq.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": false,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 3,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 234881024,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000,
+          "general_pacing": false,
+          "software_gso": false,
+          "hardware_tso": false,
+          "fast_open_client_default": false,
+          "fast_open_listener_default": false,
+          "fast_open_cache": "fresh runtime",
+          "pmtud_first_hop_mtu": 1500,
+          "fast_open_cookie_policy": "hmac-sha256"
+        },
+        "claim": "Setup-only opt-in PMTUD mapping, not a behavioral pass or Linux defaults equivalence. Original reduced receive-MSS and oversized data expectations remain diagnostic.",
+        "reasons": [
+          "Identical to UpstreamFastOpen except connection.pmtud=Some(PmtudConfig::new(1500)); retains three preallocated connections, 224 MiB budget, HMAC cookies, timestamps off, immediate ACK policy and no offload.",
+          "Only hash-audited setup and restore are replaced. No host sysctl or restore command is executed. Original packet assertions, timing, tolerance, cookies, sequences, payload and TCP_INFO assertion are unchanged.",
+          "RFC1191 section6.4 keeps advertised receive MSS1460 independent of outbound PMTU. Validated exact SYN-data feedback triggers bare-SYN fallback; subsequent retained data retries obey PMTU despite peer MSS1040. The upstream reduced-MSS SYN and single 1000-byte retry expectations are preserved, not endorsed."
+        ]
+      },
+      "audited_shell_commands": [
+        {
+          "command": "`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`",
+          "sha256": "5cb0e8a62ef4087e6344a5d7ef9cbd8721bdcec466c0c5cbb789a793a8d87dbc",
+          "semantic_mapping": "Identical to UpstreamFastOpen except connection.pmtud=Some(PmtudConfig::new(1500)); retains three preallocated connections, 224 MiB budget, HMAC cookies, timestamps off, immediate ACK policy and no offload. Only hash-audited setup and restore are replaced. No host sysctl or restore command is executed. Original packet assertions, timing, tolerance, cookies, sequences, payload and TCP_INFO assertion are unchanged. RFC1191 section6.4 keeps advertised receive MSS1460 independent of outbound PMTU. Validated exact SYN-data feedback triggers bare-SYN fallback; subsequent retained data retries obey PMTU despite peer MSS1040. The upstream reduced-MSS SYN and single 1000-byte retry expectations are preserved, not endorsed."
+        },
+        {
+          "command": "`/tmp/sysctl_restore_${PPID}.sh`",
+          "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
+          "semantic_mapping": "Process-local runtime ends with the runner; no host sysctls or restore file to restore."
+        }
+      ],
+      "additional_setup_files": [
+        {
+          "path": "common/set_sysctls.py",
+          "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
+        }
+      ],
+      "command_sha256": "0912d315bbb2e31cf6e169eeb8a745141ee7a0d345416062b720b4b62a4c767b",
+      "restore_line": "`/tmp/sysctl_restore_${PPID}.sh`\n",
+      "restore_sha256": "60a62f306d37841760269f429facc4f42420d9a0f3331bcb8ac55a14f7e84b48",
+      "restore_replacement_line": "// ntcp profile is process-local; no host sysctls to restore.\n",
+      "embedded_tcp_info": true
+    },
+    "fastopen/client/syn-data-icmp-unreach-frag-needed.pkt": {
+      "setup_path": "common/defaults.sh",
+      "setup_sha256": "c327942994a801c7b39f94e19cd31e9a1960836177ca3472215188881b3526ee",
+      "variant": "ipv4",
+      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n",
+      "adapter_flags": "upstream-fastopen-pmtud,local=192.168.0.1",
+      "source_sha256": "3a9b817e8f37398b45550a6121d9c4cd3762c8ab44c07ba4259784653ca0fe63",
+      "expected_command_count": 2,
+      "command_line": "`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n",
+      "mapping": {
+        "linux_defaults_reproduced": false,
+        "assertions_preserved": true,
+        "scope": "fastopen/client/syn-data-icmp-unreach-frag-needed.pkt; original packet/syscall/assertion/timing bytes preserved",
+        "ntcp_settings": {
+          "sack": true,
+          "timestamps": false,
+          "initial_window": "Iw10",
+          "rack": true,
+          "prr": "LegacyInitialCredit",
+          "tlp": true,
+          "rto_min_us": 200000,
+          "preallocate_connections": 3,
+          "ecn": false,
+          "mss": 1460,
+          "receive_capacity": 8388608,
+          "window_scale": 8,
+          "endpoint_max_buffer_bytes": 234881024,
+          "congestion_control": "Reno",
+          "delayed_ack_us": 0,
+          "abort_with_ack": true,
+          "coalesce_read_window_updates": true,
+          "peer_max_ack_delay_us": 200000,
+          "general_pacing": false,
+          "software_gso": false,
+          "hardware_tso": false,
+          "fast_open_client_default": false,
+          "fast_open_listener_default": false,
+          "fast_open_cache": "fresh runtime",
+          "pmtud_first_hop_mtu": 1500,
+          "fast_open_cookie_policy": "hmac-sha256"
+        },
+        "claim": "Setup-only opt-in PMTUD mapping, not a behavioral pass or Linux defaults equivalence. Original reduced receive-MSS and oversized data expectations remain diagnostic.",
+        "reasons": [
+          "Identical to UpstreamFastOpen except connection.pmtud=Some(PmtudConfig::new(1500)); retains three preallocated connections, 224 MiB budget, HMAC cookies, timestamps off, immediate ACK policy and no offload.",
+          "Only hash-audited setup and restore are replaced. No host sysctl or restore command is executed. Original packet assertions, timing, tolerance, cookies, sequences, payload and TCP_INFO assertion are unchanged.",
+          "RFC1191 section6.4 keeps advertised receive MSS1460 independent of outbound PMTU. Validated exact SYN-data feedback triggers bare-SYN fallback; subsequent retained data retries obey PMTU despite peer MSS1040. The upstream reduced-MSS SYN and single 1000-byte retry expectations are preserved, not endorsed."
+        ]
+      },
+      "audited_shell_commands": [
+        {
+          "command": "`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`",
+          "sha256": "5cb0e8a62ef4087e6344a5d7ef9cbd8721bdcec466c0c5cbb789a793a8d87dbc",
+          "semantic_mapping": "Identical to UpstreamFastOpen except connection.pmtud=Some(PmtudConfig::new(1500)); retains three preallocated connections, 224 MiB budget, HMAC cookies, timestamps off, immediate ACK policy and no offload. Only hash-audited setup and restore are replaced. No host sysctl or restore command is executed. Original packet assertions, timing, tolerance, cookies, sequences, payload and TCP_INFO assertion are unchanged. RFC1191 section6.4 keeps advertised receive MSS1460 independent of outbound PMTU. Validated exact SYN-data feedback triggers bare-SYN fallback; subsequent retained data retries obey PMTU despite peer MSS1040. The upstream reduced-MSS SYN and single 1000-byte retry expectations are preserved, not endorsed."
+        },
+        {
+          "command": "`/tmp/sysctl_restore_${PPID}.sh`",
+          "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
+          "semantic_mapping": "Process-local runtime ends with the runner; no host sysctls or restore file to restore."
+        }
+      ],
+      "additional_setup_files": [
+        {
+          "path": "common/set_sysctls.py",
+          "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
+        }
+      ],
+      "command_sha256": "0912d315bbb2e31cf6e169eeb8a745141ee7a0d345416062b720b4b62a4c767b",
+      "restore_line": "`/tmp/sysctl_restore_${PPID}.sh`\n",
+      "restore_sha256": "60a62f306d37841760269f429facc4f42420d9a0f3331bcb8ac55a14f7e84b48",
+      "restore_replacement_line": "// ntcp profile is process-local; no host sysctls to restore.\n",
+      "embedded_tcp_info": true
     }
   }
 }

@@ -31,6 +31,7 @@ pub enum Profile {
     UpstreamEcn,
     UpstreamBasic,
     UpstreamFastOpen,
+    UpstreamFastOpenPmtud,
     #[cfg(feature = "tfo-linux-cookie")]
     UpstreamFastOpenLinuxCookie,
 }
@@ -63,6 +64,7 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
                 "upstream-ecn" => Profile::UpstreamEcn,
                 "upstream-basic" => Profile::UpstreamBasic,
                 "upstream-fastopen" => Profile::UpstreamFastOpen,
+                "upstream-fastopen-pmtud" => Profile::UpstreamFastOpenPmtud,
                 #[cfg(feature = "tfo-linux-cookie")]
                 "upstream-fastopen-linux-cookie" => Profile::UpstreamFastOpenLinuxCookie,
                 #[cfg(not(feature = "tfo-linux-cookie"))]
@@ -83,6 +85,11 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
 }
 
 pub(crate) fn config(profile: Profile) -> EndpointConfig {
+    if profile == Profile::UpstreamFastOpenPmtud {
+        let mut config = config(Profile::UpstreamFastOpen);
+        config.connection.pmtud = Some(ntcp::PmtudConfig::new(1500));
+        return config;
+    }
     let profile = match profile {
         #[cfg(feature = "tfo-linux-cookie")]
         Profile::UpstreamFastOpenLinuxCookie => Profile::UpstreamFastOpen,
@@ -274,6 +281,43 @@ pub(crate) fn notsent_lowat(profile: Profile) -> u32 {
 #[cfg(test)]
 mod setup_profile_tests {
     use super::*;
+
+    #[test]
+    fn fast_open_pmtud_profile_changes_only_opt_in_pmtud() {
+        let selected = profile("upstream-fastopen-pmtud,local=192.0.2.1")
+            .unwrap()
+            .1;
+        assert_eq!(selected, Profile::UpstreamFastOpenPmtud);
+        let mut actual = config(selected);
+        assert_eq!(
+            format!("{:?}", actual.connection.pmtud.take().unwrap()),
+            format!("{:?}", ntcp::PmtudConfig::new(1500))
+        );
+        assert_eq!(
+            format!("{actual:?}"),
+            format!("{:?}", config(Profile::UpstreamFastOpen))
+        );
+        for other in [
+            Profile::Baseline,
+            Profile::UpstreamBasic,
+            Profile::UpstreamFastOpen,
+        ] {
+            assert!(config(other).connection.pmtud.is_none());
+        }
+        #[cfg(feature = "tfo-linux-cookie")]
+        assert!(
+            config(Profile::UpstreamFastOpenLinuxCookie)
+                .connection
+                .pmtud
+                .is_none()
+        );
+        assert!(matches!(
+            cookie_policy(selected),
+            ntcp::FastOpenCookiePolicy::HmacSha256
+        ));
+        assert_eq!(notsent_lowat(selected), u32::MAX);
+        assert!(gso(selected).is_none());
+    }
 
     #[test]
     fn linux_cookie_profile_is_opt_in() {
