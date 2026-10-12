@@ -5519,3 +5519,7 @@ fn pmtud_endpoint_opt_in_tuple_dispatch_path_query_and_link_update() {
     let (a, _, _, id) = endpoints();
     assert_eq!(a.path_mtu_info(id).unwrap(), None);
 }
+
+mod handshake_limit {
+    include!("endpoint_handshake_limit_tests.rs");
+}

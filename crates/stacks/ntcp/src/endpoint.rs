@@ -1,7 +1,10 @@
 extern crate alloc;
 
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
-use core::net::{IpAddr, SocketAddr};
+use core::{
+    net::{IpAddr, SocketAddr},
+    num::NonZeroU8,
+};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -307,6 +310,7 @@ struct Listener {
     rx_timestamp_capacity: usize,
     buffer_capacities: (usize, usize),
     application_timeout_us: Option<u64>,
+    handshake_retransmission_limit: Option<NonZeroU8>,
     address: SocketAddr,
     backlog: usize,
     children: Vec<ConnectionId>,
@@ -646,6 +650,7 @@ impl Endpoint {
                 self.config.connection.receive_capacity,
             ),
             application_timeout_us: None,
+            handshake_retransmission_limit: None,
             address,
             backlog,
             children,
@@ -2004,6 +2009,7 @@ impl Endpoint {
                 return Ok(InputDisposition::Dropped);
             }
             let application_timeout = record.application_timeout_us;
+            let handshake_retransmission_limit = record.handshake_retransmission_limit;
             let buffer_capacities = record.buffer_capacities;
             let rx_ranges = record.rx_timestamp_capacity;
             let iss = self.isn(tuple);
@@ -2019,6 +2025,7 @@ impl Endpoint {
                 Err(Error::NoMemory) => return Ok(InputDisposition::Dropped),
                 Err(error) => return Err(error.into()),
             };
+            connection.set_handshake_retransmission_limit(handshake_retransmission_limit);
             if let Err(error) = connection.set_application_timeout(application_timeout) {
                 self.recycle_connection(connection);
                 return Err(error.into());
@@ -2076,6 +2083,7 @@ impl Endpoint {
             return Ok(InputDisposition::Dropped);
         }
         let application_timeout = record.application_timeout_us;
+        let handshake_retransmission_limit = record.handshake_retransmission_limit;
         let buffer_capacities = record.buffer_capacities;
         let rx_ranges = record.rx_timestamp_capacity;
         let candidate = self.isn(tuple);
@@ -2107,6 +2115,7 @@ impl Endpoint {
                 .connection
                 .timestamp_offset(),
         );
+        connection.set_handshake_retransmission_limit(handshake_retransmission_limit);
         if let Err(error) = connection.set_application_timeout(application_timeout) {
             self.recycle_connection(connection);
             return Err(error.into());
@@ -2742,6 +2751,48 @@ impl Endpoint {
 
     pub fn application_timeout(&self, id: ConnectionId) -> Result<Option<u64>, EndpointError> {
         Ok(self.slot(id)?.connection.application_timeout())
+    }
+
+    pub fn set_handshake_retransmission_limit(
+        &mut self,
+        id: ConnectionId,
+        limit: Option<NonZeroU8>,
+    ) -> Result<(), EndpointError> {
+        if self.is_output_reserved(id) {
+            return Err(EndpointError::OutputReserved);
+        }
+        self.slot_mut(id)?
+            .connection
+            .set_handshake_retransmission_limit(limit);
+        self.refresh(id.slot);
+        Ok(())
+    }
+
+    pub fn handshake_retransmission_limit(
+        &self,
+        id: ConnectionId,
+    ) -> Result<Option<NonZeroU8>, EndpointError> {
+        Ok(self.slot(id)?.connection.handshake_retransmission_limit())
+    }
+
+    pub fn set_listener_handshake_retransmission_limit(
+        &mut self,
+        id: ListenerId,
+        limit: Option<NonZeroU8>,
+    ) -> Result<(), EndpointError> {
+        self.listener(id)?;
+        self.listeners[id.slot]
+            .as_mut()
+            .unwrap()
+            .handshake_retransmission_limit = limit;
+        Ok(())
+    }
+
+    pub fn listener_handshake_retransmission_limit(
+        &self,
+        id: ListenerId,
+    ) -> Result<Option<NonZeroU8>, EndpointError> {
+        Ok(self.listener(id)?.handshake_retransmission_limit)
     }
 
     pub fn set_listener_application_timeout(

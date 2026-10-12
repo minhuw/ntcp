@@ -1,7 +1,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::{cmp::Ordering, net::SocketAddr};
+use core::{cmp::Ordering, net::SocketAddr, num::NonZeroU8};
 
 use crate::{
     RxPacketTimestamps, RxReadTimestamps, SendProgress, TxStreamRange, TxTimestampClock,
@@ -599,6 +599,9 @@ pub(crate) struct Connection {
     iw_setup_loss: bool,
     syn_loss_detected: bool,
     syn_retransmissions: u32,
+    handshake_retransmission_limit: Option<NonZeroU8>,
+    committed_syn_retransmissions: u8,
+    syn_committed: bool,
     sack_send: bool,
     sack_receive: bool,
     sack_recovery: Option<SackRecovery>,
@@ -880,6 +883,9 @@ impl Connection {
             iw_setup_loss: false,
             syn_loss_detected: false,
             syn_retransmissions: 0,
+            handshake_retransmission_limit: None,
+            committed_syn_retransmissions: 0,
+            syn_committed: false,
             sack_send: false,
             sack_receive: false,
             sack_recovery: None,
@@ -2070,6 +2076,22 @@ impl Connection {
         self.application_timeout_us
     }
 
+    pub(crate) fn set_handshake_retransmission_limit(&mut self, limit: Option<NonZeroU8>) {
+        self.handshake_retransmission_limit = limit;
+    }
+
+    pub(crate) fn handshake_retransmission_limit(&self) -> Option<NonZeroU8> {
+        self.handshake_retransmission_limit
+    }
+
+    fn record_syn_departure(&mut self) {
+        if self.syn_committed {
+            self.committed_syn_retransmissions =
+                self.committed_syn_retransmissions.saturating_add(1);
+        }
+        self.syn_committed = true;
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc5927#section-5.2
     //= reason=Selected connection-local policy: network_error mutates only the matched Connection and PMTU feedback has no cross-connection cache. The existing validation test checks live-sequence rejection and error processing on that instance.
     //# Additionally, they do not extrapolate ICMP errors across TCP connections. This
@@ -2384,6 +2406,9 @@ impl Connection {
             d.payload as u32 + u32::from(d.fin)
         });
         if d.syn {
+            if finished {
+                self.record_syn_departure();
+            }
             self.syn_payload_sent = self.syn_payload_sent.max(count);
             self.rack.record_syn_payload(
                 Seq(d.start).wrapping_add(1),
@@ -8187,6 +8212,7 @@ impl Connection {
         }
         let length = count as u32 + u32::from(flags & SYN != 0) + u32::from(flags & FIN != 0);
         if syn && !reserve {
+            self.record_syn_departure();
             self.syn_payload_sent = self.syn_payload_sent.max(count);
             self.rack
                 .record_syn_payload(seq.wrapping_add(1), seq.wrapping_add(1 + count as u32));
@@ -8694,6 +8720,15 @@ impl Connection {
         {
             self.rto_deadline = head_sent.map(|sent| sent.saturating_add(self.rto()));
         } else if expired_loss == Some(LossTimer::Rto) {
+            // Explicit application give-up budget, not the default SYN R2 policy.
+            if self.handshake_pending()
+                && self
+                    .handshake_retransmission_limit
+                    .is_some_and(|limit| self.committed_syn_retransmissions >= limit.get())
+            {
+                self.terminal(CloseReason::TimedOut);
+                return Ok(());
+            }
             self.reset_tlp();
             self.congestion.end_ecn_prr();
             self.prr = None;
@@ -9807,6 +9842,10 @@ mod tests {
 
     mod fast_open_tests {
         include!("fast_open_connection_tests.rs");
+    }
+
+    mod handshake_limit {
+        include!("connection_handshake_limit_tests.rs");
     }
 
     mod syn_deferral {
