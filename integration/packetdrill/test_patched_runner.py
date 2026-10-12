@@ -68,18 +68,70 @@ class CompiledSnapshotChecks(unittest.TestCase):
         cls.temporary = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.temporary.cleanup)
         directory = Path(cls.temporary.name)
+        with tempfile.TemporaryFile() as archive:
+            subprocess.run(['git', '-C', str(checkout), 'archive', PIN['revision']],
+                           stdout=archive, check=True)
+            archive.seek(0)
+            subprocess.run(['tar', '-xf', '-', '-C', str(directory)],
+                           stdin=archive, check=True)
         source = directory / 'gtests/net/packetdrill/code.c'
-        source.parent.mkdir(parents=True)
-        source.write_bytes(subprocess.check_output(
-            ['git', '-C', str(checkout), 'show', PIN['revision'] + ':gtests/net/packetdrill/code.c']))
         subprocess.run(['patch', '-p1', '-i', str(HERE / 'code-sockopt.patch')],
                        cwd=directory, check=True, capture_output=True)
-        if source.read_bytes() != (runner.parent / 'code.c').read_bytes():
-            raise AssertionError('built source does not match pinned source plus tracked patch')
+        for name in ('code.c', 'packet.h', 'packet.c', 'icmp_packet.c',
+                     'parser.y', 'socket.h', 'run_packet.c', 'so_testing.c'):
+            if (source.parent / name).read_bytes() != (runner.parent / name).read_bytes():
+                raise AssertionError(f'built {name} differs from pinned source plus patch')
         cls.binary = directory / 'snapshot-test'
         subprocess.run(['cc', '-g', '-Wall', '-Werror', '-I', str(runner.parent),
                         str(HERE / 'code_sockopt_test.c'), str(source),
                         '-o', str(cls.binary)], check=True)
+        cls.icmp_binary = directory / 'icmp-test'
+        objects = sorted(str(path) for path in runner.parent.glob('*.o')
+                         if path.name not in {'packetdrill.o', 'run_packet.o', 'so_testing.o'}
+                         and not path.name.endswith('_test.o'))
+        subprocess.run(['cc', '-g', '-Wall', '-Werror', '-I', str(source.parent),
+                        str(HERE / 'icmp_runner_test.c'), *objects,
+                        '-lpthread', '-lrt', '-ldl', '-o', str(cls.icmp_binary)], check=True)
+
+    def test_icmp_quote_mapping_and_callback_errors(self):
+        result = subprocess.run([str(self.icmp_binary)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = dict(line.split(' ', 1) for line in result.stdout.splitlines())
+        def checksum(data):
+            words = [int.from_bytes(data[i:i + 2], 'big')
+                     for i in range(0, len(data), 2)]
+            total = sum(words)
+            while total >> 16:
+                total = (total & 65535) + (total >> 16)
+            return ~total & 65535
+        for name, total, sequence in (
+                ('omitted', 1060, 0x12345670), ('explicit', 1060, 0x12345670),
+                ('override', 1040, 0x12345679), ('override_match', 1060, 0x12345679),
+                ('zero', 40, 0x12345670),
+                ('different', 1039, 0x12345670), ('port_miss', 1040, 0x12345670),
+                ('ip_miss', 1040, 0x12345670), ('sequence_miss', 40, 0x12345670),
+                ('no_template', 1040, 0x12345670)):
+            with self.subTest(name=name):
+                data = bytes.fromhex(rows[name])
+                self.assertEqual(len(data), 56)
+                self.assertEqual(int.from_bytes(data[30:32], 'big'), total)
+                self.assertEqual(int.from_bytes(data[52:56], 'big'), sequence)
+                self.assertEqual(data[40:48], bytes.fromhex('c0a80001c0000201'))
+                self.assertEqual(data[48:52], bytes.fromhex('9c411f90'))
+                for part in (data[:20], data[20:], data[28:48]):
+                    self.assertEqual(checksum(part), 0)
+        for name in ('bad_checksum', 'zero_checksum', 'bad_length', 'raw'):
+            data = bytes.fromhex(rows[name])
+            self.assertEqual(checksum(data[:20]), 0)
+            self.assertEqual(checksum(data[20:]), 0)
+            self.assertNotEqual(checksum(data[28:48]), 0)
+        self.assertEqual(bytes.fromhex(rows['bad_checksum'])[38:40], b'\xbe\xef')
+        self.assertEqual(bytes.fromhex(rows['bad_length'])[30:32], b'\x00\x11')
+        self.assertIn('errno 22: ', rows['error'])
+        data = bytes.fromhex(rows['ipv6'])
+        self.assertEqual(len(data), 96)
+        pseudoheader = data[8:40] + (56).to_bytes(4, 'big') + b'\x00\x00\x00\x3a'
+        self.assertEqual(checksum(pseudoheader + data[40:]), 0)
 
     def execute(self, selection, fail_option, snippet, expected, message=None):
         result = subprocess.run([str(self.binary), selection, str(fail_option), snippet],

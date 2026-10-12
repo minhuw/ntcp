@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Build the pinned runner plus the bounded code_sockopt repair in workbench."""
+"""Build the pinned runner plus audited socket-data and ICMP repairs."""
 import argparse
 import hashlib
 import json
@@ -15,13 +15,15 @@ from run import HERE, PIN, ROOT, check_checkout, runner_provenance
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkout', required=True, type=Path)
+    parser.add_argument('--build-root', type=Path,
+                        default=ROOT / 'workbench/packetdrill-builds')
     args = parser.parse_args()
     checkout = args.checkout.resolve()
     revision = check_checkout(checkout)
     patch = HERE / 'code-sockopt.patch'
     patch_bytes = patch.read_bytes()
     recipe_bytes = Path(__file__).read_bytes()
-    parent = ROOT / 'workbench/packetdrill-builds'
+    parent = args.build_root.resolve()
     parent.mkdir(parents=True, exist_ok=True)
     build = Path(tempfile.mkdtemp(prefix='code-sockopt-', dir=parent))
     # Export committed bytes, never copy untracked/generated files from checkout.

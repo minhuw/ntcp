@@ -58,3 +58,275 @@
  
  	append_text(code, state->config->script_path, event->line_number,
  		    strdup(text));
+--- a/gtests/net/packetdrill/packet.h
++++ b/gtests/net/packetdrill/packet.h
+@@ -96,6 +96,7 @@
+ 	struct udp *udp;	/* start of UDP header, if present */
+ 	struct icmpv4 *icmpv4;	/* start of ICMPv4 header, if present */
+ 	struct icmpv6 *icmpv6;	/* start of ICMPv6 header, if present */
++	struct ipv4 generated_echo_ipv4; /* untouched constructor template */
+ 	bool echoed_header;     /* icmp payload is an echoed header?
+ 				   This is for TCP/UDP */
+ 
+@@ -107,6 +108,8 @@
+ 	u32 flags;		/* various meta-flags */
+ #define FLAG_WIN_NOCHECK	0x1  /* don't check TCP receive window */
+ #define FLAG_OPTIONS_NOCHECK	0x2  /* don't check TCP options */
++#define FLAG_ICMP_ECHO_GENERATED 0x4 /* constructor-owned IPv4 quote */
++#define FLAG_ICMP_ECHO_UNSPECIFIED 0x8 /* omitted, not explicit zero payload */
+ #define FLAG_PARSE_ACE		0x400 /* output parsed AccECN ACE field */
+ 
+ 	enum tos_chk_t tos_chk;	/* how to treat the TOS byte of a packet */
+--- a/gtests/net/packetdrill/packet.c
++++ b/gtests/net/packetdrill/packet.c
+@@ -183,6 +183,7 @@
+ 	packet->tcp_ts_ecr	= offset_ptr(old_base, new_base,
+ 					     old_packet->tcp_ts_ecr);
+ 	packet->echoed_header		= old_packet->echoed_header;
++	packet->generated_echo_ipv4 = old_packet->generated_echo_ipv4;
+ }
+ 
+ /* Make a copy of the given old packet, but in the new copy reserve the
+--- a/gtests/net/packetdrill/icmp_packet.c
++++ b/gtests/net/packetdrill/icmp_packet.c
+@@ -24,6 +24,7 @@
+ 
+ #include "icmp_packet.h"
+ 
++#include "checksum.h"
+ #include "icmp.h"
+ #include "icmpv6.h"
+ #include "ip_packet.h"
+@@ -393,6 +394,14 @@
+ 			*seq = htonl(tcp_start_sequence);
+ 		}
+ 		packet->echoed_header = true;
++		if (address_family == AF_INET) {
++			struct ipv4 *quote = packet_echoed_ipv4_header(packet);
++			/* Make even an explicit zero-checksum edit distinguishable
++			 * from the constructor template. Recompute after live mapping. */
++			quote->check = ipv4_checksum(quote, sizeof(*quote));
++			packet->generated_echo_ipv4 = *quote;
++			packet->flags |= FLAG_ICMP_ECHO_GENERATED;
++		}
+ 	} else
+ 		packet->echoed_header = false;
+ 
+--- a/gtests/net/packetdrill/parser.y
++++ b/gtests/net/packetdrill/parser.y
+@@ -550,6 +550,7 @@
+ 		int protocol;		/* IPPROTO_TCP or IPPROTO_UDP */
+ 		u32 start_sequence;
+ 		u16 payload_bytes;
++		bool unspecified; /* ICMP quote details omitted */
+ 	} tcp_sequence_info;
+ 	struct option_list *option;
+ 	struct event *event;
+@@ -914,6 +915,8 @@
+ 	inner = new_icmp_packet(in_config->wire_protocol, direction, $4, $5,
+ 				$8.protocol, $8.start_sequence,
+ 				$8.payload_bytes, $2, $6, $7, &error);
++	if (inner && $8.unspecified)
++		inner->flags |= FLAG_ICMP_ECHO_UNSPECIFIED;
+ 	free($4);
+ 	free($5);
+ 	if (inner == NULL) {
+@@ -1101,11 +1104,13 @@
+ /* This specifies the relevant details about the packet echoed by ICMP. */
+ opt_icmp_echoed
+ :			{
++	$$.unspecified = true;
+ 	$$.start_sequence	= 0;
+ 	$$.payload_bytes	= 0;
+ 	$$.protocol		= IPPROTO_TCP;
+ }
+ | '[' UDP '(' INTEGER ')' ']'	{
++	$$.unspecified = false;
+ 	$$.start_sequence	= 0;
+ 	$$.payload_bytes	= $4;
+ 	$$.protocol		= IPPROTO_UDP;
+@@ -1114,6 +1119,7 @@
+ 	$$ = $2;
+ }
+ | '[' RAW '(' INTEGER ')' ']'   {
++	$$.unspecified = false;
+ 	$$.payload_bytes        = $4;
+ 	$$.protocol             = IPPROTO_RAW;
+ }
+@@ -1274,6 +1280,7 @@
+ 		semantic_error("inconsistent TCP sequence numbers and "
+ 			       "payload size");
+ 	}
++	$$.unspecified = false;
+ 	$$.start_sequence = $1;
+ 	$$.payload_bytes = $5;
+ 	$$.protocol = IPPROTO_TCP;
+--- a/gtests/net/packetdrill/socket.h
++++ b/gtests/net/packetdrill/socket.h
+@@ -112,6 +112,11 @@
+ 	 * order to induce the kernel to free the socket.
+ 	 */
+ 	struct tcp last_outbound_tcp_header;
++	/* ponytail: one recent IPv4 template, not a packet history. On a
++	 * tuple/sequence/payload miss, retain the explicit synthetic quote.
++	 * IPv4 options need variable-sized quotes; do not truncate them here. */
++	struct ipv4 last_outbound_ipv4_header;
++	bool last_outbound_ipv4_valid;
+ 	struct tcp last_injected_tcp_header;
+ 	u32 last_injected_tcp_payload_len;
+ 
+@@ -231,6 +236,8 @@
+ 	 * TCP header.
+ 	 */
+ 	DEBUGP("set_icmp_echoed_tuple");
++	if (!packet->echoed_header)
++		return; /* RAW payload is not a generated TCP/UDP quote. */
+ 
+ 	/* Flip the direction of the tuple, since the ICMP message is
+ 	 * flowing in the direction opposite that of the echoed TCP/IP
+--- a/gtests/net/packetdrill/run_packet.c
++++ b/gtests/net/packetdrill/run_packet.c
+@@ -26,6 +26,7 @@
+ 
+ #include "types.h"
+ #include <arpa/inet.h>
++#include <errno.h>
+ #include <netinet/in.h>
+ #include <stddef.h>
+ #include <stdlib.h>
+@@ -533,6 +534,58 @@
+ }
+ 
+ 
++/* Capture before tcp_convert_seq_number mutates the live sequence. Only
++ * fixed-size IPv4 headers fit the runner's existing 28-byte quote format. */
++static void remember_outbound_ip_header(struct socket *socket,
++                                       const struct packet *packet)
++{
++	socket->last_outbound_ipv4_valid = false;
++	if (packet->ipv4 && packet->tcp && packet->ipv4->ihl == 5 &&
++	    packet->ipv4->protocol == IPPROTO_TCP &&
++	    ntohs(packet->ipv4->tot_len) == sizeof(struct ipv4) +
++	        packet->tcp->doff * 4 + packet_payload_len(packet)) {
++		socket->last_outbound_ipv4_header = *packet->ipv4;
++		socket->last_outbound_ipv4_valid = true;
++	}
++}
++
++/* Only the unmodified constructor template is eligible. In particular,
++ * raw quotes and explicit checksum/length/header edits are not repaired. */
++static bool generated_icmpv4_quote(const struct packet *packet)
++{
++	return packet->icmpv4 && packet->echoed_header &&
++	       (packet->flags & FLAG_ICMP_ECHO_GENERATED) &&
++	       !memcmp(packet_echoed_ipv4_header(packet),
++	               &packet->generated_echo_ipv4, sizeof(struct ipv4));
++}
++
++static void complete_icmpv4_quote(struct socket *socket, struct packet *packet)
++{
++	struct ipv4 *quote = packet_echoed_ipv4_header(packet);
++	const struct ipv4 *ip = &socket->last_outbound_ipv4_header;
++	const struct tcp *tcp = &socket->last_outbound_tcp_header;
++	struct tcp *echo = packet_echoed_tcp_header(packet);
++
++	/* Keep explicit sequence and payload meaning, including deliberately
++	 * nonmatching quotes. Omission still maps sequence 0, as upstream does;
++	 * it is not permission to pick an unrelated last outbound sequence. */
++	if (echo && socket->last_outbound_ipv4_valid &&
++	    quote->src_ip.s_addr == ip->src_ip.s_addr &&
++	    quote->dst_ip.s_addr == ip->dst_ip.s_addr &&
++	    echo->src_port == tcp->src_port && echo->dst_port == tcp->dst_port &&
++	    echo->seq == tcp->seq &&
++	    ((packet->flags & FLAG_ICMP_ECHO_UNSPECIFIED) ||
++	     ntohs(quote->tot_len) - sizeof(struct ipv4) - sizeof(struct tcp) ==
++	     ntohs(ip->tot_len) - sizeof(struct ipv4) - tcp->doff * 4))
++		*quote = *ip;
++
++	/* Final live addresses and actual original total length, even though
++	 * only 28 bytes are included. There is no complete quoted TCP checksum
++	 * to calculate. send_live_ip_packet checksums enclosing ICMP afterwards. */
++	quote->check = 0;
++	quote->check = ipv4_checksum(quote, sizeof(*quote));
++}
++
+ /* Rewrite the TCP sequence number echoed by the ICMP packet.
+  * The Linux TCP layer ignores ICMP messages with bogus sequence numbers.
+  */
+@@ -581,6 +634,7 @@
+ 	struct socket *socket, struct packet *live_packet, char **error)
+ {
+ 	DEBUGP("map_inbound_packet\n");
++	bool generated_quote = generated_icmpv4_quote(live_packet);
+ 
+ 	/* Remap packet to live values. */
+ 	struct tuple live_inbound;
+@@ -611,8 +665,12 @@
+ 
+ 	live_packet->mss = state->config->mss;
+ 
+-	if ((live_packet->icmpv4 != NULL) || (live_packet->icmpv6 != NULL))
+-		return map_inbound_icmp_packet(socket, live_packet, error);
++	if ((live_packet->icmpv4 != NULL) || (live_packet->icmpv6 != NULL)) {
++		int result = map_inbound_icmp_packet(socket, live_packet, error);
++		if (result == STATUS_OK && generated_quote)
++			complete_icmpv4_quote(socket, live_packet);
++		return result;
++	}
+ 
+ 	/* If no TCP headers to rewrite, then we're done. */
+ 	if (live_packet->tcp == NULL)
+@@ -1850,6 +1908,7 @@
+ 		 */
+ 		if (live_packet->tcp) {
+ 			socket->last_outbound_tcp_header = *(live_packet->tcp);
++			remember_outbound_ip_header(socket, live_packet);
+ 			/* Rewrite TCP sequence number */
+ 			if (tcp_convert_seq_number(socket, live_packet, error))
+ 				goto out;
+@@ -1977,7 +2036,7 @@
+ 
+ /* Checksum the packet and inject it into the kernel under test. */
+ static int send_live_ip_packet(struct state *state,
+-			       struct packet *packet)
++			       struct packet *packet, char **error)
+ {
+ 	assert(packet->ip_bytes > 0);
+ 	/* We do IPv4 and IPv6 */
+@@ -1993,7 +2052,16 @@
+ 			return STATUS_ERR;
+ 	}
+ 
+-	return netdev_send(state->netdev, packet);
++	errno = 0;
++	int result = netdev_send(state->netdev, packet);
++	int saved_errno = errno;
++	if (result != STATUS_OK) {
++		asprintf(error, "netdev_send failed (status %d, errno %d: %s)",
++		         result, saved_errno, saved_errno ? strerror(saved_errno) :
++		         "callback did not set errno");
++	}
++	errno = saved_errno;
++	return result;
+ }
+ 
+ /* Perform the action implied by an inbound packet in a script */
+@@ -2049,7 +2117,7 @@
+ 	}
+ 
+ 	/* Inject live packet into kernel. */
+-	result = send_live_ip_packet(state, live_packet);
++	result = send_live_ip_packet(state, live_packet, error);
+ 
+ out:
+ 	packet_free(live_packet);
+@@ -2161,7 +2229,8 @@
+ 	set_packet_tuple(packet, &live_inbound);
+ 
+ 	/* Inject live packet into kernel. */
+-	result = send_live_ip_packet(state, packet);
++	result = send_live_ip_packet(state, packet, &error);
++	free(error);
+ 
+ 	packet_free(packet);
+ 
