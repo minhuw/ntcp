@@ -681,3 +681,236 @@ fn recognized_crossing_syn_admission_preserves_synack_and_ordinary_data() {
         }
     }
 }
+
+// The packetdrill crossing trace, with optional wrap, SACK/TS and ordinary SYN text.
+fn simultaneous_syn_dsack_setup(
+    irs: u32,
+    sack: bool,
+    timestamps: bool,
+    fast_open: bool,
+) -> (Connection, wire::Segment<'static>) {
+    let mut cfg = config(8192, 1460);
+    cfg.delayed_ack_us = 0; // Match the existing upstream-fastopen profile.
+    cfg.sack = sack;
+    cfg.timestamps = timestamps;
+    let mut a = Connection::active(tuple(), cfg, 0, 0).unwrap();
+    let mut cache = crate::fast_open::FastOpen::new().unwrap();
+    cache.learn(
+        0,
+        tuple().local.ip(),
+        tuple().remote.ip(),
+        wire::FastOpenCookie::new(&[0xab, 0xcd, 0x12, 0x34]).unwrap(),
+        1460,
+    );
+    a.prepare_fast_open(
+        cache.get(0, 100, tuple().local.ip(), tuple().remote.ip()),
+        &[42; 1000],
+    )
+    .unwrap();
+    let bytes = packet(&mut a, 0);
+    let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+    assert_eq!(syn.header.sequence, 0);
+    assert_eq!(syn.payload, &[42; 1000]);
+    let mut peer = wire::Segment {
+        header: wire::Header {
+            source_port: tuple().remote.port(),
+            destination_port: tuple().local.port(),
+            sequence: irs,
+            acknowledgment: 0,
+            flags: SYN,
+            window: 14600,
+            urgent_pointer: 0,
+        },
+        options: wire::Options {
+            mss: Some(1040),
+            window_scale: Some(6),
+            sack_permitted: sack,
+            timestamps: timestamps.then_some((7, 0)),
+            fast_open: fast_open
+                .then(|| wire::FastOpenCookie::new(&[0x87, 0x65, 0x43, 0x21]).unwrap()),
+            ..Default::default()
+        },
+        raw_options: &[],
+        payload: &[43; 500],
+    };
+    a.input(5_000, &peer).unwrap();
+    assert_eq!(a.state(), State::SynReceived);
+    assert_eq!(a.read(&mut [0; 500]), Err(Error::WouldBlock));
+    assert_eq!(a.receive_used, if fast_open { 0 } else { 500 });
+    let bytes = packet(&mut a, 5_000);
+    let reply = wire::parse(ip(tuple()), &bytes).unwrap();
+    assert_eq!(reply.header.flags, SYN | ACK);
+    assert_eq!(reply.header.sequence, 0);
+    assert_eq!(
+        reply.header.acknowledgment,
+        irs.wrapping_add(if fast_open { 1 } else { 501 })
+    );
+    assert!(reply.payload.is_empty());
+    assert!(reply.options.fast_open.is_none());
+    assert_eq!(reply.options.sack_blocks, [None; 4]);
+    peer.header.flags = SYN | ACK;
+    peer.header.acknowledgment = 1001;
+    peer.options.mss = Some(940);
+    peer.options.fast_open = Some(wire::FastOpenCookie::new(&[0x12, 0x34, 0x56, 0x78]).unwrap());
+    peer.payload = &[];
+    (a, peer)
+}
+
+#[test]
+fn simultaneous_syn_dsack_crossing_trace_retry_wrap_and_sack_off() {
+    for irs in [1234, u32::MAX] {
+        for sack in [false, true] {
+            for reserved in [false, true] {
+                let (mut a, mut peer) = simultaneous_syn_dsack_setup(irs, sack, false, true);
+                a.input(50_000, &peer).unwrap();
+                assert_eq!(a.state(), State::Established);
+                assert_eq!(a.acknowledged, 1000);
+                assert_eq!(a.receive_used, 0);
+                assert_eq!(a.read(&mut [0; 500]), Err(Error::WouldBlock));
+                assert_eq!(a.peer_mss, 1040); // Completion must not renegotiate MSS.
+                assert_eq!(
+                    a.transmit_selected(50_000, &mut [0; 19], reserved),
+                    Err(Error::OutputTooSmall)
+                );
+                let mut now = 50_000;
+                let bytes = selected_packet(&mut a, &mut now, reserved).unwrap();
+                let reply = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(reply.header.flags, ACK);
+                assert_eq!(reply.header.sequence, 1001);
+                assert_eq!(reply.header.acknowledgment, irs.wrapping_add(1));
+                assert!(reply.payload.is_empty());
+                assert_eq!(
+                    reply.options.sack_blocks,
+                    [sack.then_some((irs, irs.wrapping_add(1))), None, None, None]
+                );
+                assert_eq!(bytes.len(), if sack { 32 } else { 20 });
+                assert!(selected_packet(&mut a, &mut now, reserved).is_none());
+                // An unrelated output, without a new arrival, cannot repeat the report.
+                a.immediate_ack();
+                let bytes = selected_packet(&mut a, &mut now, reserved).unwrap();
+                assert_eq!(
+                    wire::parse(ip(tuple()), &bytes)
+                        .unwrap()
+                        .options
+                        .sack_blocks,
+                    [None; 4]
+                );
+
+                // The rejected 500 bytes are delivered only on ordinary retransmission.
+                peer.header.sequence = irs.wrapping_add(1);
+                peer.header.acknowledgment = 1000;
+                peer.header.flags = PSH | ACK;
+                peer.header.window = 257;
+                peer.options = wire::Options::default();
+                peer.payload = &[43; 500];
+                a.input(150_000, &peer).unwrap();
+                let bytes = packet(&mut a, 150_000);
+                let reply = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(reply.header.acknowledgment, irs.wrapping_add(501));
+                assert_eq!(reply.options.sack_blocks, [None; 4]);
+                let mut out = [0; 500];
+                assert_eq!(a.read(&mut out), Ok(500));
+                assert_eq!(out, [43; 500]);
+                a.input(150_001, &peer).unwrap();
+                assert_eq!(a.read(&mut out), Err(Error::WouldBlock));
+                let bytes = packet(&mut a, 150_001);
+                assert_eq!(
+                    wire::parse(ip(tuple()), &bytes)
+                        .unwrap()
+                        .options
+                        .sack_blocks,
+                    [
+                        sack.then_some((irs.wrapping_add(1), irs.wrapping_add(501))),
+                        None,
+                        None,
+                        None
+                    ]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn simultaneous_syn_dsack_validated_completion_only() {
+    for irs in [1234, u32::MAX] {
+        for (seq, ack, flags, ts) in [
+            (irs.wrapping_add(1), 1001, SYN | ACK, Some((7, 0))),
+            (irs.wrapping_sub(1), 1001, SYN | ACK, Some((7, 0))),
+            (irs, 0, SYN | ACK, Some((7, 0))),
+            (irs, 1002, SYN | ACK, Some((7, 0))),
+            (irs, 1001, SYN | ACK | FIN, Some((7, 0))),
+            (irs, 1001, SYN | ACK | RST, Some((7, 0))),
+            (irs, 1001, SYN, Some((7, 0))),
+            (irs, 1001, ACK, Some((7, 0))),
+            (irs, 1001, SYN | ACK, None),
+            (irs, 1001, SYN | ACK, Some((6, 0))),
+        ] {
+            let (mut a, mut peer) = simultaneous_syn_dsack_setup(irs, true, true, true);
+            peer.header.sequence = seq;
+            peer.header.acknowledgment = ack;
+            peer.header.flags = flags;
+            peer.options.timestamps = ts;
+            a.input(50_000, &peer).unwrap();
+            assert_eq!(a.state(), State::SynReceived);
+            assert_eq!(a.receive.next(), Seq(irs.wrapping_add(1)));
+            assert_eq!(a.receive_used, 0);
+            assert_eq!(a.acknowledged, 0);
+            assert_eq!(a.ts_recent, 7);
+            assert_eq!(a.receive.sack_blocks(4), [None; 4]);
+            let mut now = 50_000;
+            if let Some(bytes) = selected_packet(&mut a, &mut now, false) {
+                assert_eq!(
+                    wire::parse(ip(tuple()), &bytes)
+                        .unwrap()
+                        .options
+                        .sack_blocks,
+                    [None; 4]
+                );
+            }
+        }
+        let (mut a, peer) = simultaneous_syn_dsack_setup(irs, true, true, true);
+        a.sack_omit = true; // Empty receive_text must not suppress this new report.
+        a.input(50_000, &peer).unwrap();
+        assert_eq!(a.state(), State::Established);
+        let bytes = packet(&mut a, 50_000);
+        let reply = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert!(reply.options.timestamps.is_some());
+        assert_eq!(
+            reply.options.sack_blocks[0],
+            Some((irs, irs.wrapping_add(1)))
+        );
+        // Once synchronized, even the identical SYN+ACK is only challenged.
+        a.input(50_001, &peer).unwrap();
+        let bytes = packet(&mut a, 50_001);
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes)
+                .unwrap()
+                .options
+                .sack_blocks,
+            [None; 4]
+        );
+    }
+}
+
+#[test]
+fn simultaneous_syn_dsack_preserves_payload_report() {
+    for fast_open in [false, true] {
+        let (mut a, mut peer) = simultaneous_syn_dsack_setup(u32::MAX, true, false, fast_open);
+        peer.payload = &[43; 500];
+        a.input(50_000, &peer).unwrap();
+        assert_eq!(a.state(), State::Established);
+        assert_eq!(a.receive_used, 500);
+        let bytes = packet(&mut a, 50_000);
+        let reply = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!(reply.header.acknowledgment, 500);
+        assert_eq!(
+            reply.options.sack_blocks,
+            [(!fast_open).then_some((0, 500)), None, None, None]
+        );
+        let mut out = [0; 500];
+        assert_eq!(a.read(&mut out), Ok(500));
+        assert_eq!(out, [43; 500]);
+        assert_eq!(a.read(&mut out), Err(Error::WouldBlock));
+    }
+}

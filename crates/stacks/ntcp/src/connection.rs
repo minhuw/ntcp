@@ -4366,6 +4366,12 @@ impl Connection {
             self.last_received = now;
             self.immediate_ack();
             self.receive_text(seq.wrapping_add(1), segment);
+            if self.sack_send && segment.payload.is_empty() {
+                // Linux-compatible D-SACK of the repeated SYN sequence only,
+                // not rejected Fast Open text. Preserve any payload D-SACK.
+                self.receive.record_duplicate(seq, 1);
+                self.sack_omit = false;
+            }
             self.arm_work();
             return Ok(());
         }
