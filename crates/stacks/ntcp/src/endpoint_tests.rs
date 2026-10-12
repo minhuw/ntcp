@@ -5288,7 +5288,7 @@ fn listener_rx_timestamp_snapshot_syn_third_ack_parent_change_and_reuse() {
     let mut out = [0; 128];
     let reply = b.poll_transmit(2, &mut out, 16).unwrap().packet.unwrap();
     let synack = wire::parse(reply.ip, &out[..reply.len]).unwrap().header;
-    assert_eq!(synack.acknowledgment, 1); // SYN plus early payload crosses wire wrap.
+    assert_eq!(synack.acknowledgment, u32::MAX - 1); // Only SYN is acknowledged.
     b.input_with_timestamps(3, ip, 0, Ipv4Options::default(), &syn[..syn_len], stamps(9))
         .unwrap();
     assert_eq!(b.connection_id(tuple), Some(child));
@@ -5303,7 +5303,7 @@ fn listener_rx_timestamp_snapshot_syn_third_ack_parent_change_and_reuse() {
             ..syn_header
         },
         &[],
-        b"de",
+        b"XXXde",
         &mut third,
     )
     .unwrap();
@@ -5326,6 +5326,9 @@ fn listener_rx_timestamp_snapshot_syn_third_ack_parent_change_and_reuse() {
         b.peek_rx_timestamps(child, 5).unwrap().unwrap().timestamps,
         stamps(2)
     );
+    let mut retained = [0; 5];
+    assert_eq!(b.peek(child, &mut retained), Ok(5));
+    assert_eq!(&retained, b"abcde"); // Completing ACK cannot overwrite original SYN text.
     assert_eq!(b.accept(listener).unwrap(), child);
     // Future children snapshot new policy, even before the adapter can see them.
     let next_header = wire::Header {

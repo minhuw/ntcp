@@ -1386,7 +1386,7 @@ fn fast_open_disabled_listener_recognized_options_only_fallback() {
                     let tx = b.poll_transmit(10, &mut bytes, 64).unwrap().packet.unwrap();
                     let child = tx.connection.unwrap();
                     let reply = wire::parse(tx.ip, &bytes[..tx.len]).unwrap();
-                    let next = sequence.wrapping_add(if recognized { 1 } else { 4 });
+                    let next = sequence.wrapping_add(1);
                     assert_eq!(reply.header.acknowledgment, next);
                     assert!(reply.options.fast_open.is_none()); // Disabled listeners issue no cookies.
                     assert!(reply.options.sack_permitted);
@@ -1422,6 +1422,95 @@ fn fast_open_disabled_listener_recognized_options_only_fallback() {
                         assert_eq!(b.read(child, &mut bytes), Ok(3));
                         assert_eq!(&bytes[..3], b"abc");
                     }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ordinary_and_foexp_syn_text_ack_only_syn_then_deliver_once() {
+    for v6 in [false, true] {
+        for reserved in [false, true] {
+            for options in [&[][..], &[254, 4, 0xf9, 0x89][..]] {
+                for retransmit in [false, true] {
+                    let (local, remote) = addresses(v6, 40000);
+                    let mut endpoint =
+                        Endpoint::new(EndpointConfig::default(), [2; 32], 0, |_| true).unwrap();
+                    if reserved {
+                        endpoint.enable_output_reservations().unwrap();
+                    }
+                    let listener = endpoint.listen(remote, 4).unwrap();
+                    let ip = IpMetadata {
+                        source: local.ip(),
+                        destination: remote.ip(),
+                    };
+                    let header = wire::Header {
+                        source_port: local.port(),
+                        destination_port: remote.port(),
+                        sequence: 0,
+                        acknowledgment: 0,
+                        flags: wire::SYN,
+                        window: 8192,
+                        urgent_pointer: 0,
+                    };
+                    let mut bytes = [0; 2048];
+                    let n = wire::encode(ip, header, options, b"0123456789", &mut bytes).unwrap();
+                    endpoint.input(0, ip, &bytes[..n]).unwrap();
+                    assert!(endpoint.accept(listener).is_err());
+                    let tx = if reserved {
+                        let (output, attempt) =
+                            endpoint.poll_reserved_transmit(1, &mut bytes, 64).unwrap();
+                        let tx = output.packet.unwrap();
+                        let original = bytes[..tx.len].to_vec();
+                        let attempt = attempt.unwrap();
+                        assert_eq!(
+                            wire::parse(tx.ip, &original).unwrap().header.acknowledgment,
+                            1
+                        );
+                        assert!(endpoint.reject_unsubmitted(attempt).unwrap());
+                        let (output, retry) =
+                            endpoint.poll_reserved_transmit(1, &mut bytes, 64).unwrap();
+                        let retry_tx = output.packet.unwrap();
+                        assert_eq!(&bytes[..retry_tx.len], original.as_slice());
+                        assert!(endpoint.accept_transmit(1, retry.unwrap()).unwrap());
+                        retry_tx
+                    } else {
+                        endpoint
+                            .poll_transmit(1, &mut bytes, 64)
+                            .unwrap()
+                            .packet
+                            .unwrap()
+                    };
+                    let child = tx.connection.unwrap();
+                    let reply = wire::parse(tx.ip, &bytes[..tx.len]).unwrap();
+                    assert_eq!(reply.header.acknowledgment, 1); // Both original ordinary server fixtures.
+                    assert!(reply.options.fast_open.is_none()); // FOEXP is not receive authorization.
+                    assert_eq!(endpoint.readable_bytes(child).unwrap(), 0);
+                    let ack = wire::Header {
+                        sequence: 1,
+                        acknowledgment: reply.header.sequence.wrapping_add(1),
+                        flags: wire::ACK,
+                        ..header
+                    };
+                    let n = wire::encode(
+                        ip,
+                        ack,
+                        &[],
+                        if retransmit { b"XXXXXXXXXX" } else { b"" },
+                        &mut bytes,
+                    )
+                    .unwrap();
+                    let final_ack = bytes[..n].to_vec();
+                    endpoint.input(2, ip, &final_ack).unwrap();
+                    assert_eq!(endpoint.accept(listener).unwrap(), child);
+                    endpoint.input(3, ip, &final_ack).unwrap();
+                    assert_eq!(endpoint.read(child, &mut bytes), Ok(10));
+                    assert_eq!(&bytes[..10], b"0123456789");
+                    assert_eq!(
+                        endpoint.read(child, &mut bytes),
+                        Err(Error::WouldBlock.into())
+                    );
                 }
             }
         }

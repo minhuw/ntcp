@@ -954,6 +954,7 @@ impl Endpoint {
                 iss,
                 self.now,
                 syn,
+                accept_syn_data && syn.options.fast_open.is_some(),
                 &mut receive,
                 rx_timestamps,
                 timestamps,
@@ -4816,6 +4817,33 @@ mod recovery_observation_tests {
             }),
             hardware: None,
         };
+        let establish = |endpoint: &mut Endpoint, child: ConnectionId| {
+            let mut out = [0; 128];
+            let tx = endpoint
+                .poll_transmit(4, &mut out, 16)
+                .unwrap()
+                .packet
+                .unwrap();
+            let reply = wire::parse(tx.ip, &out[..tx.len]).unwrap();
+            assert_eq!(reply.header.acknowledgment, 101);
+            let header = Header {
+                source_port: tuple.remote.port(),
+                destination_port: tuple.local.port(),
+                sequence: 101,
+                acknowledgment: reply.header.sequence.wrapping_add(1),
+                flags: ACK,
+                window: 64,
+                urgent_pointer: 0,
+            };
+            let n = wire::encode(ip, header, &[], &[], &mut out).unwrap();
+            endpoint.input(5, ip, &out[..n]).unwrap();
+            assert_eq!(
+                endpoint.slot(child).unwrap().connection.rx_timestamps.at(2),
+                stamps
+            );
+            assert_eq!(endpoint.peek(child, &mut out), Ok(3));
+            assert_eq!(&out[..3], b"abc");
+        };
         let base = Connection::allocation_bytes(17, 17, 8).unwrap();
         let metadata = RxTimestamps::allocation_bytes(2).unwrap();
         for preallocate in [0, 1] {
@@ -4895,6 +4923,7 @@ mod recovery_observation_tests {
                 endpoint.slot(child).unwrap().connection.rx_timestamps.at(0),
                 stamps
             );
+            establish(&mut endpoint, child);
 
             // Walk every constructor allocation, not just the first metadata reserve.
             let mut failures = 0;
@@ -4917,6 +4946,7 @@ mod recovery_observation_tests {
                         endpoint.slot(child).unwrap().connection.rx_timestamps.at(2),
                         stamps
                     );
+                    establish(&mut endpoint, child);
                     assert_eq!(endpoint.buffer_bytes(), base + metadata);
                     succeeded = true;
                     break;

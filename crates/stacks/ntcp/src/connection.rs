@@ -539,6 +539,11 @@ struct SackRecovery {
     pipe: u32,
 }
 
+struct DeferredSyn {
+    received_at: Instant,
+    urgent: Option<u64>,
+}
+
 pub(crate) struct Connection {
     tuple: Tuple,
     config: ConnectionConfig,
@@ -620,6 +625,7 @@ pub(crate) struct Connection {
     // LegacyInitialCredit only: prior ACK delivery, capped and bound to its timer.
     rack_entry_delivery: Option<(u64, u32)>,
     receive_used: usize,
+    deferred_syn: Option<DeferredSyn>,
     sack_omit: bool,
     sack_data_turn: bool,
     ts_recent: u32,
@@ -894,6 +900,7 @@ impl Connection {
             prr_exit_trace: None,
             rack_entry_delivery: None,
             receive_used: 0,
+            deferred_syn: None,
             sack_omit: false,
             sack_data_turn: false,
             ts_recent: 0,
@@ -1003,6 +1010,7 @@ impl Connection {
             iss,
             now,
             syn,
+            false,
             &mut None,
             RxTimestamps::default(),
             RxPacketTimestamps::default(),
@@ -1020,6 +1028,7 @@ impl Connection {
         iss: u32,
         now: Instant,
         syn: &Segment<'_>,
+        authenticated_syn: bool,
         receive: &mut Option<ReceiveBuffer>,
         rx_timestamps: RxTimestamps,
         timestamps: RxPacketTimestamps,
@@ -1032,7 +1041,8 @@ impl Connection {
         connection.rx_timestamps = rx_timestamps;
         connection.input_timestamps = timestamps;
         connection.passive_open = true;
-        connection.learn_syn(syn);
+        connection.fast_open_early = authenticated_syn && !syn.payload.is_empty();
+        connection.learn_syn(syn, authenticated_syn);
         connection.input_timestamps = RxPacketTimestamps::default();
         connection.state = State::SynReceived;
         Ok(connection)
@@ -1188,7 +1198,13 @@ impl Connection {
             self.syn_window = if self.receive.eof() {
                 0
             } else {
-                receive.min(65535).saturating_sub(self.receive_used) as u16
+                receive
+                    .min(65535)
+                    .saturating_sub(if self.deferred_syn.is_some() {
+                        0
+                    } else {
+                        self.receive_used
+                    }) as u16
             };
             if self.irs.is_some() {
                 self.advertised_edge = self.receive.next().wrapping_add(self.syn_window as u32);
@@ -2984,7 +3000,7 @@ impl Connection {
     //# Window Scale option is received with a shift.cnt value larger than
     //# 14, the TCP SHOULD log the error but MUST use 14 instead of the
     //# specified value.
-    fn learn_syn(&mut self, syn: &Segment<'_>) {
+    fn learn_syn(&mut self, syn: &Segment<'_>, authenticated_syn: bool) {
         self.learn_ecn(syn.header.flags);
         self.sack_send |= self.config.sack && syn.options.sack_permitted;
         self.timestamps = self.config.timestamps && syn.options.timestamps.is_some();
@@ -3051,6 +3067,33 @@ impl Connection {
         self.wl2 = Seq(syn.header.acknowledgment);
         let count = syn.payload.len().min(self.syn_window as usize);
         let fin = syn.header.flags & FIN != 0 && syn.payload.len() < self.syn_window as usize;
+        let urgent = (syn.header.flags & URG != 0 && syn.header.urgent_pointer > 1)
+            .then(|| (syn.header.urgent_pointer - 1) as u64);
+        if !authenticated_syn {
+            if count == 0 && !fin && urgent.is_none() {
+                return;
+            }
+            // Conservative RFC 9293 reference ordering: retain ordinary SYN
+            // text, but do not process it until validated establishment. The
+            // staged prefix occupies the same window slots, not extra credit.
+            self.receive.defer_syn(
+                &syn.payload[..count],
+                fin,
+                syn.header.flags & PSH != 0 && count == syn.payload.len(),
+            );
+            // Keep first-arrival metadata in its existing bounded store. It is
+            // unreadable until promotion, but still constrains metadata resize.
+            if count != 0 {
+                self.rx_timestamps
+                    .insert(0, count as u64, self.input_timestamps);
+            }
+            self.deferred_syn = Some(DeferredSyn {
+                received_at: self.now,
+                urgent,
+            });
+            self.receive_used = count;
+            return;
+        }
         let outcome = self.receive_payload(
             start,
             &syn.payload[..count],
@@ -3067,9 +3110,7 @@ impl Connection {
         } else {
             self.syn_window -= count as u16;
         }
-        if syn.header.flags & URG != 0 && syn.header.urgent_pointer > 1 {
-            self.rcv_up = Some((syn.header.urgent_pointer - 1) as u64);
-        }
+        self.rcv_up = urgent;
     }
 
     // syn_timed_out imposes >=3s until fresh data sample; synack_timeout_roles_first_data_and_fresh_sample_guard asserts passive/simultaneous timeout deadlines and release, active role covered by tlp_small_rto_floor_preserves_initial_and_syn_timeout_guard.
@@ -3176,6 +3217,17 @@ impl Connection {
         }
         self.handshake_complete = true;
         self.last_data_received = self.now;
+        if let Some(deferred) = self.deferred_syn.take() {
+            let count = self.receive.promote_syn().expect("staged SYN prefix");
+            self.received_total = count as u64;
+            self.rcv_up = deferred.urgent;
+            if count != 0 {
+                self.last_data_received = deferred.received_at;
+            }
+            if count != 0 || self.receive.eof() {
+                self.immediate_ack();
+            }
+        }
         if self.state == State::SynSent || self.state == State::SynReceived {
             self.state = State::Established;
         }
@@ -3214,6 +3266,15 @@ impl Connection {
     //= reason=Terminal entry disables receive/send ECN commitment and clears echo/CWR; TIME-WAIT/CLOSED tests assert ignored negotiation and fresh same-tuple connections require new setup.
     //# When a TCP host enters TIME-WAIT or CLOSED state, it should ignore any previous state about the negotiation of ECN for that connection.
     fn terminal(&mut self, reason: CloseReason) {
+        if self.deferred_syn.take().is_some() {
+            let next = self.receive.next();
+            self.receive.clear();
+            self.rx_timestamps.clear();
+            self.receive
+                .reset_start(next)
+                .expect("cleared receive buffer");
+            self.receive_used = 0;
+        }
         self.state = State::Closed;
         self.congestion.commit_probe_response();
         if let Some(p) = &mut self.pmtud {
@@ -4145,14 +4206,17 @@ impl Connection {
                 let mut header = segment.header;
                 header.flags &= !(FIN | PSH | URG);
                 header.urgent_pointer = 0;
-                self.learn_syn(&Segment {
-                    header,
-                    options: segment.options,
-                    raw_options: segment.raw_options,
-                    payload: &[],
-                });
+                self.learn_syn(
+                    &Segment {
+                        header,
+                        options: segment.options,
+                        raw_options: segment.raw_options,
+                        payload: &[],
+                    },
+                    false,
+                );
             } else {
-                self.learn_syn(segment);
+                self.learn_syn(segment, false);
             }
             self.last_received = now;
             if valid_ack {
@@ -4326,7 +4390,8 @@ impl Connection {
         // a retry only repeats our existing SYN-ACK and receive commitment.
         if self.handshake_pending()
             && self.irs == Some(seq)
-            && h.flags & (SYN | ACK | RST | FIN) == SYN
+            && h.flags & (SYN | ACK | RST) == SYN
+            && (h.flags & FIN == 0 || self.deferred_syn.is_some())
         {
             self.learn_ecn(h.flags);
             self.sack_send |= self.config.sack && segment.options.sack_permitted;
@@ -9744,6 +9809,10 @@ mod tests {
         include!("fast_open_connection_tests.rs");
     }
 
+    mod syn_deferral {
+        include!("connection_syn_deferral_tests.rs");
+    }
+
     mod ecn_prr {
         include!("connection_ecn_prr_tests.rs");
     }
@@ -10365,21 +10434,11 @@ mod tests {
                     .unwrap();
                 assert_eq!(connection.receive.next(), next);
                 assert_eq!(connection.receive_used, syn.payload.len());
-                assert_eq!(
-                    connection.syn_window as usize,
-                    if fin {
-                        0
-                    } else {
-                        receive.min(65535).saturating_sub(syn.payload.len())
-                    }
-                );
+                assert_eq!(connection.syn_window as usize, receive.min(65535));
             }
             let bytes = packet(&mut connection, 0);
             let offer = wire::parse(ip(connection.tuple()), &bytes).unwrap();
-            assert_eq!(
-                offer.header.window as usize,
-                if fin { 0 } else { 65535 - syn.payload.len() }
-            );
+            assert_eq!(offer.header.window as usize, 65535);
             assert_eq!(offer.options.window_scale, Some(3));
             inject(&mut connection, 10, next, Seq(101), ACK, 1024, b"");
             let mut payload = [0; 64];
@@ -18765,7 +18824,7 @@ mod tests {
         let bytes = packet(&mut a, 20);
         let synack = wire::parse(ip(tuple()), &bytes).unwrap();
         assert_eq!(synack.header.flags & (SYN | ACK), SYN | ACK);
-        assert_eq!(synack.header.acknowledgment, 2);
+        assert_eq!(synack.header.acknowledgment, u32::MAX);
         inject(&mut a, 30, Seq(2), Seq(101), ACK, 64, b"");
         assert_eq!(a.state(), State::Established);
         let events = a.take_events();
@@ -20165,21 +20224,21 @@ mod tests {
         let mut uncompleted =
             Connection::passive(reverse(tuple()), config(64, 8), 900, 0, &syn).unwrap();
         uncompleted.abort();
-        assert_eq!(uncompleted.receive.readable(), 3);
+        assert_eq!(uncompleted.receive.readable(), 0);
         assert_eq!(uncompleted.terminal_readable_bytes(), 0);
         assert_eq!(uncompleted.peek_terminal(&mut [0; 8]), Ok(0));
         assert_eq!(uncompleted.read_terminal(&mut [0; 8]), Ok(0));
-        assert_eq!(uncompleted.receive_used, 3);
+        assert_eq!(uncompleted.receive_used, 0);
         let mut b = Connection::passive(reverse(tuple()), config(64, 8), 900, 0, &syn).unwrap();
-        assert_eq!(b.receive.next(), Seq(2));
+        assert_eq!(b.receive.next(), Seq(u32::MAX));
         assert!(!b.events_pending());
         assert_eq!(b.read(&mut [0; 8]), Err(Error::WouldBlock));
         assert_eq!(b.peek(&mut [0; 8]), Err(Error::WouldBlock));
         assert_eq!(b.urgent_remaining(), 0);
         let synack_bytes = packet(&mut b, 10);
         let synack = wire::parse(ip(reverse(tuple())), &synack_bytes).unwrap();
-        assert_eq!(synack.header.acknowledgment, 2);
-        assert_eq!(synack.header.window, 61);
+        assert_eq!(synack.header.acknowledgment, u32::MAX);
+        assert_eq!(synack.header.window, 64);
         inject(&mut b, 20, Seq(2), Seq(901), ACK, 64, b"");
         let events = b.take_events();
         assert!(events.connected && events.readable);
@@ -26966,7 +27025,7 @@ mod tests {
         b.set_timestamp_offset(42);
         assert_eq!(b.peer_scale, 14);
         assert_eq!(b.take_events().invalid_window_scale, Some(255));
-        b.learn_syn(&syn);
+        b.learn_syn(&syn, false);
         assert_eq!(b.take_events().invalid_window_scale, None);
         deliver(&mut b, &mut a, 2_000);
         deliver(&mut a, &mut b, 2_000);

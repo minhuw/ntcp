@@ -181,6 +181,8 @@ pub(crate) struct ReceiveBuffer {
     read_base: Seq,
     head: usize,
     contiguous_len: usize,
+    // Initialized prefix in the existing ring, not yet admitted to receive state.
+    deferred_syn: Option<(usize, bool, bool)>,
     fin_sequence: Option<Seq>,
     eof: bool,
     occupied: usize,
@@ -226,6 +228,7 @@ impl ReceiveBuffer {
             read_base: start,
             head: 0,
             contiguous_len: 0,
+            deferred_syn: None,
             fin_sequence: None,
             eof: false,
             occupied: 0,
@@ -236,6 +239,35 @@ impl ReceiveBuffer {
             pending_first: None,
             dsack: None,
         })
+    }
+
+    // Only the initial SYN prefix can be staged. No presence/reporting bits are
+    // published until validated establishment; next() remains IRS+1 throughout.
+    pub(crate) fn defer_syn(&mut self, payload: &[u8], fin: bool, push: bool) {
+        assert!(!self.has_data() && self.fin_sequence.is_none() && self.deferred_syn.is_none());
+        assert!(payload.len() <= self.capacity());
+        assert!(!fin || payload.len() < self.capacity());
+        for (offset, &byte) in payload.iter().enumerate() {
+            let index = self.index(offset);
+            self.data[index].write(byte);
+        }
+        self.deferred_syn = Some((payload.len(), fin, push));
+    }
+
+    pub(crate) fn promote_syn(&mut self) -> Option<usize> {
+        let (count, fin, push) = self.deferred_syn.take()?;
+        for offset in 0..count {
+            let index = self.index(offset);
+            self.set_present(index, true);
+        }
+        self.occupied = count;
+        self.contiguous_len = count;
+        self.pushed = push && count != 0;
+        if fin {
+            self.fin_sequence = Some(self.next());
+            self.eof = true;
+        }
+        Some(count)
     }
 
     pub(crate) fn storage_bytes(&self) -> usize {
@@ -274,6 +306,7 @@ impl ReceiveBuffer {
         self.read_base = Seq(0);
         self.head = 0;
         self.contiguous_len = 0;
+        self.deferred_syn = None;
         self.fin_sequence = None;
         self.eof = false;
         self.occupied = 0;
@@ -286,7 +319,7 @@ impl ReceiveBuffer {
     }
 
     pub(crate) fn reset_start(&mut self, start: Seq) -> Result<(), ()> {
-        if self.fin_sequence.is_some() || self.has_data() {
+        if self.fin_sequence.is_some() || self.has_data() || self.deferred_syn.is_some() {
             return Err(());
         }
         self.read_base = start;
@@ -321,7 +354,7 @@ impl ReceiveBuffer {
     }
 
     pub(crate) fn has_data(&self) -> bool {
-        self.occupied != 0
+        self.occupied != 0 || self.deferred_syn.is_some_and(|(count, _, _)| count != 0)
     }
 
     pub(crate) fn take_push(&mut self) -> bool {

@@ -379,11 +379,11 @@ fn ordinary_syn_data_remains_hidden_after_terminal_reset() {
         let mut b =
             Connection::passive(reverse(tuple()), config(8192, 536), 900, 0, &initial).unwrap();
         packet(&mut b, 10);
-        assert_eq!(b.receive.readable(), 3);
+        assert_eq!(b.receive.readable(), 0);
         assert_eq!(b.read(&mut [0; 3]), Err(Error::WouldBlock));
         let reset = wire::Segment {
             header: wire::Header {
-                sequence: 104,
+                sequence: 101,
                 flags,
                 ..initial.header
             },
@@ -569,15 +569,25 @@ fn passive_repair_ack_provenance_and_handshake_latch() {
                 let bytes = packet(&mut a, 0);
                 let mut syn = wire::parse(ip(tuple()), &bytes).unwrap();
                 syn.payload = payload;
-                let mut b =
-                    Connection::passive(reverse(tuple()), config(8192, 536), 900, 0, &syn).unwrap();
+                let mut b = Connection::passive_with_receive(
+                    reverse(tuple()),
+                    config(8192, 536),
+                    900,
+                    0,
+                    &syn,
+                    early,
+                    &mut None,
+                    RxTimestamps::default(),
+                    RxPacketTimestamps::default(),
+                )
+                .unwrap();
                 b.passive_fast_open(None, early);
                 assert!(!b.transport_info().syn_data_acked);
                 let bytes = packet(&mut b, 0);
                 let response = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
                 assert_eq!(
                     response.header.acknowledgment,
-                    iss.wrapping_add(1 + payload.len() as u32)
+                    iss.wrapping_add(1 + if early { payload.len() as u32 } else { 0 })
                 );
                 let eligible = early && !payload.is_empty();
                 assert_eq!(b.transport_info().syn_data_acked, eligible);
@@ -594,6 +604,11 @@ fn passive_repair_ack_provenance_and_handshake_latch() {
                 };
                 b.input(1, &ack).unwrap();
                 assert_eq!(b.state(), State::Established);
+                if !payload.is_empty() {
+                    let mut out = [0; 5];
+                    assert_eq!(b.read(&mut out), Ok(payload.len()));
+                    assert_eq!(&out[..payload.len()], payload);
+                }
                 assert_eq!(b.transport_info().syn_data_acked, eligible);
                 b.abort();
                 assert_eq!(b.transport_info().syn_data_acked, eligible);
@@ -641,7 +656,7 @@ fn recognized_crossing_syn_admission_preserves_synack_and_ordinary_data() {
                     a.input(10, &syn).unwrap();
                     assert_eq!(
                         a.receive.next(),
-                        Seq(sequence.wrapping_add(if fallback { 1 } else { 501 }))
+                        Seq(sequence.wrapping_add(if ack { 501 } else { 1 }))
                     );
                     assert_eq!(a.receive_used, if fallback { 0 } else { 500 });
                     assert_eq!(a.rcv_up, None);
@@ -654,12 +669,28 @@ fn recognized_crossing_syn_admission_preserves_synack_and_ordinary_data() {
                     // Recognized crossing SYN: ACK 1235, never 1735; normal SYN-ACK data is retained.
                     assert_eq!(
                         reply.header.acknowledgment,
-                        sequence.wrapping_add(if fallback { 1 } else { 501 })
+                        sequence.wrapping_add(if ack { 501 } else { 1 })
                     );
                     assert_eq!(
                         a.read(&mut [0; 512]),
                         if ack { Ok(500) } else { Err(Error::WouldBlock) }
                     );
+                    if !ack && !fallback {
+                        let final_ack = wire::Segment {
+                            header: wire::Header {
+                                sequence: sequence.wrapping_add(1),
+                                flags: ACK,
+                                ..syn.header
+                            },
+                            payload: &[],
+                            ..syn
+                        };
+                        a.input(30, &final_ack).unwrap();
+                        let mut retained = [0; 512];
+                        assert_eq!(a.read(&mut retained), Ok(500));
+                        assert_eq!(&retained[..500], &[42; 500]);
+                        assert_eq!(a.read(&mut retained), Err(Error::WouldBlock));
+                    }
                     if fallback {
                         assert!(!a.receive.eof());
                         let reset = wire::Segment {
