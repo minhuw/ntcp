@@ -27,6 +27,7 @@ impl Adapter {
             Profile::UpstreamEcn => "upstream-ecn",
             Profile::UpstreamBasic => "upstream-basic",
             Profile::UpstreamFastOpen => "upstream-fastopen",
+            Profile::UpstreamFastOpenAdaptiveAck => "upstream-fastopen-adaptive-ack",
             Profile::UpstreamFastOpenPmtud => "upstream-fastopen-pmtud",
             #[cfg(feature = "tfo-linux-cookie")]
             Profile::UpstreamFastOpenLinuxCookie => "upstream-fastopen-linux-cookie",

@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from run import (FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
+from run import (ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
                  fixture_command, HERE, PIN, adapt_source, check_plugin_hash, invoke, main, outcome,
                  preflight, profile_metadata, select_cases, variants, verify_backend)
 
@@ -476,7 +476,7 @@ class AdaptationChecks(unittest.TestCase):
         for name, entry in self.manifest['scripts'].items():
             if name in ('nagle/https_client.pkt', 'notsent_lowat/notsent-lowat-sysctl.pkt',
                         'syscall_bad_arg/fastopen-invalid-buf-ptr.pkt') or name in (
-                            LINUX_COOKIE_SCRIPTS | FASTOPEN_PMTUD_SCRIPTS):
+                            LINUX_COOKIE_SCRIPTS | FASTOPEN_PMTUD_SCRIPTS | ADAPTIVE_ACK_SCRIPTS):
                 path = self.directory / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 source = self.source.replace(b'`../common/defaults.sh`\n', entry['command_line'].encode())
@@ -780,7 +780,7 @@ class AdaptationChecks(unittest.TestCase):
                                  134217728 if cubic else 234881024
                                  if entry['adapter_flags'].split(',')[0] in
                                  {'upstream-fastopen', 'upstream-fastopen-linux-cookie',
-                                  'upstream-fastopen-pmtud'} else 33554432)
+                                  'upstream-fastopen-pmtud', 'upstream-fastopen-adaptive-ack'} else 33554432)
             if cubic:
                 self.assertTrue(any('bounded 128 MiB aggregate buffer budget' in reason
                                     for reason in entry['mapping']['reasons']))

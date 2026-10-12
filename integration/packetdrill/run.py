@@ -45,6 +45,18 @@ FASTOPEN_PMTUD_SETTINGS = {
     'fast_open_cookie_policy': 'hmac-sha256'}
 
 
+ADAPTIVE_ACK_PROFILE = 'upstream-fastopen-adaptive-ack'
+ADAPTIVE_ACK_SCRIPTS = {
+    'fastopen/client/' + name + '.pkt'
+    for name in ('blocking-connect-bypass', 'blocking-sendmsg-multi-iov', 'blocking-sendto')}
+ADAPTIVE_ACK_SETTINGS = {
+    'timestamps': False, 'endpoint_max_buffer_bytes': 234881024,
+    'preallocate_connections': 3, 'mss': 1460,
+    'fast_open_client_default': False, 'fast_open_listener_default': False,
+    'fast_open_cache': 'fresh runtime', 'fast_open_cookie_policy': 'hmac-sha256',
+    'adaptive_ack': True, 'delayed_ack_us': 200000, 'initial_ack_timeout_us': 40000}
+
+
 SENDFILE_FIXTURE = 'sendfile-five-zero-bytes'
 SENDFILE_SETUP = (b'`../../common/defaults.sh\n'
                   b'/bin/rm -f /tmp/testfile\n'
@@ -245,6 +257,13 @@ def adapt_source(directory, relative, manifest, so_flags):
         raise ValueError('Linux cookie setup is limited to audited explicit listeners')
     if FASTOPEN_PMTUD_PROFILE in so_flags.split(',') and relative not in FASTOPEN_PMTUD_SCRIPTS:
         raise ValueError('Fast Open PMTUD setup is limited to two audited ICMP cases')
+    if ADAPTIVE_ACK_PROFILE in so_flags.split(',') and relative not in ADAPTIVE_ACK_SCRIPTS:
+        raise ValueError('Adaptive ACK setup is limited to three audited blocking clients')
+    for name in ADAPTIVE_ACK_SCRIPTS:
+        setup_profiles[name] = (
+            b'`../../common/defaults.sh\n'
+            b' ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n',
+            ADAPTIVE_ACK_PROFILE, dict(ADAPTIVE_ACK_SETTINGS))
     for name in FASTOPEN_PMTUD_SCRIPTS:
         setup_profiles[name] = (
             b'`../../common/defaults.sh\n'
@@ -258,7 +277,7 @@ def adapt_source(directory, relative, manifest, so_flags):
         settings.update(general_pacing=False, software_gso=False, hardware_tso=False)
         commands = [command.rstrip(b'\n')]
         replacements = [(command, replacement)]
-        if token in ('upstream-https', 'upstream-fastopen', FASTOPEN_PMTUD_PROFILE):
+        if token in ('upstream-https', 'upstream-fastopen', FASTOPEN_PMTUD_PROFILE, ADAPTIVE_ACK_PROFILE):
             restore = b'`/tmp/sysctl_restore_${PPID}.sh`\n'
             restored = b'// ntcp profile is process-local; no host sysctls to restore.\n'
             if (entry.get('restore_line', '').encode() != restore
@@ -270,7 +289,7 @@ def adapt_source(directory, relative, manifest, so_flags):
             commands.append(restore.rstrip(b'\n'))
             replacements.append((restore, restored))
         expected_replacement = b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n'
-        if token == FASTOPEN_PMTUD_PROFILE:
+        if token in (FASTOPEN_PMTUD_PROFILE, ADAPTIVE_ACK_PROFILE):
             expected_replacement += b'\n'  # Keep the audited two-line setup's line numbers.
         if (command != expected or so_flags != token + ',local=192.168.0.1'
                 or entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
@@ -452,13 +471,14 @@ def profile_metadata(so_flags):
         'baseline', 'sack', 'upstream-window8', 'upstream-sack', 'upstream-ecn',
         'upstream-basic', 'upstream-cubic', 'upstream-cubic-ecn',
         'upstream-https', 'upstream-global-lowat', 'upstream-fastopen', LINUX_COOKIE_PROFILE,
-        FASTOPEN_PMTUD_PROFILE,
+        FASTOPEN_PMTUD_PROFILE, ADAPTIVE_ACK_PROFILE,
         'pipeline', 'pipeline-paced', 'pipeline-gso', 'pipeline-paced-gso'}
     # Configuration/capture boundary only: not measured timing or Linux fq/TSO equivalence.
     return {
         'profile': profile,
         **(LINUX_COOKIE_SETTINGS if profile == LINUX_COOKIE_PROFILE else {}),
         **(FASTOPEN_PMTUD_SETTINGS if profile == FASTOPEN_PMTUD_PROFILE else {}),
+        **(ADAPTIVE_ACK_SETTINGS if profile == ADAPTIVE_ACK_PROFILE else {}),
         'transport_clock': 'monotonic Instant elapsed microseconds' if known else None,
         'prr_pacing': profile not in {'upstream-cubic', 'upstream-cubic-ecn'} if known else None,
         'transmit_batch_clock': 'monotonic sample per selection/accept' if known else None,

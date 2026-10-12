@@ -32,6 +32,7 @@ pub enum Profile {
     UpstreamBasic,
     UpstreamFastOpen,
     UpstreamFastOpenPmtud,
+    UpstreamFastOpenAdaptiveAck,
     #[cfg(feature = "tfo-linux-cookie")]
     UpstreamFastOpenLinuxCookie,
 }
@@ -64,6 +65,7 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
                 "upstream-ecn" => Profile::UpstreamEcn,
                 "upstream-basic" => Profile::UpstreamBasic,
                 "upstream-fastopen" => Profile::UpstreamFastOpen,
+                "upstream-fastopen-adaptive-ack" => Profile::UpstreamFastOpenAdaptiveAck,
                 "upstream-fastopen-pmtud" => Profile::UpstreamFastOpenPmtud,
                 #[cfg(feature = "tfo-linux-cookie")]
                 "upstream-fastopen-linux-cookie" => Profile::UpstreamFastOpenLinuxCookie,
@@ -85,6 +87,12 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
 }
 
 pub(crate) fn config(profile: Profile) -> EndpointConfig {
+    if profile == Profile::UpstreamFastOpenAdaptiveAck {
+        let mut config = config(Profile::UpstreamFastOpen);
+        config.connection.adaptive_ack = true;
+        config.connection.delayed_ack_us = 200_000;
+        return config;
+    }
     if profile == Profile::UpstreamFastOpenPmtud {
         let mut config = config(Profile::UpstreamFastOpen);
         config.connection.pmtud = Some(ntcp::PmtudConfig::new(1500));
@@ -281,6 +289,46 @@ pub(crate) fn notsent_lowat(profile: Profile) -> u32 {
 #[cfg(test)]
 mod setup_profile_tests {
     use super::*;
+
+    #[test]
+    fn adaptive_ack_profile_changes_only_ack_policy() {
+        let selected = profile("upstream-fastopen-adaptive-ack,local=192.0.2.1")
+            .unwrap()
+            .1;
+        assert_eq!(selected, Profile::UpstreamFastOpenAdaptiveAck);
+        let mut actual = config(selected);
+        assert!(actual.connection.adaptive_ack);
+        assert_eq!(actual.connection.delayed_ack_us, 200_000);
+        actual.connection.adaptive_ack = false;
+        actual.connection.delayed_ack_us = 0;
+        assert_eq!(
+            format!("{actual:?}"),
+            format!("{:?}", config(Profile::UpstreamFastOpen))
+        );
+        for other in [
+            Profile::Baseline,
+            Profile::UpstreamBasic,
+            Profile::UpstreamFastOpen,
+            Profile::UpstreamFastOpenPmtud,
+        ] {
+            assert!(!config(other).connection.adaptive_ack);
+        }
+        #[cfg(feature = "tfo-linux-cookie")]
+        assert!(
+            !config(Profile::UpstreamFastOpenLinuxCookie)
+                .connection
+                .adaptive_ack
+        );
+        assert!(matches!(
+            cookie_policy(selected),
+            ntcp::FastOpenCookiePolicy::HmacSha256
+        ));
+        assert_eq!(notsent_lowat(selected), u32::MAX);
+        assert!(gso(selected).is_none());
+        assert!(
+            profile("upstream-fastopen-adaptive-ack,upstream-fastopen,local=192.0.2.1").is_err()
+        );
+    }
 
     #[test]
     fn fast_open_pmtud_profile_changes_only_opt_in_pmtud() {

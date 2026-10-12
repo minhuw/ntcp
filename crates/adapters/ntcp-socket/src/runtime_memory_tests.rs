@@ -497,3 +497,4 @@ fn packet_ptb_queued_feedback_still_checks_target_tuple_and_sequence() {
 }
 
 include!("runtime_pmtud_profile_tests.rs");
+include!("runtime_adaptive_ack_profile_tests.rs");
