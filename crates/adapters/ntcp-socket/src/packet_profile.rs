@@ -142,8 +142,8 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
     // Reserve owned receive storage before packetdrill starts timed events.
     // Its mlockall(MCL_FUTURE) makes first-touch allocation synchronous.
     config.preallocate_connections = if fast_open {
-        // Cookie warmup retains its storage when the timed second open starts.
-        2
+        // Warmup and both test connections retain storage through the short trace.
+        3
     } else {
         usize::from(upstream || profile == Profile::UpstreamWindow8)
     };
@@ -320,7 +320,7 @@ mod setup_profile_tests {
             32 * 1024 * 1024
         );
         actual.max_buffer_bytes = 32 * 1024 * 1024;
-        assert_eq!(actual.preallocate_connections, 2);
+        assert_eq!(actual.preallocate_connections, 3);
         actual.preallocate_connections = 1;
         assert_eq!(
             format!("{actual:?}"),
@@ -333,7 +333,7 @@ mod setup_profile_tests {
     #[test]
     fn fast_open_budget_admits_seven_retained_connections_but_not_eight() {
         let config = config(Profile::UpstreamFastOpen);
-        assert_eq!(config.preallocate_connections, 2);
+        assert_eq!(config.preallocate_connections, 3);
         let preallocate = config.preallocate_connections;
         let budget = config.max_buffer_bytes;
         let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
@@ -390,8 +390,12 @@ mod setup_profile_tests {
     }
 
     #[test]
-    fn fast_open_second_open_uses_reserved_charge_only_with_two_preallocations() {
-        for preallocate in [1, config(Profile::UpstreamFastOpen).preallocate_connections] {
+    fn fast_open_three_retained_opens_transfer_reserved_charges_once() {
+        for preallocate in [
+            1,
+            2,
+            config(Profile::UpstreamFastOpen).preallocate_connections,
+        ] {
             let mut config = config(Profile::UpstreamFastOpen);
             config.preallocate_connections = preallocate;
             let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
@@ -399,13 +403,13 @@ mod setup_profile_tests {
             let charge = reserved / preallocate;
             endpoint.enable_fast_open().unwrap();
             let initial = endpoint.buffer_bytes();
-            for index in 0..2 {
+            for index in 0..3 {
                 let local = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 40000 + index);
                 endpoint
                     .connect_fast_open(0, local, "192.0.2.2:8080".parse().unwrap(), &[])
                     .unwrap();
-                // Pool ownership transfers without charging twice. With only
-                // one reserve, the second retained open needs new storage.
+                // Transfer each reserve once; only opens beyond the reserve
+                // count need newly charged storage.
                 assert_eq!(
                     endpoint.buffer_bytes(),
                     initial + (usize::from(index) + 1).saturating_sub(preallocate) * charge
@@ -417,11 +421,13 @@ mod setup_profile_tests {
     #[test]
     fn fast_open_preallocated_constructor_failure_preserves_charge() {
         let mut config = config(Profile::UpstreamFastOpen);
+        assert_eq!(config.preallocate_connections, 3);
+        let attempts = config.preallocate_connections + 1;
         config.connection.mss = 0;
         let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
         endpoint.enable_fast_open().unwrap();
         let initial = endpoint.buffer_bytes();
-        for _ in 0..3 {
+        for _ in 0..attempts {
             assert_eq!(
                 endpoint.connect_fast_open(
                     0,
