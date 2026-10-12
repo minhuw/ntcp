@@ -326,6 +326,9 @@ struct Socket {
     send_capacity: usize,
     receive_capacity: usize,
     handle: Handle,
+    // Inline, one per socket (bounded by socket_limit), not endpoint buffer
+    // storage or a retained connection. Err preserves an unavailable snapshot.
+    terminal_transport: Option<Result<ntcp::TransportInfo>>,
     local: Option<SocketAddr>,
     flags: i32,
     // Adapter bind policy: mutual REUSEADDR permits live connection-port reuse;
@@ -373,6 +376,7 @@ impl Socket {
             send_capacity: BYTES,
             receive_capacity: BYTES,
             handle: Handle::Fresh,
+            terminal_transport: None,
             local: None,
             flags,
             reuse: false,
@@ -1855,10 +1859,11 @@ impl Owner {
                 self.sockets.get_mut(&id).unwrap().completions.pop_front();
             }
             Op::Transport(option) | Op::TransportPrefix(option, _) => {
-                let Handle::Connection(cid) = s.handle else {
-                    return Err(ENOTCONN);
+                let info = match s.handle {
+                    Handle::Connection(cid) => self.endpoint.transport_info(cid).map_err(engine)?,
+                    Handle::Fresh => s.terminal_transport.ok_or(ENOTCONN)??,
+                    Handle::Listener(_) => return Err(ENOTCONN),
                 };
-                let info = self.endpoint.transport_info(cid).map_err(engine)?;
                 out.bytes = if let Op::TransportPrefix(_, requested) = op {
                     crate::transport::transport_option_prefix(info, option, requested)?
                 } else {

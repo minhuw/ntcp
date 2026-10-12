@@ -166,6 +166,197 @@ mod packets {
         fd
     }
     #[test]
+    fn failed_fast_open_tcp_info_aliases_and_pointer_faults() {
+        if !child(
+            "fast_open_abi_tests::packets::failed_fast_open_tcp_info_aliases_and_pointer_faults",
+            "NTCP_TFO_FAILURE_CHILD",
+        ) {
+            return;
+        }
+        packet_test::start((
+            Ipv4Addr::new(192, 0, 2, 1),
+            packet_profile::Profile::Pipeline,
+        ))
+        .unwrap();
+        let addr = sockaddr_in {
+            sin_family: AF_INET as u16,
+            sin_port: 8080u16.to_be(),
+            sin_addr: in_addr {
+                s_addr: u32::from_ne_bytes([192, 0, 2, 2]),
+            },
+            sin_zero: [0; 8],
+        };
+        unsafe {
+            let warm = socket();
+            assert_eq!(
+                sendto(
+                    warm,
+                    ptr::null(),
+                    0,
+                    MSG_FASTOPEN,
+                    (&addr as *const sockaddr_in).cast(),
+                    16
+                ),
+                -1
+            );
+            assert_eq!(errno(), EINPROGRESS);
+            reply(&segment(&capture()));
+            assert_eq!(close(warm), 0);
+            capture(); // FIN
+            for deferred in [false, true] {
+                let fd = socket();
+                let alias = dup(fd);
+                assert!(alias >= 0);
+                if deferred {
+                    assert_eq!(set(fd, TCP_FASTOPEN_CONNECT, 1), 0);
+                    assert_eq!(connect(fd, (&addr as *const sockaddr_in).cast(), 16), 0);
+                }
+                call(owned(fd).unwrap().unwrap(), Op::Flags(F_SETFL, 0)).unwrap();
+                let send = std::thread::spawn(move || {
+                    let result = if deferred {
+                        write(alias, c"hi".as_ptr().cast(), 2)
+                    } else {
+                        sendto(
+                            alias,
+                            c"hi".as_ptr().cast(),
+                            2,
+                            MSG_FASTOPEN,
+                            (&addr as *const sockaddr_in).cast(),
+                            16,
+                        )
+                    };
+                    (result, errno())
+                });
+                let syn = capture();
+                let syn = segment(&syn);
+                assert_eq!(syn.payload, b"hi");
+                let ip = ntcp::IpMetadata {
+                    source: Ipv4Addr::new(192, 0, 2, 2).into(),
+                    destination: Ipv4Addr::new(192, 0, 2, 1).into(),
+                };
+                let header = ntcp::wire::Header {
+                    source_port: 8080,
+                    destination_port: syn.header.source_port,
+                    sequence: 0,
+                    acknowledgment: syn.header.sequence.wrapping_add(1),
+                    flags: ntcp::wire::RST | ACK,
+                    window: 0,
+                    urgent_pointer: 0,
+                };
+                let mut reset = vec![0; 40];
+                let len = ntcp::wire::encode(ip, header, &[], &[], &mut reset[20..]).unwrap();
+                ntcp_ip::encode(
+                    &mut reset,
+                    ntcp::Transmit {
+                        tx_timestamp: None,
+                        connection: None,
+                        ip,
+                        len,
+                        hop_limit: 64,
+                        dscp: 0,
+                        ecn: 0,
+                        ipv4_options: Default::default(),
+                    },
+                    0,
+                )
+                .unwrap();
+                packet_test::inject(reset).unwrap();
+                assert_eq!(send.join().unwrap(), (-1, ECONNREFUSED));
+                let mut full = [0u8; 280];
+                let mut len = 280;
+                assert_eq!(
+                    getsockopt(
+                        fd,
+                        IPPROTO_TCP,
+                        TCP_INFO,
+                        full.as_mut_ptr().cast(),
+                        &mut len
+                    ),
+                    0
+                );
+                assert_eq!(len, 280);
+                assert_eq!(full[0], 7);
+                assert_eq!(full[5] & 32, 0);
+                for size in [0, 1, 7, 192, 193, 280, 300] {
+                    let mut bytes = [0xa5; 300];
+                    let mut len = size;
+                    assert_eq!(
+                        getsockopt(
+                            alias,
+                            IPPROTO_TCP,
+                            TCP_INFO,
+                            bytes.as_mut_ptr().cast(),
+                            &mut len
+                        ),
+                        0
+                    );
+                    assert_eq!(len, size.min(280));
+                    assert_eq!(&bytes[..len as usize], &full[..len as usize]);
+                    assert!(bytes[len as usize..].iter().all(|b| *b == 0xa5));
+                }
+                len = 280;
+                assert_eq!(
+                    getsockopt(alias, IPPROTO_TCP, TCP_INFO, ptr::null_mut(), &mut len),
+                    -1
+                );
+                assert_eq!(errno(), EFAULT);
+                assert_eq!(
+                    getsockopt(
+                        alias,
+                        IPPROTO_TCP,
+                        TCP_INFO,
+                        full.as_mut_ptr().cast(),
+                        ptr::null_mut()
+                    ),
+                    -1
+                );
+                assert_eq!(errno(), EFAULT);
+                assert_eq!(write(alias, ptr::null(), 2), -1);
+                assert_eq!(errno(), EFAULT);
+                assert_eq!(
+                    sendto(
+                        alias,
+                        ptr::null(),
+                        2,
+                        MSG_FASTOPEN,
+                        (&addr as *const sockaddr_in).cast(),
+                        16
+                    ),
+                    -1
+                );
+                assert_eq!(errno(), EFAULT);
+                let mut again = [0; 280];
+                len = 280;
+                assert_eq!(
+                    getsockopt(
+                        alias,
+                        IPPROTO_TCP,
+                        TCP_INFO,
+                        again.as_mut_ptr().cast(),
+                        &mut len
+                    ),
+                    0
+                );
+                assert_eq!(again, full);
+                assert_eq!(close(fd), 0);
+                assert_eq!(
+                    getsockopt(
+                        alias,
+                        IPPROTO_TCP,
+                        TCP_INFO,
+                        again.as_mut_ptr().cast(),
+                        &mut len
+                    ),
+                    0
+                );
+                assert_eq!(again, full);
+                assert_eq!(close(alias), 0);
+            }
+        }
+        packet_test::stop();
+    }
+
+    #[test]
     fn fast_open_sendto_sendmsg_deferred_alias_and_fault_abi() {
         if !child(
             "fast_open_abi_tests::packets::fast_open_sendto_sendmsg_deferred_alias_and_fault_abi",

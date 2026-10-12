@@ -318,12 +318,25 @@ fn fast_open_miss_nonblocking_and_dontwait_retries_do_not_accept_payload() {
 
 #[test]
 fn fast_open_blocking_hit_and_miss_wait_handshake_and_complete_iovecs() {
-    for warm in [false, true] {
+    for (warm, deferred, first_len) in [
+        (false, false, 900),
+        (true, false, 900),
+        (true, true, 900),
+        (false, false, 2000),
+        (true, false, 2000),
+        (true, true, 2000),
+    ] {
         let (mut a, mut b, listener) = tfo_setup(warm);
         let client = new(&mut a, 0);
         a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
             .unwrap();
-        let first = vec![1; 2000];
+        if deferred {
+            a.execute(client, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
+                .unwrap();
+            a.execute(client, Op::Connect("192.0.2.2:8080".parse().unwrap()))
+                .unwrap();
+        }
+        let first = vec![1; first_len];
         let second = vec![2; 1000];
         let (reply, rx) = mpsc::sync_channel(1);
         let mut request = Request {
@@ -335,7 +348,7 @@ fn fast_open_blocking_hit_and_miss_wait_handshake_and_complete_iovecs() {
                         (first.as_ptr() as usize, first.len()),
                         (second.as_ptr() as usize, second.len()),
                     ],
-                    MSG_FASTOPEN,
+                    if deferred { 0 } else { MSG_FASTOPEN },
                     Some("192.0.2.2:8080".parse().unwrap()),
                     None,
                 )),
@@ -351,7 +364,7 @@ fn fast_open_blocking_hit_and_miss_wait_handshake_and_complete_iovecs() {
         assert!(!a.service(&mut request));
         exchange(&mut a, &mut b);
         assert!(a.service(&mut request));
-        assert_eq!(rx.recv().unwrap().unwrap().value, 3000);
+        assert_eq!(rx.recv().unwrap().unwrap().value as usize, first_len + 1000);
         assert_eq!(
             a.execute(client, tfo_send(b"done", MSG_FASTOPEN))
                 .unwrap_err(),
@@ -697,15 +710,27 @@ fn fast_open_listener_keeps_ordinary_zerocopy_snapshot_at_final_ack() {
     }
 }
 
-#[test]
-fn fast_open_blocking_send_reset_finishes_with_error_or_accepted_prefix() {
-    for warm in [false, true] {
+fn blocking_connect_failure(deferred: bool, timeout: bool) {
+    for warm in [true, false] {
+        // Deferred opens require a cookie; the cold control uses MSG_FASTOPEN.
+        if deferred && !warm {
+            continue;
+        }
         let (mut a, mut b, listener) = tfo_setup(warm);
         let client = new(&mut a, 0);
+        if deferred {
+            a.execute(client, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
+                .unwrap();
+            a.execute(client, Op::Connect("192.0.2.2:8080".parse().unwrap()))
+                .unwrap();
+        }
         let (reply, rx) = mpsc::sync_channel(1);
         let mut request = Request {
             id: client,
-            op: Op::Wait(Box::new(tfo_send(b"hi", MSG_FASTOPEN)), None),
+            op: Op::Wait(
+                Box::new(tfo_send(b"hi", if deferred { 0 } else { MSG_FASTOPEN })),
+                None,
+            ),
             reply,
             deadline: None,
             send: None,
@@ -716,24 +741,64 @@ fn fast_open_blocking_send_reset_finishes_with_error_or_accepted_prefix() {
             request.send.as_ref().unwrap().accepted,
             if warm { 2 } else { 0 }
         );
-        // A closed destination produces the valid RST+ACK required in SynSent.
-        b.execute(listener, Op::Close).unwrap();
-        tfo_deliver(&mut b, tfo_capture(&mut a));
-        let reset = tfo_capture(&mut b);
-        assert_ne!(segment(&reset).header.flags & ntcp::wire::RST, 0);
-        tfo_deliver(&mut a, reset);
+        let failed = cid(&a, client);
+        if timeout {
+            tfo_capture(&mut a);
+            for _ in 0..20 {
+                if a.endpoint.state(failed).unwrap() == State::Closed {
+                    break;
+                }
+                let now = a.endpoint.next_deadline().unwrap();
+                a.test_now = Some(now);
+                a.endpoint.on_timeout(now, BUDGET).unwrap();
+                a.events();
+                a.service_egress().unwrap();
+                while a.execute(0, Op::Capture(65535)).is_ok() {}
+            }
+        } else {
+            b.execute(listener, Op::Close).unwrap();
+            tfo_deliver(&mut b, tfo_capture(&mut a));
+            let reset = tfo_capture(&mut b);
+            assert_ne!(segment(&reset).header.flags & ntcp::wire::RST, 0);
+            tfo_deliver(&mut a, reset);
+        }
+        assert_eq!(a.endpoint.state(failed).unwrap(), State::Closed);
+        let terminal = a.execute(client, Op::Transport(1)).unwrap().bytes;
+        assert_eq!(terminal[0], 7);
+        assert_eq!(terminal[5] & 32, 0);
         assert!(a.service(&mut request));
         assert!(request.send.is_none());
         assert!(!a.sockets[&client].connect_pending);
         assert!(matches!(a.sockets[&client].handle, Handle::Fresh));
-        let result = rx.try_recv().expect("reset must finish the blocked send");
-        if warm {
-            // The copied SYN prefix was already accepted before the reset.
-            assert_eq!(result.unwrap().value, 2);
-        } else {
-            assert_eq!(result.unwrap_err(), ECONNREFUSED);
-        }
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap_err(),
+            if timeout { ETIMEDOUT } else { ECONNREFUSED }
+        );
+        assert_eq!(a.execute(client, Op::Transport(1)).unwrap().bytes, terminal);
+        // Timeout may retain a reset until the existing release barrier drains.
+        a.service_egress().unwrap();
+        while a.execute(0, Op::Capture(65535)).is_ok() {}
+        assert!(!a.endpoint.connection_exists(failed));
+        assert_eq!(a.sockets[&client].zc_reserved, 0);
+        assert!(a.sockets[&client].completions.is_empty());
     }
+}
+
+#[test]
+fn fast_open_blocking_msg_reset() {
+    blocking_connect_failure(false, false);
+}
+#[test]
+fn fast_open_blocking_msg_timeout() {
+    blocking_connect_failure(false, true);
+}
+#[test]
+fn fast_open_blocking_deferred_reset() {
+    blocking_connect_failure(true, false);
+}
+#[test]
+fn fast_open_blocking_deferred_timeout() {
+    blocking_connect_failure(true, true);
 }
 
 fn tfo_early_terminal_socket(payload: &[u8]) -> (Owner, u64, Vec<u8>) {
@@ -1262,6 +1327,9 @@ fn fast_open_failed_implicit_completion_rolls_back_for_retry() {
             let reset = tfo_capture(&mut b);
             assert_ne!(segment(&reset).header.flags & ntcp::wire::RST, 0);
             tfo_deliver(&mut a, reset);
+            let terminal = a.execute(client, Op::Transport(1)).unwrap().bytes;
+            assert_eq!(terminal[0], 7);
+            assert_eq!(terminal[5] & 32, 0);
             if consume_error {
                 assert_eq!(
                     a.execute(client, Op::Get(SOL_SOCKET, SO_ERROR))
@@ -1283,6 +1351,60 @@ fn fast_open_failed_implicit_completion_rolls_back_for_retry() {
             assert!(!a.sockets[&client].connect_pending);
             assert!(!a.sockets[&client].connected);
             tfo_no_output(&mut a);
+            assert!(!a.endpoint.connection_exists(failed));
+            assert_eq!(a.execute(client, Op::Transport(1)).unwrap().bytes, terminal);
+            for requested in [0, 1, 7, 192, 193, 280, 512] {
+                assert_eq!(
+                    a.execute(client, Op::TransportPrefix(1, requested))
+                        .unwrap()
+                        .bytes,
+                    terminal[..requested.min(280)]
+                );
+            }
+            assert_eq!(
+                a.execute(client, Op::Get(SOL_SOCKET, SO_ERROR))
+                    .unwrap()
+                    .value,
+                0
+            );
+            // Invalid destinations and pre-start copy faults cannot erase the snapshot.
+            assert_eq!(
+                a.execute(
+                    client,
+                    Op::SendTo(
+                        vec![(0, 2)],
+                        MSG_FASTOPEN,
+                        Some("192.0.2.2:8080".parse().unwrap()),
+                        None
+                    )
+                )
+                .unwrap_err(),
+                EFAULT
+            );
+            assert_eq!(
+                a.execute(client, Op::Connect("192.0.2.2:0".parse().unwrap()))
+                    .unwrap_err(),
+                EINVAL
+            );
+            assert_eq!(
+                a.execute(client, Op::Connect("0.0.0.0:8080".parse().unwrap()))
+                    .unwrap_err(),
+                EINVAL
+            );
+            assert_eq!(a.execute(client, Op::Transport(1)).unwrap().bytes, terminal);
+            if warm {
+                a.execute(client, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
+                    .unwrap();
+                a.execute(client, Op::Connect("192.0.2.2:8080".parse().unwrap()))
+                    .unwrap();
+                assert_eq!(a.execute(client, Op::Transport(1)).unwrap().bytes, terminal);
+                assert_eq!(
+                    a.execute(client, Op::SendTo(vec![(0, 2)], 0, None, None))
+                        .unwrap_err(),
+                    EFAULT
+                );
+                assert_eq!(a.execute(client, Op::Transport(1)).unwrap().bytes, terminal);
+            }
             let _listener = tfo_listener(&mut b);
             let result = a.execute(client, tfo_send(b"retry", MSG_FASTOPEN));
             match result {
@@ -1290,9 +1412,74 @@ fn fast_open_failed_implicit_completion_rolls_back_for_retry() {
                 Err(error) => assert_eq!(error, EINPROGRESS),
             }
             assert_ne!(cid(&a, client), failed);
+            assert_eq!(a.execute(client, Op::Transport(1)).unwrap().bytes[0], 2);
             exchange(&mut a, &mut b);
             assert!(a.sockets[&client].connected);
             assert!(a.sockets[&client].connect_pending);
+            assert_eq!(a.execute(client, Op::Transport(1)).unwrap().bytes[0], 1);
+        }
+    }
+}
+
+#[test]
+fn fast_open_post_handshake_partial_error_and_peer_fin_controls() {
+    for deferred in [false, true] {
+        for peer_fin in [false, true] {
+            let (mut a, mut b, listener) = tfo_setup(true);
+            let client = new(&mut a, 0);
+            if deferred {
+                a.execute(client, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
+                    .unwrap();
+                a.execute(client, Op::Connect("192.0.2.2:8080".parse().unwrap()))
+                    .unwrap();
+            }
+            let bytes = vec![42; if peer_fin { 2 } else { 2 * BYTES }];
+            let (reply, rx) = mpsc::sync_channel(1);
+            let mut request = Request {
+                id: client,
+                op: Op::Wait(
+                    Box::new(tfo_send(&bytes, if deferred { 0 } else { MSG_FASTOPEN })),
+                    None,
+                ),
+                reply,
+                deadline: None,
+                send: None,
+                closing: None,
+            };
+            assert!(!a.service(&mut request));
+            exchange(&mut a, &mut b);
+            let server = b
+                .execute(listener, Op::Accept(SOCK_NONBLOCK))
+                .unwrap()
+                .value as u64;
+            if peer_fin {
+                b.execute(server, Op::Shutdown(SHUT_WR)).unwrap();
+                exchange(&mut a, &mut b);
+                assert_eq!(a.endpoint.state(cid(&a, client)).unwrap(), State::CloseWait);
+                assert!(a.service(&mut request));
+                assert_eq!(rx.try_recv().unwrap().unwrap().value, 2);
+                assert_eq!(
+                    a.execute(client, tfo_send(b"still writable", 0))
+                        .unwrap()
+                        .value,
+                    14
+                );
+                a.execute(client, Op::Shutdown(SHUT_WR)).unwrap();
+                assert_eq!(
+                    a.execute(client, tfo_send(b"closed", 0)).unwrap_err(),
+                    EPIPE
+                );
+            } else {
+                assert!(!a.service(&mut request));
+                let accepted = request.send.as_ref().unwrap().accepted;
+                assert!(accepted > 2 && accepted < bytes.len());
+                // The handshake completed and ordinary data was admitted. A
+                // later transport error still returns the ordinary short count.
+                b.endpoint.abort(cid(&b, server)).unwrap();
+                tfo_deliver(&mut a, tfo_capture(&mut b));
+                assert!(a.service(&mut request));
+                assert_eq!(rx.try_recv().unwrap().unwrap().value as usize, accepted);
+            }
         }
     }
 }

@@ -30,6 +30,9 @@ impl Owner {
             State::Closed => {
                 // __inet_stream_connect's sock_error path returns to
                 // SS_UNCONNECTED; do not leave a failed implicit open pending.
+                // Snapshot before timestamp cleanup/release can invalidate the
+                // core view. Queries must retain its validity bits and errors.
+                s.terminal_transport = Some(self.endpoint.transport_info(cid).map_err(engine));
                 let error = if s.error != 0 { s.error } else { ECONNABORTED };
                 s.error = 0;
                 s.handle = Handle::Fresh;
@@ -105,6 +108,9 @@ impl Owner {
                 0,
             )
         };
+        // Core admission begins the next transport attempt. Invalid requests,
+        // failed admission, and deferred peer selection retain the old view.
+        self.sockets.get_mut(&id).unwrap().terminal_transport = None;
         if let Err(e) = self.apply_options(cid, &options) {
             self.rollback_connection(cid);
             return Err(e);
@@ -123,6 +129,70 @@ impl Owner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn terminal_transport_queries_preserve_validity_and_unavailability() {
+        let (mut owner, _peer, client, _, _) = crate::runtime::tests::pair();
+        let Handle::Connection(cid) = owner.sockets[&client].handle else {
+            panic!()
+        };
+        owner.endpoint.abort(cid).unwrap();
+        owner.events();
+        assert_eq!(owner.complete_connect(client), Err(ECONNABORTED));
+        let info = owner.sockets[&client].terminal_transport.unwrap().unwrap();
+        assert_eq!(info.state, State::Closed);
+        let unsupported = unsupported_option("test");
+        for ledger_valid in [false, true] {
+            for delivered_segments_valid in [false, true] {
+                owner.sockets.get_mut(&client).unwrap().terminal_transport =
+                    Some(Ok(ntcp::TransportInfo {
+                        ledger_valid,
+                        delivered_segments_valid,
+                        ..info
+                    }));
+                for requested in [0, 1, 7, 192, 193, 280, 512] {
+                    let result = owner.execute(client, Op::TransportPrefix(1, requested));
+                    if ledger_valid && (requested <= 192 || delivered_segments_valid) {
+                        let bytes = result.unwrap().bytes;
+                        assert_eq!(bytes.len(), requested.min(280));
+                        if requested > 0 {
+                            assert_eq!(bytes[0], 7);
+                        }
+                    } else {
+                        assert_eq!(result.unwrap_err(), unsupported);
+                    }
+                }
+                assert_eq!(
+                    owner.execute(client, Op::Transport(1)).is_ok(),
+                    ledger_valid && delivered_segments_valid
+                );
+                assert!(
+                    owner
+                        .execute(client, Op::Transport(2))
+                        .unwrap()
+                        .bytes
+                        .is_empty()
+                );
+                assert_eq!(
+                    owner.execute(client, Op::Transport(99)).unwrap_err(),
+                    unsupported
+                );
+            }
+        }
+        owner.sockets.get_mut(&client).unwrap().terminal_transport = Some(Err(EIO));
+        for op in [
+            Op::Transport(1),
+            Op::TransportPrefix(1, 0),
+            Op::TransportPrefix(1, 192),
+        ] {
+            assert_eq!(owner.execute(client, op).unwrap_err(), EIO);
+        }
+        let fresh = owner.execute(0, Op::New(0)).unwrap().value as u64;
+        assert_eq!(
+            owner.execute(fresh, Op::Transport(1)).unwrap_err(),
+            ENOTCONN
+        );
+    }
+
     #[test]
     fn fast_open_enable_budget_failure_is_atomic_on_fresh_and_listener() {
         let local = Ipv4Addr::new(192, 0, 2, 1);

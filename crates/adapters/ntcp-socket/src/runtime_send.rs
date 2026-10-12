@@ -277,7 +277,9 @@ impl Owner {
             }
             s.readiness_generations[2] = s.readiness_generations[2].wrapping_add(1);
         }
-        if send.accepted == 0 {
+        // A blocking implicit connect has only provisionally copied SYN data.
+        // Its failure is not an ordinary post-handshake partial send success.
+        if send.accepted == 0 || send.wait_handshake {
             result?;
         }
         Ok(Reply {
