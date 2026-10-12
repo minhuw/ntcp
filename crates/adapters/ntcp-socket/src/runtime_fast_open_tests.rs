@@ -1517,17 +1517,25 @@ fn syncnt_blocking_fast_open_and_deferred_timeout_retains_snapshot() {
             a.endpoint.handshake_retransmission_limit(failed).unwrap(),
             NonZeroU8::new(1)
         );
+        let start = a.now();
         let syn = tfo_capture(&mut a);
         assert_ne!(segment(&syn).header.flags & ntcp::wire::SYN, 0);
         // One submitted retry, then abort at the following RTO (not a new budget on fallback).
-        let now = a.endpoint.next_deadline().unwrap();
+        let now = start + 1_000_000;
+        assert_eq!(a.endpoint.next_deadline(), Some(now));
         a.test_now = Some(now);
         a.endpoint.on_timeout(now, BUDGET).unwrap();
         let retry = tfo_capture(&mut a);
         assert_ne!(segment(&retry).header.flags & ntcp::wire::SYN, 0);
         assert_eq!(a.endpoint.state(failed).unwrap(), State::SynSent);
         assert!(!a.service(&mut request));
-        let now = a.endpoint.next_deadline().unwrap();
+        let now = start + 3_000_000;
+        assert_eq!(a.endpoint.next_deadline(), Some(now));
+        a.test_now = Some(now - 1);
+        a.endpoint.on_timeout(now - 1, BUDGET).unwrap();
+        assert_eq!(a.endpoint.state(failed).unwrap(), State::SynSent);
+        assert!(!a.service(&mut request));
+        tfo_no_output(&mut a);
         a.test_now = Some(now);
         a.endpoint.on_timeout(now, BUDGET).unwrap();
         a.events();

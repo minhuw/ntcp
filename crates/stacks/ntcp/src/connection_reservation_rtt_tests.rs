@@ -228,6 +228,12 @@ fn reserved_control_echo_validation_karn_and_syn_backoff() {
                         0
                     };
                     output(&mut c, selected, 2_000_000, true);
+                    assert!(!c.syn_delivered);
+                    assert_eq!(c.rto(), if retry { 2_000_000 } else { 1_000_000 });
+                    assert_eq!(
+                        c.rto_deadline,
+                        Some(if retry { 4_000_000 } else { 3_000_000 })
+                    );
                     let echo = if retry && !valid_echo {
                         c.timestamp_value(0) // Delayed original, not the retransmission.
                     } else {

@@ -942,3 +942,64 @@ fn simultaneous_syn_dsack_preserves_payload_report() {
         assert_eq!(a.read(&mut out), Err(Error::WouldBlock));
     }
 }
+
+#[test]
+fn timed_out_syn_ack_rearms_residual_tfo_with_data_phase_floor() {
+    for reserved in [false, true] {
+        for acked in [0, 3] {
+            let mut a = client(100, 12);
+            let mut bytes = [0; 2048];
+            for now in [0, 1_000_000] {
+                if now != 0 {
+                    a.timeout(now).unwrap();
+                }
+                let size = a
+                    .transmit_selected(now, &mut bytes, reserved)
+                    .unwrap()
+                    .unwrap();
+                let syn = wire::parse(ip(tuple()), &bytes[..size]).unwrap();
+                assert_eq!(syn.payload.len(), if now == 0 { 12 } else { 0 });
+                if reserved {
+                    let mut departure = a.last_departure.unwrap();
+                    a.accept_reserved_output(now, &mut departure, 0, syn.payload.len(), true)
+                        .unwrap();
+                }
+            }
+            assert_eq!(a.rto_deadline, Some(3_000_000));
+            assert!(!a.syn_delivered);
+            synack(&mut a, acked, 1_100_000);
+            assert!(a.syn_delivered && a.syn_timed_out);
+            assert_eq!(a.state(), State::Established);
+            assert_eq!(a.data_flight(), 12 - acked);
+            // accept_ack rearms this flight before establish changes handshake state.
+            assert_eq!(a.rto_deadline, Some(4_100_000));
+            assert_eq!(a.rto(), 3_000_000);
+            assert_eq!(a.rtt.updates, 0); // Neither SYN retry nor SYN data supplies fresh RTT.
+        }
+    }
+}
+
+#[test]
+fn tfo_two_retry_budget_keeps_exponential_syn_wait() {
+    let mut a = client(100, 12);
+    a.set_handshake_retransmission_limit(core::num::NonZeroU8::new(2));
+    for (retry, now) in [(0, 0), (1, 1_000_000), (2, 3_000_000)] {
+        if retry != 0 {
+            assert_eq!(a.rto_deadline, Some(now));
+            a.timeout(now - 1).unwrap();
+            assert_eq!(a.transmit(now - 1, &mut [0; 2048]), Ok(None));
+            a.timeout(now).unwrap();
+        }
+        let bytes = packet(&mut a, now);
+        let syn = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_ne!(syn.header.flags & SYN, 0);
+        assert_eq!(syn.payload.len(), if retry == 0 { 12 } else { 0 });
+        assert_eq!(a.committed_syn_retransmissions, retry);
+    }
+    assert_eq!(a.rto_deadline, Some(7_000_000));
+    a.timeout(6_999_999).unwrap();
+    assert!(a.handshake_pending());
+    a.timeout(7_000_000).unwrap();
+    assert_eq!(a.reason, Some(CloseReason::TimedOut));
+    assert_eq!(a.transmit(7_000_000, &mut [0; 2048]), Ok(None));
+}

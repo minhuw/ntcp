@@ -18,7 +18,8 @@ fn handshake_limit_direct_active_passive_simultaneous_and_default() {
             // of that same sequence number and must not get a fresh budget.
             assert_eq!(a.committed_syn_retransmissions, u8::from(role == 2));
             if role != 2 {
-                let now = a.rto_deadline.unwrap();
+                let now = now + 1_000_000;
+                assert_eq!(a.rto_deadline, Some(now));
                 a.timeout(now).unwrap();
                 assert_eq!(a.committed_syn_retransmissions, 0);
                 assert_eq!(a.transmit(now, &mut [0; 19]), Err(Error::OutputTooSmall));
@@ -26,7 +27,8 @@ fn handshake_limit_direct_active_passive_simultaneous_and_default() {
                 packet(&mut a, now);
             }
             assert_eq!(a.committed_syn_retransmissions, 1);
-            let end = a.rto_deadline.unwrap();
+            let end = now + if role == 2 { 1_000_000 } else { 3_000_000 };
+            assert_eq!(a.rto_deadline, Some(end));
             a.timeout(end - 1).unwrap();
             assert!(a.handshake_pending());
             a.timeout(end).unwrap();
@@ -61,7 +63,9 @@ fn handshake_limit_tfo_fallback_and_changing_limit_preserve_committed_count() {
             let now = if retry == 0 {
                 0
             } else {
-                a.rto_deadline.unwrap()
+                let retry_at = 1_000_000 + if reserved { 100 } else { 0 };
+                assert_eq!(a.rto_deadline, Some(retry_at));
+                retry_at
             };
             if retry != 0 {
                 a.timeout(now).unwrap();
@@ -84,7 +88,11 @@ fn handshake_limit_tfo_fallback_and_changing_limit_preserve_committed_count() {
         a.set_handshake_retransmission_limit(NonZeroU8::new(2));
         a.set_handshake_retransmission_limit(None);
         a.set_handshake_retransmission_limit(NonZeroU8::new(1));
-        a.timeout(a.rto_deadline.unwrap()).unwrap();
+        let end = 3_000_000 + if reserved { 200 } else { 0 };
+        assert_eq!(a.rto_deadline, Some(end));
+        a.timeout(end - 1).unwrap();
+        assert!(a.handshake_pending());
+        a.timeout(end).unwrap();
         assert_eq!(a.reason, Some(CloseReason::TimedOut));
     }
 }
@@ -117,10 +125,12 @@ fn handshake_limit_reserved_passive_and_simultaneous_count_only_departures() {
         let (mut a, _) = opening_for_close(config(1024, 64), 100, simultaneous);
         a.set_handshake_retransmission_limit(NonZeroU8::new(1));
         let mut bytes = [0; 2048];
-        let mut now = a.now;
+        let start = a.now;
+        let mut now = start;
         for expected in u8::from(simultaneous)..=1 {
             if expected != u8::from(simultaneous) {
-                now = a.rto_deadline.unwrap();
+                now = start + 1_000_100;
+                assert_eq!(a.rto_deadline, Some(now));
                 a.timeout(now).unwrap();
             }
             a.transmit_selected(now, &mut bytes, true).unwrap().unwrap();
@@ -132,7 +142,11 @@ fn handshake_limit_reserved_passive_and_simultaneous_count_only_departures() {
                 .unwrap();
             assert_eq!(a.committed_syn_retransmissions, expected);
         }
-        a.timeout(a.rto_deadline.unwrap()).unwrap();
+        let end = start + if simultaneous { 1_000_100 } else { 3_000_200 };
+        assert_eq!(a.rto_deadline, Some(end));
+        a.timeout(end - 1).unwrap();
+        assert!(a.handshake_pending());
+        a.timeout(end).unwrap();
         assert_eq!(a.reason, Some(CloseReason::TimedOut));
     }
 }
@@ -156,4 +170,36 @@ fn handshake_limit_clearing_retains_default_r2_floor() {
     assert!(a.handshake_pending());
     a.timeout(180_000_000).unwrap();
     assert_eq!(a.reason, Some(CloseReason::TimedOut));
+}
+
+#[test]
+fn handshake_limit_two_retries_abort_at_seven_seconds() {
+    for passive in [false, true] {
+        let mut a = if passive {
+            opening_for_close(config(1024, 64), 100, false).0
+        } else {
+            Connection::active(tuple(), config(1024, 64), 100, 0).unwrap()
+        };
+        a.set_handshake_retransmission_limit(NonZeroU8::new(2));
+        let start = a.now;
+        packet(&mut a, start);
+        for (retry, elapsed) in [(1, 1_000_000), (2, 3_000_000)] {
+            assert_eq!(a.rto_deadline, Some(start + elapsed));
+            a.timeout(start + elapsed - 1).unwrap();
+            assert_eq!(a.transmit(start + elapsed - 1, &mut [0; 2048]), Ok(None));
+            a.timeout(start + elapsed).unwrap();
+            let bytes = packet(&mut a, start + elapsed);
+            assert_ne!(
+                wire::parse(ip(tuple()), &bytes).unwrap().header.flags & SYN,
+                0
+            );
+            assert_eq!(a.committed_syn_retransmissions, retry);
+        }
+        assert_eq!(a.rto_deadline, Some(start + 7_000_000));
+        a.timeout(start + 6_999_999).unwrap();
+        assert!(a.handshake_pending());
+        a.timeout(start + 7_000_000).unwrap();
+        assert_eq!(a.reason, Some(CloseReason::TimedOut));
+        assert_eq!(a.transmit(start + 7_000_000, &mut [0; 2048]), Ok(None));
+    }
 }

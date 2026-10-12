@@ -12,7 +12,8 @@ fn handshake_limit_reserved_selection_rejection_and_acceptance() {
         let now = if retry == 0 {
             0
         } else {
-            a.next_deadline().unwrap()
+            assert_eq!(a.next_deadline(), Some(1_010_000));
+            1_010_000
         };
         if retry != 0 {
             a.on_timeout(now, 64).unwrap();
@@ -46,7 +47,8 @@ fn handshake_limit_reserved_selection_rejection_and_acceptance() {
         assert!(!a.accept_transmit(accepted_at, attempt.unwrap()).unwrap());
         assert_eq!(a.state(client), Ok(State::SynSent));
     }
-    let end = a.next_deadline().unwrap();
+    let end = 3_020_000; // Both accepted departures were delayed by 10ms.
+    assert_eq!(a.next_deadline(), Some(end));
     a.on_timeout(end - 1, 64).unwrap();
     assert_eq!(a.state(client), Ok(State::SynSent));
     a.on_timeout(end, 64).unwrap();

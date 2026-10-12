@@ -3138,19 +3138,21 @@ impl Connection {
         self.rcv_up = urgent;
     }
 
-    // syn_timed_out imposes >=3s until fresh data sample; synack_timeout_roles_first_data_and_fresh_sample_guard asserts passive/simultaneous timeout deadlines and release, active role covered by tlp_small_rto_floor_preserves_initial_and_syn_timeout_guard.
+    // After SYN acknowledgment, syn_timed_out imposes >=3s until fresh data sample; synack_timeout_roles_first_data_and_fresh_sample_guard asserts passive/simultaneous timeout deadlines and release, active role covered by tlp_small_rto_floor_preserves_initial_and_syn_timeout_guard.
     //= https://www.rfc-editor.org/rfc/rfc6298#section-5
-    //= reason=syn_timed_out imposes >=3s until fresh data sample; synack_timeout_roles_first_data_and_fresh_sample_guard asserts passive/simultaneous timeout deadlines and release, active role covered by tlp_small_rto_floor_preserves_initial_and_syn_timeout_guard.
+    //= reason=After SYN acknowledgment, syn_timed_out imposes >=3s until fresh data sample; synack_timeout_roles_first_data_and_fresh_sample_guard asserts passive/simultaneous timeout deadlines and release, active role covered by tlp_small_rto_floor_preserves_initial_and_syn_timeout_guard.
     //# (5.7) If the timer expires awaiting the ACK of a SYN segment and the TCP
     //# implementation is using an RTO less than 3 seconds, the RTO MUST be re-initialized to
     //# 3 seconds when data transmission begins (i.e., after the three-way handshake
     //# completes).
     fn rto(&self) -> u64 {
-        self.rtt.rto().max(if self.syn_timed_out {
-            self.config.timebase.ticks_from_us(3_000_000)
-        } else {
-            0
-        })
+        self.rtt
+            .rto()
+            .max(if self.syn_timed_out && self.syn_delivered {
+                self.config.timebase.ticks_from_us(3_000_000)
+            } else {
+                0
+            })
     }
 
     // FlightSize counts payload, not SYN/FIN sequence-space consumption.
@@ -11936,7 +11938,8 @@ mod tests {
                     wire::parse(ip(tuple()), &lost).unwrap().header.flags & (SYN | ACK),
                     SYN | ACK
                 );
-                let deadline = a.rto_deadline.unwrap();
+                let deadline = 1_000_020;
+                assert_eq!(a.rto_deadline, Some(deadline));
                 a.timeout(deadline - 1).unwrap();
                 assert_eq!(a.transmit(deadline - 1, &mut [0; 128]), Ok(None));
                 a.timeout(deadline).unwrap();
@@ -11947,6 +11950,9 @@ mod tests {
                 );
                 assert_eq!((a.snd_nxt, a.rto_deadline, a.syn_pending, a.now), before);
                 packet(&mut a, deadline);
+                assert!(!a.syn_delivered);
+                assert_eq!(a.rto(), 2_000_000);
+                assert_eq!(a.rto_deadline, Some(3_000_020));
                 let next = a.receive.next();
                 inject(
                     &mut a,
@@ -12250,6 +12256,9 @@ mod tests {
             assert!(a.handshake_complete());
             assert_eq!(a.state(), State::FinWait1);
             assert_eq!(a.acknowledged(), 0);
+            assert!(a.syn_delivered && a.syn_timed_out);
+            assert_eq!(a.rto(), 3_000_000);
+            assert_eq!(a.rto_deadline, Some(now + 3_000_000));
             assert_eq!(a.user_deadline(), Some(now + 1_000_000));
             // Lengthen post-handshake R2 so this test can service the backed-off RTO.
             a.config.user_timeout_us = 300_000_000;
@@ -14940,6 +14949,9 @@ mod tests {
         packet(&mut a, 0); // lose SYN
         a.timeout(1_000_000).unwrap();
         let bytes = packet(&mut a, 1_000_000);
+        assert!(!a.syn_delivered);
+        assert_eq!(a.rto(), 2_000_000);
+        assert_eq!(a.rto_deadline, Some(3_000_000));
         let syn = wire::parse(ip(tuple()), &bytes).unwrap();
         let mut b = Connection::passive(reverse(tuple()), cfg, 900, 1_000_000, &syn).unwrap();
         deliver(&mut b, &mut a, 1_100_000);
