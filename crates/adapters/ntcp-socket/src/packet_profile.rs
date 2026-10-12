@@ -141,7 +141,12 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
     };
     // Reserve owned receive storage before packetdrill starts timed events.
     // Its mlockall(MCL_FUTURE) makes first-touch allocation synchronous.
-    config.preallocate_connections = usize::from(upstream || profile == Profile::UpstreamWindow8);
+    config.preallocate_connections = if fast_open {
+        // Cookie warmup retains its storage when the timed second open starts.
+        2
+    } else {
+        usize::from(upstream || profile == Profile::UpstreamWindow8)
+    };
     config.connection.mss = 1460;
     config.connection.pacing = pacing.then(ntcp::PacingConfig::default);
     if matches!(profile, Profile::UpstreamWindow8 | Profile::UpstreamBasic) {
@@ -303,7 +308,7 @@ mod setup_profile_tests {
     }
 
     #[test]
-    fn fast_open_setup_changes_only_timestamps_and_aggregate_budget() {
+    fn fast_open_setup_changes_only_timestamps_budget_and_preallocation() {
         let selected = profile("upstream-fastopen,local=192.0.2.1").unwrap().1;
         assert_eq!(selected, Profile::UpstreamFastOpen);
         let mut actual = config(selected);
@@ -315,6 +320,8 @@ mod setup_profile_tests {
             32 * 1024 * 1024
         );
         actual.max_buffer_bytes = 32 * 1024 * 1024;
+        assert_eq!(actual.preallocate_connections, 2);
+        actual.preallocate_connections = 1;
         assert_eq!(
             format!("{actual:?}"),
             format!("{:?}", config(Profile::UpstreamBasic))
@@ -326,16 +333,18 @@ mod setup_profile_tests {
     #[test]
     fn fast_open_budget_admits_seven_retained_connections_but_not_eight() {
         let config = config(Profile::UpstreamFastOpen);
-        assert_eq!(config.preallocate_connections, 1);
+        assert_eq!(config.preallocate_connections, 2);
+        let preallocate = config.preallocate_connections;
         let budget = config.max_buffer_bytes;
         let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
-        let charge = endpoint.buffer_bytes();
+        let reserved = endpoint.buffer_bytes();
+        let charge = reserved / preallocate;
         // The smallest 32 MiB budget step that covers the corpus maximum.
         assert!(7 * charge > budget - 32 * 1024 * 1024);
         assert!(7 * charge <= budget);
         assert!(8 * charge > budget);
         endpoint.enable_fast_open().unwrap();
-        let cache_charge = endpoint.buffer_bytes() - charge;
+        let cache_charge = endpoint.buffer_bytes() - reserved;
         let remote = "192.0.2.2:8080".parse().unwrap();
         for index in 0..7 {
             let local = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 40000 + index);
@@ -343,7 +352,7 @@ mod setup_profile_tests {
             assert_eq!(accepted, 0);
             assert_eq!(
                 endpoint.buffer_bytes(),
-                (usize::from(index) + 1) * charge + cache_charge
+                (usize::from(index) + 1).max(preallocate) * charge + cache_charge
             );
         }
         assert_eq!(
@@ -351,6 +360,81 @@ mod setup_profile_tests {
             Err(ntcp::EndpointError::LimitReached)
         );
         assert_eq!(endpoint.buffer_bytes(), 7 * charge + cache_charge);
+    }
+
+    #[test]
+    fn non_fast_open_preallocation_is_unchanged() {
+        assert_eq!(EndpointConfig::default().preallocate_connections, 0);
+        for selected in [
+            Profile::Baseline,
+            Profile::Pipeline,
+            Profile::PipelinePaced,
+            Profile::PipelineGso,
+            Profile::PipelinePacedGso,
+            Profile::Sack,
+        ] {
+            assert_eq!(config(selected).preallocate_connections, 0);
+        }
+        for selected in [
+            Profile::UpstreamWindow8,
+            Profile::UpstreamHttps,
+            Profile::UpstreamGlobalLowat,
+            Profile::UpstreamSack,
+            Profile::UpstreamCubic,
+            Profile::UpstreamCubicEcn,
+            Profile::UpstreamEcn,
+            Profile::UpstreamBasic,
+        ] {
+            assert_eq!(config(selected).preallocate_connections, 1);
+        }
+    }
+
+    #[test]
+    fn fast_open_second_open_uses_reserved_charge_only_with_two_preallocations() {
+        for preallocate in [1, config(Profile::UpstreamFastOpen).preallocate_connections] {
+            let mut config = config(Profile::UpstreamFastOpen);
+            config.preallocate_connections = preallocate;
+            let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+            let reserved = endpoint.buffer_bytes();
+            let charge = reserved / preallocate;
+            endpoint.enable_fast_open().unwrap();
+            let initial = endpoint.buffer_bytes();
+            for index in 0..2 {
+                let local = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 40000 + index);
+                endpoint
+                    .connect_fast_open(0, local, "192.0.2.2:8080".parse().unwrap(), &[])
+                    .unwrap();
+                // Pool ownership transfers without charging twice. With only
+                // one reserve, the second retained open needs new storage.
+                assert_eq!(
+                    endpoint.buffer_bytes(),
+                    initial + (usize::from(index) + 1).saturating_sub(preallocate) * charge
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fast_open_preallocated_constructor_failure_preserves_charge() {
+        let mut config = config(Profile::UpstreamFastOpen);
+        config.connection.mss = 0;
+        let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
+        endpoint.enable_fast_open().unwrap();
+        let initial = endpoint.buffer_bytes();
+        for _ in 0..3 {
+            assert_eq!(
+                endpoint.connect_fast_open(
+                    0,
+                    "192.0.2.1:40000".parse().unwrap(),
+                    "192.0.2.2:8080".parse().unwrap(),
+                    &[],
+                ),
+                Err(ntcp::EndpointError::Connection(
+                    ntcp::Error::InvalidArgument
+                ))
+            );
+            assert_eq!(endpoint.buffer_bytes(), initial);
+        }
     }
 
     #[test]
