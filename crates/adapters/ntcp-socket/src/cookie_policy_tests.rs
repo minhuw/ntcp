@@ -61,7 +61,7 @@ fn binary_key_public_abi_faults_lengths_aliases_and_unsupported_get() {
         assert!(alias >= 0);
         let key = [0xabu8; 32];
         let set = |fd, p, len| setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN_KEY, p, len);
-        #[cfg(feature = "tfo-linux-cookie")]
+        #[cfg(all(feature = "linux", feature = "tfo-linux-cookie"))]
         {
             assert_eq!(set(fd, key.as_ptr().cast(), 16), 0);
             for len in [0, 4, 15, 17, 32, u32::MAX] {
@@ -94,7 +94,7 @@ fn binary_key_public_abi_faults_lengths_aliases_and_unsupported_get() {
             call(id, Op::Listen(4)).unwrap();
             assert_eq!(set(alias, key.as_ptr().cast(), 16), 0);
         }
-        #[cfg(not(feature = "tfo-linux-cookie"))]
+        #[cfg(not(all(feature = "linux", feature = "tfo-linux-cookie")))]
         {
             assert_eq!(set(fd, key.as_ptr().cast(), 16), -1);
             assert_eq!(errno(), ENOPROTOOPT);
@@ -118,7 +118,7 @@ fn binary_key_public_abi_faults_lengths_aliases_and_unsupported_get() {
         assert_eq!(len, 32);
         assert_eq!(close(fd), 0);
         assert_eq!(owned(alias).unwrap(), Some(id));
-        #[cfg(feature = "tfo-linux-cookie")]
+        #[cfg(all(feature = "linux", feature = "tfo-linux-cookie"))]
         assert_eq!(set(alias, key.as_ptr().cast(), 16), 0);
         assert_eq!(close(alias), 0);
         assert_eq!(call(id, Op::Ready).unwrap_err(), EBADF);

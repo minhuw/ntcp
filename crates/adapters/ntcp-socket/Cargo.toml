@@ -8,6 +8,8 @@ license = "MIT AND GPL-2.0-or-later"
 crate-type = ["rlib", "cdylib"]
 
 [features]
+default = ["linux"]
+linux = []
 packet-test = []
 tfo-linux-cookie = ["ntcp/tfo-linux-cookie"]
 

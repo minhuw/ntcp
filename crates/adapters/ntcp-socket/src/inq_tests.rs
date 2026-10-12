@@ -62,11 +62,14 @@ fn connected() -> (i32, ntcp::wire::Header) {
         };
         assert_eq!(connect(fd, (&addr as *const sockaddr_in).cast(), 16), -1);
         assert_eq!(errno(), EINPROGRESS);
-        let enabled = 1i32;
-        assert_eq!(
-            setsockopt(fd, IPPROTO_TCP, TCP_INQ, (&enabled as *const i32).cast(), 4),
-            0
-        );
+        #[cfg(feature = "linux")]
+        {
+            let enabled = 1i32;
+            assert_eq!(
+                setsockopt(fd, IPPROTO_TCP, TCP_INQ, (&enabled as *const i32).cast(), 4),
+                0
+            );
+        }
         let syn = header(&capture());
         let h = ntcp::wire::Header {
             source_port: 8080,
@@ -89,9 +92,11 @@ fn connected() -> (i32, ntcp::wire::Header) {
         )
     }
 }
+#[cfg(feature = "linux")]
 unsafe fn message(fd: i32, data: &mut [u8], flags: i32) -> i32 {
     unsafe { message_n(fd, data, flags, data.len()) }
 }
+#[cfg(feature = "linux")]
 unsafe fn message_n(fd: i32, data: &mut [u8], flags: i32, received: usize) -> i32 {
     let mut peer: sockaddr_in = unsafe { std::mem::zeroed() };
     let mut control = [0xaau8; 32];
@@ -125,6 +130,7 @@ unsafe fn message_n(fd: i32, data: &mut [u8], flags: i32, received: usize) -> i3
     );
     i32::from_ne_bytes(control[16..20].try_into().unwrap())
 }
+#[cfg(feature = "linux")]
 #[test]
 fn shared_abi_inq_timestamp_gate_staging_alias_fault_and_eof() {
     const CHILD: &str = "NTCP_TEST_INQ_ABI_CHILD";
@@ -405,6 +411,7 @@ fn splice_stops_at_urgent_octet_without_consuming_it() {
     packet_test::stop();
 }
 
+#[cfg(feature = "linux")]
 #[test]
 fn lowat_shared_alias_partial_write() {
     const CHILD: &str = "NTCP_TEST_LOWAT_ABI_CHILD";
@@ -566,6 +573,7 @@ fn shared_abi_pipeline_capacity_one_and_real_clock_pacing() {
     packet_test::stop();
 }
 
+#[cfg(feature = "linux")]
 #[test]
 fn global_lowat_alias_writes_poll_epoll_and_drain() {
     const CHILD: &str = "NTCP_TEST_GLOBAL_LOWAT_ABI_CHILD";

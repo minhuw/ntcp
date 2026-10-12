@@ -15,10 +15,12 @@ fn child(test: &str, variable: &str) -> bool {
     );
     false
 }
+#[cfg(feature = "linux")]
 fn set(fd: i32, option: i32, value: i32) -> i32 {
     unsafe { setsockopt(fd, IPPROTO_TCP, option, (&value as *const i32).cast(), 4) }
 }
 
+#[cfg(feature = "linux")]
 #[test]
 fn fast_open_raw_options_and_aliases() {
     if !child(
@@ -165,6 +167,7 @@ mod packets {
         assert!(fd >= 0);
         fd
     }
+    #[cfg(feature = "linux")]
     #[test]
     fn failed_fast_open_tcp_info_aliases_and_pointer_faults() {
         if !child(
@@ -512,27 +515,30 @@ mod packets {
             assert_eq!(close(alias), 0);
             let _fin = capture();
 
-            let fd = socket();
-            assert_eq!(set(fd, TCP_FASTOPEN, 1), 0);
-            assert_eq!(set(fd, TCP_FASTOPEN_CONNECT, 1), 0);
-            assert_eq!(connect(fd, destination, 16), 0);
-            let id = owned(fd).unwrap().unwrap();
-            let alias = dup(fd);
-            assert!(alias >= 0);
-            assert_eq!(close(fd), 0);
-            assert_eq!(packet_test::try_capture(65535).unwrap_err(), EAGAIN);
-            assert_eq!(write(alias, ptr::null(), 1), -1);
-            assert_eq!(errno(), EFAULT);
-            assert_eq!(packet_test::try_capture(65535).unwrap_err(), EAGAIN);
-            assert_eq!(send(alias, c"xyz".as_ptr().cast(), 3, MSG_FASTOPEN), 3);
-            assert_eq!(segment(&capture()).payload, b"xyz");
-            assert_eq!(close(alias), 0);
-            assert_eq!(call(id, Op::Ready).unwrap_err(), EBADF);
-            // A never-written deferred socket leaves no connection on last close.
-            let idle = socket();
-            assert_eq!(set(idle, TCP_FASTOPEN_CONNECT, 1), 0);
-            assert_eq!(connect(idle, destination, 16), 0);
-            assert_eq!(close(idle), 0);
+            #[cfg(feature = "linux")]
+            {
+                let fd = socket();
+                assert_eq!(set(fd, TCP_FASTOPEN, 1), 0);
+                assert_eq!(set(fd, TCP_FASTOPEN_CONNECT, 1), 0);
+                assert_eq!(connect(fd, destination, 16), 0);
+                let id = owned(fd).unwrap().unwrap();
+                let alias = dup(fd);
+                assert!(alias >= 0);
+                assert_eq!(close(fd), 0);
+                assert_eq!(packet_test::try_capture(65535).unwrap_err(), EAGAIN);
+                assert_eq!(write(alias, ptr::null(), 1), -1);
+                assert_eq!(errno(), EFAULT);
+                assert_eq!(packet_test::try_capture(65535).unwrap_err(), EAGAIN);
+                assert_eq!(send(alias, c"xyz".as_ptr().cast(), 3, MSG_FASTOPEN), 3);
+                assert_eq!(segment(&capture()).payload, b"xyz");
+                assert_eq!(close(alias), 0);
+                assert_eq!(call(id, Op::Ready).unwrap_err(), EBADF);
+                // A never-written deferred socket leaves no connection on last close.
+                let idle = socket();
+                assert_eq!(set(idle, TCP_FASTOPEN_CONNECT, 1), 0);
+                assert_eq!(connect(idle, destination, 16), 0);
+                assert_eq!(close(idle), 0);
+            }
         }
         packet_test::stop();
     }

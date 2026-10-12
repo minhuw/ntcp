@@ -1596,6 +1596,24 @@ pub unsafe extern "C" fn ntcp_managed_recvfrom(
         read_to(fd, id, n, flags, vec![(p as usize, n)], Vec::new())
     }) as ssize_t
 }
+// Exact exported socket-option boundary only; typed runtime operations stay available.
+fn socket_option_feature(level: i32, name: i32) -> Result<()> {
+    if !cfg!(feature = "linux")
+        && matches!(
+            (level, name),
+            (IPPROTO_TCP, TCP_CORK | TCP_INFO | TCP_CC_INFO | TCP_USER_TIMEOUT
+                | TCP_NOTSENT_LOWAT | TCP_INQ | TCP_KEEPIDLE | TCP_KEEPINTVL
+                | TCP_KEEPCNT | TCP_FASTOPEN | TCP_FASTOPEN_CONNECT | TCP_FASTOPEN_KEY
+                | TCP_SYNCNT)
+                // SO_TIMESTAMPING_OLD / SO_TIMESTAMPING_NEW.
+                | (SOL_SOCKET, SO_ZEROCOPY | SO_DOMAIN | SO_PROTOCOL | 37 | 65)
+                | (IPPROTO_IP, IP_FREEBIND | IP_MTU_DISCOVER | IP_MTU)
+        )
+    {
+        return Err(ENOPROTOOPT);
+    }
+    Ok(())
+}
 // Linux old timeval and new __kernel_sock_timeval are both two signed
 // 64-bit fields on the supported x86_64/aarch64 ABIs.
 fn timeout_option(level: i32, name: i32) -> Option<bool> {
@@ -1634,6 +1652,7 @@ pub unsafe extern "C" fn ntcp_managed_setsockopt(
         let Some(id) = owned(fd)? else {
             return raw(unsafe { syscall(SYS_setsockopt, fd, level, name, p, len) });
         };
+        socket_option_feature(level, name)?;
         if (level, name) == (IPPROTO_TCP, TCP_FASTOPEN_KEY) {
             #[cfg(feature = "tfo-linux-cookie")]
             {
@@ -1708,6 +1727,7 @@ pub unsafe extern "C" fn ntcp_managed_getsockopt(
         let Some(id) = owned(fd)? else {
             return raw(unsafe { syscall(SYS_getsockopt, fd, level, name, p, len) });
         };
+        socket_option_feature(level, name)?;
         // No key export: never route this binary option through the integer ABI.
         if (level, name) == (IPPROTO_TCP, TCP_FASTOPEN_KEY) {
             return Err(ENOPROTOOPT);
@@ -2040,6 +2060,7 @@ pub unsafe extern "C" fn ntcp_managed_dup3(fd: i32, new: i32, flags: i32) -> i32
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "linux")]
     #[test]
     fn tcp_info_prefix_abi_lengths_and_faults() {
         const CHILD: &str = "NTCP_TEST_INFO_ABI_CHILD";
@@ -3085,8 +3106,11 @@ mod inq_tests;
 #[cfg(all(test, feature = "packet-test"))]
 mod stream_read_tests;
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "linux", feature = "packet-test")))]
 mod fast_open_abi_tests;
 
 #[cfg(test)]
 mod cookie_policy_tests;
+
+#[cfg(all(test, not(feature = "linux")))]
+mod linux_option_abi_tests;
