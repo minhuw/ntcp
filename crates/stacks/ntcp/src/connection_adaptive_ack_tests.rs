@@ -464,3 +464,86 @@ fn only_frontier_advancing_new_data_trains_receive_timing() {
     assert!(a.ack_pending);
     assert_eq!(a.ack_deadline, None);
 }
+
+#[test]
+fn direct_and_reserved_departure_use_actual_clock_at_ato_boundary() {
+    for units in [1_000_000, 1_000_000_000] {
+        for offset in [-1i64, 0, 1] {
+            for reserved in [false, true] {
+                for ack_first in [false, true] {
+                    let mut cfg = adaptive_config();
+                    cfg.timebase.units_per_second = units;
+                    let received = cfg.timebase.ticks_from_us(100);
+                    let ato = cfg.timebase.ticks_from_us(40_000);
+                    let departed = (received + ato).checked_add_signed(offset).unwrap();
+                    let (mut a, _) = pair(cfg, 100);
+                    data(&mut a, received, b"request");
+                    if ack_first {
+                        packet(&mut a, received);
+                    }
+                    let quick = a.ack_quick;
+                    a.write(b"response").unwrap();
+                    let before = (
+                        a.now,
+                        a.ack_receive,
+                        a.ack_ato,
+                        a.ack_pending,
+                        a.ack_deadline,
+                    );
+                    assert_eq!(
+                        a.transmit_selected(received - 1, &mut [0; 2048], reserved),
+                        Err(Error::TimeWentBackwards)
+                    );
+                    assert_eq!(
+                        a.transmit_selected(departed, &mut [0; 19], reserved),
+                        Err(Error::OutputTooSmall)
+                    );
+                    assert_eq!(
+                        (
+                            a.now,
+                            a.ack_receive,
+                            a.ack_ato,
+                            a.ack_pending,
+                            a.ack_deadline
+                        ),
+                        before
+                    );
+                    assert_eq!(a.ack_quick, quick);
+                    assert!(!a.ack_interactive);
+                    if reserved {
+                        let mut d = selected(&mut a, received + 1);
+                        assert!(d.fresh_data);
+                        assert_eq!(d.data_ack, !ack_first);
+                        assert_eq!(a.ack_quick, quick);
+                        assert!(!a.ack_interactive);
+                        assert_eq!(
+                            a.accept_reserved_output(received, &mut d, 0, 8, true),
+                            Err(Error::TimeWentBackwards)
+                        );
+                        assert_eq!(a.ack_quick, quick);
+                        assert!(!a.ack_interactive);
+                        assert_eq!(d.data_ack, !ack_first);
+                        a.accept_reserved_output(departed, &mut d, 0, 8, true)
+                            .unwrap();
+                    } else {
+                        let bytes = packet(&mut a, departed);
+                        assert_eq!(
+                            wire::parse(ip(tuple()), &bytes).unwrap().payload,
+                            b"response"
+                        );
+                    }
+                    assert_eq!(a.now, departed);
+                    assert_eq!(a.ack_quick, quick - u8::from(!ack_first));
+                    assert_eq!(
+                        a.ack_interactive,
+                        offset < 0,
+                        "units={units}, offset={offset}, reserved={reserved}, ack_first={ack_first}"
+                    );
+                    data(&mut a, departed + 1, b"next");
+                    assert_eq!(a.ack_pending, offset >= 0);
+                    assert_eq!(a.ack_deadline.is_some(), offset < 0);
+                }
+            }
+        }
+    }
+}

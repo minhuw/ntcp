@@ -7995,7 +7995,6 @@ impl Connection {
         let data_ack = flags & ACK != 0
             && (self.unacked_segments != 0 || (passive_syn_data_acked && !self.syn_data_acked));
         if !reserve {
-            self.adaptive_departure(data_ack, fresh_data);
             self.syn_data_acked |= passive_syn_data_acked;
         }
         self.reserved_ledger = None;
@@ -8128,6 +8127,9 @@ impl Connection {
                 .collapse_push(seq.distance_from(self.send_base) as usize, count);
         }
         self.update_time(now)?;
+        if !reserve {
+            self.adaptive_departure(data_ack, fresh_data);
+        }
         self.last_output_ecn = ecn;
         if syn {
             self.sack_receive |= sack_offer;
