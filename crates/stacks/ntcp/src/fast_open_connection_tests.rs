@@ -772,10 +772,7 @@ fn simultaneous_syn_dsack_setup(
     let reply = wire::parse(ip(tuple()), &bytes).unwrap();
     assert_eq!(reply.header.flags, SYN | ACK);
     assert_eq!(reply.header.sequence, 0);
-    assert_eq!(
-        reply.header.acknowledgment,
-        irs.wrapping_add(if fast_open { 1 } else { 501 })
-    );
+    assert_eq!(reply.header.acknowledgment, irs.wrapping_add(1));
     assert!(reply.payload.is_empty());
     assert!(reply.options.fast_open.is_none());
     assert_eq!(reply.options.sack_blocks, [None; 4]);
