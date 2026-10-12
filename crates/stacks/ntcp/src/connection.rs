@@ -196,6 +196,8 @@ pub struct ConnectionConfig {
     pub rto_min_us: u64,
     pub retransmit_beyond_window: bool,
     pub delayed_ack_us: u64,
+    // Opt-in receive-spacing policy; delayed_ack_us is its positive maximum.
+    pub adaptive_ack: bool,
     // Default Linux-style standalone read updates: double the remaining
     // receive window. Ordinary ACKs and zero/sub-scale reopening retain
     // receiver SWS selection. False opts into eager one-MSS read updates.
@@ -263,6 +265,7 @@ impl ConnectionConfig {
             //# should not be excessively delayed; in particular, the delay MUST be less
             //# than 0.5 seconds (MUST-40).
             || self.delayed_ack_us >= 500_000
+            || (self.adaptive_ack && self.delayed_ack_us == 0)
             || self.challenge_ack_limit == 0
             || self.challenge_ack_interval_us == 0
             || self.user_timeout_us == 0
@@ -345,6 +348,7 @@ impl Default for ConnectionConfig {
             rto_min_us: 1_000_000,
             retransmit_beyond_window: false,
             delayed_ack_us: 200_000,
+            adaptive_ack: false,
             coalesce_read_window_updates: true,
             challenge_ack_limit: 100,
             challenge_ack_interval_us: 1_000_000,
@@ -673,6 +677,11 @@ pub(crate) struct Connection {
     fin_standalone: bool,
     syn_pending: bool,
     ack_pending: bool,
+    ack_ato: u64,
+    // The boolean distinguishes the establishment seed from the first data sample.
+    ack_receive: Option<(Instant, bool)>,
+    ack_quick: u8,
+    ack_interactive: bool,
     challenge_ack_pending: bool,
     challenge_ack_start: Option<Instant>,
     challenge_ack_sent: u32,
@@ -833,6 +842,9 @@ impl Connection {
             }
         };
         let timestamp_tick = config.timestamp_granularity.tick_in(now, config.timebase);
+        let ack_ato = config
+            .timebase
+            .ticks_from_us(config.delayed_ack_us.min(40_000));
         Ok(Self {
             tuple,
             peer_mss: config.mss,
@@ -940,6 +952,10 @@ impl Connection {
             fin_sent_at: None,
             fin_standalone: false,
             syn_pending: true,
+            ack_ato,
+            ack_receive: None,
+            ack_quick: 2,
+            ack_interactive: false,
             ack_pending: false,
             challenge_ack_pending: false,
             challenge_ack_start: None,
@@ -2394,6 +2410,8 @@ impl Connection {
             );
         }
         self.update_time(now)?;
+        self.adaptive_departure(d.data_ack, d.fresh_data && count != 0 && !d.syn);
+        d.data_ack = false; // One logical ACK, including SACK-only repair fragments.
         self.syn_data_acked |= d.passive_syn_data_acked;
         // Payload has accepted-departure evidence in RACK. SYN (including
         // SYN+data) and standalone FIN retain their Karn-eligible sample, but
@@ -3243,6 +3261,9 @@ impl Connection {
             self.fast_open_retry = Some((self.snd_una, self.snd_nxt));
         }
         self.handshake_complete = true;
+        if self.config.adaptive_ack {
+            self.ack_receive = Some((self.now, false));
+        }
         self.last_data_received = self.now;
         if let Some(deferred) = self.deferred_syn.take() {
             let count = self.receive.promote_syn().expect("staged SYN prefix");
@@ -3334,6 +3355,13 @@ impl Connection {
         }
         self.syn_pending = false;
         self.ack_pending = false;
+        self.ack_receive = None;
+        self.ack_interactive = false;
+        self.ack_quick = 2;
+        self.ack_ato = self
+            .config
+            .timebase
+            .ticks_from_us(self.config.delayed_ack_us.min(40_000));
         self.challenge_ack_pending = false;
         self.retx_pending = false;
         self.probe_pending = false;
@@ -6004,6 +6032,9 @@ impl Connection {
             self.terminal(CloseReason::Aborted);
             return;
         }
+        if self.config.adaptive_ack && outcome.new_bytes != 0 {
+            self.adaptive_receive();
+        }
         self.events.pushed |= self.receive.take_push();
         let advanced = self.receive.next().distance_from(next);
         self.received_total = self
@@ -6046,16 +6077,17 @@ impl Connection {
                 || self.unacked_segments >= 2
                 || self.unacked_bytes >= 2 * u32::from(rmss)
                 || self.config.delayed_ack_us == 0
+                || (self.config.adaptive_ack && self.ack_quick != 0 && !self.ack_interactive)
             {
                 self.immediate_ack();
             } else if !self.ack_pending && self.ack_deadline.is_none() {
-                self.ack_deadline = Some(
-                    self.now.saturating_add(
-                        self.config
-                            .timebase
-                            .ticks_from_us(self.config.delayed_ack_us),
-                    ),
-                );
+                self.ack_deadline = Some(self.now.saturating_add(if self.config.adaptive_ack {
+                    self.ack_ato
+                } else {
+                    self.config
+                        .timebase
+                        .ticks_from_us(self.config.delayed_ack_us)
+                }));
             }
         }
         if outcome.fin {
@@ -6066,6 +6098,50 @@ impl Connection {
                 State::FinWait2 => self.time_wait(),
                 _ => {}
             }
+        }
+    }
+
+    fn adaptive_receive(&mut self) {
+        let min = self
+            .config
+            .timebase
+            .ticks_from_us(self.config.delayed_ack_us.min(40_000));
+        let max = self
+            .config
+            .timebase
+            .ticks_from_us(self.config.delayed_ack_us);
+        if let Some((last, initialized)) = self.ack_receive {
+            let gap = self.now.saturating_sub(last);
+            if gap > self.rto() {
+                self.ack_quick = 2;
+                self.ack_interactive = false;
+            } else if !initialized {
+                self.ack_ato = min;
+            } else if gap <= min / 2 {
+                self.ack_ato = self.ack_ato / 2 + min / 2;
+            } else if gap < self.ack_ato {
+                self.ack_ato = (self.ack_ato / 2).saturating_add(gap);
+            }
+        } else {
+            self.ack_ato = min;
+        }
+        self.ack_ato = self.ack_ato.clamp(min, max);
+        self.ack_receive = Some((self.now, true));
+    }
+
+    fn adaptive_departure(&mut self, data_ack: bool, fresh_data: bool) {
+        if !self.config.adaptive_ack || self.reason.is_some() {
+            return;
+        }
+        if data_ack {
+            self.ack_quick = self.ack_quick.saturating_sub(1);
+        }
+        if fresh_data
+            && self
+                .ack_receive
+                .is_some_and(|(last, _)| self.now.saturating_sub(last) < self.ack_ato)
+        {
+            self.ack_interactive = true;
         }
     }
 
@@ -7916,11 +7992,16 @@ impl Connection {
             && self
                 .passive_syn_data_start
                 .is_some_and(|start| after(Seq(header.acknowledgment), start));
+        let data_ack = flags & ACK != 0
+            && (self.unacked_segments != 0 || (passive_syn_data_acked && !self.syn_data_acked));
         if !reserve {
+            self.adaptive_departure(data_ack, fresh_data);
             self.syn_data_acked |= passive_syn_data_acked;
         }
         self.reserved_ledger = None;
         self.last_departure = reserve.then_some(Departure {
+            data_ack,
+            fresh_data,
             passive_syn_data_acked,
             segmentation,
             selected_at: now,
@@ -8798,6 +8879,10 @@ impl Connection {
             }
         }
         if due(self.ack_deadline, now) {
+            if self.config.adaptive_ack {
+                self.ack_interactive = false;
+                self.ack_quick = 2;
+            }
             self.immediate_ack();
         }
         if expired_loss == Some(LossTimer::Zwp) {
@@ -9836,6 +9921,10 @@ mod tests {
         assert!(a.take_events().connected);
         assert!(b.take_events().connected);
         (a, b)
+    }
+
+    mod adaptive_ack_tests {
+        include!("connection_adaptive_ack_tests.rs");
     }
 
     mod statistics {

@@ -5,6 +5,8 @@ use crate::{ConnectionId, EndpointError, Error, Instant, Transmit, wire};
 // Only physical-departure work; sequence, recovery and PRR charges stay selected.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Departure {
+    pub data_ack: bool,
+    pub fresh_data: bool,
     pub segmentation: Option<TransmitSegmentation>,
     pub selected_at: Instant,
     pub start: u32,

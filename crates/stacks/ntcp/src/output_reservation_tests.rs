@@ -27,15 +27,18 @@ fn pair() -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
 }
 
 fn paced_pair(pacing: Option<bool>) -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
-    configured_pair(pacing, None)
+    configured_pair(pacing, None, false)
 }
 
 fn configured_pair(
     pacing: Option<bool>,
     granularity: Option<crate::TimestampGranularity>,
+    adaptive_ack: bool,
 ) -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
     let mut a = endpoint();
     let mut b = endpoint();
+    a.config.connection.adaptive_ack = adaptive_ack;
+    b.config.connection.adaptive_ack = adaptive_ack;
     if let Some(granularity) = granularity {
         a.config.connection.timestamps = true;
         b.config.connection.timestamps = true;
@@ -762,7 +765,7 @@ fn reserved_acceptance_survives_successive_mtu_clock_advances() {
     for endpoint_wide in [false, true] {
         for repair in [false, true] {
             let (mut a, _, id, _) =
-                configured_pair(None, Some(crate::TimestampGranularity::Microseconds));
+                configured_pair(None, Some(crate::TimestampGranularity::Microseconds), false);
             a.set_user_timeout(id, 10_000_000_000).unwrap();
             a.write(id, &[1; 100]).unwrap();
             let mut bytes = [0; 2048];
@@ -2286,4 +2289,65 @@ fn group_final_acceptance_rearms_pending_listener_readiness() {
         assert_eq!(b.next_event(), None);
         assert_eq!(b.accept(listener).unwrap(), child);
     }
+}
+
+#[test]
+fn adaptive_ack_held_owner_rejection_and_repair_preserve_ack_history() {
+    let (mut a, mut b, id, peer) = configured_pair(None, None, true);
+    let mut bytes = [0; 2048];
+    b.write(peer, b"request").unwrap();
+    let request = b.poll_transmit(2, &mut bytes, 16).unwrap().packet.unwrap();
+    let request_bytes = bytes[..request.len].to_vec();
+    a.input(2, request.ip, &request_bytes).unwrap();
+    a.write(id, &[7; 300]).unwrap();
+    let (_, token) = a.poll_reserved_transmit(3, &mut bytes, 16).unwrap();
+    let token = token.unwrap();
+    assert_eq!(
+        a.input(4, request.ip, &request_bytes),
+        Err(EndpointError::OutputReserved)
+    );
+    assert_eq!(a.read(id, &mut [0; 32]), Err(EndpointError::OutputReserved));
+    assert_eq!(a.write(id, b"x"), Err(EndpointError::OutputReserved));
+    assert_eq!(a.close(id), Err(EndpointError::OutputReserved));
+    assert_eq!(a.on_timeout(4, 16), Ok(false));
+    assert!(
+        a.reservations[0]
+            .current
+            .as_ref()
+            .unwrap()
+            .departure
+            .unwrap()
+            .data_ack
+    );
+    a.set_first_hop_mtu(4, id, 100).unwrap();
+    assert!(a.reject_unsubmitted(token).unwrap());
+    assert!(!a.accept_transmit(4, token).unwrap());
+    let mut fragments = 0;
+    while a.is_output_reserved(id) {
+        let (out, token) = a.poll_reserved_transmit(5, &mut bytes, 16).unwrap();
+        let packet = out.packet.unwrap();
+        let departure = a.reservations[0]
+            .current
+            .as_ref()
+            .unwrap()
+            .departure
+            .unwrap();
+        assert_eq!(departure.data_ack, fragments == 0);
+        b.input(5, packet.ip, &bytes[..packet.len]).unwrap();
+        assert!(a.accept_transmit(5, token.unwrap()).unwrap());
+        fragments += 1;
+    }
+    assert!(fragments > 1);
+    // Actual accepted response, not the earlier rejected selection, permits delay.
+    b.write(peer, b"next").unwrap();
+    let next = b.poll_transmit(6, &mut bytes, 16).unwrap().packet.unwrap();
+    a.input(6, next.ip, &bytes[..next.len]).unwrap();
+    assert!(a.poll_transmit(6, &mut bytes, 16).unwrap().packet.is_none());
+    a.on_timeout(40_006, 16).unwrap();
+    assert!(
+        a.poll_transmit(40_006, &mut bytes, 16)
+            .unwrap()
+            .packet
+            .is_some()
+    );
 }
