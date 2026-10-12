@@ -6032,7 +6032,7 @@ impl Connection {
             self.terminal(CloseReason::Aborted);
             return;
         }
-        if self.config.adaptive_ack && outcome.new_bytes != 0 {
+        if self.config.adaptive_ack && outcome.new_bytes != 0 && outcome.advanced {
             self.adaptive_receive();
         }
         self.events.pushed |= self.receive.take_push();

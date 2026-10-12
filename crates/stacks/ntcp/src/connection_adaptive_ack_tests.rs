@@ -407,3 +407,60 @@ fn ecn_window_reopening_and_peer_reset_keep_mandatory_feedback() {
     assert_eq!(a.ack_receive, None);
     assert!(!a.ack_interactive);
 }
+
+#[test]
+fn only_frontier_advancing_new_data_trains_receive_timing() {
+    let (mut a, _) = pair(adaptive_config(), 100);
+    data(&mut a, 100, b"a");
+    packet(&mut a, 100);
+    data(&mut a, 30_100, b"b");
+    packet(&mut a, 30_100);
+    assert_eq!(a.ack_ato, 50_000);
+    let history = a.ack_receive;
+    let next = a.receive.next();
+    let ack = a.snd_nxt;
+    let used = a.receive_used;
+    inject(&mut a, 60_100, next.wrapping_add(2), ack, ACK, 8192, b"e");
+    assert_eq!(a.receive_used, used + 1); // Accepted, but still above a hole.
+    assert_eq!(a.receive.next(), next);
+    assert!(a.ack_pending);
+    assert_eq!(a.ack_deadline, None);
+    assert_eq!(a.ack_receive, history);
+    assert_eq!(a.ack_ato, 50_000);
+    packet(&mut a, 60_100);
+
+    // Outside the last frontier sample's ATO, but inside the OOO arrival's ATO.
+    a.write(b"independent").unwrap();
+    let mut departure = selected(&mut a, 90_101);
+    assert!(departure.fresh_data);
+    assert_eq!(departure.payload, b"independent".len());
+    a.accept_reserved_output(90_102, &mut departure, 0, b"independent".len(), true)
+        .unwrap();
+    assert!(!a.ack_interactive);
+
+    // Overlap below RCV.NXT fills the hole and releases the buffered suffix.
+    let ack = a.snd_nxt;
+    inject(
+        &mut a,
+        100_100,
+        next.wrapping_add(u32::MAX),
+        ack,
+        ACK,
+        8192,
+        b"bcd",
+    );
+    assert_eq!(a.receive.next(), next.wrapping_add(3));
+    assert_eq!(a.ack_receive, Some((100_100, true)));
+    assert_eq!(a.ack_ato, 50_000);
+    assert!(a.ack_pending);
+    assert_eq!(a.ack_deadline, None);
+    packet(&mut a, 100_100);
+
+    // An ordinary frontier-extending overlap also contributes its receive gap.
+    inject(&mut a, 130_100, next.wrapping_add(2), ack, ACK, 8192, b"ef");
+    assert_eq!(a.receive.next(), next.wrapping_add(4));
+    assert_eq!(a.ack_receive, Some((130_100, true)));
+    assert_eq!(a.ack_ato, 55_000);
+    assert!(a.ack_pending);
+    assert_eq!(a.ack_deadline, None);
+}
