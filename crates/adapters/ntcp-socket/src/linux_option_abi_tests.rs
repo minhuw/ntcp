@@ -19,7 +19,6 @@ fn disabled_linux_options_preserve_native_and_posix_abi() {
         );
         return;
     }
-    assert!(!cfg!(feature = "linux"));
     assert!(RUNTIME.set(Ok(Runtime::in_memory_test())).is_ok());
     let id = call(0, Op::New(SOCK_NONBLOCK)).unwrap().value as u64;
     let (fd, token) = token(SOCK_CLOEXEC).unwrap();
