@@ -23,6 +23,7 @@ use send::LogicalSend;
 use std::{
     collections::{BTreeMap, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::NonZeroU8,
     sync::mpsc::{self, Receiver, SyncSender},
     time::Instant,
 };
@@ -362,6 +363,7 @@ struct Socket {
     receive_timeout_us: u64,
     send_timeout_us: u64,
     user_timeout_ms: i32,
+    syn_retries: Option<NonZeroU8>,
     tos: u8,
     discover: i32,
     zerocopy: bool,
@@ -405,6 +407,7 @@ impl Socket {
             receive_timeout_us: 0,
             send_timeout_us: 0,
             user_timeout_ms: 0,
+            syn_retries: None,
             tos: 0,
             discover: IP_PMTUDISC_WANT,
             zerocopy: false,
@@ -1250,6 +1253,9 @@ impl Owner {
         self.endpoint
             .set_application_timeout(cid, user_timeout_us(s.user_timeout_ms)?)
             .map_err(engine)?;
+        self.endpoint
+            .set_handshake_retransmission_limit(cid, s.syn_retries)
+            .map_err(engine)?;
         self.endpoint.set_dscp(cid, s.tos >> 2).map_err(engine)?;
         self.endpoint.set_nagle(cid, !s.nodelay).map_err(engine)?;
         self.endpoint.set_cork(cid, s.cork).map_err(engine)?;
@@ -1502,6 +1508,7 @@ impl Owner {
                 let cookie_policy = s.fast_open_cookie_policy.clone();
                 let capacities = (s.send_capacity, s.receive_capacity);
                 let application_timeout = user_timeout_us(s.user_timeout_ms)?;
+                let syn_retries = s.syn_retries;
                 let local = match s.local {
                     Some(a) => a,
                     None => SocketAddr::new(self.local.into(), self.port()?),
@@ -1521,6 +1528,13 @@ impl Owner {
                 if let Err(e) = self
                     .endpoint
                     .set_listener_application_timeout(listener, application_timeout)
+                {
+                    let _ = self.endpoint.close_listener(listener);
+                    return Err(engine(e));
+                }
+                if let Err(e) = self
+                    .endpoint
+                    .set_listener_handshake_retransmission_limit(listener, syn_retries)
                 {
                     let _ = self.endpoint.close_listener(listener);
                     return Err(engine(e));
@@ -1607,6 +1621,10 @@ impl Owner {
                         return Err(e);
                     }
                 };
+                child.syn_retries = self
+                    .endpoint
+                    .handshake_retransmission_limit(cid)
+                    .map_err(engine)?;
                 child.user_timeout_ms = self
                     .endpoint
                     .application_timeout(cid)
@@ -2023,6 +2041,12 @@ impl Owner {
                         }
                         s.discover = value;
                     }
+                    (IPPROTO_TCP, TCP_SYNCNT) => {
+                        if !(1..=127).contains(&value) {
+                            return Err(EINVAL);
+                        }
+                        s.syn_retries = NonZeroU8::new(value as u8);
+                    }
                     (IPPROTO_TCP, TCP_USER_TIMEOUT) => {
                         user_timeout_us(value)?;
                         s.user_timeout_ms = value;
@@ -2106,6 +2130,10 @@ impl Owner {
                             .endpoint
                             .set_keepalive(cid, s.keepalive_config())
                             .map_err(engine)?,
+                        (IPPROTO_TCP, TCP_SYNCNT) => self
+                            .endpoint
+                            .set_handshake_retransmission_limit(cid, s.syn_retries)
+                            .map_err(engine)?,
                         (IPPROTO_TCP, TCP_USER_TIMEOUT) => self
                             .endpoint
                             .set_application_timeout(cid, user_timeout_us(s.user_timeout_ms)?)
@@ -2128,6 +2156,13 @@ impl Owner {
                             listener,
                             user_timeout_us(s.user_timeout_ms)?,
                         )
+                        .map_err(engine)?;
+                }
+                if (level, name) == (IPPROTO_TCP, TCP_SYNCNT)
+                    && let Handle::Listener(listener) = s.handle
+                {
+                    self.endpoint
+                        .set_listener_handshake_retransmission_limit(listener, s.syn_retries)
                         .map_err(engine)?;
                 }
                 if (level, name) == (IPPROTO_TCP, TCP_FASTOPEN) {
@@ -2178,6 +2213,8 @@ impl Owner {
                     (IPPROTO_TCP, TCP_CORK) => s.cork as i32,
                     (IPPROTO_TCP, TCP_INQ) => s.inq as i32,
                     (IPPROTO_TCP, TCP_NOTSENT_LOWAT) => s.notsent_lowat as i32,
+                    // Zero reports no application override, not Linux's default count.
+                    (IPPROTO_TCP, TCP_SYNCNT) => s.syn_retries.map_or(0, |n| i32::from(n.get())),
                     (IPPROTO_TCP, TCP_USER_TIMEOUT) => s.user_timeout_ms,
                     (IPPROTO_IP, IP_FREEBIND) => s.freebind as i32,
                     (IPPROTO_IP, IP_TOS) => s.tos as i32,
@@ -2287,6 +2324,7 @@ mod tests {
     include!("file_transfer_tests.rs");
     include!("runtime_pacing_tests.rs");
     include!("runtime_lowat_tests.rs");
+    include!("runtime_syncnt_tests.rs");
     fn owner(last: u8) -> Owner {
         owner_with_config(
             last,

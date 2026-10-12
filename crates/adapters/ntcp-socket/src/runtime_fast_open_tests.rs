@@ -1483,3 +1483,70 @@ fn fast_open_post_handshake_partial_error_and_peer_fin_controls() {
         }
     }
 }
+
+#[test]
+fn syncnt_blocking_fast_open_and_deferred_timeout_retains_snapshot() {
+    for (warm, deferred) in [(false, false), (true, false), (true, true)] {
+        let (mut a, _b, _) = tfo_setup(warm);
+        let client = new(&mut a, 0);
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_SYNCNT, 1))
+            .unwrap();
+        if deferred {
+            a.execute(client, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
+                .unwrap();
+            a.execute(client, Op::Connect("192.0.2.2:8080".parse().unwrap()))
+                .unwrap();
+            assert!(matches!(a.sockets[&client].handle, Handle::Fresh));
+            tfo_no_output(&mut a);
+        }
+        let (reply, rx) = mpsc::sync_channel(1);
+        let mut request = Request {
+            id: client,
+            op: Op::Wait(
+                Box::new(tfo_send(b"hi", if deferred { 0 } else { MSG_FASTOPEN })),
+                None,
+            ),
+            reply,
+            deadline: None,
+            send: None,
+            closing: None,
+        };
+        assert!(!a.service(&mut request));
+        let failed = cid(&a, client);
+        assert_eq!(
+            a.endpoint.handshake_retransmission_limit(failed).unwrap(),
+            NonZeroU8::new(1)
+        );
+        let syn = tfo_capture(&mut a);
+        assert_ne!(segment(&syn).header.flags & ntcp::wire::SYN, 0);
+        // One submitted retry, then abort at the following RTO (not a new budget on fallback).
+        let now = a.endpoint.next_deadline().unwrap();
+        a.test_now = Some(now);
+        a.endpoint.on_timeout(now, BUDGET).unwrap();
+        let retry = tfo_capture(&mut a);
+        assert_ne!(segment(&retry).header.flags & ntcp::wire::SYN, 0);
+        assert_eq!(a.endpoint.state(failed).unwrap(), State::SynSent);
+        assert!(!a.service(&mut request));
+        let now = a.endpoint.next_deadline().unwrap();
+        a.test_now = Some(now);
+        a.endpoint.on_timeout(now, BUDGET).unwrap();
+        a.events();
+        assert_eq!(a.endpoint.state(failed).unwrap(), State::Closed);
+        let terminal = a.execute(client, Op::Transport(1)).unwrap().bytes;
+        assert_eq!(terminal[0], 7);
+        assert!(a.service(&mut request));
+        assert_eq!(rx.try_recv().unwrap().unwrap_err(), ETIMEDOUT);
+        assert!(matches!(a.sockets[&client].handle, Handle::Fresh));
+        assert_eq!(
+            a.execute(client, Op::Get(IPPROTO_TCP, TCP_SYNCNT))
+                .unwrap()
+                .value,
+            1
+        );
+        assert_eq!(a.execute(client, Op::Transport(1)).unwrap().bytes, terminal);
+        a.service_egress().unwrap();
+        while a.execute(0, Op::Capture(65535)).is_ok() {}
+        assert!(!a.endpoint.connection_exists(failed));
+        assert_eq!(a.execute(client, Op::Transport(1)).unwrap().bytes, terminal);
+    }
+}

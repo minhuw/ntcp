@@ -3114,3 +3114,6 @@ mod cookie_policy_tests;
 
 #[cfg(all(test, not(feature = "linux")))]
 mod linux_option_abi_tests;
+
+#[cfg(all(test, feature = "linux"))]
+mod syncnt_abi_tests;
