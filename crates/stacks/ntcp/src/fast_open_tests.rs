@@ -1684,3 +1684,40 @@ fn fast_open_negative_reserved_timeout_starts_at_acceptance() {
             .unwrap()
     );
 }
+
+#[test]
+fn fast_open_negative_local_deadline_does_not_suppress_when_serviced_late() {
+    for units in [1_000_000, 1_000_000_000] {
+        for (application_us, service_us, suppressed) in [
+            (100_000, 100_000, false),
+            (100_000, 2_000_000, false),
+            (1_500_000, 2_000_000, true),
+        ] {
+            let mut cfg = EndpointConfig::default();
+            cfg.connection.timebase.units_per_second = units;
+            let timebase = cfg.connection.timebase;
+            let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+            a.enable_fast_open().unwrap();
+            let (local, remote) = addresses(false, 40000);
+            a.connect_fast_open(0, local, remote, &[]).unwrap();
+            let syn = packet(&mut a, 0);
+            deliver(&mut a, 1, &cache_reply(&syn, 536, Some(&[7; 8])));
+            packet(&mut a, 1);
+            let (local, _) = addresses(false, 40001);
+            let (id, accepted) = a.connect_fast_open(2, local, remote, b"hello").unwrap();
+            assert_eq!(accepted, 5);
+            a.set_application_timeout(id, Some(application_us)).unwrap();
+            packet(&mut a, 2);
+            let now = 2 + timebase.ticks_from_us(service_us);
+            a.on_timeout(now, 64).unwrap();
+            assert_eq!(a.state(id).unwrap(), State::Closed);
+            assert_eq!(
+                a.can_defer_fast_open(now, local.ip(), remote).unwrap(),
+                !suppressed
+            );
+            let (local, _) = addresses(false, 40002);
+            let (_, accepted) = a.connect_fast_open(now, local, remote, b"retry").unwrap();
+            assert_eq!(accepted, if suppressed { 0 } else { 5 });
+        }
+    }
+}

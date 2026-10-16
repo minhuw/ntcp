@@ -1140,3 +1140,29 @@ fn fast_open_negative_ptb_keeps_existing_validation() {
     assert!(a.pmtu_feedback(2, 100, size, 20, 68).unwrap());
     assert!(a.fast_open_negative);
 }
+
+#[test]
+fn fast_open_negative_terminal_deadline_precedence_with_late_service() {
+    for units in [1_000_000, 1_000_000_000] {
+        for (application_us, service_us, expected) in [
+            (100_000, 100_000, false),
+            (100_000, 2_000_000, false),
+            (1_000_000, 2_000_000, true),
+            (1_500_000, 2_000_000, true),
+        ] {
+            let template = client(100, 12);
+            let mut cfg = template.config.clone();
+            cfg.timebase.units_per_second = units;
+            let mut a = Connection::active(tuple(), cfg, 100, 0).unwrap();
+            a.fast_open = template.fast_open;
+            a.fast_open_initial = 12;
+            a.write(&[42; 12]).unwrap();
+            a.set_application_timeout(Some(application_us)).unwrap();
+            packet(&mut a, 0);
+            assert_eq!(a.rto_deadline, Some(units));
+            a.timeout(a.config.timebase.ticks_from_us(service_us)).unwrap();
+            assert_eq!(a.state(), State::Closed);
+            assert_eq!(a.fast_open_negative, expected);
+        }
+    }
+}

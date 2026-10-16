@@ -8765,8 +8765,18 @@ impl Connection {
             self.ack_pending = false;
             return Ok(());
         }
-        if due(self.user_deadline(), now) || due(self.application_deadline(), now) {
-            if due(self.rto_deadline, now) {
+        let terminal_deadline = self
+            .user_deadline()
+            .into_iter()
+            .chain(self.application_deadline())
+            .min();
+        if due(terminal_deadline, now) {
+            // Late servicing must not turn an earlier local give-up into SYN loss.
+            if self
+                .rto_deadline
+                .zip(terminal_deadline)
+                .is_some_and(|(rto, terminal)| rto <= terminal)
+            {
                 self.report_fast_open_failure();
             }
             self.terminal(CloseReason::TimedOut);
