@@ -7431,9 +7431,9 @@ impl Connection {
                 let mss = self.mss as u32;
                 let initial = (4 * mss).min((2 * mss).max(4380));
                 self.snd_wnd
-                    .min(cwnd)
-                    .min(initial)
-                    .saturating_sub(self.data_flight()) as usize
+                    .saturating_sub(self.flight())
+                    .min(cwnd.min(initial).saturating_sub(self.data_flight()))
+                    as usize
             } else if self.sack_recovery.is_none()
                 && let Some(prr) = self.prr
             {

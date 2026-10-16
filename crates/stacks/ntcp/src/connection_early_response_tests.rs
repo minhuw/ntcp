@@ -173,7 +173,7 @@ fn early_response_actual_cap_window_mss_and_no_early_gso() {
                 let cap = (4 * smss)
                     .min((2 * smss).max(4380))
                     .min(a.congestion.cwnd())
-                    .min(window);
+                    .min(window.saturating_sub(1));
                 let mut payload = vec![0; 16_384];
                 let mut sent = 0;
                 for _ in 0..20 {
@@ -226,6 +226,74 @@ fn early_response_actual_cap_window_mss_and_no_early_gso() {
                 }
             }
         }
+    }
+}
+
+fn assert_early_response_window_boundary(window: u32) {
+    for reserved in [false, true] {
+        for iss in [100, u32::MAX - 100] {
+            let (_, mut a, _) = opening(cfg(1_000_000), iss, true, b"request");
+            // Isolate receive credit without completing the handshake.
+            a.snd_wnd = window;
+            a.write(&[42; 4000]).unwrap();
+            emit(&mut a, 20_000, reserved);
+            assert_eq!((a.flight(), a.data_flight()), (1, 0));
+            let una = a.snd_una;
+            let anchor = a.rto_deadline;
+            let mut sent = 0;
+            for now in [300_000, 600_000, 900_000] {
+                a.timeout(now).unwrap(); // Release SWS for a sub-MSS window tail.
+                let mut bytes = [0; 2048];
+                let Some(n) = a.transmit_selected(now, &mut bytes, reserved).unwrap() else {
+                    continue;
+                };
+                let data = wire::parse(ip(a.tuple()), &bytes[..n]).unwrap();
+                assert_eq!(data.header.flags & (SYN | FIN), 0);
+                assert!(!data.payload.is_empty());
+                let start = Seq(data.header.sequence);
+                let end = start.wrapping_add(data.payload.len() as u32);
+                assert_eq!(start, a.iss.wrapping_add(1 + sent));
+                assert!(
+                    end.distance_from(una) <= window,
+                    "early payload exceeds rwnd={window}: ISS={iss}, reserved={reserved}"
+                );
+                if reserved {
+                    let mut d = a.last_departure.unwrap();
+                    a.accept_reserved_output(now, &mut d, 0, data.payload.len(), true)
+                        .unwrap();
+                }
+                let original = a.rack.original_retry_span(start, end).unwrap();
+                assert_eq!(
+                    (original.original_start, original.original_end),
+                    (start, end)
+                );
+                assert!(original.originally_in_window);
+                assert_eq!(original.successful_retries, 0);
+                sent += data.payload.len() as u32;
+            }
+            assert_eq!(sent, window - 1);
+            assert_eq!(a.data_flight(), sent);
+            assert_eq!(a.flight(), window);
+            assert_eq!(a.snd_nxt, una.wrapping_add(window));
+            assert_eq!(
+                a.transmit_selected(900_000, &mut [0; 2048], reserved),
+                Ok(None)
+            );
+            assert_eq!(a.rto_deadline, anchor);
+            assert!(a.handshake_pending());
+        }
+    }
+}
+
+#[test]
+fn early_response_window_boundary_syn_exhausts_one_byte_window() {
+    assert_early_response_window_boundary(1);
+}
+
+#[test]
+fn early_response_window_boundary_small_windows_and_wrapped_iss() {
+    for window in [700, 1700] {
+        assert_early_response_window_boundary(window);
     }
 }
 
