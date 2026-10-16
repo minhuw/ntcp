@@ -4302,6 +4302,7 @@ impl Connection {
                     false,
                     segment.options.timestamps.map(|ts| ts.1),
                     self.snd_wnd,
+                    false,
                 );
                 if self.fast_open.is_some() {
                     self.fast_open_learned = Some((
@@ -4508,6 +4509,7 @@ impl Connection {
                 false,
                 segment.options.timestamps.map(|ts| ts.1),
                 self.snd_wnd,
+                false,
             );
             self.establish();
             self.last_received = now;
@@ -4812,6 +4814,11 @@ impl Connection {
             self.ts_recent = value;
             self.ts_recent_at = now;
         }
+        let response_handshake = self.handshake_pending()
+            && self.passive_open
+            && self.fast_open_early
+            && self.data_flight() != 0;
+        let split_response_ack = response_handshake && after(ack, self.iss.wrapping_add(1));
         if self.handshake_pending() {
             if !after(ack, self.snd_una) {
                 self.pending_rst = Some((ack, false));
@@ -4819,11 +4826,17 @@ impl Connection {
                 self.reset_reply = true;
                 return Ok(());
             }
+            // Leave response delivery for the normal ACK/SACK/PRR snapshot below.
             self.accept_ack(
-                ack,
+                if split_response_ack {
+                    self.iss.wrapping_add(1)
+                } else {
+                    ack
+                },
                 false,
                 segment.options.timestamps.map(|ts| ts.1),
                 self.snd_wnd,
+                split_response_ack,
             );
             self.establish();
         }
@@ -5050,7 +5063,10 @@ impl Connection {
                     self.note_probe_loss(start, self.rack.counts().lost > 1);
                 }
             }
-            if !advancing && let Some(sample) = self.rack.ack_sample {
+            if !advancing
+                && !response_handshake
+                && let Some(sample) = self.rack.ack_sample
+            {
                 self.congestion.observe_startup_ack(
                     live_ack,
                     crate::hystart::StartupAck {
@@ -5104,6 +5120,7 @@ impl Connection {
                 } else {
                     old_window
                 },
+                response_handshake,
             );
         }
         if self
@@ -5625,8 +5642,17 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc6928#section-9
     //= reason=IW10 divided/delayed new ACKs with outstanding flight restart at ACKtime+current RTO after estimator update; duplicate ACK does not restart, last new ACK cancels. RFC6298 universal timing audit remains separate.
     //# To minimize spurious retransmissions, implementations MUST follow RFC 6298 [RFC6298] to restart the retransmission timer with the current value of RTO for each ACK received that acknowledges new data.
-    fn accept_ack(&mut self, ack: Seq, ece: bool, echo: Option<u32>, send_window: u32) {
-        if self.pmtud.is_some() {
+    fn accept_ack(
+        &mut self,
+        ack: Seq,
+        ece: bool,
+        echo: Option<u32>,
+        send_window: u32,
+        response_handshake: bool,
+    ) {
+        let syn_ack = self.snd_una == self.iss && self.handshake_pending();
+        // A split handshake ACK owns one PMTU observation, at its actual full ACK.
+        if self.pmtud.is_some() && !(response_handshake && syn_ack) {
             let cooldown = self.pmtu_cooldown();
             let rto = self.rto();
             self.pmtud
@@ -5639,7 +5665,6 @@ impl Connection {
         // original qualifies. A scalar RTTM pending across a SACK must not
         // count that same transmission again on its later cumulative ACK.
         let startup_scalar_allowed = !self.rack.valid();
-        let syn_ack = self.snd_una == self.iss && self.handshake_pending();
         if syn_ack {
             self.syn_delivered = true;
             self.syn_data_acked |=
@@ -5756,7 +5781,9 @@ impl Connection {
             //= reason=Ordinary RTTM and local-clock RACK delivery share a causal-round gate: next eligible original must be sent at or after the prior sampling ACK. Continuous sliding, delayed/stretched and same-tick flights count actual updates; dense SACK and mixed cumulative delivery retain exact RFC6298 history. Conservative one-per-RTT sampling avoids fixed-weight history truncation; Appendix G and many-per-window sampling are suggestions, not mandatory formulas.
             //# to update the RTT estimator, an implementation SHOULD try to adhere
             //# to the spirit of the history specified in [RFC6298].
-            if !self.timestamps || echo == Some(self.timestamp_value(sent)) {
+            if (!response_handshake || syn_ack)
+                && (!self.timestamps || echo == Some(self.timestamp_value(sent)))
+            {
                 let sample = self
                     .now
                     .saturating_sub(self.sample_departure.unwrap_or(sent));
@@ -5775,8 +5802,10 @@ impl Connection {
         // Unlike RTTM above, it uses no peer echo, valid or otherwise.
         // The SYN scalar owns handshake RTT: payload must not sample twice or
         // bypass a rejected echo/Karn gate when that ACK also covers SYN data.
+        // The split passive response ACK retains this rule through its data step.
         if let Some(sample) = self.rack.ack_sample
             && !syn_ack
+            && !response_handshake
             && self.update_rtt(sample)
         {
             self.syn_timed_out = false;
@@ -5809,7 +5838,8 @@ impl Connection {
                     rtt: self
                         .rack
                         .ack_sample
-                        .or(startup_rtt.filter(|_| startup_scalar_allowed)),
+                        .or(startup_rtt.filter(|_| startup_scalar_allowed))
+                        .filter(|_| !response_handshake),
                     snd_nxt: self.snd_nxt,
                     paced: self.pacing_enabled(),
                 });
@@ -9984,6 +10014,10 @@ mod tests {
         include!("fast_open_connection_tests.rs");
     }
 
+    mod early_ack_handoff {
+        include!("connection_early_ack_handoff_tests.rs");
+    }
+
     mod handshake_limit {
         include!("connection_handshake_limit_tests.rs");
     }
@@ -10673,10 +10707,10 @@ mod tests {
         a.set_buffer_capacities(4, 4, usize::MAX).unwrap();
         assert_eq!(a.write(b"!"), Err(Error::WouldBlock));
         assert!(!a.take_events().writable);
-        a.accept_ack(a.send_base.wrapping_add(10), false, None, a.snd_wnd);
+        a.accept_ack(a.send_base.wrapping_add(10), false, None, a.snd_wnd, false);
         assert_eq!(a.send.len(), 16);
         assert!(!a.take_events().writable);
-        a.accept_ack(a.send_base.wrapping_add(13), false, None, a.snd_wnd);
+        a.accept_ack(a.send_base.wrapping_add(13), false, None, a.snd_wnd, false);
         assert_eq!(a.send.len(), 3);
         assert!(a.take_events().writable);
         b.set_buffer_capacities(4, 4, usize::MAX).unwrap();
