@@ -791,13 +791,13 @@ fn passive_repair_terminal_before_accept_retains_only_early_children() {
 }
 
 #[test]
-fn passive_repair_terminal_pending_releases_quota_not_ownership() {
+fn passive_repair_terminal_pending_retains_debt_and_ownership() {
     for release in [false, true] {
         let mut endpoint = endpoint();
         endpoint.enable_fast_open().unwrap();
         let (local, remote) = addresses(8080);
         let listener = endpoint.listen(local, 8).unwrap();
-        endpoint.set_listener_fast_open(listener, 1).unwrap();
+        endpoint.set_listener_fast_open(listener, 2).unwrap();
         let baseline = endpoint.buffer_bytes();
         let cookie = crate::fast_open::issue(&[42; 32], local.ip(), remote.ip(), 0);
         send_syn(&mut endpoint, local, remote, Some(cookie), b"early");
@@ -810,13 +810,20 @@ fn passive_repair_terminal_pending_releases_quota_not_ownership() {
         other.set_port(40001);
         send_syn(&mut endpoint, local, other, Some(cookie), b"early");
         let (second, _, ack) = response(&mut endpoint);
-        assert_eq!(ack, 106); // A terminal pending child no longer charges TFO quota.
+        assert_eq!(ack, 106); // One debt entry leaves one of the two admission slots available.
         assert!(endpoint.transport_info(second).unwrap().syn_data_acked);
         passive_reset(&mut endpoint, local, other, ack);
         if release {
             assert_eq!(endpoint.accept(listener).unwrap(), second);
             endpoint.release(second).unwrap();
         }
+        // Both recent resets retain the two slots, even after explicit release.
+        other.set_port(40002);
+        send_syn(&mut endpoint, local, other, Some(cookie), b"early");
+        let (fallback, _, ack) = response(&mut endpoint);
+        assert_eq!(ack, 101);
+        assert!(!endpoint.transport_info(fallback).unwrap().syn_data_acked);
+        passive_reset(&mut endpoint, local, other, ack);
         // Without explicit release neither closed child was reclaimed or dequeued.
         if !release {
             assert!(endpoint.connection_exists(first));

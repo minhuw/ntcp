@@ -307,6 +307,8 @@ struct Slot {
 struct Listener {
     fast_open_cookie_policy: Option<FastOpenCookiePolicy>,
     fast_open_limit: usize,
+    reset_debt: usize,
+    reset_debt_expiry: Option<Instant>,
     rx_timestamp_capacity: usize,
     buffer_capacities: (usize, usize),
     application_timeout_us: Option<u64>,
@@ -316,6 +318,16 @@ struct Listener {
     children: Vec<ConnectionId>,
     pending: VecDeque<ConnectionId>,
     closing: bool,
+}
+
+impl Listener {
+    fn reset_debt(&mut self, now: Instant) -> usize {
+        if self.reset_debt_expiry.is_some_and(|expiry| now >= expiry) {
+            self.reset_debt = 0;
+            self.reset_debt_expiry = None;
+        }
+        self.reset_debt
+    }
 }
 
 // An endpoint and its policy are bound to one ingress network context. Policies
@@ -643,6 +655,8 @@ impl Endpoint {
             .map_err(|_| Error::NoMemory)?;
         self.listeners[slot] = Some(Listener {
             fast_open_limit: 0,
+            reset_debt: 0,
+            reset_debt_expiry: None,
             fast_open_cookie_policy: None,
             rx_timestamp_capacity: 0,
             buffer_capacities: (
@@ -913,6 +927,10 @@ impl Endpoint {
                         && slot.connection.state() != State::Closed
                 })
                 .count();
+            let reset_debt = self.listeners[listener.slot]
+                .as_mut()
+                .unwrap()
+                .reset_debt(self.now);
             let policy = self.listeners[listener.slot]
                 .as_ref()
                 .unwrap()
@@ -929,7 +947,7 @@ impl Endpoint {
                     cookie,
                 )
             });
-            accept_syn_data = valid && pending < limit;
+            accept_syn_data = valid && pending.saturating_add(reset_debt) < limit;
             early = accept_syn_data && !syn.payload.is_empty();
             // RFC 7413 §4.2.2 permits omission; Linux does not refresh valid cookies.
             // This decision is independent of payload admission and pending quota.
@@ -1559,6 +1577,9 @@ impl Endpoint {
 
     fn refresh(&mut self, index: usize) {
         let fast_open_lifetime = self.fast_open_lifetime();
+        // RFC 7413 §5.1: retain recent remote resets in admission accounting.
+        // Sixty seconds and latest-reset batch retention are local policy.
+        let reset_cooldown = self.config.connection.timebase.ticks_from_us(60_000_000);
         if let Some(slot) = self.slots[index].as_mut() {
             if core::mem::take(&mut slot.connection.fast_open_negative)
                 && let Some(service) = self.fast_open.as_mut()
@@ -1581,6 +1602,18 @@ impl Endpoint {
                         mss,
                     );
                 }
+            }
+            if core::mem::take(&mut slot.connection.fast_open_peer_reset)
+                && let Some(owner) = slot.fast_open_owner
+                && self.listener_generations.get(owner.slot) == Some(&owner.generation)
+                && let Some(listener) = self.listeners[owner.slot].as_mut()
+                && !listener.closing
+            {
+                listener.reset_debt = listener
+                    .reset_debt(self.now)
+                    .saturating_add(1)
+                    .min(self.config.max_connections);
+                listener.reset_debt_expiry = Some(self.now.saturating_add(reset_cooldown));
             }
             if slot.connection.handshake_complete() || slot.connection.state() == State::Closed {
                 slot.fast_open_owner = None;
@@ -5252,4 +5285,9 @@ mod endpoint_mtu_update_tests {
 #[cfg(test)]
 mod output_reservation_tests {
     include!("output_reservation_tests.rs");
+}
+
+#[cfg(test)]
+mod reset_defense_tests {
+    include!("endpoint_reset_defense_tests.rs");
 }

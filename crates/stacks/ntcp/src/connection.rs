@@ -578,6 +578,7 @@ pub(crate) struct Connection {
     deferred_tfo_push: bool,
     fast_open_retry: Option<(Seq, Seq)>,
     pub(crate) fast_open_early: bool,
+    pub(crate) fast_open_peer_reset: bool,
     pub(crate) fast_open_learned: Option<(Option<wire::FastOpenCookie>, u16)>,
     snd_una: Seq,
     snd_nxt: Seq,
@@ -877,6 +878,7 @@ impl Connection {
             deferred_tfo_push: false,
             fast_open_retry: None,
             fast_open_early: false,
+            fast_open_peer_reset: false,
             fast_open_learned: None,
             snd_una: Seq(iss),
             snd_nxt: Seq(iss),
@@ -4667,6 +4669,8 @@ impl Connection {
         //# prescribed below according to the connection state.
         if h.flags & RST != 0 {
             if seq == next {
+                self.fast_open_peer_reset =
+                    self.handshake_pending() && self.passive_open && self.fast_open_early;
                 self.report_fast_open_failure();
                 let passive =
                     self.handshake_pending() && self.passive_open && !self.fast_open_early;

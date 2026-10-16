@@ -943,7 +943,7 @@ fn fast_open_early_terminal_reset_event_and_quota() {
             matches!(b.next_event(), Some(Event::Connection(id, events)) if id == child && events.closed == Some(CloseReason::Reset))
         );
         assert!(b.next_event().is_none());
-        // Terminal cleanup releases the one-child quota without releasing the handle.
+        // Only a validated remote RST retains quota as cooldown debt.
         let cookie = crate::fast_open::issue(&[2; 32], ip.destination, ip.source, 0);
         let mut options = [1; 12];
         options[..2].copy_from_slice(&[34, 10]);
@@ -960,6 +960,21 @@ fn fast_open_early_terminal_reset_event_and_quota() {
         )
         .unwrap();
         b.input(40, ip, &bytes[..n]).unwrap();
+        if flags == wire::RST {
+            assert!(b.accept(listener).is_err());
+            let fallback = packet(&mut b, 40);
+            assert_eq!(
+                wire::parse(fallback.0, &fallback.1)
+                    .unwrap()
+                    .header
+                    .acknowledgment,
+                101
+            );
+            // A new tuple can deliver early data again at the cooldown boundary.
+            bytes[0..2].copy_from_slice(&40003u16.to_be_bytes());
+            repair_cache_checksum(ip, &mut bytes[..n]);
+            b.input(60_000_030, ip, &bytes[..n]).unwrap();
+        }
         let next = b.accept(listener).unwrap();
         assert_ne!(next, child);
         assert_eq!(b.read(next, &mut bytes).unwrap(), 4);
