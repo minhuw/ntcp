@@ -155,6 +155,9 @@ pub struct ConnectionConfig {
     // Linux tcp_send_active_reset uses RST|ACK; only the flag policy is matched:
     // https://github.com/torvalds/linux/blob/22430ae5d90ab288b0ee2ad99ae941f4a666b694/net/ipv4/tcp_output.c
     pub abort_with_ack: bool,
+    // Opt-in authenticated passive response packets after a committed SYN-ACK.
+    // Default withholding avoids pre-handshake reflection (RFC 7413 section 5.2).
+    pub fast_open_early_response: bool,
     // Opt-in logical output PUSH batches in segments; 0/1 retain legacy hints.
     // >=2 hints the last segment of each full contiguous ordinary-data batch
     // only when a queued application PUSH covers it. Trailing singletons keep
@@ -332,6 +335,7 @@ impl Default for ConnectionConfig {
             cubic_fast_convergence: true,
             initial_window: InitialWindow::default(),
             abort_with_ack: false,
+            fast_open_early_response: false,
             output_push_batch_segments: 0,
             timestamps: false,
             timestamp_granularity: TimestampGranularity::default(),
@@ -1314,6 +1318,14 @@ impl Connection {
                 self.state,
                 State::SynSent | State::SynReceived | State::FinWait1
             )
+    }
+
+    fn early_response_eligible(&self) -> bool {
+        self.passive_open
+            && self.fast_open_early
+            && self.handshake_pending()
+            && self.config.fast_open_early_response
+            && self.syn_committed
     }
 
     pub(crate) fn time_wait_valid(&self, now: Instant) -> bool {
@@ -2524,7 +2536,11 @@ impl Connection {
                 self.schedule_tlp();
             }
         }
-        self.select_loss_timer();
+        if d.syn && finished && self.early_response_eligible() {
+            self.arm_work();
+        } else {
+            self.select_loss_timer();
+        }
         Ok(())
     }
 
@@ -3487,7 +3503,8 @@ impl Connection {
 
     fn arm_work(&mut self) {
         self.resolve_probe_response();
-        if !self.synchronized() {
+        let early_response = self.early_response_eligible();
+        if !self.synchronized() && !early_response {
             self.select_loss_timer();
             return;
         }
@@ -3501,7 +3518,8 @@ impl Connection {
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
         //# If the window shrinks to zero, the TCP implementation MUST probe it in the
         //# standard way (described below) (MUST-35).
-        if self.snd_wnd == 0 && pending {
+        // Early response coalescing is live, but loss/persist timing stays SYN-owned.
+        if !early_response && self.snd_wnd == 0 && pending {
             if self.prr.is_some() && self.config.prr_algorithm == PrrAlgorithm::Rfc9937 {
                 // Complete the PRR episode before zero-window probes.
                 self.congestion.complete_prr();
@@ -3531,7 +3549,7 @@ impl Connection {
                     self.rto_deadline = Some(self.now.saturating_add(self.persist_interval));
                 }
             }
-        } else {
+        } else if !early_response {
             self.persist_deadline = None;
             self.probe_pending = false;
             self.persist_interval = 0;
@@ -6713,6 +6731,7 @@ impl Connection {
         let challenge = reset.is_none() && self.challenge_ack_pending;
         let syn = reset.is_none() && !challenge && self.syn_pending;
         let live = self.synchronized() && !challenge;
+        let early_response = self.early_response_eligible() && !challenge;
         // Control and due protocol probes bypass pacing: SYN/RST/challenge,
         // pure ACK/FIN, RTO head retry outside PRR, TLP, persist and keepalive.
         // Actual stream data on bypasses still schedules spacing (keepalive's
@@ -7361,7 +7380,7 @@ impl Connection {
             seq = self.iss.wrapping_add(1);
             flags |= FIN;
             new_fin = true;
-        } else if live
+        } else if (live || early_response)
             && (!pacing_blocked
                 || self.send.len() <= self.snd_nxt.distance_from(self.send_base) as usize)
             && !(pacing_blocked && self.retx_pending)
@@ -7407,7 +7426,15 @@ impl Connection {
             //# send data with a sequence number higher than the sum of the
             //# highest acknowledged sequence number and the minimum of the cwnd
             //# and rwnd.
-            let usable = if self.sack_recovery.is_none()
+            let usable = if early_response {
+                // RFC 7413 section 4.2.2: bound payload even with configured IW10.
+                let mss = self.mss as u32;
+                let initial = (4 * mss).min((2 * mss).max(4380));
+                self.snd_wnd
+                    .min(cwnd)
+                    .min(initial)
+                    .saturating_sub(self.data_flight()) as usize
+            } else if self.sack_recovery.is_none()
                 && let Some(prr) = self.prr
             {
                 self.snd_wnd.saturating_sub(self.flight()).min(prr.credit()) as usize
@@ -7460,7 +7487,8 @@ impl Connection {
             // Leading/trailing retransmissions are tracked through cumulative
             // delivery, so an isolated loss is never inferred prematurely.
             let candidate = self.pmtud.as_ref().and_then(|p| p.target()).filter(|_| {
-                self.rtt.srtt().is_some()
+                !early_response
+                    && self.rtt.srtt().is_some()
                     && !pacing_blocked
                     && !self.congestion.in_recovery()
                     && self.sack_recovery.is_none()
@@ -7556,7 +7584,12 @@ impl Connection {
                 //# coalesce short segments (SHLD-7).
                 let final_fin =
                     fin_admissible && count == unsent && (count as u32) < timestamp_credit;
-                let nagle = !flushing && !final_fin && self.config.nagle && self.flight() != 0;
+                let nagle_flight = if early_response {
+                    self.data_flight()
+                } else {
+                    self.flight()
+                };
+                let nagle = !flushing && !final_fin && self.config.nagle && nagle_flight != 0;
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.2.1
                 //# A TCP implementation MUST include a SWS avoidance algorithm in the
                 //# sender (MUST-38).
@@ -7592,7 +7625,8 @@ impl Connection {
             // Extend only an already-admissible full-sized ordinary segment.
             // Keep protocol scratch/MTU unchanged: only the first segment is
             // encoded here; separately reserved storage retains the whole range.
-            if count == wire_mss
+            if !early_response
+                && count == wire_mss
                 && count != 0
                 && packet_mss == wire_mss
                 && reserve
@@ -8618,7 +8652,7 @@ impl Connection {
                 || self.fast_open_retry.is_some()
                 || self.probe_pending
                 || self.keepalive_pending
-                || self.synchronized()
+                || (self.synchronized() || self.early_response_eligible())
                     && (self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize
                         || self.shutdown && self.fin_sequence.is_none())))
         .then(|| {
@@ -8895,11 +8929,14 @@ impl Connection {
             self.congestion.end_ecn_prr();
             self.prr = None;
             self.rack_entry_delivery = None;
-            self.rack.rto(now, self.snd_una, self.rtt.srtt());
+            let early_response = self.early_response_eligible();
+            if !early_response {
+                self.rack.rto(now, self.snd_una, self.rtt.srtt());
+            }
             //= https://www.rfc-editor.org/rfc/rfc6675#section-5.1
             //= reason=Timeout discards advisory ranges and guards a fresh recovery phase until its exclusive data boundary is covered.
             //# RecoveryPoint MUST be set to HighData.
-            if self.sack_recovery_enabled() {
+            if !early_response && self.sack_recovery_enabled() {
                 self.scoreboard.clear();
                 self.sack_recovery = None;
                 self.sack_guard = Some(self.data_high());
@@ -10012,6 +10049,10 @@ mod tests {
 
     mod fast_open_tests {
         include!("fast_open_connection_tests.rs");
+    }
+
+    mod early_response {
+        include!("connection_early_response_tests.rs");
     }
 
     mod early_ack_handoff {
