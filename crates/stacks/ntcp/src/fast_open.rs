@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use core::net::IpAddr;
+use core::net::{IpAddr, SocketAddr};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -103,6 +103,7 @@ impl FastOpenCookiePolicy {
 }
 
 const CAPACITY: usize = 64;
+pub(crate) const NEGATIVE_LIFETIME_US: u64 = 60_000_000;
 pub(crate) const LIFETIME_US: u64 = 3_600_000_000;
 
 #[derive(Clone, Copy)]
@@ -114,14 +115,23 @@ pub(crate) struct CachedCookie {
     learned: Instant,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct NegativeService {
+    local: IpAddr,
+    remote: SocketAddr,
+    failed: Instant,
+}
+
 pub(crate) struct FastOpen {
     entries: Vec<CachedCookie>,
     next: usize,
+    negative: Vec<NegativeService>,
+    negative_next: usize,
 }
 
 impl FastOpen {
     pub const fn allocation_bytes() -> usize {
-        CAPACITY * core::mem::size_of::<CachedCookie>()
+        CAPACITY * (core::mem::size_of::<CachedCookie>() + core::mem::size_of::<NegativeService>())
     }
 
     pub fn new() -> Result<Self, Error> {
@@ -129,7 +139,48 @@ impl FastOpen {
         entries
             .try_reserve_exact(CAPACITY)
             .map_err(|_| Error::NoMemory)?;
-        Ok(Self { entries, next: 0 })
+        let mut negative = Vec::new();
+        negative
+            .try_reserve_exact(CAPACITY)
+            .map_err(|_| Error::NoMemory)?;
+        Ok(Self {
+            entries,
+            next: 0,
+            negative,
+            negative_next: 0,
+        })
+    }
+
+    pub fn suppressed(
+        &self,
+        now: Instant,
+        lifetime: u64,
+        local: IpAddr,
+        remote: SocketAddr,
+    ) -> bool {
+        self.negative.iter().any(|e| {
+            e.local == local && e.remote == remote && now >= e.failed && now - e.failed < lifetime
+        })
+    }
+
+    pub fn fail(&mut self, now: Instant, local: IpAddr, remote: SocketAddr) {
+        let entry = NegativeService {
+            local,
+            remote,
+            failed: now,
+        };
+        if let Some(old) = self
+            .negative
+            .iter_mut()
+            .find(|e| e.local == local && e.remote == remote)
+        {
+            *old = entry;
+        } else if self.negative.len() < CAPACITY {
+            self.negative.push(entry);
+        } else {
+            self.negative[self.negative_next] = entry;
+            self.negative_next = (self.negative_next + 1) % CAPACITY;
+        }
     }
 
     pub fn get(
@@ -324,6 +375,56 @@ mod tests {
             }
             assert_eq!(cache.entries.len(), CAPACITY);
             assert!(cache.get(10, 100, local, remote).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod negative_tests {
+    use super::*;
+
+    #[test]
+    fn negative_capacity_lifetime_isolation_and_independent_cookie_age() {
+        for units in [1_000_000, 1_000_000_000] {
+            let lifetime = crate::CallerTimebase {
+                units_per_second: units,
+                ..Default::default()
+            }
+            .ticks_from_us(NEGATIVE_LIFETIME_US);
+            let local = "192.0.2.1".parse().unwrap();
+            let other = "192.0.2.3".parse().unwrap();
+            let remote: SocketAddr = "192.0.2.2:80".parse().unwrap();
+            let mut cache = FastOpen::new().unwrap();
+            let cookie = FastOpenCookie::new(&[1; 8]).unwrap();
+            cache.learn(1, local, remote.ip(), cookie, 536);
+            cache.fail(10, local, remote);
+            for now in [9, 10, 10 + lifetime - 1, 10 + lifetime] {
+                assert_eq!(
+                    cache.suppressed(now, lifetime, local, remote),
+                    (10..10 + lifetime).contains(&now)
+                );
+            }
+            assert!(!cache.suppressed(10, lifetime, other, remote));
+            assert!(!cache.suppressed(10, lifetime, local, SocketAddr::new(other, 80)));
+            assert!(!cache.suppressed(10, lifetime, local, SocketAddr::new(remote.ip(), 81)));
+            assert_eq!(cache.entries[0].learned, 1);
+            assert_eq!(cache.entries[0].mss, 536);
+            cache.learn(11, local, remote.ip(), cookie, 940);
+            assert!(cache.suppressed(11, lifetime, local, remote));
+            cache.fail(20, local, remote);
+            assert_eq!(cache.negative.len(), 1);
+            assert!(cache.suppressed(10 + lifetime, lifetime, local, remote));
+            assert!(!cache.suppressed(20 + lifetime, lifetime, local, remote));
+            crate::allocation_tests::fail_after(0, || {
+                for port in 81..=145 {
+                    cache.fail(20, local, SocketAddr::new(remote.ip(), port));
+                }
+            });
+            assert_eq!(cache.negative.len(), CAPACITY);
+            assert_eq!(cache.negative.capacity(), CAPACITY);
+            assert!(!cache.suppressed(20, lifetime, local, remote));
+            assert_eq!(cache.entries[0].learned, 11);
+            assert_eq!(cache.entries[0].mss, 940);
         }
     }
 }

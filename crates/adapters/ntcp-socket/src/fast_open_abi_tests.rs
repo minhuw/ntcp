@@ -207,6 +207,11 @@ mod packets {
             assert_eq!(close(warm), 0);
             capture(); // FIN
             for deferred in [false, true] {
+                // RFC7413: independent service ports share cookies, not reset suppression.
+                let addr = sockaddr_in {
+                    sin_port: (8080u16 + u16::from(deferred)).to_be(),
+                    ..addr
+                };
                 let fd = socket();
                 let alias = dup(fd);
                 assert!(alias >= 0);
@@ -238,7 +243,7 @@ mod packets {
                     destination: Ipv4Addr::new(192, 0, 2, 1).into(),
                 };
                 let header = ntcp::wire::Header {
-                    source_port: 8080,
+                    source_port: u16::from_be(addr.sin_port),
                     destination_port: syn.header.source_port,
                     sequence: 0,
                     acknowledgment: syn.header.sequence.wrapping_add(1),

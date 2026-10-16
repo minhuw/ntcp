@@ -1671,7 +1671,7 @@ impl Owner {
                     self.endpoint.enable_fast_open().map_err(engine)?;
                     if self
                         .endpoint
-                        .has_fast_open_cookie(self.now(), local.ip(), remote.ip())
+                        .can_defer_fast_open(self.now(), local.ip(), remote)
                         .map_err(engine)?
                     {
                         let s = self.sockets.get_mut(&id).unwrap();

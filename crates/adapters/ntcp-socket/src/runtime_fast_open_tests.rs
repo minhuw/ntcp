@@ -1392,6 +1392,20 @@ fn fast_open_failed_implicit_completion_rolls_back_for_retry() {
                 EINVAL
             );
             assert_eq!(a.execute(client, Op::Transport(1)).unwrap().bytes, terminal);
+            // RFC7413: the reset suppresses this service until the fixed cooldown expires.
+            let remote = "192.0.2.2:8080".parse().unwrap();
+            assert!(
+                !a.endpoint
+                    .can_defer_fast_open(a.now(), a.local.into(), remote)
+                    .unwrap()
+            );
+            a.test_now = Some(a.now() + 60_000_000);
+            assert_eq!(
+                a.endpoint
+                    .can_defer_fast_open(a.now(), a.local.into(), remote)
+                    .unwrap(),
+                warm
+            );
             if warm {
                 a.execute(client, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
                     .unwrap();
@@ -1556,5 +1570,77 @@ fn syncnt_blocking_fast_open_and_deferred_timeout_retains_snapshot() {
         while a.execute(0, Op::Capture(65535)).is_ok() {}
         assert!(!a.endpoint.connection_exists(failed));
         assert_eq!(a.execute(client, Op::Transport(1)).unwrap().bytes, terminal);
+    }
+}
+
+#[test]
+fn fast_open_negative_suppresses_msg_deferred_query_and_already_deferred_write() {
+    for mode in 0..3 {
+        let (mut a, mut b, listener) = tfo_setup(true);
+        let remote = "192.0.2.2:8080".parse().unwrap();
+        let client = new(&mut a, SOCK_NONBLOCK);
+        if mode != 0 {
+            a.execute(client, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
+                .unwrap();
+        }
+        if mode == 2 {
+            a.execute(client, Op::Connect(remote)).unwrap();
+            tfo_no_output(&mut a);
+        }
+        let failing = new(&mut a, SOCK_NONBLOCK);
+        assert_eq!(
+            a.execute(failing, tfo_send(b"bad", MSG_FASTOPEN))
+                .unwrap()
+                .value,
+            3
+        );
+        let syn = tfo_capture(&mut a);
+        let tuple = a.endpoint.tuple(cid(&a, failing)).unwrap();
+        let seq = segment(&syn).header.sequence;
+        assert!(
+            a.endpoint
+                .network_error(a.now(), tuple, seq, ntcp::NetworkError::HardUnreachable)
+                .unwrap()
+        );
+        a.events();
+        assert!(
+            a.endpoint
+                .has_fast_open_cookie(a.now(), tuple.local.ip(), remote.ip())
+                .unwrap()
+        );
+        assert!(
+            !a.endpoint
+                .can_defer_fast_open(a.now(), tuple.local.ip(), remote)
+                .unwrap()
+        );
+        let result = if mode == 1 {
+            a.execute(client, Op::Connect(remote))
+        } else {
+            a.execute(
+                client,
+                tfo_send(b"hello", if mode == 0 { MSG_FASTOPEN } else { 0 }),
+            )
+        };
+        assert_eq!(result.unwrap_err(), EINPROGRESS);
+        assert!(a.sockets[&client].deferred_peer.is_none());
+        let syn = tfo_capture(&mut a);
+        assert!(segment(&syn).options.fast_open.is_none());
+        assert!(segment(&syn).payload.is_empty());
+        assert_eq!(
+            a.endpoint
+                .transport_info(cid(&a, client))
+                .unwrap()
+                .send_used,
+            0
+        );
+        tfo_deliver(&mut b, syn);
+        exchange(&mut a, &mut b);
+        let server = b
+            .execute(listener, Op::Accept(SOCK_NONBLOCK))
+            .unwrap()
+            .value as u64;
+        assert_eq!(a.execute(client, tfo_send(b"hello", 0)).unwrap().value, 5);
+        exchange(&mut a, &mut b);
+        assert_eq!(b.execute(server, Op::Read(5)).unwrap().bytes, b"hello");
     }
 }

@@ -64,6 +64,7 @@ fn syn_data_ack_bounds_wrap_partial_retry_and_flush() {
             assert_eq!(a.flush().unwrap(), 0); // On-wire bytes cannot be discarded.
             synack(&mut a, acked, 1000);
             assert_eq!(a.state(), State::Established);
+            assert_eq!(a.fast_open_negative, acked < 12);
             assert_eq!(a.acknowledged, acked as u64);
             assert_eq!(a.send.len(), 12 - acked as usize);
             assert_eq!(a.data_flight(), 12 - acked);
@@ -90,6 +91,7 @@ fn syn_data_ack_bounds_wrap_partial_retry_and_flush() {
         assert_eq!(a.state(), State::SynSent);
         assert_eq!(a.acknowledged, 0);
         assert!(a.fast_open_learned.is_none());
+        assert!(!a.fast_open_negative);
         assert_eq!(a.send.len(), 12);
     }
 }
@@ -1002,4 +1004,139 @@ fn tfo_two_retry_budget_keeps_exponential_syn_wait() {
     a.timeout(7_000_000).unwrap();
     assert_eq!(a.reason, Some(CloseReason::TimedOut));
     assert_eq!(a.transmit(7_000_000, &mut [0; 2048]), Ok(None));
+}
+
+#[test]
+fn fast_open_negative_requires_physical_option_and_reports_once() {
+    for reserved in [false, true] {
+        for option in [false, true] {
+            let mut a = client(100, 12);
+            if !option {
+                a.config.send_ip_payload_limit = 44;
+            }
+            assert_eq!(
+                a.transmit_selected(0, &mut [0; 19], reserved),
+                Err(Error::OutputTooSmall)
+            );
+            assert!(!a.fast_open_attempt);
+            assert!(
+                !a.network_error(1, 100, NetworkError::HardUnreachable)
+                    .unwrap()
+            );
+            let mut bytes = [0; 2048];
+            a.transmit_selected(2, &mut bytes, reserved)
+                .unwrap()
+                .unwrap();
+            if reserved {
+                assert!(!a.fast_open_attempt);
+                a.reject_reserved_output();
+                a.timeout(1_000_000).unwrap();
+                assert!(!a.fast_open_negative);
+                let mut departure = a.last_departure.unwrap();
+                let payload = departure.payload;
+                a.accept_reserved_output(2_000_000, &mut departure, 0, payload, true)
+                    .unwrap();
+            }
+            assert_eq!(a.fast_open_attempt, option);
+            let timeout = a.rto_deadline.unwrap();
+            a.timeout(timeout - 1).unwrap();
+            assert!(!a.fast_open_negative);
+            a.timeout(timeout).unwrap();
+            assert_eq!(core::mem::take(&mut a.fast_open_negative), option);
+            let retry = packet(&mut a, timeout);
+            assert!(
+                wire::parse(ip(tuple()), &retry)
+                    .unwrap()
+                    .options
+                    .fast_open
+                    .is_none()
+            );
+            let timeout = a.rto_deadline.unwrap();
+            a.timeout(timeout).unwrap();
+            assert!(!a.fast_open_negative);
+        }
+    }
+}
+
+#[test]
+fn fast_open_negative_validated_errors_reset_and_local_abort() {
+    for error in [
+        NetworkError::HardUnreachable,
+        NetworkError::SoftUnreachable,
+        NetworkError::TimeExceeded,
+        NetworkError::ParameterProblem,
+    ] {
+        let mut a = client(100, 12);
+        packet(&mut a, 0);
+        assert!(!a.network_error(1, 99, error).unwrap());
+        assert!(!a.network_error(2, 113, error).unwrap());
+        assert!(!a.network_error(3, 100, NetworkError::SourceQuench).unwrap());
+        assert!(!a.fast_open_negative);
+        assert!(a.network_error(4, 100, error).unwrap());
+        assert!(core::mem::take(&mut a.fast_open_negative));
+        a.network_error(5, 100, error).unwrap();
+        assert!(!a.fast_open_negative);
+    }
+    for ack in [100, 101, 113, 114] {
+        let mut a = client(100, 12);
+        packet(&mut a, 0);
+        let segment = wire::Segment {
+            header: wire::Header {
+                source_port: tuple().remote.port(),
+                destination_port: tuple().local.port(),
+                sequence: 99,
+                acknowledgment: ack,
+                flags: RST | ACK,
+                window: 0,
+                urgent_pointer: 0,
+            },
+            options: Default::default(),
+            raw_options: &[],
+            payload: &[],
+        };
+        a.input(1, &segment).unwrap();
+        assert_eq!(a.fast_open_negative, (101..=113).contains(&ack));
+    }
+    let mut a = client(100, 12);
+    packet(&mut a, 0);
+    a.timeout(400_000_000).unwrap();
+    assert_eq!(a.state(), State::Closed);
+    assert!(a.fast_open_negative);
+    let mut a = client(100, 12);
+    packet(&mut a, 0);
+    a.abort();
+    assert!(!a.fast_open_negative);
+    let mut a = client(100, 12);
+    packet(&mut a, 0);
+    synack(&mut a, 12, 1);
+    assert!(!a.fast_open_negative);
+    a.write(b"later").unwrap();
+    packet(&mut a, 2);
+    a.network_error(3, 113, NetworkError::HardUnreachable)
+        .unwrap();
+    assert!(!a.fast_open_negative);
+}
+
+#[test]
+fn fast_open_negative_ptb_keeps_existing_validation() {
+    let template = client(100, 200);
+    let mut cfg = template.config.clone();
+    cfg.pmtud = Some(crate::PmtudConfig::new(1500));
+    let mut a = Connection::active(tuple(), cfg, 100, 0).unwrap();
+    a.fast_open = template.fast_open;
+    a.fast_open_initial = 200;
+    a.write(&[42; 200]).unwrap();
+    let bytes = packet(&mut a, 0);
+    let size = bytes.len() as u32 + 20;
+    for (seq, len, header, mtu) in [
+        (99, size, 20, 68),
+        (100, size + 1, 20, 68),
+        (100, size, 24, 68),
+        (100, size, 20, 1500),
+    ] {
+        assert!(!a.pmtu_feedback(1, seq, len, header, mtu).unwrap());
+        assert!(!a.fast_open_negative);
+    }
+    assert!(a.pmtu_feedback(2, 100, size, 20, 68).unwrap());
+    assert!(a.fast_open_negative);
 }

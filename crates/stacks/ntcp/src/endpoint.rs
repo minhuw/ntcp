@@ -1150,6 +1150,13 @@ impl Endpoint {
             .ticks_from_us(crate::fast_open::LIFETIME_US)
     }
 
+    fn fast_open_negative_lifetime(&self) -> u64 {
+        self.config
+            .connection
+            .timebase
+            .ticks_from_us(crate::fast_open::NEGATIVE_LIFETIME_US)
+    }
+
     /// Opt this listener into replay-tolerant early delivery; zero disables it.
     pub fn set_listener_fast_open(
         &mut self,
@@ -1178,6 +1185,18 @@ impl Endpoint {
                 .get(now, self.fast_open_lifetime(), local, remote)
                 .is_some()
         }))
+    }
+
+    pub fn can_defer_fast_open(
+        &self,
+        now: Instant,
+        local: IpAddr,
+        remote: SocketAddr,
+    ) -> Result<bool, EndpointError> {
+        Ok(self.has_fast_open_cookie(now, local, remote.ip())?
+            && self.fast_open.as_ref().is_some_and(|service| {
+                !service.suppressed(now, self.fast_open_negative_lifetime(), local, remote)
+            }))
     }
 
     /// Copy initial data before publishing an active TFO connection. A cache
@@ -1211,6 +1230,8 @@ impl Endpoint {
     ) -> Result<(ConnectionId, usize), EndpointError> {
         self.check_clock(now)?;
         let service = self.fast_open.as_ref().ok_or(Error::InvalidState)?;
+        let suppressed =
+            service.suppressed(now, self.fast_open_negative_lifetime(), local.ip(), remote);
         let cached = service.get(now, self.fast_open_lifetime(), local.ip(), remote.ip());
         let tuple = Tuple { local, remote };
         Connection::validate_buffer_capacities(send_capacity, receive_capacity)?;
@@ -1225,7 +1246,11 @@ impl Endpoint {
             0,
             RxPacketTimestamps::default(),
         )?;
-        let accepted = match connection.prepare_fast_open(cached, initial) {
+        let accepted = match if suppressed {
+            Ok(0)
+        } else {
+            connection.prepare_fast_open(cached, initial)
+        } {
             Ok(count) => count,
             Err(error) => {
                 self.recycle_connection(connection);
@@ -1535,6 +1560,12 @@ impl Endpoint {
     fn refresh(&mut self, index: usize) {
         let fast_open_lifetime = self.fast_open_lifetime();
         if let Some(slot) = self.slots[index].as_mut() {
+            if core::mem::take(&mut slot.connection.fast_open_negative)
+                && let Some(service) = self.fast_open.as_mut()
+            {
+                let tuple = slot.connection.tuple();
+                service.fail(self.now, tuple.local.ip(), tuple.remote);
+            }
             if let Some((cookie, mss)) = slot.connection.fast_open_learned.take()
                 && let Some(service) = self.fast_open.as_mut()
             {

@@ -644,7 +644,8 @@ fn fast_open_cache_enable_budget_exact_fit_and_idempotence() {
     let charge = FastOpen::allocation_bytes();
     assert_eq!(
         charge,
-        64 * core::mem::size_of::<crate::fast_open::CachedCookie>()
+        64 * (core::mem::size_of::<crate::fast_open::CachedCookie>()
+            + core::mem::size_of::<crate::fast_open::NegativeService>())
     );
     let (local, remote) = addresses(false, 40001);
     for budget in [0, charge - 1, charge] {
@@ -692,15 +693,17 @@ fn fast_open_cache_allocation_failure_does_not_publish_or_charge() {
     };
     let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
     let (local, remote) = addresses(false, 40001);
-    assert_eq!(
-        crate::allocation_tests::fail_after(0, || a.enable_fast_open()),
-        Err(EndpointError::Connection(Error::NoMemory))
-    );
-    assert_eq!(a.buffer_bytes(), 0);
-    assert_eq!(
-        a.connect_fast_open(0, local, remote, b"disabled"),
-        Err(EndpointError::Connection(Error::InvalidState))
-    );
+    for failure in 0..2 {
+        assert_eq!(
+            crate::allocation_tests::fail_after(failure, || a.enable_fast_open()),
+            Err(EndpointError::Connection(Error::NoMemory))
+        );
+        assert_eq!(a.buffer_bytes(), 0);
+        assert_eq!(
+            a.connect_fast_open(0, local, remote, b"disabled"),
+            Err(EndpointError::Connection(Error::InvalidState))
+        );
+    }
     a.enable_fast_open().unwrap();
     assert_eq!(a.buffer_bytes(), charge);
     assert!(
@@ -1515,4 +1518,169 @@ fn ordinary_and_foexp_syn_text_ack_only_syn_then_deliver_once() {
             }
         }
     }
+}
+
+#[test]
+fn fast_open_negative_synack_suppresses_next_service_attempt() {
+    let (mut a, _, _) = warm(false);
+    let (local, remote) = addresses(false, 40001);
+    a.connect_fast_open(100, local, remote, b"hello").unwrap();
+    let syn = packet(&mut a, 100);
+    let mut response = cache_reply(&syn, 536, Some(&[9; 8]));
+    let seq = wire::parse(syn.0, &syn.1).unwrap().header.sequence;
+    response.1[8..12].copy_from_slice(&seq.wrapping_add(1).to_be_bytes());
+    repair_cache_checksum(response.0, &mut response.1);
+    deliver(&mut a, 110, &response);
+    packet(&mut a, 110);
+    assert!(
+        a.has_fast_open_cookie(110, local.ip(), remote.ip())
+            .unwrap()
+    );
+    let (local, _) = addresses(false, 40002);
+    let (_, accepted) = a.connect_fast_open(120, local, remote, b"retry").unwrap();
+    assert_eq!(accepted, 0);
+    let syn = packet(&mut a, 120);
+    let syn = wire::parse(syn.0, &syn.1).unwrap();
+    assert!(syn.options.fast_open.is_none());
+    assert!(syn.payload.is_empty());
+}
+
+#[test]
+fn fast_open_negative_endpoint_clock_expiry_and_repeated_errors() {
+    for units in [1_000_000, 1_000_000_000] {
+        for v6 in [false, true] {
+            let mut cfg = EndpointConfig::default();
+            cfg.connection.timebase.units_per_second = units;
+            let cooldown = cfg
+                .connection
+                .timebase
+                .ticks_from_us(crate::fast_open::NEGATIVE_LIFETIME_US);
+            let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+            a.enable_fast_open().unwrap();
+            let (local, remote) = addresses(v6, 40000);
+            a.connect_fast_open(0, local, remote, &[]).unwrap();
+            let syn = packet(&mut a, 0);
+            deliver(&mut a, 1, &cache_reply(&syn, 536, Some(&[7; 8])));
+            packet(&mut a, 1);
+            let (local, _) = addresses(v6, 40001);
+            let (id, _) = a.connect_fast_open(2, local, remote, b"hello").unwrap();
+            let syn = packet(&mut a, 2);
+            let seq = wire::parse(syn.0, &syn.1).unwrap().header.sequence;
+            let tuple = Tuple { local, remote };
+            assert!(
+                !a.network_error(3, tuple, seq.wrapping_sub(1), NetworkError::SoftUnreachable)
+                    .unwrap()
+            );
+            assert!(a.can_defer_fast_open(3, local.ip(), remote).unwrap());
+            assert!(
+                a.network_error(10, tuple, seq, NetworkError::SoftUnreachable)
+                    .unwrap()
+            );
+            assert!(!a.can_defer_fast_open(10, local.ip(), remote).unwrap());
+            assert!(
+                a.network_error(20, tuple, seq, NetworkError::TimeExceeded)
+                    .unwrap()
+            );
+            // Valid replacement learning must not remove the independent negative entry.
+            deliver(&mut a, 30, &cache_reply(&syn, 940, Some(&[9; 8])));
+            packet(&mut a, 30);
+            assert!(a.has_fast_open_cookie(30, local.ip(), remote.ip()).unwrap());
+            assert!(!a.can_defer_fast_open(30, local.ip(), remote).unwrap());
+            let other_port = SocketAddr::new(remote.ip(), remote.port() + 1);
+            assert!(a.can_defer_fast_open(30, local.ip(), other_port).unwrap());
+            let (other_local, _) = addresses(v6, 40002);
+            let (_, n) = a
+                .connect_fast_open(31, other_local, other_port, b"hello")
+                .unwrap();
+            assert_eq!(n, 5);
+            let other_syn = packet(&mut a, 31);
+            assert!(
+                wire::parse(other_syn.0, &other_syn.1)
+                    .unwrap()
+                    .options
+                    .fast_open
+                    .is_some()
+            );
+            // A suppressed attempt neither stores initial bytes nor refreshes cooldown.
+            let (other_local, _) = addresses(v6, 40003);
+            let (ordinary, n) = a
+                .connect_fast_open(32, other_local, remote, b"hello")
+                .unwrap();
+            assert_eq!(n, 0);
+            assert_eq!(a.transport_info(ordinary).unwrap().send_used, 0);
+            let ordinary_syn = packet(&mut a, 32);
+            let parsed = wire::parse(ordinary_syn.0, &ordinary_syn.1).unwrap();
+            assert!(parsed.options.fast_open.is_none());
+            assert!(
+                a.network_error(
+                    33,
+                    Tuple {
+                        local: other_local,
+                        remote
+                    },
+                    parsed.header.sequence,
+                    NetworkError::HardUnreachable
+                )
+                .unwrap()
+            );
+            a.release(ordinary).unwrap();
+            assert_eq!(a.abort(ordinary), Err(EndpointError::InvalidHandle));
+            assert!(
+                !a.can_defer_fast_open(10 + cooldown - 1, local.ip(), remote)
+                    .unwrap()
+            );
+            assert!(
+                a.can_defer_fast_open(10 + cooldown, local.ip(), remote)
+                    .unwrap()
+            );
+            let (local, _) = addresses(v6, 40004);
+            let (_, n) = a
+                .connect_fast_open(10 + cooldown, local, remote, b"again")
+                .unwrap();
+            assert_eq!(n, 5);
+            let syn = packet(&mut a, 10 + cooldown);
+            assert_eq!(
+                wire::parse(syn.0, &syn.1).unwrap().options.fast_open,
+                Some(wire::FastOpenCookie::new(&[9; 8]).unwrap())
+            );
+            assert!(a.can_defer_fast_open(9, local.ip(), remote).is_err());
+            assert_eq!(a.state(id).unwrap(), State::Established);
+        }
+    }
+}
+
+#[test]
+fn fast_open_negative_reserved_timeout_starts_at_acceptance() {
+    let (mut a, _, _) = warm(false);
+    a.enable_output_reservations().unwrap();
+    let (local, remote) = addresses(false, 40001);
+    let (id, _) = a.connect_fast_open(100, local, remote, b"hello").unwrap();
+    let mut bytes = [0; 2048];
+    let (_, attempt) = a
+        .poll_reserved_transmit_for(100, id, &mut bytes, 16)
+        .unwrap();
+    let attempt = attempt.unwrap();
+    assert!(a.reject_unsubmitted(attempt).unwrap());
+    a.on_timeout(2_000_000, 64).unwrap();
+    assert!(
+        a.can_defer_fast_open(2_000_000, local.ip(), remote)
+            .unwrap()
+    );
+    let (_, retry) = a
+        .poll_reserved_transmit_for(2_000_000, id, &mut bytes, 16)
+        .unwrap();
+    assert!(!a.accept_transmit(3_000_000, attempt).unwrap());
+    assert!(a.accept_transmit(3_000_000, retry.unwrap()).unwrap());
+    let deadline = a.next_deadline().unwrap();
+    a.on_timeout(deadline - 1, 64).unwrap();
+    assert!(
+        a.can_defer_fast_open(deadline - 1, local.ip(), remote)
+            .unwrap()
+    );
+    a.on_timeout(deadline, 64).unwrap();
+    assert!(!a.can_defer_fast_open(deadline, local.ip(), remote).unwrap());
+    assert!(
+        a.has_fast_open_cookie(deadline, local.ip(), remote.ip())
+            .unwrap()
+    );
 }

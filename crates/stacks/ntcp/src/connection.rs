@@ -563,6 +563,8 @@ pub(crate) struct Connection {
     passive_open: bool,
     fast_open: Option<wire::FastOpenCookie>,
     fast_open_initial: usize,
+    fast_open_attempt: bool,
+    pub(crate) fast_open_negative: bool,
     // Physical SYN acceptance, separate from attempted/queued Fast Open data.
     syn_payload_sent: usize,
     syn_data_acked: bool,
@@ -864,6 +866,8 @@ impl Connection {
             passive_open: false,
             fast_open: None,
             fast_open_initial: 0,
+            fast_open_attempt: false,
+            fast_open_negative: false,
             syn_payload_sent: 0,
             syn_data_acked: false,
             passive_syn_data_start: None,
@@ -2100,6 +2104,12 @@ impl Connection {
         self.handshake_retransmission_limit
     }
 
+    fn report_fast_open_failure(&mut self) {
+        if self.handshake_pending() && core::mem::take(&mut self.fast_open_attempt) {
+            self.fast_open_negative = true;
+        }
+    }
+
     fn record_syn_departure(&mut self) {
         if self.syn_committed {
             self.committed_syn_retransmissions =
@@ -2138,6 +2148,7 @@ impl Connection {
         //# Since these Unreachable messages indicate soft error conditions, a
         //# TCP implementation MUST NOT abort the connection (MUST-56), and it
         //# SHOULD make the information available to the application (SHLD-25).
+        self.report_fast_open_failure();
         self.events.network_error = Some(error);
         if let Some(p) = &mut self.pmtud {
             p.network_error();
@@ -2425,6 +2436,7 @@ impl Connection {
         });
         if d.syn {
             if finished {
+                self.fast_open_attempt |= d.fast_open && !self.syn_committed;
                 self.record_syn_departure();
             }
             self.syn_payload_sent = self.syn_payload_sent.max(count);
@@ -2694,6 +2706,7 @@ impl Connection {
             .as_mut()
             .is_some_and(|p| p.feedback(now, Seq(seq), size, header, mtu));
         if accepted {
+            self.report_fast_open_failure();
             self.refresh_path_mss();
             self.arm_work();
         }
@@ -3247,6 +3260,7 @@ impl Connection {
     }
 
     fn establish(&mut self) {
+        self.fast_open_attempt = false;
         if self.deferred_tfo_push {
             self.deferred_tfo_push = false;
             let end = self.iss.wrapping_add(1 + self.fast_open_initial as u32);
@@ -4247,6 +4261,7 @@ impl Connection {
             //# Otherwise (no ACK), drop the segment and return.
             if h.flags & RST != 0 {
                 if valid_ack {
+                    self.report_fast_open_failure();
                     self.terminal(CloseReason::Reset);
                 }
                 return Ok(());
@@ -4275,6 +4290,11 @@ impl Connection {
             }
             self.last_received = now;
             if valid_ack {
+                if self.syn_payload_sent != 0
+                    && after(self.iss.wrapping_add(1 + self.syn_payload_sent as u32), ack)
+                {
+                    self.report_fast_open_failure();
+                }
                 self.accept_ack(
                     ack,
                     false,
@@ -4476,6 +4496,11 @@ impl Connection {
                 self.ts_latest = value;
                 self.ts_recent_at = now;
             }
+            if self.syn_payload_sent != 0
+                && after(self.iss.wrapping_add(1 + self.syn_payload_sent as u32), ack)
+            {
+                self.report_fast_open_failure();
+            }
             self.accept_ack(
                 ack,
                 false,
@@ -4642,6 +4667,7 @@ impl Connection {
         //# prescribed below according to the connection state.
         if h.flags & RST != 0 {
             if seq == next {
+                self.report_fast_open_failure();
                 let passive =
                     self.handshake_pending() && self.passive_open && !self.fast_open_early;
                 self.terminal(CloseReason::Reset);
@@ -8008,6 +8034,7 @@ impl Connection {
             payload: count,
             stream: count != 0 && !keepalive,
             syn,
+            fast_open: fast_open_option.is_some() && !self.passive_open,
             fin: flags & FIN != 0,
             rto: !keepalive
                 && !probe
@@ -8297,6 +8324,8 @@ impl Connection {
         }
         let length = count as u32 + u32::from(flags & SYN != 0) + u32::from(flags & FIN != 0);
         if syn && !reserve {
+            self.fast_open_attempt |=
+                fast_open_option.is_some() && !self.passive_open && !self.syn_committed;
             self.record_syn_departure();
             self.syn_payload_sent = self.syn_payload_sent.max(count);
             self.rack
@@ -8737,6 +8766,9 @@ impl Connection {
             return Ok(());
         }
         if due(self.user_deadline(), now) || due(self.application_deadline(), now) {
+            if due(self.rto_deadline, now) {
+                self.report_fast_open_failure();
+            }
             self.terminal(CloseReason::TimedOut);
             return Ok(());
         }
@@ -8805,6 +8837,7 @@ impl Connection {
         {
             self.rto_deadline = head_sent.map(|sent| sent.saturating_add(self.rto()));
         } else if expired_loss == Some(LossTimer::Rto) {
+            self.report_fast_open_failure();
             // Explicit application give-up budget, not the default SYN R2 policy.
             if self.handshake_pending()
                 && self
