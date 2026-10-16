@@ -1644,3 +1644,126 @@ fn fast_open_negative_suppresses_msg_deferred_query_and_already_deferred_write()
         assert_eq!(b.execute(server, Op::Read(5)).unwrap().bytes, b"hello");
     }
 }
+
+#[test]
+fn fast_open_reset_suppressed_blocking_send_success_and_syncnt_timeout() {
+    for timeout in [false, true] {
+        let (mut a, mut b, listener) = tfo_setup(true);
+        let failing = new(&mut a, SOCK_NONBLOCK);
+        assert_eq!(
+            a.execute(failing, tfo_send(b"bad", MSG_FASTOPEN))
+                .unwrap()
+                .value,
+            3
+        );
+        let syn = tfo_capture(&mut a);
+        assert_eq!(segment(&syn).payload, b"bad");
+        assert!(segment(&syn).options.fast_open.is_some());
+        b.execute(listener, Op::Close).unwrap();
+        tfo_deliver(&mut b, syn);
+        let reset = tfo_capture(&mut b);
+        assert_ne!(segment(&reset).header.flags & ntcp::wire::RST, 0);
+        tfo_deliver(&mut a, reset);
+        assert_eq!(
+            a.execute(failing, tfo_send(b"retry", MSG_FASTOPEN))
+                .unwrap_err(),
+            ECONNREFUSED
+        );
+        tfo_no_output(&mut a);
+        let remote: SocketAddr = "192.0.2.2:8080".parse().unwrap();
+        assert!(
+            a.endpoint
+                .has_fast_open_cookie(a.now(), a.local.into(), remote.ip())
+                .unwrap()
+        );
+        assert!(
+            !a.endpoint
+                .can_defer_fast_open(a.now(), a.local.into(), remote)
+                .unwrap()
+        );
+        let listener = tfo_listener(&mut b);
+        let client = new(&mut a, 0);
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_SYNCNT, 1))
+            .unwrap();
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1))
+            .unwrap();
+        let payload = vec![42; 3000];
+        let (reply, rx) = mpsc::sync_channel(1);
+        let mut request = Request {
+            id: client,
+            op: Op::Wait(Box::new(tfo_send(&payload, MSG_FASTOPEN)), None),
+            reply,
+            deadline: None,
+            send: None,
+            closing: None,
+        };
+        assert!(!a.service(&mut request));
+        let connection = cid(&a, client);
+        let start = a.now();
+        let syn = tfo_capture(&mut a);
+        assert!(segment(&syn).payload.is_empty());
+        assert!(segment(&syn).options.fast_open.is_none());
+        assert_eq!(request.send.as_ref().unwrap().accepted, 0);
+        assert_eq!(a.endpoint.transport_info(connection).unwrap().send_used, 0);
+        assert!(!a.service(&mut request));
+        assert!(rx.try_recv().is_err());
+        if timeout {
+            for offset in [1_000_000, 3_000_000] {
+                let now = start + offset;
+                assert_eq!(a.endpoint.next_deadline(), Some(now));
+                a.test_now = Some(now);
+                a.endpoint.on_timeout(now, BUDGET).unwrap();
+                a.events();
+                assert_eq!(request.send.as_ref().unwrap().accepted, 0);
+                assert_eq!(a.endpoint.transport_info(connection).unwrap().send_used, 0);
+                if offset == 1_000_000 {
+                    let retry = tfo_capture(&mut a);
+                    assert!(segment(&retry).payload.is_empty());
+                    assert!(segment(&retry).options.fast_open.is_none());
+                    assert!(!a.service(&mut request));
+                }
+            }
+            let terminal = a.execute(client, Op::Transport(1)).unwrap().bytes;
+            assert_eq!(terminal[0], 7);
+            assert_eq!(terminal[5] & 32, 0);
+            assert!(a.service(&mut request));
+            assert_eq!(rx.try_recv().unwrap().unwrap_err(), ETIMEDOUT);
+            assert!(matches!(a.sockets[&client].handle, Handle::Fresh));
+            assert!(!a.sockets[&client].connect_pending);
+            assert_eq!(
+                a.execute(client, Op::Get(SOL_SOCKET, SO_ERROR))
+                    .unwrap()
+                    .value,
+                0
+            );
+            assert_eq!(a.execute(client, Op::Transport(1)).unwrap().bytes, terminal);
+            a.service_egress().unwrap();
+            while a.execute(0, Op::Capture(65535)).is_ok() {}
+            assert!(!a.endpoint.connection_exists(connection));
+            assert_eq!(a.execute(client, Op::Transport(1)).unwrap().bytes, terminal);
+        } else {
+            tfo_deliver(&mut b, syn);
+            exchange(&mut a, &mut b);
+            let server = b
+                .execute(listener, Op::Accept(SOCK_NONBLOCK))
+                .unwrap()
+                .value as u64;
+            assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap_err(), EAGAIN);
+            assert!(a.service(&mut request));
+            assert_eq!(rx.try_recv().unwrap().unwrap().value, payload.len() as i32);
+            exchange(&mut a, &mut b);
+            assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap().bytes, payload);
+            assert_eq!(b.execute(server, Op::Read(1)).unwrap_err(), EAGAIN);
+            assert_eq!(
+                a.execute(client, tfo_send(b"again", MSG_FASTOPEN))
+                    .unwrap_err(),
+                EISCONN
+            );
+        }
+        assert!(
+            !a.endpoint
+                .can_defer_fast_open(a.now(), a.local.into(), remote)
+                .unwrap()
+        );
+    }
+}

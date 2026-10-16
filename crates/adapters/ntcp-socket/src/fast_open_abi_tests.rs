@@ -360,8 +360,149 @@ mod packets {
                 assert_eq!(again, full);
                 assert_eq!(close(alias), 0);
             }
+            suppressed_blocking_send_success_and_timeout(&addr);
         }
         packet_test::stop();
+    }
+
+    // Both cases reuse the exact service whose physically captured TFO SYN was reset above.
+    #[cfg(feature = "linux")]
+    unsafe fn suppressed_blocking_send_success_and_timeout(addr: &sockaddr_in) {
+        unsafe {
+            for timeout in [true, false] {
+                let fd = socket();
+                let alias = dup(fd);
+                assert!(alias >= 0);
+                assert_eq!(set(fd, TCP_SYNCNT, 1), 0);
+                assert_eq!(set(fd, TCP_NODELAY, 1), 0);
+                call(owned(fd).unwrap().unwrap(), Op::Flags(F_SETFL, 0)).unwrap();
+                let addr = *addr;
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                let send = std::thread::spawn(move || {
+                    let bytes = [42u8; 2000];
+                    let result = sendto(
+                        alias,
+                        bytes.as_ptr().cast(),
+                        bytes.len(),
+                        MSG_FASTOPEN,
+                        (&addr as *const sockaddr_in).cast(),
+                        16,
+                    );
+                    tx.send((result, errno())).unwrap();
+                });
+                let syn = capture();
+                let initial = segment(&syn);
+                assert_ne!(initial.header.flags & SYN, 0);
+                assert!(initial.options.fast_open.is_none());
+                assert!(initial.payload.is_empty());
+                assert!(rx.try_recv().is_err());
+                if timeout {
+                    // The warmup's unacknowledged FIN can also retransmit.
+                    let retry = (0..8)
+                        .find_map(|_| {
+                            let packet = capture();
+                            (segment(&packet).header.source_port == initial.header.source_port)
+                                .then_some(packet)
+                        })
+                        .expect("suppressed SYN retry");
+                    assert_eq!(segment(&retry).header.sequence, initial.header.sequence);
+                    assert!(segment(&retry).payload.is_empty());
+                    assert!(segment(&retry).options.fast_open.is_none());
+                    assert_eq!(
+                        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+                        (-1, ETIMEDOUT)
+                    );
+                    let mut full = [0u8; 280];
+                    let mut len = 280;
+                    assert_eq!(
+                        getsockopt(
+                            fd,
+                            IPPROTO_TCP,
+                            TCP_INFO,
+                            full.as_mut_ptr().cast(),
+                            &mut len
+                        ),
+                        0
+                    );
+                    assert_eq!(full[0], 7);
+                    assert_eq!(full[5] & 32, 0);
+                    for size in [0, 1, 7, 192, 193, 280, 300] {
+                        let mut bytes = [0xa5u8; 300];
+                        let mut len = size;
+                        assert_eq!(
+                            getsockopt(
+                                alias,
+                                IPPROTO_TCP,
+                                TCP_INFO,
+                                bytes.as_mut_ptr().cast(),
+                                &mut len
+                            ),
+                            0
+                        );
+                        assert_eq!(len, size.min(280));
+                        assert_eq!(&bytes[..len as usize], &full[..len as usize]);
+                        assert!(bytes[len as usize..].iter().all(|&b| b == 0xa5));
+                    }
+                    let mut error = -1i32;
+                    len = 4;
+                    assert_eq!(
+                        getsockopt(
+                            alias,
+                            SOL_SOCKET,
+                            SO_ERROR,
+                            (&mut error as *mut i32).cast(),
+                            &mut len
+                        ),
+                        0
+                    );
+                    assert_eq!(error, 0);
+                    assert_eq!(close(fd), 0);
+                    let mut again = [0u8; 280];
+                    len = 280;
+                    assert_eq!(
+                        getsockopt(
+                            alias,
+                            IPPROTO_TCP,
+                            TCP_INFO,
+                            again.as_mut_ptr().cast(),
+                            &mut len
+                        ),
+                        0
+                    );
+                    assert_eq!(again, full);
+                } else {
+                    reply(&initial);
+                    assert_eq!(
+                        rx.recv_timeout(std::time::Duration::from_secs(2))
+                            .unwrap()
+                            .0,
+                        2000
+                    );
+                    let mut received = Vec::new();
+                    while received.len() < 2000 {
+                        let packet = capture();
+                        let data = segment(&packet);
+                        assert!(!data.payload.is_empty());
+                        assert_eq!(data.header.flags & SYN, 0);
+                        assert_eq!(
+                            data.header.sequence,
+                            initial
+                                .header
+                                .sequence
+                                .wrapping_add(1 + received.len() as u32)
+                        );
+                        received.extend_from_slice(data.payload);
+                    }
+                    assert_eq!(received, [42; 2000]);
+                    assert!(matches!(packet_test::try_capture(65535), Err(EAGAIN)));
+                    assert_eq!(close(fd), 0);
+                }
+                send.join().unwrap();
+                assert_eq!(close(alias), 0);
+                // Drain close output before the next socket's SYN.
+                while packet_test::try_capture(65535).is_ok() {}
+            }
+        }
     }
 
     #[test]
