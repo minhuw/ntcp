@@ -106,6 +106,9 @@ fn icmp_checked_quotes_and_ptb() {
             let feedback = decode_icmp(&b).unwrap();
             assert_eq!(feedback.kind, expected);
             assert_eq!(feedback.candidate_mtu, None);
+            if v6 {
+                assert_eq!(feedback.ipv4_network_error(), None);
+            }
         }
         for cut in 0..header + 8 {
             assert!(decode_icmp(&error_packet(v6, &tcp[..cut])).is_err());
@@ -313,4 +316,49 @@ fn disabled_families_are_rejected() {
         }
     }
     assert_eq!(decode_icmp(&[]).unwrap_err(), Error::Truncated);
+}
+
+#[test]
+#[cfg(feature = "ipv4")]
+fn ipv4_error_classification_separates_soft_hard_pmtu_and_source_quench() {
+    let tcp = tcp_packet(false, OutgoingIpv4Options::default());
+    let mut cases: Vec<_> = (0..=15).map(|code| (3, code)).collect();
+    cases.extend([(4, 0), (11, 0), (11, 1), (12, 0), (12, 1), (12, 2)]);
+    for (kind, code) in cases {
+        let mut bytes = error_packet(false, &tcp[..28]);
+        bytes[20] = kind;
+        bytes[21] = code;
+        if (kind, code) != (3, 4) {
+            bytes[24..28].fill(0);
+        }
+        bytes[22..24].fill(0);
+        let sum = checksum(&bytes[20..]);
+        bytes[22..24].copy_from_slice(&sum.to_be_bytes());
+        let decoded = decode_icmp(&bytes).unwrap();
+        let expected = match (kind, code) {
+            (3, 2 | 3) => Some(ntcp::NetworkError::HardUnreachable),
+            (3, 4) => None,
+            (3, _) => Some(ntcp::NetworkError::SoftUnreachable),
+            (4, 0) => Some(ntcp::NetworkError::SourceQuench),
+            (11, _) => Some(ntcp::NetworkError::TimeExceeded),
+            (12, _) => Some(ntcp::NetworkError::ParameterProblem),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            decoded.ipv4_network_error(),
+            expected,
+            "kind={kind}, code={code}"
+        );
+        let mut corrupt = bytes.clone();
+        corrupt[22] ^= 1;
+        assert_eq!(decode_icmp(&corrupt).unwrap_err(), Error::Checksum);
+        bytes[54] ^= 1; // Exact quoted sequence bytes are preserved, not reinterpreted.
+        bytes[22..24].fill(0);
+        let sum = checksum(&bytes[20..]);
+        bytes[22..24].copy_from_slice(&sum.to_be_bytes());
+        assert_ne!(
+            decode_icmp(&bytes).unwrap().quoted.sequence,
+            decoded.quoted.sequence
+        );
+    }
 }

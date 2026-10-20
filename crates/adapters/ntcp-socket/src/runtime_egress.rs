@@ -104,7 +104,7 @@ impl Egress {
     pub(super) fn has_held(&self) -> bool {
         self.tx.iter().any(|s| s.entry.is_some()) || !self.received.is_empty()
     }
-    fn retained_rx(&self, id: ConnectionId) -> bool {
+    pub(super) fn retained_rx(&self, id: ConnectionId) -> bool {
         self.rx.iter().any(|slot| slot.owner == Some(id))
     }
     fn clear(&mut self, index: usize) -> Result<()> {
@@ -257,6 +257,13 @@ impl Owner {
         let (output, attempt) = match output {
             Ok(output) => output,
             Err(EndpointError::OutputReserved) => return Ok(()),
+            // Candidate IDs are hints captured before this service pass. Core
+            // cleanup can reclaim an unaccepted child while another lane is
+            // serviced. Never turn that expired hint into a backend failure;
+            // an existing reserved ticket still requires its exact owner.
+            Err(EndpointError::InvalidHandle) if owner.is_some() && existing.is_none() => {
+                return Ok(());
+            }
             Err(EndpointError::ReservationMtuTooSmall) if existing.is_some() => {
                 let attempt = egress.tx[index].entry.as_ref().unwrap().attempt;
                 if !self.endpoint.abandon_transmit(attempt).map_err(engine)? {
@@ -421,7 +428,23 @@ impl Owner {
                             egress.clear(index)?;
                         }
                     }
-                    Ok(TxOutcome::WouldBlock) => {
+                    Ok(TxOutcome::Rejected)
+                        if self
+                            .endpoint
+                            .cancel_unsubmitted_repair(entry.attempt)
+                            .map_err(engine)? =>
+                    {
+                        egress
+                            .scheduler
+                            .resolve(token, Outcome::Dropped)
+                            .map_err(|_| EIO)?;
+                        entry.packet = None;
+                        egress.clear(index)?;
+                        // Yield to RX before retrying this still-lost repair.
+                        // output_wait retains the owner's bounded 1ms cadence.
+                        break;
+                    }
+                    Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => {
                         let now = self.now();
                         entry
                             .deadline
@@ -493,7 +516,9 @@ impl Owner {
             }
         } else {
             let feedback = ntcp_icmp::decode_icmp(bytes).ok()?;
-            if feedback.kind != ntcp_icmp::FeedbackKind::PacketTooBig {
+            // Even nonterminal errors must wait for the exact reserved owner;
+            // Source Quench needs no connection state and is discarded directly.
+            if feedback.kind == ntcp_icmp::FeedbackKind::SourceQuench {
                 return None;
             }
             let q = feedback.quoted;

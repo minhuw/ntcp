@@ -272,23 +272,41 @@ impl Owner {
         }
         if p.protocol == 6 {
             let _ = self.input_stamped(self.now(), p.ip, p.traffic_class, p.payload, stamps);
-        } else if let Ok(feedback) = ntcp_icmp::decode_icmp(bytes)
-            && feedback.kind == ntcp_icmp::FeedbackKind::PacketTooBig
-        {
+        } else if let Ok(feedback) = ntcp_icmp::decode_icmp(bytes) {
+            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2
+            //= reason=Validated native IPv4 ICMP is correlated using its quoted outbound tuple and live sequence at Endpoint; soft errors stay nonterminal, PTB keeps its exact-sent PMTU validation.
+            //# TCP implementations MUST act on an ICMP error message passed up from
+            //# the IP layer, directing it to the connection that created the error
+            //# (MUST-54).
+            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2
+            //= reason=SourceQuench is discarded before time, connection, error-report or PMTU processing; packet admission only validates its framing.
+            //# TCP implementations MUST silently discard any received ICMP Source
+            //# Quench messages (MUST-55).
+            if feedback.kind == ntcp_icmp::FeedbackKind::SourceQuench {
+                return;
+            }
             let q = feedback.quoted;
-            let _ = self.endpoint.pmtu_feedback(
-                self.now(),
-                ntcp::Tuple {
-                    local: SocketAddr::new(q.ip.source, q.source_port),
-                    remote: SocketAddr::new(q.ip.destination, q.destination_port),
-                },
-                q.sequence,
-                q.ip_packet_len,
-                q.ip_header_len,
-                feedback.candidate_mtu.unwrap_or(0),
-            );
+            let tuple = ntcp::Tuple {
+                local: SocketAddr::new(q.ip.source, q.source_port),
+                remote: SocketAddr::new(q.ip.destination, q.destination_port),
+            };
+            if feedback.kind == ntcp_icmp::FeedbackKind::PacketTooBig {
+                let _ = self.endpoint.pmtu_feedback(
+                    self.now(),
+                    tuple,
+                    q.sequence,
+                    q.ip_packet_len,
+                    q.ip_header_len,
+                    feedback.candidate_mtu.unwrap_or(0),
+                );
+            } else if let Some(error) = feedback.ipv4_network_error() {
+                let _ = self
+                    .endpoint
+                    .network_error(self.now(), tuple, q.sequence, error);
+            }
         }
     }
+
     pub(super) fn transmit_ethernet(&mut self) -> std::io::Result<TxOutcome> {
         let sources = self
             .pending_token

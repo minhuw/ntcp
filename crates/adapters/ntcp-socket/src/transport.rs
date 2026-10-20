@@ -6,6 +6,7 @@ use ntcp::State;
 // below are supported; every other field is reserved zero, NOT a metric.
 // Embedded-code assertions require the runner's field capability allowlist.
 const TCP_INFO_SIZE: usize = 280;
+#[cfg(test)]
 pub(crate) fn transport_option(info: ntcp::TransportInfo, option: i32) -> Result<Vec<u8>> {
     transport_option_prefix(info, option, TCP_INFO_SIZE)
 }
@@ -26,16 +27,16 @@ pub(crate) fn transport_option_prefix(
         let value = value.min(u32::MAX as u64) as u32;
         bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
     };
-    if !info.ledger_valid {
-        return Err(unsupported(
-            "TCP_INFO segment counts: bounded transport ledger invalid",
-        ));
-    }
-    if requested > 192 && !info.delivered_segments_valid {
-        return Err(unsupported(
-            "TCP_INFO delivered segments: metric unavailable",
-        ));
-    }
+    // optlen is the caller's capacity, not a demand for every trailing metric.
+    // A short reply exposes the available prefix without inventing delivery
+    // values. Callers needing later fields must inspect the returned length.
+    let available = if !info.ledger_valid {
+        24 // The first unavailable segment counter is tcpi_unacked.
+    } else if !info.delivered_segments_valid {
+        192
+    } else {
+        TCP_INFO_SIZE
+    };
     if info.send_window_scale > 14 || info.receive_window_scale > 14 {
         return Err(EIO);
     }
@@ -91,12 +92,36 @@ pub(crate) fn transport_option_prefix(
         3
     } else if info.ecn_response {
         2 // TCP_CA_CWR; loss/recovery supersede overlapping ECN epochs.
-    } else if info.sacked > 0 {
+    } else if info.ledger_valid && info.sacked > 0 {
         1
     } else {
         0
     };
     // Never return unavailable delivery bytes, even as reserved zero.
+    bytes.truncate(requested.min(available));
+    Ok(bytes)
+}
+
+// No Connection exists on a fresh/bound/deferred-connect socket or listener.
+// Their counters really are zero; listener queue occupancy uses Linux's
+// special tcpi_unacked/tcpi_sacked meanings rather than data-segment counts.
+pub(crate) fn idle_transport_option(
+    listener: Option<(usize, usize)>,
+    option: i32,
+    requested: usize,
+) -> Result<Vec<u8>> {
+    if option == 2 {
+        return Ok(Vec::new());
+    }
+    if option != 1 {
+        return Err(unsupported("transport option"));
+    }
+    let mut bytes = vec![0; TCP_INFO_SIZE];
+    bytes[0] = if listener.is_some() { 10 } else { 7 }; // LISTEN/CLOSE.
+    if let Some((pending, backlog)) = listener {
+        bytes[24..28].copy_from_slice(&(pending.min(u32::MAX as usize) as u32).to_ne_bytes());
+        bytes[28..32].copy_from_slice(&(backlog.min(u32::MAX as usize) as u32).to_ne_bytes());
+    }
     bytes.truncate(requested.min(TCP_INFO_SIZE));
     Ok(bytes)
 }
@@ -346,6 +371,7 @@ mod tests {
             cwnd: 10000,
             ssthresh: 8000,
             mss: 1000,
+            max_send_window: 32000,
             rtt_us: Some(12000),
             rttvar_us: 3000,
             rto_us: 200000,
@@ -376,6 +402,22 @@ mod tests {
                 ..info
             };
             assert_eq!(transport_option(sample, 1).unwrap()[1], state);
+        }
+        for (state, code) in [
+            (State::Established, 1),
+            (State::SynSent, 2),
+            (State::SynReceived, 3),
+            (State::FinWait1, 4),
+            (State::FinWait2, 5),
+            (State::TimeWait, 6),
+            (State::Closed, 7),
+            (State::CloseWait, 8),
+            (State::LastAck, 9),
+            (State::Closing, 11),
+        ] {
+            let bytes = transport_option(ntcp::TransportInfo { state, ..info }, 1).unwrap();
+            assert_eq!(bytes.len(), 280);
+            assert_eq!(bytes[0], code);
         }
         let error = if cfg!(feature = "packet-test") {
             ENOSYS
@@ -459,7 +501,7 @@ mod tests {
         }
         sample = info;
         sample.delivered_segments_valid = false;
-        assert_eq!(transport_option(sample, 1).err(), Some(error));
+        assert_eq!(transport_option(sample, 1).unwrap(), bytes[..192]);
         assert!(transport_option(sample, 2).unwrap().is_empty());
         for requested in [0, 1, 6, 7, 9, 191, 192] {
             assert_eq!(
@@ -468,7 +510,10 @@ mod tests {
             );
         }
         for requested in [193, 195, 196, 280, 512, usize::MAX] {
-            assert_eq!(transport_option_prefix(sample, 1, requested), Err(error));
+            assert_eq!(
+                transport_option_prefix(sample, 1, requested).unwrap(),
+                bytes[..192]
+            );
             assert_eq!(
                 transport_option_prefix(info, 1, requested).unwrap(),
                 bytes[..requested.min(TCP_INFO_SIZE)]
@@ -478,7 +523,9 @@ mod tests {
             sample.ledger_valid = false;
             sample.delivered_segments_valid = delivered_valid;
             for requested in [0, 1, 192, 193, 280] {
-                assert_eq!(transport_option_prefix(sample, 1, requested), Err(error));
+                let prefix = transport_option_prefix(sample, 1, requested).unwrap();
+                assert_eq!(prefix.len(), requested.min(24));
+                assert_eq!(prefix.get(5), (requested > 5).then_some(&bytes[5]));
                 assert!(
                     transport_option_prefix(sample, 2, requested)
                         .unwrap()

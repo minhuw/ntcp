@@ -63,8 +63,12 @@ fn syn_data_ack_bounds_wrap_partial_retry_and_flush() {
             );
             assert_eq!(a.flush().unwrap(), 0); // On-wire bytes cannot be discarded.
             synack(&mut a, acked, 1000);
+            assert_eq!(
+                a.congestion.ack_history(),
+                Some((Seq(iss), Seq(iss).wrapping_add(1 + acked)))
+            );
             assert_eq!(a.state(), State::Established);
-            assert_eq!(a.fast_open_negative, acked < 12);
+            assert_eq!(a.fast_open_negative, acked == 0);
             assert_eq!(a.acknowledged, acked as u64);
             assert_eq!(a.send.len(), 12 - acked as usize);
             assert_eq!(a.data_flight(), 12 - acked);
@@ -88,6 +92,7 @@ fn syn_data_ack_bounds_wrap_partial_retry_and_flush() {
         let mut a = client(iss, 12);
         packet(&mut a, 0);
         synack(&mut a, 13, 1000);
+        assert_eq!(a.congestion.ack_history(), None);
         assert_eq!(a.state(), State::SynSent);
         assert_eq!(a.acknowledged, 0);
         assert!(a.fast_open_learned.is_none());
@@ -1095,7 +1100,8 @@ fn fast_open_negative_validated_errors_reset_and_local_abort() {
             payload: &[],
         };
         a.input(1, &segment).unwrap();
-        assert_eq!(a.fast_open_negative, (101..=113).contains(&ack));
+        assert!(!a.fast_open_negative);
+        assert_eq!(a.state() == State::Closed, (101..=113).contains(&ack));
     }
     let mut a = client(100, 12);
     packet(&mut a, 0);
@@ -1160,9 +1166,238 @@ fn fast_open_negative_terminal_deadline_precedence_with_late_service() {
             a.set_application_timeout(Some(application_us)).unwrap();
             packet(&mut a, 0);
             assert_eq!(a.rto_deadline, Some(units));
-            a.timeout(a.config.timebase.ticks_from_us(service_us)).unwrap();
+            a.timeout(a.config.timebase.ticks_from_us(service_us))
+                .unwrap();
             assert_eq!(a.state(), State::Closed);
             assert_eq!(a.fast_open_negative, expected);
+        }
+    }
+}
+
+#[test]
+fn pending_writer_initializes_engine_not_receive_history_at_validated_handshake() {
+    for units in [1_000_000, 1_000_000_000] {
+        for pending in [false, true] {
+            for tail in [false, true] {
+                for idle in [false, true] {
+                    let mut a = client(100, 12);
+                    a.config.adaptive_ack = true;
+                    a.config.timestamps = false;
+                    a.config.timebase.units_per_second = units;
+                    let ticks = |us| us * (units / 1_000_000);
+                    a.ack_ato = ticks(40_000);
+                    a.set_fast_open_write_pending(pending).unwrap();
+                    packet(&mut a, 0);
+                    synack(&mut a, 12, ticks(200));
+                    assert_eq!(a.ack_engine_initialized, pending);
+                    assert!(!a.fast_open_write_pending);
+                    assert_eq!(a.ack_receive, Some((ticks(200), false)));
+                    assert!(!a.ack_interactive);
+                    if tail {
+                        a.write(b"fresh").unwrap();
+                        assert!(!a.ack_interactive);
+                        assert_eq!(
+                            a.transmit(ticks(201), &mut [0; 19]),
+                            Err(Error::OutputTooSmall)
+                        );
+                        assert!(!a.ack_interactive);
+                        a.transmit_selected(ticks(201), &mut [0; 2048], true)
+                            .unwrap()
+                            .unwrap();
+                        let mut departure = a.last_departure.take().unwrap();
+                        assert!(!a.ack_interactive);
+                        a.accept_reserved_output(ticks(202), &mut departure, 0, 2, false)
+                            .unwrap();
+                        assert_eq!(a.ack_interactive, pending);
+                        a.accept_reserved_output(ticks(203), &mut departure, 2, 3, true)
+                            .unwrap();
+                        assert_eq!(
+                            a.ack_quick,
+                            if pending {
+                                a.adaptive_quick_budget()
+                            } else {
+                                0
+                            }
+                        );
+                    } else {
+                        packet(&mut a, ticks(201)); // Handshake ACK is not a fresh send.
+                        assert!(!a.ack_interactive);
+                    }
+                    let next = a.receive.next();
+                    let ack = if idle { a.snd_una } else { a.snd_nxt };
+                    let arrival = if idle {
+                        ticks(200) + a.rto() + 1
+                    } else {
+                        ticks(300)
+                    };
+                    inject(&mut a, arrival, next, ack, ACK, 8192, b"response");
+                    assert_eq!(a.ack_pending, !(pending && tail && !idle));
+                    assert_eq!(a.ack_receive, Some((arrival, true)));
+                    assert!(a.ack_engine_initialized);
+                    a.terminal(CloseReason::Reset);
+                    assert!(!a.ack_engine_initialized);
+                    assert!(!a.fast_open_write_pending);
+                }
+            }
+        }
+    }
+    let mut invalid = client(100, 12);
+    invalid.config.adaptive_ack = true;
+    invalid.set_fast_open_write_pending(true).unwrap();
+    packet(&mut invalid, 0);
+    synack(&mut invalid, 13, 100);
+    assert!(!invalid.ack_engine_initialized);
+    assert!(invalid.fast_open_write_pending);
+    invalid.terminal(CloseReason::Reset);
+    assert!(!invalid.fast_open_write_pending);
+    for reason in [
+        CloseReason::Aborted,
+        CloseReason::TimedOut,
+        CloseReason::Reset,
+    ] {
+        let mut a = client(100, 12);
+        a.set_fast_open_write_pending(true).unwrap();
+        a.set_fast_open_write_pending(false).unwrap();
+        packet(&mut a, 0);
+        synack(&mut a, 12, 100);
+        assert!(!a.ack_engine_initialized);
+        a.terminal(reason);
+        assert!(!a.fast_open_write_pending);
+        assert_eq!(
+            a.set_fast_open_write_pending(true),
+            Err(Error::InvalidState)
+        );
+    }
+}
+
+#[test]
+fn fast_open_reset_preserves_prior_failure_and_simultaneous_open_validation() {
+    for simultaneous in [false, true] {
+        for prior_failure in 0..3 {
+            for valid in [false, true] {
+                let mut a = client(u32::MAX - 4, 12);
+                packet(&mut a, 0);
+                if simultaneous {
+                    let syn = wire::Segment {
+                        header: wire::Header {
+                            source_port: tuple().remote.port(),
+                            destination_port: tuple().local.port(),
+                            sequence: 999,
+                            acknowledgment: 0,
+                            flags: SYN,
+                            window: 8192,
+                            urgent_pointer: 0,
+                        },
+                        options: Default::default(),
+                        raw_options: &[],
+                        payload: &[],
+                    };
+                    a.input(1, &syn).unwrap();
+                    assert_eq!(a.state(), State::SynReceived);
+                    packet(&mut a, 2);
+                }
+                let mut reset_time = 4;
+                if prior_failure == 2 {
+                    let deadline = a.rto_deadline.unwrap();
+                    a.timeout(deadline).unwrap();
+                    assert!(a.fast_open_negative);
+                    reset_time = deadline + 1;
+                } else if prior_failure == 1 {
+                    // Soft ICMP retains the handshake while recording independent evidence.
+                    assert!(
+                        a.network_error(3, a.iss.0, NetworkError::SoftUnreachable)
+                            .unwrap()
+                    );
+                    assert!(a.fast_open_negative);
+                }
+                let reset = wire::Segment {
+                    header: wire::Header {
+                        source_port: tuple().remote.port(),
+                        destination_port: tuple().local.port(),
+                        sequence: if simultaneous {
+                            if valid { 1000 } else { 1001 }
+                        } else {
+                            99
+                        },
+                        acknowledgment: if valid {
+                            a.iss.wrapping_add(1).0
+                        } else {
+                            a.iss.0
+                        },
+                        flags: if simultaneous { RST } else { RST | ACK },
+                        window: 0,
+                        urgent_pointer: 0,
+                    },
+                    options: Default::default(),
+                    raw_options: &[],
+                    payload: &[],
+                };
+                a.input(reset_time, &reset).unwrap();
+                assert_eq!(a.state() == State::Closed, valid);
+                assert_eq!(a.fast_open_negative, prior_failure != 0);
+                assert!(!a.fast_open_peer_reset); // Active opens do not affect passive admission.
+            }
+        }
+    }
+}
+
+#[test]
+fn fast_open_synack_classification_shared_across_handshake_roles() {
+    for simultaneous in [false, true] {
+        for iss in [100, u32::MAX - 4] {
+            for reserved in [false, true] {
+                for prior_failure in 0..3 {
+                    for acked in [0, 3, 12] {
+                        let mut a = client(iss, 12);
+                        let mut now = 0;
+                        selected_packet(&mut a, &mut now, reserved).unwrap();
+                        if simultaneous {
+                            let syn = wire::Segment {
+                                header: wire::Header {
+                                    source_port: tuple().remote.port(),
+                                    destination_port: tuple().local.port(),
+                                    sequence: 999,
+                                    acknowledgment: 0,
+                                    flags: SYN,
+                                    window: 8192,
+                                    urgent_pointer: 0,
+                                },
+                                options: Default::default(),
+                                raw_options: &[],
+                                payload: &[],
+                            };
+                            a.input(now, &syn).unwrap();
+                            assert_eq!(a.state(), State::SynReceived);
+                            selected_packet(&mut a, &mut now, reserved).unwrap();
+                        }
+                        if prior_failure == 1 {
+                            assert!(
+                                a.network_error(now, iss, NetworkError::SoftUnreachable)
+                                    .unwrap()
+                            );
+                            now += 100;
+                        } else if prior_failure == 2 {
+                            let deadline = a.rto_deadline.unwrap();
+                            a.timeout(deadline).unwrap();
+                            now = deadline + 100;
+                        }
+                        assert_eq!(a.fast_open_negative, prior_failure != 0);
+                        synack(&mut a, acked, now);
+                        assert_eq!(a.state(), State::Established);
+                        assert_eq!(a.fast_open_negative, prior_failure != 0 || acked == 0);
+                        assert_eq!(a.syn_data_acked, acked != 0);
+                        assert_eq!(a.snd_una, Seq(iss.wrapping_add(1 + acked)));
+                        assert_eq!(a.send.len(), 12 - acked as usize);
+                        now += 100;
+                        let bytes = selected_packet(&mut a, &mut now, reserved).unwrap();
+                        let repair = wire::parse(ip(tuple()), &bytes).unwrap();
+                        assert_eq!(repair.header.sequence, iss.wrapping_add(1 + acked));
+                        assert_eq!(repair.payload, &[42; 12][acked as usize..]);
+                        assert_eq!(repair.header.flags & SYN, 0);
+                        assert_eq!(a.snd_una, Seq(iss.wrapping_add(1 + acked)));
+                    }
+                }
+            }
         }
     }
 }

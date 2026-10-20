@@ -284,6 +284,10 @@ pub(crate) struct Congestion {
     // Exclusive SND.NXT, not the inclusive highest byte used in RFC 6582.
     recover: Option<Seq>,
     initial_recover: Option<Seq>,
+    // RFC 6582 section 4.1: actual consecutive cumulative ACK edges, not
+    // duplicate ACKs or an invented zero-based history.
+    ack_history: Option<(Seq, Seq)>,
+    initial_ack_heuristic: bool,
     congestion_avoidance: bool,
     fast_recovery: bool,
     sack_recovery: bool,
@@ -305,7 +309,7 @@ impl Congestion {
     //# The initial value of ssthresh SHOULD be set arbitrarily high (e.g., to the size of the largest
     //# possible advertised window), but ssthresh MUST be reduced in response to congestion.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Inclusive initial ISS is stored separately as exclusive ISS+1; NewReno alone requires ACK greater than this boundary. Controller ISS/ISS+1/ISS+2 and wrapping vectors complement real first-flight suppression, subsequent-byte entry and timeout guards; Reno/SACK first-flight behavior is retained.
+    //= reason=Inclusive initial ISS is stored separately as exclusive ISS+1. NewReno retains the basic strict guard when ACK history is unknown; validated initial ACK history can enable the optional section4.1 heuristic. Reno/SACK behavior and loss-epoch guards are retained.
     //# When the TCP protocol control block is initialized, recover is set to the initial send sequence
     //# number.
     pub(crate) fn new(
@@ -331,6 +335,8 @@ impl Congestion {
             // RFC6582 inclusive ISS is represented by exclusive ISS+1.
             // Unlike a loss epoch, this guard applies only to NewReno.
             initial_recover: Some(iss.wrapping_add(1)),
+            ack_history: None,
+            initial_ack_heuristic: true,
             congestion_avoidance: false,
             fast_recovery: false,
             sack_recovery: false,
@@ -417,6 +423,26 @@ impl Congestion {
     ) {
         if let Some(cubic) = &mut self.cubic {
             cubic.prepare_ack(now, rtt, ack, acked, send_window >= self.cwnd);
+        }
+    }
+
+    pub(crate) fn growth_prefix(&self, start: Seq, bytes: u32) -> u32 {
+        self.cubic
+            .as_ref()
+            .map_or(0, |c| c.growth_prefix(start, bytes))
+    }
+
+    // Conservative CUBIC growth policy: earlier out-of-order delivery does not
+    // earn deferred growth on its later cumulative ACK. Recovery still consumes
+    // the complete cumulative advance and keeps its own delivery accounting.
+    //= https://www.rfc-editor.org/rfc/rfc5681#section-3
+    //= reason=Limited Transmit reordering controls preserve cwnd on duplicate ACKs and reduce only subsequent CUBIC growth credit; ordinary delayed ACKs retain their full byte credit. No retransmission/admission allowance is increased.
+    //# In some situations, it may be
+    //# beneficial for a TCP sender to be more conservative than the
+    //# algorithms allow;
+    pub(crate) fn discount_ack_growth(&mut self, bytes: u32) {
+        if let Some(cubic) = &mut self.cubic {
+            cubic.discount_ack_growth(bytes);
         }
     }
 
@@ -1305,25 +1331,57 @@ impl Congestion {
         }
     }
 
+    // Called only for validated, advancing wire ACKs. The connection supplies
+    // the previous SND.UNA, including ISS before the SYN is acknowledged.
+    // Internal split processing of a TFO ACK must call this only once.
+    pub(crate) fn observe_ack_advance(&mut self, previous: Seq, ack: Seq) {
+        if ack.serial_cmp(previous) == Some(Ordering::Greater) {
+            self.ack_history = Some((previous, ack));
+            self.observe_ack(ack);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ack_history(&self) -> Option<(Seq, Seq)> {
+        self.ack_history
+    }
+
+    // Also called for the first SYN RTO, where the IW10 policy can retain
+    // its window without invoking the congestion-loss response.
+    pub(crate) fn disarm_initial_ack_heuristic(&mut self) {
+        self.initial_ack_heuristic = false;
+    }
+
+    // RFC 6582 section 4.1 is optional. Use it only for the initial recover
+    // boundary; retain the basic section 3.2 guard for every loss epoch.
+    // A timeout permanently disarms this initial exception, even if cwnd grows.
+    fn initial_ack_heuristic_allows(&self, ack: Seq) -> bool {
+        self.initial_ack_heuristic
+            && self.cwnd() > self.mss
+            && self.ack_history.is_some_and(|(previous, highest)| {
+                ack == highest && highest.distance_from(previous) <= self.mss.saturating_mul(4)
+            })
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
     //= reason=No-SACK NewReno RFC5681 section3.2 layer: duplicate_ack_eligibility_and_intervening_advancement_reset, limited_transmit_is_one_packet_per_duplicate_and_excluded_from_threshold, fourth_duplicate_grants_fresh_mss_only_with_both_windows and wire partial/exit traces assert eligibility, exclusions, inflation and bounded output. Initial guard and zero partial deflation have dedicated tests; this is not a global enhanced-PRR/half-flight assertion.
     //# The procedures specified in Section 3.2 of [RFC5681] are followed, with the modifications
     //# listed below.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Real initial and retained loss-epoch third-duplicate suppression leaves threshold unchanged; cumulative progress beyond the boundary resets duplicates and admits entry. Active-recovery RTO and guarded duplicates also asserted. ECN shared epochs remain covered by existing tests.
+    //= reason=Unknown-history initial and retained loss-epoch third-duplicate suppression leaves threshold unchanged; the optional section4.1 exception requires validated history at the initial boundary only. Active-recovery RTO and ECN shared epochs remain guarded.
     //# When the third duplicate ACK is received, the TCP sender first checks the value of recover to
     //# see if the Cumulative Acknowledgment field covers more than recover. If so, the value of
     //# recover is incremented to the value of the highest sequence number transmitted by the TCP so
     //# far. The TCP then enters fast retransmit (step 2 of Section 3.2 of [RFC5681]). If not, the TCP
     //# does not enter fast retransmit and does not reset ssthresh.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
-    //= reason=Initial ISS+1 and loss-epoch exclusive end both require strictly greater cumulative ACK for NewReno. Equality suppression, later-byte entry, timeout and wrap are asserted by integrated traces and initial_recover_boundaries_and_long_bounded_progress.
+    //= reason=Basic NewReno uses exclusive boundaries requiring strictly greater cumulative ACK. The optional section4.1 heuristic applies only to the initial boundary with validated ACK history; retained loss boundaries remain strict, including after RTO and wrap.
     //# Because the acknowledgment field contains the sequence number that the sender next expects to
     //# receive, the acknowledgment "ack_number" covers more than recover when ack_number - 1 >
     //# recover; i.e., at least one byte more of data is acknowledged beyond the highest byte that was
     //# outstanding when fast retransmit was last entered.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6
-    //= reason=Initial ISS+1 and loss-epoch exclusive end both require strictly greater cumulative ACK for NewReno. Equality suppression, later-byte entry, timeout and wrap are asserted by integrated traces and initial_recover_boundaries_and_long_bounded_progress.
+    //= reason=Basic NewReno uses exclusive boundaries requiring strictly greater cumulative ACK. The optional section4.1 heuristic applies only to the initial boundary with validated ACK history; retained loss boundaries remain strict, including after RTO and wrap.
     //# Entry into fast recovery is only possible when the Cumulative Acknowledgment field covers more
     //# than the state variable recover.
     #[cfg(test)]
@@ -1358,16 +1416,33 @@ impl Congestion {
         self.duplicate_acks = self.duplicate_acks.saturating_add(1);
         if self.duplicate_acks != 3
             || self.recover.is_some()
-            || self.algorithm == RecoveryAlgorithm::NewReno && self.initial_recover.is_some()
+            || self.algorithm == RecoveryAlgorithm::NewReno
+                && self.initial_recover.is_some()
+                && !self.initial_ack_heuristic_allows(ack)
         {
             return false;
         }
         self.end_ecn_prr();
         if self.ecn_end.is_none() && self.tlp_reduction_end.is_none() {
-            if let Some(start) = probe.filter(|_| !ece) {
-                self.begin_probe_response(start, flight);
+            // Initial no-SACK CUBIC recovery uses the logical window. Keep the
+            // same target when PMTU isolation defers the congestion response.
+            // Cubic::sent/prepare_ack enforce full-flight and receiver eligibility.
+            // Reno congestion control retains FlightSize/Limited Transmit exclusions.
+            //= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
+            //= reason=CUBIC startup/avoidance retain their committed-flight and receiver-window growth guards; cubic_no_sack_cwnd_basis_keeps_app_and_receiver_growth_guards tests both gates before this reduction. Normal/deferred PMTU paths share this basis and MSS-scaled commit invariants.
+            //# Implementations
+            //# that use _cwnd_ MUST use other measures to prevent _cwnd_ from
+            //# growing when the volume of bytes in flight is smaller than
+            //# _cwnd_.
+            let basis = if self.cubic.is_some() {
+                self.cwnd
             } else {
-                self.reduce_threshold(flight);
+                flight
+            };
+            if let Some(start) = probe.filter(|_| !ece) {
+                self.begin_probe_response(start, basis);
+            } else {
+                self.reduce_threshold(basis);
             }
         }
         let inflated = self
@@ -1379,6 +1454,7 @@ impl Congestion {
         } else {
             inflated
         });
+        self.initial_ack_heuristic = false;
         self.recover = Some(highest_sent);
         self.fast_recovery = true;
         self.acknowledged = 0;
@@ -1470,7 +1546,7 @@ impl Congestion {
     //#
     //# ssthresh = cwnd
     //= https://www.rfc-editor.org/rfc/rfc9438#section-3.1
-    //= reason=Selected CUBIC saves pre-event logical cwnd and sets beta=0.7 of actual eligible flight for loss or prior logical cwnd for ECN; two-SMSS threshold/loss floor, independent one-SMSS ECE floor in on_ecn. Existing recovery/PRR owns temporary ACK-clock response cwnd; QUIC is not implemented.
+    //= reason=Selected CUBIC saves pre-event logical cwnd; beta=0.7 uses guarded cwnd for initial no-SACK recovery and ECN, eligible flight for SACK/RACK and bounded additional loss. Two-SMSS threshold/loss floor and independent one-SMSS ECE floor remain. Recovery/PRR owns temporary admission; QUIC is not implemented.
     //# After a window reduction in response to a congestion event detected
     //# by duplicate acknowledgments (ACKs), Explicit Congestion
     //# Notification-Echo (ECN-Echo (ECE)) ACKs [RFC3168], RACK-TLP for TCP
@@ -1478,7 +1554,7 @@ impl Congestion {
     //# congestion window size at which it received the congestion event and
     //# performs a multiplicative decrease of the congestion window.
     //= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
-    //= reason=Selected CUBIC saves pre-event logical cwnd and sets beta=0.7 of actual eligible flight for loss or prior logical cwnd for ECN; two-SMSS threshold/loss floor, independent one-SMSS ECE floor in on_ecn. Existing recovery/PRR owns temporary ACK-clock response cwnd; QUIC is not implemented.
+    //= reason=Selected CUBIC saves pre-event logical cwnd; beta=0.7 uses guarded cwnd for initial no-SACK recovery and ECN, eligible flight for SACK/RACK and bounded additional loss. Two-SMSS threshold/loss floor and independent one-SMSS ECE floor remain. Recovery/PRR owns temporary admission; QUIC is not implemented.
     //# ssthresh =  flight_size * β      new  ssthresh
     //# cubic
     //# cwnd      = cwnd                 save  cwnd
@@ -1490,7 +1566,7 @@ impl Congestion {
     //#
     //# Figure 5
     //= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
-    //= reason=Selected CUBIC saves pre-event logical cwnd and sets beta=0.7 of actual eligible flight for loss or prior logical cwnd for ECN; two-SMSS threshold/loss floor, independent one-SMSS ECE floor in on_ecn. Existing recovery/PRR owns temporary ACK-clock response cwnd; QUIC is not implemented.
+    //= reason=Selected CUBIC saves pre-event logical cwnd; beta=0.7 uses guarded cwnd for initial no-SACK recovery and ECN, eligible flight for SACK/RACK and bounded additional loss. Two-SMSS threshold/loss floor and independent one-SMSS ECE floor remain. Recovery/PRR owns temporary admission; QUIC is not implemented.
     //# The parameter β__cubic_ SHOULD be set to 0.7, which is different from
     //# the multiplicative decrease factor used in [RFC5681] (and [RFC6675])
     //# during fast recovery.
@@ -1599,6 +1675,7 @@ impl Congestion {
     //# [RFC5681] but sets _ssthresh_ using β__cubic_ (same as in
     //# Section 4.6) in a way that is different from Reno TCP [RFC5681].
     pub(crate) fn on_timeout(&mut self, flight: u32, highest_sent: Seq) {
+        self.disarm_initial_ack_heuristic();
         self.end_ecn_prr();
         self.commit_probe_response();
         self.hystart = None;
@@ -1801,7 +1878,7 @@ impl Prr {
     //#    SndCnt = MIN(ssthresh - inflight, SndCnt)
     //# }
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-    //= reason=Nonzero delivery only; failure consumes nothing, successful short output prevents another floor. This test injects the equation state then exercises real transactional output; zero-delivery timer entry is independently tested to remain zero.
+    //= reason=Nonzero delivery only; failure consumes nothing, successful short output prevents another floor. This test injects the equation state then exercises real transactional output; timer entry has a separate bounded first-repair contract.
     //# if (prr_out is 0 AND SndCnt is 0) {
     //#    // Force a fast retransmit upon entering recovery
     //#    SndCnt = SMSS
@@ -1854,6 +1931,26 @@ impl Prr {
         }
     }
 
+    // RFC 6675 section 5 first repair, composed with RFC 8985 timer entry;
+    // not DeliveredData or the RFC 9937 per-ACK floor. Caller owns fresh entry.
+    pub(crate) fn admit_timer_repair(&mut self, pipe: u32, cwnd: u32) {
+        if self.algorithm == PrrAlgorithm::Rfc9937 && self.delivered == 0 && self.out == 0 {
+            self.credit = self.mss.min(cwnd.saturating_sub(pipe));
+        }
+    }
+
+    // Only timer entry grants strict credit without delivery; reserved output
+    // holds the owner against ingress until its admitted fragments finish.
+    pub(crate) fn timer_repair(&self) -> bool {
+        self.algorithm == PrrAlgorithm::Rfc9937 && self.delivered == 0 && self.credit != 0
+    }
+
+    pub(crate) fn finish_timer_repair(&mut self) {
+        if self.timer_repair() {
+            self.credit = 0;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn counters(&self) -> (u32, u64, u64) {
         (self.recover_fs, self.delivered, self.out)
@@ -1880,6 +1977,33 @@ impl Prr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timer_first_repair_bounds_and_accounting_are_separate_from_ack_floor() {
+        for (pipe, cwnd, expected) in [
+            (5000, 5000, 0),
+            (6000, 5000, 0),
+            (4750, 5000, 250),
+            (2000, 5000, 1000),
+        ] {
+            let mut p = Prr::new(9000, 1000, PrrAlgorithm::Rfc9937);
+            p.acknowledge(0, pipe, cwnd, false);
+            assert_eq!(p.credit(), 0);
+            p.admit_timer_repair(pipe, cwnd);
+            assert_eq!(p.credit(), expected);
+            assert_eq!(p.counters(), (9000, 0, 0));
+            p.acknowledge(0, 0, cwnd, true);
+            assert_eq!(p.credit(), expected);
+            if expected != 0 {
+                p.sent(expected.min(97));
+                p.finish_timer_repair();
+                assert_eq!(p.counters(), (9000, 0, u64::from(expected.min(97))));
+                assert_eq!(p.credit(), 0);
+                p.admit_timer_repair(0, cwnd); // Even mistaken re-entry cannot mint after output.
+                assert_eq!(p.credit(), 0);
+            }
+        }
+    }
 
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
@@ -2029,6 +2153,58 @@ mod tests {
                     i == 3
                 );
             }
+        }
+    }
+
+    #[test]
+    fn initial_ack_heuristic_requires_known_small_progress_and_preserves_loss_guards() {
+        for iss in [Seq(100), Seq(u32::MAX)] {
+            let end = iss.wrapping_add(1);
+            let make =
+                || Congestion::new(1000, RecoveryAlgorithm::NewReno, InitialWindow::Iw10, iss);
+            for history in [None, Some(1), Some(4000), Some(4001)] {
+                for cwnd in [1000, 1001] {
+                    let mut c = make();
+                    if let Some(advance) = history {
+                        c.observe_ack_advance(end.wrapping_add(0u32.wrapping_sub(advance)), end);
+                    }
+                    c.cwnd = cwnd;
+                    let allowed = history.is_some_and(|n| n <= 4000) && cwnd > 1000;
+                    for i in 1..=3 {
+                        assert_eq!(
+                            c.on_duplicate_ack(end, 4000, end.wrapping_add(4000), false),
+                            allowed && i == 3
+                        );
+                    }
+                    assert_eq!(c.in_fast_recovery(), allowed);
+                }
+            }
+            let mut c = make();
+            c.observe_ack_advance(iss, end);
+            let history = c.ack_history;
+            for stale in [iss, end, end.wrapping_add(1 << 31)] {
+                c.observe_ack_advance(end, stale);
+                c.observe_ack(stale);
+                assert_eq!(c.ack_history, history);
+            }
+            // A different duplicate edge cannot borrow a stored ACK's history.
+            assert!(!c.initial_ack_heuristic_allows(iss));
+            let mut c = make();
+            c.observe_ack_advance(iss, end);
+            c.on_timeout(4000, end.wrapping_add(4000));
+            c.cwnd = 10000; // Even subsequent growth cannot revive the exception.
+            assert!(!c.initial_ack_heuristic_allows(end));
+            for _ in 0..3 {
+                assert!(!c.on_duplicate_ack(end, 4000, end.wrapping_add(4000), false));
+            }
+            let boundary = end.wrapping_add(4000);
+            c.observe_ack_advance(end, boundary);
+            c.on_ack(boundary, 4000, 4000);
+            c.cwnd = 10000;
+            for _ in 0..3 {
+                assert!(!c.on_duplicate_ack(boundary, 4000, boundary.wrapping_add(4000), false));
+            }
+            assert_eq!(c.recover, Some(boundary));
         }
     }
 

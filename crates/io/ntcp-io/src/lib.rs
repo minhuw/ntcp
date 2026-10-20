@@ -14,6 +14,9 @@ pub enum PacketLayer {
 pub enum TxOutcome {
     Submitted,
     WouldBlock,
+    // Synchronous local rejection: no packet, timestamp request or scheduled
+    // object was submitted. Never report this for unknown/asynchronous errors.
+    Rejected,
 }
 
 // Explicit aggregate submission; all maxima are in layer() bytes, not IP MTU.

@@ -21,6 +21,11 @@ use crate::{
     wire::{self, ACK, CWR, ECE, FIN, Header, IpMetadata, PSH, RST, SYN, Segment, URG},
 };
 
+mod local_repair {
+    include!("connection_local_repair.rs");
+}
+use local_repair::RepairUndo;
+
 // Caller-owned ticks in CallerTimebase units; deadlines use the same unit.
 // The caller supplies monotonic, consistent-rate time in its real or simulated
 // time domain, with precision at least as fine as the wire timestamp tick and
@@ -167,6 +172,18 @@ pub struct ConnectionConfig {
     // selection does. Paced outputs are excluded from these batches.
     // This is not GSO emulation and does not change packetization/admission.
     pub output_push_batch_segments: u16,
+    // Optional flush hint on the terminal physical segment of an admitted GSO
+    // group covered by pending application PUSH. Group size follows actual
+    // backend/queue/window limits and a 1ms window/RTT work target (minimum
+    // useful aggregation: two full segments), capped to half the effective cwnd. The hint
+    // is transient: it never creates an application PUSH mark for retries.
+    // Default false preserves exact scalar/GSO wire-equivalence for callers
+    // that use segmentation solely as an encoding optimization.
+    pub output_group_flush: bool,
+    // Whether opted-in logical batches also replace normal retransmission hints.
+    // Default true preserves the existing explicit batch option. False groups
+    // only new data; repair segments retain their existing PUSH boundaries.
+    pub output_push_batch_retransmissions: bool,
     pub timestamps: bool,
     pub timestamp_granularity: TimestampGranularity,
     pub timebase: CallerTimebase,
@@ -337,6 +354,8 @@ impl Default for ConnectionConfig {
             abort_with_ack: false,
             fast_open_early_response: false,
             output_push_batch_segments: 0,
+            output_group_flush: false,
+            output_push_batch_retransmissions: true,
             timestamps: false,
             timestamp_granularity: TimestampGranularity::default(),
             timebase: CallerTimebase::default(),
@@ -422,11 +441,12 @@ pub struct TransportInfo {
     pub ecn_negotiated: bool,
     // Initial handshake acknowledged a positive prefix actually sent in SYN.
     pub syn_data_acked: bool,
-    // Saturating one-shot ACK/SACK packet delivery, including SYN/standalone
-    // FIN, not bytes. Incomplete evidence when delivered_segments_valid is false.
+    // Saturating one-shot ACK/SACK delivery of queued packetization units,
+    // including SYN/standalone FIN, not bytes or every physical retry copy.
+    // Resegmentation updates unit boundaries; repeated SACK/ACK cannot renew credit.
     pub delivered_segments: u64,
-    // Sticky false after lost packet identity (overlapping partial retry,
-    // mixed delivered/undelivered replacement, or ledger/inference abandonment).
+    // False only after diagnostic ledger/inference abandonment. Partial
+    // retransmission and mixed prior SACK credit keep exact delivery units.
     // Recovery's ledger_valid is independent and can remain true.
     pub delivered_segments_valid: bool,
     pub unacked: u32,
@@ -439,6 +459,8 @@ pub struct TransportInfo {
     pub cwnd: u32,
     pub ssthresh: u32,
     pub mss: u32,
+    // Largest accepted peer window, in bytes; useful for bounded host batching.
+    pub max_send_window: u32,
     pub rtt_us: Option<u64>,
     pub rttvar_us: u64,
     pub rto_us: u64,
@@ -579,6 +601,7 @@ pub(crate) struct Connection {
     // Current accepted FIN-bearing packet, not a historical standalone latch.
     fin_packet_has_payload: Option<bool>,
     fin_delivered: bool,
+    fin_needs_separate_credit: bool,
     deferred_tfo_push: bool,
     fast_open_retry: Option<(Seq, Seq)>,
     pub(crate) fast_open_early: bool,
@@ -666,6 +689,8 @@ pub(crate) struct Connection {
     pub(crate) last_departure: Option<Departure>,
     // Optional timing evidence, separate from the retained output obligation.
     reserved_ledger: Option<crate::rack::DepartureSelection>,
+    repair_undo: Option<RepairUndo>,
+    reserved_retransmit_counts: Option<crate::rack::Counts>,
     last_pmtu_output: Option<(Seq, Seq)>,
     pub(crate) rx_timestamps: RxTimestamps,
     input_timestamps: RxPacketTimestamps,
@@ -687,6 +712,9 @@ pub(crate) struct Connection {
     ack_ato: u64,
     // The boolean distinguishes the establishment seed from the first data sample.
     ack_receive: Option<(Instant, bool)>,
+    // A waiting Fast Open writer can initialize ATO without stream receive history.
+    ack_engine_initialized: bool,
+    fast_open_write_pending: bool,
     ack_quick: u8,
     ack_interactive: bool,
     challenge_ack_pending: bool,
@@ -698,6 +726,9 @@ pub(crate) struct Connection {
     limited_pending: bool,
     limited_sent: u32,
     limited_end: Option<Seq>,
+    // Earlier no-SACK delivery estimates, consumed only by real data ACKs.
+    // Independent of Limited Transmit grants and recovery's PRR counters.
+    growth_dupack_bytes: u32,
     probe_pending: bool,
     keepalive_pending: bool,
     rtt: RttEstimator,
@@ -731,6 +762,8 @@ pub(crate) struct Connection {
     persist_deadline: Option<Instant>,
     persist_interval: u64,
     persist_unanswered_since: Option<Instant>,
+    // End of a committed fresh persist octet sent with no ordinary data in flight.
+    persist_probe_end: Option<Seq>,
     shrink_unanswered_since: Option<Instant>,
     sws_deadline: Option<Instant>,
     sws_override: bool,
@@ -879,6 +912,7 @@ impl Connection {
             syn_delivered: false,
             fin_packet_has_payload: None,
             fin_delivered: false,
+            fin_needs_separate_credit: false,
             deferred_tfo_push: false,
             fast_open_retry: None,
             fast_open_early: false,
@@ -946,6 +980,8 @@ impl Connection {
             last_output_range: None,
             last_departure: None,
             reserved_ledger: None,
+            repair_undo: None,
+            reserved_retransmit_counts: None,
             last_pmtu_output: None,
             rx_timestamps: RxTimestamps::default(),
             input_timestamps: RxPacketTimestamps::default(),
@@ -964,7 +1000,9 @@ impl Connection {
             syn_pending: true,
             ack_ato,
             ack_receive: None,
-            ack_quick: 2,
+            ack_engine_initialized: false,
+            fast_open_write_pending: false,
+            ack_quick: 0,
             ack_interactive: false,
             ack_pending: false,
             challenge_ack_pending: false,
@@ -976,6 +1014,7 @@ impl Connection {
             limited_pending: false,
             limited_sent: 0,
             limited_end: None,
+            growth_dupack_bytes: 0,
             probe_pending: false,
             keepalive_pending: false,
             rtt,
@@ -1005,6 +1044,7 @@ impl Connection {
             persist_deadline: None,
             persist_interval: 0,
             persist_unanswered_since: None,
+            persist_probe_end: None,
             shrink_unanswered_since: None,
             sws_deadline: None,
             sws_override: false,
@@ -1297,6 +1337,14 @@ impl Connection {
         Ok(count)
     }
 
+    pub(crate) fn set_fast_open_write_pending(&mut self, pending: bool) -> Result<(), Error> {
+        if pending && self.state != State::SynSent {
+            return Err(Error::InvalidState);
+        }
+        self.fast_open_write_pending = pending;
+        Ok(())
+    }
+
     pub(crate) fn passive_fast_open(&mut self, cookie: Option<wire::FastOpenCookie>, early: bool) {
         self.fast_open = cookie;
         self.fast_open_early = early;
@@ -1369,7 +1417,9 @@ impl Connection {
 
     // Read-only sampling also covers dormant connections whose clock lags Endpoint.
     pub(crate) fn transport_info_at(&self, now: Instant) -> TransportInfo {
-        let counts = self.rack.counts();
+        let counts = self
+            .reserved_retransmit_counts
+            .unwrap_or_else(|| self.rack.packet_counts());
         let ticks = self.transport_ticks_at(now);
         TransportInfo {
             state: self.state,
@@ -1397,6 +1447,7 @@ impl Connection {
             cwnd: self.congestion.cwnd(),
             ssthresh: self.congestion.ssthresh(),
             mss: self.mss as u32,
+            max_send_window: self.max_snd_wnd,
             rtt_us: self
                 .rtt
                 .srtt()
@@ -1510,7 +1561,7 @@ impl Connection {
             && self.consecutive_timeouts == 0
             && !self.retx_pending
             && self.ecn_pause.is_none_or(|deadline| self.now >= deadline)
-            && self.rack.counts().sacked == 0
+            && self.rack.packet_counts().sacked == 0
             && self.rack.deadline.is_none()
     }
 
@@ -1592,7 +1643,7 @@ impl Connection {
                             at_or_after(fin, self.snd_una)
                                 && (self.fin_standalone || fin == self.snd_una)
                         }));
-                        let delay = if self.rack.counts().unacked + fin_packet == 1 {
+                        let delay = if self.rack.packet_counts().unacked + fin_packet == 1 {
                             self.config
                                 .timebase
                                 .ticks_from_us(self.config.peer_max_ack_delay_us)
@@ -1896,7 +1947,7 @@ impl Connection {
         }
         let further_loss = self.rack.pipe() < old_pipe;
         if let Some((start, _)) = self.rack.lowest_lost(self.mss as u32) {
-            self.note_probe_loss(start, self.rack.counts().lost > 1);
+            self.note_probe_loss(start, self.rack.packet_counts().lost > 1);
             self.note_iw_loss(start);
             self.start_sack_recovery();
         }
@@ -2124,6 +2175,16 @@ impl Connection {
         }
     }
 
+    // Called after SYN-ACK validation. Any acknowledged SYN payload is
+    // positive TFO progress; repair its residue separately (RFC 7413 4.2.2).
+    // Only SYN-only acknowledgment adds rejection evidence here. Independent
+    // ICMP/RTO evidence is neither consumed nor cleared by partial progress.
+    fn report_fast_open_syn_rejection(&mut self, ack: Seq) {
+        if self.syn_payload_sent != 0 && ack == self.iss.wrapping_add(1) {
+            self.report_fast_open_failure();
+        }
+    }
+
     fn record_syn_departure(&mut self) {
         if self.syn_committed {
             self.committed_syn_retransmissions =
@@ -2300,6 +2361,24 @@ impl Connection {
         self.resolve_probe_response();
     }
 
+    // User-approved scoped SHLD-7 departure: a sole persist octet must not
+    // strand the fresh tail after a valid window reopening. This changes only
+    // Nagle admission; ordinary data, SWS, CORK, rwnd/cwnd and pacing still gate.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.4
+    //= reason=Scoped persist-reopen SHOULD departure is recorded in rfc9293-todos.toml; only a physically committed fresh persist octet with no other flight can admit one fresh segment. Ordinary-short-flight, one-shot, window/CORK, wrap, failed-output and reserved-departure tests bound this policy.
+    //# A TCP implementation SHOULD implement the Nagle algorithm to
+    //# coalesce short segments (SHLD-7).
+    fn persist_reopen_nagle_exception(&self) -> bool {
+        self.snd_wnd != 0
+            && self.persist_probe_end == Some(self.snd_nxt)
+            && self.flight() == 1
+            && !self.retx_pending
+            && self.consecutive_timeouts == 0
+            && !self.congestion.in_recovery()
+            && self.prr.is_none()
+            && self.sack_recovery.is_none()
+    }
+
     pub(crate) fn reserved_pacing_deadline(&self, now: Instant, d: &Departure) -> Option<Instant> {
         if d.bypass || !d.stream {
             return None;
@@ -2393,10 +2472,10 @@ impl Connection {
     }
 
     fn record_fin_departure(&mut self, start: Seq, payload: usize) {
-        if payload != 0 {
-            self.rack
+        self.fin_needs_separate_credit = payload == 0
+            || self
+                .rack
                 .record_fin_payload(start, start.wrapping_add(payload as u32));
-        }
         self.fin_packet_has_payload = Some(payload != 0);
     }
 
@@ -2409,6 +2488,17 @@ impl Connection {
         finished: bool,
     ) -> Result<(), Error> {
         self.validate_reserved_output(now, d, offset, count)?;
+        if count != 0 {
+            self.repair_undo = None; // Accepted prefixes can never be cancelled.
+            self.reserved_retransmit_counts = None;
+        }
+        if finished && d.defer_push {
+            self.send.collapse_push(
+                Seq(d.start).distance_from(self.send_base) as usize,
+                d.payload,
+            );
+            d.defer_push = false;
+        }
         if d.stream
             && count != 0
             && let Some(selection) = self.reserved_ledger
@@ -2435,6 +2525,15 @@ impl Connection {
             );
         }
         self.update_time(now)?;
+        if d.stream
+            && let Some(prr) = &mut self.prr
+            && prr.timer_repair()
+        {
+            prr.sent(count as u32);
+            if finished {
+                prr.finish_timer_repair();
+            }
+        }
         self.adaptive_departure(d.data_ack, d.fresh_data && count != 0 && !d.syn);
         d.data_ack = false; // One logical ACK, including SACK-only repair fragments.
         self.syn_data_acked |= d.passive_syn_data_acked;
@@ -2508,7 +2607,14 @@ impl Connection {
             self.shrink_unanswered_since = Some(now);
             d.shrink = false;
         }
+        if sequence && !d.persist && !d.keepalive {
+            self.persist_probe_end = None;
+        }
         if sequence && d.persist {
+            if count != 0 && d.persist_probe {
+                self.persist_probe_end = Some(Seq(d.start).wrapping_add(1));
+                d.persist_probe = false;
+            }
             if d.unanswered {
                 self.persist_unanswered_since = Some(now);
                 d.unanswered = false;
@@ -2549,6 +2655,8 @@ impl Connection {
         self.pending_rst = None;
         self.reset_echo = None;
         self.reset_reply = false;
+        self.repair_undo = None;
+        self.reserved_retransmit_counts = None;
         self.terminal(CloseReason::Aborted);
     }
 
@@ -3293,8 +3401,16 @@ impl Connection {
             self.fast_open_retry = Some((self.snd_una, self.snd_nxt));
         }
         self.handshake_complete = true;
+        self.ack_engine_initialized = core::mem::take(&mut self.fast_open_write_pending);
         if self.config.adaptive_ack {
             self.ack_receive = Some((self.now, false));
+            if self.ack_engine_initialized {
+                self.ack_ato = self
+                    .config
+                    .timebase
+                    .ticks_from_us(self.config.delayed_ack_us.min(40_000));
+                self.ack_quick = self.adaptive_quick_budget();
+            }
         }
         self.last_data_received = self.now;
         if let Some(deferred) = self.deferred_syn.take() {
@@ -3373,6 +3489,7 @@ impl Connection {
         self.sack_post_rto = None;
         self.sack_fallback = None;
         self.scoreboard.clear();
+        self.growth_dupack_bytes = 0;
         self.ecn_echo = false;
         self.ecn_cwr_pending = false;
         self.ecn_pause = None;
@@ -3388,8 +3505,10 @@ impl Connection {
         self.syn_pending = false;
         self.ack_pending = false;
         self.ack_receive = None;
+        self.ack_engine_initialized = false;
+        self.fast_open_write_pending = false;
         self.ack_interactive = false;
-        self.ack_quick = 2;
+        self.ack_quick = 0;
         self.ack_ato = self
             .config
             .timebase
@@ -3397,6 +3516,7 @@ impl Connection {
         self.challenge_ack_pending = false;
         self.retx_pending = false;
         self.probe_pending = false;
+        self.persist_probe_end = None;
         self.keepalive_pending = false;
         self.rto_deadline = None;
         self.loss_timer = None;
@@ -4281,7 +4401,8 @@ impl Connection {
             //# Otherwise (no ACK), drop the segment and return.
             if h.flags & RST != 0 {
                 if valid_ack {
-                    self.report_fast_open_failure();
+                    // A validated refusal ends this connection, but alone is not
+                    // evidence that the service cannot accept Fast Open.
                     self.terminal(CloseReason::Reset);
                 }
                 return Ok(());
@@ -4310,17 +4431,14 @@ impl Connection {
             }
             self.last_received = now;
             if valid_ack {
-                if self.syn_payload_sent != 0
-                    && after(self.iss.wrapping_add(1 + self.syn_payload_sent as u32), ack)
-                {
-                    self.report_fast_open_failure();
-                }
+                self.report_fast_open_syn_rejection(ack);
                 self.accept_ack(
                     ack,
                     false,
                     segment.options.timestamps.map(|ts| ts.1),
                     self.snd_wnd,
                     false,
+                    0,
                 );
                 if self.fast_open.is_some() {
                     self.fast_open_learned = Some((
@@ -4517,17 +4635,14 @@ impl Connection {
                 self.ts_latest = value;
                 self.ts_recent_at = now;
             }
-            if self.syn_payload_sent != 0
-                && after(self.iss.wrapping_add(1 + self.syn_payload_sent as u32), ack)
-            {
-                self.report_fast_open_failure();
-            }
+            self.report_fast_open_syn_rejection(ack);
             self.accept_ack(
                 ack,
                 false,
                 segment.options.timestamps.map(|ts| ts.1),
                 self.snd_wnd,
                 false,
+                0,
             );
             self.establish();
             self.last_received = now;
@@ -4691,7 +4806,7 @@ impl Connection {
             if seq == next {
                 self.fast_open_peer_reset =
                     self.handshake_pending() && self.passive_open && self.fast_open_early;
-                self.report_fast_open_failure();
+                // Preserve earlier path-failure evidence without adding any for RST.
                 let passive =
                     self.handshake_pending() && self.passive_open && !self.fast_open_early;
                 self.terminal(CloseReason::Reset);
@@ -4837,6 +4952,11 @@ impl Connection {
             && self.fast_open_early
             && self.data_flight() != 0;
         let split_response_ack = response_handshake && after(ack, self.iss.wrapping_add(1));
+        if response_handshake {
+            // This wire ACK may be processed as SYN then payload internally.
+            // Preserve its actual cumulative advance for RFC6582 section4.1.
+            self.congestion.observe_ack_advance(self.snd_una, ack);
+        }
         if self.handshake_pending() {
             if !after(ack, self.snd_una) {
                 self.pending_rst = Some((ack, false));
@@ -4855,6 +4975,7 @@ impl Connection {
                 segment.options.timestamps.map(|ts| ts.1),
                 self.snd_wnd,
                 split_response_ack,
+                0,
             );
             self.establish();
         }
@@ -4973,6 +5094,7 @@ impl Connection {
                 .on_ecn(ack, self.data_flight(), self.snd_nxt);
         if ecn_reduced {
             self.ecn_cwr_pending = true;
+            self.growth_dupack_bytes = 0;
             self.reset_limited_transmit();
         }
         // Snapshot before ACK removal; start only after old loss recovery exits
@@ -5018,6 +5140,13 @@ impl Connection {
         let live_ack = if advancing { ack } else { self.snd_una };
         let sack_allowed =
             self.sack_receive && self.sack_fallback.is_none_or(|end| at_or_after(ack, end));
+        // Snapshot before SACK/cumulative retirement removes earlier delivery.
+        // SYN/FIN sequence space never contributes data growth credit.
+        let growth_discount = if advancing {
+            self.ack_growth_discount(ack, sack_allowed)
+        } else {
+            0
+        };
         // Per-input ledger sample: SACK fallback may skip acknowledge entirely.
         // Never let a prior ACK's candidate leak into startup or RTO sampling.
         self.rack.ack_sample = None;
@@ -5078,7 +5207,7 @@ impl Connection {
                     .rack
                     .mark_scoreboard_losses(&self.scoreboard, self.mss as u32);
                 if let Some((start, _)) = self.rack.lowest_lost(self.mss as u32) {
-                    self.note_probe_loss(start, self.rack.counts().lost > 1);
+                    self.note_probe_loss(start, self.rack.packet_counts().lost > 1);
                 }
             }
             if !advancing
@@ -5139,6 +5268,7 @@ impl Connection {
                     old_window
                 },
                 response_handshake,
+                growth_discount,
             );
         }
         if self
@@ -5280,6 +5410,20 @@ impl Connection {
             && h.flags & FIN == 0
             && self.snd_wnd == old_window
             && self.snd_wnd != 0;
+        if duplicate
+            && !self.sack_receive
+            && !ece
+            && !self.congestion.in_recovery()
+            && self.prr.is_none()
+            && self.config.congestion_algorithm == CongestionAlgorithm::Cubic
+        {
+            // Duplicate ACKs are only bounded evidence of delivery. They grant
+            // no cwnd growth; their estimates discount later cumulative growth.
+            self.growth_dupack_bytes = self
+                .growth_dupack_bytes
+                .saturating_add(self.mss as u32)
+                .min(self.data_flight());
+        }
         if self.sack_recovery_enabled()
             && (!self.scoreboard.ranges().is_empty()
                 || self.sack_recovery.is_some()
@@ -5301,7 +5445,7 @@ impl Connection {
                 {
                     self.rack
                         .mark_scoreboard_losses(&self.scoreboard, self.mss as u32);
-                    self.note_probe_loss(self.snd_una, self.rack.counts().lost > 1);
+                    self.note_probe_loss(self.snd_una, self.rack.packet_counts().lost > 1);
                     self.start_sack_recovery();
                 }
             }
@@ -5353,6 +5497,9 @@ impl Connection {
             self.congestion.reset_duplicate_acks();
         }
         let (new_response, rack_loss) = self.detect_rack();
+        if self.congestion.in_recovery() || self.prr.is_some() || tlp_reduced {
+            self.growth_dupack_bytes = 0;
+        }
         let ecn_loss_takeover = ecn_prr_was_active
             && self.congestion.ecn_prr_end().is_none()
             && self.congestion.in_recovery();
@@ -5495,6 +5642,36 @@ impl Connection {
 
     fn data_high(&self) -> Seq {
         self.fin_sequence.unwrap_or(self.snd_nxt)
+    }
+
+    fn ack_growth_discount(&mut self, ack: Seq, sack_allowed: bool) -> u32 {
+        let start = self.send_base;
+        let end = if after(ack, self.data_high()) {
+            self.data_high()
+        } else {
+            ack
+        };
+        if !after(end, start) {
+            return 0;
+        }
+        let cumulative = end.distance_from(start);
+        let eligible = self.congestion.growth_prefix(start, cumulative);
+        if sack_allowed {
+            // Only advice inside the actual eligible prefix can discount it.
+            // A SACKed tail beyond a historical full flight is irrelevant.
+            eligible
+                - self
+                    .scoreboard
+                    .unsacked_bytes(start, start.wrapping_add(eligible))
+        } else if !self.sack_receive {
+            // Consume estimates by bytes, even on divided ACKs or when growth
+            // is disallowed. Unknown delivery positions are treated conservatively.
+            let estimated = cumulative.min(self.growth_dupack_bytes);
+            self.growth_dupack_bytes -= estimated;
+            eligible.min(estimated)
+        } else {
+            0 // SACK fallback does not invent duplicate-ACK delivery estimates.
+        }
     }
 
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.2
@@ -5667,7 +5844,11 @@ impl Connection {
         echo: Option<u32>,
         send_window: u32,
         response_handshake: bool,
+        growth_discount: u32,
     ) {
+        if !response_handshake {
+            self.congestion.observe_ack_advance(self.snd_una, ack);
+        }
         let syn_ack = self.snd_una == self.iss && self.handshake_pending();
         // A split handshake ACK owns one PMTU observation, at its actual full ACK.
         if self.pmtud.is_some() && !(response_handshake && syn_ack) {
@@ -5688,9 +5869,7 @@ impl Connection {
             self.syn_data_acked |=
                 self.syn_payload_sent != 0 && after(ack, self.iss.wrapping_add(1));
         }
-        if self.fin_packet_has_payload == Some(false)
-            && self.fin_sequence.is_some_and(|fin| after(ack, fin))
-        {
+        if self.fin_needs_separate_credit && self.fin_sequence.is_some_and(|fin| after(ack, fin)) {
             self.fin_delivered = true;
         }
         if !self.sack_receive || self.handshake_pending() {
@@ -5753,6 +5932,12 @@ impl Connection {
             }
         }
         self.snd_una = ack;
+        if self
+            .persist_probe_end
+            .is_some_and(|end| at_or_after(ack, end))
+        {
+            self.persist_probe_end = None;
+        }
         if let Some((start, end)) = self.fast_open_retry {
             self.fast_open_retry = if at_or_after(ack, end) {
                 None
@@ -5842,6 +6027,7 @@ impl Connection {
                 bytes,
                 send_window,
             );
+            self.congestion.discount_ack_growth(growth_discount);
             // Consume at most one fresh raw candidate, independent of the
             // causal-round gate used by the fixed-weight RTO estimator. RACK's
             // ledger excludes incomplete/retransmitted/previously delivered
@@ -6188,13 +6374,13 @@ impl Connection {
             .config
             .timebase
             .ticks_from_us(self.config.delayed_ack_us);
-        if let Some((last, initialized)) = self.ack_receive {
+        if let Some((last, initialized)) = self.ack_receive
+            && (initialized || self.ack_engine_initialized)
+        {
             let gap = self.now.saturating_sub(last);
             if gap > self.rto() {
-                self.ack_quick = 2;
+                self.ack_quick = self.adaptive_quick_budget();
                 self.ack_interactive = false;
-            } else if !initialized {
-                self.ack_ato = min;
             } else if gap <= min / 2 {
                 self.ack_ato = self.ack_ato / 2 + min / 2;
             } else if gap < self.ack_ato {
@@ -6202,9 +6388,11 @@ impl Connection {
             }
         } else {
             self.ack_ato = min;
+            self.ack_quick = self.adaptive_quick_budget();
         }
         self.ack_ato = self.ack_ato.clamp(min, max);
         self.ack_receive = Some((self.now, true));
+        self.ack_engine_initialized = true;
     }
 
     fn adaptive_departure(&mut self, data_ack: bool, fresh_data: bool) {
@@ -6215,12 +6403,19 @@ impl Connection {
             self.ack_quick = self.ack_quick.saturating_sub(1);
         }
         if fresh_data
-            && self
-                .ack_receive
-                .is_some_and(|(last, _)| self.now.saturating_sub(last) < self.ack_ato)
+            && self.ack_receive.is_some_and(|(last, initialized)| {
+                (initialized || self.ack_engine_initialized)
+                    && self.now.saturating_sub(last) < self.ack_ato
+            })
         {
             self.ack_interactive = true;
         }
+    }
+
+    fn adaptive_quick_budget(&self) -> u8 {
+        // Use the remaining local advertised byte window, not the peer's send credit.
+        let budget = self.receive_window() / (2 * u32::from(self.receive_mss()));
+        if budget == 0 { 2 } else { budget.min(16) as u8 }
     }
 
     fn receive_mss(&self) -> u16 {
@@ -7589,7 +7784,11 @@ impl Connection {
                 } else {
                     self.flight()
                 };
-                let nagle = !flushing && !final_fin && self.config.nagle && nagle_flight != 0;
+                let nagle = !flushing
+                    && !final_fin
+                    && self.config.nagle
+                    && nagle_flight != 0
+                    && !self.persist_reopen_nagle_exception();
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.2.1
                 //# A TCP implementation MUST include a SWS avoidance algorithm in the
                 //# sender (MUST-38).
@@ -7622,10 +7821,13 @@ impl Connection {
             if self.ecn_pause.is_some_and(|deadline| now < deadline) {
                 count = 0;
             }
-            // Extend only an already-admissible full-sized ordinary segment.
+            // Extend only an already-admissible full-sized fresh segment.
+            // PRR may group new data using its existing byte credit; repairs
+            // retain their separate, immutable reservation/undo policy.
+            let prr_group = self.config.output_group_flush && self.prr.is_some();
             // Keep protocol scratch/MTU unchanged: only the first segment is
             // encoded here; separately reserved storage retains the whole range.
-            if !early_response
+            let group_eligible = !early_response
                 && count == wire_mss
                 && count != 0
                 && packet_mss == wire_mss
@@ -7637,30 +7839,57 @@ impl Connection {
                 && !self.probe_pending
                 && self.pmtud.as_ref().is_none_or(|p| p.probe.is_none())
                 && candidate.is_none()
-                && !self.congestion.in_recovery()
-                && self.prr.is_none()
+                && (!self.congestion.in_recovery() || prr_group)
+                && (self.prr.is_none() || prr_group)
                 && self.congestion.ecn_prr_end().is_none()
-                && self.sack_recovery.is_none()
+                && (self.sack_recovery.is_none() || prr_group)
                 && self.sack_post_rto.is_none()
                 && self.sack_fallback.is_none()
                 && self.consecutive_timeouts == 0
                 && self.rack.valid()
-                && self.rack.counts().lost == 0
+                && (self.rack.counts().lost == 0 || prr_group)
                 && !self.limited_pending
                 && self.ecn_pause.is_none()
                 && !self.pacing_enabled()
                 && self.tx_timestamps.is_empty()
                 && sack_option_len == 0
                 && self.config.output_push_batch_segments < 2
-                && let Some(buffer) = &gso
-            {
+                && gso.is_some();
+            if group_eligible {
+                let buffer = gso.as_ref().unwrap();
                 let bounded = unsent
                     .min(usable)
                     .min(timestamp_credit as usize)
                     .min(buffer.limits.max_bytes)
                     .min(buffer.payload.len());
+                let group_limit = if self.config.output_group_flush {
+                    // Aim for at most 1ms of estimated send work per group.
+                    // Rate estimation sizes batches even when pacing is off;
+                    // it never marks this flight as paced or grants credit.
+                    // Two full segments are the minimum useful aggregation,
+                    // not an instruction to put PSH on every second packet.
+                    let rtt_us = self
+                        .config
+                        .timebase
+                        .us_from_ticks(self.rtt.srtt().unwrap_or(self.rtt.rto()))
+                        .max(1);
+                    let gain = if cwnd < self.congestion.ssthresh() {
+                        200u128
+                    } else {
+                        120
+                    };
+                    let bytes = u128::from(cwnd.max(self.data_flight())) * gain * 1000
+                        / (u128::from(rtt_us) * 100);
+                    let target = usize::try_from(bytes / wire_mss as u128)
+                        .unwrap_or(usize::MAX)
+                        .max(2);
+                    target.min((cwnd as usize / wire_mss / 2).max(1))
+                } else {
+                    buffer.limits.max_segments
+                };
                 let segments = (self.send.record_len(offset, bounded) / wire_mss)
-                    .min(buffer.limits.max_segments);
+                    .min(buffer.limits.max_segments)
+                    .min(group_limit);
                 let total = segments * wire_mss;
                 // A PUSH in an intermediate physical segment must not migrate.
                 // Leave such selections scalar, including successive PUSH writes.
@@ -7674,7 +7903,16 @@ impl Connection {
                     });
                 }
             }
-            burst_push = count != 0
+            // Startup retains the window-exhaustion flush boundary: ACK
+            // progress is needed to release the next flight. After congestion
+            // reduction, a singleton is not an extra aggregation group; avoid
+            // forcing its flush unless the application requested PUSH.
+            let startup_flush = self.prr.is_none()
+                && !self.congestion.in_recovery()
+                && self.congestion.ecn_prr_end().is_none()
+                && cwnd < self.congestion.ssthresh();
+            burst_push = (!self.config.output_group_flush || !group_eligible || startup_flush)
+                && count != 0
                 && self.flight().saturating_add(count as u32) == self.snd_wnd.min(cwnd)
                 && self.send.pushed(offset, unsent);
             if segmentation.is_none() {
@@ -7743,7 +7981,9 @@ impl Connection {
             .distance_from(self.send_base) as usize;
         let application_push = count != 0 && !keepalive && self.send.pushed(offset, count);
         let batch_limit = self.config.output_push_batch_segments;
+        let batch_category = !retransmitted || self.config.output_push_batch_retransmissions;
         let output_push_batch = (batch_limit >= 2
+            && batch_category
             && count != 0
             && reset.is_none()
             && !syn
@@ -7759,7 +7999,7 @@ impl Connection {
             let segments = previous.map_or(0, |(_, _, segments)| segments) + 1;
             (seq.wrapping_add(count as u32), retransmitted, segments)
         });
-        if batch_limit >= 2 {
+        if batch_limit >= 2 && batch_category {
             // RFC9293 section3.9.1.2: intermediate flush hints are separate
             // from the application's final PUSH, which always survives below.
             // Linux tcp_output.c __tcp_transmit_skb hints GSO pcount>1;
@@ -7771,7 +8011,12 @@ impl Connection {
                         .send
                         .pushed(offset, self.send.len().saturating_sub(offset)));
         }
-        if count != 0 && !keepalive && (burst_push || application_push) {
+        let group_push = self.config.output_group_flush
+            && segmentation.is_some()
+            && self
+                .send
+                .pushed(offset, self.send.len().saturating_sub(offset));
+        if count != 0 && !keepalive && (burst_push || application_push || group_push) {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
             // Scope: write supplies automatic PUSH; explicit no-PUSH SENDs are
             // supported separately. Batch hints never suppress the final mark.
@@ -8078,6 +8323,25 @@ impl Connection {
                 Error::Wire(error)
             }
         })?;
+        // Only the first timer-entry repair has not charged PRR at selection.
+        // Fixed receive-report metadata is journaled along with sender state.
+        // FIN/URG outputs retain the existing immutable reservation contract.
+        self.reserved_retransmit_counts =
+            (reserve && retransmitted && !syn && !probe && !keepalive)
+                .then(|| self.rack.packet_counts());
+        self.repair_undo = if reserve
+            && retransmitted
+            && !syn
+            && !probe
+            && !tlp
+            && !keepalive
+            && flags & (FIN | URG) == 0
+            && self.prr.is_some_and(|p| p.timer_repair())
+        {
+            RepairUndo::capture(self, seq, count)
+        } else {
+            None
+        };
         if segmentation.is_some() {
             let buffer = gso.as_mut().unwrap();
             self.send.copy(offset, &mut buffer.payload[..count]);
@@ -8092,8 +8356,13 @@ impl Connection {
             self.syn_data_acked |= passive_syn_data_acked;
         }
         self.reserved_ledger = None;
+        let persist_probe =
+            probe && count == 1 && !retransmitted && self.flight() == 0 && self.snd_wnd == 0;
         self.last_departure = reserve.then_some(Departure {
             data_ack,
+            defer_push: self.repair_undo.is_some()
+                && flags & PSH != 0
+                && (application_push || batch_limit < 2 && !group_push),
             fresh_data,
             passive_syn_data_acked,
             segmentation,
@@ -8116,6 +8385,7 @@ impl Connection {
             }),
             tlp: (fresh_data || new_fin) && !tlp,
             persist: probe,
+            persist_probe,
             keepalive,
             shrink: retransmit
                 && self.shrink_unanswered_since.is_none()
@@ -8217,7 +8487,10 @@ impl Connection {
         // Commit the on-wire endpoint only after output succeeds. A partial ACK
         // past an earlier collapsed mark must not lose PSH on retransmission.
         // Opt-in batch-only hints are transient, not application PUSH requests.
-        if flags & PSH != 0 && (batch_limit < 2 || application_push) {
+        if self.repair_undo.is_none()
+            && flags & PSH != 0
+            && (application_push || batch_limit < 2 && !group_push)
+        {
             self.send
                 .collapse_push(seq.distance_from(self.send_base) as usize, count);
         }
@@ -8262,7 +8535,12 @@ impl Connection {
             // Strict recovery exits before persist; legacy probes retain their
             // separate policy. Record every real emission in the age ledger.
             if !probe && let Some(prr) = &mut self.prr {
-                prr.sent(count as u32);
+                // Timer-entry credit belongs to this lost-head repair only.
+                // Reservations account actual accepted fragments, not selection.
+                if !reserve || !prr.timer_repair() {
+                    prr.sent(count as u32);
+                    prr.finish_timer_repair();
+                }
             }
             self.rack
                 .transmit(seq, seq.wrapping_add(count as u32), now, retransmitted);
@@ -8471,6 +8749,13 @@ impl Connection {
                 // Commit only after encode succeeds; retries cannot postpone
                 // the deadline for the oldest still-unanswered retransmission.
                 self.shrink_unanswered_since.get_or_insert(now);
+            }
+        }
+        if !reserve && (count != 0 && !keepalive || new_fin) {
+            if persist_probe {
+                self.persist_probe_end = Some(seq.wrapping_add(1));
+            } else if !probe {
+                self.persist_probe_end = None;
             }
         }
         if probe {
@@ -8868,8 +9153,12 @@ impl Connection {
                 .take()
                 .filter(|&(deadline, _)| self.rack.deadline == Some(deadline))
                 .map_or(0, |(_, bytes)| bytes);
+            let fresh_episode = self.prr.is_none() && self.sack_recovery.is_none();
             self.detect_rack();
             if let Some(prr) = &mut self.prr {
+                if fresh_episode && self.sack_recovery.is_some_and(|r| r.entry_pending) {
+                    prr.admit_timer_repair(self.rack.pipe(), self.congestion.cwnd());
+                }
                 prr.acknowledge(
                     delivery,
                     self.rack.pipe(),
@@ -8915,7 +9204,19 @@ impl Connection {
         {
             self.rto_deadline = head_sent.map(|sent| sent.saturating_add(self.rto()));
         } else if expired_loss == Some(LossTimer::Rto) {
-            self.report_fast_open_failure();
+            self.growth_dupack_bytes = 0;
+            self.congestion.disarm_initial_ack_heuristic();
+            // RFC 7413 section 4.2.1: a request-only SYN loss may be
+            // spurious. First fall back on this connection; a further RTO
+            // after a physically committed retry is stronger failure evidence.
+            // SYN-data, ICMP and final timeout reporting retain their policy.
+            let cookie_request = self.syn_payload_sent == 0
+                && self
+                    .fast_open
+                    .is_some_and(|cookie| cookie.as_bytes().is_empty());
+            if !cookie_request || self.committed_syn_retransmissions != 0 {
+                self.report_fast_open_failure();
+            }
             // Explicit application give-up budget, not the default SYN R2 policy.
             if self.handshake_pending()
                 && self
@@ -8946,6 +9247,7 @@ impl Connection {
             self.reset_limited_transmit();
             self.rto_deadline = None;
             self.sample = None;
+            self.persist_probe_end = None;
             self.rtt.backoff();
             self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
             let cooldown = self.pmtu_cooldown();
@@ -8997,7 +9299,7 @@ impl Connection {
         if due(self.ack_deadline, now) {
             if self.config.adaptive_ack {
                 self.ack_interactive = false;
-                self.ack_quick = 2;
+                self.ack_quick = self.adaptive_quick_budget();
             }
             self.immediate_ack();
         }
@@ -10047,6 +10349,10 @@ mod tests {
         include!("connection_statistics_tests.rs");
     }
 
+    mod persist_reopen_study {
+        include!("connection_persist_reopen_tests.rs");
+    }
+
     mod fast_open_tests {
         include!("fast_open_connection_tests.rs");
     }
@@ -10381,6 +10687,118 @@ mod tests {
             assert_eq!(a.transport_info().busy_time_us, 350_000);
             a.update_time(start + 450_000 * scale).unwrap();
             assert_eq!(a.transport_info().busy_time_us, 350_000);
+        }
+    }
+
+    #[test]
+    fn upstream_rwnd_limited_reopen_event_orders() {
+        for probe_first in [false, true] {
+            let cfg = ConnectionConfig {
+                timestamps: true,
+                sack: true,
+                rack: true,
+                prr: true,
+                prr_algorithm: PrrAlgorithm::LegacyInitialCredit,
+                tlp: true,
+                initial_window: InitialWindow::Iw10,
+                rto_min_us: 200_000,
+                peer_max_ack_delay_us: 200_000,
+                delayed_ack_us: 0,
+                recovery_algorithm: RecoveryAlgorithm::Reno,
+                ..config(65_536, 1460)
+            };
+            let mut a = Connection::active(tuple(), cfg, 100, 0).unwrap();
+            packet(&mut a, 0);
+            let metadata = ip(reverse(tuple()));
+            let mut synack = [0; 28];
+            let size = wire::encode(
+                metadata,
+                Header {
+                    source_port: tuple().remote.port(),
+                    destination_port: tuple().local.port(),
+                    sequence: 900,
+                    acknowledgment: 101,
+                    flags: SYN | ACK,
+                    window: 0,
+                    urgent_pointer: 0,
+                },
+                &[2, 4, 3, 232, 1, 1, 4, 2], // MSS 1000, no TS or WS.
+                &[],
+                &mut synack,
+            )
+            .unwrap();
+            a.input(10_000, &wire::parse(metadata, &synack[..size]).unwrap())
+                .unwrap();
+            packet(&mut a, 10_000);
+            assert!(!a.timestamps && !a.scaling);
+            assert_eq!(a.transport_info().rwnd_limited_us, 0);
+            a.write(&[1; 1000]).unwrap();
+            assert_eq!(a.transport_info_at(110_000).rwnd_limited_us, 100_000);
+            assert_eq!(a.loss_timer, Some((LossTimer::Zwp, 210_000)));
+            if probe_first {
+                a.timeout(210_000).unwrap();
+                let bytes = packet(&mut a, 210_000);
+                let probe = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!((probe.header.sequence, probe.payload.len()), (101, 1));
+                assert_eq!(a.snd_nxt, Seq(102));
+                assert_eq!(a.congestion.cwnd(), 10_000);
+            }
+            // Both event orders share the script's 200ms reopen/probe boundary.
+            inject(&mut a, 210_000, Seq(901), Seq(101), ACK, 2000, &[]);
+            assert_eq!(a.snd_wnd, 2000);
+            assert!(!a.probe_pending);
+            assert_eq!(a.persist_deadline, None);
+            assert_eq!(a.transport_info().rwnd_limited_us, 200_000);
+            if probe_first {
+                // The probe remains unacknowledged; the scoped Nagle departure
+                // admits only the fresh tail, without retransmitting its byte.
+                assert!(a.config.nagle);
+                assert_eq!((a.snd_una, a.snd_nxt, a.flight()), (Seq(101), Seq(102), 1));
+                assert_eq!(a.transport_info().notsent_bytes, 999);
+                let bytes = packet(&mut a, 210_000);
+                let tail = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!((tail.header.sequence, tail.payload.len()), (102, 999));
+                assert_eq!(tail.header.flags, PSH | ACK);
+                assert_eq!(a.snd_una, Seq(101));
+                assert_eq!(a.consecutive_timeouts, 0);
+            } else {
+                let bytes = packet(&mut a, 210_000);
+                let data = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!((data.header.sequence, data.payload.len()), (101, 1000));
+                assert_eq!(data.header.flags, PSH | ACK);
+            }
+            let first_ack_at = 240_000;
+            inject(&mut a, first_ack_at, Seq(901), Seq(1101), ACK, 10, &[]);
+            a.write(&[2; 1000]).unwrap();
+            assert_eq!(a.transmit(first_ack_at, &mut [0; 1500]), Ok(None));
+            inject(
+                &mut a,
+                first_ack_at + 100_000,
+                Seq(901),
+                Seq(1101),
+                ACK,
+                2000,
+                &[],
+            );
+            let info = a.transport_info();
+            assert_eq!(
+                (info.rwnd_limited_us, info.busy_time_us),
+                (300_000, first_ack_at + 90_000)
+            );
+            let bytes = packet(&mut a, first_ack_at + 100_000);
+            let data = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!((data.header.sequence, data.payload.len()), (1101, 1000));
+            assert_eq!(data.header.flags, PSH | ACK);
+            inject(
+                &mut a,
+                first_ack_at + 120_000,
+                Seq(901),
+                Seq(2101),
+                ACK,
+                2000,
+                &[],
+            );
+            assert_eq!(a.transport_info().busy_time_us, first_ack_at + 110_000);
         }
     }
 
@@ -10748,10 +11166,24 @@ mod tests {
         a.set_buffer_capacities(4, 4, usize::MAX).unwrap();
         assert_eq!(a.write(b"!"), Err(Error::WouldBlock));
         assert!(!a.take_events().writable);
-        a.accept_ack(a.send_base.wrapping_add(10), false, None, a.snd_wnd, false);
+        a.accept_ack(
+            a.send_base.wrapping_add(10),
+            false,
+            None,
+            a.snd_wnd,
+            false,
+            0,
+        );
         assert_eq!(a.send.len(), 16);
         assert!(!a.take_events().writable);
-        a.accept_ack(a.send_base.wrapping_add(13), false, None, a.snd_wnd, false);
+        a.accept_ack(
+            a.send_base.wrapping_add(13),
+            false,
+            None,
+            a.snd_wnd,
+            false,
+            0,
+        );
         assert_eq!(a.send.len(), 3);
         assert!(a.take_events().writable);
         b.set_buffer_capacities(4, 4, usize::MAX).unwrap();
@@ -11079,12 +11511,12 @@ mod tests {
     //# possible advertised window), but ssthresh MUST be reduced in response to congestion.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
     //= type=test
-    //= reason=Inclusive initial ISS is stored separately as exclusive ISS+1; NewReno alone requires ACK greater than this boundary. Controller ISS/ISS+1/ISS+2 and wrapping vectors complement real first-flight suppression, subsequent-byte entry and timeout guards; Reno/SACK first-flight behavior is retained.
+    //= reason=Inclusive initial ISS is stored as exclusive ISS+1; unknown ACK history retains the strict initial guard, while real handshake history permits the optional section4.1 exception. Loss-epoch equality and timeout guards are retained.
     //# When the TCP protocol control block is initialized, recover is set to the initial send sequence
     //# number.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
     //= type=test
-    //= reason=Real initial and retained loss-epoch third-duplicate suppression leaves threshold unchanged; cumulative progress beyond the boundary resets duplicates and admits entry. Active-recovery RTO and guarded duplicates also asserted. ECN shared epochs remain covered by existing tests.
+    //= reason=Unknown-history initial and retained loss-epoch third-duplicate suppression leaves threshold unchanged; initial validated handshake history enables the optional section4.1 exception. Active-recovery RTO and ECN shared epochs remain guarded.
     //# When the third duplicate ACK is received, the TCP sender first checks the value of recover to
     //# see if the Cumulative Acknowledgment field covers more than recover. If so, the value of
     //# recover is incremented to the value of the highest sequence number transmitted by the TCP so
@@ -11092,14 +11524,14 @@ mod tests {
     //# does not enter fast retransmit and does not reset ssthresh.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-3.2
     //= type=test
-    //= reason=Initial ISS+1 and loss-epoch exclusive end both require strictly greater cumulative ACK for NewReno. Equality suppression, later-byte entry, timeout and wrap are asserted by integrated traces and initial_recover_boundaries_and_long_bounded_progress.
+    //= reason=Basic NewReno uses exclusive boundaries requiring strictly greater cumulative ACK. The optional section4.1 heuristic applies only to the initial boundary with validated ACK history; retained loss boundaries remain strict, including after RTO and wrap.
     //# Because the acknowledgment field contains the sequence number that the sender next expects to
     //# receive, the acknowledgment "ack_number" covers more than recover when ack_number - 1 >
     //# recover; i.e., at least one byte more of data is acknowledged beyond the highest byte that was
     //# outstanding when fast retransmit was last entered.
     //= https://www.rfc-editor.org/rfc/rfc6582#section-6
     //= type=test
-    //= reason=Initial ISS+1 and loss-epoch exclusive end both require strictly greater cumulative ACK for NewReno. Equality suppression, later-byte entry, timeout and wrap are asserted by integrated traces and initial_recover_boundaries_and_long_bounded_progress.
+    //= reason=Basic NewReno uses exclusive boundaries requiring strictly greater cumulative ACK. The optional section4.1 heuristic applies only to the initial boundary with validated ACK history; retained loss boundaries remain strict, including after RTO and wrap.
     //# Entry into fast recovery is only possible when the Cumulative Acknowledgment field covers more
     //# than the state variable recover.
     fn newreno_initial_boundary_and_loss_epoch_are_distinct() {
@@ -11110,6 +11542,9 @@ mod tests {
                     ..config(128, 4)
                 };
                 let (mut a, _) = pair(cfg, iss);
+                // Explicit unknown-history controller control. Real wire
+                // handshakes are covered by the initial heuristic regressions.
+                a.congestion = Congestion::new(4, algorithm, a.config.initial_window, Seq(iss));
                 assert_eq!(a.congestion.ssthresh(), 0x7fff_ffff);
                 a.write(&[1; 32]).unwrap();
                 for _ in 0..4 {
@@ -13580,7 +14015,7 @@ mod tests {
     //# cwnd = inflight + SndCnt
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.3
     //= type=test
-    //= reason=Every successfully encoded active-PRR payload increments out by actual bytes and consumes equal credit; failed encoding changes neither. Strict mode cancels PRR before persist; legacy probe bypass is excluded.
+    //= reason=Committed active-PRR payload increments out by actual bytes; timer-entry reservations charge accepted fragments and discard unused admission after the repair. Failed encoding changes neither. Strict mode cancels PRR before persist; legacy probe bypass is excluded.
     //# On any data transmission or retransmission, PRR executes the
     //# following:
     //#
@@ -13632,7 +14067,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
     //= type=test
-    //= reason=Nonzero delivery only; failure consumes nothing, successful short output prevents another floor. This test injects the equation state then exercises real transactional output; zero-delivery timer entry is independently tested to remain zero.
+    //= reason=Nonzero delivery only; failure consumes nothing, successful short output prevents another floor. This test injects the equation state then exercises real transactional output; timer entry has a separate bounded first-repair contract.
     //# if (prr_out is 0 AND SndCnt is 0) {
     //#    // Force a fast retransmit upon entering recovery
     //#    SndCnt = SMSS
@@ -13956,14 +14391,16 @@ mod tests {
             assert!(a.rack_entry_delivery.is_none());
             a.timeout(225_000).unwrap();
             assert_eq!(a.prr.unwrap().counters(), (9000, 0, 0));
-            assert_eq!(a.prr.unwrap().credit(), 0);
+            assert_eq!(a.prr.unwrap().credit(), 1000);
+            assert_eq!(prr_packet(&mut a, 225_000), (iss.wrapping_add(1), 1000));
+            assert_eq!(a.prr.unwrap().counters(), (9000, 0, 1000));
             assert_eq!(a.transmit(225_000, &mut [0; 1500]), Ok(None));
             strict_ack(&mut a, 226_000, 0, &[(7000, 8000)]);
             assert_eq!(a.prr.unwrap().credit(), 0); // No old ACK replay/floor.
             strict_ack(&mut a, 227_000, 0, &[(7000, 9000)]);
             assert_eq!(a.prr.unwrap().counters().1, 1000);
             prr_packet(&mut a, 227_000);
-            assert_eq!(a.prr.unwrap().counters().2, 1000);
+            assert_eq!(a.prr.unwrap().counters().2, 2000);
             strict_ack(&mut a, 228_000, 8000, &[(8000, 9000)]);
             assert_eq!(a.prr.unwrap().counters().1, 8000); // signed SACK trimming
             let rto = a.rto_deadline.unwrap();
@@ -14249,7 +14686,7 @@ mod tests {
             assert_eq!(a.rack.pipe(), 9000); // SACKed bytes excluded, originals live.
             a.timeout(225_000).unwrap();
             assert_eq!(a.rack.pipe(), 2000); // Seven premature time losses excluded.
-            assert_eq!(a.prr.unwrap().credit(), 0);
+            assert_eq!(a.prr.unwrap().credit(), 1000); // Separate timer-entry repair.
             // Reordered originals actually arrive. Loss assumptions do not add
             // delivery; each ACK adds only new scoreboard bytes and the equation
             // limits the emitted replacement. This is modified RACK recovery.

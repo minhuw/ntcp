@@ -30,7 +30,21 @@ int getsockopt(int fd, int level, int option, void *data, socklen_t *len)
 		errno = ENOPROTOOPT;
 		return -1;
 	}
+	if (option == TCP_INFO) {
+		if (getenv("TCP_INFO_TRACE"))
+			fprintf(stderr, "requested TCP_INFO %u\n", (unsigned)*len);
+		const char *limit = getenv("TCP_INFO_LIMIT");
+		if (limit && *len > atoi(limit)) {
+			errno = EOPNOTSUPP;
+			return -1;
+		}
+	}
 	memset(data, 0, *len);
+	if (option == TCP_INFO) {
+		const char *reply = getenv("TCP_INFO_RETURN_LEN");
+		if (reply)
+			*len = atoi(reply);
+	}
 	return 0;
 }
 
@@ -48,7 +62,8 @@ int main(int argc, char **argv)
 	enum code_data_t selection = state.code->data_type;
 	for (int i = 0; i < 2; ++i) {
 		count = 0;
-		run_code_event(&state, &event, argv[3]);
+		const char *second = getenv("TCP_INFO_SECOND_SNIPPET");
+		run_code_event(&state, &event, i == 1 && second ? second : argv[3]);
 		assert(state.code->data_type == selection);
 		if (selection == DATA_NONE) {
 			assert(count == 3);

@@ -454,9 +454,27 @@ fn fast_open_empty_payload_destination_and_lowwater() {
         a.execute(client, tfo_send(&[3; 100], MSG_FASTOPEN))
             .unwrap()
             .value,
-        7
+        100
     );
-    assert_eq!(segment(&tfo_capture(&mut a)).payload, &[3; 7]);
+    assert_eq!(segment(&tfo_capture(&mut a)).payload, &[3; 100]);
+    let (mut a, _b, _) = tfo_setup(true);
+    a.socket_policy.notsent_lowat = 0;
+    let client = new(&mut a, SOCK_NONBLOCK);
+    assert_eq!(
+        a.execute(
+            client,
+            Op::SendTo(
+                vec![(0, 100)],
+                MSG_FASTOPEN,
+                Some("192.0.2.2:8080".parse().unwrap()),
+                None
+            )
+        )
+        .unwrap_err(),
+        EAGAIN
+    );
+    assert!(matches!(a.sockets[&client].handle, Handle::Fresh));
+    tfo_no_output(&mut a);
 }
 
 #[test]
@@ -1392,14 +1410,8 @@ fn fast_open_failed_implicit_completion_rolls_back_for_retry() {
                 EINVAL
             );
             assert_eq!(a.execute(client, Op::Transport(1)).unwrap().bytes, terminal);
-            // RFC7413: the reset suppresses this service until the fixed cooldown expires.
+            // A refusal preserves the cookie without poisoning the next connection.
             let remote = "192.0.2.2:8080".parse().unwrap();
-            assert!(
-                !a.endpoint
-                    .can_defer_fast_open(a.now(), a.local.into(), remote)
-                    .unwrap()
-            );
-            a.test_now = Some(a.now() + 60_000_000);
             assert_eq!(
                 a.endpoint
                     .can_defer_fast_open(a.now(), a.local.into(), remote)
@@ -1646,8 +1658,8 @@ fn fast_open_negative_suppresses_msg_deferred_query_and_already_deferred_write()
 }
 
 #[test]
-fn fast_open_reset_suppressed_blocking_send_success_and_syncnt_timeout() {
-    for timeout in [false, true] {
+fn fast_open_reset_cookie_reuse_and_independent_suppression_blocking_send() {
+    for (timeout, suppress) in [(false, false), (true, false), (false, true), (true, true)] {
         let (mut a, mut b, listener) = tfo_setup(true);
         let failing = new(&mut a, SOCK_NONBLOCK);
         assert_eq!(
@@ -1660,9 +1672,24 @@ fn fast_open_reset_suppressed_blocking_send_success_and_syncnt_timeout() {
         assert_eq!(segment(&syn).payload, b"bad");
         assert!(segment(&syn).options.fast_open.is_some());
         b.execute(listener, Op::Close).unwrap();
+        let failed_sequence = segment(&syn).header.sequence;
         tfo_deliver(&mut b, syn);
         let reset = tfo_capture(&mut b);
         assert_ne!(segment(&reset).header.flags & ntcp::wire::RST, 0);
+        let failed_tuple = a.endpoint.tuple(cid(&a, failing)).unwrap();
+        if suppress {
+            assert!(
+                a.endpoint
+                    .network_error(
+                        a.now(),
+                        failed_tuple,
+                        failed_sequence,
+                        ntcp::NetworkError::SoftUnreachable
+                    )
+                    .unwrap()
+            );
+            a.events();
+        }
         tfo_deliver(&mut a, reset);
         assert_eq!(
             a.execute(failing, tfo_send(b"retry", MSG_FASTOPEN))
@@ -1676,10 +1703,11 @@ fn fast_open_reset_suppressed_blocking_send_success_and_syncnt_timeout() {
                 .has_fast_open_cookie(a.now(), a.local.into(), remote.ip())
                 .unwrap()
         );
-        assert!(
-            !a.endpoint
+        assert_eq!(
+            a.endpoint
                 .can_defer_fast_open(a.now(), a.local.into(), remote)
-                .unwrap()
+                .unwrap(),
+            !suppress
         );
         let listener = tfo_listener(&mut b);
         let client = new(&mut a, 0);
@@ -1701,10 +1729,18 @@ fn fast_open_reset_suppressed_blocking_send_success_and_syncnt_timeout() {
         let connection = cid(&a, client);
         let start = a.now();
         let syn = tfo_capture(&mut a);
-        assert!(segment(&syn).payload.is_empty());
-        assert!(segment(&syn).options.fast_open.is_none());
-        assert_eq!(request.send.as_ref().unwrap().accepted, 0);
-        assert_eq!(a.endpoint.transport_info(connection).unwrap().send_used, 0);
+        assert_ne!(
+            a.endpoint.tuple(connection).unwrap().local.port(),
+            failed_tuple.local.port()
+        );
+        let initial = segment(&syn).payload.len();
+        assert_eq!(initial > 0, !suppress);
+        assert_eq!(segment(&syn).options.fast_open.is_some(), !suppress);
+        assert_eq!(request.send.as_ref().unwrap().accepted, initial);
+        assert_eq!(
+            a.endpoint.transport_info(connection).unwrap().send_used,
+            initial
+        );
         assert!(!a.service(&mut request));
         assert!(rx.try_recv().is_err());
         if timeout {
@@ -1714,8 +1750,9 @@ fn fast_open_reset_suppressed_blocking_send_success_and_syncnt_timeout() {
                 a.test_now = Some(now);
                 a.endpoint.on_timeout(now, BUDGET).unwrap();
                 a.events();
-                assert_eq!(request.send.as_ref().unwrap().accepted, 0);
-                assert_eq!(a.endpoint.transport_info(connection).unwrap().send_used, 0);
+                assert_eq!(request.send.as_ref().unwrap().accepted, initial);
+                // SYN payload is retained internally until terminal cleanup, but
+                // unacknowledged data never becomes TCP_INFO acknowledged bytes.
                 if offset == 1_000_000 {
                     let retry = tfo_capture(&mut a);
                     assert!(segment(&retry).payload.is_empty());
@@ -1726,6 +1763,10 @@ fn fast_open_reset_suppressed_blocking_send_success_and_syncnt_timeout() {
             let terminal = a.execute(client, Op::Transport(1)).unwrap().bytes;
             assert_eq!(terminal[0], 7);
             assert_eq!(terminal[5] & 32, 0);
+            assert_eq!(
+                u64::from_ne_bytes(terminal[120..128].try_into().unwrap()),
+                0
+            );
             assert!(a.service(&mut request));
             assert_eq!(rx.try_recv().unwrap().unwrap_err(), ETIMEDOUT);
             assert!(matches!(a.sockets[&client].handle, Handle::Fresh));
@@ -1748,7 +1789,9 @@ fn fast_open_reset_suppressed_blocking_send_success_and_syncnt_timeout() {
                 .execute(listener, Op::Accept(SOCK_NONBLOCK))
                 .unwrap()
                 .value as u64;
-            assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap_err(), EAGAIN);
+            if initial == 0 {
+                assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap_err(), EAGAIN);
+            }
             assert!(a.service(&mut request));
             assert_eq!(rx.try_recv().unwrap().unwrap().value, payload.len() as i32);
             exchange(&mut a, &mut b);
@@ -1760,10 +1803,11 @@ fn fast_open_reset_suppressed_blocking_send_success_and_syncnt_timeout() {
                 EISCONN
             );
         }
-        assert!(
-            !a.endpoint
+        assert_eq!(
+            a.endpoint
                 .can_defer_fast_open(a.now(), a.local.into(), remote)
-                .unwrap()
+                .unwrap(),
+            !timeout && !suppress
         );
     }
 }

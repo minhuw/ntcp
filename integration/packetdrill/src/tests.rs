@@ -11,27 +11,7 @@ const TCP_INFO_SIZE: usize = 280;
 struct Adapter;
 impl Adapter {
     fn start((local, profile): (Ipv4Addr, ntcp_socket::packet_test::Profile)) -> Result<Self, i32> {
-        let profile = match profile {
-            Profile::Baseline => "baseline",
-            Profile::Pipeline => "pipeline",
-            Profile::PipelinePaced => "pipeline-paced",
-            Profile::PipelineGso => "pipeline-gso",
-            Profile::PipelinePacedGso => "pipeline-paced-gso",
-            Profile::UpstreamWindow8 => "upstream-window8",
-            Profile::UpstreamHttps => "upstream-https",
-            Profile::UpstreamGlobalLowat => "upstream-global-lowat",
-            Profile::Sack => "sack",
-            Profile::UpstreamSack => "upstream-sack",
-            Profile::UpstreamCubic => "upstream-cubic",
-            Profile::UpstreamCubicEcn => "upstream-cubic-ecn",
-            Profile::UpstreamEcn => "upstream-ecn",
-            Profile::UpstreamBasic => "upstream-basic",
-            Profile::UpstreamFastOpen => "upstream-fastopen",
-            Profile::UpstreamFastOpenAdaptiveAck => "upstream-fastopen-adaptive-ack",
-            Profile::UpstreamFastOpenPmtud => "upstream-fastopen-pmtud",
-            #[cfg(feature = "tfo-linux-cookie")]
-            Profile::UpstreamFastOpenLinuxCookie => "upstream-fastopen-linux-cookie",
-        };
+        let profile = profile.flags();
         let flags = std::ffi::CString::new(format!("{profile},local={local}")).unwrap();
         let mut table = [0usize; 64];
         unsafe {
@@ -82,9 +62,17 @@ fn call(
             9 => ntcp_socket::shutdown(fd, a) as i64,
             14 => ntcp_net_send(USERDATA, bytes.as_ptr().cast(), bytes.len()) as i64,
             15 => {
-                let mut n = capacity;
-                let mut stamp = 0;
-                let r = ntcp_net_receive(USERDATA, output.as_mut_ptr().cast(), &mut n, &mut stamp);
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let (r, n) = loop {
+                    let mut n = capacity;
+                    let mut stamp = 0;
+                    let r =
+                        ntcp_net_receive(USERDATA, output.as_mut_ptr().cast(), &mut n, &mut stamp);
+                    if r != 0 || n != 0 || Instant::now() >= deadline {
+                        break (r, n);
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                };
                 if r < 0 {
                     -1
                 } else {
@@ -473,11 +461,16 @@ fn host_bridge_preloaded_process_and_lifecycle() {
 #include <sys/syscall.h>
 #include <pthread.h>
 #include <fcntl.h>
-static void *blocked(void *arg) {
+#include <time.h>
+static void *empty_capture(void *arg) {
     struct packetdrill_interface *p = arg;
     unsigned char packet[65535]; size_t n = sizeof(packet); long long t;
-    assert(p->netdev_receive(p->userdata, packet, &n, &t) == -1);
-    assert(errno == ECANCELED || errno == EIO);
+    struct timespec before, after;
+    assert(!clock_gettime(CLOCK_MONOTONIC, &before));
+    assert(p->netdev_receive(p->userdata, packet, &n, &t) == 0);
+    assert(n == 0);
+    assert(!clock_gettime(CLOCK_MONOTONIC, &after));
+    assert(after.tv_sec - before.tv_sec < 2);
     return NULL;
 }
 int main(int argc, char **argv) {
@@ -492,7 +485,7 @@ int main(int argc, char **argv) {
     assert(init);
 #define GETOPT(fd, level, name, value, len) (preloaded ? getsockopt(fd, level, name, value, len) : p.getsockopt(p.userdata, fd, level, name, value, len))
     struct packetdrill_interface p, other;
-    init("local=192.0.2.1,upstream-sack", &p); assert(p.userdata);
+    init("upstream,local=192.0.2.1", &p); assert(p.userdata);
     init("local=192.0.2.1,baseline", &other); assert(!other.userdata);
     int fd = p.socket(p.userdata, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP); assert(fd >= 0);
     struct sockaddr_in addr = {.sin_family=AF_INET, .sin_port=htons(8080), .sin_addr={htonl(0xc0000202)}};
@@ -530,11 +523,15 @@ int main(int argc, char **argv) {
     k = sizeof(kernel); n = sizeof(forwarded);
     assert(syscall(SYS_getsockopt, host, SOL_SOCKET, SO_MEMINFO, kernel, &k) == 0);
     assert(GETOPT(host, SOL_SOCKET, SO_MEMINFO, forwarded, &n) == 0 && k == n && !memcmp(kernel, forwarded, n)); close(host);
-    // Drain SYN output; next netdev callback blocks until teardown cancels it.
+    // Drain SYN output; an empty callback returns promptly before teardown.
     unsigned char packet[65535]; size_t size = sizeof(packet); long long t;
     assert(p.netdev_receive(p.userdata, packet, &size, &t) == 0);
-    pthread_t thread; assert(!pthread_create(&thread, NULL, blocked, &p)); usleep(10000);
-    p.free(p.userdata); assert(!pthread_join(thread, NULL));
+    pthread_t thread; assert(!pthread_create(&thread, NULL, empty_capture, &p));
+    assert(!pthread_join(thread, NULL));
+    p.free(p.userdata);
+    size = sizeof(packet);
+    assert(p.netdev_receive(p.userdata, packet, &size, &t) == -1);
+    assert(size == 0 && (errno == ECANCELED || errno == EIO));
     p.free(p.userdata); // Stale userdata never dereferenced.
     if (!preloaded) assert(syscall(SYS_fcntl, retained, F_GETFD) == -1 && errno == EBADF);
     assert(fcntl(epfd, F_GETFD) >= 0); // Neither mode may close the foreign epoll.
@@ -1206,6 +1203,10 @@ fn pipeline_wire_segments(profile: Profile, bounded: bool) {
             let result = unsafe {
                 ntcp_net_receive(USERDATA, bytes.as_mut_ptr().cast(), &mut n, &mut stamp)
             };
+            if result == 0 && n == 0 {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
             let capture = if result == 0 {
                 bytes.truncate(n);
                 Ok((bytes, stamp, Instant::now()))
@@ -1251,7 +1252,7 @@ fn pipeline_wire_segments(profile: Profile, bounded: bool) {
     // profiles this observes real monotonic delivery with no fake clock advance.
     assert!(previous.duration_since(started) < Duration::from_secs(3));
     assert!(received.recv_timeout(Duration::from_millis(10)).is_err());
-    drop(adapter); // Cancels the next blocking netdev receive, even with bounded queues.
+    drop(adapter); // The next polling callback observes teardown, even with bounded queues.
     let error = received
         .recv_timeout(Duration::from_secs(3))
         .unwrap()
@@ -1340,7 +1341,11 @@ fn fast_open_profile_keeps_socket_opt_in_and_disables_timestamps() {
     if isolated("tests::fast_open_profile_keeps_socket_opt_in_and_disables_timestamps") {
         return;
     }
-    let adapter = Adapter::start((local(), Profile::UpstreamFastOpen)).unwrap();
+    let adapter = Adapter::start((
+        local(),
+        upstream_tests("no-timestamps,budget224m,prealloc3"),
+    ))
+    .unwrap();
     // Enabling one client must not enable the next ordinary client or listener.
     for enabled in [true, false] {
         let fd = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
@@ -1514,7 +1519,7 @@ fn original_fast_open_profile_retains_hmac_default() {
     if isolated("tests::original_fast_open_profile_retains_hmac_default") {
         return;
     }
-    profile_cookie_response(Profile::UpstreamFastOpen, false);
+    profile_cookie_response(upstream_tests("no-timestamps,budget224m,prealloc3"), false);
 }
 
 #[test]
@@ -1525,7 +1530,10 @@ fn linux_cookie_profile_applies_key_after_endpoint_replacement_without_enabling_
     ) {
         return;
     }
-    profile_cookie_response(Profile::UpstreamFastOpenLinuxCookie, true);
+    profile_cookie_response(
+        upstream_tests("no-timestamps,budget224m,prealloc3,linux-cookie"),
+        true,
+    );
 }
 
 #[test]
@@ -1533,5 +1541,260 @@ fn pmtud_fast_open_profile_retains_hmac_default() {
     if isolated("tests::pmtud_fast_open_profile_retains_hmac_default") {
         return;
     }
-    profile_cookie_response(Profile::UpstreamFastOpenPmtud, false);
+    profile_cookie_response(
+        upstream_tests("no-timestamps,budget224m,prealloc3,pmtud1500"),
+        false,
+    );
+}
+
+fn upstream_tests(options: &str) -> Profile {
+    ntcp_socket::packet_test::profile(&format!("upstream,local=192.0.2.1,{options}"))
+        .unwrap()
+        .1
+}
+
+#[test]
+fn tcp_info_complete_reply_after_pmtu_resegmentation_preserves_abi_buffer() {
+    if isolated("tests::tcp_info_complete_reply_after_pmtu_resegmentation_preserves_abi_buffer") {
+        return;
+    }
+    let adapter = Adapter::start((local(), upstream_tests("no-timestamps,pmtud1500"))).unwrap();
+    let (_listener, fd, peer_ip, mut peer_ack) = connect_listener(&adapter, 8080, false, None);
+    let mut complete = [0xa5u8; 512];
+    let mut n = complete.len() as socklen_t;
+    unsafe {
+        assert_eq!(
+            ntcp_socket::getsockopt(
+                fd,
+                IPPROTO_TCP,
+                TCP_INFO,
+                complete.as_mut_ptr().cast(),
+                &mut n
+            ),
+            0
+        );
+    }
+    assert_eq!(n, 280);
+    assert_eq!(complete[0], 1); // ESTABLISHED.
+    assert!(complete[280..].iter().all(|&b| b == 0xa5));
+    let payload = [0x42u8; 536];
+    unsafe {
+        assert_eq!(
+            ntcp_socket::write(fd, payload.as_ptr().cast(), payload.len()),
+            536
+        );
+    }
+    let first = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+    let (ip, tcp) = parse_frame(&first).unwrap();
+    let first_payload = ntcp::wire::parse(ip, tcp).unwrap().payload.len();
+    // The initial peer has no MSS option:536-byte packets. A matched ICMP
+    // MTU300 requires partial retransmission. Both byte and packet-unit
+    // delivery statistics must remain available after repacketization.
+    assert_eq!(first_payload, 536);
+    let mut feedback = vec![0u8; 56];
+    feedback[0] = 0x45;
+    feedback[2..4].copy_from_slice(&56u16.to_be_bytes());
+    feedback[8] = 64;
+    feedback[9] = 1;
+    feedback[12..16].copy_from_slice(&[192, 0, 2, 2]);
+    feedback[16..20].copy_from_slice(&local().octets());
+    feedback[20..22].copy_from_slice(&[3, 4]);
+    feedback[26..28].copy_from_slice(&300u16.to_be_bytes());
+    feedback[28..56].copy_from_slice(&first[..28]);
+    let checksum = ntcp_ip::checksum(&feedback[20..]);
+    feedback[22..24].copy_from_slice(&checksum.to_be_bytes());
+    let checksum = ntcp_ip::checksum(&feedback[..20]);
+    feedback[10..12].copy_from_slice(&checksum.to_be_bytes());
+    call(&adapter, 14, 0, 0, feedback, 0).unwrap();
+    let retry = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+    assert_eq!(
+        packet_header(&retry).sequence,
+        packet_header(&first).sequence
+    );
+    assert_eq!(retry.len(), 300);
+    for requested in [0, 1, 6, 7, 191, 192, 193, 196, 280, 512] {
+        let mut bytes = [0xa5u8; 512];
+        let mut len = requested;
+        unsafe {
+            assert_eq!(
+                ntcp_socket::getsockopt(
+                    fd,
+                    IPPROTO_TCP,
+                    TCP_INFO,
+                    bytes.as_mut_ptr().cast(),
+                    &mut len,
+                ),
+                0
+            );
+        }
+        assert_eq!(len, requested.min(280));
+        if len > 0 {
+            assert_eq!(bytes[0], 1);
+        }
+        if len >= 6 {
+            assert_eq!(bytes[5] & 32, 0);
+        }
+        if len >= 196 {
+            assert_eq!(u32::from_ne_bytes(bytes[192..196].try_into().unwrap()), 1);
+        }
+        assert!(bytes[len as usize..].iter().all(|&b| b == 0xa5));
+    }
+    let mut repaired = 260;
+    loop {
+        peer_ack.acknowledgment = packet_header(&first).sequence.wrapping_add(repaired as u32);
+        inject(peer_ip, peer_ack, &[]);
+        let snapshot = call(&adapter, 18, fd, 1, vec![], 280).unwrap().bytes;
+        assert_eq!(snapshot.len(), 280);
+        if repaired == payload.len() {
+            assert_eq!(
+                u32::from_ne_bytes(snapshot[192..196].try_into().unwrap()),
+                4
+            ); // SYN+three repaired units.
+            break;
+        }
+        let bytes = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+        assert_eq!(
+            packet_header(&bytes).sequence,
+            packet_header(&first).sequence.wrapping_add(repaired as u32)
+        );
+        let (ip, tcp) = parse_frame(&bytes).unwrap();
+        let segment = ntcp::wire::parse(ip, tcp).unwrap();
+        assert!(bytes.len() <= 300);
+        repaired += segment.payload.len();
+        assert!(repaired <= payload.len());
+    }
+}
+
+#[test]
+fn tcp_info_fresh_bound_listener_queue_and_closed_connection_states() {
+    if isolated("tests::tcp_info_fresh_bound_listener_queue_and_closed_connection_states") {
+        return;
+    }
+    let adapter = Adapter::start((local(), upstream_tests("no-timestamps"))).unwrap();
+    let listener = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+        .unwrap()
+        .value as i32;
+    let query = |fd, expected_state| {
+        let info = call(&adapter, 18, fd, 1, vec![], 512).unwrap().bytes;
+        assert_eq!(info.len(), 280);
+        assert_eq!(info[0], expected_state);
+        info
+    };
+    let fresh = query(listener, 7);
+    assert_eq!(&fresh[192..196], &[0; 4]);
+    call(
+        &adapter,
+        2,
+        listener,
+        0,
+        encode_addr(SocketAddr::new(local().into(), 8080)),
+        0,
+    )
+    .unwrap();
+    query(listener, 7); // Binding alone creates no TCP connection.
+    call(&adapter, 3, listener, 3, vec![], 0).unwrap();
+    let info = query(listener, 10);
+    assert_eq!(u32::from_ne_bytes(info[24..28].try_into().unwrap()), 0);
+    assert_eq!(u32::from_ne_bytes(info[28..32].try_into().unwrap()), 3);
+    call(&adapter, 14, 0, 0, syn(100, 8080), 0).unwrap();
+    let packet = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+    let parsed = ntcp_ip::parse(&packet, false).unwrap();
+    let sent = packet_header(&packet);
+    let ip = IpMetadata {
+        source: parsed.ip.destination,
+        destination: parsed.ip.source,
+    };
+    let mut ack = ntcp::wire::Header {
+        source_port: 50000,
+        destination_port: 8080,
+        sequence: 101,
+        acknowledgment: sent.sequence.wrapping_add(1),
+        flags: ntcp::wire::ACK,
+        window: 65535,
+        urgent_pointer: 0,
+    };
+    query(listener, 10); // An in-progress passive handshake is still LISTEN.
+    inject(ip, ack, &[]);
+    let info = query(listener, 10);
+    assert_eq!(u32::from_ne_bytes(info[24..28].try_into().unwrap()), 1);
+    let fd = call(&adapter, 4, listener, SOCK_NONBLOCK, vec![], 16)
+        .unwrap()
+        .value as i32;
+    query(fd, 1);
+    assert_eq!(
+        u32::from_ne_bytes(query(listener, 10)[24..28].try_into().unwrap()),
+        0
+    );
+    ack.flags |= ntcp::wire::FIN;
+    inject(ip, ack, &[]);
+    let response = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+    assert_eq!(packet_header(&response).acknowledgment, 102);
+    query(fd, 8); // CLOSE_WAIT.
+    call(&adapter, 9, fd, SHUT_WR, vec![], 0).unwrap();
+    let fin = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+    query(fd, 9); // LAST_ACK.
+    ack.flags = ntcp::wire::ACK;
+    ack.sequence = 102;
+    ack.acknowledgment = packet_header(&fin).sequence.wrapping_add(1);
+    inject(ip, ack, &[]);
+    let closed = query(fd, 7); // TCP closed, application descriptor still valid.
+    assert_eq!(u32::from_ne_bytes(closed[192..196].try_into().unwrap()), 2); // SYN+FIN.
+    call(&adapter, 8, fd, 0, vec![], 0).unwrap();
+    assert_eq!(call(&adapter, 18, fd, 1, vec![], 280).err(), Some(EBADF));
+}
+
+#[test]
+fn icmp_network_errors_cross_shared_abi_without_soft_stream_failure() {
+    if isolated("tests::icmp_network_errors_cross_shared_abi_without_soft_stream_failure") {
+        return;
+    }
+    let adapter = Adapter::start((local(), upstream_tests("no-timestamps"))).unwrap();
+    let (_listener, fd, _ip, _ack) = connect_listener(&adapter, 8080, false, None);
+    let payload = [0x42u8; 536];
+    unsafe {
+        assert_eq!(
+            ntcp_socket::write(fd, payload.as_ptr().cast(), payload.len()),
+            536
+        );
+    }
+    let packet = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+    let report = |kind: u8, code: u8| {
+        let mut bytes = vec![0u8; 56];
+        bytes[0] = 0x45;
+        bytes[2..4].copy_from_slice(&56u16.to_be_bytes());
+        bytes[8] = 64;
+        bytes[9] = 1;
+        bytes[12..16].copy_from_slice(&[192, 0, 2, 254]);
+        bytes[16..20].copy_from_slice(&local().octets());
+        bytes[20] = kind;
+        bytes[21] = code;
+        bytes[28..56].copy_from_slice(&packet[..28]);
+        let checksum = ntcp_ip::checksum(&bytes[20..]);
+        bytes[22..24].copy_from_slice(&checksum.to_be_bytes());
+        let checksum = ntcp_ip::checksum(&bytes[..20]);
+        bytes[10..12].copy_from_slice(&checksum.to_be_bytes());
+        call(&adapter, 14, 0, 0, bytes, 0).unwrap();
+    };
+    report(3, 1); // Host unreachable is a nonterminal notification.
+    unsafe {
+        assert_eq!(
+            ntcp_socket::write(fd, payload.as_ptr().cast(), payload.len()),
+            536
+        );
+    }
+    let next = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+    assert_eq!(
+        packet_header(&next).sequence,
+        packet_header(&packet).sequence.wrapping_add(536)
+    );
+    report(4, 0); // Source Quench must not clear a pending real notification.
+    assert_eq!(get_buffer(fd, SO_ERROR), EHOSTUNREACH);
+    assert_eq!(get_buffer(fd, SO_ERROR), 0);
+    report(11, 0);
+    report(3, 3); // Existing core hard-error policy wins over the soft report.
+    assert_eq!(get_buffer(fd, SO_ERROR), EHOSTUNREACH);
+    assert_eq!(get_buffer(fd, SO_ERROR), 0);
+    let info = call(&adapter, 18, fd, 1, vec![], 280).unwrap().bytes;
+    assert_eq!(info.len(), 280);
+    assert_eq!(info[0], 7); // TCP closed; application descriptor still valid.
 }

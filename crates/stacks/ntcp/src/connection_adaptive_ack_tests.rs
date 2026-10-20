@@ -27,7 +27,7 @@ fn startup_response_delayed_fin_and_timer_in_both_clock_units() {
             let ticks = |us| cfg.timebase.ticks_from_us(us);
             let (mut a, _) = pair(cfg.clone(), 100);
             assert_eq!(a.ack_ato, ticks(40_000));
-            for (i, expected) in [(0, 1), (1, 0)] {
+            for (i, expected) in [(0, 3), (1, 2)] {
                 data(&mut a, ticks(100 + i), b"request");
                 assert!(a.ack_pending);
                 packet(&mut a, ticks(100 + i));
@@ -61,9 +61,9 @@ fn startup_response_delayed_fin_and_timer_in_both_clock_units() {
                 a.timeout(deadline).unwrap();
                 assert!(a.ack_pending);
                 assert!(!a.ack_interactive);
-                assert_eq!(a.ack_quick, 2);
+                assert_eq!(a.ack_quick, 4);
                 packet(&mut a, deadline);
-                assert_eq!(a.ack_quick, 1);
+                assert_eq!(a.ack_quick, 3);
             }
         }
     }
@@ -75,17 +75,17 @@ fn reserved_commit_not_selection_counts_once_and_uses_departure_time() {
         let (mut a, _) = pair(adaptive_config(), 100);
         data(&mut a, 100, b"request");
         assert_eq!(a.transmit(101, &mut [0; 19]), Err(Error::OutputTooSmall));
-        assert_eq!(a.ack_quick, 2);
+        assert_eq!(a.ack_quick, 4);
         let mut ack = selected(&mut a, 101);
         assert!(ack.data_ack);
-        assert_eq!(a.ack_quick, 2);
+        assert_eq!(a.ack_quick, 4);
         assert!(!a.ack_pending); // Selection remains the ownership barrier.
         assert_eq!(a.ack_deadline, None);
         a.accept_reserved_output(102, &mut ack, 0, 0, false)
             .unwrap();
-        assert_eq!(a.ack_quick, 1);
+        assert_eq!(a.ack_quick, 3);
         a.accept_reserved_output(103, &mut ack, 0, 0, true).unwrap();
-        assert_eq!(a.ack_quick, 1);
+        assert_eq!(a.ack_quick, 3);
         a.write(&[7; 100]).unwrap();
         let mut reply = selected(&mut a, 104);
         assert!(!a.ack_interactive); // A rejected/held submission does nothing.
@@ -95,7 +95,7 @@ fn reserved_commit_not_selection_counts_once_and_uses_departure_time() {
         assert_eq!(a.ack_interactive, !late);
         a.accept_reserved_output(at + 1, &mut reply, 40, 60, true)
             .unwrap();
-        assert_eq!(a.ack_quick, 1);
+        assert_eq!(a.ack_quick, 3);
     }
     let (mut a, _) = pair(adaptive_config(), 100);
     data(&mut a, 100, b"request");
@@ -104,10 +104,10 @@ fn reserved_commit_not_selection_counts_once_and_uses_departure_time() {
     assert!(reply.data_ack);
     a.accept_reserved_output(102, &mut reply, 0, 40, false)
         .unwrap();
-    assert_eq!(a.ack_quick, 1);
+    assert_eq!(a.ack_quick, 3);
     a.accept_reserved_output(103, &mut reply, 40, 60, true)
         .unwrap();
-    assert_eq!(a.ack_quick, 1);
+    assert_eq!(a.ack_quick, 3);
 }
 
 #[test]
@@ -119,18 +119,20 @@ fn pure_fin_is_not_response_and_reserved_fin_commits_data_ack() {
     assert!(!a.ack_interactive);
     let mut fin = selected(&mut a, 101);
     assert!(fin.fin && fin.data_ack && !fin.fresh_data);
-    assert_eq!(a.ack_quick, 2);
+    assert_eq!(a.ack_quick, 4);
     a.accept_reserved_output(102, &mut fin, 0, 0, true).unwrap();
     assert!(!a.ack_interactive);
-    assert_eq!(a.ack_quick, 1);
+    assert_eq!(a.ack_quick, 3);
 }
 
 #[test]
 fn mandatory_feedback_overrides_interactive_delay() {
     for case in 0..7 {
         let (mut a, _) = pair(adaptive_config(), 100);
+        data(&mut a, 35, b"seed");
+        a.read(&mut [0; 4]).unwrap();
         a.write(b"request").unwrap();
-        packet(&mut a, 40); // Establishment seed is valid response evidence.
+        packet(&mut a, 40);
         assert!(a.ack_interactive);
         match case {
             0 => {
@@ -149,7 +151,10 @@ fn mandatory_feedback_overrides_interactive_delay() {
                 packet(&mut a, 100);
                 data(&mut a, 101, b"ab"); // Gap fill.
             }
-            4 => inject(&mut a, 100, Seq(901), Seq(108), ACK | FIN, 8192, b""),
+            4 => {
+                let next = a.receive.next();
+                inject(&mut a, 100, next, Seq(108), ACK | FIN, 8192, b"");
+            }
             5 => data(&mut a, 100, &[1; 8192]), // Receive window exhausted.
             _ => {
                 data(&mut a, 100, b"a");
@@ -186,6 +191,8 @@ fn spacing_bounds_long_idle_and_terminal_history() {
         data(&mut a, 101, b"x");
         assert_eq!(a.ack_ato, (max / 2 + min / 2).clamp(min, max));
         packet(&mut a, 101);
+        a.write(b"reply").unwrap();
+        packet(&mut a, 101);
         a.ack_ato = max;
         let gap = max * 3 / 4;
         data(&mut a, 102 + gap, b"x");
@@ -197,7 +204,7 @@ fn spacing_bounds_long_idle_and_terminal_history() {
         let idle = a.now + a.rto() + 1;
         data(&mut a, idle, b"x");
         assert!(!a.ack_interactive);
-        assert_eq!(a.ack_quick, 2);
+        assert_eq!(a.ack_quick, a.adaptive_quick_budget());
         assert!(a.ack_pending);
         a.terminal(CloseReason::Reset);
         assert_eq!(a.ack_receive, None);
@@ -232,97 +239,103 @@ fn adaptive_config_bounds_and_unchanged_fixed_modes() {
 
 #[test]
 fn fast_open_syn_only_and_post_handshake_request_fixtures() {
-    for (syn_bytes, total) in [(1000, 1000), (900, 1900)] {
-        for reserved in [false, true] {
-            let mut cfg = adaptive_config();
-            cfg.mss = 1460;
-            cfg.send_ip_payload_limit = 1500;
-            cfg.receive_ip_payload_limit = 1500;
-            let mut a = Connection::active(tuple(), cfg, 100, 0).unwrap();
-            let mut cache = crate::fast_open::FastOpen::new().unwrap();
-            cache.learn(
-                0,
-                tuple().local.ip(),
-                tuple().remote.ip(),
-                wire::FastOpenCookie::new(&[7; 8]).unwrap(),
-                syn_bytes + 40,
-            );
-            a.prepare_fast_open(
-                cache.get(0, 100, tuple().local.ip(), tuple().remote.ip()),
-                &vec![42; total],
-            )
-            .unwrap();
-            let mut out = [0; 2048];
-            let n = a.transmit_selected(0, &mut out, reserved).unwrap().unwrap();
-            assert_eq!(
-                wire::parse(ip(tuple()), &out[..n]).unwrap().payload.len(),
-                syn_bytes as usize
-            );
-            assert!(!a.ack_interactive);
-            assert_eq!(a.ack_receive, None);
-            if reserved {
-                let mut d = a.last_departure.take().unwrap();
-                a.accept_reserved_output(1, &mut d, 0, syn_bytes as usize, true)
-                    .unwrap();
-            }
-            assert!(!a.ack_interactive);
-            let synack = Segment {
-                header: Header {
-                    source_port: tuple().remote.port(),
-                    destination_port: tuple().local.port(),
-                    sequence: 900,
-                    acknowledgment: 101 + syn_bytes as u32,
-                    flags: SYN | ACK,
-                    window: 8192,
-                    urgent_pointer: 0,
-                },
-                options: wire::Options {
-                    mss: Some(1000),
-                    ..Default::default()
-                },
-                raw_options: &[],
-                payload: &[],
-            };
-            a.input(100, &synack).unwrap();
-            assert_eq!(a.ack_receive, Some((100, false)));
-            if total > syn_bytes as usize {
-                a.write(&vec![42; total - syn_bytes as usize]).unwrap();
-            }
-            let n = a
-                .transmit_selected(101, &mut out, reserved)
-                .unwrap()
+    for units in [1_000_000, 1_000_000_000] {
+        for (syn_bytes, total) in [(1000, 1000), (900, 1900)] {
+            for reserved in [false, true] {
+                let mut cfg = adaptive_config();
+                cfg.timebase.units_per_second = units;
+                let ticks = |us| cfg.timebase.ticks_from_us(us);
+                cfg.mss = 1460;
+                cfg.send_ip_payload_limit = 1500;
+                cfg.receive_ip_payload_limit = 1500;
+                let mut a = Connection::active(tuple(), cfg.clone(), 100, 0).unwrap();
+                let mut cache = crate::fast_open::FastOpen::new().unwrap();
+                cache.learn(
+                    0,
+                    tuple().local.ip(),
+                    tuple().remote.ip(),
+                    wire::FastOpenCookie::new(&[7; 8]).unwrap(),
+                    syn_bytes + 40,
+                );
+                a.prepare_fast_open(
+                    cache.get(0, 100, tuple().local.ip(), tuple().remote.ip()),
+                    &vec![42; total],
+                )
                 .unwrap();
-            let payload = wire::parse(ip(tuple()), &out[..n]).unwrap().payload.len();
-            assert_eq!(payload, total - syn_bytes as usize);
-            if reserved {
+                let mut out = [0; 2048];
+                let n = a.transmit_selected(0, &mut out, reserved).unwrap().unwrap();
+                assert_eq!(
+                    wire::parse(ip(tuple()), &out[..n]).unwrap().payload.len(),
+                    syn_bytes as usize
+                );
                 assert!(!a.ack_interactive);
-                let mut d = a.last_departure.take().unwrap();
-                a.accept_reserved_output(102, &mut d, 0, payload, true)
+                assert_eq!(a.ack_receive, None);
+                if reserved {
+                    let mut d = a.last_departure.take().unwrap();
+                    a.accept_reserved_output(ticks(1), &mut d, 0, syn_bytes as usize, true)
+                        .unwrap();
+                }
+                assert!(!a.ack_interactive);
+                let synack = Segment {
+                    header: Header {
+                        source_port: tuple().remote.port(),
+                        destination_port: tuple().local.port(),
+                        sequence: 900,
+                        acknowledgment: 101 + syn_bytes as u32,
+                        flags: SYN | ACK,
+                        window: 8192,
+                        urgent_pointer: 0,
+                    },
+                    options: wire::Options {
+                        mss: Some(1000),
+                        ..Default::default()
+                    },
+                    raw_options: &[],
+                    payload: &[],
+                };
+                a.input(ticks(100), &synack).unwrap();
+                assert_eq!(a.ack_receive, Some((ticks(100), false)));
+                if total > syn_bytes as usize {
+                    a.write(&vec![42; total - syn_bytes as usize]).unwrap();
+                }
+                let n = a
+                    .transmit_selected(ticks(101), &mut out, reserved)
+                    .unwrap()
                     .unwrap();
+                let payload = wire::parse(ip(tuple()), &out[..n]).unwrap().payload.len();
+                assert_eq!(payload, total - syn_bytes as usize);
+                if reserved {
+                    assert!(!a.ack_interactive);
+                    let mut d = a.last_departure.take().unwrap();
+                    a.accept_reserved_output(ticks(102), &mut d, 0, payload, true)
+                        .unwrap();
+                }
+                assert!(!a.ack_interactive);
+                data(&mut a, ticks(200), &[9; 500]);
+                assert!(a.ack_pending);
+                assert_eq!(a.ack_deadline, None);
+                a.read(&mut [0; 500]).unwrap();
+                a.close().unwrap();
+                let bytes = packet(&mut a, ticks(201));
+                assert_eq!(
+                    wire::parse(ip(tuple()), &bytes).unwrap().header.flags & (FIN | ACK),
+                    FIN | ACK
+                );
+                assert_eq!(a.ack_deadline, None);
             }
-            assert_eq!(a.ack_interactive, total == 1900);
-            data(&mut a, 200, b"response");
-            assert_eq!(a.ack_pending, total == 1000);
-            assert_eq!(a.ack_deadline, (total == 1900).then_some(40_200));
-            a.read(&mut [0; 32]).unwrap();
-            a.close().unwrap();
-            let bytes = packet(&mut a, 201);
-            assert_eq!(
-                wire::parse(ip(tuple()), &bytes).unwrap().header.flags & (FIN | ACK),
-                FIN | ACK
-            );
-            assert_eq!(a.ack_deadline, None);
         }
     }
 }
-
 #[test]
 fn invalid_and_paws_failed_data_do_not_train_or_defer_deadline() {
     let mut cfg = adaptive_config();
     cfg.timestamps = true;
-    let (mut a, _) = pair(cfg, 100);
+    let (mut a, mut b) = pair(cfg, 100);
+    b.write(b"seed").unwrap();
+    deliver(&mut b, &mut a, 35);
     a.write(b"request").unwrap();
     packet(&mut a, 40);
+    assert!(a.ack_interactive);
     let mut segment = Segment {
         header: Header {
             source_port: tuple().remote.port(),
@@ -359,6 +372,7 @@ fn invalid_and_paws_failed_data_do_not_train_or_defer_deadline() {
 #[test]
 fn pending_deadline_survives_spacing_change_and_long_idle() {
     let (mut a, _) = pair(adaptive_config(), 100);
+    data(&mut a, 35, b"seed");
     a.write(b"request").unwrap();
     packet(&mut a, 40);
     data(&mut a, 100, b"x");
@@ -371,7 +385,7 @@ fn pending_deadline_survives_spacing_change_and_long_idle() {
     a.now += a.rto() + 1;
     a.adaptive_receive();
     assert_eq!(a.ack_deadline, first);
-    assert_eq!(a.ack_quick, 2);
+    assert_eq!(a.ack_quick, 4);
     assert!(!a.ack_interactive);
 }
 
@@ -380,6 +394,9 @@ fn ecn_window_reopening_and_peer_reset_keep_mandatory_feedback() {
     let mut cfg = adaptive_config();
     cfg.ecn = true;
     let (mut a, mut b) = pair(cfg, 100);
+    b.write(b"seed").unwrap();
+    deliver(&mut b, &mut a, 35);
+    a.read(&mut [0; 4]).unwrap();
     a.write(b"request").unwrap();
     deliver(&mut a, &mut b, 40);
     assert!(a.ack_interactive);
@@ -544,6 +561,242 @@ fn direct_and_reserved_departure_use_actual_clock_at_ato_boundary() {
                     assert_eq!(a.ack_deadline.is_some(), offset < 0);
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn handshake_only_https_request_does_not_suppress_first_response_ack() {
+    for units in [1_000_000, 1_000_000_000] {
+        for reserved in [false, true] {
+            let mut cfg = adaptive_config();
+            cfg.mss = 1460;
+            cfg.nagle = false;
+            cfg.timebase.units_per_second = units;
+            let ticks = |us| cfg.timebase.ticks_from_us(us);
+            let (mut a, _) = pair(cfg.clone(), 100);
+            assert_eq!(a.ack_receive, Some((20, false)));
+            assert_eq!(a.ack_quick, 0);
+            a.write(&[7; 517]).unwrap();
+            let now = ticks(30);
+            if reserved {
+                let mut request = selected(&mut a, now);
+                assert!(request.fresh_data);
+                a.accept_reserved_output(now, &mut request, 0, 517, true)
+                    .unwrap();
+            } else {
+                let bytes = packet(&mut a, now);
+                assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 517);
+            }
+            assert!(!a.ack_interactive);
+            data(&mut a, ticks(100_030), &[9; 143]);
+            assert_eq!(a.ack_receive, Some((ticks(100_030), true)));
+            assert!(a.ack_pending);
+            assert_eq!(a.ack_deadline, None);
+            let quick = a.ack_quick;
+            if reserved {
+                let mut ack = selected(&mut a, ticks(100_030));
+                assert_eq!(a.ack_quick, quick);
+                a.accept_reserved_output(ticks(100_030), &mut ack, 0, 0, true)
+                    .unwrap();
+            } else {
+                packet(&mut a, ticks(100_030));
+            }
+            assert_eq!(a.ack_quick, quick - 1);
+            a.write(b"real reply").unwrap();
+            packet(&mut a, ticks(100_031));
+            assert!(a.ack_interactive);
+            data(&mut a, ticks(100_032), b"next");
+            assert!(!a.ack_pending);
+            assert_eq!(a.ack_deadline, Some(ticks(140_032)));
+        }
+    }
+}
+
+#[test]
+fn epoll_4000_6000_read_1000_then_2000_keeps_quick_credit() {
+    for units in [1_000_000, 1_000_000_000] {
+        for reserved in [false, true] {
+            let mut cfg = adaptive_config();
+            cfg.receive_capacity = 131_072;
+            cfg.mss = 1460;
+            cfg.timebase.units_per_second = units;
+            let ticks = |us| cfg.timebase.ticks_from_us(us);
+            let (mut a, _) = pair(cfg.clone(), 100);
+            let mut quick = 16;
+            for (at, len) in [(100, 4000), (101, 6000), (102, 2000)] {
+                if len == 2000 {
+                    assert_eq!(a.read(&mut [0; 1000]), Ok(1000));
+                }
+                // The peer's scaled send window is unrelated to our quick budget.
+                let next = a.receive.next();
+                inject(&mut a, ticks(at), next, Seq(101), ACK, 257, &vec![1; len]);
+                assert!(a.ack_pending);
+                assert_eq!(a.ack_deadline, None);
+                assert_eq!(a.ack_quick, quick);
+                if reserved {
+                    let mut ack = selected(&mut a, ticks(at));
+                    assert!(ack.data_ack);
+                    assert_eq!(a.ack_quick, quick);
+                    a.accept_reserved_output(ticks(at), &mut ack, 0, 0, true)
+                        .unwrap();
+                } else {
+                    packet(&mut a, ticks(at));
+                }
+                quick -= 1;
+                assert_eq!(a.ack_quick, quick);
+            }
+        }
+    }
+}
+
+#[test]
+fn quick_budget_uses_local_unscaled_window_and_receive_mss_with_safe_bounds() {
+    let (mut a, _) = pair(adaptive_config(), 100);
+    a.snd_wnd = 1;
+    for (window, expected) in [
+        (0, 2),
+        (1, 2),
+        (1999, 2),
+        (2000, 1),
+        (3999, 1),
+        (4000, 2),
+        (31_999, 15),
+        (32_000, 16),
+        (131_072, 16),
+        ((1 << 31) - 1, 16),
+    ] {
+        a.advertised_edge = a.receive.next().wrapping_add(window);
+        assert_eq!(a.adaptive_quick_budget(), expected, "window={window}");
+    }
+    // Receive MSS is also constrained by the local receive IP payload limit.
+    a.config.mss = u16::MAX;
+    a.config.receive_ip_payload_limit = 520;
+    a.advertised_edge = a.receive.next().wrapping_add(3000);
+    assert_eq!(a.adaptive_quick_budget(), 3);
+    a.config.receive_ip_payload_limit = u16::MAX;
+    a.advertised_edge = a.receive.next().wrapping_add(131_030);
+    assert_eq!(a.adaptive_quick_budget(), 1);
+
+    for (capacity, expected) in [(1, 2), (2000, 2), (2001, 1), (4001, 2), (64001, 16)] {
+        let mut cfg = adaptive_config();
+        cfg.receive_capacity = capacity;
+        let (mut a, _) = pair(cfg, 100);
+        assert_eq!(a.ack_quick, 0);
+        data(&mut a, 100, b"x");
+        assert_eq!(a.ack_quick, expected, "capacity={capacity}");
+        a.terminal(CloseReason::Reset);
+        assert_eq!(a.ack_quick, 0);
+    }
+}
+
+#[test]
+fn quick_budget_is_not_minted_per_arrival_and_refills_on_timer_and_idle() {
+    for units in [1_000_000, 1_000_000_000] {
+        let mut cfg = adaptive_config();
+        cfg.timebase.units_per_second = units;
+        let ticks = |us| cfg.timebase.ticks_from_us(us);
+        let (mut a, _) = pair(cfg.clone(), 100);
+        for i in 0..4 {
+            data(&mut a, ticks(100 + i), b"x");
+            assert_eq!(a.ack_quick, 4 - i as u8);
+            packet(&mut a, ticks(100 + i));
+            assert_eq!(a.ack_quick, 3 - i as u8);
+        }
+        data(&mut a, ticks(104), b"x");
+        assert!(!a.ack_pending);
+        let deadline = ticks(40_104);
+        assert_eq!(a.ack_deadline, Some(deadline));
+        a.timeout(deadline).unwrap();
+        assert_eq!(a.ack_quick, a.adaptive_quick_budget());
+        packet(&mut a, deadline);
+        assert_eq!(a.ack_quick, 3);
+        // A genuine response suppresses quick mode until an idle receive resets it.
+        data(&mut a, deadline + 1, b"next");
+        a.write(b"reply").unwrap();
+        packet(&mut a, deadline + 2);
+        assert!(a.ack_interactive);
+        let idle = a.now + a.rto() + 1;
+        let next = a.receive.next();
+        let ack = a.snd_una; // Do not change the RTT/RTO with the idle arrival.
+        inject(&mut a, idle, next, ack, ACK, 8192, b"x");
+        assert!(!a.ack_interactive);
+        assert_eq!(a.ack_quick, a.adaptive_quick_budget());
+        assert!(a.ack_pending);
+    }
+}
+
+#[test]
+fn staged_syn_and_early_response_do_not_initialize_stream_ack_history() {
+    for authenticated in [false, true] {
+        for reserved in [false, true] {
+            let mut cfg = adaptive_config();
+            cfg.fast_open_early_response = true;
+            let syn = Segment {
+                header: Header {
+                    source_port: tuple().remote.port(),
+                    destination_port: tuple().local.port(),
+                    sequence: 900,
+                    acknowledgment: 0,
+                    flags: SYN,
+                    window: 8192,
+                    urgent_pointer: 0,
+                },
+                options: wire::Options::default(),
+                raw_options: &[],
+                payload: b"request",
+            };
+            let mut a = Connection::passive_with_receive(
+                tuple(),
+                cfg,
+                100,
+                0,
+                &syn,
+                authenticated,
+                &mut None,
+                RxTimestamps::default(),
+                RxPacketTimestamps::default(),
+            )
+            .unwrap();
+            a.write(b"reply").unwrap();
+            if reserved {
+                let mut synack = selected(&mut a, 10);
+                a.accept_reserved_output(10, &mut synack, 0, 0, true)
+                    .unwrap();
+            } else {
+                packet(&mut a, 10);
+            }
+            assert_eq!(a.ack_quick, 0);
+            assert_eq!(a.ack_receive, None);
+            if authenticated {
+                if reserved {
+                    let mut reply = selected(&mut a, 20);
+                    a.accept_reserved_output(20, &mut reply, 0, 5, true)
+                        .unwrap();
+                } else {
+                    packet(&mut a, 20);
+                }
+                assert!(!a.ack_interactive);
+            }
+            let ack = a.snd_nxt;
+            inject(&mut a, 30, Seq(908), ack, ACK, 8192, b"");
+            assert_eq!(a.state, State::Established);
+            assert_eq!(a.ack_receive, Some((30, false)));
+            if !authenticated {
+                if reserved {
+                    let mut reply = selected(&mut a, 31);
+                    a.accept_reserved_output(31, &mut reply, 0, 5, true)
+                        .unwrap();
+                } else {
+                    packet(&mut a, 31);
+                }
+            }
+            assert!(!a.ack_interactive);
+            assert_eq!(a.ack_quick, 0);
+            data(&mut a, 40, b"new stream data");
+            assert_eq!(a.ack_receive, Some((40, true)));
+            assert_eq!(a.ack_quick, a.adaptive_quick_budget());
+            assert!(a.ack_pending);
         }
     }
 }

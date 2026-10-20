@@ -694,51 +694,33 @@ fn socket_sends_wait_for_handshake_without_core_buffering() {
 #[test]
 fn profiles_require_one_selection_and_one_ipv4_address() {
     assert_eq!(
-        profile("local=192.0.2.1,upstream-window8").unwrap(),
-        (local(), Profile::UpstreamWindow8)
+        profile("local=192.0.2.1,upstream").unwrap(),
+        (local(), upstream_packet_tests(""))
     );
     assert_eq!(
         profile("sack,local=192.0.2.1").unwrap(),
         (local(), Profile::Sack)
     );
     assert_eq!(
-        profile("upstream-sack,local=192.0.2.1").unwrap(),
-        (local(), Profile::UpstreamSack)
-    );
-    assert_eq!(
-        profile("upstream-cubic,local=192.0.2.1").unwrap(),
-        (local(), Profile::UpstreamCubic)
-    );
-    assert_eq!(
-        profile("upstream-cubic-ecn,local=192.0.2.1").unwrap(),
-        (local(), Profile::UpstreamCubicEcn)
+        profile("upstream,ecn,local=192.0.2.1").unwrap(),
+        (local(), upstream_packet_tests("ecn"))
     );
     for flags in [
-        "upstream-cubic-ecn",
-        "upstream-cubic-ecn,upstream-cubic,local=192.0.2.1",
-        "upstream-cubic-ecn,upstream-cubic-ecn,local=192.0.2.1",
-        "upstream-cubic",
-        "upstream-cubic,upstream-sack,local=192.0.2.1",
-        "upstream-cubic,upstream-cubic,local=192.0.2.1",
+        "upstream",
         "",
-        "upstream-sack",
-        "upstream-sack,sack,local=192.0.2.1",
-        "upstream-sack,upstream-sack,local=192.0.2.1",
         "sack",
         "sack,sack,local=192.0.2.1",
         "baseline",
-        "upstream-window8",
         "local=192.0.2.1",
-        "baseline,baseline,local=192.0.2.1",
-        "upstream-window8,upstream-window8,local=192.0.2.1",
-        "baseline,upstream-window8,local=192.0.2.1",
-        "upstream-window8,baseline,local=192.0.2.1",
+        "upstream,upstream,local=192.0.2.1",
+        "baseline,upstream,local=192.0.2.1",
+        "upstream,baseline,local=192.0.2.1",
         "baseline,local=192.0.2.1,local=192.0.2.1",
-        "upstream-window8,local=192.0.2.1,local=192.0.2.2",
-        "upstream-window8,local=::1",
+        "upstream,local=192.0.2.1,local=192.0.2.2",
+        "upstream,local=::1",
         "baseline,local=invalid",
-        "upstream-window8,local=192.0.2.1,sack",
-        "upstream-window8,local=192.0.2.1,",
+        "upstream,local=192.0.2.1,sack",
+        "upstream,local=192.0.2.1,",
     ] {
         assert_eq!(profile(flags), Err(ENOSYS), "{flags}");
     }
@@ -749,8 +731,8 @@ fn window8_acks_third_2000_byte_packet_before_application_read() {
     for selected in [
         Profile::Baseline,
         Profile::Sack,
-        Profile::UpstreamSack,
-        Profile::UpstreamWindow8,
+        upstream_packet_tests(""),
+        upstream_packet_tests("no-timestamps,immediate-ack"),
     ] {
         let mut owner = Owner::new((local(), selected)).unwrap();
         let listener = owner.alloc(Socket::new(0)).unwrap();
@@ -808,8 +790,8 @@ fn window8_acks_third_2000_byte_packet_before_application_read() {
                 .on_timeout(owner.inner.now(), BUDGET)
                 .unwrap();
             let output = poll_frame(&mut owner);
-            if selected == Profile::UpstreamWindow8 {
-                let (_, bytes) = output.expect("immediate ACK before read");
+            if matches!(selected, Profile::Upstream(_)) {
+                let (_, bytes) = output.expect("upstream ACK before read");
                 let sent = packet_header(&bytes);
                 assert_eq!(sent.flags, ntcp::wire::ACK);
                 assert_eq!(sent.acknowledgment, 101 + (i + 1) * 2000);
@@ -826,10 +808,10 @@ fn window8_acks_third_2000_byte_packet_before_application_read() {
 }
 
 #[test]
-fn upstream_sack_rto_uses_linux_floor_while_baseline_keeps_core_floor() {
+fn common_upstream_rto_uses_linux_floor_while_local_keeps_core_floor() {
     for (profile, initial_rto, floor) in [
         (Profile::Baseline, 1_000_000, 1_000_000),
-        (Profile::UpstreamSack, 300_000, 200_000),
+        (upstream_packet_tests(""), 300_000, 200_000),
     ] {
         let mut owner = Owner::new((local(), profile)).unwrap();
         let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
@@ -905,19 +887,18 @@ fn upstream_sack_rto_uses_linux_floor_while_baseline_keeps_core_floor() {
 }
 
 #[test]
-fn window8_changes_only_receive_preallocation() {
-    let mut old = crate::packet_profile::config(Profile::Baseline);
-    old.connection.receive_capacity = 8 * 1024 * 1024;
-    old.connection.delayed_ack_us = 0;
-    let mut current = crate::packet_profile::config(Profile::UpstreamWindow8);
-    assert_eq!(current.preallocate_connections, 1);
-    current.preallocate_connections = 0;
+fn upstream_receive64k_changes_only_receive_capacity() {
+    let old = crate::packet_profile::config(upstream_packet_tests(""));
+    let mut current = crate::packet_profile::config(upstream_packet_tests("receive64k"));
+    assert_eq!(current.connection.receive_capacity, 65535);
+    current.connection.receive_capacity = old.connection.receive_capacity;
     assert_eq!(format!("{current:?}"), format!("{old:?}"));
 }
 
 #[test]
 fn window8_preallocation_is_charged_once_and_preserves_admission_limit() {
-    let config = crate::packet_profile::config(Profile::UpstreamWindow8);
+    let config =
+        crate::packet_profile::config(upstream_packet_tests("no-timestamps,immediate-ack"));
     assert_eq!(config.max_buffer_bytes, 32 * 1024 * 1024);
     assert_eq!(config.max_connections, 128);
     assert_eq!(config.max_listeners, 128);
@@ -947,14 +928,14 @@ fn window8_preallocation_is_charged_once_and_preserves_admission_limit() {
 }
 
 #[test]
-fn only_upstream_cubic_budget_allows_200000_sndbuf_growth() {
+fn explicit_budget128_allows_200000_sndbuf_growth() {
     for profile in [
         Profile::Baseline,
-        Profile::UpstreamWindow8,
+        upstream_packet_tests("no-timestamps,immediate-ack"),
         Profile::Sack,
-        Profile::UpstreamSack,
-        Profile::UpstreamEcn,
-        Profile::UpstreamBasic,
+        upstream_packet_tests(""),
+        upstream_packet_tests("ecn"),
+        upstream_packet_tests("immediate-ack,abort-with-ack,coalesce-read-window"),
     ] {
         assert_eq!(
             crate::packet_profile::config(profile).max_buffer_bytes,
@@ -962,7 +943,7 @@ fn only_upstream_cubic_budget_allows_200000_sndbuf_growth() {
             "{profile:?}"
         );
     }
-    let config = crate::packet_profile::config(Profile::UpstreamCubic);
+    let config = crate::packet_profile::config(upstream_packet_tests("budget128m"));
     assert_eq!(config.max_buffer_bytes, 128 * 1024 * 1024);
     assert_eq!(config.connection.send_capacity, 65536);
     assert_eq!(config.connection.receive_capacity, 8 * 1024 * 1024);
@@ -998,8 +979,8 @@ fn only_upstream_cubic_budget_allows_200000_sndbuf_growth() {
 fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
     for (name, receive_capacity) in [
         ("baseline", 65535),
-        ("upstream-window8", 8 * 1024 * 1024),
-        ("upstream-sack", 8 * 1024 * 1024),
+        ("upstream,no-timestamps,immediate-ack", 8 * 1024 * 1024),
+        ("upstream", 8 * 1024 * 1024),
     ] {
         let settings = profile(&format!("{name},local=192.0.2.1")).unwrap();
         let mut owner = Owner::new(settings).unwrap();
@@ -1276,12 +1257,14 @@ fn logical_ephemeral_ports_do_not_follow_reused_os_descriptors() {
 fn upstream_profiles_use_iw10() {
     for (profile, expected) in [
         (Profile::Baseline, 4380),
-        (Profile::UpstreamWindow8, 4380),
+        (upstream_packet_tests("no-timestamps,immediate-ack"), 14600),
         (Profile::Sack, 4380),
-        (Profile::UpstreamSack, 14600),
-        (Profile::UpstreamCubic, 14600),
-        (Profile::UpstreamEcn, 14600),
-        (Profile::UpstreamBasic, 14600),
+        (upstream_packet_tests(""), 14600),
+        (upstream_packet_tests("ecn"), 14600),
+        (
+            upstream_packet_tests("immediate-ack,abort-with-ack,coalesce-read-window"),
+            14600,
+        ),
     ] {
         let mut owner = Owner::new((local(), profile)).unwrap();
         let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
@@ -1304,7 +1287,7 @@ fn upstream_profiles_use_iw10() {
         let syn = ntcp::wire::parse(tx.ip, &tcp[..tx.len]).unwrap().header;
         assert_eq!(
             syn.flags & (ntcp::wire::ECE | ntcp::wire::CWR),
-            if profile == Profile::UpstreamEcn {
+            if profile == upstream_packet_tests("ecn") {
                 ntcp::wire::ECE | ntcp::wire::CWR
             } else {
                 0
@@ -1357,7 +1340,7 @@ fn upstream_profiles_use_iw10() {
         assert_eq!(
             reset.header.flags,
             ntcp::wire::RST
-                | if profile == Profile::UpstreamBasic {
+                | if matches!(profile, Profile::Upstream(_)) {
                     ntcp::wire::ACK
                 } else {
                     0
@@ -1581,7 +1564,7 @@ fn ip_options_changes_preserve_sack_holes_and_data_ack() {
 
 #[test]
 fn transport_encoding_counts_recovery_and_invalid_ledger() {
-    let mut owner = Owner::new((local(), Profile::UpstreamSack)).unwrap();
+    let mut owner = Owner::new((local(), upstream_packet_tests(""))).unwrap();
     let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
     let (mut req, _) = request(
         5,
@@ -1631,7 +1614,9 @@ fn transport_encoding_counts_recovery_and_invalid_ledger() {
     info.loss = true;
     assert_eq!(transport_option(info, 1).unwrap()[1], 4);
     info.ledger_valid = false;
-    assert_eq!(transport_option(info, 1).err(), Some(ENOSYS));
+    let prefix = transport_option(info, 1).unwrap();
+    assert_eq!(prefix.len(), 24);
+    assert_eq!(prefix[1], 4); // Known loss state survives missing segment counts.
     assert!(transport_option(info, 2).unwrap().is_empty());
     assert_eq!(transport_option(info, 3).err(), Some(ENOSYS));
     let (mut req, _) = request(18, fd, 3, vec![], 36);
@@ -1763,20 +1748,20 @@ fn native_tcp_shutdown_precedes_inaccessible_send_payload() {
 #[test]
 fn cubic_real_loss_snapshot_and_upstream_reno_independence() {
     for (profile, pacing, threshold) in [
-        (Profile::UpstreamCubic, Some(true), 7),
-        (Profile::UpstreamCubic, Some(false), 7),
-        (Profile::UpstreamCubic, None, 7),
-        (Profile::UpstreamSack, Some(true), 5),
-        (Profile::UpstreamSack, Some(false), 5),
-        (Profile::UpstreamSack, None, 5),
+        (upstream_packet_tests(""), Some(true), 7),
+        (upstream_packet_tests(""), Some(false), 7),
+        (upstream_packet_tests(""), None, 7),
+        (upstream_packet_tests("reno,legacy-prr"), Some(true), 5),
+        (upstream_packet_tests("reno,legacy-prr"), Some(false), 5),
+        (upstream_packet_tests("reno,legacy-prr"), None, 5),
     ] {
         let mut owner = match pacing {
             Some(pacing) => Owner::new_with_prr_pacing((local(), profile), pacing),
             None => Owner::new((local(), profile)),
         }
         .unwrap();
-        // Default CUBIC matches explicit false; legacy Reno ignores pacing.
-        let pacing = pacing.unwrap_or(profile != Profile::UpstreamCubic);
+        // Test-only override exercises PRR pacing independently of general pacing.
+        let pacing = pacing.unwrap_or(false);
         let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
         let (mut connect, _) = request(
             5,
@@ -1827,7 +1812,7 @@ fn cubic_real_loss_snapshot_and_upstream_reno_independence() {
         }
         assert_eq!(
             emitted,
-            if profile == Profile::UpstreamCubic && pacing {
+            if profile == upstream_packet_tests("") && pacing {
                 1000
             } else {
                 10_000
@@ -1886,7 +1871,7 @@ fn cubic_real_loss_snapshot_and_upstream_reno_independence() {
         let info = owner.inner.endpoint.transport_info(id).unwrap();
         assert_eq!(
             info.cwnd,
-            if profile == Profile::UpstreamCubic {
+            if profile == upstream_packet_tests("") {
                 7000
             } else {
                 2000
@@ -2049,7 +2034,10 @@ fn owner_constructs_endpoint_and_preserves_output_under_backpressure() {
 
 #[test]
 fn owner_loop_emits_pure_handshake_ack_before_pending_send_data() {
-    for selected in [Profile::Baseline, Profile::UpstreamWindow8] {
+    for selected in [
+        Profile::Baseline,
+        upstream_packet_tests("no-timestamps,immediate-ack"),
+    ] {
         let adapter = Adapter::start((local(), selected)).unwrap();
         let fd = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
             .unwrap()
@@ -2145,8 +2133,8 @@ fn owner_loop_emits_pure_handshake_ack_before_pending_send_data() {
 fn profiles_emit_real_synack_scale_through_owner_thread() {
     for (name, scale) in [
         ("baseline", 0),
-        ("upstream-window8", 8),
-        ("upstream-sack", 8),
+        ("upstream,no-timestamps", 8),
+        ("upstream", 8),
     ] {
         let adapter = Adapter::start(profile(&format!("{name},local=192.0.2.1")).unwrap()).unwrap();
         let fd = call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap().value as u64;
@@ -2177,7 +2165,11 @@ fn profiles_emit_real_synack_scale_through_owner_thread() {
 
 #[test]
 fn owner_loop_coalesces_queued_reads_with_immediate_ack_window_credit() {
-    let adapter = Adapter::start((local(), Profile::UpstreamWindow8)).unwrap();
+    let adapter = Adapter::start((
+        local(),
+        upstream_packet_tests("no-timestamps,immediate-ack"),
+    ))
+    .unwrap();
     let listener = call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap().value as u64;
     call(
         &adapter,
@@ -2321,7 +2313,7 @@ fn upstream_sack_profile_negotiates_combined_options_and_peer_fallback() {
         (true, false, &[2, 4, 5, 180, 1, 1, 4, 2, 1, 3, 3, 7][..]),
         (false, false, &[2, 4, 5, 180, 1, 3, 3, 7][..]),
     ] {
-        let adapter = Adapter::start((local(), Profile::UpstreamSack)).unwrap();
+        let adapter = Adapter::start((local(), upstream_packet_tests(""))).unwrap();
         let fd = call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap().value as u64;
         call(
             &adapter,
@@ -2358,13 +2350,12 @@ fn upstream_sack_profile_negotiates_combined_options_and_peer_fallback() {
 #[test]
 fn owner_loop_profiles_preserve_terminal_push_without_frozen_batch_clock() {
     for selected in [
-        Profile::UpstreamCubic,
+        upstream_packet_tests(""),
         Profile::Baseline,
         Profile::Sack,
-        Profile::UpstreamWindow8,
-        Profile::UpstreamSack,
-        Profile::UpstreamEcn,
-        Profile::UpstreamBasic,
+        upstream_packet_tests("no-timestamps,immediate-ack"),
+        upstream_packet_tests("ecn"),
+        upstream_packet_tests("immediate-ack,abort-with-ack,coalesce-read-window"),
     ] {
         let adapter = Adapter::start((local(), selected)).unwrap();
         let listener = call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap().value as u64;
@@ -2410,9 +2401,9 @@ fn owner_loop_profiles_preserve_terminal_push_without_frozen_batch_clock() {
         .unwrap();
         call(&adapter, 14, 0, 0, ack, 0).unwrap();
         let fd = call(&adapter, 4, listener, 0, vec![], 0).unwrap().value as u64;
-        // A single SEND fits each profile's original initial window. CUBIC's
-        // frozen-batch PUSH pairing was removed with the scalar test bypass.
-        let segments = if selected == Profile::UpstreamCubic {
+        // A single SEND fits each profile's initial window. Common upstream
+        // actual group endpoints remain independent of clock sampling.
+        let segments = if selected == upstream_packet_tests("") {
             5
         } else {
             3
@@ -2429,20 +2420,15 @@ fn owner_loop_profiles_preserve_terminal_push_without_frozen_batch_clock() {
             assert_eq!(sent.header.sequence, base.wrapping_add((i * 1460) as u32));
             assert_eq!(sent.header.acknowledgment, 101);
             assert_eq!(sent.payload, &payload[i * 1460..(i + 1) * 1460]);
-            // The removed frozen batch_time override paired CUBIC PUSH flags.
-            // Common egress samples time per selection, so only terminal PUSH is fixed.
-            let push = i == segments - 1;
-            let flags = if selected == Profile::UpstreamCubic && !push {
-                // Consecutive selections can still share a microsecond tick.
-                sent.header.flags & !ntcp::wire::PSH
-            } else {
-                sent.header.flags
-            };
-            assert_eq!(
-                flags,
-                ntcp::wire::ACK | if push { ntcp::wire::PSH } else { 0 },
-                "{selected:?} initial segment {i}"
-            );
+            // The real owner thread measures RTT; intermediate real group
+            // boundaries can therefore vary with scheduling. Exact terminal
+            // positions are covered by deterministic group-policy tests.
+            assert_eq!(sent.header.flags & !ntcp::wire::PSH, ntcp::wire::ACK);
+            if i == segments - 1 {
+                assert_ne!(sent.header.flags & ntcp::wire::PSH, 0);
+            } else if i == 0 || !matches!(selected, Profile::Upstream(_)) {
+                assert_eq!(sent.header.flags & ntcp::wire::PSH, 0);
+            }
         }
     }
 }
@@ -3098,8 +3084,8 @@ fn owner_loop_preserves_pending_send_read_fifo_on_refused_handshake() {
 
 #[test]
 fn cubic_ecn_profile_changes_only_ecn_enablement() {
-    let cubic = crate::packet_profile::config(Profile::UpstreamCubic);
-    let mut ecn = crate::packet_profile::config(Profile::UpstreamCubicEcn);
+    let cubic = crate::packet_profile::config(upstream_packet_tests(""));
+    let mut ecn = crate::packet_profile::config(upstream_packet_tests("ecn"));
     assert!(!cubic.connection.ecn);
     assert!(ecn.connection.ecn);
     ecn.connection.ecn = false;
@@ -3108,3 +3094,13 @@ fn cubic_ecn_profile_changes_only_ecn_enablement() {
 
 #[path = "packet_allocation_tests.rs"]
 mod allocation_tests;
+
+fn upstream_packet_tests(options: &str) -> crate::packet_profile::Profile {
+    crate::packet_profile::profile(&format!(
+        "upstream,local=192.0.2.1{}{}",
+        if options.is_empty() { "" } else { "," },
+        options
+    ))
+    .unwrap()
+    .1
+}

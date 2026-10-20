@@ -2351,3 +2351,139 @@ fn adaptive_ack_held_owner_rejection_and_repair_preserve_ack_history() {
             .is_some()
     );
 }
+
+#[test]
+fn fast_open_pending_writer_setter_reservation_and_generation_barriers() {
+    let mut a = endpoint();
+    a.enable_fast_open().unwrap();
+    a.enable_output_reservations().unwrap();
+    let local = "192.0.2.1:40000".parse().unwrap();
+    let remote = "192.0.2.2:8080".parse().unwrap();
+    let (id, _) = a.connect_fast_open(0, local, remote, b"request").unwrap();
+    a.set_fast_open_write_pending(id, true).unwrap();
+    let (_, attempt) = a.poll_reserved_transmit(0, &mut [0; 2048], 16).unwrap();
+    let attempt = attempt.unwrap();
+    for pending in [false, true] {
+        assert_eq!(
+            a.set_fast_open_write_pending(id, pending),
+            Err(EndpointError::OutputReserved)
+        );
+    }
+    a.reject_unsubmitted(attempt).unwrap();
+    assert_eq!(
+        a.set_fast_open_write_pending(id, false),
+        Err(EndpointError::OutputReserved)
+    );
+    let (_, retry) = a.poll_reserved_transmit(0, &mut [0; 2048], 16).unwrap();
+    a.accept_transmit(0, retry.unwrap()).unwrap();
+    a.set_fast_open_write_pending(id, false).unwrap();
+    a.abort(id).unwrap();
+    let (out, reset) = a.poll_reserved_transmit(0, &mut [0; 2048], 16).unwrap();
+    assert!(out.packet.is_none());
+    assert!(reset.is_none());
+    a.release(id).unwrap();
+    let (replacement, _) = a.connect_fast_open(1, local, remote, b"new").unwrap();
+    assert_eq!(id.slot, replacement.slot);
+    assert_ne!(id, replacement);
+    for pending in [false, true] {
+        assert_eq!(
+            a.set_fast_open_write_pending(id, pending),
+            Err(EndpointError::InvalidHandle)
+        );
+    }
+    a.set_fast_open_write_pending(replacement, true).unwrap();
+    a.set_fast_open_write_pending(replacement, false).unwrap();
+    // A suppressed Fast Open call has no wire option: context comes from its writer.
+    let fallback = a
+        .connect(1, "192.0.2.1:40001".parse().unwrap(), remote)
+        .unwrap();
+    a.set_fast_open_write_pending(fallback, true).unwrap();
+    a.set_fast_open_write_pending(fallback, false).unwrap();
+}
+
+#[test]
+fn initial_newreno_heuristic_reserved_repair_rejection_preserves_credit() {
+    let mut a = endpoint();
+    let mut b = endpoint();
+    for e in [&mut a, &mut b] {
+        e.config.connection.sack = false;
+        e.config.connection.pmtud = None;
+        e.config.connection.prr = true;
+        e.config.connection.prr_pacing = false;
+        e.config.connection.congestion_algorithm = crate::CongestionAlgorithm::Cubic;
+        e.config.connection.initial_window = crate::InitialWindow::Iw10;
+    }
+    let local = "192.0.2.1:40000".parse().unwrap();
+    let remote = "192.0.2.2:8080".parse().unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let id = a.connect(0, local, remote).unwrap();
+    let mut bytes = [0; 2048];
+    for step in 0..3 {
+        let (src, dst) = if step == 1 {
+            (&mut b, &mut a)
+        } else {
+            (&mut a, &mut b)
+        };
+        let p = src
+            .poll_transmit(1, &mut bytes, 16)
+            .unwrap()
+            .packet
+            .unwrap();
+        dst.input(1, p.ip, &bytes[..p.len]).unwrap();
+    }
+    b.accept(listener).unwrap();
+    a.write(id, &[1; 4000]).unwrap();
+    let mut base = 0;
+    for segment in 0..4 {
+        let p = a.poll_transmit(2, &mut bytes, 16).unwrap().packet.unwrap();
+        let parsed = wire::parse(p.ip, &bytes[..p.len]).unwrap();
+        assert_eq!(parsed.payload.len(), 1000);
+        if segment == 0 {
+            base = parsed.header.sequence;
+        } else {
+            b.input(3, p.ip, &bytes[..p.len]).unwrap();
+        }
+    }
+    // Receiver's cumulative ACK remains at the missing first segment. Each
+    // out-of-order arrival above scheduled an immediate ACK; inject the same
+    // validated ACK three times, as on the original no-SACK fixture.
+    let ack = b.poll_transmit(3, &mut bytes, 16).unwrap().packet.unwrap();
+    let ack_bytes = bytes[..ack.len].to_vec();
+    assert_eq!(
+        wire::parse(ack.ip, &ack_bytes)
+            .unwrap()
+            .header
+            .acknowledgment,
+        base
+    );
+    // First update installs the smaller advertised receive window; only the
+    // following three unchanged ACKs qualify as duplicate evidence.
+    a.input(4, ack.ip, &ack_bytes).unwrap();
+    for _ in 0..3 {
+        a.input(4, ack.ip, &ack_bytes).unwrap();
+    }
+    a.enable_output_reservations().unwrap();
+    assert!(a.poll_reserved_transmit(4, &mut [0; 20], 16).is_err());
+    let (out, token) = a.poll_reserved_transmit(4, &mut bytes, 16).unwrap();
+    let p = out.packet.unwrap();
+    let repair = bytes[..p.len].to_vec();
+    let parsed = wire::parse(p.ip, &repair).unwrap();
+    assert_eq!((parsed.header.sequence, parsed.payload.len()), (base, 1000));
+    assert!(a.reject_unsubmitted(token.unwrap()).unwrap());
+    let (out, token) = a.poll_reserved_transmit(4, &mut bytes, 16).unwrap();
+    let p = out.packet.unwrap();
+    assert_eq!(&bytes[..p.len], repair);
+    assert!(a.accept_transmit(5, token.unwrap()).unwrap());
+    assert!(
+        a.poll_reserved_transmit(5, &mut bytes, 16)
+            .unwrap()
+            .0
+            .packet
+            .is_none()
+    );
+}
+
+mod local_tx_failure {
+    use super::*;
+    include!("output_local_tx_failure_tests.rs");
+}

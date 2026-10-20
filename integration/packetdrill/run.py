@@ -13,17 +13,19 @@ import subprocess
 import sys
 import tempfile
 
+from expectations import (PORTED_EXCLUSION, PORTED_SCRIPTS,
+                          apply_expectations, load_expectations)
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 PIN = json.loads((HERE / 'upstream.json').read_text())
 
 
-LINUX_COOKIE_PROFILE = 'upstream-fastopen-linux-cookie'
+LINUX_COOKIE_OPTION = 'linux-cookie'
 LINUX_COOKIE_SCRIPTS = {
     'fastopen/server/opt34/' + name + '.pkt'
     for name in ('fin-close-socket', 'reset-after-accept', 'reset-before-accept')}
 LINUX_COOKIE_SETTINGS = {
-    'timestamps': False, 'endpoint_max_buffer_bytes': 234881024,
     'fast_open_client_default': False, 'fast_open_listener_default': False,
     'fast_open_cache': 'fresh runtime', 'fast_open_cookie_policy': 'linux-siphash24',
     'fast_open_key_hex': 'a1a1a1a1b2b2b2b2c3c3c3c3d4d4d4d4',
@@ -33,28 +35,207 @@ LINUX_COOKIE_SETTINGS = {
     'implicit_listener_enablement': False, 'cookieless': False, 'foexp': False}
 
 
-FASTOPEN_PMTUD_PROFILE = 'upstream-fastopen-pmtud'
+FASTOPEN_PMTUD_OPTION = 'pmtud1500'
 FASTOPEN_PMTUD_SCRIPTS = {
     'fastopen/client/syn-data-icmp-unreach-frag-needed' + suffix + '.pkt'
     for suffix in ('', '-with-seq')}
 FASTOPEN_PMTUD_SETTINGS = {
-    'timestamps': False, 'endpoint_max_buffer_bytes': 234881024,
-    'preallocate_connections': 3, 'pmtud_first_hop_mtu': 1500,
+    'pmtud_first_hop_mtu': 1500,
     'mss': 1460, 'fast_open_client_default': False,
     'fast_open_listener_default': False, 'fast_open_cache': 'fresh runtime',
     'fast_open_cookie_policy': 'hmac-sha256'}
 
 
-ADAPTIVE_ACK_PROFILE = 'upstream-fastopen-adaptive-ack'
+ADAPTIVE_ACK_OPTION = 'adaptive-ack'
 ADAPTIVE_ACK_SCRIPTS = {
     'fastopen/client/' + name + '.pkt'
     for name in ('blocking-connect-bypass', 'blocking-sendmsg-multi-iov', 'blocking-sendto')}
 ADAPTIVE_ACK_SETTINGS = {
-    'timestamps': False, 'endpoint_max_buffer_bytes': 234881024,
-    'preallocate_connections': 3, 'mss': 1460,
+    'mss': 1460,
     'fast_open_client_default': False, 'fast_open_listener_default': False,
     'fast_open_cache': 'fresh runtime', 'fast_open_cookie_policy': 'hmac-sha256',
     'adaptive_ack': True, 'delayed_ack_us': 200000, 'initial_ack_timeout_us': 40000}
+
+
+FASTOPEN_CLIENT_SCRIPTS = {
+    'fastopen/client/' + name + '.pkt'
+    for name in ('blocking-connect-bypass-errno', 'blocking-sendto-errnos',
+                 'cookie-req-timeout', 'fastopen-connect-keepalive',
+                 'nonblocking-connect-bypass', 'nonblocking-sendmsg-multi-iov',
+                 'nonblocking-sendto-empty-buf', 'nonblocking-sendto-over-mss',
+                 'poll', 'simultaneous-fast-open', 'syn-data-rtt-from-syn-data',
+                 'syn-data-timeout', 'valid-cookie-format')}
+NON_TFO_SETUP_COMMANDS = {
+    'fastopen/server/icmp-baseline.pkt': (
+        b'`../../common/defaults.sh\n'
+        b' ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_fastopen=0x30003`\n'),
+    'fastopen/client/sendto-af-unspec.pkt': b'`../../common/defaults.sh`\n',
+    'fastopen/server/basic-non-tfo-listener.pkt': (
+        b'`../../common/defaults.sh\n'
+        b' ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_fastopen=2`\n'),
+    'fastopen/server/opt34/basic-non-tfo-listener.pkt': (
+        b'`../../../common/defaults.sh\n sysctl -q net.ipv4.tcp_fastopen=2`\n'),
+}
+
+
+SLOW_START_ACK_SCRIPTS = {
+    f'slow_start/slow-start-ack-per-{interval}pkt.pkt' for interval in (1, 2, 4)
+}
+SLOW_START_ACK_SETUP = (b'`../common/defaults.sh\n'
+                        b'sysctl -q net.ipv4.tcp_tso_win_divisor=100`\n')
+
+
+# Exact per-case option audit: setup-only adaptation never interprets shell/sysctl text.
+UPSTREAM_OPTION_AUDIT = {
+    'blocking/blocking-accept.pkt': {
+        'immediate-ack': 'Original scripted receive ACK precedes application read; explicit immediate ACK compatibility, not Linux quickACK emulation.',
+    },
+    'blocking/blocking-read.pkt': {
+        'immediate-ack': 'Original scripted receive ACK precedes application read; explicit immediate ACK compatibility, not Linux quickACK emulation.',
+    },
+    'cubic/cubic-rto-ss-ca-cwnd-bump.pkt': {
+        'budget128m': 'Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change.',
+    },
+    'cwnd_moderation/cwnd-moderation-ecn-enter-cwr-no-moderation-700.pkt': {
+        'ecn': 'Exact audited inline tcp_ecn setup enables ECN for the active case or this passive listener only; this is not global Linux mode2 active-open semantics.',
+    },
+    'ecn/ecn-uses-ect0.pkt': {
+        'ecn': 'Exact audited inline tcp_ecn setup enables ECN for the active case or this passive listener only; this is not global Linux mode2 active-open semantics.',
+    },
+    'fastopen/client/blocking-connect-bypass-errno.pkt': {
+        'budget224m': 'Trace creates 3 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/client/blocking-connect-bypass.pkt': {
+        'adaptive-ack': 'Audited interactive request/response trace requires the existing adaptive ACK policy (initial ATO40ms, maximum200ms); not Linux TCP_QUICKACK emulation.',
+        'budget224m': 'Trace creates 3 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/client/blocking-sendmsg-multi-iov.pkt': {
+        'adaptive-ack': 'Audited interactive request/response trace requires the existing adaptive ACK policy (initial ATO40ms, maximum200ms); not Linux TCP_QUICKACK emulation.',
+        'budget224m': 'Trace creates 3 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/client/blocking-sendto-errnos.pkt': {
+        'budget224m': 'Trace creates 3 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/client/blocking-sendto.pkt': {
+        'adaptive-ack': 'Audited interactive request/response trace requires the existing adaptive ACK policy (initial ATO40ms, maximum200ms); not Linux TCP_QUICKACK emulation.',
+        'budget224m': 'Trace creates 3 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/client/cookie-req-timeout.pkt': {
+        'budget224m': 'Trace creates 3 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/client/fastopen-connect-keepalive.pkt': {
+        'budget224m': 'Trace creates 2 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/client/nonblocking-connect-bypass.pkt': {
+        'budget224m': 'Trace creates 5 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/client/nonblocking-sendmsg-multi-iov.pkt': {
+        'budget224m': 'Trace creates 3 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/client/nonblocking-sendto-empty-buf.pkt': {
+        'budget224m': 'Trace creates 3 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/client/nonblocking-sendto-over-mss.pkt': {
+        'budget224m': 'Trace creates 3 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/client/poll.pkt': {
+        'budget224m': 'Trace creates 4 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/client/simultaneous-fast-open.pkt': {
+        'budget224m': 'Trace creates 2 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/client/syn-data-icmp-unreach-frag-needed-with-seq.pkt': {
+        'budget224m': 'Trace creates 2 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'pmtud1500': 'Exact ICMP fragmentation-needed trace needs outbound PMTUD with first-hop MTU1500; receive MSS and packet assertions remain unchanged.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/client/syn-data-icmp-unreach-frag-needed.pkt': {
+        'budget224m': 'Trace creates 2 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'pmtud1500': 'Exact ICMP fragmentation-needed trace needs outbound PMTUD with first-hop MTU1500; receive MSS and packet assertions remain unchanged.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/client/syn-data-rtt-from-syn-data.pkt': {
+        'budget224m': 'Trace creates 3 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/client/syn-data-timeout.pkt': {
+        'budget224m': 'Trace creates 2 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/client/valid-cookie-format.pkt': {
+        'budget224m': 'Trace creates 7 client sockets; retained receive/send/scoreboard/RACK storage exceeds the 32 MiB single-connection budget. Keep the measured bounded seven-connection budget, not Linux skb accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'prealloc3': 'Warmup and test sockets retain storage during timed events; reserve three owned pools before timed allocation, charged within budget224m.',
+    },
+    'fastopen/server/opt34/fin-close-socket.pkt': {
+        'linux-cookie': 'Exact defaults key and explicit TCP_FASTOPEN listener require Linux SipHash-2-4 address-pair cookies; feature-gated and confined to these three opt34 scripts. No implicit listeners or FOEXP.',
+    },
+    'fastopen/server/opt34/reset-after-accept.pkt': {
+        'linux-cookie': 'Exact defaults key and explicit TCP_FASTOPEN listener require Linux SipHash-2-4 address-pair cookies; feature-gated and confined to these three opt34 scripts. No implicit listeners or FOEXP.',
+    },
+    'fastopen/server/opt34/reset-before-accept.pkt': {
+        'linux-cookie': 'Exact defaults key and explicit TCP_FASTOPEN listener require Linux SipHash-2-4 address-pair cookies; feature-gated and confined to these three opt34 scripts. No implicit listeners or FOEXP.',
+    },
+    'nagle/https_client.pkt': {
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+    },
+    'notsent_lowat/notsent-lowat-sysctl.pkt': {
+        'lowat4000': 'Exact setup sets global tcp_notsent_lowat=4000; raw per-socket zero still means inherit. No skb-accounting equivalence.',
+    },
+    'slow_start/slow-start-ack-per-1pkt.pkt': {
+        'budget128m': 'Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change.',
+    },
+    'slow_start/slow-start-ack-per-2pkt.pkt': {
+        'budget128m': 'Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change.',
+    },
+    'slow_start/slow-start-ack-per-4pkt.pkt': {
+        'budget128m': 'Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change.',
+    },
+    'slow_start/slow-start-app-limited-9-packets-out.pkt': {
+        'budget128m': 'Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change.',
+    },
+    'slow_start/slow-start-app-limited.pkt': {
+        'budget128m': 'Original SO_SNDBUF=200000 requires staged doubled400000-byte quota plus retained storage; the measured resize peak needs a bounded128MiB budget. No send-buffer semantics change.',
+    },
+    'syscall_bad_arg/fastopen-invalid-buf-ptr.pkt': {
+        'budget224m': 'Four client sockets can retain charged storage through this short syscall-error trace; bounded seven-connection budget, not per-socket Linux memory accounting.',
+        'no-timestamps': 'Exact audited setup explicitly disables tcp_timestamps; no host sysctl is executed.',
+        'prealloc3': 'Reserve three owned connection pools before timed events; reservation is charged within budget224m.',
+    },
+}
+
+def upstream_flags(relative):
+    return "upstream,local=192.168.0.1" + "".join("," + token for token in sorted(UPSTREAM_OPTION_AUDIT.get(relative, {})))
 
 
 SENDFILE_FIXTURE = 'sendfile-five-zero-bytes'
@@ -217,6 +398,13 @@ def adapt_source(directory, relative, manifest, so_flags):
     entry = manifest['scripts'][relative]
     if so_flags != entry['adapter_flags']:
         raise ValueError('adapter flags differ from audited mapping')
+    if so_flags != upstream_flags(relative):
+        raise ValueError('options differ from exact per-case audit')
+    metadata = profile_metadata(so_flags)
+    if entry['mapping']['ntcp_settings'] != metadata:
+        raise ValueError('settings differ from resolved upstream configuration')
+    if entry['mapping'].get('option_reasons') != UPSTREAM_OPTION_AUDIT.get(relative, {}):
+        raise ValueError('option reasons differ from exact per-case audit')
     source = (directory / relative).read_bytes()
     setup = (directory / entry['setup_path']).read_bytes()
     for label, data, expected in (
@@ -235,49 +423,38 @@ def adapt_source(directory, relative, manifest, so_flags):
         return source, dict(entry)
     command = entry['command_line'].encode()
     replacement = entry['replacement_line'].encode()
-    setup_profiles = {
+    setup_commands = {
         'syscall_bad_arg/fastopen-invalid-buf-ptr.pkt': (
             b'`../common/defaults.sh\n'
-            b' ../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n',
-            'upstream-fastopen',
-            {'timestamps': False, 'endpoint_max_buffer_bytes': 234881024,
-             'fast_open_client_default': False,
-             'fast_open_listener_default': False, 'fast_open_cache': 'fresh runtime'}),
+            b' ../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n'),
         'nagle/https_client.pkt': (
             b'`../common/defaults.sh\nethtool -K tun0 tso off gso off\n'
-            b'../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n',
-            'upstream-https',
-            {'timestamps': False, 'sack': True, 'output_push_batch_segments': 2}),
+            b'../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n'),
         'notsent_lowat/notsent-lowat-sysctl.pkt': (
-            b'`../../common/defaults.sh\nsysctl -q net.ipv4.tcp_notsent_lowat=4000`\n',
-            'upstream-global-lowat',
-            {'global_notsent_lowat': 4000, 'socket_notsent_lowat': 0}),
+            b'`../../common/defaults.sh\nsysctl -q net.ipv4.tcp_notsent_lowat=4000`\n'),
+        **NON_TFO_SETUP_COMMANDS,
+        **{name: SLOW_START_ACK_SETUP for name in SLOW_START_ACK_SCRIPTS},
     }
-    if LINUX_COOKIE_PROFILE in so_flags.split(',') and relative not in LINUX_COOKIE_SCRIPTS:
-        raise ValueError('Linux cookie setup is limited to audited explicit listeners')
-    if FASTOPEN_PMTUD_PROFILE in so_flags.split(',') and relative not in FASTOPEN_PMTUD_SCRIPTS:
-        raise ValueError('Fast Open PMTUD setup is limited to two audited ICMP cases')
-    if ADAPTIVE_ACK_PROFILE in so_flags.split(',') and relative not in ADAPTIVE_ACK_SCRIPTS:
-        raise ValueError('Adaptive ACK setup is limited to three audited blocking clients')
-    for name in ADAPTIVE_ACK_SCRIPTS:
-        setup_profiles[name] = (
+    for name in FASTOPEN_CLIENT_SCRIPTS | ADAPTIVE_ACK_SCRIPTS | FASTOPEN_PMTUD_SCRIPTS:
+        setup_commands[name] = (
             b'`../../common/defaults.sh\n'
-            b' ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n',
-            ADAPTIVE_ACK_PROFILE, dict(ADAPTIVE_ACK_SETTINGS))
-    for name in FASTOPEN_PMTUD_SCRIPTS:
-        setup_profiles[name] = (
-            b'`../../common/defaults.sh\n'
-            b' ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n',
-            FASTOPEN_PMTUD_PROFILE, dict(FASTOPEN_PMTUD_SETTINGS))
+            b' ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n')
     for name in LINUX_COOKIE_SCRIPTS:
-        setup_profiles[name] = (b'`../../../common/defaults.sh`\n',
-                                LINUX_COOKIE_PROFILE, dict(LINUX_COOKIE_SETTINGS))
-    if relative in setup_profiles:
-        expected, token, settings = setup_profiles[relative]
-        settings.update(general_pacing=False, software_gso=False, hardware_tso=False)
+        setup_commands[name] = b'`../../../common/defaults.sh`\n'
+    if LINUX_COOKIE_OPTION in so_flags.split(',') and relative not in LINUX_COOKIE_SCRIPTS:
+        raise ValueError('Linux cookie setup is limited to audited explicit listeners')
+    if FASTOPEN_PMTUD_OPTION in so_flags.split(',') and relative not in FASTOPEN_PMTUD_SCRIPTS:
+        raise ValueError('Fast Open PMTUD setup is limited to two audited ICMP cases')
+    if ADAPTIVE_ACK_OPTION in so_flags.split(',') and relative not in ADAPTIVE_ACK_SCRIPTS:
+        raise ValueError('Adaptive ACK setup is limited to three audited blocking clients')
+    if relative in setup_commands:
+        expected = setup_commands[relative]
         commands = [command.rstrip(b'\n')]
         replacements = [(command, replacement)]
-        if token in ('upstream-https', 'upstream-fastopen', FASTOPEN_PMTUD_PROFILE, ADAPTIVE_ACK_PROFILE):
+        if (relative in FASTOPEN_CLIENT_SCRIPTS | ADAPTIVE_ACK_SCRIPTS | FASTOPEN_PMTUD_SCRIPTS
+                or relative in {'syscall_bad_arg/fastopen-invalid-buf-ptr.pkt', 'nagle/https_client.pkt',
+                                'fastopen/server/basic-non-tfo-listener.pkt',
+                                'fastopen/server/icmp-baseline.pkt'}):
             restore = b'`/tmp/sysctl_restore_${PPID}.sh`\n'
             restored = b'// ntcp profile is process-local; no host sysctls to restore.\n'
             if (entry.get('restore_line', '').encode() != restore
@@ -289,19 +466,18 @@ def adapt_source(directory, relative, manifest, so_flags):
             commands.append(restore.rstrip(b'\n'))
             replacements.append((restore, restored))
         expected_replacement = b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n'
-        if token in (FASTOPEN_PMTUD_PROFILE, ADAPTIVE_ACK_PROFILE):
+        if (relative in FASTOPEN_PMTUD_SCRIPTS | ADAPTIVE_ACK_SCRIPTS | FASTOPEN_CLIENT_SCRIPTS | SLOW_START_ACK_SCRIPTS
+                or relative in NON_TFO_SETUP_COMMANDS and expected.count(b'\n') == 2):
             expected_replacement += b'\n'  # Keep the audited two-line setup's line numbers.
-        if (command != expected or so_flags != token + ',local=192.168.0.1'
+        if (command != expected or so_flags != upstream_flags(relative)
                 or entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
                 or replacement != expected_replacement
                 or entry.get('command_sha256') != hashlib.sha256(command).hexdigest()
                 or entry['expected_command_count'] != len(commands)
                 or re.findall(rb'`[^`]*`', source) != commands
-                or any(entry['mapping']['ntcp_settings'].get(key) != value
-                       for key, value in settings.items())
                 or [(c['command'].encode(), c['sha256']) for c in entry['audited_shell_commands']]
                    != [(c, hashlib.sha256(c).hexdigest()) for c in commands]):
-            raise ValueError('expected exact audited setup profile and commands')
+            raise ValueError('expected exact audited setup and commands')
         generated = source
         for old, new in replacements:
             if source.count(old) != 1 or not (source.startswith(old) or b'\n' + old in source):
@@ -314,7 +490,7 @@ def adapt_source(directory, relative, manifest, so_flags):
     ecn_command = (b'`../common/defaults.sh\n'
                    b'sysctl -q net.ipv4.tcp_ecn=1  # fully enabled\n`\n')
     ecn_mapped = (command == ecn_command
-                  and so_flags == 'upstream-ecn,local=192.168.0.1'
+                  and so_flags == upstream_flags(relative) and 'ecn' in so_flags.split(',')
                   and entry['mapping']['ntcp_settings'].get('ecn') is True
                   and entry.get('command_sha256') == hashlib.sha256(command).hexdigest())
     passive_ecn_command = (b'`../common/defaults.sh\n'
@@ -322,14 +498,14 @@ def adapt_source(directory, relative, manifest, so_flags):
     passive_ecn_mapped = (
         relative == 'cwnd_moderation/cwnd-moderation-ecn-enter-cwr-no-moderation-700.pkt'
         and command == passive_ecn_command
-        and so_flags == 'upstream-cubic-ecn,local=192.168.0.1'
+        and so_flags == upstream_flags(relative) and 'ecn' in so_flags.split(',')
         and entry['mapping']['ntcp_settings'].get('ecn') is True
         and entry['mapping'].get('ecn_scope') == 'passive listener in this exact script only'
         and entry.get('command_sha256') == hashlib.sha256(command).hexdigest())
     fixture_mapped = (relative == 'sendfile/sendfile-simple.pkt'
                       and command == SENDFILE_SETUP
                       and entry.get('fixture') == SENDFILE_FIXTURE
-                      and so_flags == 'upstream-basic,local=192.168.0.1'
+                      and so_flags == upstream_flags(relative)
                       and entry.get('command_sha256') == hashlib.sha256(command).hexdigest())
     if entry.get('fixture') is not None and not fixture_mapped:
         raise ValueError('fixture is not the exact audited sendfile setup')
@@ -437,7 +613,8 @@ def variants(script, upstream):
 
 
 def select_cases(scripts, directory, suite, selected_variants=None, selected_scripts=None):
-    known_variants = set(PIN['variants']) if suite in ('upstream', 'adapted') else {'native-ipv4'}
+    known_variants = ({'ipv4'} if suite == 'ntcp-ported' else set(PIN['variants'])
+                      if suite in ('upstream-raw', 'upstream') else {'native-ipv4'})
     for variant in selected_variants or []:
         if variant not in known_variants:
             raise ValueError(f'--variant {variant!r} is invalid for suite {suite}')
@@ -448,48 +625,104 @@ def select_cases(scripts, directory, suite, selected_variants=None, selected_scr
     selected, excluded = [], []
     for script in scripts:
         relative = str(script.relative_to(directory))
-        for variant, flags in variants(script, suite in ('upstream', 'adapted')):
+        available = ([('ipv4', PIN['variants']['ipv4'])] if suite == 'ntcp-ported'
+                     else variants(script, suite in ('upstream-raw', 'upstream')))
+        for variant, flags in available:
             reasons = []
             if selected_scripts is not None and relative not in selected_scripts:
                 reasons.append('excluded by --script selection')
             if selected_variants is not None and variant not in selected_variants:
                 reasons.append('excluded by --variant selection')
+            if not reasons and suite == 'upstream' and relative in PORTED_SCRIPTS:
+                reasons.append(PORTED_EXCLUSION)
             if reasons:
-                excluded.append({'script': relative, 'variant': variant,
-                                 'suite': suite, 'reasons': reasons})
+                exclusion = {'script': relative, 'variant': variant,
+                             'suite': suite, 'reasons': reasons}
+                if PORTED_EXCLUSION in reasons:
+                    exclusion['ported_to'] = 'ntcp-ported'
+                excluded.append(exclusion)
             else:
                 selected.append((script, variant, flags))
-    if not selected:
+    if not selected and not any(PORTED_EXCLUSION in row['reasons'] for row in excluded):
         raise ValueError('selection matches no eligible packetdrill cases')
     return selected, excluded
 
 
+UPSTREAM_BASELINE_REASON = 'Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.'
+
+
+UPSTREAM_OPTIONS = {
+    'no-timestamps', 'ecn', 'adaptive-ack', 'lowat4000', 'linux-cookie', 'pmtud1500',
+    'budget128m', 'budget224m', 'prealloc3', 'immediate-ack', 'peer-ack-delay200ms',
+    'abort-with-ack', 'coalesce-read-window', 'legacy-prr',
+    'reno', 'paced', 'receive64k',
+}
+
+
 def profile_metadata(so_flags):
-    profiles = [flag for flag in so_flags.split(',') if not flag.startswith('local=')]
-    profile = profiles[0] if len(profiles) == 1 else None
-    known = profile in {
-        'baseline', 'sack', 'upstream-window8', 'upstream-sack', 'upstream-ecn',
-        'upstream-basic', 'upstream-cubic', 'upstream-cubic-ecn',
-        'upstream-https', 'upstream-global-lowat', 'upstream-fastopen', LINUX_COOKIE_PROFILE,
-        FASTOPEN_PMTUD_PROFILE, ADAPTIVE_ACK_PROFILE,
-        'pipeline', 'pipeline-paced', 'pipeline-gso', 'pipeline-paced-gso'}
-    # Configuration/capture boundary only: not measured timing or Linux fq/TSO equivalence.
-    return {
+    tokens = so_flags.split(',')
+    local = [token[6:] for token in tokens if token.startswith('local=')]
+    policies = [token for token in tokens if not token.startswith('local=')]
+    profiles = set(policies) & {'baseline', 'sack', 'pipeline', 'pipeline-paced',
+                                'pipeline-gso', 'pipeline-paced-gso', 'upstream'}
+    profile = next(iter(profiles)) if len(profiles) == 1 else None
+    options = set(policies) - profiles
+    import ipaddress
+    try:
+        valid_local = len(local) == 1 and isinstance(ipaddress.ip_address(local[0]), ipaddress.IPv4Address)
+    except ValueError:
+        valid_local = False
+    known = (valid_local and profile is not None and len(tokens) == len(set(tokens))
+             and (not options or profile == 'upstream' and options <= UPSTREAM_OPTIONS)
+             and not {'budget128m', 'budget224m'} <= options
+             and not {'immediate-ack', 'adaptive-ack'} <= options)
+    upstream = profile == 'upstream'
+    # Configuration/capture boundary only, never a claim of Linux fq/TSO timing equivalence.
+    metadata = {
         'profile': profile,
-        **(LINUX_COOKIE_SETTINGS if profile == LINUX_COOKIE_PROFILE else {}),
-        **(FASTOPEN_PMTUD_SETTINGS if profile == FASTOPEN_PMTUD_PROFILE else {}),
-        **(ADAPTIVE_ACK_SETTINGS if profile == ADAPTIVE_ACK_PROFILE else {}),
-        'transport_clock': 'monotonic Instant elapsed microseconds' if known else None,
-        'prr_pacing': profile not in {'upstream-cubic', 'upstream-cubic-ecn'} if known else None,
-        'transmit_batch_clock': 'monotonic sample per selection/accept' if known else None,
-        'egress_pipeline': 'shared production scheduler' if known else None,
-        'general_pacing': profile in {'pipeline-paced', 'pipeline-paced-gso'} if known else None,
-        'software_gso': profile in {'pipeline-gso', 'pipeline-paced-gso'} if known else None,
-        'capture_boundary': 'individual raw IPv4 TCP wire segments' if known else None,
-        'capture_clock': 'realtime epoch microseconds at backend submission' if known else None,
-        'hardware_tso': False if known else None,
-        'gro': False if known else None,
+        'transport_clock': 'monotonic Instant elapsed microseconds',
+        'prr_pacing': ('paced' in options if upstream else True),
+        'transmit_batch_clock': 'monotonic sample per selection/accept',
+        'egress_pipeline': 'shared production scheduler',
+        'general_pacing': ('paced' in options if upstream else profile in {'pipeline-paced', 'pipeline-paced-gso'}),
+        'software_gso': upstream or profile in {'pipeline-gso', 'pipeline-paced-gso'},
+        'capture_boundary': 'individual raw IPv4 TCP wire segments',
+        'capture_clock': 'realtime epoch microseconds at backend submission',
+        'hardware_tso': False, 'gro': False,
     }
+    if not known:
+        return {key: value if key == 'profile' else None for key, value in metadata.items()}
+    if upstream:
+        metadata.update(
+            options=sorted(options), sack=True, timestamps='no-timestamps' not in options,
+            initial_window='Iw10', rack=True, prr='LegacyInitialCredit' if 'legacy-prr' in options else 'Rfc9937',
+            tlp=True, rto_min_us=200000, preallocate_connections=3 if 'prealloc3' in options else 1,
+            ecn='ecn' in options, mss=1460,
+            receive_capacity=65535 if 'receive64k' in options else 8388608,
+            window_scale=0 if 'receive64k' in options else 8,
+            endpoint_max_buffer_bytes=(224 if 'budget224m' in options else 128 if 'budget128m' in options else 32) * 1024 * 1024,
+            congestion_control='Reno' if 'reno' in options else 'Cubic',
+            cubic_hystart=True, cubic_fast_convergence=True,
+            delayed_ack_us=0 if 'immediate-ack' in options else 200000,
+            adaptive_ack='immediate-ack' not in options,
+            initial_ack_timeout_us=40000,
+            abort_with_ack=True,
+            coalesce_read_window_updates=True,
+            peer_max_ack_delay_us=200000 if 'peer-ack-delay200ms' in options else 499999,
+            output_push_batch_segments=0,
+            output_group_flush=True,
+            output_push_batch_retransmissions=False,
+            global_notsent_lowat=4000 if 'lowat4000' in options else 4294967295,
+            socket_notsent_lowat=0, fast_open_client_default=False, fast_open_listener_default=False,
+            fast_open_cache='fresh runtime', fast_open_cookie_policy='hmac-sha256',
+            pacing_config={'rate_gain_percent': 125, 'max_bytes_per_second': None, 'max_burst_segments': 2} if 'paced' in options else None)
+        if 'linux-cookie' in options:
+            metadata.update(LINUX_COOKIE_SETTINGS)
+        if 'pmtud1500' in options:
+            metadata.update(FASTOPEN_PMTUD_SETTINGS)
+        if 'adaptive-ack' in options:
+            metadata.update(ADAPTIVE_ACK_SETTINGS)
+    return metadata
 
 
 def main():
@@ -499,7 +732,7 @@ def main():
                         help='explicit patched executable produced by build_runner.py')
     parser.add_argument('--plugin', type=Path,
                         default=ROOT / 'target/debug/libntcp_packetdrill.so')
-    parser.add_argument('--suite', choices=['smoke', 'sack', 'upstream', 'adapted'], default='smoke')
+    parser.add_argument('--suite', choices=['smoke', 'sack', 'upstream-raw', 'upstream', 'ntcp-ported'], default='smoke')
     parser.add_argument('--variant', action='append',
                         choices=['native-ipv4', *PIN['variants']],
                         help='select a suite variant (repeatable; default: all eligible variants)')
@@ -510,7 +743,7 @@ def main():
     parser.add_argument('--timeout', type=float, default=15)
     parser.add_argument('--so-flags')
     args = parser.parse_args()
-    if args.so_flags is None and args.suite != 'adapted':
+    if args.so_flags is None and args.suite not in ('upstream', 'ntcp-ported'):
         args.so_flags = ('sack,local=192.0.2.1' if args.suite == 'sack' else
                          'baseline,local=192.0.2.1' if args.suite == 'smoke' else
                          'baseline,local=192.168.0.1')
@@ -548,9 +781,18 @@ def main():
         socket_backend, plugin_sha256 = verify_backend(plugin, args.timeout)
     except (ValueError, OSError) as error:
         parser.error(str(error))
-    manifest_bytes = (HERE / 'adaptations.json').read_bytes() if args.suite == 'adapted' else None
+    manifest_bytes = ((HERE / 'adaptations.json').read_bytes()
+                      if args.suite in ('upstream', 'ntcp-ported') else None)
     manifest = json.loads(manifest_bytes) if manifest_bytes is not None else None
-    upstream = args.suite in ('upstream', 'adapted')
+    expectation_manifest = None
+    expectation_manifest_sha256 = None
+    if args.suite == 'ntcp-ported':
+        try:
+            expectation_manifest, expectation_manifest_sha256 = load_expectations(
+                HERE, PIN['revision'], manifest)
+        except (ValueError, OSError, TypeError, KeyError) as error:
+            parser.error(str(error))
+    upstream = args.suite in ('upstream-raw', 'upstream', 'ntcp-ported')
     directory = (checkout / PIN['tcp_tests'] if upstream else
                  HERE / ('sack-tests' if args.suite == 'sack' else 'tests'))
     upstream_scripts = []
@@ -560,7 +802,8 @@ def main():
             text=True,
         ).split('\0')
         upstream_scripts = sorted(checkout / path for path in tracked if path.endswith('.pkt'))
-        scripts = (sorted(directory / path for path in manifest['scripts'])
+        scripts = (sorted(directory / path for path in manifest['scripts']
+                          if args.suite != 'ntcp-ported' or path in PORTED_SCRIPTS)
                    if manifest is not None else upstream_scripts)
         if any(script not in upstream_scripts for script in scripts):
             parser.error('adaptation allowlist contains an untracked upstream script')
@@ -575,12 +818,16 @@ def main():
     except ValueError as error:
         parser.error(str(error))
     selected_script_files = len({script for script, _, _ in cases})
+    for row in excluded:
+        if row.get('ported_to') == 'ntcp-ported':
+            print(f'excluded: {row["script"]} ({row["variant"]}, {args.suite}): {PORTED_EXCLUSION}', flush=True)
     with tempfile.TemporaryDirectory(prefix='ntcp-packetdrill-') as temporary:
         for script, variant, flags in cases:
             source = script.read_bytes()
             text = source.decode()
             row = {'script': str(script.relative_to(directory)), 'variant': variant,
                    'suite': args.suite, 'adapted': False,
+                   'expectation_kind': 'upstream' if upstream else 'native',
                    'sha256': hashlib.sha256(source).hexdigest(),
                    'effective_flags': {'adapter': args.so_flags, 'packetdrill': flags},
                    'syntax_returncode': None, 'behavior_executed': False,
@@ -595,6 +842,14 @@ def main():
                 try:
                     generated, audit = adapt_source(directory, row['script'], manifest,
                                                     so_flags)
+                    if expectation_manifest is not None:
+                        generated, audit = apply_expectations(
+                            HERE, row['script'], generated, audit, expectation_manifest)
+                    if 'expectation_adjustment' in audit:
+                        row['expectation_kind'] = 'ntcp-accounting'
+                        reasons = preflight(generated.decode(), audit.get('embedded_tcp_info') is True)
+                        if reasons:
+                            raise ValueError('accounting fixture preflight: ' + '; '.join(reasons))
                     row['adaptation'] = audit
                     if audit.get('blocked_reasons'):
                         row.update(status='unsupported', reasons=audit['blocked_reasons'])
@@ -631,10 +886,12 @@ def main():
                         # Teardown and direct libc calls must share the plugin's socket registry.
                         preload = ['env', 'PYTHONOPTIMIZE=0', f'LD_PRELOAD={plugin}']
                         row['effective_flags']['preload'] = str(plugin)
-                        code_flags = (['--code_sockopt=TCP_INFO']
-                                      if provenance is not None and (
-                                          (embedded_tcp_info and tcp_info_only(text))
-                                          or so_flags.split(',')[0] == LINUX_COOKIE_PROFILE) else [])
+                        code_flags = []
+                        if provenance is not None:
+                            if embedded_tcp_info and tcp_info_only(text):
+                                code_flags = ['--code_sockopt=TCP_INFO_PREFIX']
+                            elif so_flags.split(',')[0] == LINUX_COOKIE_OPTION:
+                                code_flags = ['--code_sockopt=TCP_INFO']
                         row['effective_flags']['packetdrill'] = [*flags, *code_flags]
                         argv = ['unshare', '--user', '--map-root-user', '--net',
                                 *preload, str(runner), f'--so_filename={plugin}',
@@ -667,7 +924,9 @@ def main():
                                    stage='environment' if status == 'environment_error' or fixture_unavailable else 'behavior',
                                    behavior_executed=status != 'environment_error' and not fixture_unavailable, log=log)
             results.append(row)
-            print(f'{row["status"]}: {row["script"]} ({variant}, {args.suite})', flush=True)
+            expectation_label = (', ntcp-accounting'
+                                 if row['expectation_kind'] == 'ntcp-accounting' else '')
+            print(f'{row["status"]}: {row["script"]} ({variant}, {args.suite}{expectation_label})', flush=True)
     try:
         check_plugin_hash(plugin, plugin_sha256)
     except (ValueError, OSError) as error:
@@ -689,17 +948,29 @@ def main():
               'plugin_path': str(plugin),
               'plugin_sha256': plugin_sha256,
               'socket_backend': socket_backend,
-              'counts': counts, 'total': len(results), 'results': results,
+              'counts': counts,
+              'expectations': ('ntcp' if args.suite == 'ntcp-ported' else
+                               'upstream' if upstream else 'native'),
+              'counts_by_expectation': {
+                  kind: dict(collections.Counter(row['status'] for row in results
+                                                 if row['expectation_kind'] == kind))
+                  for kind in sorted({row['expectation_kind'] for row in results})},
+              'total': len(results), 'results': results,
               'all_passed': bool(results) and len(results) == len(cases) and all(
                   row['status'] == 'passed' and row['behavior_executed']
                   for row in results)}
     if upstream:
         report['coverage'] = {'selected_script_files': selected_script_files,
                               'upstream_script_files': len(upstream_scripts),
-                              'selection': 'adaptation_allowlist' if manifest is not None
-                              else 'all_tracked_upstream_scripts'}
+                              'selection': ('ported_registry' if args.suite == 'ntcp-ported' else
+                                            'adaptation_allowlist' if manifest is not None
+                                            else 'all_tracked_upstream_scripts')}
+        report['ported_exclusions'] = [row for row in excluded
+                                       if PORTED_EXCLUSION in row['reasons']]
     if manifest is not None:
         report['adaptation_manifest_sha256'] = hashlib.sha256(manifest_bytes).hexdigest()
+    if expectation_manifest_sha256 is not None:
+        report['expectation_manifest_sha256'] = expectation_manifest_sha256
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(counts, sort_keys=True))

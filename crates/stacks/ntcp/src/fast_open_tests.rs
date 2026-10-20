@@ -1535,6 +1535,14 @@ fn ordinary_and_foexp_syn_text_ack_only_syn_then_deliver_once() {
     }
 }
 
+mod cookie_timeout_study {
+    include!("fast_open_cookie_timeout_tests.rs");
+}
+
+mod partial_synack_study {
+    include!("fast_open_partial_synack_tests.rs");
+}
+
 #[test]
 fn fast_open_negative_synack_suppresses_next_service_attempt() {
     let (mut a, _, _) = warm(false);

@@ -819,3 +819,28 @@ fn early_response_close_drains_queue_after_handshake_and_keeps_empty_early_fin()
     acknowledge(&mut a, 40_000, 1, &[]);
     assert_eq!(a.state, State::FinWait2);
 }
+
+#[test]
+fn passive_tfo_split_ack_history_uses_single_wire_advance() {
+    for iss in [100, u32::MAX] {
+        for count in [0, 500, 1000] {
+            let (_, mut a, _) = opening(cfg(1_000_000), iss, true, b"request");
+            emit(&mut a, 0, false); // SYN-ACK
+            a.write(&[1; 1000]).unwrap();
+            emit(&mut a, 20_000, false); // Early response before final handshake ACK.
+            assert_eq!(a.congestion.ack_history(), None);
+            acknowledge(&mut a, 100_000, count, &[]);
+            assert_eq!(a.state(), State::Established);
+            assert_eq!(
+                a.congestion.ack_history(),
+                Some((Seq(iss), Seq(iss).wrapping_add(1 + count)))
+            );
+            // An unchanged window/duplicate cannot replace the recorded advance.
+            acknowledge(&mut a, 100_001, count, &[]);
+            assert_eq!(
+                a.congestion.ack_history(),
+                Some((Seq(iss), Seq(iss).wrapping_add(1 + count)))
+            );
+        }
+    }
+}

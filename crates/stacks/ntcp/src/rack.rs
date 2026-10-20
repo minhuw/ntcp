@@ -59,6 +59,9 @@ const PACKET_DELIVERED: u8 = 1 << 0;
 // credit already represented FIN even when a later copy replaces it.
 const PACKET_INCLUDES_FIN: u8 = 1 << 1;
 const SYN_PAYLOAD: u8 = 1 << 2;
+// Independent delivery-unit boundary: latest RACK transmissions can overlap
+// only part of a queued packet. Byte/SACK splits preserve this endpoint.
+const DELIVERY_END: u8 = 1 << 3;
 
 impl Interval {
     fn stats_flag(&self, bit: u8) -> bool {
@@ -83,7 +86,15 @@ pub(crate) struct DepartureSelection {
     end: Seq,
     selected: u64,
     retransmit: bool,
-    packet_layout_valid: bool,
+}
+
+// Constant-size undo for one homogeneous original wire packet. Arbitrarily
+// split intervals remain in place; no packet-path allocation or ledger clone.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RetryUndo {
+    start: Seq,
+    end: Seq,
+    prior: Interval,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -342,6 +353,7 @@ impl Rack {
     // Reclaim cumulative bytes without consulting SACK advice or creating
     // delivery/RTT evidence. Trim in place: a full ledger needs no split slot.
     pub(crate) fn trim_cumulative(&mut self, ack: Seq) {
+        self.acknowledge_packets(ack, None);
         self.intervals.retain_mut(|r| {
             if !after(r.end, ack) {
                 if !r.stats_flag(PACKET_DELIVERED)
@@ -386,7 +398,81 @@ impl Rack {
         let mut right = self.intervals[i];
         right.start = edge;
         self.intervals[i].end = edge;
+        self.intervals[i].set_stats_flag(DELIVERY_END, false);
         self.intervals.insert(i + 1, right);
+        true
+    }
+
+    pub(crate) fn retry_undo(&self, start: Seq, end: Seq) -> Option<RetryUndo> {
+        if !self.valid() || !after(end, start) {
+            return None;
+        }
+        let prior = *self.intervals.iter().find(|r| r.start == start)?;
+        if prior.sacked || !prior.needs_retransmit || prior.successful_retries == u32::MAX {
+            return None;
+        }
+        let mut covered = start;
+        for r in self
+            .intervals
+            .iter()
+            .filter(|r| after(end, r.start) && after(r.end, start))
+        {
+            if r.start != covered
+                || r.original_wire_start != prior.original_wire_start
+                || r.original_wire_end != prior.original_wire_end
+                || r.transmission_start != prior.transmission_start
+                || r.transmission_end != prior.transmission_end
+                || r.sent != prior.sent
+                || r.timestamp_eligible != prior.timestamp_eligible
+                || r.retransmitted != prior.retransmitted
+                || r.departure_committed != prior.departure_committed
+                || r.original_retransmitted != prior.original_retransmitted
+                || r.loss_response_pending != prior.loss_response_pending
+                || r.successful_retries != prior.successful_retries
+                || r.sacked
+                || !r.needs_retransmit
+                || r.stats_flag(SYN_PAYLOAD) != prior.stats_flag(SYN_PAYLOAD)
+            {
+                return None;
+            }
+            covered = if after(r.end, end) { end } else { r.end };
+        }
+        (covered == end).then_some(RetryUndo { start, end, prior })
+    }
+
+    pub(crate) fn cancel_retry(&mut self, selection: DepartureSelection, undo: RetryUndo) -> bool {
+        if self.departure_selection != Some(selection)
+            || !self.valid()
+            || !selection.retransmit
+            || selection.start != undo.start
+            || selection.end != undo.end
+            || self.intervals.iter().any(|r| {
+                after(undo.end, r.start) && after(r.end, undo.start) && r.departure_committed
+            })
+        {
+            return false;
+        }
+        for r in &mut self.intervals {
+            if r.original_wire_start == undo.prior.original_wire_start
+                && r.original_wire_end == undo.prior.original_wire_end
+            {
+                r.original_retransmitted = undo.prior.original_retransmitted;
+            }
+            if !after(undo.start, r.start) && !after(r.end, undo.end) {
+                r.transmission_start = undo.prior.transmission_start;
+                r.transmission_end = undo.prior.transmission_end;
+                r.sent = undo.prior.sent;
+                r.timestamp_eligible = undo.prior.timestamp_eligible;
+                r.retransmitted = undo.prior.retransmitted;
+                r.departure_committed = undo.prior.departure_committed;
+                r.loss_response_pending = undo.prior.loss_response_pending;
+                r.successful_retries = undo.prior.successful_retries;
+                r.needs_retransmit = undo.prior.needs_retransmit;
+                r.sacked = undo.prior.sacked;
+                r.set_stats_flag(SYN_PAYLOAD, undo.prior.stats_flag(SYN_PAYLOAD));
+            }
+        }
+        self.departure_selection = None; // Generations are never rolled back.
         true
     }
 
@@ -490,17 +576,22 @@ impl Rack {
         if !self.validate_departure(selection, start, end, now) {
             return false;
         }
-        self.delivered_segments_valid &= selection.packet_layout_valid;
         // Preflight above guarantees these cannot fail or allocate.
         let left = self.split(start);
         let right = self.split(end);
         debug_assert!(left && right);
-        let mut counted = false;
-        let mut uncounted = false;
+        // Repacketize delivery units only after actual acceptance. Keep the
+        // untouched prefix/suffix as separate queued units; do not tie their
+        // completion to an overwritten latest-transmission sequence range.
+        if let Some(previous) = self.intervals.iter_mut().find(|r| r.end == start) {
+            previous.set_stats_flag(DELIVERY_END, true);
+        }
         for r in &mut self.intervals {
             if !after(start, r.start) && !after(r.end, end) {
-                counted |= r.stats_flag(PACKET_DELIVERED);
-                uncounted |= !r.stats_flag(PACKET_DELIVERED);
+                r.set_stats_flag(DELIVERY_END, r.end == end);
+                if selection.retransmit {
+                    r.set_stats_flag(SYN_PAYLOAD, false);
+                }
                 if !r.stats_flag(PACKET_DELIVERED) {
                     r.set_stats_flag(PACKET_INCLUDES_FIN, false);
                 }
@@ -517,9 +608,6 @@ impl Rack {
                 }
             }
         }
-        // An envelope can contain both kinds of credit without any physical
-        // packet mixing them (GSO groups and MTU repair use this same commit).
-        self.delivered_segments_valid &= !(counted && uncounted);
         true
     }
 
@@ -545,7 +633,6 @@ impl Rack {
                 end,
                 selected: now,
                 retransmit,
-                packet_layout_valid: true,
             }
         });
         if let Some(boundary) = self.fallback {
@@ -556,21 +643,6 @@ impl Rack {
             return;
         }
         if retransmit {
-            // The bounded ledger retains only the latest copy. Replacing part
-            // of an outstanding packet loses the earlier overlapping identity;
-            // don't manufacture a packet count from the surviving byte pieces.
-            let low = self.intervals.first().map_or(start, |r| r.start);
-            for r in &self.intervals {
-                if after(end, r.start)
-                    && after(r.end, start)
-                    && !r.stats_flag(PACKET_DELIVERED)
-                    && ((after(start, r.transmission_start) && after(start, low))
-                        || after(r.transmission_end, end))
-                    && let Some(selection) = &mut self.departure_selection
-                {
-                    selection.packet_layout_valid = false;
-                }
-            }
             if !self.split(start) || !self.split(end) {
                 let boundary = self.intervals.last().map_or(end, |r| r.end);
                 self.abandon(boundary);
@@ -633,15 +705,57 @@ impl Rack {
         }
     }
 
-    pub(crate) fn record_fin_payload(&mut self, start: Seq, end: Seq) {
+    // Returns whether an already-delivered data-only unit cannot also supply
+    // the new FIN's delivery credit. Keep that control credit in Connection.
+    pub(crate) fn record_fin_payload(&mut self, start: Seq, end: Seq) -> bool {
+        let mut all_credited = true;
+        let mut fin_credited = false;
         for r in &mut self.intervals {
             if !after(start, r.start) && !after(r.end, end) {
-                // Credited data+FIN already represents this control. Adding a
-                // separate/new FIN to data-only credit is genuinely mixed.
-                self.delivered_segments_valid &=
-                    !r.stats_flag(PACKET_DELIVERED) || r.stats_flag(PACKET_INCLUDES_FIN);
-                r.set_stats_flag(PACKET_INCLUDES_FIN, true);
+                all_credited &= r.stats_flag(PACKET_DELIVERED);
+                fin_credited |= r.stats_flag(PACKET_DELIVERED) && r.stats_flag(PACKET_INCLUDES_FIN);
+                if !r.stats_flag(PACKET_DELIVERED) {
+                    r.set_stats_flag(PACKET_INCLUDES_FIN, true);
+                }
             }
+        }
+        all_credited && !fin_credited
+    }
+
+    // Statistics use queued packetization units, as opposed to unknowable
+    // physical-copy attribution. Resegmentation changes their boundaries;
+    // per-byte credit survives SACK reneging and prevents repeated delivery.
+    fn acknowledge_packets(&mut self, ack: Seq, scoreboard: Option<&Scoreboard>) {
+        let mut start = 0;
+        for end in 0..self.intervals.len() {
+            if !self.intervals[end].stats_flag(DELIVERY_END) {
+                continue;
+            }
+            let packet = &mut self.intervals[start..=end];
+            let complete = packet.iter().all(|r| {
+                r.departure_committed
+                    && (!after(r.end, ack)
+                        || scoreboard.is_some_and(|s| {
+                            s.unsacked_bytes(if after(r.start, ack) { r.start } else { ack }, r.end)
+                                == 0
+                        }))
+            });
+            if complete {
+                let newly_delivered = packet
+                    .iter()
+                    .any(|r| !r.stats_flag(PACKET_DELIVERED) && !r.stats_flag(SYN_PAYLOAD));
+                let includes_fin = packet.iter().any(|r| r.stats_flag(PACKET_INCLUDES_FIN));
+                if newly_delivered && self.delivered_segments_valid {
+                    self.delivered_segments = self.delivered_segments.saturating_add(1);
+                }
+                for r in packet {
+                    r.set_stats_flag(PACKET_DELIVERED, true);
+                    if includes_fin && newly_delivered {
+                        r.set_stats_flag(PACKET_INCLUDES_FIN, true);
+                    }
+                }
+            }
+            start = end + 1;
         }
     }
 
@@ -750,6 +864,7 @@ impl Rack {
     ) -> u32 {
         self.ack_sample = None;
         self.reo_grew = false;
+        self.acknowledge_packets(ack, Some(scoreboard));
         if self.fallback.is_some() {
             self.trim_cumulative(ack);
             return 0;
@@ -778,19 +893,6 @@ impl Rack {
                     },
                     r.transmission_end,
                 ) == 0;
-            if covered
-                && packet_complete
-                && r.departure_committed
-                && !r.stats_flag(PACKET_DELIVERED)
-            {
-                if r.end == r.transmission_end
-                    && !r.stats_flag(SYN_PAYLOAD)
-                    && self.delivered_segments_valid
-                {
-                    self.delivered_segments = self.delivered_segments.saturating_add(1);
-                }
-                r.set_stats_flag(PACKET_DELIVERED, true);
-            }
             if covered && !r.sacked {
                 if !r.delivered {
                     delivered += r.end.distance_from(r.start);
@@ -896,7 +998,7 @@ impl Rack {
     //# Otherwise, if some reordering has been observed, then RACK does not
     //# trigger fast recovery based on DupThresh.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
-    //= reason=Implements zeroing after three complete SACKed logical segments or in recovery only without observed reordering; otherwise multiplies before integer division by four and caps at SRTT. Missing estimates yield zero.
+    //= reason=Implements zeroing after three complete SACKed original wire packets or in recovery only without observed reordering; otherwise multiplies before integer division by four and caps at SRTT. Missing estimates yield zero.
     //# If RACK.reordering_seen is FALSE:
     //# If in Fast or RTO recovery:
     //# Return 0
@@ -904,7 +1006,7 @@ impl Rack {
     //# Return 0
     //# Return min(RACK.reo_wnd_mult * RACK.min_RTT / 4, SRTT)
     fn reo_window(&self, recovery: bool, srtt: Option<u64>) -> u64 {
-        if !self.reordering_seen && (recovery || self.counts().sacked >= 3) {
+        if !self.reordering_seen && (recovery || self.packet_counts().sacked >= 3) {
             return 0;
         }
         // Divide after multiplication, including minima below four caller ticks.
@@ -1077,11 +1179,26 @@ impl Rack {
     // Diagnostic/accounting identity remains the logical selection, not local
     // repair packetization (which must not manufacture new loss/retry counts).
     pub(crate) fn counts(&self) -> Counts {
+        self.count_by_original(false)
+    }
+
+    // Packet-unit consumers must distinguish the original wire segments of a
+    // single logical admission. ACK/SACK splits preserve these boundaries;
+    // later retry repacketization must not create extra original packets.
+    pub(crate) fn packet_counts(&self) -> Counts {
+        self.count_by_original(true)
+    }
+
+    fn count_by_original(&self, physical: bool) -> Counts {
         let mut counts = Counts::default();
-        for segment in self
-            .intervals
-            .chunk_by(|a, b| a.original_end == b.original_end)
-        {
+        for segment in self.intervals.chunk_by(|a, b| {
+            if physical {
+                a.original_wire_start == b.original_wire_start
+                    && a.original_wire_end == b.original_wire_end
+            } else {
+                a.original_end == b.original_end
+            }
+        }) {
             counts.unacked += 1;
             counts.sacked += u32::from(segment.iter().all(|r| r.sacked));
             counts.lost += u32::from(segment.iter().any(|r| r.original_lost && !r.sacked));
@@ -1101,6 +1218,10 @@ mod tests {
 
     mod statistics {
         include!("rack_statistics_tests.rs");
+    }
+
+    mod local_repair {
+        include!("rack_local_repair_tests.rs");
     }
 
     fn sack(
@@ -1365,6 +1486,7 @@ mod tests {
                 transmission_start: seq(8),
                 transmission_end: seq(16),
                 departure_committed: true,
+                stats_flags: before.stats_flags | DELIVERY_END,
                 ..before
             };
             assert_eq!(*accepted, expected);

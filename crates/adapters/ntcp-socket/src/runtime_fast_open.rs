@@ -111,6 +111,7 @@ impl Owner {
         // Core admission begins the next transport attempt. Invalid requests,
         // failed admission, and deferred peer selection retain the old view.
         self.sockets.get_mut(&id).unwrap().terminal_transport = None;
+        self.sockets.get_mut(&id).unwrap().soft_error = 0;
         if let Err(e) = self.apply_options(cid, &options) {
             self.rollback_connection(cid);
             return Err(e);
@@ -151,20 +152,20 @@ mod tests {
                     }));
                 for requested in [0, 1, 7, 192, 193, 280, 512] {
                     let result = owner.execute(client, Op::TransportPrefix(1, requested));
-                    if ledger_valid && (requested <= 192 || delivered_segments_valid) {
-                        let bytes = result.unwrap().bytes;
-                        assert_eq!(bytes.len(), requested.min(280));
-                        if requested > 0 {
-                            assert_eq!(bytes[0], 7);
-                        }
+                    let bytes = result.unwrap().bytes;
+                    let available = if !ledger_valid {
+                        24
+                    } else if !delivered_segments_valid {
+                        192
                     } else {
-                        assert_eq!(result.unwrap_err(), unsupported);
+                        280
+                    };
+                    assert_eq!(bytes.len(), requested.min(available));
+                    if requested > 0 {
+                        assert_eq!(bytes[0], 7);
                     }
                 }
-                assert_eq!(
-                    owner.execute(client, Op::Transport(1)).is_ok(),
-                    ledger_valid && delivered_segments_valid
-                );
+                assert!(owner.execute(client, Op::Transport(1)).is_ok());
                 assert!(
                     owner
                         .execute(client, Op::Transport(2))
@@ -187,10 +188,9 @@ mod tests {
             assert_eq!(owner.execute(client, op).unwrap_err(), EIO);
         }
         let fresh = owner.execute(0, Op::New(0)).unwrap().value as u64;
-        assert_eq!(
-            owner.execute(fresh, Op::Transport(1)).unwrap_err(),
-            ENOTCONN
-        );
+        let snapshot = owner.execute(fresh, Op::Transport(1)).unwrap().bytes;
+        assert_eq!(snapshot.len(), 280);
+        assert_eq!(snapshot[0], 7);
     }
 
     #[test]

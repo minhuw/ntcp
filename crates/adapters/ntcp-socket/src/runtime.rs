@@ -340,6 +340,8 @@ struct Socket {
     cork: bool,
     inq: bool,
     notsent_lowat: u32,
+    send_batch: Option<send::SendBatch>,
+    send_finish: Option<send::SendFinish>,
     fast_open_limit: i32,
     fast_open_cookie_policy: Option<FastOpenCookiePolicy>,
     fast_open_connect: bool,
@@ -351,6 +353,9 @@ struct Socket {
     interval: i32,
     probes: i32,
     error: i32,
+    // Nonterminal network notifications are consumable through SO_ERROR,
+    // independently of the fatal read/write/connect error path.
+    soft_error: i32,
     connected: bool,
     // Linux SS_CONNECTING is independent of transport establishment. All fd
     // aliases address this socket; an API connect completion consumes it once.
@@ -387,6 +392,8 @@ impl Socket {
             cork: false,
             inq: false,
             notsent_lowat: 0,
+            send_batch: None,
+            send_finish: None,
             fast_open_limit: 0,
             fast_open_cookie_policy: None,
             fast_open_connect: false,
@@ -398,6 +405,7 @@ impl Socket {
             interval: 75,
             probes: 9,
             error: 0,
+            soft_error: 0,
             connected: false,
             connect_pending: false,
             peer_fin: false,
@@ -417,6 +425,27 @@ impl Socket {
             timestamps: TimestampState::default(),
         }
     }
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8
+    //= reason=The shared socket owner exposes nonterminal connection/passive reports through consumable SO_ERROR and EPOLLERR without routing them into fatal I/O errors; terminal reports retain precedence.
+    //# There MUST be a mechanism for reporting soft TCP error conditions to
+    //# the application (MUST-47).
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2
+    //= reason=IPv4 core network-error events now reach application-visible notifications; a listening socket's failed child does not make accept return a network error.
+    //# SHOULD make the information available to the application (SHLD-25).
+    fn report_network_error(&mut self, error: ntcp::NetworkError) {
+        self.soft_error = match error {
+            ntcp::NetworkError::SoftUnreachable | ntcp::NetworkError::HardUnreachable => {
+                EHOSTUNREACH
+            }
+            ntcp::NetworkError::TimeExceeded => ETIMEDOUT,
+            ntcp::NetworkError::ParameterProblem => EPROTO,
+            ntcp::NetworkError::SourceQuench => return,
+        };
+        // Each report can wake an edge-triggered observer even while an older
+        // notification remains pending. It does not make send_state fail.
+        self.readiness_generations[2] = self.readiness_generations[2].wrapping_add(1);
+    }
+
     fn keepalive_config(&self) -> Option<ntcp::KeepaliveConfig> {
         self.keepalive.then_some(ntcp::KeepaliveConfig {
             idle_us: self.idle as u64 * 1_000_000,
@@ -781,6 +810,7 @@ impl Owner {
         false
     }
     fn service(&mut self, request: &mut Request) -> bool {
+        self.finish_retained_sends();
         // Last-close must give its already-queued FIN/RST a submission turn
         // before waking a caller that may immediately exit the process. This
         // retained generation survives socket removal; other requests progress.
@@ -795,6 +825,19 @@ impl Owner {
         }
         // Defer before inspecting foreign buffers or consuming file/pipe producers.
         if self.command_held(request.id, &request.op) {
+            // A continued nonblocking send never waits for backend capacity.
+            // Retain boundary metadata until the immutable output plan releases;
+            // the accepted prefix and its completions can return immediately.
+            if request
+                .send
+                .as_ref()
+                .is_some_and(LogicalSend::continuing_nonblocking)
+            {
+                let mut send = request.send.take().unwrap();
+                let result = self.finish_send(request.id, &mut send, Ok(()));
+                let _ = request.reply.send(result);
+                return true;
+            }
             return false;
         }
         let (op, wait) = if let Op::Wait(op, _) = &request.op {
@@ -912,6 +955,22 @@ impl Owner {
         self.pending_packet = Some(packet);
         Ok(true)
     }
+    fn service_before_output(&mut self, after_output: &mut Vec<(Request, bool)>) {
+        for _ in 0..self.pending.len().min(BUDGET) {
+            let mut request = self.pending.pop_front().unwrap();
+            // Admit a retained TFO tail before selecting the handshake ACK.
+            // service() still enforces the per-generation output reservation barrier.
+            let early = request
+                .send
+                .as_ref()
+                .is_some_and(LogicalSend::waiting_fast_open)
+                || (matches!(&request.op, Op::Wait(op, _) if matches!(**op, Op::Read(_) | Op::Peek(_) | Op::ReadTo(..)))
+                    && self.sockets.get(&request.id).is_some_and(|s| s.error == 0));
+            if !early || !self.service(&mut request) {
+                after_output.push((request, early));
+            }
+        }
+    }
     fn run(&mut self, rx: Receiver<Request>, wake: i32, stop: &std::sync::atomic::AtomicBool) {
         let mut input = vec![0; 65535 + if self.ethernet.is_some() { 14 } else { 0 }];
         // Keep in-flight batches owned through every output/backend exit.
@@ -929,14 +988,7 @@ impl Owner {
                 break 'run;
             }
             self.events();
-            for _ in 0..self.pending.len().min(BUDGET) {
-                let mut request = self.pending.pop_front().unwrap();
-                let early = matches!(&request.op, Op::Wait(op, _) if matches!(**op, Op::Read(_) | Op::Peek(_) | Op::ReadTo(..)))
-                    && self.sockets.get(&request.id).is_some_and(|s| s.error == 0);
-                if !early || !self.service(&mut request) {
-                    after_output.push((request, early));
-                }
-            }
+            self.service_before_output(&mut after_output);
             if self.egress.is_some() {
                 if self.service_egress().is_err() {
                     break 'run;
@@ -952,7 +1004,7 @@ impl Owner {
                     if self.tun.is_some() || self.ethernet.is_some() {
                         match self.submit_reserved_packet() {
                             Ok(TxOutcome::Submitted) => (),
-                            Ok(TxOutcome::WouldBlock) => break,
+                            Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => break,
                             Err(_) => break 'run,
                         }
                     }
@@ -1178,6 +1230,7 @@ impl Owner {
         result
     }
     fn events(&mut self) {
+        self.finish_retained_sends();
         if self.reservation.is_some() {
             return;
         }
@@ -1191,6 +1244,16 @@ impl Owner {
                         s.acceptable = true;
                         s.readiness_generations[0] = s.readiness_generations[0].wrapping_add(1);
                     }
+                    (
+                        Handle::Listener(id),
+                        Event::PassiveError {
+                            listener, error, ..
+                        },
+                    ) if id == *listener => {
+                        // A failed child never turns the listener's accept into
+                        // a connection failure. The application can query it.
+                        s.report_network_error(*error);
+                    }
                     (Handle::Connection(id), Event::Connection(other, e)) if id == *other => {
                         s.connected |= e.connected;
                         s.peer_fin |= e.half_closed;
@@ -1198,6 +1261,7 @@ impl Owner {
                             s.readiness_generations[0] = s.readiness_generations[0].wrapping_add(1);
                         }
                         if let Some(reason) = e.closed {
+                            s.soft_error = 0; // A terminal event supersedes prior soft reports.
                             s.error = match reason {
                                 CloseReason::Reset if !s.connected => ECONNREFUSED,
                                 CloseReason::Reset => ECONNRESET,
@@ -1206,6 +1270,8 @@ impl Owner {
                                 CloseReason::NetworkError => EHOSTUNREACH,
                                 CloseReason::Normal => 0,
                             };
+                        } else if let Some(error) = e.network_error {
+                            s.report_network_error(error);
                         }
                     }
                     _ => (),
@@ -1344,7 +1410,7 @@ impl Owner {
             return Ok(0);
         }
         let mut bits = 0;
-        if s.error != 0 || !s.completions.is_empty() {
+        if s.error != 0 || s.soft_error != 0 || !s.completions.is_empty() {
             bits |= EPOLLERR;
         }
         match s.handle {
@@ -1877,15 +1943,28 @@ impl Owner {
                 self.sockets.get_mut(&id).unwrap().completions.pop_front();
             }
             Op::Transport(option) | Op::TransportPrefix(option, _) => {
-                let info = match s.handle {
-                    Handle::Connection(cid) => self.endpoint.transport_info(cid).map_err(engine)?,
-                    Handle::Fresh => s.terminal_transport.ok_or(ENOTCONN)??,
-                    Handle::Listener(_) => return Err(ENOTCONN),
-                };
-                out.bytes = if let Op::TransportPrefix(_, requested) = op {
-                    crate::transport::transport_option_prefix(info, option, requested)?
+                let requested = if let Op::TransportPrefix(_, requested) = op {
+                    requested
                 } else {
-                    crate::transport::transport_option(info, option)?
+                    usize::MAX
+                };
+                out.bytes = match s.handle {
+                    Handle::Connection(cid) => crate::transport::transport_option_prefix(
+                        self.endpoint.transport_info(cid).map_err(engine)?,
+                        option,
+                        requested,
+                    )?,
+                    Handle::Fresh => match s.terminal_transport {
+                        Some(info) => {
+                            crate::transport::transport_option_prefix(info?, option, requested)?
+                        }
+                        None => crate::transport::idle_transport_option(None, option, requested)?,
+                    },
+                    Handle::Listener(id) => crate::transport::idle_transport_option(
+                        Some(self.endpoint.listener_queue_info(id).map_err(engine)?),
+                        option,
+                        requested,
+                    )?,
                 };
             }
             Op::Close => {
@@ -1893,6 +1972,7 @@ impl Owner {
                     Handle::Fresh => (),
                     Handle::Listener(l) => self.endpoint.close_listener(l).map_err(engine)?,
                     Handle::Connection(cid) => {
+                        let _ = self.endpoint.set_fast_open_write_pending(cid, false);
                         let _ = self.endpoint.cancel_tx_timestamps(cid);
                         while matches!(self.endpoint.next_tx_timestamp(cid), Ok(Some(_))) {}
                         let _ = self.endpoint.set_tx_timestamp_capacity(cid, 0);
@@ -2196,9 +2276,11 @@ impl Owner {
                     (SOL_SOCKET, SO_DOMAIN) => AF_INET,
                     (SOL_SOCKET, SO_PROTOCOL) => IPPROTO_TCP,
                     (SOL_SOCKET, SO_ERROR) => {
-                        let e = s.error;
-                        s.error = 0;
-                        e
+                        if s.error != 0 {
+                            core::mem::take(&mut s.error)
+                        } else {
+                            core::mem::take(&mut s.soft_error)
+                        }
                     }
                     (SOL_SOCKET, SO_ACCEPTCONN) => {
                         i32::from(matches!(s.handle, Handle::Listener(_)))
@@ -2324,6 +2406,15 @@ mod tests {
     include!("file_transfer_tests.rs");
     include!("runtime_pacing_tests.rs");
     include!("runtime_lowat_tests.rs");
+    include!("runtime_accounting_expectations_tests.rs");
+    #[cfg(feature = "packet-test")]
+    mod lowat_upstream_study {
+        include!("runtime_lowat_upstream_tests.rs");
+    }
+    #[cfg(feature = "packet-test")]
+    mod timestamp_partial_study {
+        include!("runtime_timestamp_partial_tests.rs");
+    }
     include!("runtime_syncnt_tests.rs");
     fn owner(last: u8) -> Owner {
         owner_with_config(
@@ -2503,12 +2594,12 @@ mod tests {
         owner.test_now = Some(deadline);
         let info = owner.endpoint.transport_info(cid).unwrap();
         assert!(info.ledger_valid);
-        assert!(!info.delivered_segments_valid);
+        assert!(info.delivered_segments_valid);
         let prefix = owner
-            .execute(id, Op::TransportPrefix(1, 192))
+            .execute(id, Op::TransportPrefix(1, 280))
             .unwrap()
             .bytes;
-        assert_eq!(prefix.len(), 192);
+        assert_eq!(prefix.len(), 280);
         assert_eq!(prefix[0], 4); // FIN_WAIT1
         for requested in [0, 1, 7, 191] {
             assert_eq!(
@@ -2519,16 +2610,16 @@ mod tests {
                 prefix[..requested]
             );
         }
-        let error = unsupported_option("test");
         for requested in [193, 280, 512] {
             assert_eq!(
                 owner
                     .execute(id, Op::TransportPrefix(1, requested))
-                    .unwrap_err(),
-                error
+                    .unwrap()
+                    .bytes,
+                prefix[..requested.min(280)]
             );
         }
-        assert_eq!(owner.execute(id, Op::Transport(1)).unwrap_err(), error);
+        assert_eq!(owner.execute(id, Op::Transport(1)).unwrap().bytes, prefix);
         assert!(
             owner
                 .execute(id, Op::Transport(2))
@@ -2715,7 +2806,7 @@ mod tests {
         }
     }
     #[test]
-    fn lowwater_bounds_partial_send_before_copy_and_preserves_hysteresis() {
+    fn lowwater_bounds_batch_before_copy_and_preserves_hysteresis() {
         let (mut a, _b, client, _, _) = pair();
         a.execute(client, Op::Set(IPPROTO_TCP, TCP_CORK, 1))
             .unwrap();
@@ -2736,20 +2827,21 @@ mod tests {
         );
         // Readiness retains the independent half-threshold rule.
         assert_eq!(a.execute(client, Op::Ready).unwrap().value & EPOLLOUT, 0);
-        let tail = vec![3; 9000];
-        // Bytes outside the admitted prefix must not be dereferenced.
+        let Handle::Connection(cid) = a.sockets[&client].handle else {
+            panic!()
+        };
+        let goal = send::batch_goal(&a.endpoint.transport_info(cid).unwrap());
+        let tail = vec![3; goal];
+        // Bytes outside the batch prefix must not be dereferenced.
         let sources = vec![(tail.as_ptr() as usize, tail.len()), (0, 1)];
         assert_eq!(
             a.execute(client, Op::Send(sources, MSG_MORE | MSG_EOR))
                 .unwrap()
-                .value,
-            2000
+                .value as usize,
+            goal - 2000
         );
         assert_eq!(a.execute(client, Op::Write(vec![4])).unwrap_err(), EAGAIN);
-        let Handle::Connection(cid) = a.sockets[&client].handle else {
-            panic!()
-        };
-        assert_eq!(a.endpoint.transport_info(cid).unwrap().notsent_bytes, 4000);
+        assert_eq!(a.endpoint.transport_info(cid).unwrap().notsent_bytes, goal);
         a.execute(client, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, -1))
             .unwrap();
         assert_eq!(

@@ -84,14 +84,7 @@ fn transfer_reserves_bytes_and_timestamp_metadata_before_pipe_consumption() {
     fresh
         .execute(client, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, 2))
         .unwrap();
-    assert_eq!(fresh.execute(client, op.clone()).unwrap().value, 2);
-    assert_eq!(queued(), 1);
-    assert_eq!(fresh.execute(client, op.clone()).unwrap_err(), EAGAIN);
-    assert_eq!(queued(), 1); // LOWAT must reject before consuming native input.
-    fresh
-        .execute(client, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, 0))
-        .unwrap();
-    assert_eq!(fresh.execute(client, op).unwrap().value, 1);
+    assert_eq!(fresh.execute(client, op.clone()).unwrap().value, 3);
     assert_eq!(queued(), 0);
     let mut packet = [0; 1480];
     assert!(
@@ -102,6 +95,28 @@ fn transfer_reserves_bytes_and_timestamp_metadata_before_pipe_consumption() {
             .packet
             .is_none()
     );
+    let Handle::Connection(cid) = fresh.sockets[&client].handle else {
+        panic!()
+    };
+    let goal = send::batch_goal(&fresh.endpoint.transport_info(cid).unwrap());
+    assert_eq!(
+        fresh
+            .execute(client, Op::WriteFlags(vec![8; goal], MSG_MORE))
+            .unwrap()
+            .value as usize,
+        goal - 3
+    );
+    assert_eq!(
+        unsafe { syscall(SYS_write, source[1], b"x".as_ptr(), 1) },
+        1
+    );
+    assert_eq!(fresh.execute(client, op.clone()).unwrap_err(), EAGAIN);
+    assert_eq!(queued(), 1); // A new batch must reject before consuming native input.
+    fresh
+        .execute(client, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, 0))
+        .unwrap();
+    assert_eq!(fresh.execute(client, op).unwrap().value, 1);
+    assert_eq!(queued(), 0);
 }
 
 #[test]

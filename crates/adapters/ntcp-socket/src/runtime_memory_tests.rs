@@ -392,7 +392,6 @@ fn packet_ptb_validation_precedes_bounded_queue_admission() {
         (0, 0x65, true, ENOSYS),            // IPv6 is not admitted.
         (0, 0x46, true, ENOSYS),            // Outer options remain unsupported.
         (9, 17, true, ENOSYS),              // UDP is not admitted.
-        (21, 3, true, ENOSYS),              // Other destination-unreachable code.
         (20, 8, true, ENOSYS),              // Echo is not admitted.
         (16, 203, true, EINVAL),            // Destination must match quoted sender.
     ] {
@@ -498,3 +497,220 @@ fn packet_ptb_queued_feedback_still_checks_target_tuple_and_sequence() {
 
 include!("runtime_pmtud_profile_tests.rs");
 include!("runtime_adaptive_ack_profile_tests.rs");
+
+#[test]
+fn icmp_synrecv_baseline_soft_errors_preserve_handshake() {
+    for mode in [
+        "packet-admission",
+        "production-input",
+        "soft-core",
+        "hard-core-control",
+    ] {
+        let mut a = owner(1, upstream_runtime_pmtud_profile_tests(""), 8);
+        let listener = new(&mut a, SOCK_NONBLOCK);
+        let local: SocketAddr = "192.0.2.1:8080".parse().unwrap();
+        let remote: SocketAddr = "192.0.2.2:50000".parse().unwrap();
+        a.execute(listener, Op::Bind(local)).unwrap();
+        a.execute(listener, Op::Listen(1)).unwrap();
+        let incoming = ntcp::IpMetadata {
+            source: remote.ip(),
+            destination: local.ip(),
+        };
+        let mut tcp = [0u8; 128];
+        let size = ntcp::wire::encode(
+            incoming,
+            ntcp::wire::Header {
+                source_port: remote.port(),
+                destination_port: local.port(),
+                sequence: 100,
+                acknowledgment: 0,
+                flags: ntcp::wire::SYN,
+                window: 32792,
+                urgent_pointer: 0,
+            },
+            &[
+                2, 4, 5, 180, 4, 2, 1, 1, 254, 12, 0xf9, 0x89, 0x12, 0x34, 0x12, 0x34, 0x12, 0x34,
+                0x12, 0x34,
+            ],
+            &[0x42; 10],
+            &mut tcp,
+        )
+        .unwrap();
+        let frame = a
+            .frame(
+                ntcp::Transmit {
+                    tx_timestamp: None,
+                    connection: None,
+                    ip: incoming,
+                    len: size,
+                    hop_limit: 64,
+                    dscp: 0,
+                    ecn: 0,
+                    ipv4_options: Default::default(),
+                },
+                &tcp[..size],
+            )
+            .unwrap();
+        tfo_deliver(&mut a, frame);
+        let synack = tfo_capture(&mut a);
+        let sent = segment(&synack);
+        assert_eq!(sent.header.flags, ntcp::wire::SYN | ntcp::wire::ACK);
+        assert_eq!(sent.header.acknowledgment, 101); // SYN data not accepted.
+        assert!(sent.payload.is_empty());
+        assert!(sent.options.fast_open.is_none());
+        let sequence = sent.header.sequence;
+        let tuple = ntcp::Tuple { local, remote };
+        let child = a.endpoint.connection_id(tuple).unwrap();
+        assert_eq!(a.endpoint.state(child).unwrap(), State::SynReceived);
+        let now = a.now();
+        let mut wrong = tuple;
+        wrong.remote.set_port(50001);
+        assert!(
+            !a.endpoint
+                .network_error(now, wrong, sequence, ntcp::NetworkError::SoftUnreachable)
+                .unwrap()
+        );
+        assert!(
+            !a.endpoint
+                .network_error(
+                    now,
+                    tuple,
+                    sequence.wrapping_add(1),
+                    ntcp::NetworkError::SoftUnreachable
+                )
+                .unwrap()
+        );
+        let mut feedback = ptb_frame(&synack);
+        feedback[21] = 1; // ICMP type3/code1: host unreachable, a soft error.
+        feedback[24..28].fill(0);
+        ptb_checksums(&mut feedback);
+        let decoded = ntcp_icmp::decode_icmp(&feedback).unwrap();
+        assert_eq!(
+            decoded.kind,
+            ntcp_icmp::FeedbackKind::DestinationUnreachable
+        );
+        assert_eq!(decoded.code, 1);
+        assert_eq!(decoded.quoted.sequence, sequence);
+        let hard = mode == "hard-core-control";
+        match mode {
+            "packet-admission" => {
+                a.execute(0, Op::Inject(feedback)).unwrap();
+                a.receive_batch(&mut vec![0; 65535]).unwrap();
+            }
+            "production-input" => a.input_ip(&feedback, ntcp::RxPacketTimestamps::default()),
+            "soft-core" | "hard-core-control" => {
+                // HardUnreachable is an API control, not a proposed mapping
+                // of host-unreachable code1. It proves the late-RST path.
+                assert!(
+                    a.endpoint
+                        .network_error(
+                            now,
+                            tuple,
+                            sequence,
+                            if hard {
+                                ntcp::NetworkError::HardUnreachable
+                            } else {
+                                ntcp::NetworkError::SoftUnreachable
+                            }
+                        )
+                        .unwrap()
+                );
+            }
+            _ => unreachable!(),
+        }
+        let mut reports = 0;
+        while let Some(event) = a.endpoint.next_event() {
+            if let ntcp::Event::PassiveError {
+                tuple: reported,
+                error,
+                ..
+            } = event
+            {
+                assert_eq!(reported, tuple);
+                assert_eq!(
+                    error,
+                    if hard {
+                        ntcp::NetworkError::HardUnreachable
+                    } else {
+                        ntcp::NetworkError::SoftUnreachable
+                    }
+                );
+                reports += 1;
+            }
+        }
+        assert_eq!(reports, 1); // Wire ingress and direct calls reach the same core report.
+        if hard {
+            assert!(a.endpoint.connection_id(tuple).is_none());
+        } else {
+            assert_eq!(a.endpoint.state(child).unwrap(), State::SynReceived);
+        }
+        tfo_no_output(&mut a);
+        let size = ntcp::wire::encode(
+            incoming,
+            ntcp::wire::Header {
+                source_port: remote.port(),
+                destination_port: local.port(),
+                sequence: 101,
+                acknowledgment: sequence.wrapping_add(1),
+                flags: ntcp::wire::ACK,
+                window: 32792,
+                urgent_pointer: 0,
+            },
+            &[],
+            &[],
+            &mut tcp,
+        )
+        .unwrap();
+        let ack = a
+            .frame(
+                ntcp::Transmit {
+                    tx_timestamp: None,
+                    connection: None,
+                    ip: incoming,
+                    len: size,
+                    hop_limit: 64,
+                    dscp: 0,
+                    ecn: 0,
+                    ipv4_options: Default::default(),
+                },
+                &tcp[..size],
+            )
+            .unwrap();
+        tfo_deliver(&mut a, ack);
+        if hard {
+            let reset = tfo_capture(&mut a);
+            assert_eq!(segment(&reset).header.flags, ntcp::wire::RST);
+            assert_eq!(segment(&reset).header.sequence, sequence.wrapping_add(1));
+            assert_eq!(
+                a.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap_err(),
+                EAGAIN
+            );
+        } else {
+            assert_eq!(a.endpoint.state(child).unwrap(), State::Established);
+            let accepted = a
+                .execute(listener, Op::Accept(SOCK_NONBLOCK))
+                .unwrap()
+                .value as u64;
+            assert_eq!(cid(&a, accepted), child);
+            let readable = a.endpoint.readable_bytes(child).unwrap();
+            a.service_egress().unwrap();
+            let mut responses = Vec::new();
+            while let Ok(packet) = a.execute(0, Op::Capture(65535)) {
+                let header = segment(&packet.bytes).header;
+                assert_eq!(header.flags & ntcp::wire::RST, 0);
+                responses.push((header.flags, header.acknowledgment));
+            }
+            eprintln!(
+                "ICMP_SYNRECV_CONTINUATION mode={mode} readable={readable} responses={responses:?}"
+            );
+            assert_eq!(a.execute(accepted, Op::Read(10)).unwrap().bytes, [0x42; 10]);
+        }
+        eprintln!(
+            "ICMP_SYNRECV mode={mode} code=1 decoded=true before=SynReceived after_error={} after_late_ack={} wrong_tuple_rejected=true wrong_sequence_rejected=true",
+            if hard { "Removed" } else { "SynReceived" },
+            if hard { "RST" } else { "Established" }
+        );
+    }
+}
+
+include!("runtime_icmp_tests.rs");

@@ -1,0 +1,40 @@
+// Test send-buffer-limited time in tcp_info for client side.
+// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.
+
+// Create a socket and set it to non-blocking.
+    0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
+   +0 fcntl(3, F_GETFL) = 0x2 (flags O_RDWR)
+   +0 fcntl(3, F_SETFL, O_RDWR|O_NONBLOCK) = 0
+
+   +0 connect(3, ..., ...) = -1 EINPROGRESS (Operation now in progress)
+   +0 > S 0:0(0) <mss 1460,sackOK,TS val 100 ecr 0,nop,wscale 8>
+ +.01 < S. 0:0(0) ack 1 win 10000 <mss 1000,sackOK,nop,nop,nop,wscale 8>
+   +0 > . 1:1(0) ack 1
+   +0 getsockopt(3, SOL_SOCKET, SO_ERROR, [0], [4]) = 0
+   +0 fcntl(3, F_SETFL, O_RDWR) = 0   // set back to blocking
+   +0 setsockopt(3, SOL_SOCKET, SO_SNDBUF, [10000], 4) = 0
+   +0 getsockopt(3, SOL_SOCKET, SO_SNDBUF, [20000], [4]) = 0
+
+ +.09...0.13 write(3, ..., 60000) = 60000
+
+ +.01 < . 1:1(0) ack 10001 win 10000
+
+ +.01 < . 1:1(0) ack 28001 win 10000
+
+// ntcp keeps 20000 payload bytes, and unpaced HyStart++ grows 10->18->26 MSS.
+// ACK 28001 permits a full 20000-byte flight with cwnd 26000 and a blocked writer.
+// Hold that genuinely buffer-starved state from 120ms until 140ms.
+// The realtime bound uses the existing 4ms packet-event tolerance; deterministic
+// replay checks exactly 20000us. Positive duration remains mandatory.
+ +.02 < . 1:1(0) ack 48001 win 10000
+
+// The final 12000 bytes fit and complete the 60000-byte blocking write.
+// At 150ms data is still outstanding, but the socket is no longer buffer-limited.
+ +.01 %{ assert 16000 <= tcpi_sndbuf_limited <= 24000, tcpi_sndbuf_limited; \
+     assert 49000 <= tcpi_busy_time <= 52000, tcpi_busy_time; \
+     assert 0 == tcpi_rwnd_limited, tcpi_rwnd_limited }%
+
+ +.02 < . 1:1(0) ack 60001 win 10000
+   +0 %{ assert 16000 <= tcpi_sndbuf_limited <= 24000, tcpi_sndbuf_limited;\
+     assert 69000 <= tcpi_busy_time <= 73000, tcpi_busy_time;\
+     assert 0 == tcpi_rwnd_limited, tcpi_rwnd_limited }%

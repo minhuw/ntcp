@@ -1,0 +1,294 @@
+{
+  "schema_version": 1,
+  "upstream_revision": "83f72d3f9085d0e26eb4d206fe4d7cfab5b6d872",
+  "scope": "The ntcp-ported suite exclusively owns these source-derived accounting tests. The upstream suite excludes these source identities from execution and result counts; the two suites use the same common transport profile.",
+  "scripts": {
+    "timestamping/partial.pkt": {
+      "source_sha256": "5a119eceac60170a8d3cc160c06ee272da119d63286ba1e1a9a87b992490038c",
+      "input_generated_sha256": "cf0d84113668ac68912d0d951d2fc66cabd6592af0d8d70d2ab36fdf4242d57f",
+      "fixture": "ntcp-expectations/timestamping/partial.pkt",
+      "fixture_sha256": "f28fb0ba798027bad1f95e0cbdbc3656a45bb812cf93a6982abda8cd0c21d0b7",
+      "rationale": "ntcp stores payload in a byte ring: SO_SNDBUF1000 becomes max(2*1000,4608)=4608 payload bytes, whereas Linux charges skb memory and this source expects2964. Exercise the same partial-write/last-byte timestamp contract using the native capacity.",
+      "changes": [
+        {
+          "field": "nonblocking write return",
+          "upstream": 2964,
+          "ntcp": 4608,
+          "derivation": "max(2*1000,4608); request10000 still exceeds capacity."
+        },
+        {
+          "field": "initial peer SYN window",
+          "upstream": 2000,
+          "ntcp": 1976,
+          "derivation": "2*(1000-12 timestamp option bytes); keep the initial receive window segment-aligned and avoid coupling timestamp assertions to Linux intermediate PUSH policy."
+        },
+        {
+          "field": "second outbound aggregate / final ACK",
+          "upstream": "1977:2965(988),ACK2965",
+          "ntcp": "1977:4609(2632),ACK4609",
+          "derivation": "Remaining4608-1976=2632 bytes; full-buffer finalization releases them after the20ms ACK."
+        },
+        {
+          "field": "all3 timestamp ee_data IDs",
+          "upstream": 2963,
+          "ntcp": 4607,
+          "derivation": "Last actually accepted byte:4608-1. SCHED/SND20ms,ACK30ms and RTT bounds unchanged."
+        }
+      ],
+      "invariants": [
+        "The write remains partial:4608 of10000, not a smaller full write.",
+        "Contiguous data is fully acknowledged; ACKs never cover unsent bytes.",
+        "All3 timestamp phases, option fields, packet payload and RTT assertions remain enabled.",
+        "The final application PUSH remains checked; no runtime/profile/timestamp-counter changes."
+      ]
+    },
+    "tcp_info/tcp-info-sndbuf-limited.pkt": {
+      "source_sha256": "b210842cadfbc6d0ce1fee19afb3790dc9b9fe8c1fe02673288a646e3239e644",
+      "input_generated_sha256": "0943bca391bead0d64d7d806c196afb51c50300dde35e503342d7501ad77fc92",
+      "fixture": "ntcp-expectations/tcp_info/tcp-info-sndbuf-limited.pkt",
+      "fixture_sha256": "8e8e4288eb7bdf6756352be6e7324179758c75fa123b79601003f6ac16d58c88",
+      "rationale": "ntcp SO_SNDBUF10000 is20000 payload bytes. Unpaced HyStart++ and this hard capacity send10k,18k,then20k flights; the Linux source ACK30001/70001/95001 runs ahead. Use a60000-byte blocking workload and valid ACKs while retaining a genuine20ms buffer-starvation interval.",
+      "changes": [
+        {
+          "field": "blocking write workload",
+          "upstream": 150000,
+          "ntcp": 60000,
+          "derivation": "48k queued by120ms; final12k becomes admissible on the140ms ACK. The write still blocks until buffer space is freed."
+        },
+        {
+          "field": "write return-time range",
+          "upstream": "+.09...0.14",
+          "ntcp": "+.09...0.13",
+          "derivation": "Relative to prior10ms event, start100ms and finish140ms, matching the smaller workload."
+        },
+        {
+          "field": "cumulative ACK timeline",
+          "upstream": "110ms:10001,120ms:30001,130ms:70001,150ms:95001,170ms:150001",
+          "ntcp": "110ms:10001,120ms:28001,140ms:48001,170ms:60001",
+          "derivation": "Actual transmitted frontiers under20k capacity and10->18->26 MSS growth. Counter snapshots remain150ms and170ms."
+        },
+        {
+          "field": "positive realtime sndbuf-limited bounds",
+          "upstream": [
+            19000,
+            21000
+          ],
+          "ntcp": [
+            16000,
+            24000
+          ],
+          "derivation": "Expected20ms plus/minus the existing4000us packet-event tolerance, including asynchronous owner copy/output transition. Deterministic replay checks exactly20000us; zero still fails."
+        }
+      ],
+      "invariants": [
+        "Buffer starvation is required, not replaced with zero or an application-limited workload.",
+        "The write remains blocking and exceeds the physical payload capacity.",
+        "Both busy-time ranges remain49000..52000 and69000..73000; rwnd-limited remains0.",
+        "All ACKs cover transmitted data; positive counter persists after the final ACK.",
+        "No runtime, congestion-control, counter or profile changes."
+      ]
+    }
+  },
+  "inventory": [
+    {
+      "script": "blocking/blocking-write.pkt",
+      "source_sha256": "92051dff53277fa0b39accb4e6b10289be21b6b1ce535b4e0cf67cf6c90643cd",
+      "symbols": [
+        "SO_SNDBUF"
+      ],
+      "disposition": "unsupported-setup-or-backend",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "cubic/cubic-bulk-166k-idle-restart.pkt",
+      "source_sha256": "854682928b07e3a4490246435c65ae3d4dfb96a97e489c5f6ade76f54f87cba3",
+      "symbols": [
+        "SO_SNDBUF"
+      ],
+      "disposition": "unsupported-setup-or-backend",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "cubic/cubic-bulk-166k.pkt",
+      "source_sha256": "f3c166fc79557070ea845274ab2d1ba5e2001c6eba007aaf7ce401519b2e4804",
+      "symbols": [
+        "SO_SNDBUF"
+      ],
+      "disposition": "unsupported-setup-or-backend",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "cubic/cubic-hystart-delay-min-rtt-jumps-downward.pkt",
+      "source_sha256": "07e4ecdffa40645fda09939091314b709716946d8e8954e84c35f236f0aa1e13",
+      "symbols": [
+        "SO_SNDBUF"
+      ],
+      "disposition": "unsupported-setup-or-backend",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "cubic/cubic-hystart-delay-rtt-jumps-upward.pkt",
+      "source_sha256": "ea1f72a4d09f9598619bda2c457d7c60ad0d07406d64cafa16f8093cce42421f",
+      "symbols": [
+        "SO_SNDBUF"
+      ],
+      "disposition": "unsupported-setup-or-backend",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "cubic/cubic-rto-ss-ca-cwnd-bump.pkt",
+      "source_sha256": "edd82fda961653e95c57eba7db52da66eaa69bfb6ea7d0c0dc5d2da95c150d02",
+      "symbols": [
+        "SO_SNDBUF"
+      ],
+      "disposition": "unchanged-accepted-other-cause",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "epoll/epoll_out_edge.pkt",
+      "source_sha256": "9b19fb287c49efbeecf90f5a2a75eedbb1bc3ce3b91772b0c7c4b684bdbdcd24",
+      "symbols": [
+        "TCP_NOTSENT_LOWAT"
+      ],
+      "disposition": "unsupported-setup-or-backend",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "epoll/epoll_out_edge_default_notsent_lowat.pkt",
+      "source_sha256": "dfef6226aa011c2ddc8676d8a448ff3ff6f7668e06edde4f6469011ff0fca15b",
+      "symbols": [
+        "TCP_NOTSENT_LOWAT"
+      ],
+      "disposition": "unsupported-setup-or-backend",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "epoll/epoll_out_edge_notsent_lowat.pkt",
+      "source_sha256": "1c92e45e15289838e41e562c41c214071b1c9a196e4e2df9015893578d776ba2",
+      "symbols": [
+        "TCP_NOTSENT_LOWAT"
+      ],
+      "disposition": "unsupported-setup-or-backend",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "notsent_lowat/notsent-lowat-default.pkt",
+      "source_sha256": "b96dc3e7a6bc4d4f7369895120c77503cb94c18f18bccc4e9e8b5ee15903ac87",
+      "symbols": [
+        "TCP_NOTSENT_LOWAT"
+      ],
+      "disposition": "unsupported-setup-or-backend",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "notsent_lowat/notsent-lowat-setsockopt.pkt",
+      "source_sha256": "44d8b348c0044c61b2d8d1cac518f912664123257a1996779243c53e3c0fe255",
+      "symbols": [
+        "TCP_NOTSENT_LOWAT"
+      ],
+      "disposition": "unchanged-original-expectations",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "notsent_lowat/notsent-lowat-sysctl.pkt",
+      "source_sha256": "1eccbbf8187a17b6852bb588a5d9136a4c16faea9c4482eb4c58ab336154bc6d",
+      "symbols": [
+        "TCP_NOTSENT_LOWAT",
+        "tcp_notsent_lowat"
+      ],
+      "disposition": "unchanged-original-expectations",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "slow_start/slow-start-ack-per-1pkt.pkt",
+      "source_sha256": "e9dacd1681931bf596488922f3c8e2a01ef54b61aa2fd7475b04c468bc34705f",
+      "symbols": [
+        "SO_SNDBUF"
+      ],
+      "disposition": "unsupported-setup-or-backend",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "slow_start/slow-start-ack-per-2pkt.pkt",
+      "source_sha256": "d6dc649547109b44e4d8262ff48f6af28e81a31639b871c52d551302006cb571",
+      "symbols": [
+        "SO_SNDBUF"
+      ],
+      "disposition": "unsupported-setup-or-backend",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "slow_start/slow-start-ack-per-4pkt.pkt",
+      "source_sha256": "5acfc60f7682a1c51601e084090f8b21807d3d0c1f2154b1798f51f951386f06",
+      "symbols": [
+        "SO_SNDBUF"
+      ],
+      "disposition": "unsupported-setup-or-backend",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "slow_start/slow-start-after-idle.pkt",
+      "source_sha256": "e6aa937a156e292148011c1e13897b6f36d532a7c219c88747511010823452fe",
+      "symbols": [
+        "SO_SNDBUF"
+      ],
+      "disposition": "unsupported-setup-or-backend",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "slow_start/slow-start-after-win-update.pkt",
+      "source_sha256": "33ad8bd05e7e892114447e54bc10c8abd2f6f2f4a496b5ba69b1a561d153ff21",
+      "symbols": [
+        "SO_SNDBUF"
+      ],
+      "disposition": "unsupported-setup-or-backend",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "slow_start/slow-start-app-limited-9-packets-out.pkt",
+      "source_sha256": "278d947ade76d63bf8f1fbb8ee3374e7815b05f4e7fdb17f8391edd9f0c4fbc9",
+      "symbols": [
+        "SO_SNDBUF"
+      ],
+      "disposition": "unchanged-accepted-other-cause",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "slow_start/slow-start-app-limited.pkt",
+      "source_sha256": "7c486a28882c3c2748e1b9c5771052b2c947da38032438e5214249f767b9c7a0",
+      "symbols": [
+        "SO_SNDBUF"
+      ],
+      "disposition": "unchanged-original-expectations",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "slow_start/slow-start-fq-ack-per-2pkt.pkt",
+      "source_sha256": "cc58c3e67eeefe30228d4f0815279e14f87fd4377034a8ed5b5a9b648bf205dc",
+      "symbols": [
+        "SO_SNDBUF"
+      ],
+      "disposition": "unsupported-setup-or-backend",
+      "owner_suite": "upstream"
+    },
+    {
+      "script": "tcp_info/tcp-info-sndbuf-limited.pkt",
+      "source_sha256": "b210842cadfbc6d0ce1fee19afb3790dc9b9fe8c1fe02673288a646e3239e644",
+      "symbols": [
+        "SO_SNDBUF",
+        "tcpi_sndbuf_limited"
+      ],
+      "disposition": "ntcp-accounting-expectation",
+      "owner_suite": "ntcp-ported"
+    },
+    {
+      "script": "timestamping/partial.pkt",
+      "source_sha256": "5a119eceac60170a8d3cc160c06ee272da119d63286ba1e1a9a87b992490038c",
+      "symbols": [
+        "SO_SNDBUF"
+      ],
+      "disposition": "ntcp-accounting-expectation",
+      "owner_suite": "ntcp-ported"
+    }
+  ]
+}

@@ -286,7 +286,7 @@ impl<'a> Pending<'a> {
             Err(e) => return self.rejected(endpoint, Rejection::Preflight(e)),
         }
         match io.transmit_segmented(self.bytes, self.request) {
-            Ok(TxOutcome::WouldBlock) => Submission::WouldBlock(self),
+            Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => Submission::WouldBlock(self),
             Ok(TxOutcome::Submitted) => match endpoint.accept_transmit_group(clock(), self.group) {
                 Ok(true) => Submission::Submitted(self.charge),
                 Ok(false) => Submission::Quarantined(self.quarantine(QuarantineReason::StaleToken)),

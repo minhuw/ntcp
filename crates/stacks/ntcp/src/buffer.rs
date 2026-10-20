@@ -197,6 +197,15 @@ pub(crate) struct ReceiveBuffer {
     dsack: Option<(Seq, Seq)>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ReceiveOutputUndo {
+    reported: [Option<Seq>; 4],
+    dsack: Option<(Seq, Seq)>,
+    report_debt: usize,
+    pending_first: Option<Seq>,
+    pending_byte: Option<(usize, u8)>,
+}
+
 impl ReceiveBuffer {
     pub(crate) fn new(start: Seq, capacity: usize) -> Result<Self, ()> {
         if capacity == 0 || capacity >= 1usize << 31 {
@@ -546,6 +555,35 @@ impl ReceiveBuffer {
             offset = right;
         }
         blocks
+    }
+
+    pub(crate) fn output_undo(&self) -> ReceiveOutputUndo {
+        let pending_byte = self
+            .report_anchor()
+            .filter(|&seq| self.pending(seq))
+            .map(|seq| {
+                let index = self.index(seq.distance_from(self.read_base) as usize) / 8;
+                (index, self.report_pending[index])
+            });
+        ReceiveOutputUndo {
+            reported: self.reported,
+            dsack: self.dsack,
+            report_debt: self.report_debt,
+            pending_first: self.pending_first,
+            pending_byte,
+        }
+    }
+
+    // Output consumes at most one pending anchor. Reservation ownership excludes
+    // input/read mutation, so restoring that byte and fixed report metadata is exact.
+    pub(crate) fn restore_output(&mut self, undo: ReceiveOutputUndo) {
+        self.reported = undo.reported;
+        self.dsack = undo.dsack;
+        self.report_debt = undo.report_debt;
+        self.pending_first = undo.pending_first;
+        if let Some((index, value)) = undo.pending_byte {
+            self.report_pending[index] = value;
+        }
     }
 
     // Called only after a SACK-bearing packet has been successfully encoded.

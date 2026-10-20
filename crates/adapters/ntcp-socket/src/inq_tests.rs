@@ -153,7 +153,7 @@ fn shared_abi_inq_timestamp_gate_staging_alias_fault_and_eof() {
     }
     packet_test::start((
         Ipv4Addr::new(192, 0, 2, 1),
-        packet_profile::Profile::UpstreamBasic,
+        upstream_inq_tests("immediate-ack,abort-with-ack,coalesce-read-window"),
     ))
     .unwrap();
     let scenario = std::env::var(CHILD).unwrap();
@@ -355,7 +355,7 @@ fn splice_stops_at_urgent_octet_without_consuming_it() {
     }
     packet_test::start((
         Ipv4Addr::new(192, 0, 2, 1),
-        packet_profile::Profile::UpstreamBasic,
+        upstream_inq_tests("immediate-ack,abort-with-ack,coalesce-read-window"),
     ))
     .unwrap();
     unsafe {
@@ -432,7 +432,7 @@ fn lowat_shared_alias_partial_write() {
     }
     packet_test::start((
         Ipv4Addr::new(192, 0, 2, 1),
-        packet_profile::Profile::UpstreamBasic,
+        upstream_inq_tests("immediate-ack,abort-with-ack,coalesce-read-window"),
     ))
     .unwrap();
     unsafe {
@@ -466,7 +466,11 @@ fn lowat_shared_alias_partial_write() {
             0
         );
         assert_eq!(observed, lowat);
-        assert_eq!(send(fd, b"abc".as_ptr().cast(), 3, MSG_MORE), 1);
+        assert_eq!(send(fd, b"abc".as_ptr().cast(), 3, MSG_MORE), 3);
+        assert_eq!(send(alias, b"x".as_ptr().cast(), 1, MSG_MORE), 1);
+        let fill = vec![7u8; 65535];
+        let tail = send(fd, fill.as_ptr().cast(), fill.len(), MSG_MORE);
+        assert!(tail > 0 && tail < fill.len() as isize);
         assert_eq!(send(alias, b"x".as_ptr().cast(), 1, MSG_MORE), -1);
         assert_eq!(errno(), EAGAIN);
         let unlimited = 0u32; // Socket zero still resolves to its default, UINT_MAX.
@@ -594,7 +598,7 @@ fn global_lowat_alias_writes_poll_epoll_and_drain() {
     }
     packet_test::start((
         Ipv4Addr::new(192, 0, 2, 1),
-        packet_profile::Profile::UpstreamGlobalLowat,
+        upstream_inq_tests("lowat4000,immediate-ack,coalesce-read-window"),
     ))
     .unwrap();
     unsafe {
@@ -675,14 +679,17 @@ fn global_lowat_alias_writes_poll_epoll_and_drain() {
         assert_eq!(writev(alias, &iov, 1), 1);
         poll(0); // Half-threshold hysteresis starts at exactly 2000.
         edges(0);
+        let fill = vec![7u8; 65535];
         let mut iov = iovec {
-            iov_base: bytes.as_ptr().cast_mut().cast(),
-            iov_len: bytes.len(),
+            iov_base: fill.as_ptr().cast_mut().cast(),
+            iov_len: fill.len(),
         };
         let mut message: msghdr = std::mem::zeroed();
         message.msg_iov = &mut iov;
         message.msg_iovlen = 1;
-        assert_eq!(sendmsg(fd, &message, MSG_MORE), 2000);
+        let tail = sendmsg(fd, &message, MSG_MORE);
+        assert!(tail > 2000 && tail < fill.len() as isize);
+        let queued = 2000 + tail as usize;
         assert_eq!(send(alias, bytes.as_ptr().cast(), 1, MSG_MORE), -1);
         assert_eq!(errno(), EAGAIN);
         poll(0);
@@ -715,16 +722,19 @@ fn global_lowat_alias_writes_poll_epoll_and_drain() {
         h.window = 65535;
         inject(h, TS, &[]);
         let mut sent = 0;
-        while sent < 4000 {
+        while sent < queued {
             let packet = capture();
             let frame = packet_profile::parse_frame(&packet).unwrap();
-            sent += ntcp::wire::parse(frame.ip, frame.payload)
-                .unwrap()
-                .payload
-                .len();
+            let segment = ntcp::wire::parse(frame.ip, frame.payload).unwrap();
+            sent += segment.payload.len();
+            h.acknowledgment = segment
+                .header
+                .sequence
+                .wrapping_add(segment.payload.len() as u32);
+            inject(h, TS, &[]);
         }
-        assert_eq!(sent, 4000);
-        poll(2); // Transmit progress, without an ACK, restores both aliases.
+        assert_eq!(sent, queued);
+        poll(2); // Draining the queued batches restores both aliases.
         edges(2);
         edges(0);
         assert_eq!(close(epfd), 0);
@@ -732,4 +742,14 @@ fn global_lowat_alias_writes_poll_epoll_and_drain() {
         assert_eq!(close(fd), 0);
     }
     packet_test::stop();
+}
+
+fn upstream_inq_tests(options: &str) -> crate::packet_profile::Profile {
+    crate::packet_profile::profile(&format!(
+        "upstream,local=192.0.2.1{}{}",
+        if options.is_empty() { "" } else { "," },
+        options
+    ))
+    .unwrap()
+    .1
 }

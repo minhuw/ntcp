@@ -27,6 +27,7 @@ struct State {
     receives: usize,
     capacity: usize,
     block: bool,
+    reject: bool,
     block_port: Option<u16>,
     block_after: Option<(u16, usize)>,
     rx_stamps: PacketTimestamps,
@@ -82,6 +83,9 @@ impl PacketIo for Fixture {
         if let Some(error) = state.output_error {
             return Err(error.into());
         }
+        if state.reject {
+            return Ok(TxOutcome::Rejected);
+        }
         // Model native packet syscall EINTR: no packet or timestamp consumed.
         if state.interrupted
             || state.block
@@ -118,6 +122,9 @@ impl PacketIo for Fixture {
         }
         if let Some(error) = state.error {
             return Err(error.into());
+        }
+        if state.reject {
+            return Ok(TxOutcome::Rejected);
         }
         // Model native packet syscall EINTR: no packet or timestamp consumed.
         if state.interrupted
@@ -2487,4 +2494,8 @@ fn software_gso_cpu_sample() {
             gso.is_some()
         );
     }
+}
+
+mod local_repair {
+    include!("runtime_local_repair_tests.rs");
 }

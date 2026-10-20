@@ -12,7 +12,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from run import (ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
+from expectations import PORTED_SCRIPTS
+
+from run import (SLOW_START_ACK_SCRIPTS, FASTOPEN_CLIENT_SCRIPTS, NON_TFO_SETUP_COMMANDS, ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
                  fixture_command, HERE, PIN, adapt_source, check_plugin_hash, invoke, main, outcome,
                  preflight, profile_metadata, select_cases, variants, verify_backend)
 
@@ -300,7 +302,7 @@ class SelectionChecks(unittest.TestCase):
     def test_selection_combinations_and_exclusion_reasons(self):
         directory = Path('/tests')
         scripts = [directory / name for name in ('basic.pkt', 'only-v4.pkt', 'only-v6.pkt')]
-        for suite in ('upstream', 'adapted'):
+        for suite in ('upstream-raw', 'upstream'):
             for variant_filter, script_filter, expected in (
                 (None, None, 6),
                 (['ipv4'], None, 2),
@@ -332,13 +334,13 @@ class SelectionChecks(unittest.TestCase):
         scripts = [directory / 'only-v6.pkt']
         for suite, variant_filter, script_filter in (
             ('smoke', ['ipv4'], None),
-            ('upstream', ['native-ipv4'], None),
-            ('adapted', ['unknown'], None),
-            ('upstream', [''], None),
-            ('upstream', [], None),
-            ('upstream', ['ipv4'], ['only-v6.pkt']),
-            ('upstream', None, []),
-            *[('upstream', None, [name]) for name in
+            ('upstream-raw', ['native-ipv4'], None),
+            ('upstream', ['unknown'], None),
+            ('upstream-raw', [''], None),
+            ('upstream-raw', [], None),
+            ('upstream-raw', ['ipv4'], ['only-v6.pkt']),
+            ('upstream-raw', None, []),
+            *[('upstream-raw', None, [name]) for name in
               ('', 'missing.pkt', '*.pkt', '/tests/only-v6.pkt',
                './only-v6.pkt', '../tests/only-v6.pkt', 'only-v6.pkt/')],
         ):
@@ -348,7 +350,16 @@ class SelectionChecks(unittest.TestCase):
         with self.assertRaises(ValueError):
             select_cases([], directory, 'smoke')
 
-    def test_main_smoke_and_upstream_reporting_status_and_argument_errors(self):
+    def test_old_adapted_suite_is_rejected(self):
+        with patch.object(sys, 'argv', ['run.py', '--checkout', '/unused',
+                                        '--suite', 'adapted']), \
+                patch('run.check_checkout') as check:
+            with self.assertRaises(SystemExit) as error:
+                main()
+            self.assertEqual(error.exception.code, 2)
+            check.assert_not_called()
+
+    def test_main_smoke_and_upstream_raw_reporting_status_and_argument_errors(self):
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary)
             runner = checkout / PIN['runner']
@@ -358,7 +369,7 @@ class SelectionChecks(unittest.TestCase):
             plugin = checkout / 'plugin.so'
             plugin.write_text('plugin')
             report = checkout / 'report.json'
-            for suite in ('smoke', 'sack', 'upstream'):
+            for suite in ('smoke', 'sack', 'upstream-raw'):
                 native = suite in ('smoke', 'sack')
                 directory = checkout / ('sack-tests' if suite == 'sack' else
                                         'tests' if suite == 'smoke' else PIN['tcp_tests'])
@@ -385,6 +396,11 @@ class SelectionChecks(unittest.TestCase):
                                 side_effect=[(0, False, ''), (code, expired, log)]) as execute:
                             self.assertEqual(main(), 0 if status == 'passed' else 1)
                         data = json.loads(report.read_text())
+                        self.assertEqual(data['suite'], suite)
+                        self.assertEqual(data['results'][0]['suite'], suite)
+                        self.assertFalse(data['results'][0]['adapted'])
+                        self.assertNotIn('adaptation', data['results'][0])
+                        self.assertNotIn('adaptation_manifest_sha256', data)
                         self.assertEqual(data['socket_backend'], 'ntcp-socket')
                         self.assertEqual(data['plugin_sha256'], hashlib.sha256(plugin.read_bytes()).hexdigest())
                         self.assertEqual(data['results'][0]['effective_flags']['profile'],
@@ -439,7 +455,11 @@ class SelectionChecks(unittest.TestCase):
                     self.assertEqual(data['selected_total'], data['eligible_total'])
                     self.assertEqual(data['excluded_cases'], [])
                     self.assertEqual(data['selection'], {'variants': None, 'scripts': None})
-                    if suite == 'upstream':
+                    if suite == 'upstream-raw':
+                        self.assertEqual(data['coverage'], {
+                            'selected_script_files': 2, 'upstream_script_files': 2,
+                            'selection': 'all_tracked_upstream_scripts'})
+                        self.assertTrue(all(not row['adapted'] for row in data['results']))
                         self.assertEqual(data['counts'], {'passed': 2, 'unsupported': 4})
                         self.assertEqual(data['behavior_executed'], 2)
                     with patch.object(sys, 'argv', argv + filters), \
@@ -460,6 +480,22 @@ class SelectionChecks(unittest.TestCase):
                             execute.assert_not_called()
 
 
+TFO26 = [
+    'fastopen/client/' + name + '.pkt' for name in (
+        'blocking-connect-bypass-errno', 'blocking-connect-bypass',
+        'blocking-sendmsg-multi-iov', 'blocking-sendto-errnos', 'blocking-sendto',
+        'cookie-req-timeout', 'fastopen-connect-keepalive', 'nonblocking-connect-bypass',
+        'nonblocking-sendmsg-multi-iov', 'nonblocking-sendto-empty-buf',
+        'nonblocking-sendto-over-mss', 'poll', 'sendto-af-unspec',
+        'simultaneous-fast-open', 'syn-data-icmp-unreach-frag-needed',
+        'syn-data-icmp-unreach-frag-needed-with-seq', 'syn-data-rtt-from-syn-data',
+        'syn-data-timeout', 'valid-cookie-format')
+] + ['fastopen/server/' + name + '.pkt' for name in (
+    'basic-non-tfo-listener', 'icmp-baseline', 'opt34/basic-non-tfo-listener',
+    'opt34/fin-close-socket', 'opt34/reset-after-accept', 'opt34/reset-before-accept')
+] + ['syscall_bad_arg/fastopen-invalid-buf-ptr.pkt']
+
+
 class AdaptationChecks(unittest.TestCase):
     def setUp(self):
         mock_backend(self)
@@ -476,7 +512,8 @@ class AdaptationChecks(unittest.TestCase):
         for name, entry in self.manifest['scripts'].items():
             if name in ('nagle/https_client.pkt', 'notsent_lowat/notsent-lowat-sysctl.pkt',
                         'syscall_bad_arg/fastopen-invalid-buf-ptr.pkt') or name in (
-                            LINUX_COOKIE_SCRIPTS | FASTOPEN_PMTUD_SCRIPTS | ADAPTIVE_ACK_SCRIPTS):
+                            LINUX_COOKIE_SCRIPTS | FASTOPEN_PMTUD_SCRIPTS | ADAPTIVE_ACK_SCRIPTS
+                            | FASTOPEN_CLIENT_SCRIPTS | NON_TFO_SETUP_COMMANDS.keys() | SLOW_START_ACK_SCRIPTS):
                 path = self.directory / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 source = self.source.replace(b'`../common/defaults.sh`\n', entry['command_line'].encode())
@@ -494,6 +531,7 @@ class AdaptationChecks(unittest.TestCase):
             entry.pop('additional_setup_files', None)
             entry.pop('fixture', None)
             entry['command_line'] = '`../common/defaults.sh`\n'
+            entry['replacement_line'] = '// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n'
             entry['expected_command_count'] = 1
             path = self.directory / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -537,6 +575,7 @@ class AdaptationChecks(unittest.TestCase):
             entry['command_line'] = '`../common/defaults.sh`\n'
 
     def test_inline_ecn_enablement_requires_exact_hash_and_profile(self):
+        self.name = 'ecn/ecn-uses-ect0.pkt'
         entry = self.manifest['scripts'][self.name]
         command = ('`../common/defaults.sh\n'
                    'sysctl -q net.ipv4.tcp_ecn=1  # fully enabled\n`\n')
@@ -545,8 +584,8 @@ class AdaptationChecks(unittest.TestCase):
         entry.update(command_line=command,
                      source_sha256=hashlib.sha256(original).hexdigest(),
                      command_sha256=hashlib.sha256(command.encode()).hexdigest(),
-                     adapter_flags='upstream-ecn,local=192.168.0.1')
-        entry['mapping']['ntcp_settings']['ecn'] = True
+                     adapter_flags='upstream,local=192.168.0.1,ecn')
+        entry['mapping']['ntcp_settings'] = profile_metadata(entry['adapter_flags'])
         flags = entry['adapter_flags']
         generated, _ = adapt_source(self.directory, self.name, self.manifest, flags)
         self.assertEqual(generated, original.replace(command.encode(),
@@ -602,7 +641,7 @@ class AdaptationChecks(unittest.TestCase):
                 patch('run.subprocess.check_output', return_value=tracked), \
                 patch('run.invoke') as execute, patch.object(sys, 'argv',
                     ['run.py', '--checkout', str(checkout), '--plugin', str(plugin),
-                     '--suite', 'adapted', '--variant', 'ipv4', '--script', self.name,
+                     '--suite', 'upstream', '--variant', 'ipv4', '--script', self.name,
                      '--report', str(report)]):
             self.assertEqual(main(), 1)
             execute.assert_not_called()
@@ -660,7 +699,7 @@ class AdaptationChecks(unittest.TestCase):
         tracked = '\0'.join(str(Path(PIN['tcp_tests']) / name)
                             for name in self.manifest['scripts'])
         argv = ['run.py', '--checkout', str(checkout), '--plugin', str(plugin),
-                '--suite', 'adapted', '--variant', 'ipv4', '--script', self.name,
+                '--suite', 'upstream', '--variant', 'ipv4', '--script', self.name,
                 '--report', str(report)]
         provenance = {'audited': True}
         with patch('run.HERE', manifest_dir), \
@@ -686,7 +725,7 @@ class AdaptationChecks(unittest.TestCase):
                     execute.assert_not_called()
                     self.assertFalse(data['all_passed'])
                 else:
-                    self.assertEqual('--code_sockopt=TCP_INFO' in execute.call_args.args[0], override)
+                    self.assertEqual('--code_sockopt=TCP_INFO_PREFIX' in execute.call_args.args[0], override)
                 if not override:
                     audit.assert_not_called()
             # A changed artifact must abort before/after both dry-run and behavior.
@@ -730,60 +769,53 @@ class AdaptationChecks(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     adapt_source(self.directory, self.name, self.manifest, self.flags)
 
-    def test_upstream_sack_mapping_declares_legacy_not_rfc_crb(self):
-        for entry in self.manifest['scripts'].values():
-            if entry['adapter_flags'].startswith('upstream-sack,'):
-                self.assertEqual(entry['mapping']['ntcp_settings']['prr'], 'LegacyInitialCredit')
-                self.assertTrue(any('not claimed to conform to RFC 6937 or RFC 9937' in reason
-                                    for reason in entry['mapping']['reasons']))
-
-    def test_only_four_prr_mappings_select_real_cubic_and_test_only_unpaced_prr(self):
-        names = {
-            'fast_recovery/prr-ss-10pkt-lost-1.pkt',
-            'fast_recovery/prr-ss-30pkt-lost-1_4-11_16.pkt',
-            'fast_recovery/prr-ss-30pkt-lost1_4.pkt',
-            'fast_recovery/prr-ss-ack-below-snd_una-cubic.pkt',
-        }
-        entries = {name: entry for name, entry in self.manifest['scripts'].items()
-                   if name.startswith('fast_recovery/')
-                   and entry['adapter_flags'].startswith('upstream-cubic,')}
-        self.assertEqual(set(entries), names)
-        for entry in entries.values():
-            self.assertEqual(entry['adapter_flags'], 'upstream-cubic,local=192.168.0.1')
-            self.assertEqual(entry['mapping']['ntcp_settings'], {
-                'sack': True, 'timestamps': True, 'initial_window': 'Iw10',
-                'rack': True, 'prr': 'Rfc9937', 'prr_pacing': False, 'tlp': True,
-                'rto_min_us': 200000, 'preallocate_connections': 1,
-                'receive_capacity': 8388608, 'ecn': False, 'congestion_control': 'Cubic',
-                'output_push_batch_segments': 2,
-                'cubic_hystart': True, 'cubic_fast_convergence': True,
-                'endpoint_max_buffer_bytes': 134217728,
-            })
-            self.assertIn('full Linux recovery equivalence and conformance are not claimed',
-                          entry['mapping']['claim'])
-            self.assertIn('test-only pacing exception', entry['mapping']['claim'])
-            reason = entry['mapping']['reasons'][0]
-            for policy in ('unpublished isolated-test profile', 'same-time Linux aggregated bursts',
-                           'section 6.4 RECOMMENDED pacing', 'delivery, credit and exit equations',
-                           'core default stays paced'):
-                self.assertIn(policy, reason)
+    def test_every_mapping_resolves_common_unpaced_cubic_and_rfc9937(self):
+        from run import UPSTREAM_BASELINE_REASON, UPSTREAM_OPTION_AUDIT, upstream_flags
+        for name, entry in self.manifest['scripts'].items():
+            settings = profile_metadata(entry['adapter_flags'])
+            self.assertEqual(entry['adapter_flags'], upstream_flags(name))
+            self.assertEqual(entry['mapping']['ntcp_settings'], profile_metadata(entry['adapter_flags']))
+            self.assertEqual(entry['mapping']['option_reasons'], UPSTREAM_OPTION_AUDIT.get(name, {}))
+            self.assertEqual(entry['mapping']['reasons'][0], UPSTREAM_BASELINE_REASON)
+            self.assertEqual(settings['adaptive_ack'], 'immediate-ack' not in settings['options'])
+            self.assertEqual(settings['delayed_ack_us'], 0 if 'immediate-ack' in settings['options'] else 200000)
+            self.assertEqual(settings['initial_ack_timeout_us'], 40000)
+            self.assertTrue(settings['coalesce_read_window_updates'])
+            self.assertEqual(settings['profile'], 'upstream')
+            self.assertEqual(settings['congestion_control'], 'Cubic')
+            self.assertEqual(settings['prr'], 'Rfc9937')
+            self.assertFalse(settings['general_pacing'])
+            self.assertFalse(settings['prr_pacing'])
+            self.assertTrue(settings['cubic_hystart'])
+            self.assertTrue(settings['cubic_fast_convergence'])
+            self.assertIsNone(settings['pacing_config'])
+            self.assertEqual(set(settings['options']), set(entry['mapping']['option_reasons']))
             self.assertTrue(entry['mapping']['assertions_preserved'])
-            self.assertNotIn('blocked_reasons', entry)
 
+    def test_consistent_manifest_cannot_smuggle_unaudited_options(self):
+        name = 'tcp_info/tcp-info-sndbuf-limited.pkt'
+        for token in ('reno', 'paced', 'legacy-prr', 'linux-cookie', 'pmtud1500', 'adaptive-ack'):
+            manifest = copy.deepcopy(self.manifest)
+            entry = manifest['scripts'][name]
+            entry['adapter_flags'] += ',' + token
+            entry['mapping']['ntcp_settings'] = profile_metadata(entry['adapter_flags'])
+            entry['mapping']['option_reasons'][token] = 'unaudited policy'
+            with self.subTest(token=token), self.assertRaisesRegex(ValueError, 'per-case audit'):
+                adapt_source(self.directory, name, manifest, entry['adapter_flags'])
 
-    def test_only_cubic_mappings_use_128_mib_budget(self):
-        for entry in self.manifest['scripts'].values():
-            cubic = entry['adapter_flags'].split(',')[0] in {'upstream-cubic', 'upstream-cubic-ecn'}
+    def test_resource_options_are_independent_of_congestion(self):
+        large = {'cubic/cubic-rto-ss-ca-cwnd-bump.pkt',
+                 'slow_start/slow-start-app-limited-9-packets-out.pkt',
+                 'slow_start/slow-start-app-limited.pkt'} | SLOW_START_ACK_SCRIPTS
+        self.assertEqual({name for name, entry in self.manifest['scripts'].items()
+                          if 'budget128m' in entry['adapter_flags'].split(',')}, large)
+        for name, entry in self.manifest['scripts'].items():
             settings = entry['mapping']['ntcp_settings']
-            if cubic or 'endpoint_max_buffer_bytes' in settings:
-                self.assertEqual(settings['endpoint_max_buffer_bytes'],
-                                 134217728 if cubic else 234881024
-                                 if entry['adapter_flags'].split(',')[0] in
-                                 {'upstream-fastopen', 'upstream-fastopen-linux-cookie',
-                                  'upstream-fastopen-pmtud', 'upstream-fastopen-adaptive-ack'} else 33554432)
-            if cubic:
-                self.assertTrue(any('bounded 128 MiB aggregate buffer budget' in reason
-                                    for reason in entry['mapping']['reasons']))
+            self.assertEqual(settings['endpoint_max_buffer_bytes'],
+                             (128 if 'budget128m' in settings['options'] else
+                              224 if 'budget224m' in settings['options'] else 32) * 1024 * 1024)
+            self.assertEqual(settings['preallocate_connections'],
+                             3 if 'prealloc3' in settings['options'] else 1)
 
     def test_congestion_basic_selection_and_diagnostic_profiles(self):
         manifest = json.loads((HERE / 'adaptations.json').read_text())
@@ -793,24 +825,23 @@ class AdaptationChecks(unittest.TestCase):
         self.assertTrue(set(selection) <= manifest['scripts'].keys())
         cubic = {name for name, entry in manifest['scripts'].items()
                  if not name.startswith('fast_recovery/')
-                 and entry['adapter_flags'].startswith('upstream-cubic,')
+                 and (name.startswith(('cubic/', 'slow_start/')) or name == 'cwnd_moderation/cwnd-moderation-disorder-no-moderation.pkt')
                  and not entry.get('blocked_reasons')}
-        self.assertEqual(cubic, DEFAULTS_ONLY_CUBIC)
-        settings = manifest['scripts']['fast_recovery/prr-ss-10pkt-lost-1.pkt']['mapping']['ntcp_settings']
+        self.assertEqual(cubic, DEFAULTS_ONLY_CUBIC | SLOW_START_ACK_SCRIPTS)
         for name in DEFAULTS_ONLY_CUBIC:
             entry = manifest['scripts'][name]
-            self.assertEqual(entry['mapping']['ntcp_settings'], settings)
+            self.assertEqual(entry['mapping']['ntcp_settings'], profile_metadata(entry['adapter_flags']))
             self.assertTrue(entry['embedded_tcp_info'])
             self.assertEqual(entry['expected_command_count'], 1)
             self.assertEqual(entry['command_line'], '`../common/defaults.sh`\n')
             self.assertTrue(entry['mapping']['assertions_preserved'])
             self.assertFalse(entry['mapping']['linux_defaults_reproduced'])
         blocked = {name for name in selection if manifest['scripts'][name].get('blocked_reasons')}
-        self.assertEqual(blocked, (set(CONGESTION18) - DEFAULTS_ONLY_CUBIC - {PASSIVE_CUBIC_ECN}) | {
+        self.assertEqual(blocked, (set(CONGESTION18) - DEFAULTS_ONLY_CUBIC - SLOW_START_ACK_SCRIPTS - {PASSIVE_CUBIC_ECN}) | {
             'blocking/blocking-write.pkt',
         })
         copied = manifest['scripts']['syscall_bad_arg/sendmsg-empty-iov.pkt']
-        self.assertEqual(copied['adapter_flags'], 'upstream-basic,local=192.168.0.1')
+        self.assertEqual(copied['adapter_flags'], 'upstream,local=192.168.0.1')
         self.assertNotIn('blocked_reasons', copied)
         self.assertIn('copied-fallback MSG_ZEROCOPY', copied['mapping']['claim'])
         self.assertTrue(copied['mapping']['assertions_preserved'])
@@ -823,25 +854,19 @@ class AdaptationChecks(unittest.TestCase):
                                  command['sha256'])
                 self.assertIn('Unavailable:', command['semantic_mapping'])
 
-    def test_buffer_reasons_describe_shared_capacity_without_enabling_blocked_setup(self):
+    def test_explicit_resource_reasons_do_not_enable_blocked_setup(self):
         manifest = json.loads((HERE / 'adaptations.json').read_text())
         self.assertNotIn('no SO_SNDBUF mapping', json.dumps(manifest))
+        reasons = [entry['mapping']['option_reasons']['budget128m']
+                   for entry in manifest['scripts'].values()
+                   if 'budget128m' in entry['mapping']['option_reasons']]
+        self.assertEqual(len(reasons), 6)
+        self.assertTrue(all('SO_SNDBUF=200000' in reason and 'staged' in reason for reason in reasons))
         for entry in manifest['scripts'].values():
-            reasons = [r for r in entry['mapping'].get('reasons', [])
-                       if 'Shared ntcp-socket implements SO_SNDBUF' in r]
-            for reason in reasons:
-                self.assertIn('request clamping/doubling', reason)
-                self.assertIn('real send-capacity/quota updates', reason)
-                self.assertIn('Linux skb memory accounting is not reproduced', reason)
-                if entry.get('blocked_reasons'):
-                    self.assertIn(reason, entry['blocked_reasons'])
-                    self.assertTrue(any('Linux' in r and 'no' in r
-                                        and 'SO_SNDBUF' not in r
-                                        for r in entry['blocked_reasons']))
-                    for command in entry['audited_shell_commands']:
-                        self.assertIn(reason, command['semantic_mapping'])
-                else:
-                    self.assertIn('ENOBUFS', reason)
+            if entry.get('blocked_reasons'):
+                self.assertTrue(any('Unavailable:' in command['semantic_mapping']
+                                    or 'Blocked:' in command['semantic_mapping']
+                                    for command in entry['audited_shell_commands']))
 
     def test_mapping_requires_allowlist_exact_flags_count_and_replacement(self):
         with self.assertRaisesRegex(ValueError, 'allowlisted'):
@@ -881,29 +906,29 @@ class AdaptationChecks(unittest.TestCase):
             return 1, False, 'packet mismatch'
 
         argv = ['run.py', '--checkout', str(checkout), '--plugin', str(plugin),
-                '--suite', 'adapted', '--report', str(report)]
+                '--suite', 'upstream', '--report', str(report)]
         with patch('run.HERE', manifest_dir), patch('run.check_checkout', return_value=PIN['revision']), \
                 patch('run.subprocess.check_output', return_value=tracked), \
                 patch('run.invoke', side_effect=execute), patch.object(sys, 'argv', argv):
             self.assertEqual(main(), 1)
         data = json.loads(report.read_text())
-        self.assertEqual(data['suite'], 'adapted')
-        count = len(self.manifest['scripts'])
+        self.assertEqual(data['suite'], 'upstream')
+        inventory_count = len(self.manifest['scripts'])
+        count = inventory_count - len(PORTED_SCRIPTS & self.manifest['scripts'].keys())
         self.assertEqual(data['coverage'], {'selected_script_files': count,
-                                          'upstream_script_files': count + 1,
+                                          'upstream_script_files': inventory_count + 1,
                                           'selection': 'adaptation_allowlist'})
         self.assertEqual(data['counts'], {'failed': count - 1, 'passed': 1, 'unsupported': 2 * count})
         self.assertFalse(data['all_passed'])
         self.assertEqual(len(calls), 2 * count)
         for row in data['results']:
-            self.assertEqual(row['suite'], 'adapted')
+            self.assertEqual(row['suite'], 'upstream')
             self.assertEqual(row['effective_flags']['adapter'],
                              self.manifest['scripts'][row['script']]['adapter_flags'])
             self.assertEqual(row['effective_flags']['profile'],
                              row['effective_flags']['adapter'].split(',')[0])
             self.assertIn('generated_sha256', row['adaptation'])
-            cubic = row['effective_flags']['profile'] in {'upstream-cubic', 'upstream-cubic-ecn'}
-            self.assertEqual(row['effective_flags']['prr_pacing'], not cubic)
+            self.assertFalse(row['effective_flags']['prr_pacing'])
             self.assertEqual(row['effective_flags']['transport_clock'],
                              'monotonic Instant elapsed microseconds')
             self.assertEqual(row['effective_flags']['transmit_batch_clock'],
@@ -954,10 +979,10 @@ class AdaptationChecks(unittest.TestCase):
             data = json.loads(report.read_text())
             self.assertEqual(data['counts'], expected_counts)
             self.assertEqual(data['all_passed'], expected_counts == {'passed': 1})
-            self.assertEqual(data['eligible_total'], 3 * count)
-            self.assertEqual(data['eligible_script_files'], count)
+            self.assertEqual(data['eligible_total'], 3 * inventory_count)
+            self.assertEqual(data['eligible_script_files'], inventory_count)
             self.assertEqual(data['selected_total'], sum(expected_counts.values()))
-            self.assertEqual(data['excluded_total'], 3 * count - data['selected_total'])
+            self.assertEqual(data['excluded_total'], 3 * inventory_count - data['selected_total'])
             self.assertEqual(len(calls), expected_calls)
             self.assertEqual(data['adaptation_manifest_sha256'],
                              hashlib.sha256((manifest_dir / 'adaptations.json').read_bytes()).hexdigest())
@@ -974,7 +999,7 @@ class AdaptationChecks(unittest.TestCase):
                 patch('run.subprocess.check_output', return_value=tracked), \
                 patch('run.invoke') as execute, patch.object(sys, 'argv',
                     ['run.py', '--checkout', str(checkout), '--plugin', str(plugin),
-                     '--suite', 'adapted', '--report', str(report), '--so-flags', 'baseline']):
+                     '--suite', 'upstream', '--report', str(report), '--so-flags', 'baseline']):
             self.assertEqual(main(), 1)
             execute.assert_not_called()
         self.assertEqual(json.loads(report.read_text())['counts'], {'adaptation_rejected': 3 * count})
@@ -1050,7 +1075,7 @@ class FileFixtureChecks(unittest.TestCase):
             self.manifest['scripts'] = {self.name: self.entry}
             (manifest_dir / 'adaptations.json').write_text(json.dumps(self.manifest))
             argv = ['run.py', '--checkout', str(checkout), '--plugin', str(plugin),
-                    '--suite', 'adapted', '--variant', 'ipv4', '--script', self.name,
+                    '--suite', 'upstream', '--variant', 'ipv4', '--script', self.name,
                     '--report', str(report)]
             for log, expected, executed in (
                     ('packet mismatch', 'failed', True),
@@ -1156,6 +1181,56 @@ class PublishedSelectionChecks(unittest.TestCase):
             self.skipTest('pinned packetdrill checkout unavailable; set NTCP_PACKETDRILL_CHECKOUT')
         self.manifest = json.loads((HERE / 'adaptations.json').read_text())
 
+    def test_upstream_manifest_executes_all_tfo26_and_preserves_icmp_mismatch(self):
+        self.assertEqual(len(set(TFO26)), 26)
+        self.assertTrue(set(TFO26) <= self.manifest['scripts'].keys())
+        profiles = [self.manifest['scripts'][name]['adapter_flags'].split(',')[0] for name in TFO26]
+        self.assertEqual(set(profiles), {'upstream'})
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            (checkout / PIN['tcp_tests']).parent.mkdir(parents=True)
+            (checkout / PIN['tcp_tests']).symlink_to(self.directory.resolve())
+            runner = checkout / PIN['runner']
+            runner.parent.mkdir(parents=True)
+            runner.write_text('unused')
+            runner.chmod(0o700)
+            plugin = checkout / 'plugin.so'
+            plugin.write_text('unused')
+            report = checkout / 'report.json'
+            tracked = '\0'.join(str(Path(PIN['tcp_tests']) / n)
+                                for n in self.manifest['scripts'])
+            executed = []
+
+            def execute(argv, cwd, timeout):
+                generated = Path(argv[-1]).read_bytes()
+                self.assertNotIn(b'`', generated)
+                if '--dry_run' not in argv:
+                    executed.append(generated)
+                    if Path(argv[-1]).name == 'icmp-baseline.pkt':
+                        return 1, False, 'expected RST, actual ACK after retained handshake'
+                return 0, False, ''
+
+            argv = ['run.py', '--checkout', str(checkout), '--plugin', str(plugin),
+                    '--suite', 'upstream', '--variant', 'ipv4', '--report', str(report)]
+            for name in TFO26:
+                argv.extend(['--script', name])
+            with patch('run.check_checkout', return_value=PIN['revision']), \
+                    patch('run.subprocess.check_output', return_value=tracked), \
+                    patch('run.invoke', side_effect=execute) as invoke_mock, \
+                    patch.object(sys, 'argv', argv):
+                self.assertEqual(main(), 1)  # An executed mismatch is not a pass.
+            data = json.loads(report.read_text())
+            self.assertEqual({r['script'] for r in data['results']}, set(TFO26))
+            self.assertEqual(data['counts'], {'passed': 25, 'failed': 1})
+            self.assertEqual(invoke_mock.call_count, 52)
+            self.assertEqual(len(executed), 26)
+            control = next(r for r in data['results'] if r['status'] == 'failed')
+            self.assertEqual(control['script'], 'fastopen/server/icmp-baseline.pkt')
+            self.assertTrue(control['behavior_executed'])
+            self.assertEqual(control['syntax_returncode'], 0)
+            self.assertIn('expected RST', control['log'])
+            self.assertIn('generated_sha256', control['adaptation'])
+
     def test_original_file_transfer_sources_candidate_mapping_preserves_all_nonsetup_bytes(self):
         manifest = copy.deepcopy(self.manifest)
         for name in ('sendfile/sendfile-simple.pkt', 'splice/tcp_splice_loop_test.pkt'):
@@ -1178,10 +1253,12 @@ class PublishedSelectionChecks(unittest.TestCase):
         entry = self.manifest['scripts'][PASSIVE_CUBIC_ECN]
         settings = copy.deepcopy(entry['mapping']['ntcp_settings'])
         self.assertTrue(settings.pop('ecn'))
-        cubic = copy.deepcopy(self.manifest['scripts'][next(iter(DEFAULTS_ONLY_CUBIC))]['mapping']['ntcp_settings'])
+        cubic = profile_metadata('upstream,local=192.168.0.1')
+        self.assertEqual(settings.pop('options'), ['ecn'])
+        self.assertEqual(cubic.pop('options'), [])
         self.assertFalse(cubic.pop('ecn'))
         self.assertEqual(settings, cubic)
-        self.assertIn('active-open equivalence', entry['mapping']['claim'])
+        self.assertIn('mode2 active-open', entry['mapping']['option_reasons']['ecn'])
         self.assertEqual(entry['mapping']['ecn_scope'], 'passive listener in this exact script only')
         generated, _ = adapt_source(self.directory, PASSIVE_CUBIC_ECN, self.manifest, entry['adapter_flags'])
         source = (self.directory / PASSIVE_CUBIC_ECN).read_bytes()
@@ -1228,9 +1305,9 @@ class PublishedSelectionChecks(unittest.TestCase):
                     self.assertEqual(preflight(generated.decode(), entry.get('embedded_tcp_info') is True), [])
                     self.assertEqual(audit['generated_sha256'], hashlib.sha256(generated).hexdigest())
                 self.assertEqual((self.directory / name).read_bytes(), source)
-                if name in DEFAULTS_ONLY_CUBIC and b'SO_SNDBUF' in source:
-                    self.assertTrue(any('real send-capacity/quota updates' in r
-                                        and 'ENOBUFS' in r for r in entry['mapping']['reasons']))
+                if name in DEFAULTS_ONLY_CUBIC | SLOW_START_ACK_SCRIPTS and b'SO_SNDBUF' in source:
+                    self.assertIn('budget128m', entry['mapping']['option_reasons'])
+                    self.assertEqual(entry['mapping']['ntcp_settings']['endpoint_max_buffer_bytes'], 128 * 1024 * 1024)
 
     def test_socket43_inventory_hashes_and_assertions(self):
         counts = {'blocking': 4, 'close': 3, 'shutdown': 6, 'ioctl': 1,
@@ -1269,11 +1346,10 @@ class PublishedSelectionChecks(unittest.TestCase):
         self.assertNotIn('TCP_NOTSENT_LOWAT is also unavailable', stale)
         for name in SOCKET_FEATURE19:
             entry = self.manifest['scripts'][name]
-            token = {'nagle/https_client.pkt': 'upstream-https',
-                     'notsent_lowat/notsent-lowat-sysctl.pkt': 'upstream-global-lowat'}.get(name, 'upstream-basic')
-            self.assertEqual(entry['adapter_flags'], token + ',local=192.168.0.1')
-            self.assertEqual(entry['mapping']['ntcp_settings']['prr'],
-                             False if token == 'upstream-https' else 'LegacyInitialCredit')
+            from run import upstream_flags
+            self.assertEqual(entry['adapter_flags'], upstream_flags(name))
+            self.assertEqual(entry['mapping']['ntcp_settings']['prr'], 'Rfc9937')
+            self.assertFalse(entry['mapping']['ntcp_settings']['general_pacing'])
             if name.startswith('tcp_info/'):
                 self.assertTrue(entry['embedded_tcp_info'])
                 self.assertNotIn('blocked_reasons', entry)
@@ -1292,7 +1368,9 @@ class PublishedSelectionChecks(unittest.TestCase):
                                 for name in self.manifest['scripts'])
             # The candidate fixture remains runtime-gated until integration is ready.
             sendfile_enabled = not self.manifest['scripts']['sendfile/sendfile-simple.pkt'].get('blocked_reasons')
-            for selection, eligible in ((SOCKET43, 36 + int(sendfile_enabled)), (SOCKET_FEATURE19, 15)):
+            for selection, source_eligible in ((SOCKET43, 36 + int(sendfile_enabled)), (SOCKET_FEATURE19, 15)):
+                ported = set(selection) & PORTED_SCRIPTS
+                eligible = source_eligible - len(ported)
                 executed = []
 
                 def execute(argv, cwd, timeout):
@@ -1309,7 +1387,7 @@ class PublishedSelectionChecks(unittest.TestCase):
                     return 1 if '--dry_run' not in argv else 0, False, 'diagnostic mismatch'
 
                 argv = ['run.py', '--checkout', str(checkout), '--plugin', str(plugin),
-                        '--suite', 'adapted', '--variant', 'ipv4', '--report', str(report)]
+                        '--suite', 'upstream', '--variant', 'ipv4', '--report', str(report)]
                 for name in selection:
                     argv.extend(['--script', name])
                 with patch('run.check_checkout', return_value=PIN['revision']), \
@@ -1318,14 +1396,16 @@ class PublishedSelectionChecks(unittest.TestCase):
                         patch.object(sys, 'argv', argv):
                     self.assertEqual(main(), 1)
                 data = json.loads(report.read_text())
-                self.assertEqual(data['counts'], {'failed': eligible, 'unsupported': len(selection) - eligible})
+                self.assertEqual(data['counts'], {'failed': eligible, 'unsupported': len(selection) - source_eligible})
+                self.assertFalse(set(executed) & PORTED_SCRIPTS)
+                self.assertEqual({r['script'] for r in data['ported_exclusions']}, ported)
                 self.assertEqual(invoke_mock.call_count, 2 * eligible)
                 self.assertEqual(len(executed), eligible)
                 self.assertFalse(data['all_passed'])
                 for row in data['results']:
                     flags = row['effective_flags']
                     self.assertEqual(flags['profile'], self.manifest['scripts'][row['script']]['adapter_flags'].split(',')[0])
-                    self.assertTrue(flags['prr_pacing'])
+                    self.assertEqual(flags['prr_pacing'], flags['profile'] != 'upstream')
                     self.assertEqual(flags['transport_clock'], 'monotonic Instant elapsed microseconds')
                     self.assertEqual(flags['transmit_batch_clock'], 'monotonic sample per selection/accept')
                     if row['status'] == 'unsupported':
@@ -1366,7 +1446,7 @@ class PublishedSelectionChecks(unittest.TestCase):
             tracked = '\0'.join(str(Path(PIN['tcp_tests']) / name)
                                  for name in self.manifest['scripts'])
             argv = ['run.py', '--checkout', str(checkout), '--plugin', str(plugin),
-                    '--suite', 'adapted', '--variant', 'ipv4', '--report', str(report)]
+                    '--suite', 'upstream', '--variant', 'ipv4', '--report', str(report)]
             for name in selection:
                 argv.extend(['--script', name])
             with patch('run.check_checkout', return_value=PIN['revision']), \
@@ -1378,7 +1458,7 @@ class PublishedSelectionChecks(unittest.TestCase):
             self.assertEqual(data['script_files'], 35)
             self.assertEqual({row['script'] for row in data['results']}, set(selection))
             self.assertFalse(data['all_passed'])
-            self.assertEqual(len(executed), 23)
+            self.assertEqual(len(executed), 26)
             self.assertIn('syscall_bad_arg/sendmsg-empty-iov.pkt', executed)
             for row in data['results']:
                 entry = self.manifest['scripts'][row['script']]
@@ -1397,13 +1477,13 @@ class PublishedSelectionChecks(unittest.TestCase):
 class PipelineProfileTests(unittest.TestCase):
     def test_explicit_profiles_describe_configuration_not_offloaded_captures(self):
         for profile in ('pipeline', 'pipeline-paced', 'pipeline-gso', 'pipeline-paced-gso',
-                        'baseline', 'upstream-cubic', 'upstream-cubic-ecn'):
+                        'baseline', 'sack', 'upstream'):
             with self.subTest(profile=profile):
                 flags = profile_metadata(f'local=192.0.2.1,{profile}')
                 self.assertEqual(flags['profile'], profile)
                 self.assertEqual(flags['general_pacing'], 'paced' in profile)
-                self.assertEqual(flags['software_gso'], 'gso' in profile)
-                self.assertEqual(flags['prr_pacing'], not profile.startswith('upstream-cubic'))
+                self.assertEqual(flags['software_gso'], profile == 'upstream' or 'gso' in profile)
+                self.assertEqual(flags['prr_pacing'], flags['profile'] != 'upstream')
                 self.assertEqual(flags['egress_pipeline'], 'shared production scheduler')
                 self.assertEqual(flags['transmit_batch_clock'], 'monotonic sample per selection/accept')
                 self.assertEqual(flags['capture_boundary'], 'individual raw IPv4 TCP wire segments')
@@ -1411,9 +1491,60 @@ class PipelineProfileTests(unittest.TestCase):
                 self.assertFalse(flags['hardware_tso'])
                 self.assertFalse(flags['gro'])
 
+    def test_common_read_window_coalescing_and_idempotent_option(self):
+        base = profile_metadata('upstream,local=192.0.2.1')
+        self.assertTrue(base['coalesce_read_window_updates'])
+        explicit = profile_metadata('upstream,coalesce-read-window,local=192.0.2.1')
+        self.assertEqual(explicit.pop('options'), ['coalesce-read-window'])
+        self.assertEqual(explicit, {key: value for key, value in base.items() if key != 'options'})
+
+    def test_common_adaptive_ack_and_immediate_override(self):
+        base = profile_metadata('upstream,local=192.0.2.1')
+        self.assertTrue(base['adaptive_ack'])
+        self.assertEqual(base['delayed_ack_us'], 200000)
+        self.assertEqual(base['initial_ack_timeout_us'], 40000)
+        explicit = profile_metadata('upstream,adaptive-ack,local=192.0.2.1')
+        self.assertEqual(explicit.pop('options'), ['adaptive-ack'])
+        self.assertEqual(explicit, {key: value for key, value in base.items() if key != 'options'})
+        for options in ('immediate-ack', 'paced,immediate-ack'):
+            immediate = profile_metadata(f'upstream,{options},local=192.0.2.1')
+            self.assertFalse(immediate['adaptive_ack'])
+            self.assertEqual(immediate['delayed_ack_us'], 0)
+            self.assertEqual(immediate['initial_ack_timeout_us'], 40000)
+            self.assertEqual(immediate['general_pacing'], 'paced' in options)
+            self.assertEqual(immediate['prr_pacing'], 'paced' in options)
+        for options in ('adaptive-ack,immediate-ack', 'immediate-ack,adaptive-ack',
+                        'paced,adaptive-ack,immediate-ack'):
+            invalid = profile_metadata(f'upstream,{options},local=192.0.2.1')
+            self.assertTrue(all(value is None for key, value in invalid.items() if key != 'profile'))
+
+    def test_paced_is_one_positive_fixed_option(self):
+        base = profile_metadata('upstream,local=192.0.2.1')
+        paced = profile_metadata('upstream,paced,local=192.0.2.1')
+        self.assertFalse(base['general_pacing'])
+        self.assertFalse(base['prr_pacing'])
+        self.assertIsNone(base['pacing_config'])
+        self.assertTrue(paced['adaptive_ack'])
+        self.assertEqual(paced['delayed_ack_us'], 200000)
+        self.assertEqual(paced['initial_ack_timeout_us'], 40000)
+        self.assertTrue(paced['general_pacing'])
+        self.assertTrue(paced['prr_pacing'])
+        self.assertEqual(paced['pacing_config'], {
+            'rate_gain_percent': 125, 'max_bytes_per_second': None, 'max_burst_segments': 2})
+        paced.update(options=[], general_pacing=False, prr_pacing=False, pacing_config=None)
+        self.assertEqual(paced, base)
+
     def test_unknown_or_conflicting_profiles_do_not_claim_pipeline_policy(self):
         for flags in ('local=192.0.2.1', 'unknown,local=192.0.2.1',
-                      'baseline,pipeline-gso,local=192.0.2.1'):
+                      'baseline,pipeline-gso,local=192.0.2.1',
+                      'upstream-basic,local=192.0.2.1', 'upstream,ecn,ecn,local=192.0.2.1',
+                      'upstream,unpaced,local=192.0.2.1', 'upstream,unpaced-prr,local=192.0.2.1',
+                      'upstream,paced,paced,local=192.0.2.1',
+                      'upstream,paced,unpaced,local=192.0.2.1',
+                      'upstream,immediate-ack,adaptive-ack,local=192.0.2.1',
+                      'upstream,budget128m,budget224m,local=192.0.2.1',
+                      'baseline,ecn,local=192.0.2.1', 'upstream,rate=42,local=192.0.2.1',
+                      'upstream,local=::1', 'upstream,local=192.0.2.1,local=192.0.2.2'):
             metadata = profile_metadata(flags)
             self.assertTrue(all(value is None for key, value in metadata.items() if key != 'profile'))
 

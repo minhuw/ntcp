@@ -134,7 +134,13 @@ unsafe extern "C" fn ntcp_net_receive(
         if output.is_null() || stamp.is_null() {
             return Err(EFAULT);
         }
-        let (bytes, timestamp) = packet_test::capture(capacity)?;
+        let (bytes, timestamp) = match packet_test::try_capture(capacity) {
+            Ok(packet) => packet,
+            // The existing callback ABI represents an empty capture by count=0.
+            // The runner owns the receive deadline and retries, not this callback.
+            Err(EAGAIN) => (Vec::new(), 0),
+            Err(error) => return Err(error),
+        };
         memory(bytes.as_ptr().cast_mut(), output.cast(), bytes.len(), true)?;
         memory(
             (&timestamp as *const i64).cast_mut().cast(),

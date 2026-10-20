@@ -393,17 +393,21 @@ impl Owner {
                 .map_err(engine)?;
         }
         let progress = self.endpoint.send_progress(cid).map_err(engine)?;
-        let lowat = self.sockets[&id].notsent_lowat;
-        let lowat = Some(effective_notsent_lowat(
-            lowat,
-            self.socket_policy.notsent_lowat,
-        ));
+        let goal = send::batch_goal(&self.endpoint.transport_info(cid).map_err(engine)?);
+        let lowat = None; // Socket lowat gates batches; core still enforces hard capacity.
+        let (batch_room, batch_start) = self.send_batch_admission(id, cid)?;
         let room = if capacity == 0 {
             0
         } else {
-            self.endpoint
+            let room = self
+                .endpoint
                 .check_write_admission(cid, lowat, request)
-                .map_err(engine)?
+                .map_err(engine)?;
+            let room = room.min(batch_room);
+            if room == 0 {
+                return Err(EAGAIN);
+            }
+            room
         };
         let produced = produce(capacity.min(room))?;
         let bytes = produced.as_ref();
@@ -420,6 +424,18 @@ impl Owner {
             )
             .map_err(engine)?;
         assert_eq!(n, bytes.len());
+        if n != 0 {
+            let end = progress.queued_end + n as u64;
+            self.sockets.get_mut(&id).unwrap().send_batch = if flags & MSG_EOR == 0 && goal != 0 {
+                Some(send::SendBatch {
+                    connection: cid,
+                    start: batch_start + ((end - batch_start - 1) / goal as u64) * goal as u64,
+                    end,
+                })
+            } else {
+                None
+            };
+        }
         if n != 0 && phases != 0 {
             let s = self.sockets.get_mut(&id).unwrap();
             s.timestamps.pending.push(Pending {

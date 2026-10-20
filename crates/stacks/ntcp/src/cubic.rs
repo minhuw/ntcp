@@ -129,13 +129,7 @@ impl Cubic {
         self.clock(now);
         self.rtt = rtt.unwrap_or(0);
         let start = ack.wrapping_add(0u32.wrapping_sub(acked));
-        self.acked = self.limited_end.map_or(0, |end| {
-            if end.serial_cmp(start) == Some(Ordering::Greater) {
-                acked.min(end.distance_from(start))
-            } else {
-                0
-            }
-        });
+        self.acked = self.growth_prefix(start, acked);
         if self.limited_end.is_some_and(|end| {
             matches!(
                 ack.serial_cmp(end),
@@ -149,6 +143,22 @@ impl Cubic {
             // Receiver-limited periods must not inflate cwnd or age the curve.
             self.pause();
         }
+    }
+
+    // Preserve the actual cumulative interval when discounting earlier delivery.
+    // The committed full-flight boundary can lie inside that interval.
+    pub(crate) fn growth_prefix(&self, start: Seq, bytes: u32) -> u32 {
+        self.limited_end.map_or(0, |end| {
+            if end.serial_cmp(start) == Some(Ordering::Greater) {
+                bytes.min(end.distance_from(start))
+            } else {
+                0
+            }
+        })
+    }
+
+    pub(crate) fn discount_ack_growth(&mut self, bytes: u32) {
+        self.acked = self.acked.saturating_sub(bytes);
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9438#section-4.2

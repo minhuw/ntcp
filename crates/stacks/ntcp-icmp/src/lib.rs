@@ -9,6 +9,7 @@ pub enum FeedbackKind {
     TimeExceeded,
     ParameterProblem,
     PacketTooBig,
+    SourceQuench,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TcpQuote {
@@ -28,6 +29,33 @@ pub struct Feedback {
     // live transmission and apply path policy. This is not autonomous PMTUD.
     pub candidate_mtu: Option<u32>,
     pub quoted: TcpQuote,
+}
+
+impl Feedback {
+    // Classify validated IPv4 errors, not their connection-specific effect.
+    // PTB remains on the PMTU path. IPv6 consumers need their own mapping.
+    // Unlisted IPv4 unreachable codes stay nonterminal rather than becoming
+    // fatal merely because the decoder recognizes their wire format.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2
+    //= reason=IPv4 codes0/1/5, TimeExceeded and ParameterProblem classify as soft; only codes2/3 classify as HardUnreachable. Code4 is separately PacketTooBig.
+    //# For IPv4 ICMP, these include: Destination Unreachable -- codes 0,
+    //# 1, 5; Time Exceeded -- codes 0, 1; and Parameter Problem.
+    pub fn ipv4_network_error(self) -> Option<ntcp::NetworkError> {
+        if !self.outer.source.is_ipv4() {
+            return None;
+        }
+        Some(match self.kind {
+            FeedbackKind::DestinationUnreachable => match self.code {
+                2 | 3 => ntcp::NetworkError::HardUnreachable,
+                0 | 1 | 5..=15 => ntcp::NetworkError::SoftUnreachable,
+                _ => return None,
+            },
+            FeedbackKind::TimeExceeded => ntcp::NetworkError::TimeExceeded,
+            FeedbackKind::ParameterProblem => ntcp::NetworkError::ParameterProblem,
+            FeedbackKind::SourceQuench => ntcp::NetworkError::SourceQuench,
+            FeedbackKind::PacketTooBig => return None,
+        })
+    }
 }
 
 // Decode a complete outer IP frame; the inner IP frame may be a partial quote,
@@ -135,6 +163,7 @@ fn icmpv4_feedback(icmp: &[u8]) -> Result<(FeedbackKind, Option<u32>), Error> {
             },
         ),
         (3, 0..=15) => (FeedbackKind::DestinationUnreachable, None),
+        (4, 0) => (FeedbackKind::SourceQuench, None),
         (11, 0..=1) => (FeedbackKind::TimeExceeded, None),
         (12, 0..=2) => (FeedbackKind::ParameterProblem, None),
         _ => return Err(Error::ProtocolUnsupported),

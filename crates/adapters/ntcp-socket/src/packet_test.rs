@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Explicit one-shot packet backend: never enables process-wide socket creation.
-pub use crate::packet_profile::{Profile, profile};
+pub use crate::packet_profile::{Profile, UpstreamOptions, profile};
 use crate::*;
 
 #[derive(Clone, Copy, Debug)]

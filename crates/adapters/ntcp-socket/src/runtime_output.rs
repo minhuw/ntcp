@@ -183,6 +183,22 @@ impl Owner {
                 self.pending_token = None;
                 Ok(TxOutcome::Submitted)
             }
+            Ok(TxOutcome::Rejected) => {
+                if let Some(attempt) = self.reservation
+                    && self
+                        .endpoint
+                        .cancel_unsubmitted_repair(attempt)
+                        .map_err(engine)?
+                {
+                    self.pending_packet = None;
+                    self.pending_token = None;
+                    self.completed_reservation()?;
+                    self.cancel_unused_backend_timestamps();
+                } else {
+                    self.start_reservation_deadline();
+                }
+                Ok(TxOutcome::WouldBlock)
+            }
             Ok(TxOutcome::WouldBlock) => {
                 self.start_reservation_deadline();
                 Ok(TxOutcome::WouldBlock)

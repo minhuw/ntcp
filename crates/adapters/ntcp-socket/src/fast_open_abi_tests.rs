@@ -115,7 +115,7 @@ mod packets {
         let p = ntcp_ip::parse(bytes, false).unwrap();
         ntcp::wire::parse(p.ip, p.payload).unwrap()
     }
-    fn reply(syn: &ntcp::wire::Segment<'_>) {
+    fn reply(syn: &ntcp::wire::Segment<'_>) -> Vec<u8> {
         let ip = ntcp::IpMetadata {
             source: Ipv4Addr::new(192, 0, 2, 2).into(),
             destination: Ipv4Addr::new(192, 0, 2, 1).into(),
@@ -158,7 +158,9 @@ mod packets {
         .unwrap();
         bytes.truncate(20 + len);
         packet_test::inject(bytes).unwrap();
-        assert_eq!(segment(&capture()).header.flags & SYN, 0);
+        let packet = capture();
+        assert_eq!(segment(&packet).header.flags & SYN, 0);
+        packet
     }
     fn socket() -> i32 {
         let fd = unsafe {
@@ -207,7 +209,7 @@ mod packets {
             assert_eq!(close(warm), 0);
             capture(); // FIN
             for deferred in [false, true] {
-                // RFC7413: independent service ports share cookies, not reset suppression.
+                // Independent service ports share the warmed destination cookie.
                 let addr = sockaddr_in {
                     sin_port: (8080u16 + u16::from(deferred)).to_be(),
                     ..addr
@@ -360,14 +362,14 @@ mod packets {
                 assert_eq!(again, full);
                 assert_eq!(close(alias), 0);
             }
-            suppressed_blocking_send_success_and_timeout(&addr);
+            reset_reuse_then_rto_suppressed_blocking_send(&addr);
         }
         packet_test::stop();
     }
 
-    // Both cases reuse the exact service whose physically captured TFO SYN was reset above.
+    // Reuse the reset service with SYN-data; its actual RTO then suppresses the next send.
     #[cfg(feature = "linux")]
-    unsafe fn suppressed_blocking_send_success_and_timeout(addr: &sockaddr_in) {
+    unsafe fn reset_reuse_then_rto_suppressed_blocking_send(addr: &sockaddr_in) {
         unsafe {
             for timeout in [true, false] {
                 let fd = socket();
@@ -393,8 +395,8 @@ mod packets {
                 let syn = capture();
                 let initial = segment(&syn);
                 assert_ne!(initial.header.flags & SYN, 0);
-                assert!(initial.options.fast_open.is_none());
-                assert!(initial.payload.is_empty());
+                assert_eq!(initial.options.fast_open.is_some(), timeout);
+                assert_eq!(!initial.payload.is_empty(), timeout);
                 assert!(rx.try_recv().is_err());
                 if timeout {
                     // The warmup's unacknowledged FIN can also retransmit.
@@ -404,7 +406,7 @@ mod packets {
                             (segment(&packet).header.source_port == initial.header.source_port)
                                 .then_some(packet)
                         })
-                        .expect("suppressed SYN retry");
+                        .expect("SYN-data falls back to an ordinary SYN retry");
                     assert_eq!(segment(&retry).header.sequence, initial.header.sequence);
                     assert!(segment(&retry).payload.is_empty());
                     assert!(segment(&retry).options.fast_open.is_none());
@@ -471,7 +473,7 @@ mod packets {
                     );
                     assert_eq!(again, full);
                 } else {
-                    reply(&initial);
+                    let mut first = Some(reply(&initial));
                     assert_eq!(
                         rx.recv_timeout(std::time::Duration::from_secs(2))
                             .unwrap()
@@ -480,7 +482,8 @@ mod packets {
                     );
                     let mut received = Vec::new();
                     while received.len() < 2000 {
-                        let packet = capture();
+                        // The retained writer now piggybacks the handshake ACK on data.
+                        let packet = first.take().unwrap_or_else(capture);
                         let data = segment(&packet);
                         assert!(!data.payload.is_empty());
                         assert_eq!(data.header.flags & SYN, 0);

@@ -1,9 +1,161 @@
 --- a/gtests/net/packetdrill/code.c
 +++ b/gtests/net/packetdrill/code.c
-@@ -761,43 +761,20 @@
+@@ -26,6 +26,7 @@
+ #include "code.h"
+ 
+ #include <errno.h>
++#include <ctype.h>
+ #include <signal.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -140,11 +141,103 @@
+ 
+ #ifdef linux
+ 
++/* This opt-in collector matches run.py's audited assertion fields. Keep the
++ * field's end offset, not sizeof(tcp_info): kernels may return older layouts. */
++#define TCP_INFO_PREFIX_FIELDS(X) \
++	X(tcpi_ca_state) \
++	X(tcpi_options) \
++	X(tcpi_unacked) \
++	X(tcpi_sacked) \
++	X(tcpi_lost) \
++	X(tcpi_retrans) \
++	X(tcpi_last_data_recv) \
++	X(tcpi_rtt) \
++	X(tcpi_snd_ssthresh) \
++	X(tcpi_snd_cwnd) \
++	X(tcpi_reordering) \
++	X(tcpi_notsent_bytes) \
++	X(tcpi_busy_time) \
++	X(tcpi_rwnd_limited) \
++	X(tcpi_sndbuf_limited) \
++	X(tcpi_delivered)
++#define TCP_INFO_FIELD_END(name) \
++	(offsetof(struct _tcp_info, name) + sizeof(((struct _tcp_info *)0)->name))
++/* The two scale bitfields occupy the byte immediately after tcpi_options. */
++#define TCP_INFO_SCALE_END (TCP_INFO_FIELD_END(tcpi_options) + 1)
++
++static const struct {
++	const char *name;
++	size_t end;
++} tcp_info_prefix_fields[] = {
++#define PREFIX_FIELD(name) {#name, TCP_INFO_FIELD_END(name)},
++	TCP_INFO_PREFIX_FIELDS(PREFIX_FIELD)
++#undef PREFIX_FIELD
++	{"tcpi_snd_wscale", TCP_INFO_SCALE_END},
++	{"tcpi_rcv_wscale", TCP_INFO_SCALE_END},
++};
++
++static int tcp_info_prefix_len(const char *text, char **error)
++{
++	/* A constant-only assertion needs no metric. One byte keeps the socket
++	 * query nonempty without requesting any optional trailing metric. */
++	int required = 1;
++	for (const char *p = text; *p;) {
++		if (!isalnum((unsigned char)*p) && *p != '_') {
++			++p;
++			continue;
++		}
++		const char *start = p;
++		while (isalnum((unsigned char)*p) || *p == '_')
++			++p;
++		size_t len = p - start;
++		if (len < 5 || memcmp(start, "tcpi_", 5))
++			continue;
++		bool found = false;
++		for (size_t i = 0; i < sizeof(tcp_info_prefix_fields) /
++		                       sizeof(tcp_info_prefix_fields[0]); ++i) {
++			if (strlen(tcp_info_prefix_fields[i].name) == len &&
++			    !memcmp(start, tcp_info_prefix_fields[i].name, len)) {
++				required = max(required, (int)tcp_info_prefix_fields[i].end);
++				found = true;
++				break;
++			}
++		}
++		if (!found) {
++			asprintf(error, "unsupported TCP_INFO prefix field: %.*s",
++			         (int)len, start);
++			return -1;
++		}
++	}
++	return required;
++}
++
++static void write_tcp_info_prefix(struct code_state *code,
++				  const struct _tcp_info *info, int len)
++{
++	write_symbols(code);
++	/* Emit only values the socket actually returned. Every referenced field
++	 * was required by this event before collecting; none is padded as zero. */
++#define EMIT_PREFIX(name) \
++	if ((size_t)len >= TCP_INFO_FIELD_END(name)) \
++		emit_var(code, #name, info->name);
++	TCP_INFO_PREFIX_FIELDS(EMIT_PREFIX)
++#undef EMIT_PREFIX
++	if ((size_t)len >= TCP_INFO_SCALE_END) {
++		emit_var(code, "tcpi_snd_wscale", info->tcpi_snd_wscale);
++		emit_var(code, "tcpi_rcv_wscale", info->tcpi_rcv_wscale);
++	}
++	emit_var_end(code);
++}
++
+ /* Write out a formatted representation of the given tcp_info buffer. */
+ static void write_tcp_info(struct code_state *code,
+ 				   const struct _tcp_info *info,
+ 				   int len)
+ {
++	if (code->tcp_info_prefix) {
++		write_tcp_info_prefix(code, info, len);
++		return;
++	}
+ 	assert(len >= sizeof(struct _tcp_info));
+ 
+ 	write_symbols(code);
+@@ -559,6 +652,11 @@
+ 	if (strcmp(config->code_sockopt, "") == 0) {
+ 		code->data_type = DATA_NONE;		/* auto-detect */
+ #if HAVE_TCP_INFO
++#ifdef linux
++	} else if (strcmp(config->code_sockopt, "TCP_INFO_PREFIX") == 0) {
++		code->data_type = DATA_TCP_INFO;
++		code->tcp_info_prefix = true;
++#endif
+ 	} else if (strcmp(config->code_sockopt, "TCP_INFO") == 0) {
+ 		code->data_type = DATA_TCP_INFO;
+ #endif
+@@ -710,7 +808,8 @@
+ #if HAVE_TCP_INFO
+ 	case DATA_TCP_INFO:
+ 		opt_name = TCP_INFO;
+-		data_len = sizeof(struct _tcp_info);
++		data_len = state->code->tcp_info_prefix ?
++			state->code->tcp_info_len : sizeof(struct _tcp_info);
+ 		level = SOL_TCP;
+ 		break;
+ #endif  /* HAVE_TCP_INFO */
+@@ -740,6 +839,16 @@
+ 		free(data);
+ 		return NULL;
+ 	}
++	/* A short reply cannot satisfy this event, even if a previous snapshot
++	 * provided the missing field. Reject overlength replies as well. */
++#if HAVE_TCP_INFO
++	if (state->code->tcp_info_prefix && data_type == DATA_TCP_INFO &&
++	    opt_len != data_len) {
++		free(data);
++		errno = EMSGSIZE;
++		return NULL;
++	}
++#endif
+ 	*len = opt_len;
+ 	return data;
+ }
+@@ -760,44 +869,28 @@
+ 	}
  	int fd = state->socket_under_test->fd.live_fd;
  	struct code_state *code = state->code;
- 
+-
 -	void *data = NULL;
 -	void *data_ext = NULL;
 -	void *data_meminfo = NULL;
@@ -39,8 +191,14 @@
 -		asprintf(&error,
 -			 "can't find getsockopt to get sk_meminfo");
 -		goto error_out;
--	}
--#endif
++#ifdef linux
++	if (code->tcp_info_prefix) {
++		code->tcp_info_len = tcp_info_prefix_len(text, &error);
++		if (code->tcp_info_len < 0)
++			goto error_out;
+ 	}
+ #endif
++
 +	/* data_type is the user's selection, not the last collected metric. */
 +	for (enum code_data_t type = DATA_NONE + 1;
 +	     type < DATA_NUM_TYPES; ++type) {
@@ -194,7 +352,15 @@
  #include <netinet/in.h>
  #include <stddef.h>
  #include <stdlib.h>
-@@ -533,6 +534,58 @@
+@@ -43,6 +44,7 @@
+ #include "psp_state.h"
+ #include "run.h"
+ #include "script.h"
++#include "so_testing.h"
+ #include "tcp.h"
+ #include "tcp_options_iterator.h"
+ #include "tcp_options_to_string.h"
+@@ -533,6 +535,58 @@
  }
  
  
@@ -253,7 +419,7 @@
  /* Rewrite the TCP sequence number echoed by the ICMP packet.
   * The Linux TCP layer ignores ICMP messages with bogus sequence numbers.
   */
-@@ -581,6 +634,7 @@
+@@ -581,6 +635,7 @@
  	struct socket *socket, struct packet *live_packet, char **error)
  {
  	DEBUGP("map_inbound_packet\n");
@@ -261,7 +427,7 @@
  
  	/* Remap packet to live values. */
  	struct tuple live_inbound;
-@@ -611,8 +665,12 @@
+@@ -611,8 +666,12 @@
  
  	live_packet->mss = state->config->mss;
  
@@ -276,7 +442,65 @@
  
  	/* If no TCP headers to rewrite, then we're done. */
  	if (live_packet->tcp == NULL)
-@@ -1850,6 +1908,7 @@
+@@ -1653,10 +1712,8 @@
+ 				packet_index, error);
+ }
+ 
+-/* Sniff the next outbound live packet and return it. */
+-static int sniff_outbound_live_packet(
+-	struct state *state, struct socket *expected_socket,
+-	struct packet **packet, char **error)
++/* Retain upstream's expected event interval plus two-second receive tolerance. */
++static s32 outbound_timeout_secs(struct state *state)
+ {
+ 	s64 expected_usecs =  state->event->time_usecs - state->script_last_time_usecs;
+ 	s64 expected_usecs_end =  state->event->time_usecs_end - state->script_last_time_usecs;
+@@ -1668,6 +1725,16 @@
+ 
+ 	/* Disable timeout if packet can take any amount of time */
+ 	timeout_secs = (state->event->time_type == ANY_TIME) ? TIMEOUT_NONE : timeout_secs;
++
++	return timeout_secs;
++}
++
++/* Sniff the next outbound live packet and return it. */
++static int sniff_outbound_live_packet(
++	struct state *state, struct socket *expected_socket,
++	struct packet **packet, char **error)
++{
++	s32 timeout_secs = outbound_timeout_secs(state);
+ 
+ 	DEBUGP("sniff_outbound_live_packet\n");
+ 	struct socket *socket = NULL;
+@@ -1802,6 +1869,10 @@
+ 	int packet_count = 0;  /* number of sniffed packets */
+ 	int expected_payload_len = packet_payload_len(packet);
+ 	int sniffed_payload_len = 0;
++	bool so_capture = state->so_instance != NULL;
++	if (so_capture && so_netdev_begin_receive(state->netdev,
++			outbound_timeout_secs(state), error))
++		return STATUS_ERR;
+ 
+ 	if ((socket->state == SOCKET_PASSIVE_PACKET_RECEIVED) &&
+ 	    packet->tcp && packet->tcp->syn && packet->tcp->ack) {
+@@ -1827,9 +1898,14 @@
+ 		/* Sniff outbound live packet and verify it's for the right
+ 		 * socket.
+ 		 */
+-		if (sniff_outbound_live_packet(state, socket, &live_packet,
+-					       error))
++		int capture_status = sniff_outbound_live_packet(state, socket,
++						 &live_packet, error);
++		if (capture_status) {
++			if (capture_status == STATUS_TIMEOUT)
++				asprintf(error, "outbound capture timed out: expected %d payload bytes, captured %d",
++					 expected_payload_len, sniffed_payload_len);
+ 			goto out;
++		}
+ 		live_payload = packet_payload_len(live_packet);
+ 		DEBUGP("Sniffed packet with payload %d bytes\n", live_payload);
+ 
+@@ -1850,6 +1926,7 @@
  		 */
  		if (live_packet->tcp) {
  			socket->last_outbound_tcp_header = *(live_packet->tcp);
@@ -284,7 +508,14 @@
  			/* Rewrite TCP sequence number */
  			if (tcp_convert_seq_number(socket, live_packet, error))
  				goto out;
-@@ -1977,7 +2036,7 @@
+@@ -1972,12 +2049,14 @@
+ 	if (live_packet != NULL)
+ 		packet_free(live_packet);
+ 	packet_list_free(sniffed_packets_start);
++	if (so_capture)
++		so_netdev_end_receive(state->netdev);
+ 	return result;
+ }
  
  /* Checksum the packet and inject it into the kernel under test. */
  static int send_live_ip_packet(struct state *state,
@@ -293,7 +524,7 @@
  {
  	assert(packet->ip_bytes > 0);
  	/* We do IPv4 and IPv6 */
-@@ -1993,7 +2052,16 @@
+@@ -1993,7 +2072,16 @@
  			return STATUS_ERR;
  	}
  
@@ -311,7 +542,7 @@
  }
  
  /* Perform the action implied by an inbound packet in a script */
-@@ -2049,7 +2117,7 @@
+@@ -2049,7 +2137,7 @@
  	}
  
  	/* Inject live packet into kernel. */
@@ -320,7 +551,7 @@
  
  out:
  	packet_free(live_packet);
-@@ -2161,7 +2229,8 @@
+@@ -2161,7 +2249,8 @@
  	set_packet_tuple(packet, &live_inbound);
  
  	/* Inject live packet into kernel. */
@@ -330,3 +561,190 @@
  
  	packet_free(packet);
  
+--- a/gtests/net/packetdrill/so_testing.c
++++ b/gtests/net/packetdrill/so_testing.c
+@@ -25,6 +25,8 @@
+ #include "so_testing.h"
+ 
+ #include <dlfcn.h>
++#include <errno.h>
++#include <time.h>
+ 
+ #include "logging.h"
+ #include "netdev.h"
+@@ -34,6 +36,7 @@
+ struct so_netdev {
+ 	struct netdev netdev;		/* "inherit" from netdev */
+ 	struct packetdrill_interface *ifc;	/* to be filled in later */
++	s64 receive_deadline; /* host monotonic usecs; zero means unbounded */
+ };
+ 
+ /* "Downcast" an abstract netdev to our flavor. */
+@@ -65,43 +68,105 @@
+ 					packet->ip_bytes);
+ }
+ 
++/* Capture timestamps stay in the plugin's realtime domain. Only waiting uses
++ * the host monotonic clock; never use the plugin's script clock for deadlines. */
++static s64 receive_now(void)
++{
++	struct timespec now;
++	if (clock_gettime(CLOCK_MONOTONIC, &now))
++		return -1;
++	return (s64)now.tv_sec * 1000000 + now.tv_nsec / 1000;
++}
++
++int so_netdev_begin_receive(struct netdev *a_netdev, s32 timeout_secs,
++                           char **error)
++{
++	struct so_netdev *netdev = to_so_netdev(a_netdev);
++	netdev->receive_deadline = 0;
++	/* Match packet_socket_receive: zero and TIMEOUT_NONE are unbounded. */
++	if (timeout_secs <= 0)
++		return STATUS_OK;
++	s64 now = receive_now();
++	if (now < 0) {
++		asprintf(error, "capture clock_gettime: %s", strerror(errno));
++		return STATUS_ERR;
++	}
++	netdev->receive_deadline = now + (s64)timeout_secs * 1000000;
++	return STATUS_OK;
++}
++
++void so_netdev_end_receive(struct netdev *a_netdev)
++{
++	to_so_netdev(a_netdev)->receive_deadline = 0;
++}
++
+ static int so_netdev_receive(struct netdev *a_netdev, s32 timeout_secs,
+-			     struct packet **packet, char **error)
+-{
+-	struct so_netdev *netdev = to_so_netdev(a_netdev);
+-	enum packet_parse_result_t result;
+-	enum packet_layer_t layer = PACKET_LAYER_3_IP;
+-	size_t in_bytes;
+-
+-	assert(*packet == NULL);	/* should be no packet yet */
+-
++                            struct packet **packet, char **error)
++{
++	struct so_netdev *netdev = to_so_netdev(a_netdev);
++	s64 now = receive_now();
++	if (now < 0) {
++		asprintf(error, "capture clock_gettime: %s", strerror(errno));
++		return STATUS_ERR;
++	}
++	s64 deadline = timeout_secs > 0 ?
++		now + (s64)timeout_secs * 1000000 : 0;
++	if (netdev->receive_deadline &&
++	    (!deadline || netdev->receive_deadline < deadline))
++		deadline = netdev->receive_deadline;
++	assert(*packet == NULL);
+ 	for (;;) {
++		now = receive_now();
++		if (now < 0) {
++			asprintf(error, "capture clock_gettime: %s", strerror(errno));
++			return STATUS_ERR;
++		}
++		if (deadline && now >= deadline)
++			return STATUS_TIMEOUT;
+ 		*packet = packet_new(PACKET_READ_BYTES);
+-		in_bytes = (*packet)->buffer_bytes;
+-
+-		/* Sniff the next outbound packet from the stack under test. */
+-		if (netdev->ifc->netdev_receive(netdev->ifc->userdata,
+-						(*packet)->buffer, &in_bytes,
+-						&((*packet)->time_usecs)))
+-			goto next;
+-
+-		result = parse_packet(*packet, in_bytes, layer, error);
+-
+-		if (result == PACKET_OK)
+-			return STATUS_OK;
+-
+-		if (result == PACKET_BAD)
++		size_t in_bytes = (*packet)->buffer_bytes;
++		errno = 0;
++		int status = netdev->ifc->netdev_receive(netdev->ifc->userdata,
++			(*packet)->buffer, &in_bytes, &((*packet)->time_usecs));
++		int saved_errno = errno;
++		if (status && saved_errno != EAGAIN && saved_errno != EWOULDBLOCK &&
++		    saved_errno != EINTR) {
++			asprintf(error, "netdev_receive failed (status %d, errno %d: %s)",
++				status, saved_errno, saved_errno ? strerror(saved_errno) :
++				"callback did not set errno");
++			packet_free(*packet);
++			*packet = NULL;
++			errno = saved_errno;
+ 			return STATUS_ERR;
+-
+-		DEBUGP("parse_result:%d; error parsing packet: %s\n",
+-		       result, *error);
+-next:
++		}
++		if (!status && in_bytes) {
++			enum packet_parse_result_t result = parse_packet(*packet,
++				in_bytes, PACKET_LAYER_3_IP, error);
++			if (result == PACKET_OK)
++				return STATUS_OK;
++			if (result == PACKET_BAD) {
++				packet_free(*packet);
++				*packet = NULL;
++				return STATUS_ERR;
++			}
++			/* An unknown protocol is ignorable, but cannot reset the budget. */
++			free(*error);
++			*error = NULL;
++		}
+ 		packet_free(*packet);
+ 		*packet = NULL;
++		now = receive_now();
++		if (now < 0) {
++			asprintf(error, "capture clock_gettime: %s", strerror(errno));
++			return STATUS_ERR;
++		}
++		if (deadline && now >= deadline)
++			return STATUS_TIMEOUT;
++		/* At most 1 ms between polls, and never sleep past the deadline. */
++		s64 delay = deadline ? min((s64)1000, deadline - now) : 1000;
++		struct timespec pause = {.tv_sec = 0, .tv_nsec = delay * 1000};
++		nanosleep(&pause, NULL);
+ 	}
+-
+-	assert(!"should not be reached");
+-	return STATUS_ERR;	/* not reached */
+ }
+ 
+ static struct netdev_ops so_netdev_ops = {
+--- a/gtests/net/packetdrill/so_testing.h
++++ b/gtests/net/packetdrill/so_testing.h
+@@ -26,6 +26,7 @@
+ #define __SO_TESTING_H__
+ 
+ #include "packetdrill.h"
++#include "types.h"
+ 
+ struct config;
+ struct netdev;
+@@ -40,6 +41,10 @@
+ /* Allocate and return a new netdev for SO testing. */
+ struct netdev *so_netdev_new(struct config *config);
+ 
++/* One deadline covers all fragments and ignored packets in an outbound event. */
++int so_netdev_begin_receive(struct netdev *netdev, s32 timeout_secs, char **error);
++void so_netdev_end_receive(struct netdev *netdev);
++
+ /* Allocate a new so_instance. */
+ struct so_instance *so_instance_new(void);
+ 
+--- a/gtests/net/packetdrill/code.h
++++ b/gtests/net/packetdrill/code.h
+@@ -90,6 +90,8 @@
+ 	bool verbose;				/* print debug info? */
+ 	enum code_format_t format;		/* language syntax to emit */
+ 	enum code_data_t data_type;		/* data to get for snippets */
++	bool tcp_info_prefix;             /* audited per-event field collection */
++	int tcp_info_len;                 /* required prefix for current event */
+ 	char *command_line;			/* system(3) command to run */
+ 	char *path;				/* path where we write code */
+ 	FILE *file;				/* output file we're writing */

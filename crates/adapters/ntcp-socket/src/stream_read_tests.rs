@@ -109,7 +109,7 @@ fn shared_abi_large_stream_read_requests() {
     let kind = std::env::var(CHILD).unwrap();
     packet_test::start((
         Ipv4Addr::new(192, 0, 2, 1),
-        packet_profile::Profile::UpstreamBasic,
+        upstream_stream_read_tests("immediate-ack,abort-with-ack,coalesce-read-window"),
     ))
     .unwrap();
     unsafe {
@@ -207,4 +207,14 @@ fn shared_abi_large_stream_read_requests() {
         close(fd);
     }
     packet_test::stop();
+}
+
+fn upstream_stream_read_tests(options: &str) -> crate::packet_profile::Profile {
+    crate::packet_profile::profile(&format!(
+        "upstream,local=192.0.2.1{}{}",
+        if options.is_empty() { "" } else { "," },
+        options
+    ))
+    .unwrap()
+    .1
 }

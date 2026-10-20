@@ -252,18 +252,18 @@ fn selected_recovery_output_policy_matrix() {
         );
         assert_eq!(a.prr.unwrap().counters(), (10_000, 3000, 3000));
 
-        // Timer-driven RACK entry has no ACK delivery and therefore zero strict credit.
+        // Timer-driven RACK entry admits one repair without inventing ACK delivery.
         let mut a = strict_flight(iss);
         assert_eq!(a.config.prr_algorithm, PrrAlgorithm::Rfc9937);
         let base = a.snd_una;
         strict_ack(&mut a, 200_000, 0, &[(7000, 8000)]);
         a.timeout(225_000).unwrap();
-        assert_eq!(outputs(&mut a, 225_000, base), vec![]);
-        assert_eq!(a.prr.unwrap().counters(), (9000, 0, 0));
+        assert_eq!(outputs(&mut a, 225_000, base), vec![(0, 1000)]);
+        assert_eq!(a.prr.unwrap().counters(), (9000, 0, 1000));
         strict_ack(&mut a, 226_000, 0, &[(7000, 9000)]);
         assert_eq!(a.prr.unwrap().credit(), 1000);
-        assert_eq!(outputs(&mut a, 226_000, base), vec![(0, 1000)]);
-        assert_eq!(a.prr.unwrap().counters(), (9000, 1000, 1000));
+        assert_eq!(outputs(&mut a, 226_000, base), vec![(1000, 1000)]);
+        assert_eq!(a.prr.unwrap().counters(), (9000, 1000, 2000));
         strict_ack(&mut a, 227_000, 0, &[(7000, 9000)]);
         assert_eq!(outputs(&mut a, 227_000, base), vec![]);
     }
@@ -1022,9 +1022,15 @@ fn batch_pair(iss: u32, push: bool, bytes: usize) -> (Connection, Connection) {
 #[test]
 fn output_push_batch_initial_and_recovery_wire() {
     assert_eq!(ConnectionConfig::default().output_push_batch_segments, 0);
-    for iss in [0, u32::MAX - 4999] {
+    for (iss, batch_retries) in [
+        (0, false),
+        (u32::MAX - 4999, false),
+        (0, true),
+        (u32::MAX - 4999, true),
+    ] {
         for push in [false, true] {
             let (mut a, mut legacy) = batch_pair(iss, push, 10_000);
+            a.config.output_push_batch_retransmissions = batch_retries;
             let base = a.send_base;
             for i in 0..10 {
                 batch_wire(
@@ -1090,8 +1096,14 @@ fn output_push_batch_initial_and_recovery_wire() {
 
 #[test]
 fn output_push_batch_fresh_prr_two_mss_wire() {
-    for iss in [0, u32::MAX - 4999] {
+    for (iss, batch_retries) in [
+        (0, false),
+        (u32::MAX - 4999, false),
+        (0, true),
+        (u32::MAX - 4999, true),
+    ] {
         let (mut a, mut legacy) = batch_pair(iss, true, 20_000);
+        a.config.output_push_batch_retransmissions = batch_retries;
         let base = a.send_base;
         for i in 0..10 {
             batch_wire(
@@ -1168,17 +1180,28 @@ fn advancing_batch_departures(retry: bool) {
                 reserved.transmit_selected(selected, &mut [0; 19], true),
                 Err(Error::OutputTooSmall)
             );
-            assert_eq!((reserved.output_push_batch, reserved.snd_nxt, reserved.now), before);
+            assert_eq!(
+                (reserved.output_push_batch, reserved.snd_nxt, reserved.now),
+                before
+            );
             let mut bytes = [0; 1500];
-            let n = reserved.transmit_selected(selected, &mut bytes, true).unwrap().unwrap();
+            let n = reserved
+                .transmit_selected(selected, &mut bytes, true)
+                .unwrap()
+                .unwrap();
             let mut departure = reserved.last_departure.unwrap();
             let count = departure.payload;
-            reserved.accept_reserved_output(accepted, &mut departure, 0, count, true).unwrap();
+            reserved
+                .accept_reserved_output(accepted, &mut departure, 0, count, true)
+                .unwrap();
             assert_eq!(&bytes[..n], packet(&mut scalar, accepted));
             let segment = wire::parse(ip(tuple()), &bytes[..n]).unwrap();
             assert_eq!(segment.header.sequence, base.wrapping_add(offset).0);
             assert_eq!(segment.payload, &[0x55; 1000]);
-            assert_eq!(segment.header.flags & PSH != 0, if retry { i == 2 } else { i % 2 == 1 });
+            assert_eq!(
+                segment.header.flags & PSH != 0,
+                if retry { i == 2 } else { i % 2 == 1 }
+            );
             assert_eq!(reserved.now, accepted);
             assert_eq!(reserved.last_sent, accepted);
         }
@@ -1471,7 +1494,12 @@ fn output_push_batch_endpoint_poll_budgets() {
         a.write(id, &[0x55; 15_000]).unwrap();
         let mut base = None;
         for i in 0..10 {
-            assert!(a.poll_transmit(40 + i as u64, &mut out, 0).unwrap().packet.is_none());
+            assert!(
+                a.poll_transmit(40 + i as u64, &mut out, 0)
+                    .unwrap()
+                    .packet
+                    .is_none()
+            );
             let tx = a
                 .poll_transmit(40 + i as u64, &mut out, budget)
                 .unwrap()
@@ -1621,6 +1649,18 @@ fn hystart_wire_ack(a: &mut Connection, now: u64, ack: Seq, flags: u8) {
 }
 
 fn hystart_wire_ack_echo(a: &mut Connection, now: u64, ack: Seq, flags: u8, echo: u32) {
+    let window = (a.snd_wnd >> a.peer_scale) as u16;
+    hystart_wire_ack_echo_window(a, now, ack, flags, echo, window);
+}
+
+fn hystart_wire_ack_echo_window(
+    a: &mut Connection,
+    now: u64,
+    ack: Seq,
+    flags: u8,
+    echo: u32,
+    window: u16,
+) {
     let mut options = [1, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0];
     options[4..8].copy_from_slice(&(a.ts_recent.wrapping_add(1)).to_be_bytes());
     options[8..].copy_from_slice(&echo.to_be_bytes());
@@ -1634,7 +1674,7 @@ fn hystart_wire_ack_echo(a: &mut Connection, now: u64, ack: Seq, flags: u8, echo
             sequence: a.receive.next().0,
             acknowledgment: ack.0,
             flags,
-            window: (a.snd_wnd >> a.peer_scale) as u16,
+            window,
             urgent_pointer: 0,
         },
         if a.timestamps { &options } else { &[] },
@@ -1660,9 +1700,11 @@ fn hystart_wire_round(a: &mut Connection, sent: u64, delay: u64) {
     assert_eq!(a.snd_nxt, base.wrapping_add(10 * mss));
     let rto_updates = a.rtt.updates;
     for n in 1..=10 {
-        // One duplicate cannot supply a cached RTT to HyStart++.
+        // A window-only ACK cannot supply a cached RTT to HyStart++. Bare
+        // no-SACK duplicates separately imply delivery and discount growth.
         let state = a.congestion.startup_state();
-        hystart_wire_ack(a, sent + delay, a.snd_una, ACK);
+        let window = ((a.snd_wnd >> a.peer_scale) as u16) - 1;
+        hystart_wire_ack_echo_window(a, sent + delay, a.snd_una, ACK, u32::MAX, window);
         assert_eq!(a.congestion.startup_state(), state);
         hystart_wire_ack(a, sent + delay, base.wrapping_add(n * mss), ACK);
         if n < 10 && a.congestion.startup_state().is_some() {
@@ -3148,4 +3190,59 @@ fn general_pacing_saturated_clock_preserves_burst_bound_and_actual_send_time() {
     let ack = packet(&mut a, u64::MAX);
     assert!(wire::parse(ip(tuple()), &ack).unwrap().payload.is_empty());
     assert_eq!(a.pacer, debt);
+}
+
+#[test]
+fn output_push_new_data_batches_preserve_retry_wire_and_credit() {
+    assert!(ConnectionConfig::default().output_push_batch_retransmissions);
+    for iss in [0, u32::MAX - 4999] {
+        for push in [false, true] {
+            for unsent in [false, true] {
+                let mut a = rack_flight(iss);
+                let mut legacy = rack_flight(iss);
+                for c in [&mut a, &mut legacy] {
+                    rack_sack(c, 200_000, 10_000, &[]);
+                    c.write_with_push(&[0x55; 6000], push).unwrap();
+                }
+                a.config.output_push_batch_segments = 2;
+                a.config.output_push_batch_retransmissions = false;
+                let base = a.send_base;
+                for i in 0..6 {
+                    batch_wire(
+                        &mut a,
+                        &mut legacy,
+                        200_000,
+                        base.wrapping_add(i * 1000),
+                        push && i % 2 == 1,
+                    );
+                }
+                for c in [&mut a, &mut legacy] {
+                    if unsent {
+                        c.write_with_push(&[0x66; 1000], push).unwrap();
+                    }
+                    rack_sack(c, 300_000, 10_000, &[(12_000, 16_000)]);
+                }
+                for i in 0..2 {
+                    let before = a.prr.unwrap().counters();
+                    assert_eq!(
+                        a.transmit(300_000, &mut [0; 20]),
+                        Err(Error::OutputTooSmall)
+                    );
+                    assert_eq!(a.prr.unwrap().counters(), before);
+                    let expected = packet(&mut legacy, 300_000 + i);
+                    let actual = packet(&mut a, 300_000 + i);
+                    assert_eq!(actual, expected); // Includes PSH and checksum.
+                    let segment = wire::parse(ip(tuple()), &actual).unwrap();
+                    assert_eq!(
+                        segment.header.sequence,
+                        base.wrapping_add(i as u32 * 1000).0
+                    );
+                    assert_eq!(segment.header.flags & PSH != 0, push && !unsent && i == 1);
+                    assert_eq!(a.prr.unwrap().counters(), legacy.prr.unwrap().counters());
+                    assert_eq!(a.prr.unwrap().credit(), legacy.prr.unwrap().credit());
+                    assert!(a.output_push_batch.is_none());
+                }
+            }
+        }
+    }
 }

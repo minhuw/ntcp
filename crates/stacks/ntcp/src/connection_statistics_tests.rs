@@ -422,18 +422,14 @@ fn statistics_fin_payload_credit_distinguishes_combined_from_separate_fin() {
                 a.accept_reserved_output(timeout + 100, &mut d, 0, 100, true)
                     .unwrap();
             }
-            assert_eq!(
-                a.transport_info().delivered_segments_valid,
-                initially_combined
-            );
+            assert!(a.transport_info().delivered_segments_valid);
             let next = a.receive.next();
             let end = a.snd_nxt;
             timestamp_input(&mut a, timeout + 200, next, end, ACK, None, b"");
-            assert_eq!(a.transport_info().delivered_segments, 2); // No extra FIN or data credit.
-            assert_eq!(
-                a.transport_info().delivered_segments_valid,
-                initially_combined
-            );
+            // Previously credited data supplies no new data credit; a FIN
+            // first attached to that credited data still needs control credit.
+            assert_eq!(a.transport_info().delivered_segments, if initially_combined { 2 } else { 3 });
+            assert!(a.transport_info().delivered_segments_valid);
             assert!(a.transport_info().ledger_valid);
         }
     }

@@ -14,6 +14,108 @@ pub(super) fn max_rw_count() -> usize {
     })
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct SendBatch {
+    pub connection: ConnectionId,
+    pub start: u64,
+    pub end: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct SendFinish {
+    pub connection: ConnectionId,
+    pub end: u64,
+    pub more: bool,
+    pub end_of_record: bool,
+    pub force: bool,
+}
+
+pub(super) fn batch_goal(info: &ntcp::TransportInfo) -> usize {
+    let mss = (info.mss as usize).max(1);
+    ((info.max_send_window as usize / 2 / mss) * mss)
+        .max(mss)
+        .min((BYTES / mss).max(1) * mss)
+        .min(info.send_capacity)
+}
+
+impl Owner {
+    // A nonblocking caller may return while output owns an immutable plan.
+    // Apply only its boundary metadata once that generation is mutable again.
+    pub(super) fn finish_retained_sends(&mut self) {
+        if self.reservation.is_some() {
+            return;
+        }
+        for socket in self.sockets.values_mut() {
+            if let Some(finish) = socket.send_finish
+                && !self.endpoint.is_output_reserved(finish.connection)
+            {
+                if matches!(socket.handle, Handle::Connection(cid) if cid == finish.connection) {
+                    let _ = self.endpoint.finish_send(
+                        finish.connection,
+                        finish.end,
+                        finish.more,
+                        finish.end_of_record,
+                        finish.force,
+                    );
+                }
+                socket.send_finish = None;
+            }
+        }
+    }
+
+    // Host coalescing batches are separate from TCP's exact byte-quota API.
+    // Filling an existing tail may cross lowat; opening another batch may not.
+    pub(super) fn send_batch_admission(&self, id: u64, cid: ConnectionId) -> Result<(usize, u64)> {
+        let s = self.sockets.get(&id).ok_or(EBADF)?;
+        let info = self.endpoint.transport_info(cid).map_err(engine)?;
+        let progress = self.endpoint.send_progress(cid).map_err(engine)?;
+        let room = self
+            .endpoint
+            .send_admission_room(cid, None)
+            .map_err(engine)?;
+        let lowat = effective_notsent_lowat(s.notsent_lowat, self.socket_policy.notsent_lowat);
+        let goal = batch_goal(&info);
+        let transmitted = progress
+            .queued_end
+            .saturating_sub(info.notsent_bytes as u64);
+        let tail_start = s
+            .send_batch
+            .filter(|b| b.connection == cid && b.end == progress.queued_end && b.start <= b.end)
+            .map(|b| b.start.max(transmitted))
+            .filter(|&start| progress.queued_end - start < goal as u64);
+        if lowat == u32::MAX {
+            return Ok((room, tail_start.unwrap_or(progress.queued_end)));
+        }
+        if lowat == 0 {
+            return Ok((0, progress.queued_end));
+        }
+        if let Some(start) = tail_start {
+            return Ok((
+                room.min(goal - (progress.queued_end - start) as usize),
+                start,
+            ));
+        }
+        Ok((
+            if info.notsent_bytes < lowat as usize {
+                room.min(goal)
+            } else {
+                0
+            },
+            progress.queued_end,
+        ))
+    }
+
+    pub(super) fn socket_send_room(&self, id: u64, cid: ConnectionId) -> Result<usize> {
+        self.send_batch_admission(id, cid).map(|(room, _)| room)
+    }
+
+    fn batched_send(&self, id: u64) -> bool {
+        self.sockets.get(&id).is_some_and(|s| {
+            effective_notsent_lowat(s.notsent_lowat, self.socket_policy.notsent_lowat) != u32::MAX
+        })
+    }
+}
+
 pub(super) struct LogicalSend {
     sources: Vec<(usize, usize)>,
     total: usize,
@@ -30,6 +132,8 @@ pub(super) struct LogicalSend {
     destination: Option<SocketAddr>,
     fast_open_started: bool,
     wait_handshake: bool,
+    pending_fast_open: Option<ConnectionId>,
+    batch_turns: usize,
 }
 impl LogicalSend {
     pub(super) fn new(
@@ -70,11 +174,19 @@ impl LogicalSend {
             destination,
             fast_open_started: false,
             wait_handshake: false,
+            pending_fast_open: None,
+            batch_turns: 0,
         })
     }
     #[cfg(test)]
     pub(super) fn total_for_test(&self) -> usize {
         self.total
+    }
+    pub(super) fn waiting_fast_open(&self) -> bool {
+        self.wait_handshake
+    }
+    pub(super) fn continuing_nonblocking(&self) -> bool {
+        self.batch_turns != 0 && self.accepted != 0 && !self.wait_handshake
     }
     fn done(&self) -> bool {
         self.accepted == self.total && !self.wait_handshake
@@ -140,12 +252,8 @@ impl Owner {
             }
             let lowat =
                 effective_notsent_lowat(socket.notsent_lowat, self.socket_policy.notsent_lowat);
-            let count = send
-                .total
-                .min(BYTES)
-                .min(socket.send_capacity)
-                .min(lowat as usize);
-            if count == 0 && send.total != 0 {
+            let count = send.total.min(BYTES).min(socket.send_capacity);
+            if lowat == 0 && send.total != 0 {
                 return Err(EAGAIN);
             }
             // Crucially precedes local-port allocation, core connection, and
@@ -156,12 +264,26 @@ impl Owner {
             send.fast_open_started = true;
             send.advance(n);
             send.wait_handshake = blocking;
+            if blocking {
+                let Handle::Connection(cid) = self.sockets[&id].handle else {
+                    unreachable!()
+                };
+                self.endpoint
+                    .set_fast_open_write_pending(cid, send.total != 0)
+                    .map_err(engine)?;
+                send.pending_fast_open = Some(cid);
+            }
             if n == 0 && !blocking {
                 return Err(EINPROGRESS);
             }
             return Ok(());
         }
         if send.wait_handshake {
+            if !self.sockets.get(&id).is_some_and(|s| {
+                matches!(s.handle, Handle::Connection(cid) if Some(cid) == send.pending_fast_open)
+            }) {
+                return Err(EBADF);
+            }
             self.complete_connect(id)?;
             send.wait_handshake = false;
         }
@@ -180,15 +302,7 @@ impl Owner {
             return Ok(());
         }
         let room = if let Some(cid) = cid {
-            self.endpoint
-                .send_admission_room(
-                    cid,
-                    Some(effective_notsent_lowat(
-                        self.sockets[&id].notsent_lowat,
-                        self.socket_policy.notsent_lowat,
-                    )),
-                )
-                .map_err(engine)?
+            self.socket_send_room(id, cid)?
         } else {
             BYTES
         };
@@ -198,26 +312,27 @@ impl Owner {
                 .map_err(engine)?;
             return Err(EAGAIN);
         }
+        let deferred = blocking || self.batched_send(id);
         let completion = if cid.is_some() {
             self.reserve_send_completion(
                 id,
                 true,
                 send.zerocopy && send.zc.is_none(),
                 send.bits,
-                blocking,
+                deferred,
             )?
         } else {
             false
         };
         let mut observed = Vec::new();
-        if blocking && send.bits & crate::timestamping::TX_RECORD != 0 {
+        if deferred && send.bits & crate::timestamping::TX_RECORD != 0 {
             observed.try_reserve_exact(4).map_err(|_| ENOBUFS)?;
         }
         let count = remaining.min(BYTES).min(room);
         let bytes = send.copy_chunk(count)?;
         let copied = bytes.len();
         let cid = cid.ok_or(ENOTCONN)?;
-        let flags = if blocking && copied < remaining {
+        let flags = if deferred && copied < remaining {
             (send.flags | MSG_MORE) & !MSG_EOR
         } else {
             send.flags
@@ -232,7 +347,7 @@ impl Owner {
             self.discard_timestamp(id, cid, old);
         }
         if self.timestamp_cookie != cookie {
-            if blocking {
+            if deferred {
                 self.defer_timestamp(id, cookie, observed);
             }
             send.cookie = Some(cookie);
@@ -251,15 +366,34 @@ impl Owner {
         send: &mut LogicalSend,
         result: Result<()>,
     ) -> Result<Reply> {
+        if let Some(cid) = send.pending_fast_open.take() {
+            let _ = self.endpoint.set_fast_open_write_pending(cid, false);
+        }
         if let Some(cid) = send.cid {
             let full = !send.done() && self.endpoint.send_admission_room(cid, None) == Ok(0);
-            let _ = self.endpoint.finish_send(
+            let finish = SendFinish {
+                connection: cid,
+                end: send.end,
+                more: send.flags & MSG_MORE != 0,
+                end_of_record: send.flags & MSG_EOR != 0,
+                force: full,
+            };
+            let result = self.endpoint.finish_send(
                 cid,
-                send.end,
-                send.flags & MSG_MORE != 0,
-                send.flags & MSG_EOR != 0,
-                full,
+                finish.end,
+                finish.more,
+                finish.end_of_record,
+                finish.force,
             );
+            if let Some(socket) = self.sockets.get_mut(&id) {
+                if result == Err(ntcp::EndpointError::OutputReserved) {
+                    debug_assert!(socket.send_finish.is_none());
+                    socket.send_finish = Some(finish);
+                }
+                if finish.end_of_record {
+                    socket.send_batch = None;
+                }
+            }
         }
         if let Some(cookie) = send.cookie.take() {
             self.finish_timestamp(id, cookie);
@@ -301,26 +435,32 @@ impl Owner {
         } else {
             self.send_step(request.id, &mut send, blocking)
         };
-        if blocking && !expired && !send.done() && (result.is_ok() || matches!(result, Err(EAGAIN)))
+        let continuing = !blocking
+            && !expired
+            && !send.done()
+            && send.cid.is_some()
+            && !send.wait_handshake
+            && result.is_ok()
+            && self.batched_send(request.id)
+            && send.batch_turns < BUDGET;
+        if (blocking || continuing)
+            && !expired
+            && !send.done()
+            && (result.is_ok() || matches!(result, Err(EAGAIN)))
         {
             // A blocked syscall must release the queued prefix even under MORE
             // or CORK. RFC FLUSH is deliberately not used: it discards bytes.
             if let Some(s) = self.sockets.get(&request.id)
                 && let Handle::Connection(cid) = s.handle
             {
-                let room = self
-                    .endpoint
-                    .send_admission_room(
-                        cid,
-                        Some(effective_notsent_lowat(
-                            s.notsent_lowat,
-                            self.socket_policy.notsent_lowat,
-                        )),
-                    )
-                    .unwrap_or(0);
+                let room = self.socket_send_room(request.id, cid).unwrap_or(0);
                 if room == 0 || matches!(result, Err(EAGAIN)) {
-                    let _ = self.endpoint.finish_send(cid, send.end, true, false, true);
+                    let more = !self.batched_send(request.id) || send.flags & MSG_MORE != 0;
+                    let _ = self.endpoint.finish_send(cid, send.end, more, false, true);
                 }
+            }
+            if continuing {
+                send.batch_turns += 1;
             }
             let _ = self.refresh_readiness(request.id);
             request.send = Some(send);

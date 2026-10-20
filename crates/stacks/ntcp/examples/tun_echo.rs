@@ -567,7 +567,7 @@ mod linux {
                 *pending = 0;
                 Ok(true)
             }
-            Ok(TxOutcome::WouldBlock) => Ok(false),
+            Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => Ok(false),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
             Err(error) => Err(error),
         }

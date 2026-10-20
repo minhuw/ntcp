@@ -547,3 +547,44 @@ fn ecn_export_checks_cumulative_ack_without_clearing_marker() {
         assert!(!c.in_ecn_response(end.wrapping_add(1)));
     }
 }
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc9438#section-4.6
+//= type=test
+//= reason=Initial CUBIC window remains10000 after an underfilled4000-byte flight or receiver-window5000 prevents growth on an otherwise eligible ACK. Subsequent real duplicate-ACK entry reduces that guarded window to7000 for Reno/NewReno recovery; the wire-level fr4 regression separately asserts actual byte PRR/repair admission.
+//# Implementations
+//# that use _cwnd_ MUST use other measures to prevent _cwnd_ from
+//# growing when the volume of bytes in flight is smaller than
+//# _cwnd_.
+fn cubic_no_sack_cwnd_basis_keeps_app_and_receiver_growth_guards() {
+    for recovery in [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno] {
+        for receiver_limited in [false, true] {
+            let mut c = controller(recovery, 1000);
+            let flight = if receiver_limited { 10000 } else { 4000 };
+            let end = Seq(1 + flight);
+            c.on_data_sent(100, flight, end, false);
+            c.prepare_ack(
+                200,
+                Some(100),
+                end,
+                flight,
+                if receiver_limited { 5000 } else { MAX_WINDOW },
+            );
+            c.prepare_startup_ack(StartupAck {
+                rtt: Some(100),
+                snd_nxt: end,
+                paced: false,
+            });
+            assert!(!c.on_ack(end, flight, 0));
+            assert_eq!(c.cwnd(), 10000);
+            for duplicate in 1..=3 {
+                assert_eq!(
+                    c.on_duplicate_ack(end, 4000, end.wrapping_add(4000), false),
+                    duplicate == 3
+                );
+            }
+            assert_eq!(c.ssthresh(), 7000);
+            assert_eq!(c.recovery_target(), 7000);
+        }
+    }
+}

@@ -6,6 +6,7 @@ use crate::{ConnectionId, EndpointError, Error, Instant, Transmit, wire};
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Departure {
     pub data_ack: bool,
+    pub defer_push: bool,
     pub fresh_data: bool,
     pub segmentation: Option<TransmitSegmentation>,
     pub selected_at: Instant,
@@ -21,6 +22,7 @@ pub(crate) struct Departure {
     pub prior_rto_deadline: Option<Instant>,
     pub tlp: bool,
     pub persist: bool,
+    pub persist_probe: bool,
     pub keepalive: bool,
     pub shrink: bool,
     pub unanswered: bool,

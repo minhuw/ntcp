@@ -315,7 +315,11 @@ fn typed_core_settings_reach_native_connections() {
 #[test]
 fn packet_profiles_ignore_native_socket_defaults() {
     use crate::packet_profile::Profile;
-    for profile in [Profile::Baseline, Profile::UpstreamCubic, Profile::UpstreamCubicEcn] {
+    for profile in [
+        Profile::Baseline,
+        upstream_runtime_pacing_tests(""),
+        upstream_runtime_pacing_tests("ecn"),
+    ] {
         let local = Ipv4Addr::new(10, 73, 0, 2);
         let mut owner = Owner::packet((local, profile)).unwrap();
         // Packet profiles now use production per-selection clock sampling.
@@ -334,4 +338,15 @@ fn packet_profiles_ignore_native_socket_defaults() {
         assert!(!socket.nodelay);
         assert_eq!(socket.tos, 0);
     }
+}
+
+#[cfg(feature = "packet-test")]
+fn upstream_runtime_pacing_tests(options: &str) -> crate::packet_profile::Profile {
+    crate::packet_profile::profile(&format!(
+        "upstream,local=192.0.2.1{}{}",
+        if options.is_empty() { "" } else { "," },
+        options
+    ))
+    .unwrap()
+    .1
 }

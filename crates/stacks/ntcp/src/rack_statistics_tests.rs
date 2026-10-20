@@ -122,7 +122,7 @@ fn statistics_unsubmitted_suffix_and_failed_selection_cannot_deliver() {
 }
 
 #[test]
-fn statistics_overlapping_retry_reports_unavailable_without_changing_recovery() {
+fn statistics_overlapping_retry_repacketizes_delivery_without_changing_recovery() {
     for retry in [(0, 9), (9, 20), (5, 15)] {
         let mut rack = Rack::with_capacity(64).unwrap();
         let mut scoreboard = Scoreboard::with_capacity(64).unwrap();
@@ -135,16 +135,19 @@ fn statistics_overlapping_retry_reports_unavailable_without_changing_recovery() 
         let counts = rack.counts();
         let pipe = rack.pipe();
         assert!(rack.commit_departure(token, Seq(retry.0), Seq(retry.1), 1000));
-        assert!(!rack.delivered_segments_valid);
+        assert!(rack.delivered_segments_valid);
         assert!(rack.valid());
         assert_eq!(rack.pipe(), pipe);
         assert_eq!(rack.counts().unacked, counts.unacked);
         assert_eq!(sack(&mut rack, &mut scoreboard, 20, 20, 2000, &[]), 20);
-        assert_eq!(rack.delivered_segments, 0); // Known prefix, not a guessed total.
-        assert!(!rack.delivered_segments_valid); // Does not recover with flight drain.
+        let units = if retry == (5, 15) { 3 } else { 2 };
+        assert_eq!(rack.delivered_segments, units);
+        assert!(rack.delivered_segments_valid);
+        sack(&mut rack, &mut scoreboard, 20, 20, 2001, &[]);
+        assert_eq!(rack.delivered_segments, units);
         commit(&mut rack, Seq(20), Seq(30), 3000, false);
         sack(&mut rack, &mut scoreboard, 30, 30, 4000, &[]);
-        assert_eq!(rack.delivered_segments, 0);
+        assert_eq!(rack.delivered_segments, units + 1);
     }
 }
 
@@ -157,8 +160,8 @@ fn statistics_abandonment_and_skipped_inference_are_sticky_and_count_saturates()
     sack(&mut rack, &mut scoreboard, 10, 10, 100, &[]);
     assert_eq!(rack.delivered_segments, u64::MAX);
     commit(&mut rack, Seq(10), Seq(20), 200, false);
-    rack.trim_cumulative(Seq(20)); // SACK fallback bypassed ACK inference.
-    assert!(!rack.delivered_segments_valid);
+    rack.trim_cumulative(Seq(20)); // Cumulative statistics do not need RACK inference.
+    assert!(rack.delivered_segments_valid);
     assert!(rack.valid());
     rack.abandon(Seq(20));
     rack.trim_cumulative(Seq(20));
@@ -169,7 +172,6 @@ fn statistics_abandonment_and_skipped_inference_are_sticky_and_count_saturates()
 #[test]
 fn statistics_mixed_credit_is_checked_per_accepted_packet_not_reservation() {
     for ends in [&[10, 20][..], &[4, 10, 20][..], &[20][..]] {
-        let fragmented = ends.len() != 1;
         let mut rack = Rack::with_capacity(64).unwrap();
         let mut scoreboard = Scoreboard::with_capacity(64).unwrap();
         commit(&mut rack, Seq(0), Seq(10), 0, false);
@@ -189,13 +191,13 @@ fn statistics_mixed_credit_is_checked_per_accepted_packet_not_reservation() {
         let mut start = Seq(0);
         for &end in ends {
             assert!(rack.commit_departure(token, start, Seq(end), 1200));
-            assert_eq!(rack.delivered_segments_valid, fragmented);
+            assert!(rack.delivered_segments_valid);
             start = Seq(end);
         }
         assert_eq!(sack(&mut rack, &mut scoreboard, 20, 20, 2000, &[]), 20);
         assert_eq!(
             rack.delivered_segments,
-            if fragmented { ends.len() as u64 } else { 1 }
+            if ends.len() == 1 { 2 } else { ends.len() as u64 }
         );
         assert!(rack.valid());
     }
@@ -229,10 +231,7 @@ fn statistics_fin_credit_follows_the_credited_packet_not_an_uncredited_old_copy(
         scoreboard.clear();
         commit(&mut rack, Seq(0), Seq(10), 2100, true);
         rack.record_fin_payload(Seq(0), Seq(10));
-        assert_eq!(
-            rack.delivered_segments_valid,
-            credited_before_data_only_replacement
-        );
+        assert!(rack.delivered_segments_valid);
         sack(&mut rack, &mut scoreboard, 10, 10, 2200, &[]);
         assert_eq!(rack.delivered_segments, 1);
     }
@@ -294,5 +293,126 @@ fn statistics_flags_split_and_update_independently() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn statistics_syn_payload_pmtu_partial_retry_retains_packet_count_and_byte_ledger() {
+    for base in [Seq(1), Seq(u32::MAX - 500)] {
+        for first_len in [760, 800] {
+            let seq = |n| base.wrapping_add(n);
+            let mut rack = Rack::with_capacity(32).unwrap();
+            commit(&mut rack, base, seq(1000), 0, false);
+            rack.record_syn_payload(base, seq(1000));
+            assert!(rack.delivered_segments_valid);
+            // SYN-only ACK leaves all SYN payload outstanding. The first
+            // smaller retry overlaps the original 1000-byte packet identity.
+            rack.transmit(base, seq(first_len), 20, true);
+            let first = rack.departure_selection().unwrap();
+            assert!(rack.delivered_segments_valid); // Not committed yet.
+            assert!(rack.commit_departure(first, base, seq(first_len), 20));
+            assert!(rack.delivered_segments_valid);
+            assert!(rack.valid());
+            commit(&mut rack, seq(first_len), seq(1000), 20, true);
+            let mut scoreboard = Scoreboard::with_capacity(32).unwrap();
+            assert_eq!(
+                sack(&mut rack, &mut scoreboard, seq(1000).0, seq(1000).0, 40, &[]),
+                1000
+            );
+            assert!(rack.valid());
+            assert!(rack.delivered_segments_valid);
+            assert_eq!(rack.delivered_segments, 2);
+            assert_eq!(rack.counts().unacked, 0);
+        }
+    }
+}
+
+#[test]
+fn statistics_overlapping_repacketization_sack_and_ack_keep_independent_units() {
+    for base in [Seq(0), Seq(u32::MAX - 6)] {
+        let seq = |n| base.wrapping_add(n);
+        let mut rack = Rack::with_capacity(64).unwrap();
+        let mut scoreboard = Scoreboard::with_capacity(64).unwrap();
+        commit(&mut rack, base, seq(12), 0, false);
+        commit(&mut rack, base, seq(8), 10, true);
+        commit(&mut rack, seq(4), seq(12), 20, true);
+        // Current queued units are [0,4) and [4,12), independent of the
+        // old [0,8) latest transmission still retained for the first bytes.
+        sack(&mut rack, &mut scoreboard, base.0, seq(12).0, 30, &[(seq(4).0, seq(10).0)]);
+        assert_eq!(rack.delivered_segments, 0);
+        sack(&mut rack, &mut scoreboard, base.0, seq(12).0, 40, &[(seq(4).0, seq(12).0)]);
+        assert_eq!(rack.delivered_segments, 1);
+        sack(&mut rack, &mut scoreboard, seq(2).0, seq(12).0, 50, &[]);
+        assert_eq!(rack.delivered_segments, 1);
+        sack(&mut rack, &mut scoreboard, seq(4).0, seq(12).0, 60, &[]);
+        assert_eq!(rack.delivered_segments, 2);
+        sack(&mut rack, &mut scoreboard, seq(12).0, seq(12).0, 70, &[]);
+        sack(&mut rack, &mut scoreboard, seq(12).0, seq(12).0, 80, &[]);
+        assert_eq!(rack.delivered_segments, 2);
+        assert!(rack.delivered_segments_valid);
+        assert!(rack.valid());
+    }
+}
+
+#[test]
+fn statistics_every_single_subrange_retry_counts_queued_units_once() {
+    for base in [Seq(10), Seq(u32::MAX - 9)] {
+        for start in 0..20 {
+            for end in start + 1..=20 {
+                let seq = |n| base.wrapping_add(n);
+                let mut rack = Rack::with_capacity(64).unwrap();
+                let mut scoreboard = Scoreboard::with_capacity(64).unwrap();
+                commit(&mut rack, base, seq(20), 0, false);
+                commit(&mut rack, seq(start), seq(end), 100, true);
+                let units = 1 + u64::from(start != 0) + u64::from(end != 20);
+                for ack in 1..=20 {
+                    sack(&mut rack, &mut scoreboard, seq(ack).0, seq(20).0, 200, &[]);
+                    let expected = u64::from(start != 0 && ack >= start)
+                        + u64::from(ack >= end)
+                        + u64::from(end != 20 && ack == 20);
+                    assert_eq!(rack.delivered_segments, expected, "start={start}, end={end}, ack={ack}");
+                }
+                sack(&mut rack, &mut scoreboard, seq(20).0, seq(20).0, 300, &[]);
+                assert_eq!(rack.delivered_segments, units);
+                assert!(rack.delivered_segments_valid);
+            }
+        }
+    }
+}
+
+#[test]
+fn physical_packet_counts_keep_logical_admissions_and_retry_units_separate() {
+    for base in [Seq(0), Seq(u32::MAX - 12)] {
+        let seq = |n| base.wrapping_add(n);
+        let mut rack = Rack::with_capacity(64).unwrap();
+        let mut scoreboard = Scoreboard::with_capacity(64).unwrap();
+        rack.transmit(base, seq(40), 0, false);
+        let token = rack.departure_selection().unwrap();
+        for offset in (0..40).step_by(10) {
+            assert!(rack.commit_departure(token, seq(offset), seq(offset + 10), 1));
+        }
+        assert_eq!(rack.counts().unacked, 1);
+        assert_eq!(rack.packet_counts().unacked, 4);
+        sack(&mut rack, &mut scoreboard, base.0, seq(40).0, 10, &[(seq(10).0, seq(35).0)]);
+        assert_eq!(rack.counts().sacked, 0);
+        assert_eq!(rack.packet_counts().sacked, 2);
+        assert!(rack.reo_window(false, Some(100)) > 0);
+        sack(&mut rack, &mut scoreboard, base.0, seq(40).0, 11, &[(seq(35).0, seq(40).0)]);
+        assert_eq!(rack.packet_counts().sacked, 3);
+        assert_eq!(rack.reo_window(false, Some(100)), 0);
+        // One original packet retried in smaller pieces remains one original
+        // packet. A partial cumulative ACK also cannot create a new unit.
+        for (start, end) in [(0, 4), (4, 10)] {
+            commit(&mut rack, seq(start), seq(end), 20, true);
+        }
+        assert_eq!(rack.packet_counts().retransmitted, 1);
+        assert_eq!(rack.packet_counts().unacked, 4);
+        sack(&mut rack, &mut scoreboard, seq(4).0, seq(40).0, 30, &[]);
+        assert_eq!(rack.packet_counts().unacked, 4);
+        sack(&mut rack, &mut scoreboard, seq(10).0, seq(40).0, 31, &[]);
+        assert_eq!(rack.packet_counts().unacked, 3);
+        assert_eq!(rack.counts().unacked, 1);
+        sack(&mut rack, &mut scoreboard, seq(40).0, seq(40).0, 40, &[]);
+        assert_eq!(rack.packet_counts().unacked, 0);
     }
 }

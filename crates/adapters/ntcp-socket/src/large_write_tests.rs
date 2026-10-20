@@ -524,16 +524,23 @@ fn logical_zero_progress_backpressure_counts_byte_capacity_not_lowat() {
 }
 
 // Diagnostic replay of tcp_info/tcp-info-sndbuf-limited.pkt, not a Linux
-// chronograph equivalence assertion. Keep upstream-basic (Reno) unchanged.
+// chronograph equivalence assertion. Explicit unpaced Reno is the control.
 #[cfg(feature = "packet-test")]
 #[test]
-fn logical_sndbuf_upstream_ack_timeline() {
+fn logical_sndbuf_reno_control_ack_timeline() {
+    sndbuf_ack_timeline(upstream_large_write_tests("reno,legacy-prr"));
+}
+
+#[cfg(feature = "packet-test")]
+#[test]
+fn logical_sndbuf_paced_upstream_ack_timeline() {
+    sndbuf_ack_timeline(upstream_large_write_tests("paced"));
+}
+
+#[cfg(feature = "packet-test")]
+fn sndbuf_ack_timeline(profile: crate::packet_profile::Profile) {
     use ntcp::wire::{self, ACK, SYN};
-    let mut a = Owner::packet((
-        Ipv4Addr::new(192, 168, 0, 1),
-        crate::packet_profile::Profile::UpstreamBasic,
-    ))
-    .unwrap();
+    let mut a = Owner::packet((Ipv4Addr::new(192, 168, 0, 1), profile)).unwrap();
     a.test_now = Some(0);
     let client = new(&mut a, SOCK_NONBLOCK);
     assert_eq!(
@@ -594,6 +601,117 @@ fn logical_sndbuf_upstream_ack_timeline() {
     header.sequence = 1;
     header.flags = ACK;
     let mut high = 1;
+    if profile == upstream_large_write_tests("paced") {
+        let mut now = 10000;
+        let mut flight_times = Vec::new();
+        let mut finished = false;
+        for (ack_time, ack) in [
+            (110000, 10001),
+            (120000, 30001),
+            (130000, 70001),
+            (150000, 95001),
+            (170000, 150001),
+        ] {
+            // Advance to actual endpoint deadlines, not a configured-pacing claim.
+            for turn in 0..2000 {
+                assert!(turn < 1999, "deadline loop did not quiesce");
+                a.test_now = Some(now);
+                a.endpoint.on_timeout(now, BUDGET).unwrap();
+                for _ in 0..BUDGET {
+                    let Some(tx) = a
+                        .endpoint
+                        .poll_transmit(now, &mut packet, BUDGET)
+                        .unwrap()
+                        .packet
+                    else {
+                        break;
+                    };
+                    let segment = wire::parse(tx.ip, &packet[..tx.len]).unwrap();
+                    if !segment.payload.is_empty() {
+                        high = high.max(
+                            segment.header.sequence.wrapping_sub(syn.sequence)
+                                + segment.payload.len() as u32,
+                        );
+                        if ack == 10001 {
+                            flight_times.push(now);
+                        }
+                        eprintln!("PACED output t={now} high={high}");
+                    }
+                }
+                a.events();
+                let queued = a.endpoint.send_progress(cid).unwrap().queued_end;
+                if now >= 100000 && !finished {
+                    finished = a.service(&mut request);
+                }
+                let refilled = a.endpoint.send_progress(cid).unwrap().queued_end != queued;
+                if now == ack_time {
+                    break;
+                }
+                let next = a
+                    .endpoint
+                    .next_deadline()
+                    .filter(|&d| d > now)
+                    .unwrap_or(ack_time)
+                    .min(ack_time);
+                // A service retry can queue data after output, as in Owner::run.
+                now = if now < 100000 {
+                    next.min(100000)
+                } else if refilled {
+                    now
+                } else {
+                    next
+                };
+            }
+            let before = a.endpoint.send_progress(cid).unwrap();
+            eprintln!(
+                "PACED before ACK{ack} high={high} progress={before:?} info={:?}",
+                a.endpoint.transport_info(cid).unwrap()
+            );
+            if ack == 10001 {
+                assert_eq!(before.acknowledged, 0);
+                assert_eq!(a.endpoint.transport_info(cid).unwrap().cwnd, 10000);
+            }
+            header.acknowledgment = syn.sequence.wrapping_add(ack);
+            let n = wire::encode(ip, header, &[], &[], &mut packet).unwrap();
+            a.input(now, ip, 0, &packet[..n]).unwrap();
+            eprintln!(
+                "PACED after ACK{ack} progress={:?} info={:?}",
+                a.endpoint.send_progress(cid).unwrap(),
+                a.endpoint.transport_info(cid).unwrap()
+            );
+            let after = a.endpoint.send_progress(cid).unwrap();
+            let info = a.endpoint.transport_info(cid).unwrap();
+            assert_eq!(info.send_capacity, 20000);
+            assert_eq!(info.rwnd_limited_us, 0);
+            if ack <= high {
+                assert_eq!(after.acknowledged, u64::from(ack - 1));
+            } else {
+                assert_eq!(high, 50001);
+                assert_eq!(after, before);
+                assert_eq!(after.acknowledged, 30000);
+                assert_eq!(request.send.as_ref().unwrap().accepted, 50000);
+                assert_eq!(info.cwnd, 40000);
+                assert_eq!(info.send_used, 20000);
+                assert_eq!(info.notsent_bytes, 0);
+                // Full byte ring, no unsent data, flight 20k < cwnd 40k.
+                assert!(info.sndbuf_limited_us > 0);
+            }
+            if ack == 10001 {
+                assert_eq!(high, 10001);
+                assert_eq!(flight_times.len(), 10);
+                assert!(flight_times.last().unwrap() > flight_times.first().unwrap());
+                assert!(flight_times.windows(3).all(|t| t[0] < t[2]));
+                assert_eq!(info.cwnd, 20000);
+            } else if ack == 30001 {
+                assert_eq!(high, 30001);
+                assert_eq!(info.cwnd, 40000);
+                assert_eq!(info.sndbuf_limited_us, 0);
+            }
+        }
+        assert!(!finished);
+        assert!(reply.try_recv().is_err());
+        return;
+    }
     for now in (10000..=170000).step_by(1000) {
         a.test_now = Some(now);
         a.endpoint.on_timeout(now, BUDGET).unwrap();
@@ -666,4 +784,15 @@ fn logical_sndbuf_upstream_ack_timeline() {
         }
     }
     assert!(reply.try_recv().is_err());
+}
+
+#[cfg(feature = "packet-test")]
+fn upstream_large_write_tests(options: &str) -> crate::packet_profile::Profile {
+    crate::packet_profile::profile(&format!(
+        "upstream,local=192.0.2.1{}{}",
+        if options.is_empty() { "" } else { "," },
+        options
+    ))
+    .unwrap()
+    .1
 }
