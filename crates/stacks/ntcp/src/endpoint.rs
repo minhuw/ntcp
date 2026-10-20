@@ -3812,6 +3812,25 @@ impl Endpoint {
         &mut self,
         attempt: crate::TransmitAttempt,
     ) -> Result<bool, EndpointError> {
+        self.cancel_local_output(attempt, None)
+    }
+
+    // Caller certifies a synchronous local rejection, not a WouldBlock or an
+    // unknown/asynchronous result. Unsupported output keeps its reservation.
+    pub fn reject_local_output(
+        &mut self,
+        now: Instant,
+        attempt: crate::TransmitAttempt,
+    ) -> Result<bool, EndpointError> {
+        self.clock(now)?;
+        self.cancel_local_output(attempt, Some(now))
+    }
+
+    fn cancel_local_output(
+        &mut self,
+        attempt: crate::TransmitAttempt,
+        resource: Option<Instant>,
+    ) -> Result<bool, EndpointError> {
         let index = attempt.reservation;
         let Some(r) = self
             .reservations
@@ -3828,7 +3847,12 @@ impl Endpoint {
         };
         let timestamp = r.packet.tx_timestamp;
         let owner = &mut self.retained_slot_mut(id)?.connection;
-        if !owner.cancel_reserved_repair() {
+        let cancelled = if let Some(now) = resource {
+            owner.cancel_reserved_resource(now)? || owner.cancel_reserved_repair()
+        } else {
+            owner.cancel_reserved_repair()
+        };
+        if !cancelled {
             return Ok(false);
         }
         if let Some(token) = timestamp {
@@ -3840,6 +3864,56 @@ impl Endpoint {
         }
         self.reservations[index].current = None;
         self.refresh(id.slot);
+        Ok(true)
+    }
+
+    pub fn reserved_application_deadline(
+        &self,
+        attempt: crate::TransmitAttempt,
+    ) -> Result<Option<Instant>, EndpointError> {
+        let Some(r) = self
+            .reservations
+            .get(attempt.reservation)
+            .and_then(|s| s.current.as_ref())
+            .filter(|r| r.abandon_attempt == attempt)
+        else {
+            return Ok(None);
+        };
+        let Some(id) = r.packet.connection else {
+            return Ok(None);
+        };
+        Ok(self.retained_slot(id)?.connection.application_deadline())
+    }
+
+    // Like abandon_transmit, this requires certain non-submission of the held
+    // suffix. Only the application's absolute deadline may authorize expiry.
+    pub fn expire_reserved_application(
+        &mut self,
+        now: Instant,
+        attempt: crate::TransmitAttempt,
+    ) -> Result<bool, EndpointError> {
+        self.clock(now)?;
+        let Some(r) = self
+            .reservations
+            .get(attempt.reservation)
+            .and_then(|s| s.current.as_ref())
+            .filter(|r| r.abandon_attempt == attempt)
+        else {
+            return Ok(false);
+        };
+        let Some(id) = r.packet.connection else {
+            return Ok(false);
+        };
+        if !self
+            .retained_slot_mut(id)?
+            .connection
+            .expire_reserved_application(now)?
+        {
+            return Ok(false);
+        }
+        self.reservations[attempt.reservation].current = None;
+        self.refresh(id.slot);
+        self.rearm_pending_accept(id);
         Ok(true)
     }
 

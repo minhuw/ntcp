@@ -1178,18 +1178,48 @@ impl Rack {
 
     // Diagnostic/accounting identity remains the logical selection, not local
     // repair packetization (which must not manufacture new loss/retry counts).
+    pub(crate) fn empty_valid(&self) -> bool {
+        self.valid() && self.intervals.is_empty()
+    }
+
+    // Only a whole fresh selection with no physical acceptance or feedback.
+    // Generations never roll back, so a cancelled token cannot be replayed.
+    pub(crate) fn cancel_unsubmitted_fresh(&mut self, selection: DepartureSelection) -> bool {
+        if !self.valid()
+            || self.departure_selection != Some(selection)
+            || selection.retransmit
+            || self.intervals.is_empty()
+            || self.intervals.iter().any(|r| {
+                r.departure_committed
+                    || r.retransmitted
+                    || r.sacked
+                    || r.original_start != selection.start
+                    || r.original_end != selection.end
+            })
+        {
+            return false;
+        }
+        self.intervals.clear();
+        self.departure_selection = None;
+        true
+    }
+
     pub(crate) fn counts(&self) -> Counts {
-        self.count_by_original(false)
+        self.count_by_original(false, false)
     }
 
     // Packet-unit consumers must distinguish the original wire segments of a
     // single logical admission. ACK/SACK splits preserve these boundaries;
     // later retry repacketization must not create extra original packets.
     pub(crate) fn packet_counts(&self) -> Counts {
-        self.count_by_original(true)
+        self.count_by_original(true, false)
     }
 
-    fn count_by_original(&self, physical: bool) -> Counts {
+    pub(crate) fn committed_packet_counts(&self) -> Counts {
+        self.count_by_original(true, true)
+    }
+
+    fn count_by_original(&self, physical: bool, committed_only: bool) -> Counts {
         let mut counts = Counts::default();
         for segment in self.intervals.chunk_by(|a, b| {
             if physical {
@@ -1199,6 +1229,13 @@ impl Rack {
                 a.original_end == b.original_end
             }
         }) {
+            if committed_only
+                && !segment
+                    .iter()
+                    .any(|r| r.departure_committed || r.retransmitted)
+            {
+                continue;
+            }
             counts.unacked += 1;
             counts.sacked += u32::from(segment.iter().all(|r| r.sacked));
             counts.lost += u32::from(segment.iter().any(|r| r.original_lost && !r.sacked));

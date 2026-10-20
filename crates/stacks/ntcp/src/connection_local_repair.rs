@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
-// A retained first RACK repair can be synchronously cancelled before any bytes
-// are submitted. All snapshots are fixed-size; payload and receive buffers are
+// A retained first RACK repair or a clean fresh flight can be cancelled before
+// any physical bytes are submitted. All snapshots are fixed-size; payload and receive buffers are
 // never cloned. Unsupported outputs keep their existing immutable reservation.
 use super::*;
 
 pub(super) struct RepairUndo {
-    rack: crate::rack::RetryUndo,
+    rack: Option<crate::rack::RetryUndo>,
+    fresh: Option<FreshState>,
     mss: usize,
     receive: crate::buffer::ReceiveOutputUndo,
     congestion: Congestion,
@@ -37,11 +38,75 @@ pub(super) struct RepairUndo {
     sack_data_turn: bool,
 }
 
+#[derive(Clone, Copy)]
+struct FreshState {
+    snd_nxt: Seq,
+    iw_epoch: Option<IwEpoch>,
+    iw_started: bool,
+    iw_fallback: bool,
+    tlp_deadline: Option<Instant>,
+    tlp_end: Option<(Seq, Seq, bool)>,
+    tlp_flight: Option<Seq>,
+    tlp_fresh_rtt: bool,
+    last_output_ecn: u8,
+    last_pmtu_output: Option<(Seq, Seq)>,
+    cork_flush: Option<Seq>,
+    cork_deadline: Option<Instant>,
+    keepalive_deadline: Option<Instant>,
+}
+
 impl RepairUndo {
+    pub(super) fn is_fresh(&self) -> bool {
+        self.fresh.is_some()
+    }
     pub(super) fn capture(a: &Connection, start: Seq, count: usize) -> Option<Self> {
         let rack = a.rack.retry_undo(start, start.wrapping_add(count as u32))?;
-        Some(Self {
+        Some(Self::capture_state(a, Some(rack), None))
+    }
+
+    pub(super) fn capture_fresh(a: &Connection) -> Option<Self> {
+        if a.flight() != 0
+            || !a.rack.empty_valid()
+            || a.prr.is_some()
+            || a.congestion.in_recovery()
+            || a.congestion.ecn_prr_end().is_some()
+            || a.sack_recovery.is_some()
+            || a.sack_post_rto.is_some()
+            || a.sack_fallback.is_some()
+            || a.limited_pending
+            || a.pacing_enabled()
+            || !a.tx_timestamps.is_empty()
+            || a.fast_open_retry.is_some()
+            || a.pmtud.as_ref().is_some_and(|p| p.probe.is_some())
+        {
+            return None;
+        }
+        let fresh = FreshState {
+            snd_nxt: a.snd_nxt,
+            iw_epoch: a.iw_epoch,
+            iw_started: a.iw_started,
+            iw_fallback: a.iw_fallback,
+            tlp_deadline: a.tlp_deadline,
+            tlp_end: a.tlp_end,
+            tlp_flight: a.tlp_flight,
+            tlp_fresh_rtt: a.tlp_fresh_rtt,
+            last_output_ecn: a.last_output_ecn,
+            last_pmtu_output: a.last_pmtu_output,
+            cork_flush: a.cork_flush,
+            cork_deadline: a.cork_deadline,
+            keepalive_deadline: a.keepalive_deadline,
+        };
+        Some(Self::capture_state(a, None, Some(fresh)))
+    }
+
+    fn capture_state(
+        a: &Connection,
+        rack: Option<crate::rack::RetryUndo>,
+        fresh: Option<FreshState>,
+    ) -> Self {
+        Self {
             rack,
+            fresh,
             mss: a.mss,
             receive: a.receive.output_undo(),
             congestion: a.congestion.clone(),
@@ -71,12 +136,54 @@ impl RepairUndo {
             fast_open_retry: a.fast_open_retry,
             sack_omit: a.sack_omit,
             sack_data_turn: a.sack_data_turn,
-        })
+        }
     }
 }
 
 impl Connection {
     pub(crate) fn cancel_reserved_repair(&mut self) -> bool {
+        self.repair_undo.as_ref().is_some_and(|u| u.fresh.is_none()) && self.cancel_reserved_local()
+    }
+
+    pub(crate) fn cancel_reserved_resource(&mut self, now: Instant) -> Result<bool, Error> {
+        self.check_time(now)?;
+        let expired = due(self.application_deadline(), now);
+        if self.repair_undo.as_ref().is_none_or(|u| u.fresh.is_none())
+            || !self.cancel_reserved_local()
+        {
+            return Ok(false);
+        }
+        self.update_time(now)?;
+        // A late failure callback cannot replace an already-expired application
+        // clock with a new resource-probe epoch. Roll back only the certified
+        // unsubmitted selection, then retain truthful terminal diagnostics.
+        if expired {
+            self.terminal(CloseReason::TimedOut);
+            return Ok(true);
+        }
+        let retry_at =
+            if self.local_resource.is_some() {
+                now.saturating_add(self.config.timebase.ticks_from_us(500_000))
+            } else {
+                // Resource retry has a separate startup clock; this does not change
+                // the transport RTO or its backoff. Match the conservative RTT plus
+                // minimum-RTO allowance used before the first resource probe.
+                now.saturating_add(
+                    self.rto().max(self.rtt.srtt().unwrap_or(0).saturating_add(
+                        self.config.timebase.ticks_from_us(self.config.rto_min_us),
+                    )),
+                )
+            };
+        let epoch = self.local_resource.and_then(|r| r.epoch);
+        self.local_resource = Some(LocalResource {
+            retry_at: Some(retry_at),
+            epoch,
+        });
+        self.select_loss_timer();
+        Ok(true)
+    }
+
+    fn cancel_reserved_local(&mut self) -> bool {
         let Some(undo) = &self.repair_undo else {
             return false;
         };
@@ -84,7 +191,14 @@ impl Connection {
             return false;
         };
         // A concurrent path-MSS update must not be undone with old CC units.
-        if self.mss != undo.mss || !self.rack.cancel_retry(selection, undo.rack) {
+        if self.mss != undo.mss {
+            return false;
+        }
+        let cancelled = match undo.rack {
+            Some(rack) => self.rack.cancel_retry(selection, rack),
+            None => undo.fresh.is_some() && self.rack.cancel_unsubmitted_fresh(selection),
+        };
+        if !cancelled {
             return false;
         }
         self.reject_reserved_output();
@@ -117,6 +231,21 @@ impl Connection {
         self.fast_open_retry = undo.fast_open_retry;
         self.sack_omit = undo.sack_omit;
         self.sack_data_turn = undo.sack_data_turn;
+        if let Some(fresh) = undo.fresh {
+            self.snd_nxt = fresh.snd_nxt;
+            self.iw_epoch = fresh.iw_epoch;
+            self.iw_started = fresh.iw_started;
+            self.iw_fallback = fresh.iw_fallback;
+            self.tlp_deadline = fresh.tlp_deadline;
+            self.tlp_end = fresh.tlp_end;
+            self.tlp_flight = fresh.tlp_flight;
+            self.tlp_fresh_rtt = fresh.tlp_fresh_rtt;
+            self.last_output_ecn = fresh.last_output_ecn;
+            self.last_pmtu_output = fresh.last_pmtu_output;
+            self.cork_flush = fresh.cork_flush;
+            self.cork_deadline = fresh.cork_deadline;
+            self.keepalive_deadline = fresh.keepalive_deadline;
+        }
         self.reserved_retransmit_counts = None;
         self.last_departure = None;
         self.reserved_ledger = None;

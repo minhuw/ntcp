@@ -7,6 +7,7 @@ pub(super) struct PacketBackend {
     input: VecDeque<Vec<u8>>,
     pub(super) output: VecDeque<Reply>,
     capacity: usize,
+    pub(super) local_reject: bool,
 }
 impl PacketBackend {
     pub(super) fn new(profile: crate::packet_profile::Profile, capacity: usize) -> Result<Self> {
@@ -19,6 +20,7 @@ impl PacketBackend {
             input,
             output,
             capacity,
+            local_reject: false,
         })
     }
     pub(super) fn inject(&mut self, bytes: Vec<u8>) -> Result<()> {
@@ -48,6 +50,9 @@ impl PacketIo for PacketBackend {
         Ok(Some(packet.len()))
     }
     fn transmit(&mut self, packet: &[u8]) -> std::io::Result<TxOutcome> {
+        if self.local_reject {
+            return Ok(TxOutcome::Rejected);
+        }
         if packet.len() > crate::packet_profile::BYTES {
             return Err(std::io::Error::from_raw_os_error(EMSGSIZE));
         }

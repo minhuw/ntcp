@@ -195,70 +195,160 @@ fn local_repair_certified_rejection_yields_to_ingress_and_retries_without_false_
 }
 
 #[test]
-fn resource_study_fresh_rejection_and_backpressure_keep_backend_deadline_policy() {
-    let mut traces = Vec::new();
-    for rejected in [false, true] {
-        for io_timeout in [1_000_000, 4_000_000] {
-            let (mut a, _, socket, _, state) = pmtud_pair(None);
-            let cid = connection(&a, socket);
-            a.test_now = Some(200_000);
-            a.execute(socket, Op::Set(IPPROTO_TCP, TCP_USER_TIMEOUT, 3000))
-                .unwrap();
-            assert_eq!(
-                a.endpoint.application_timeout(cid).unwrap(),
-                Some(3_000_000)
-            );
-            a.enable_egress(2, None).unwrap();
-            a.reservation_timeout_us = io_timeout;
-            {
-                let mut io = state.lock().unwrap();
-                io.sent.clear();
-                io.reject = rejected;
-                io.block = !rejected;
+fn fresh_resource_rejection_retries_without_holding_writes_or_network_backoff() {
+    for io_timeout in [1_000_000, 4_000_000] {
+        let (mut a, _, socket, _, state) = pmtud_pair(None);
+        let cid = connection(&a, socket);
+        a.test_now = Some(200_000);
+        a.execute(socket, Op::Set(IPPROTO_TCP, TCP_USER_TIMEOUT, 3000))
+            .unwrap();
+        a.enable_egress(2, None).unwrap();
+        a.reservation_timeout_us = io_timeout;
+        state.lock().unwrap().reject = true;
+        state.lock().unwrap().sent.clear();
+        let initial_calls = state.lock().unwrap().output_calls;
+        assert_eq!(a.execute(socket, Op::Write(vec![7; 24])).unwrap().value, 24);
+        a.service_egress().unwrap();
+        assert!(!a.endpoint.is_output_reserved(cid));
+        assert!(!a.command_held(socket, &Op::Write(vec![9; 24])));
+        let info = a.endpoint.transport_info(cid).unwrap();
+        assert_eq!(info.unacked, 0);
+        assert_eq!(info.notsent_bytes, 24);
+        assert_eq!(info.resource_probes, 0);
+        let mut observed = Vec::new();
+        let mut appended = false;
+        let mut closed = false;
+        for _ in 0..32 {
+            let at = a.endpoint.next_deadline().unwrap();
+            a.test_now = Some(at);
+            a.endpoint.on_timeout(at, BUDGET).unwrap();
+            a.expire_egress(at).unwrap();
+            a.events();
+            if a.endpoint.state(cid).unwrap() == ntcp::State::Closed {
+                closed = true;
+                break;
             }
-            assert_eq!(a.execute(socket, Op::Write(vec![7; 24])).unwrap().value, 24);
+            let count = a.endpoint.transport_info(cid).unwrap().resource_probes;
+            if observed.last().is_none_or(|&(_, prior)| prior != count) && count != 0 {
+                observed.push((at, count));
+            }
             a.service_egress().unwrap();
-            assert!(a.endpoint.is_output_reserved(cid));
-            assert!(state.lock().unwrap().sent.is_empty());
-            let began = a.now();
-            let mut closed = false;
-            for elapsed in [
-                0, 1000, 500_000, 999_999, 1_000_000, 2_999_999, 3_000_000, 3_250_000, 3_350_000,
-                3_999_999, 4_000_000,
-            ] {
-                if closed {
-                    break;
-                }
-                a.test_now = Some(began + elapsed);
-                a.endpoint.on_timeout(a.now(), BUDGET).unwrap();
-                a.expire_egress(a.now()).unwrap();
-                a.events();
-                let info = a.endpoint.transport_info(cid).unwrap();
-                let reserved = a.endpoint.is_output_reserved(cid);
-                let write_held = a.command_held(socket, &Op::Write(vec![9; 24]));
-                let error = a.sockets[&socket].error;
-                let io = state.lock().unwrap();
-                traces.push(format!("{{\"certified_rejection\":{rejected},\"backend_timeout_us\":{io_timeout},\"elapsed_us\":{elapsed},\"state\":\"{:?}\",\"reserved\":{reserved},\"write_held\":{write_held},\"socket_error\":{error},\"output_calls\":{},\"submitted_packets\":{}}}", info.state, io.output_calls, io.sent.len()));
-                assert!(io.sent.is_empty());
-                drop(io);
-                if elapsed < io_timeout {
-                    assert_eq!(info.state, ntcp::State::Established);
-                    assert!(reserved && write_held);
-                    assert_eq!(error, 0);
-                    a.service_egress().unwrap();
-                } else {
-                    assert_eq!(info.state, ntcp::State::Closed);
-                    assert!(!reserved && !write_held);
-                    assert_eq!(error, ECONNABORTED);
-                    closed = true;
-                }
+            assert_eq!(
+                state.lock().unwrap().output_calls - initial_calls,
+                count as usize + 1
+            );
+            assert!(!a.endpoint.is_output_reserved(cid));
+            if count != 0 && !appended {
+                assert_eq!(a.execute(socket, Op::Write(vec![9; 24])).unwrap().value, 24);
+                appended = true;
             }
-            assert!(closed);
+            assert!(state.lock().unwrap().sent.is_empty());
+            let info = a.endpoint.transport_info(cid).unwrap();
+            assert_eq!(info.unacked, 0);
+            assert_eq!(info.rto_backoff, 0);
+            assert_eq!(info.retransmitted, 0);
+        }
+        assert!(closed);
+        assert_eq!(observed.len(), 6, "{observed:?}");
+        for (index, &(at, count)) in observed.iter().enumerate() {
+            assert_eq!(count, index as u32 + 1);
+            assert_eq!(at, observed[0].0 + index as u64 * 500_000);
+        }
+        assert_eq!(a.now(), observed[0].0 + 3_000_000);
+        assert_eq!(a.sockets[&socket].error, ETIMEDOUT);
+        let info = a.endpoint.transport_info(cid).unwrap();
+        assert_eq!(info.resource_probes, 6);
+        assert_eq!(state.lock().unwrap().output_calls - initial_calls, 7);
+        assert_eq!(info.rto_backoff, 0);
+        assert!(state.lock().unwrap().sent.is_empty());
+        assert_eq!(
+            a.execute(socket, Op::Write(vec![9; 24])).err(),
+            Some(ETIMEDOUT)
+        );
+    }
+}
+
+#[test]
+fn held_backend_output_obeys_earliest_application_or_io_deadline() {
+    for io_timeout in [1_000_000, 3_000_000, 4_000_000] {
+        let (mut a, _, socket, _, state) = pmtud_pair(None);
+        let cid = connection(&a, socket);
+        a.test_now = Some(200_000);
+        a.execute(socket, Op::Set(IPPROTO_TCP, TCP_USER_TIMEOUT, 3000))
+            .unwrap();
+        a.enable_egress(2, None).unwrap();
+        a.reservation_timeout_us = io_timeout;
+        state.lock().unwrap().block = true;
+        state.lock().unwrap().sent.clear();
+        a.execute(socket, Op::Write(vec![7; 24])).unwrap();
+        a.service_egress().unwrap();
+        assert!(a.endpoint.is_output_reserved(cid));
+        let expiry = a.now() + io_timeout.min(3_000_000);
+        a.test_now = Some(expiry - 1);
+        a.endpoint.on_timeout(a.now(), BUDGET).unwrap();
+        a.expire_egress(a.now()).unwrap();
+        assert_eq!(a.endpoint.state(cid).unwrap(), ntcp::State::Established);
+        a.test_now = Some(expiry);
+        a.expire_egress(expiry).unwrap();
+        a.events();
+        assert_eq!(a.endpoint.state(cid).unwrap(), ntcp::State::Closed);
+        assert!(!a.endpoint.is_output_reserved(cid));
+        assert_eq!(
+            a.sockets[&socket].error,
+            if io_timeout < 3_000_000 {
+                ECONNABORTED
+            } else {
+                ETIMEDOUT
+            }
+        );
+        assert_eq!(a.endpoint.transport_info(cid).unwrap().resource_probes, 0);
+    }
+}
+
+#[test]
+fn fresh_resource_retry_resumes_once_with_all_queued_data() {
+    let (mut a, _, socket, _, state) = pmtud_pair(None);
+    let cid = connection(&a, socket);
+    a.test_now = Some(200_000);
+    a.execute(socket, Op::Set(IPPROTO_TCP, TCP_USER_TIMEOUT, 3000))
+        .unwrap();
+    a.enable_egress(2, None).unwrap();
+    state.lock().unwrap().reject = true;
+    state.lock().unwrap().sent.clear();
+    a.execute(socket, Op::Write(vec![7; 24])).unwrap();
+    a.service_egress().unwrap();
+    for _ in 0..8 {
+        let at = a.endpoint.next_deadline().unwrap();
+        a.test_now = Some(at);
+        a.endpoint.on_timeout(at, BUDGET).unwrap();
+        a.service_egress().unwrap();
+        if a.endpoint.transport_info(cid).unwrap().resource_probes == 1 {
+            break;
         }
     }
-    if let Some(directory) = std::env::var_os("NTCP_RESOURCE_STUDY_OUT") {
-        let path = std::path::PathBuf::from(directory);
-        std::fs::create_dir_all(&path).unwrap();
-        std::fs::write(path.join("trace.jsonl"), traces.join("\n") + "\n").unwrap();
+    assert_eq!(a.endpoint.transport_info(cid).unwrap().resource_probes, 1);
+    a.execute(socket, Op::Write(vec![9; 24])).unwrap();
+    state.lock().unwrap().reject = false;
+    for _ in 0..8 {
+        let at = a.endpoint.next_deadline().unwrap();
+        a.test_now = Some(at);
+        a.endpoint.on_timeout(at, BUDGET).unwrap();
+        a.service_egress().unwrap();
+        if !state.lock().unwrap().sent.is_empty() {
+            break;
+        }
     }
+    let io = state.lock().unwrap();
+    assert_eq!(io.sent.len(), 1);
+    let eth = ntcp_ethernet::parse_ethernet(io.sent.front().unwrap()).unwrap();
+    let ip = ntcp_ip::parse(eth.payload, false).unwrap();
+    let segment = ntcp::wire::parse(ip.ip, ip.payload).unwrap();
+    assert_eq!(segment.payload, [&[7u8; 24][..], &[9u8; 24][..]].concat());
+    drop(io);
+    let info = a.endpoint.transport_info(cid).unwrap();
+    assert_eq!(info.resource_probes, 2);
+    assert_eq!(info.rto_backoff, 0);
+    assert_eq!(info.notsent_bytes, 0);
+    assert_eq!(info.unacked, 1);
+    assert!(!a.endpoint.is_output_reserved(cid));
 }

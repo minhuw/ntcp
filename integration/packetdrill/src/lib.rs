@@ -12,6 +12,27 @@ use std::{
 };
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+// Optional symbol, not a change to packetdrill_interface layout. Unknown
+// commands fail closed; no command string reaches a shell or host network API.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ntcp_packetdrill_control(
+    userdata: *mut c_void,
+    command: *const c_char,
+) -> i32 {
+    result(|| {
+        if ntcp_plugin_active(userdata) == 0 || command.is_null() {
+            return Err(EINVAL);
+        }
+        let enabled = match unsafe { CStr::from_ptr(command) }.to_bytes() {
+            b"ntcp-local-resource-reject-on" => true,
+            b"ntcp-local-resource-reject-off" => false,
+            _ => return Err(EOPNOTSUPP),
+        };
+        packet_test::local_resource_rejection(enabled)?;
+        Ok(0)
+    }) as i32
+}
 const USERDATA: *mut c_void = ptr::dangling_mut::<c_void>();
 unsafe extern "C" {
     fn ntcp_fill(interface: *mut c_void, userdata: *mut c_void);

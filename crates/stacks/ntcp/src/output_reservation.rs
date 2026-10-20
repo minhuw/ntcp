@@ -8,6 +8,7 @@ pub(crate) struct Departure {
     pub data_ack: bool,
     pub defer_push: bool,
     pub fresh_data: bool,
+    pub deferred_fresh: bool,
     pub segmentation: Option<TransmitSegmentation>,
     pub selected_at: Instant,
     pub start: u32,

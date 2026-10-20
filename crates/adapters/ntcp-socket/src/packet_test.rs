@@ -80,6 +80,12 @@ pub fn capture(capacity: usize) -> Result<(Vec<u8>, i64)> {
     }
 }
 
+// Called only by the patched runner's exact, audited command capability.
+pub fn local_resource_rejection(enabled: bool) -> Result<()> {
+    runtime()?.call(0, Op::LocalResourceReject(enabled))?;
+    Ok(())
+}
+
 pub fn stop() {
     if let Some(Ok(runtime)) = RUNTIME.get() {
         runtime.stop();

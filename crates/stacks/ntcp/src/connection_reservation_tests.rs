@@ -1080,3 +1080,87 @@ fn actual_group_flush_adapts_to_rtt_without_enabling_pacing() {
         }
     }
 }
+
+#[test]
+fn fresh_local_rejection_restores_sequence_push_and_denies_ack_of_unsent_bytes() {
+    for scale in [1, 1000] {
+        for iss in [0, u32::MAX - 50] {
+            let mut cfg = config(4096, 100);
+            cfg.timebase.units_per_second = 1_000_000 * scale;
+            let (mut a, _) = pair(cfg, iss);
+            a.set_application_timeout(Some(3_000_000)).unwrap();
+            a.write_with_push(&[7; 250], true).unwrap();
+            let una = a.snd_una;
+            let cwnd = a.congestion.cwnd();
+            let mut bytes = [0; 2048];
+            a.transmit_selected(40, &mut bytes, true).unwrap().unwrap();
+            assert_eq!(a.snd_nxt, una.wrapping_add(100));
+            assert_eq!(a.transport_info().unacked, 0);
+            assert!(!a.send.pushed(0, 249));
+            assert!(a.cancel_reserved_resource(50).unwrap());
+            assert_eq!(a.snd_nxt, una);
+            assert_eq!(a.rack.counts().unacked, 0);
+            assert_eq!(a.notsent_bytes(), 250);
+            assert_eq!(a.congestion.cwnd(), cwnd);
+            assert!(a.rto_deadline.is_none());
+            let next = a.receive.next();
+            inject(&mut a, 60, next, una.wrapping_add(100), ACK, 4096, &[]);
+            assert_eq!(a.snd_una, una);
+            assert_eq!(a.send.len(), 250);
+            let retry = a.local_resource.unwrap().retry_at.unwrap();
+            assert!(
+                a.transmit_selected(retry - 1, &mut bytes, true)
+                    .unwrap()
+                    .is_none()
+            );
+            a.timeout(retry).unwrap();
+            assert_eq!(a.resource_probes, 1);
+            assert_eq!(a.application_deadline(), Some(retry + 3_000_000 * scale));
+            a.transmit_selected(retry, &mut bytes, true)
+                .unwrap()
+                .unwrap();
+            let mut departure = a.last_departure.unwrap();
+            assert_eq!(Seq(departure.start), una);
+            a.accept_reserved_output(retry, &mut departure, 0, 50, false)
+                .unwrap();
+            assert_eq!(a.transport_info().unacked, 1);
+            assert!(!a.cancel_reserved_resource(retry).unwrap());
+            a.accept_reserved_output(retry, &mut departure, 50, 50, true)
+                .unwrap();
+            assert!(a.local_resource.is_none());
+            assert_eq!(a.application_deadline(), Some(retry + 3_000_000 * scale));
+            assert_eq!(a.transport_info().unacked, 2);
+            inject(
+                &mut a,
+                retry + 10,
+                next,
+                una.wrapping_add(100),
+                ACK,
+                4096,
+                &[],
+            );
+            assert_eq!(a.snd_una, una.wrapping_add(100));
+            assert_eq!(a.send.len(), 150);
+            assert_eq!(a.resource_probes, 0);
+            assert_eq!(a.consecutive_timeouts, 0);
+            assert!(!a.send.pushed(0, 149));
+            assert!(a.send.pushed(149, 1));
+        }
+    }
+}
+
+#[test]
+fn late_fresh_rejection_cannot_restart_an_expired_application_deadline() {
+    let (mut a, _) = pair(config(4096, 100), 0);
+    a.set_application_timeout(Some(100)).unwrap();
+    a.write(&[7; 250]).unwrap();
+    a.transmit_selected(40, &mut [0; 2048], true).unwrap().unwrap();
+    assert!(a.cancel_reserved_resource(200).unwrap());
+    assert_eq!(a.state, State::Closed);
+    assert_eq!(a.reason, Some(CloseReason::TimedOut));
+    assert!(a.local_resource.is_none());
+    assert_eq!(a.notsent_bytes(), 250);
+    assert_eq!(a.transport_info().unacked, 0);
+    assert_eq!(a.resource_probes, 0);
+    assert_eq!(a.consecutive_timeouts, 0);
+}

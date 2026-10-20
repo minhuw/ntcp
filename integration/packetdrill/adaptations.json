@@ -2067,8 +2067,7 @@
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
           "Only hash-audited setup/restore bytes are replaced. Original packet, syscall, payload, timing, tolerance and assertion bytes remain unchanged. Baseline behavior mismatches remain failures, not assertion edits or blocked capabilities.",
-          "The timed tc qdisc command asserts local resource congestion, not network packet loss. No adapter mapping implements pfifo limit 0 send failure, 500ms TCP_RESOURCE_PROBE_INTERVAL retries, or the resulting six probes before timeout.",
-          "Embedded tcpi_probes and tcpi_backoff assertions are unsupported by the audited TCP_INFO field mapping; TCP_USER_TIMEOUT is mapped to the ntcp application timeout, not Linux resource-probe accounting. No shell or embedded code is executed."
+          "The exact timed pfifo-limit0 command maps to a closed runner/plugin control capability that rejects backend submission locally. Resource retries and application expiry are performed by the shared production endpoint. tcpi_probes counts actual resource timer attempts; tcpi_backoff remains independent. No host tc command executes."
         ],
         "ntcp_settings": {
           "profile": "upstream",
@@ -2119,22 +2118,22 @@
         "option_reasons": {},
         "claim": "Setup-only mapping to common upstream configuration plus individually audited options; Linux behavioral equivalence and passing assertions are not claimed."
       },
-      "blocked_reasons": [
-        "The timed tc qdisc command asserts local resource congestion, not network packet loss. No adapter mapping implements pfifo limit 0 send failure, 500ms TCP_RESOURCE_PROBE_INTERVAL retries, or the resulting six probes before timeout.",
-        "Embedded tcpi_probes and tcpi_backoff assertions are unsupported by the audited TCP_INFO field mapping; TCP_USER_TIMEOUT is mapped to the ntcp application timeout, not Linux resource-probe accounting. No shell or embedded code is executed."
-      ],
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh`",
           "sha256": "db987cbec339a8140034dc0a76556fcd8346c3b83c75c17b92ce643980e7c17b",
-          "semantic_mapping": "Unavailable: The timed tc qdisc command asserts local resource congestion, not network packet loss. No adapter mapping implements pfifo limit 0 send failure, 500ms TCP_RESOURCE_PROBE_INTERVAL retries, or the resulting six probes before timeout. Embedded tcpi_probes and tcpi_backoff assertions are unsupported by the audited TCP_INFO field mapping; TCP_USER_TIMEOUT is mapped to the ntcp application timeout, not Linux resource-probe accounting. No shell or embedded code is executed."
+          "semantic_mapping": "Exact setup removal or test-backend synchronous local non-submission; no shell execution."
         },
         {
           "command": "`tc qdisc delete dev tun0 root 2>/dev/null ; tc qdisc add dev tun0 root pfifo limit 0`",
           "sha256": "5abf108ceb65e63b6377aa1d83d6d51c41fda20b0f95794a07b60a6660537994",
-          "semantic_mapping": "Unavailable: The timed tc qdisc command asserts local resource congestion, not network packet loss. No adapter mapping implements pfifo limit 0 send failure, 500ms TCP_RESOURCE_PROBE_INTERVAL retries, or the resulting six probes before timeout. Embedded tcpi_probes and tcpi_backoff assertions are unsupported by the audited TCP_INFO field mapping; TCP_USER_TIMEOUT is mapped to the ntcp application timeout, not Linux resource-probe accounting. No shell or embedded code is executed."
+          "semantic_mapping": "Exact setup removal or test-backend synchronous local non-submission; no shell execution."
         }
-      ]
+      ],
+      "command_sha256": "6c75c757b0ac9311ba3458f38b676a7841890410981ecdacfcb03ef7315546bf",
+      "embedded_tcp_info": true,
+      "resource_control": true,
+      "resource_event_sha256": "c3ba168668240345e72eda58ade025358e16b30eb9b31266891f5b2884910eb7"
     },
     "user_timeout/user_timeout.pkt": {
       "source_sha256": "0229ee144b7f8fd5f4c30efcb364b8c3f2c82a20c766b83ac133b621167b7f53",

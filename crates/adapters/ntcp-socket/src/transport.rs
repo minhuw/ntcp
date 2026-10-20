@@ -66,6 +66,8 @@ pub(crate) fn transport_option_prefix(
     ] {
         bytes[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
     }
+    bytes[3] = info.resource_probes.min(u32::from(u8::MAX)) as u8;
+    bytes[4] = info.rto_backoff.min(u32::from(u8::MAX)) as u8;
     bytes[5] = u8::from(info.timestamps_negotiated)
         | (u8::from(info.sack_negotiated) << 1)
         | (u8::from(info.window_scaling_negotiated) << 2)
@@ -368,6 +370,8 @@ mod tests {
             lost: 1,
             retransmitted: 2,
             reordering: 3,
+            resource_probes: 0,
+            rto_backoff: 0,
             cwnd: 10000,
             ssthresh: 8000,
             mss: 1000,
@@ -493,6 +497,21 @@ mod tests {
                 &transport_option(sample, 1).unwrap()[192..196],
                 &(count.min(u32::MAX as u64) as u32).to_ne_bytes()
             );
+        }
+        for (probes, backoff, expected_probes, expected_backoff) in
+            [(6, 0, 6, 0), (u32::MAX, u32::MAX, 255, 255)]
+        {
+            let metrics = transport_option(
+                ntcp::TransportInfo {
+                    resource_probes: probes,
+                    rto_backoff: backoff,
+                    ..info
+                },
+                1,
+            )
+            .unwrap();
+            assert_eq!(metrics[3], expected_probes);
+            assert_eq!(metrics[4], expected_backoff);
         }
         for (send, receive) in [(15, 0), (0, 15), (255, 255)] {
             sample.send_window_scale = send;

@@ -456,6 +456,9 @@ pub struct TransportInfo {
     // Outstanding, non-lost retransmissions, excluding SACKed retransmissions.
     pub retransmitted: u32,
     pub reordering: u32,
+    // Local resource timer attempts, independent of wire transmission and RTO.
+    pub resource_probes: u32,
+    pub rto_backoff: u32,
     pub cwnd: u32,
     pub ssthresh: u32,
     pub mss: u32,
@@ -557,6 +560,12 @@ struct IwEpoch {
     bytes: u32,
     open: bool,
     lost: bool,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct LocalResource {
+    retry_at: Option<Instant>,
+    epoch: Option<Instant>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -690,6 +699,8 @@ pub(crate) struct Connection {
     // Optional timing evidence, separate from the retained output obligation.
     reserved_ledger: Option<crate::rack::DepartureSelection>,
     repair_undo: Option<RepairUndo>,
+    local_resource: Option<LocalResource>,
+    resource_probes: u32,
     reserved_retransmit_counts: Option<crate::rack::Counts>,
     last_pmtu_output: Option<(Seq, Seq)>,
     pub(crate) rx_timestamps: RxTimestamps,
@@ -981,6 +992,8 @@ impl Connection {
             last_departure: None,
             reserved_ledger: None,
             repair_undo: None,
+            local_resource: None,
+            resource_probes: 0,
             reserved_retransmit_counts: None,
             last_pmtu_output: None,
             rx_timestamps: RxTimestamps::default(),
@@ -1444,6 +1457,8 @@ impl Connection {
             lost: counts.lost,
             retransmitted: counts.retransmitted,
             reordering: self.rack.reordering,
+            resource_probes: self.resource_probes,
+            rto_backoff: self.consecutive_timeouts,
             cwnd: self.congestion.cwnd(),
             ssthresh: self.congestion.ssthresh(),
             mss: self.mss as u32,
@@ -2489,6 +2504,9 @@ impl Connection {
     ) -> Result<(), Error> {
         self.validate_reserved_output(now, d, offset, count)?;
         if count != 0 {
+            if let Some(resource) = self.local_resource.take() {
+                self.application_progress_at = resource.epoch.unwrap_or(now);
+            }
             self.repair_undo = None; // Accepted prefixes can never be cancelled.
             self.reserved_retransmit_counts = None;
         }
@@ -2510,7 +2528,7 @@ impl Connection {
             debug_assert!(committed); // Identical read-only preflight above.
         }
         if count != 0
-            && let Some(s) = d.segmentation
+            && (d.segmentation.is_some() || d.deferred_fresh)
             && let Some(p) = &mut self.pmtud
         {
             // An aggregate is not a physical packet or PMTU observation. Record
@@ -2519,10 +2537,19 @@ impl Connection {
             p.sent(
                 start,
                 start.wrapping_add(count as u32),
-                (count + s.tcp_header_len) as u32 + u32::from(self.ip_header_len),
+                (count
+                    + d.segmentation
+                        .map_or(if self.timestamps { 32 } else { 20 }, |s| s.tcp_header_len))
+                    as u32
+                    + u32::from(self.ip_header_len),
                 self.ip_header_len,
                 false,
             );
+        }
+        if d.deferred_fresh && count != 0 && !finished {
+            // The unsubmitted suffix is reserved sequence space, not another
+            // physical packet. Keep partial-acceptance diagnostics truthful.
+            self.reserved_retransmit_counts = Some(self.rack.committed_packet_counts());
         }
         self.update_time(now)?;
         if d.stream
@@ -3472,6 +3499,8 @@ impl Connection {
             self.receive_used = 0;
         }
         self.state = State::Closed;
+        self.local_resource = None;
+        self.repair_undo = None;
         self.congestion.commit_probe_response();
         if let Some(p) = &mut self.pmtud {
             p.terminal();
@@ -3612,13 +3641,24 @@ impl Connection {
                     || self.shutdown && self.fin_sequence.is_none()))
     }
 
-    fn application_deadline(&self) -> Option<Instant> {
+    pub(crate) fn application_deadline(&self) -> Option<Instant> {
         self.application_timeout_us
             .filter(|_| self.application_timer_needed())
-            .map(|timeout| {
-                self.application_progress_at
-                    .saturating_add(self.config.timebase.ticks_from_us(timeout))
+            .and_then(|timeout| {
+                self.local_resource
+                    .map_or(Some(self.application_progress_at), |r| r.epoch)
+                    .map(|epoch| epoch.saturating_add(self.config.timebase.ticks_from_us(timeout)))
             })
+    }
+
+    pub(crate) fn expire_reserved_application(&mut self, now: Instant) -> Result<bool, Error> {
+        self.check_time(now)?;
+        if !due(self.application_deadline(), now) {
+            return Ok(false);
+        }
+        self.update_time(now)?;
+        self.terminal(CloseReason::TimedOut);
+        Ok(true)
     }
 
     fn arm_work(&mut self) {
@@ -5964,6 +6004,8 @@ impl Connection {
         }
         self.progress_at = self.now;
         self.application_progress_at = self.now;
+        self.resource_probes = 0;
+        self.local_resource = None;
         self.consecutive_timeouts = 0;
         self.retx_pending = false;
         let mut startup_rtt = None;
@@ -6919,6 +6961,9 @@ impl Connection {
         mut gso: Option<crate::output_reservation::GsoBuffer<'_>>,
     ) -> Result<Option<usize>, Error> {
         self.check_time(now)?;
+        if self.local_resource.is_some_and(|r| r.retry_at.is_some()) {
+            return Ok(None); // Owner must service the resource timer first.
+        }
         let mut segmentation = None;
         // Plan entirely before encode. Even timer/clock/accounting changes
         // are committed only once the adapter has sufficient output space.
@@ -8326,9 +8371,6 @@ impl Connection {
         // Only the first timer-entry repair has not charged PRR at selection.
         // Fixed receive-report metadata is journaled along with sender state.
         // FIN/URG outputs retain the existing immutable reservation contract.
-        self.reserved_retransmit_counts =
-            (reserve && retransmitted && !syn && !probe && !keepalive)
-                .then(|| self.rack.packet_counts());
         self.repair_undo = if reserve
             && retransmitted
             && !syn
@@ -8339,9 +8381,25 @@ impl Connection {
             && self.prr.is_some_and(|p| p.timer_repair())
         {
             RepairUndo::capture(self, seq, count)
+        } else if reserve
+            && fresh_data
+            && !syn
+            && !probe
+            && !tlp
+            && !keepalive
+            && flags & (FIN | CWR | URG) == 0
+            && pmtu_probe.is_none()
+            && sack_option_len == 0
+            && self.snd_wnd != 0
+        {
+            RepairUndo::capture_fresh(self)
         } else {
             None
         };
+        let deferred_fresh = self.repair_undo.as_ref().is_some_and(|u| u.is_fresh());
+        self.reserved_retransmit_counts =
+            (reserve && (retransmitted || deferred_fresh) && !syn && !probe && !keepalive)
+                .then(|| self.rack.packet_counts());
         if segmentation.is_some() {
             let buffer = gso.as_mut().unwrap();
             self.send.copy(offset, &mut buffer.payload[..count]);
@@ -8364,6 +8422,7 @@ impl Connection {
                 && flags & PSH != 0
                 && (application_push || batch_limit < 2 && !group_push),
             fresh_data,
+            deferred_fresh,
             passive_syn_data_acked,
             segmentation,
             selected_at: now,
@@ -8405,7 +8464,7 @@ impl Connection {
                 p.start_probe(seq, payload as u32, trailing as u32, size);
             }
             let length = count as u32 + u32::from(flags & SYN != 0) + u32::from(flags & FIN != 0);
-            if length != 0 && !keepalive && segmentation.is_none() {
+            if length != 0 && !keepalive && segmentation.is_none() && !deferred_fresh {
                 self.last_pmtu_output = Some((seq, seq.wrapping_add(length)));
                 p.sent(
                     seq,
@@ -8973,6 +9032,7 @@ impl Connection {
             self.keepalive_deadline,
             self.user_deadline(),
             self.application_deadline(),
+            self.local_resource.and_then(|r| r.retry_at),
         ]
         .into_iter()
         .flatten()
@@ -9134,6 +9194,13 @@ impl Connection {
             }
             self.terminal(CloseReason::TimedOut);
             return Ok(());
+        }
+        if let Some(resource) = &mut self.local_resource
+            && due(resource.retry_at, now)
+        {
+            resource.retry_at = None;
+            resource.epoch.get_or_insert(now);
+            self.resource_probes = self.resource_probes.saturating_add(1);
         }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
         //= reason=R1 raises route advice at three RTOs; user_deadline implements R2 closure.

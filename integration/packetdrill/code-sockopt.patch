@@ -8,7 +8,7 @@
  #include <signal.h>
  #include <stdio.h>
  #include <stdlib.h>
-@@ -140,11 +141,103 @@
+@@ -140,11 +141,105 @@
  
  #ifdef linux
  
@@ -16,6 +16,8 @@
 + * field's end offset, not sizeof(tcp_info): kernels may return older layouts. */
 +#define TCP_INFO_PREFIX_FIELDS(X) \
 +	X(tcpi_ca_state) \
++	X(tcpi_probes) \
++	X(tcpi_backoff) \
 +	X(tcpi_options) \
 +	X(tcpi_unacked) \
 +	X(tcpi_sacked) \
@@ -112,7 +114,7 @@
  	assert(len >= sizeof(struct _tcp_info));
  
  	write_symbols(code);
-@@ -559,6 +652,11 @@
+@@ -559,6 +654,11 @@
  	if (strcmp(config->code_sockopt, "") == 0) {
  		code->data_type = DATA_NONE;		/* auto-detect */
  #if HAVE_TCP_INFO
@@ -124,7 +126,7 @@
  	} else if (strcmp(config->code_sockopt, "TCP_INFO") == 0) {
  		code->data_type = DATA_TCP_INFO;
  #endif
-@@ -710,7 +808,8 @@
+@@ -710,7 +810,8 @@
  #if HAVE_TCP_INFO
  	case DATA_TCP_INFO:
  		opt_name = TCP_INFO;
@@ -134,7 +136,7 @@
  		level = SOL_TCP;
  		break;
  #endif  /* HAVE_TCP_INFO */
-@@ -740,6 +839,16 @@
+@@ -740,6 +841,16 @@
  		free(data);
  		return NULL;
  	}
@@ -151,7 +153,7 @@
  	*len = opt_len;
  	return data;
  }
-@@ -760,44 +869,28 @@
+@@ -760,44 +871,28 @@
  	}
  	int fd = state->socket_under_test->fd.live_fd;
  	struct code_state *code = state->code;
@@ -748,3 +750,47 @@
  	char *command_line;			/* system(3) command to run */
  	char *path;				/* path where we write code */
  	FILE *file;				/* output file we're writing */
+--- a/gtests/net/packetdrill/run_command.c
++++ b/gtests/net/packetdrill/run_command.c
+@@ -25,6 +25,7 @@
+ #include "run_command.h"
+ 
+ #include <errno.h>
++#include <dlfcn.h>
+ #include <signal.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -32,6 +33,7 @@
+ #include "run.h"
+ #include "script.h"
+ #include "system.h"
++#include "so_testing.h"
+ 
+ void run_command_event(
+ 	struct state *state, struct event *event, struct command_spec *command)
+@@ -43,6 +45,25 @@
+ 	wait_for_event(state);
+ 
+ 	char *error = NULL;
++	if (state->so_instance) {
++		int (*control)(void *, const char *);
++		if (strcmp(command->command_line, "ntcp-local-resource-reject-on") &&
++		    strcmp(command->command_line, "ntcp-local-resource-reject-off")) {
++			asprintf(&error, "shared-object shell commands are unsupported");
++			goto error_out;
++		}
++		control = dlsym(state->so_instance->handle, "ntcp_packetdrill_control");
++		if (!control || control(state->so_instance->ifc.userdata,
++					 command->command_line)) {
++			asprintf(&error, "shared-object control rejected");
++			goto error_out;
++		}
++		return;
++	}
++	if (!strncmp(command->command_line, "ntcp-local-", 11)) {
++		asprintf(&error, "shared-object control requires its backend");
++		goto error_out;
++	}
+ 	if (safe_system(command->command_line, &error))
+ 		goto error_out;
+ 	return;

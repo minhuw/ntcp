@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from expectations import PORTED_SCRIPTS
 
-from run import (SLOW_START_ACK_SCRIPTS, FASTOPEN_CLIENT_SCRIPTS, NON_TFO_SETUP_COMMANDS, ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
+from run import (RESOURCE_SCRIPT, RESOURCE_EVENT, RESOURCE_CONTROL, SLOW_START_ACK_SCRIPTS, FASTOPEN_CLIENT_SCRIPTS, NON_TFO_SETUP_COMMANDS, ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
                  fixture_command, HERE, PIN, adapt_source, check_plugin_hash, invoke, main, outcome,
                  preflight, profile_metadata, select_cases, variants, verify_backend)
 
@@ -503,6 +503,9 @@ class AdaptationChecks(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name) / PIN['tcp_tests']
         self.manifest = json.loads((HERE / 'adaptations.json').read_text())
+        # Timed resource commands require the exact real source/hash and have
+        # separate capability tests; generic synthetic sources cannot enable it.
+        self.manifest['scripts'].pop(RESOURCE_SCRIPT)
         self.source = (b'// assertions must survive exactly\n`../common/defaults.sh`\n'
                        b'0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3\n'
                        b'+0 > S 0:0(0) <...>\n+0 close(3) = 0\n')
@@ -1302,7 +1305,7 @@ class PublishedSelectionChecks(unittest.TestCase):
                         expected = expected.replace(entry['restore_line'].encode(),
                                                     entry['restore_replacement_line'].encode(), 1)
                     self.assertEqual(generated, expected)
-                    self.assertEqual(preflight(generated.decode(), entry.get('embedded_tcp_info') is True), [])
+                    self.assertEqual(preflight(generated.decode(), entry.get('embedded_tcp_info') is True, resource_control=entry.get('resource_control') is True), [])
                     self.assertEqual(audit['generated_sha256'], hashlib.sha256(generated).hexdigest())
                 self.assertEqual((self.directory / name).read_bytes(), source)
                 if name in DEFAULTS_ONLY_CUBIC | SLOW_START_ACK_SCRIPTS and b'SO_SNDBUF' in source:
@@ -1334,6 +1337,8 @@ class PublishedSelectionChecks(unittest.TestCase):
                     if 'restore_line' in entry:
                         restored = restored.replace(entry['restore_replacement_line'].encode(),
                                                     entry['restore_line'].encode(), 1)
+                    if name == RESOURCE_SCRIPT:
+                        restored = restored.replace(RESOURCE_CONTROL, RESOURCE_EVENT, 1)
                     self.assertEqual(restored, source)
                     self.assertIn('generated_sha256', audit)
                 self.assertFalse(entry['mapping']['linux_defaults_reproduced'])
@@ -1368,7 +1373,7 @@ class PublishedSelectionChecks(unittest.TestCase):
                                 for name in self.manifest['scripts'])
             # The candidate fixture remains runtime-gated until integration is ready.
             sendfile_enabled = not self.manifest['scripts']['sendfile/sendfile-simple.pkt'].get('blocked_reasons')
-            for selection, source_eligible in ((SOCKET43, 36 + int(sendfile_enabled)), (SOCKET_FEATURE19, 15)):
+            for selection, source_eligible in ((SOCKET43, 37 + int(sendfile_enabled)), (SOCKET_FEATURE19, 15)):
                 ported = set(selection) & PORTED_SCRIPTS
                 eligible = source_eligible - len(ported)
                 executed = []
@@ -1381,7 +1386,7 @@ class PublishedSelectionChecks(unittest.TestCase):
                                     self.manifest['scripts'][n]['adapter_flags'])[0] == path.read_bytes())
                     entry = self.manifest['scripts'][name]
                     self.assertFalse(entry.get('blocked_reasons'), name)
-                    self.assertEqual(preflight(path.read_text(), entry.get('embedded_tcp_info') is True), [])
+                    self.assertEqual(preflight(path.read_text(), entry.get('embedded_tcp_info') is True, resource_control=entry.get('resource_control') is True), [])
                     if '--dry_run' not in argv:
                         executed.append(name)
                     return 1 if '--dry_run' not in argv else 0, False, 'diagnostic mismatch'

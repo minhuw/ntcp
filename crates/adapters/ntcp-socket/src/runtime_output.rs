@@ -114,7 +114,27 @@ impl Owner {
         if self.egress.is_some() {
             return self.expire_egress(now);
         }
-        if self
+        let application = self
+            .reservation
+            .map(|attempt| self.endpoint.reserved_application_deadline(attempt))
+            .transpose()
+            .map_err(engine)?
+            .flatten();
+        if application
+            .is_some_and(|at| at <= now && self.reservation_deadline.is_none_or(|io| at <= io))
+        {
+            let attempt = self.reservation.ok_or(EIO)?;
+            if !self
+                .endpoint
+                .expire_reserved_application(now, attempt)
+                .map_err(engine)?
+            {
+                return Err(EIO);
+            }
+            self.pending_packet = None;
+            self.pending_token = None;
+            self.clear_reservation();
+        } else if self
             .reservation_deadline
             .is_some_and(|deadline| now >= deadline)
         {
@@ -187,7 +207,7 @@ impl Owner {
                 if let Some(attempt) = self.reservation
                     && self
                         .endpoint
-                        .cancel_unsubmitted_repair(attempt)
+                        .reject_local_output(self.now(), attempt)
                         .map_err(engine)?
                 {
                     self.pending_packet = None;

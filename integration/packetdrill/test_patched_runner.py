@@ -78,7 +78,7 @@ class CompiledSnapshotChecks(unittest.TestCase):
         subprocess.run(['patch', '-p1', '-i', str(HERE / 'code-sockopt.patch')],
                        cwd=directory, check=True, capture_output=True)
         for name in ('code.c', 'code.h', 'packet.h', 'packet.c', 'icmp_packet.c',
-                     'parser.y', 'socket.h', 'run_packet.c', 'so_testing.c'):
+                     'parser.y', 'socket.h', 'run_packet.c', 'so_testing.c', 'run_command.c'):
             if (source.parent / name).read_bytes() != (runner.parent / name).read_bytes():
                 raise AssertionError(f'built {name} differs from pinned source plus patch')
         cls.binary = directory / 'snapshot-test'
@@ -167,7 +167,7 @@ class CompiledSnapshotChecks(unittest.TestCase):
                          ['requested TCP_INFO 196', 'requested TCP_INFO 6'])
 
     def test_prefix_field_layout_matches_audited_fields(self):
-        ends = {'tcpi_ca_state': 2, 'tcpi_options': 6, 'tcpi_snd_wscale': 7,
+        ends = {'tcpi_ca_state': 2, 'tcpi_probes': 4, 'tcpi_backoff': 5, 'tcpi_options': 6, 'tcpi_snd_wscale': 7,
                 'tcpi_rcv_wscale': 7, 'tcpi_unacked': 28, 'tcpi_sacked': 32,
                 'tcpi_lost': 36, 'tcpi_retrans': 40, 'tcpi_last_data_recv': 56,
                 'tcpi_rtt': 72, 'tcpi_snd_ssthresh': 80, 'tcpi_snd_cwnd': 84,

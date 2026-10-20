@@ -344,3 +344,52 @@ fn local_repair_cancel_then_covering_ack_cannot_resurrect_old_retransmission() {
         a.accept_transmit(96_000, token.unwrap()).unwrap();
     }
 }
+
+#[test]
+fn fresh_local_rejection_invalidates_old_tokens_and_preserves_accepted_prefixes() {
+    for ipv6 in [false, true] {
+        let (mut a, _, id, _) = gso_pair(ipv6, true);
+        a.write(id, &[7; 3500]).unwrap();
+        let mut bytes = [0; 2048];
+        let (p, token) = a.poll_reserved_transmit_for(2, id, &mut bytes, 1).unwrap();
+        let packet = p.packet.unwrap();
+        let first = wire::parse(packet.ip, &bytes[..packet.len])
+            .unwrap()
+            .header
+            .sequence;
+        let old = token.unwrap();
+        assert!(a.reject_local_output(3, old).unwrap());
+        assert!(!a.accept_transmit(3, old).unwrap());
+        assert!(!a.reject_local_output(3, old).unwrap());
+        assert!(!a.is_output_reserved(id));
+        assert_eq!(a.transport_info(id).unwrap().notsent_bytes, 3500);
+        assert_eq!(a.transport_info(id).unwrap().unacked, 0);
+        a.write(id, b"appended").unwrap();
+        let mut selected = None;
+        for _ in 0..8 {
+            let at = a.next_deadline().unwrap();
+            a.on_timeout(at, 16).unwrap();
+            let (p, token) = a.poll_reserved_transmit_for(at, id, &mut bytes, 1).unwrap();
+            if let Some(packet) = p.packet {
+                selected = Some((at, packet, token.unwrap()));
+                break;
+            }
+        }
+        let (at, packet, token) = selected.unwrap();
+        assert_eq!(
+            wire::parse(packet.ip, &bytes[..packet.len])
+                .unwrap()
+                .header
+                .sequence,
+            first
+        );
+        let accepted = token;
+        assert!(a.accept_transmit(at, accepted).unwrap());
+        let (p, token) = a.poll_reserved_transmit_for(at, id, &mut bytes, 1).unwrap();
+        assert!(p.packet.is_some());
+        let suffix = token.unwrap();
+        assert!(!a.reject_local_output(at, suffix).unwrap());
+        assert!(a.is_output_reserved(id));
+        assert!(a.accept_transmit(at, suffix).unwrap());
+    }
+}

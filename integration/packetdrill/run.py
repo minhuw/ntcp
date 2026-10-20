@@ -286,7 +286,14 @@ def fixture_command(argv, runner, plugin):
             os.readlink('/proc/self/ns/mnt'), *argv[4:]]
 
 
-TCP_INFO_FIELDS = {'tcpi_ca_state', 'tcpi_unacked', 'tcpi_sacked',
+RESOURCE_SCRIPT = 'user_timeout/user-timeout-probe.pkt'
+RESOURCE_SETUP = b'`../../common/defaults.sh`\n'
+RESOURCE_EVENT = b'   +0 `tc qdisc delete dev tun0 root 2>/dev/null ; tc qdisc add dev tun0 root pfifo limit 0`\n'
+RESOURCE_CONTROL = b'   +0 `ntcp-local-resource-reject-on`\n'
+RESOURCE_SOURCE_SHA256 = 'fbbf50f3e1d2facf9835267513fe709665db245d1f2234f98dd448d8be59d564'
+
+
+TCP_INFO_FIELDS = {'tcpi_ca_state', 'tcpi_probes', 'tcpi_backoff', 'tcpi_unacked', 'tcpi_sacked',
                    'tcpi_lost', 'tcpi_retrans', 'tcpi_reordering',
                    'tcpi_snd_cwnd', 'tcpi_snd_ssthresh', 'tcpi_rtt',
                    'tcpi_notsent_bytes', 'tcpi_last_data_recv', 'tcpi_busy_time',
@@ -363,13 +370,16 @@ def runner_provenance(runner):
     return provenance
 
 
-def preflight(text, embedded_tcp_info=False):
+def preflight(text, embedded_tcp_info=False, resource_control=False):
     # Conservative safety/capability screening, NOT a second packetdrill parser.
     # Upstream --dry_run remains the authority for script syntax.
     # Inspect raw text conservatively, including comments: do not accidentally
     # strip a command concealed by comment-like characters inside a string.
     reasons = []
-    if '`' in text:
+    shell_text = text
+    if resource_control and text.count(RESOURCE_CONTROL.decode()) == 1:
+        shell_text = text.replace(RESOURCE_CONTROL.decode(), '', 1)
+    if '`' in shell_text:
         reasons.append('shell setup/assertions target Linux, not the ntcp backend')
     if '%{' in text or '}%' in text:
         if embedded_tcp_info:
@@ -417,6 +427,26 @@ def adapt_source(directory, relative, manifest, so_flags):
         data = (directory / extra['path']).read_bytes()
         if hashlib.sha256(data).hexdigest() != extra['sha256']:
             raise ValueError(f"setup {extra['path']} hash differs from audited adaptation")
+    if relative == RESOURCE_SCRIPT and not entry.get('blocked_reasons'):
+        expected_commands = [RESOURCE_SETUP.rstrip(b'\n'),
+                             RESOURCE_EVENT[RESOURCE_EVENT.index(b'`'):].rstrip(b'\n')]
+        expected_audit = [(c.decode(), hashlib.sha256(c).hexdigest()) for c in expected_commands]
+        if (hashlib.sha256(source).hexdigest() != RESOURCE_SOURCE_SHA256
+                or entry['command_line'].encode() != RESOURCE_SETUP
+                or entry['replacement_line'].encode() != b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n'
+                or entry.get('command_sha256') != hashlib.sha256(RESOURCE_SETUP).hexdigest()
+                or entry.get('expected_command_count') != 2
+                or re.findall(rb'`[^`]*`', source) != expected_commands
+                or [(c['command'], c['sha256']) for c in entry.get('audited_shell_commands', [])] != expected_audit
+                or entry.get('resource_control') is not True
+                or entry.get('resource_event_sha256') != hashlib.sha256(RESOURCE_EVENT).hexdigest()
+                or source.count(RESOURCE_EVENT) != 1):
+            raise ValueError('expected exact audited resource setup and timed command')
+        generated = source.replace(RESOURCE_SETUP, entry['replacement_line'].encode(), 1).replace(RESOURCE_EVENT, RESOURCE_CONTROL, 1)
+        reasons = preflight(generated.decode(), True, resource_control=True)
+        if reasons:
+            raise ValueError('; '.join(reasons))
+        return generated, {**entry, 'generated_sha256': hashlib.sha256(generated).hexdigest()}
     if entry.get('blocked_reasons'):
         # Keep unavailable shell/configuration and embedded assertions untouched.
         # The caller reports the audit but must never execute this source.
@@ -876,7 +906,7 @@ def main():
                     row['stage'] = 'preflight'
                     embedded_tcp_info = (row['adapted'] and
                                          row['adaptation'].get('embedded_tcp_info') is True)
-                    reasons = preflight(text, embedded_tcp_info)
+                    reasons = preflight(text, embedded_tcp_info, resource_control=(row['adapted'] and row['adaptation'].get('resource_control') is True))
                     if variant not in ('native-ipv4', 'ipv4'):
                         reasons.append('the adapter implements IPv4 only')
                     if reasons:

@@ -191,17 +191,32 @@ impl Owner {
         let mut egress = self.egress.take().unwrap();
         let result = (|| {
             for index in 0..egress.tx.len() {
-                if let Some(entry) = &egress.tx[index].entry
-                    && entry.deadline.is_some_and(|deadline| now >= deadline)
-                {
-                    if !self
+                if let Some(entry) = &egress.tx[index].entry {
+                    let application = self
                         .endpoint
-                        .abandon_transmit(entry.attempt)
-                        .map_err(engine)?
-                    {
-                        return Err(EIO);
+                        .reserved_application_deadline(entry.attempt)
+                        .map_err(engine)?;
+                    let app_first = application
+                        .is_some_and(|at| at <= now && entry.deadline.is_none_or(|io| at <= io));
+                    if app_first {
+                        if !self
+                            .endpoint
+                            .expire_reserved_application(now, entry.attempt)
+                            .map_err(engine)?
+                        {
+                            return Err(EIO);
+                        }
+                        egress.clear(index)?;
+                    } else if entry.deadline.is_some_and(|at| at <= now) {
+                        if !self
+                            .endpoint
+                            .abandon_transmit(entry.attempt)
+                            .map_err(engine)?
+                        {
+                            return Err(EIO);
+                        }
+                        egress.clear(index)?;
                     }
-                    egress.clear(index)?;
                 }
             }
             self.drain_timestamps(ClockPair::sample(self));
@@ -431,7 +446,7 @@ impl Owner {
                     Ok(TxOutcome::Rejected)
                         if self
                             .endpoint
-                            .cancel_unsubmitted_repair(entry.attempt)
+                            .reject_local_output(self.now(), entry.attempt)
                             .map_err(engine)? =>
                     {
                         egress

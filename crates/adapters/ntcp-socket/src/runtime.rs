@@ -84,6 +84,8 @@ pub enum Op {
     Inject(Vec<u8>),
     #[cfg(feature = "packet-test")]
     Capture(usize),
+    #[cfg(feature = "packet-test")]
+    LocalResourceReject(bool),
     Close,
     Shutdown(i32),
     Flags(i32, i32),
@@ -757,7 +759,12 @@ impl Owner {
     }
     fn admission_command(&self, op: &Op) -> bool {
         #[cfg(feature = "packet-test")]
-        if self.packet_backend() && matches!(op, Op::Inject(_) | Op::Capture(_)) {
+        if self.packet_backend()
+            && matches!(
+                op,
+                Op::Inject(_) | Op::Capture(_) | Op::LocalResourceReject(_)
+            )
+        {
             return true;
         }
         let _ = op;
@@ -1508,6 +1515,10 @@ impl Owner {
                     unreachable!()
                 };
                 self.packets.as_mut().unwrap().inject(bytes)?;
+                return Ok(out);
+            }
+            Op::LocalResourceReject(enabled) => {
+                self.packets.as_mut().ok_or(EOPNOTSUPP)?.local_reject = *enabled;
                 return Ok(out);
             }
             Op::Capture(capacity) => {
@@ -2392,7 +2403,7 @@ impl Owner {
             Op::Wait(_, _) => unreachable!(),
             Op::New(_) => unreachable!(),
             #[cfg(feature = "packet-test")]
-            Op::Inject(_) | Op::Capture(_) => unreachable!(),
+            Op::Inject(_) | Op::Capture(_) | Op::LocalResourceReject(_) => unreachable!(),
         }
         Ok(out)
     }
