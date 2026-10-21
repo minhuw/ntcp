@@ -1,6 +1,8 @@
 # Known exceptions
 
-The 14 selected upstream loss-recovery tests are accounted for: **12 pass**, and **2 fail with the documented differences below**.
+The latest recorded IPv4 `upstream` run selects **103 cases: 78 pass, 12 fail, and 13 are unsupported**. All 12 observed failures match accepted, cause-specific differences documented below. Keep their raw failure counts; exclude a failure from actionable regression lists only when its observed cause matches the corresponding entry. Reopen a case when a different cause appears.
+
+The 13 unsupported cases are separate capability or setup gaps; they are not covered by these accepted failure differences.
 
 ### Application-limited slow start
 
@@ -29,9 +31,21 @@ Linux uses Minshall's variant, which holds a short segment only when a previousl
 
 This exception covers only the observed short-tail timing difference, not initial SYN allocation delays or other failures in this script.
 
+### `fastopen/server/icmp-baseline.pkt`
+
+**Accepted handshake-abort difference: RST expected after ICMP host-unreachable, ACK observed.**
+
+The listener does not enable TCP Fast Open. After sending SYN-ACK, it receives a validated IPv4 destination-unreachable error, type 3/code 1, while the child is in `SYN_RECEIVED`. ntcp records this soft error and retains the pending handshake. The subsequent valid final ACK completes the connection. The observed reply is `ACK=11`, also acknowledging the ten bytes retained from the SYN.
+
+Linux 6.12.19 drops the ordinary pending request on this error. Runtime tracing confirmed a matching quoted SYN-ACK sequence and `abort=1`; the later ACK reaches a listener with no matching request and elicits the script's RST. The ICMP itself does not directly cause that RST.
+
+[RFC 9293 §3.9.2.2](https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2) classifies this code as a soft error and requires that it not abort the connection (MUST-56), while recommending application visibility (SHLD-25). Its note acknowledges widespread connection-establishment exceptions. [RFC 5461 §4.1](https://www.rfc-editor.org/rfc/rfc5461#section-4.1) documents the early-abort behavior as nonstandard and states that the TCP standard was not changed to adopt it. ntcp retains soft-error non-abort behavior.
+
+Keep the original script and raw failure count. Exclude failures matching this half-open soft-error retention policy from actionable lists. Reopen for a different cause, such as accepting an invalid ICMP quote, losing the soft-error notification, misclassifying a hard error, or failing to complete the retained handshake after a valid ACK.
+
 ### `inq/client.pkt`
 
-**Accepted timeout: the script waits for an ACK to data missing negotiated timestamps.**
+**Accepted ACK-capture timeout: the script waits for an ACK to data missing negotiated timestamps.**
 
 Linux accepts these packets, accommodating devices that strip TCP options. ntcp follows [RFC 7323 §3.2](https://www.rfc-editor.org/rfc/rfc7323.html#section-3.2): senders MUST include timestamps after negotiation; receivers SHOULD silently drop packets that omit them, preserving PAWS protection against old duplicates. Adding timestamps to the incoming data and FIN in a diagnostic copy passes all unchanged INQ/EOF assertions.
 
@@ -178,11 +192,12 @@ inventory in [expectations.json](expectations.json) covers all 22 entries contai
 |---|---|
 | Owned by `ntcp-ported`; excluded from `upstream` | `timestamping/partial.pkt`; `tcp_info/tcp-info-sndbuf-limited.pkt` |
 | Original expectations retained; passing | `notsent_lowat/notsent-lowat-setsockopt.pkt`; `notsent_lowat/notsent-lowat-sysctl.pkt`; `slow_start/slow-start-app-limited.pkt` |
+| Original expectations retained; passing | `slow_start/slow-start-ack-per-1pkt.pkt`; `slow_start/slow-start-ack-per-2pkt.pkt`; `slow_start/slow-start-ack-per-4pkt.pkt` |
 | Original expectations retained; accepted for a different cause above | `cubic/cubic-rto-ss-ca-cwnd-bump.pkt` (TLP timing); `slow_start/slow-start-app-limited-9-packets-out.pkt` (application-limited growth) |
 | Unsupported setup/backend; unchanged | `blocking/blocking-write.pkt`; `cubic/cubic-bulk-166k-idle-restart.pkt`; `cubic/cubic-bulk-166k.pkt`; `cubic/cubic-hystart-delay-min-rtt-jumps-downward.pkt`; `cubic/cubic-hystart-delay-rtt-jumps-upward.pkt` |
-| Unsupported setup/backend; unchanged | `slow_start/slow-start-ack-per-1pkt.pkt`; `slow_start/slow-start-ack-per-2pkt.pkt`; `slow_start/slow-start-ack-per-4pkt.pkt`; `slow_start/slow-start-after-idle.pkt`; `slow_start/slow-start-after-win-update.pkt`; `slow_start/slow-start-fq-ack-per-2pkt.pkt` |
+| Unsupported setup/backend; unchanged | `slow_start/slow-start-after-idle.pkt`; `slow_start/slow-start-after-win-update.pkt`; `slow_start/slow-start-fq-ack-per-2pkt.pkt` |
 | Unsupported setup/backend; unchanged | `epoll/epoll_out_edge.pkt`; `epoll/epoll_out_edge_default_notsent_lowat.pkt`; `epoll/epoll_out_edge_notsent_lowat.pkt`; `notsent_lowat/notsent-lowat-default.pkt` |
 
 Mentioning a buffer option does not by itself justify an adjustment or a waiver.
-The 15 unsupported cases stay unsupported, and the existing congestion-control
+The 12 buffer-dependent unsupported cases stay unsupported, and the existing congestion-control
 and retransmission-timing differences retain their separate explanations.
