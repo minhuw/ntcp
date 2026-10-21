@@ -12,11 +12,16 @@ fn local_state(a: &Connection, now: u64, label: &str, rows: &mut Vec<String>) {
 }
 
 fn local_sender(rows: &mut Vec<String>) -> Connection {
-    let mut cfg = profile(PrrAlgorithm::Rfc9937);
+    local_sender_with_algorithm(rows, PrrAlgorithm::Rfc9937)
+}
+
+fn local_sender_with_algorithm(rows: &mut Vec<String>, algorithm: PrrAlgorithm) -> Connection {
+    let mut cfg = profile(algorithm);
     // Remaining common upstream options, audited against packet_profile::config.
     cfg.coalesce_read_window_updates = true;
     cfg.abort_with_ack = true;
-    cfg.output_push_batch_segments = 2;
+    cfg.output_push_batch_segments = 0;
+    cfg.output_group_flush = true;
     cfg.output_push_batch_retransmissions = false;
     let incoming = ip(reverse(tuple()));
     let mut bytes = [0; 64];
@@ -289,4 +294,96 @@ fn local_repair_cancel_restores_receive_sack_debt_and_partial_retry_history() {
     a.accept_reserved_output(96_000, &mut d, 0, count, true)
         .unwrap();
     assert_eq!(a.prr.unwrap().counters().2, count as u64);
+}
+
+#[test]
+fn rack_timer_prr_window_survives_rejection_and_zero_delivery() {
+    let mut rows = Vec::new();
+    let mut a = local_sender(&mut rows);
+    let before = a.prr.unwrap().counters();
+    let target = a.congestion.recovery_target();
+    assert_eq!(before, (1000, 0, 0));
+    assert_eq!(a.rack.pipe(), 0);
+    assert_eq!(a.prr.unwrap().credit(), 1000);
+    assert_eq!((a.congestion.cwnd(), target), (1000, 2000));
+    let admission = 1000;
+    local_state(&a, 90_000, "synchronized_timer_entry", &mut rows);
+    for at in [90_000, 91_000] {
+        let mut bytes = [0; 2048];
+        let n = a.transmit_selected(at, &mut bytes, true).unwrap().unwrap();
+        let packet = wire::parse(ip(tuple()), &bytes[..n]).unwrap();
+        assert_eq!(
+            (packet.header.sequence, packet.payload.len()),
+            (10001, 1000)
+        );
+        assert_eq!(a.transport_info().retransmitted, 0);
+        assert!(a.cancel_reserved_repair());
+        assert_eq!(a.prr.unwrap().counters(), before);
+        assert_eq!(a.prr.unwrap().credit(), 1000);
+        assert_eq!(a.congestion.cwnd(), admission);
+        assert_eq!(a.congestion.recovery_target(), target);
+    }
+    local_state(&a, 91_000, "twice_rejected", &mut rows);
+    inject_sack(
+        &mut a,
+        95_000,
+        Seq(1),
+        Seq(10001),
+        ACK,
+        320,
+        &[9; 1000],
+        &[(11001, 12001)],
+    );
+    assert_eq!(a.receive_used, 1000);
+    assert_eq!(a.prr.unwrap().counters(), before);
+    assert_eq!(a.prr.unwrap().credit(), 1000);
+    assert_eq!(a.congestion.cwnd(), admission);
+    local_state(&a, 95_000, "input_without_new_delivery", &mut rows);
+    let mut bytes = [0; 2048];
+    let n = a
+        .transmit_selected(96_000, &mut bytes, true)
+        .unwrap()
+        .unwrap();
+    let packet = wire::parse(ip(tuple()), &bytes[..n]).unwrap();
+    assert_eq!(
+        (packet.header.sequence, packet.payload.len()),
+        (10001, 1000)
+    );
+    assert_eq!(packet.header.acknowledgment, 1001);
+    let mut departure = a.last_departure.unwrap();
+    a.accept_reserved_output(96_000, &mut departure, 0, 1000, true)
+        .unwrap();
+    assert_eq!(a.prr.unwrap().counters(), (1000, 0, 1000));
+    assert_eq!(a.prr.unwrap().credit(), 0);
+    assert_eq!(a.transport_info().retransmitted, 1);
+    assert_eq!(a.congestion.recovery_target(), target);
+    assert!(output(&mut a, 96_000, &mut rows).iter().all(|p| p.2 == 0));
+    local_state(&a, 96_000, "repair_accepted_credit_exhausted", &mut rows);
+    inject(&mut a, 100_000, Seq(1001), Seq(12001), ACK, 320, &[]);
+    assert!(!a.congestion.in_recovery());
+    assert!(a.prr.is_none());
+    assert_eq!(a.congestion.cwnd(), target);
+    local_state(
+        &a,
+        100_000,
+        "recovery_completed_at_original_target",
+        &mut rows,
+    );
+    if let Ok(directory) = std::env::var("NTCP_RACK_WINDOW_FIX_DIR") {
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            format!("{directory}/core-window-regression.json"),
+            format!("[\n{}\n]\n", rows.join(",\n")),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn rack_timer_prr_window_keeps_legacy_entry_policy() {
+    let mut rows = Vec::new();
+    let a = local_sender_with_algorithm(&mut rows, PrrAlgorithm::LegacyInitialCredit);
+    assert_eq!(a.congestion.cwnd(), 2000);
+    assert_eq!(a.congestion.recovery_target(), 2000);
+    assert_eq!(a.prr.unwrap().credit(), 1000);
 }

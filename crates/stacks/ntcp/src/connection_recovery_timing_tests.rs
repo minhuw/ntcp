@@ -341,7 +341,9 @@ fn timer_sender(scale: u64, iss: u32) -> Connection {
     assert_eq!(a.rack.counts().lost, 7);
     assert_eq!(a.prr.unwrap().counters(), (9000, 0, 0));
     assert_eq!(a.prr.unwrap().credit(), 1000);
-    assert_eq!(a.congestion.cwnd(), 5000);
+    assert_eq!(a.rack.pipe(), 2000);
+    assert_eq!(a.congestion.cwnd(), 3000);
+    assert_eq!(a.congestion.recovery_target(), 5000);
     a
 }
 
@@ -375,7 +377,8 @@ fn timer_repair_failed_selection_short_commit_and_episode_end() {
             assert_eq!(a.prr.unwrap().counters(), (9000, 0, 250));
             assert_eq!(a.prr.unwrap().credit(), 0); // A short repair consumes admission.
             assert!(!a.sack_recovery.unwrap().entry_pending);
-            assert_eq!(a.congestion.cwnd(), 5000);
+            assert_eq!(a.congestion.cwnd(), 3000);
+            assert_eq!(a.congestion.recovery_target(), 5000);
             a.write(&[0x66; 1000]).unwrap();
             for i in 2..5 {
                 a.timeout(now + i * scale).unwrap();

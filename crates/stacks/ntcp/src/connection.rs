@@ -9222,8 +9222,9 @@ impl Connection {
                 .map_or(0, |(_, bytes)| bytes);
             let fresh_episode = self.prr.is_none() && self.sack_recovery.is_none();
             self.detect_rack();
+            let fresh_entry = fresh_episode && self.sack_recovery.is_some_and(|r| r.entry_pending);
             if let Some(prr) = &mut self.prr {
-                if fresh_episode && self.sack_recovery.is_some_and(|r| r.entry_pending) {
+                if fresh_entry {
                     prr.admit_timer_repair(self.rack.pipe(), self.congestion.cwnd());
                 }
                 prr.acknowledge(
@@ -9234,6 +9235,14 @@ impl Connection {
                 );
                 if self.sack_recovery.is_some_and(|r| r.entry_pending) {
                     prr.guarantee_initial(self.mss as u32);
+                }
+                if fresh_entry && self.config.prr_algorithm == PrrAlgorithm::Rfc9937 {
+                    // Timer entry has its own first-repair grant. Represent that
+                    // allowance like ACK-driven PRR, without changing its fixed
+                    // congestion target or inventing delivery. Later timers keep
+                    // the active episode's window and accounting intact.
+                    self.congestion
+                        .prr_window(self.rack.pipe().saturating_add(prr.credit()));
                 }
             }
         }
@@ -14459,6 +14468,8 @@ mod tests {
             a.timeout(225_000).unwrap();
             assert_eq!(a.prr.unwrap().counters(), (9000, 0, 0));
             assert_eq!(a.prr.unwrap().credit(), 1000);
+            assert_eq!(a.congestion.cwnd(), a.rack.pipe() + 1000);
+            assert!(a.congestion.recovery_target() > a.congestion.cwnd());
             assert_eq!(prr_packet(&mut a, 225_000), (iss.wrapping_add(1), 1000));
             assert_eq!(a.prr.unwrap().counters(), (9000, 0, 1000));
             assert_eq!(a.transmit(225_000, &mut [0; 1500]), Ok(None));
@@ -16817,7 +16828,9 @@ mod tests {
             packet(&mut a, 400_000);
             assert!(!a.sack_recovery.unwrap().entry_pending);
             assert_eq!(a.prr.unwrap().credit(), 0);
+            let window = a.congestion.cwnd();
             a.timeout(425_000).unwrap();
+            assert_eq!(a.congestion.cwnd(), window);
             assert_eq!(a.rack.counts().lost, 3);
             assert_eq!(a.prr.unwrap().credit(), 0);
             assert_eq!(a.transmit(425_000, &mut [0; 1500]), Ok(None));

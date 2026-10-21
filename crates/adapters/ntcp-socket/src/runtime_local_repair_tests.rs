@@ -79,8 +79,26 @@ fn local_repair_packet_seq(
     packet
 }
 
+fn local_repair_snapshot(a: &Owner, id: ntcp::ConnectionId, at: u64, event: &str) -> String {
+    let i = a.endpoint.transport_info(id).unwrap();
+    format!(
+        "{{\"event\":\"{event}\",\"at_us\":{at},\"cwnd_bytes\":{},\"ssthresh_bytes\":{},\"unacked\":{},\"sacked\":{},\"lost\":{},\"retransmitted\":{},\"delivered\":{},\"reordering\":{},\"recovery\":{},\"reserved\":{}}}",
+        i.cwnd,
+        i.ssthresh,
+        i.unacked,
+        i.sacked,
+        i.lost,
+        i.retransmitted,
+        i.delivered_segments,
+        i.reordering,
+        i.recovery,
+        a.endpoint.is_output_reserved(id)
+    )
+}
+
 #[test]
 fn local_repair_certified_rejection_yields_to_ingress_and_retries_without_false_stats() {
+    let mut trace = Vec::new();
     let local = Ipv4Addr::new(10, 73, 0, 2);
     let config =
         crate::packet_profile::config(crate::packet_profile::Profile::Upstream(Default::default()));
@@ -127,6 +145,13 @@ fn local_repair_certified_rejection_yields_to_ingress_and_retries_without_false_
     }
     let p = local_repair_packet(&mut a, 40_000, base.wrapping_add(10000), false, &[], &[]);
     ingress(&mut a, &state, &p);
+    trace.push(local_repair_snapshot(
+        &a,
+        id,
+        40_000,
+        "prefix_cumulative_ack",
+    ));
+    assert_eq!(a.endpoint.transport_info(id).unwrap().cwnd, 18_000);
     a.test_now = Some(65_000);
     a.execute(socket, Op::Write(vec![8; 2000])).unwrap();
     a.service_egress().unwrap();
@@ -143,6 +168,12 @@ fn local_repair_certified_rejection_yields_to_ingress_and_retries_without_false_
     ingress(&mut a, &state, &p);
     a.test_now = Some(90_000);
     a.endpoint.on_timeout(a.now(), BUDGET).unwrap();
+    trace.push(local_repair_snapshot(&a, id, 90_000, "rack_timer_entry"));
+    let before_rejection = a.endpoint.transport_info(id).unwrap();
+    assert_eq!(
+        (before_rejection.cwnd, before_rejection.ssthresh),
+        (1000, 2000)
+    );
     state.lock().unwrap().reject = true;
     let calls = state.lock().unwrap().output_calls;
     a.service_egress().unwrap();
@@ -152,6 +183,12 @@ fn local_repair_certified_rejection_yields_to_ingress_and_retries_without_false_
     let info = a.execute(socket, Op::Transport(1)).unwrap().bytes;
     assert_eq!(u32::from_ne_bytes(info[36..40].try_into().unwrap()), 0);
     assert_eq!(a.endpoint.transport_info(id).unwrap().retransmitted, 0);
+    trace.push(local_repair_snapshot(
+        &a,
+        id,
+        90_000,
+        "repair_locally_rejected",
+    ));
     assert!(a.output_wait() > std::time::Duration::ZERO);
     let p = local_repair_packet(
         &mut a,
@@ -162,6 +199,22 @@ fn local_repair_certified_rejection_yields_to_ingress_and_retries_without_false_
         &[9; 1000],
     );
     ingress(&mut a, &state, &p);
+    trace.push(local_repair_snapshot(
+        &a,
+        id,
+        95_000,
+        "data_with_repeated_sack",
+    ));
+    let after_input = a.endpoint.transport_info(id).unwrap();
+    assert_eq!(
+        after_input.delivered_segments,
+        before_rejection.delivered_segments
+    );
+    assert_eq!(after_input.cwnd, before_rejection.cwnd);
+    assert_eq!(
+        (after_input.unacked, after_input.sacked, after_input.lost),
+        (2, 1, 1)
+    );
     assert_eq!(
         a.execute(socket, Op::Read(1000)).unwrap().bytes,
         vec![9; 1000]
@@ -192,6 +245,20 @@ fn local_repair_certified_rejection_yields_to_ingress_and_retries_without_false_
     assert_eq!(a.endpoint.transport_info(id).unwrap().retransmitted, 1);
     assert!(!a.endpoint.is_output_reserved(id));
     assert!(a.endpoint.transport_info(id).unwrap().recovery);
+    trace.push(local_repair_snapshot(
+        &a,
+        id,
+        96_000,
+        "repair_physically_accepted",
+    ));
+    if let Ok(directory) = std::env::var("NTCP_LOCAL_REPAIR_RECHECK_DIR") {
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            format!("{directory}/owner-trace.json"),
+            format!("[\n{}\n]\n", trace.join(",\n")),
+        )
+        .unwrap();
+    }
 }
 
 #[test]
