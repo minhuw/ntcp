@@ -132,6 +132,7 @@ pub(crate) struct Rack {
     rtt: u64,
     reordering_seen: bool,
     pub(crate) reordering: u32,
+    pub(crate) reordering_events: u64,
     multiplier: u128,
     persist: u8,
     pub(crate) reo_grew: bool,
@@ -201,6 +202,7 @@ impl Rack {
             rtt: 0,
             reordering_seen: false,
             reordering: 3,
+            reordering_events: 0,
             multiplier: 1,
             persist: 0,
             reo_grew: false,
@@ -311,6 +313,10 @@ impl Rack {
 
     pub(crate) fn valid(&self) -> bool {
         self.fallback.is_none()
+    }
+
+    pub(crate) fn min_rtt(&self) -> Option<u64> {
+        self.min_rtt
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2
@@ -881,6 +887,9 @@ impl Rack {
         }
         let mut delivered = 0;
         let mut newest: Option<(u64, Seq, u64, bool)> = None;
+        let prior_fack = self.fack;
+        let mut sack_reordered = false;
+        let mut cumulative_reordered = false;
         for r in &mut self.intervals {
             let cumulative = !after(r.end, ack);
             let covered = cumulative || scoreboard.unsacked_bytes(r.start, r.end) == 0;
@@ -906,6 +915,14 @@ impl Rack {
                     self.reordering = self
                         .reordering
                         .max(fack.distance_from(r.start).div_ceil(mss));
+                    // Preserve loss detection's existing proof. Diagnostics
+                    // aggregate each evidence stage, not its split intervals;
+                    // cumulative filling refers to the pre-ACK frontier.
+                    if cumulative {
+                        cumulative_reordered |= prior_fack.is_some_and(|old| after(old, r.end));
+                    } else {
+                        sack_reordered = true;
+                    }
                 }
                 if self.fack.is_none_or(|old| after(r.end, old)) {
                     self.fack = Some(r.end);
@@ -931,6 +948,9 @@ impl Rack {
                 r.needs_retransmit = false;
             }
         }
+        self.reordering_events = self
+            .reordering_events
+            .saturating_add(u64::from(sack_reordered) + u64::from(cumulative_reordered));
         if let Some((sent, end, rtt, retransmitted)) = newest {
             if !retransmitted {
                 self.ack_sample = Some(rtt);

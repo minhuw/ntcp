@@ -63,6 +63,8 @@ fn local_sender_with_algorithm(rows: &mut Vec<String>, algorithm: PrrAlgorithm) 
     inject(&mut a, 40_000, Seq(1), Seq(10001), ACK, 320, &[]);
     local_state(&a, 40_000, "prefix_cumulative_ack", rows);
     assert_eq!(a.rack.counts().sacked, 0);
+    assert_eq!(a.transport_info().reordering_events, 2);
+    assert_eq!(a.transport_info().min_rtt_us, Some(20_000));
     // Record actual growth. Do not change pacing provenance or fabricate cwnd19.
     assert!(advance(&mut a, 60_000, rows).is_empty());
     a.write(&[8; 2000]).unwrap();
@@ -322,6 +324,8 @@ fn rack_timer_prr_window_survives_rejection_and_zero_delivery() {
         assert_eq!(a.prr.unwrap().credit(), 1000);
         assert_eq!(a.congestion.cwnd(), admission);
         assert_eq!(a.congestion.recovery_target(), target);
+        assert_eq!(a.transport_info().reordering_events, 2);
+        assert_eq!(a.transport_info().min_rtt_us, Some(20_000));
     }
     local_state(&a, 91_000, "twice_rejected", &mut rows);
     inject_sack(
@@ -386,4 +390,38 @@ fn rack_timer_prr_window_keeps_legacy_entry_policy() {
     assert_eq!(a.congestion.cwnd(), 2000);
     assert_eq!(a.congestion.recovery_target(), 2000);
     assert_eq!(a.prr.unwrap().credit(), 1000);
+}
+
+#[test]
+fn transport_info_minimum_rtt_is_optional_scaled_and_retained_when_closed() {
+    for scale in [1, 1000] {
+        let mut cfg = profile(PrrAlgorithm::Rfc9937);
+        cfg.timebase.units_per_second = 1_000_000 * scale;
+        let mut a = Connection::active(tuple(), cfg, 0, 0).unwrap();
+        assert_eq!(a.transport_info().min_rtt_us, None);
+        assert_eq!(a.transport_info().reordering_events, 0);
+        a.rack.sample(20_000 * scale, 0);
+        assert!(a.update_rtt(80_000 * scale));
+        let before = a.transport_info();
+        assert_eq!(before.min_rtt_us, Some(20_000));
+        assert_eq!(before.rtt_us, Some(80_000));
+        // Querying a dormant connection does not manufacture new RTT samples.
+        assert_eq!(
+            a.transport_info_at(500_000_000 * scale).min_rtt_us,
+            Some(20_000)
+        );
+        a.rack.sample(40_000 * scale, 500_000_000 * scale);
+        assert_eq!(a.transport_info().min_rtt_us, Some(40_000));
+        a.rack.reordering_events = 7;
+        a.terminal(CloseReason::TimedOut);
+        let closed = a.transport_info();
+        assert_eq!(closed.state, State::Closed);
+        assert_eq!(closed.min_rtt_us, Some(40_000));
+        assert_eq!(closed.reordering_events, 7);
+        let mut fresh = Connection::active(tuple(), a.config.clone(), 0, 0).unwrap();
+        assert_eq!(fresh.transport_info().min_rtt_us, None);
+        assert_eq!(fresh.transport_info().reordering_events, 0);
+        fresh.rack.sample(0, 0);
+        assert_eq!(fresh.transport_info().min_rtt_us, Some(0));
+    }
 }

@@ -416,3 +416,135 @@ fn physical_packet_counts_keep_logical_admissions_and_retry_units_separate() {
         assert_eq!(rack.packet_counts().unacked, 0);
     }
 }
+
+// One evidence stage per ACK in this prefix; cumulative and SACK stages
+// are exercised together by the separate combined-ACK regression.
+#[test]
+fn reordering_events_deduplicate_each_stage_across_splits_and_wrap() {
+    extern crate std;
+    let mut rows = Vec::new();
+    for base in [Seq(0), Seq(u32::MAX - 4999)] {
+        for split in [false, true] {
+            let seq = |n| base.wrapping_add(n);
+            let mut rack = Rack::with_capacity(64).unwrap();
+            let mut scoreboard = Scoreboard::with_capacity(64).unwrap();
+            rack.sample(20_000, 20_000);
+            for offset in (0..10_000).step_by(1000) {
+                commit(&mut rack, seq(offset), seq(offset + 1000), 20_000, false);
+            }
+            if split {
+                for offset in [125, 375, 3500] {
+                    assert!(rack.split(seq(offset)));
+                }
+            }
+            for (event, ack, blocks, expected) in [
+                ("first_sack", 0, vec![(9000, 10_000)], 0),
+                ("lower_sack", 0, vec![(3000, 4000), (9000, 10_000)], 1),
+                ("repeated_sack", 0, vec![(3000, 4000), (9000, 10_000)], 1),
+                ("cumulative_ack", 10_000, vec![], 2),
+                ("dsack_after_retirement", 10_000, vec![(3000, 4000)], 2),
+            ] {
+                let mut wire = [None; 4];
+                for (slot, &(l, r)) in wire.iter_mut().zip(&blocks) {
+                    *slot = Some((seq(l).0, seq(r).0));
+                }
+                let update = scoreboard.update(seq(ack), seq(10_000), &wire);
+                rack.acknowledge(
+                    seq(ack),
+                    seq(10_000),
+                    &scoreboard,
+                    40_000,
+                    None,
+                    None,
+                    1000,
+                    update.dsack,
+                );
+                assert_eq!(rack.reordering_events, expected);
+                assert_eq!(rack.reordering_seen, expected != 0);
+                assert_eq!(rack.min_rtt, Some(20_000));
+                rows.push(alloc::format!(
+                    "{{\"base\":{},\"split\":{},\"event\":\"{}\",\"reordering_events\":{},\"reordering_seen\":{},\"min_rtt_ticks\":{}}}",
+                    base.0, split, event, rack.reordering_events, rack.reordering_seen, rack.min_rtt.unwrap()
+                ));
+            }
+            assert_eq!(rack.reordering, 10);
+        }
+    }
+    if let Ok(directory) = std::env::var("NTCP_REORDER_METRIC_FIX_DIR") {
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            alloc::format!("{directory}/reordering-evidence.json"),
+            alloc::format!("[\n{}\n]\n", rows.join(",\n")),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn reordering_events_combined_ack_counts_sack_and_cumulative_stages_separately() {
+    for base in [Seq(0), Seq(u32::MAX - 4999)] {
+        for split in [false, true] {
+            for initial in [0, u64::MAX - 1] {
+                let seq = |n| base.wrapping_add(n);
+                let mut rack = Rack::with_capacity(64).unwrap();
+                let mut scoreboard = Scoreboard::with_capacity(64).unwrap();
+                for offset in (0..10_000).step_by(1000) {
+                    commit(&mut rack, seq(offset), seq(offset + 1000), 0, false);
+                }
+                if split {
+                    for edge in [125, 375, 3500] {
+                        assert!(rack.split(seq(edge)));
+                    }
+                }
+                sack(
+                    &mut rack,
+                    &mut scoreboard,
+                    base.0,
+                    seq(10_000).0,
+                    100,
+                    &[(seq(9000).0, seq(10_000).0)],
+                );
+                assert_eq!(rack.reordering_events, 0);
+                rack.reordering_events = initial;
+                for _ in 0..3 {
+                    sack(
+                        &mut rack,
+                        &mut scoreboard,
+                        seq(2000).0,
+                        seq(10_000).0,
+                        110,
+                        &[(seq(3000).0, seq(4000).0), (seq(9000).0, seq(10_000).0)],
+                    );
+                    assert_eq!(rack.reordering_events, initial.saturating_add(2));
+                }
+                let count = rack.reordering_events;
+                let minimum = rack.min_rtt();
+                let mut rack = rack.grown(128).unwrap();
+                assert_eq!((rack.reordering_events, rack.min_rtt()), (count, minimum));
+                rack.rto(1000, seq(2000), Some(100));
+                assert_eq!((rack.reordering_events, rack.min_rtt()), (count, minimum));
+                rack.abandon(seq(10_000));
+                assert_eq!((rack.reordering_events, rack.min_rtt()), (count, minimum));
+            }
+        }
+    }
+}
+
+#[test]
+fn reordering_events_exclude_retransmitted_originals_and_dsack_only_adaptation() {
+    for prefix in [250, 1000] {
+        let mut rack = Rack::with_capacity(32).unwrap();
+        let mut scoreboard = Scoreboard::with_capacity(32).unwrap();
+        for start in [0, 1000] {
+            commit(&mut rack, Seq(start), Seq(start + 1000), 0, false);
+        }
+        sack(&mut rack, &mut scoreboard, 0, 2000, 100, &[(1000, 2000)]);
+        commit(&mut rack, Seq(0), Seq(prefix), 110, true);
+        sack(&mut rack, &mut scoreboard, 0, 2000, 210, &[(0, 2000)]);
+        assert_eq!(rack.reordering_events, 0);
+        sack(&mut rack, &mut scoreboard, 2000, 2000, 220, &[]);
+        sack(&mut rack, &mut scoreboard, 2000, 2000, 230, &[(0, 1000)]);
+        assert!(rack.reordering_seen); // DSACK adaptation remains independent.
+        assert_eq!(rack.reordering_events, 0);
+    }
+}

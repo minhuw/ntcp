@@ -456,6 +456,11 @@ pub struct TransportInfo {
     // Outstanding, non-lost retransmissions, excluding SACKed retransmissions.
     pub retransmitted: u32,
     pub reordering: u32,
+    // Saturating observed reordering detections for never-retransmitted
+    // original data. SACK and cumulative hole filling each count once per
+    // ACK; interval splits and repeated advice add no events. Separate DSACK
+    // adaptation and non-SACK duplicate-ACK heuristics are not counted.
+    pub reordering_events: u64,
     // Local resource timer attempts, independent of wire transmission and RTO.
     pub resource_probes: u32,
     pub rto_backoff: u32,
@@ -465,6 +470,10 @@ pub struct TransportInfo {
     // Largest accepted peer window, in bytes; useful for bounded host batching.
     pub max_send_window: u32,
     pub rtt_us: Option<u64>,
+    // Windowed minimum of accepted RTT samples, in microseconds. None means
+    // no sample; a measured zero remains Some(0). Sampling, not querying,
+    // ages the minimum as in the RACK estimator.
+    pub min_rtt_us: Option<u64>,
     pub rttvar_us: u64,
     pub rto_us: u64,
     // Queued payload not yet first-transmitted; SYN/FIN and retransmissions excluded.
@@ -1457,6 +1466,7 @@ impl Connection {
             lost: counts.lost,
             retransmitted: counts.retransmitted,
             reordering: self.rack.reordering,
+            reordering_events: self.rack.reordering_events,
             resource_probes: self.resource_probes,
             rto_backoff: self.consecutive_timeouts,
             cwnd: self.congestion.cwnd(),
@@ -1466,6 +1476,10 @@ impl Connection {
             rtt_us: self
                 .rtt
                 .srtt()
+                .map(|ticks| self.config.timebase.us_from_ticks(ticks)),
+            min_rtt_us: self
+                .rack
+                .min_rtt()
                 .map(|ticks| self.config.timebase.us_from_ticks(ticks)),
             rttvar_us: self.config.timebase.us_from_ticks(self.rtt.variance()),
             rto_us: self.config.timebase.us_from_ticks(self.rto()),
