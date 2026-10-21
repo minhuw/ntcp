@@ -2875,19 +2875,19 @@
         "option_reasons": {}
       },
       "blocked_reasons": [
-        "Linux pfifo limit 0 local retransmit failure is not network loss and has no ntcp qdisc/resource-congestion mapping. TCP_INFO fields tcpi_reord_seen, tcpi_min_rtt and tcpi_rtt are outside the existing embedded-field allowlist.",
+        "The exact timed tc qdisc replace dev tun0 root pfifo limit 0 event has no hash-audited runner mapping for this source. The shared backend supports certified local rejection; TCP_INFO tcpi_reord_seen, tcpi_min_rtt and tcpi_rtt are available. Host qdisc commands remain unexecuted.",
         "No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
       ],
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh`",
           "sha256": "db987cbec339a8140034dc0a76556fcd8346c3b83c75c17b92ce643980e7c17b",
-          "semantic_mapping": "Unavailable: Linux pfifo limit 0 local retransmit failure is not network loss and has no ntcp qdisc/resource-congestion mapping. TCP_INFO fields tcpi_reord_seen, tcpi_min_rtt and tcpi_rtt are outside the existing embedded-field allowlist. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "semantic_mapping": "Unavailable: The exact timed tc qdisc replace dev tun0 root pfifo limit 0 event has no hash-audited runner mapping for this source. The shared backend supports certified local rejection; TCP_INFO tcpi_reord_seen, tcpi_min_rtt and tcpi_rtt are available. Host qdisc commands remain unexecuted. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
         },
         {
           "command": "`tc qdisc replace dev tun0 root pfifo limit 0`",
           "sha256": "e9e411cb8f3a4f3097ab4cadb10e1c5ee3b9e0c0608faa5edb61415143e1763d",
-          "semantic_mapping": "Unavailable: Linux pfifo limit 0 local retransmit failure is not network loss and has no ntcp qdisc/resource-congestion mapping. TCP_INFO fields tcpi_reord_seen, tcpi_min_rtt and tcpi_rtt are outside the existing embedded-field allowlist. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
+          "semantic_mapping": "Unavailable: The exact timed tc qdisc replace dev tun0 root pfifo limit 0 event has no hash-audited runner mapping for this source. The shared backend supports certified local rejection; TCP_INFO tcpi_reord_seen, tcpi_min_rtt and tcpi_rtt are available. Host qdisc commands remain unexecuted. No shell command, packetdrill behavior or embedded assertion is executed; every original source byte is retained."
         }
       ]
     },

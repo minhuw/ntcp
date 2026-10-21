@@ -5,10 +5,21 @@
 #include "run.h"
 #include "tcp.h"
 #include <stdarg.h>
+#include <stddef.h>
 #include <errno.h>
 
 int opt_debug;
 static int calls[3], count, fail_option;
+
+static void write_metric(void *data, socklen_t capacity, size_t offset,
+                         const char *key)
+{
+	const char *text = getenv(key);
+	if (text && capacity >= offset + sizeof(__u32)) {
+		__u32 value = (__u32)strtoull(text, NULL, 0);
+		memcpy((char *)data + offset, &value, sizeof(value));
+	}
+}
 
 void wait_for_event(struct state *state) {}
 void die(char *format, ...)
@@ -41,6 +52,10 @@ int getsockopt(int fd, int level, int option, void *data, socklen_t *len)
 	}
 	memset(data, 0, *len);
 	if (option == TCP_INFO) {
+		write_metric(data, *len, offsetof(struct _tcp_info, tcpi_min_rtt),
+		             "TCP_INFO_MIN_RTT");
+		write_metric(data, *len, offsetof(struct _tcp_info, tcpi_reord_seen),
+		             "TCP_INFO_REORD_SEEN");
 		const char *reply = getenv("TCP_INFO_RETURN_LEN");
 		if (reply)
 			*len = atoi(reply);

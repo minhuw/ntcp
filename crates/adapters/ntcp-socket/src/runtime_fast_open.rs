@@ -141,6 +141,19 @@ mod tests {
         assert_eq!(owner.complete_connect(client), Err(ECONNABORTED));
         let info = owner.sockets[&client].terminal_transport.unwrap().unwrap();
         assert_eq!(info.state, State::Closed);
+        let actual = owner.execute(client, Op::Transport(1)).unwrap().bytes;
+        assert_eq!(
+            &actual[148..152],
+            &(info
+                .min_rtt_us
+                .unwrap_or(u32::MAX as u64)
+                .min(u32::MAX as u64) as u32)
+                .to_ne_bytes()
+        );
+        assert_eq!(
+            &actual[220..224],
+            &(info.reordering_events.min(u32::MAX as u64) as u32).to_ne_bytes()
+        );
         let unsupported = unsupported_option("test");
         for ledger_valid in [false, true] {
             for delivered_segments_valid in [false, true] {
@@ -148,9 +161,11 @@ mod tests {
                     Some(Ok(ntcp::TransportInfo {
                         ledger_valid,
                         delivered_segments_valid,
+                        min_rtt_us: Some(12_000),
+                        reordering_events: 7,
                         ..info
                     }));
-                for requested in [0, 1, 7, 192, 193, 280, 512] {
+                for requested in [0, 1, 7, 148, 151, 152, 192, 193, 220, 223, 224, 280, 512] {
                     let result = owner.execute(client, Op::TransportPrefix(1, requested));
                     let bytes = result.unwrap().bytes;
                     let available = if !ledger_valid {
@@ -163,6 +178,12 @@ mod tests {
                     assert_eq!(bytes.len(), requested.min(available));
                     if requested > 0 {
                         assert_eq!(bytes[0], 7);
+                    }
+                    if bytes.len() >= 152 {
+                        assert_eq!(&bytes[148..152], &12_000u32.to_ne_bytes());
+                    }
+                    if bytes.len() >= 224 {
+                        assert_eq!(&bytes[220..224], &7u32.to_ne_bytes());
                     }
                 }
                 assert!(owner.execute(client, Op::Transport(1)).is_ok());
@@ -191,6 +212,20 @@ mod tests {
         let snapshot = owner.execute(fresh, Op::Transport(1)).unwrap().bytes;
         assert_eq!(snapshot.len(), 280);
         assert_eq!(snapshot[0], 7);
+        assert_eq!(&snapshot[148..152], &u32::MAX.to_ne_bytes());
+        assert_eq!(&snapshot[220..224], &0u32.to_ne_bytes());
+        owner
+            .execute(fresh, Op::Bind("10.73.0.2:10090".parse().unwrap()))
+            .unwrap();
+        assert_eq!(
+            owner.execute(fresh, Op::Transport(1)).unwrap().bytes,
+            snapshot
+        );
+        owner.execute(fresh, Op::Listen(1)).unwrap();
+        let listening = owner.execute(fresh, Op::Transport(1)).unwrap().bytes;
+        assert_eq!(listening[0], 10);
+        assert_eq!(&listening[148..152], &0u32.to_ne_bytes());
+        assert_eq!(&listening[220..224], &0u32.to_ne_bytes());
     }
 
     #[test]

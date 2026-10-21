@@ -54,6 +54,8 @@ pub(crate) fn transport_option_prefix(
     put(36, info.retransmitted as u64);
     put(52, info.last_data_recv_ms as u64);
     put(144, info.notsent_bytes as u64);
+    put(148, info.min_rtt_us.unwrap_or(u64::from(u32::MAX)));
+    put(220, info.reordering_events);
     put(68, info.rtt_us.unwrap_or(0));
     put(72, info.rttvar_us);
     put(76, (info.ssthresh / info.mss) as u64);
@@ -123,6 +125,10 @@ pub(crate) fn idle_transport_option(
     if let Some((pending, backlog)) = listener {
         bytes[24..28].copy_from_slice(&(pending.min(u32::MAX as usize) as u32).to_ne_bytes());
         bytes[28..32].copy_from_slice(&(backlog.min(u32::MAX as usize) as u32).to_ne_bytes());
+    } else {
+        // Ordinary sockets have no RTT sample yet. LISTEN returns the
+        // zero-filled diagnostic prefix before this metric in Linux.
+        bytes[148..152].copy_from_slice(&u32::MAX.to_ne_bytes());
     }
     bytes.truncate(requested.min(TCP_INFO_SIZE));
     Ok(bytes)
@@ -370,7 +376,7 @@ mod tests {
             lost: 1,
             retransmitted: 2,
             reordering: 3,
-            reordering_events: 0,
+            reordering_events: 0xabcdef01,
             resource_probes: 0,
             rto_backoff: 0,
             cwnd: 10000,
@@ -424,6 +430,8 @@ mod tests {
             let bytes = transport_option(ntcp::TransportInfo { state, ..info }, 1).unwrap();
             assert_eq!(bytes.len(), 280);
             assert_eq!(bytes[0], code);
+            assert_eq!(&bytes[148..152], &10000u32.to_ne_bytes());
+            assert_eq!(&bytes[220..224], &0xabcdef01u32.to_ne_bytes());
         }
         let error = if cfg!(feature = "packet-test") {
             ENOSYS
@@ -445,7 +453,9 @@ mod tests {
             (68, 12000),
             (80, 10),
             (144, 4000),
+            (148, 10000),
             (192, 0x12345678),
+            (220, 0xabcdef01),
         ] {
             assert_eq!(&bytes[offset..offset + 4], &value.to_ne_bytes());
         }
@@ -467,13 +477,46 @@ mod tests {
             52..56,
             68..84,
             88..92,
-            144..148,
+            144..152,
             168..196,
+            220..224,
         ];
         for (offset, byte) in bytes.iter().enumerate() {
             if !supported.iter().any(|range| range.contains(&offset)) {
                 assert_eq!(*byte, 0, "unsupported byte {offset}");
             }
+        }
+        for minimum in [
+            None,
+            Some(0),
+            Some(20_000),
+            Some(u32::MAX as u64),
+            Some(u64::MAX),
+        ] {
+            for count in [0, 2, u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX] {
+                let metrics = transport_option(
+                    ntcp::TransportInfo {
+                        min_rtt_us: minimum,
+                        reordering_events: count,
+                        ..info
+                    },
+                    1,
+                )
+                .unwrap();
+                let expected_min =
+                    minimum.unwrap_or(u64::from(u32::MAX)).min(u32::MAX as u64) as u32;
+                assert_eq!(&metrics[148..152], &expected_min.to_ne_bytes());
+                assert_eq!(
+                    &metrics[220..224],
+                    &(count.min(u32::MAX as u64) as u32).to_ne_bytes()
+                );
+            }
+        }
+        for requested in 0..=TCP_INFO_SIZE + 1 {
+            assert_eq!(
+                transport_option_prefix(info, 1, requested).unwrap(),
+                bytes[..requested.min(TCP_INFO_SIZE)]
+            );
         }
         let mut sample = info;
         sample.timestamps_negotiated = false;
@@ -524,13 +567,13 @@ mod tests {
         sample.delivered_segments_valid = false;
         assert_eq!(transport_option(sample, 1).unwrap(), bytes[..192]);
         assert!(transport_option(sample, 2).unwrap().is_empty());
-        for requested in [0, 1, 6, 7, 9, 191, 192] {
+        for requested in [0, 1, 6, 7, 9, 148, 151, 152, 153, 191, 192] {
             assert_eq!(
                 transport_option_prefix(sample, 1, requested).unwrap(),
                 bytes[..requested]
             );
         }
-        for requested in [193, 195, 196, 280, 512, usize::MAX] {
+        for requested in [193, 195, 196, 220, 223, 224, 225, 280, 512, usize::MAX] {
             assert_eq!(
                 transport_option_prefix(sample, 1, requested).unwrap(),
                 bytes[..192]
@@ -553,6 +596,36 @@ mod tests {
                         .is_empty()
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn idle_minimum_rtt_distinguishes_unknown_from_listener_zero() {
+    for listener in [None, Some((0, 16)), Some((usize::MAX, usize::MAX))] {
+        let bytes = idle_transport_option(listener, 1, usize::MAX).unwrap();
+        assert_eq!(bytes.len(), TCP_INFO_SIZE);
+        assert_eq!(
+            &bytes[148..152],
+            &if listener.is_some() { 0u32 } else { u32::MAX }.to_ne_bytes()
+        );
+        assert_eq!(&bytes[220..224], &0u32.to_ne_bytes());
+        if let Some((pending, backlog)) = listener {
+            assert_eq!(
+                &bytes[24..28],
+                &(pending.min(u32::MAX as usize) as u32).to_ne_bytes()
+            );
+            assert_eq!(
+                &bytes[28..32],
+                &(backlog.min(u32::MAX as usize) as u32).to_ne_bytes()
+            );
+        }
+        for requested in 0..=TCP_INFO_SIZE + 1 {
+            assert_eq!(
+                idle_transport_option(listener, 1, requested).unwrap(),
+                bytes[..requested.min(TCP_INFO_SIZE)]
+            );
         }
     }
 }

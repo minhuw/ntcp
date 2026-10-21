@@ -295,7 +295,7 @@ RESOURCE_SOURCE_SHA256 = 'fbbf50f3e1d2facf9835267513fe709665db245d1f2234f98dd448
 
 TCP_INFO_FIELDS = {'tcpi_ca_state', 'tcpi_probes', 'tcpi_backoff', 'tcpi_unacked', 'tcpi_sacked',
                    'tcpi_lost', 'tcpi_retrans', 'tcpi_reordering',
-                   'tcpi_snd_cwnd', 'tcpi_snd_ssthresh', 'tcpi_rtt',
+                   'tcpi_snd_cwnd', 'tcpi_snd_ssthresh', 'tcpi_rtt', 'tcpi_min_rtt', 'tcpi_reord_seen',
                    'tcpi_notsent_bytes', 'tcpi_last_data_recv', 'tcpi_busy_time',
                    'tcpi_rwnd_limited', 'tcpi_sndbuf_limited', 'tcpi_delivered',
                    'tcpi_options', 'tcpi_snd_wscale', 'tcpi_rcv_wscale'}

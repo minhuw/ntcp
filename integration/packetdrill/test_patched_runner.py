@@ -14,6 +14,9 @@ from run import HERE, PIN, check_checkout, preflight, runner_provenance, tcp_inf
 class SelectionChecks(unittest.TestCase):
     def test_only_supported_assertions(self):
         self.assertTrue(tcp_info_only('0 %{ assert tcpi_lost == 0 }%'))
+        for snippet in ('assert tcpi_min_rtt == 20000', 'assert tcpi_reord_seen == 2'):
+            self.assertTrue(tcp_info_only('0 %{ ' + snippet + ' }%'))
+            self.assertEqual(preflight('0 %{ ' + snippet + ' }%', True), [])
         self.assertTrue(tcp_info_only('0 %{ assert tcpi_snd_cwnd == 10;\\\n }%'))
         for snippet in ('assert SK_MEMINFO_RMEM_ALLOC == 0',
                         'assert bbr_bw == 0', 'assert tcpv_minrtt == 0',
@@ -172,6 +175,7 @@ class CompiledSnapshotChecks(unittest.TestCase):
                 'tcpi_lost': 36, 'tcpi_retrans': 40, 'tcpi_last_data_recv': 56,
                 'tcpi_rtt': 72, 'tcpi_snd_ssthresh': 80, 'tcpi_snd_cwnd': 84,
                 'tcpi_reordering': 92, 'tcpi_notsent_bytes': 148,
+                'tcpi_min_rtt': 152, 'tcpi_reord_seen': 224,
                 'tcpi_busy_time': 176, 'tcpi_rwnd_limited': 184,
                 'tcpi_sndbuf_limited': 192, 'tcpi_delivered': 196}
         from run import TCP_INFO_FIELDS
@@ -186,9 +190,41 @@ class CompiledSnapshotChecks(unittest.TestCase):
                 self.assertEqual(result.stderr.splitlines(),
                                  [f'requested TCP_INFO {end}'] * 2)
 
+    def test_minimum_rtt_and_reordering_values_and_dynamic_prefixes(self):
+        for minimum, events in ((0, 0), (20000, 2), (4294967295, 4294967295)):
+            with self.subTest(minimum=minimum, events=events):
+                result = self.execute(
+                    'TCP_INFO_PREFIX', 0,
+                    f'assert tcpi_min_rtt == {minimum}; assert tcpi_reord_seen == {events}', 0,
+                    env={'TCP_INFO_MIN_RTT': str(minimum), 'TCP_INFO_REORD_SEEN': str(events),
+                         'TCP_INFO_TRACE': '1',
+                         'TCP_INFO_SECOND_SNIPPET': f'assert tcpi_min_rtt == {minimum}'})
+                self.assertEqual(result.stderr.splitlines(),
+                                 ['requested TCP_INFO 224', 'requested TCP_INFO 152'])
+        for field, environment in (
+                ('tcpi_min_rtt', {'TCP_INFO_MIN_RTT': '20000'}),
+                ('tcpi_reord_seen', {'TCP_INFO_REORD_SEEN': '2'})):
+            self.execute('TCP_INFO_PREFIX', 0, f'assert {field} == 0', 1,
+                         'AssertionError', environment)
+        result = self.execute('TCP_INFO_PREFIX', 0, 'assert tcpi_min_rtt == 0', 0,
+                              env={'TCP_INFO_TRACE': '1', 'TCP_INFO_LIMIT': '192',
+                                   'TCP_INFO_SECOND_SNIPPET': 'assert tcpi_options == 0'})
+        self.assertEqual(result.stderr.splitlines(),
+                         ['requested TCP_INFO 152', 'requested TCP_INFO 6'])
+
     def test_prefix_refuses_unavailable_short_unknown_and_false_values(self):
         for snippet, env, message in (
                 ('assert tcpi_delivered == 0', {'TCP_INFO_LIMIT': '192'},
+                 "can't get requested"),
+                ('assert tcpi_reord_seen == 0', {'TCP_INFO_LIMIT': '192'},
+                 "can't get requested"),
+                ('assert tcpi_min_rtt == 0', {'TCP_INFO_RETURN_LEN': '151'},
+                 "can't get requested"),
+                ('assert tcpi_reord_seen == 0', {'TCP_INFO_RETURN_LEN': '192'},
+                 "can't get requested"),
+                ('assert tcpi_reord_seen == 0', {'TCP_INFO_RETURN_LEN': '223'},
+                 "can't get requested"),
+                ('assert tcpi_reord_seen == 0', {'TCP_INFO_RETURN_LEN': '225'},
                  "can't get requested"),
                 ('assert tcpi_unacked == 0', {'TCP_INFO_RETURN_LEN': '27'},
                  "can't get requested"),

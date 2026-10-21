@@ -182,6 +182,8 @@ fn local_repair_certified_rejection_yields_to_ingress_and_retries_without_false_
     assert!(!a.endpoint.is_output_reserved(id));
     let info = a.execute(socket, Op::Transport(1)).unwrap().bytes;
     assert_eq!(u32::from_ne_bytes(info[36..40].try_into().unwrap()), 0);
+    assert_eq!(&info[148..152], &20_000u32.to_ne_bytes());
+    assert_eq!(&info[220..224], &2u32.to_ne_bytes());
     assert_eq!(a.endpoint.transport_info(id).unwrap().retransmitted, 0);
     trace.push(local_repair_snapshot(
         &a,
@@ -211,6 +213,9 @@ fn local_repair_certified_rejection_yields_to_ingress_and_retries_without_false_
         before_rejection.delivered_segments
     );
     assert_eq!(after_input.cwnd, before_rejection.cwnd);
+    let metrics = a.execute(socket, Op::Transport(1)).unwrap().bytes;
+    assert_eq!(&metrics[148..152], &20_000u32.to_ne_bytes());
+    assert_eq!(&metrics[220..224], &2u32.to_ne_bytes());
     assert_eq!(
         (after_input.unacked, after_input.sacked, after_input.lost),
         (2, 1, 1)

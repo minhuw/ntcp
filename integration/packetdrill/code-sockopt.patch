@@ -8,7 +8,7 @@
  #include <signal.h>
  #include <stdio.h>
  #include <stdlib.h>
-@@ -140,11 +141,105 @@
+@@ -140,11 +141,107 @@
  
  #ifdef linux
  
@@ -29,10 +29,12 @@
 +	X(tcpi_snd_cwnd) \
 +	X(tcpi_reordering) \
 +	X(tcpi_notsent_bytes) \
++	X(tcpi_min_rtt) \
 +	X(tcpi_busy_time) \
 +	X(tcpi_rwnd_limited) \
 +	X(tcpi_sndbuf_limited) \
-+	X(tcpi_delivered)
++	X(tcpi_delivered) \
++	X(tcpi_reord_seen)
 +#define TCP_INFO_FIELD_END(name) \
 +	(offsetof(struct _tcp_info, name) + sizeof(((struct _tcp_info *)0)->name))
 +/* The two scale bitfields occupy the byte immediately after tcpi_options. */
@@ -114,7 +116,7 @@
  	assert(len >= sizeof(struct _tcp_info));
  
  	write_symbols(code);
-@@ -559,6 +654,11 @@
+@@ -559,6 +656,11 @@
  	if (strcmp(config->code_sockopt, "") == 0) {
  		code->data_type = DATA_NONE;		/* auto-detect */
  #if HAVE_TCP_INFO
@@ -126,7 +128,7 @@
  	} else if (strcmp(config->code_sockopt, "TCP_INFO") == 0) {
  		code->data_type = DATA_TCP_INFO;
  #endif
-@@ -710,7 +810,8 @@
+@@ -710,7 +812,8 @@
  #if HAVE_TCP_INFO
  	case DATA_TCP_INFO:
  		opt_name = TCP_INFO;
@@ -136,7 +138,7 @@
  		level = SOL_TCP;
  		break;
  #endif  /* HAVE_TCP_INFO */
-@@ -740,6 +841,16 @@
+@@ -740,6 +843,16 @@
  		free(data);
  		return NULL;
  	}
@@ -153,7 +155,7 @@
  	*len = opt_len;
  	return data;
  }
-@@ -760,44 +871,28 @@
+@@ -760,44 +873,28 @@
  	}
  	int fd = state->socket_under_test->fd.live_fd;
  	struct code_state *code = state->code;
