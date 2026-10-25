@@ -29,6 +29,10 @@ unsafe extern "C" fn ntcp_packetdrill_control(
             b"ntcp-local-resource-reject-off" => packet_test::local_resource_rejection(false)?,
             b"ntcp-local-timestamps-on" => packet_test::timestamp_default(true)?,
             b"ntcp-local-timestamps-off" => packet_test::timestamp_default(false)?,
+            b"ntcp-local-tfo-client-on" => ntcp_socket::set_fast_open_client_enabled(true)
+                .map_err(|e| e.raw_os_error().unwrap_or(EIO))?,
+            b"ntcp-local-tfo-client-off" => ntcp_socket::set_fast_open_client_enabled(false)
+                .map_err(|e| e.raw_os_error().unwrap_or(EIO))?,
             b"ntcp-local-timestamps-on-clear-tfo-cache" => {
                 packet_test::timestamp_default(true)?;
                 packet_test::clear_fast_open_client_cache()?;

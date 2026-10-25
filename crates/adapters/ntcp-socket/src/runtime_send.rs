@@ -237,6 +237,14 @@ impl Owner {
     // turn except bytes already owned by TCP; the cursor advances only on write.
     fn send_step(&mut self, id: u64, send: &mut LogicalSend, blocking: bool) -> Result<()> {
         let deferred = self.sockets.get(&id).ok_or(EBADF)?.deferred_peer.is_some();
+        // Permission belongs to the logical call. A call already admitted
+        // before a policy change keeps its handshake/tail and completion ownership.
+        if !send.fast_open_started
+            && (send.flags & MSG_FASTOPEN != 0 || deferred)
+            && !self.socket_policy.fast_open_client_enabled
+        {
+            return Err(EOPNOTSUPP);
+        }
         if !send.fast_open_started && send.flags & MSG_FASTOPEN != 0 && !deferred {
             // Completing SS_CONNECTING is an ordinary send, not another SYN
             // copy: retain normal timestamp/zerocopy admission on this retry.

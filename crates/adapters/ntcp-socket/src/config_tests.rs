@@ -607,3 +607,33 @@ fn socket_notsent_lowat_full_unsigned_range_and_strict_keys() {
         );
     }
 }
+
+#[test]
+fn client_tfo_permission_configuration_is_strict_and_defaults_to_allowed() {
+    assert!(
+        SocketConfig::parse(BASE)
+            .unwrap()
+            .socket
+            .fast_open_client_enabled
+    );
+    for enabled in [false, true] {
+        let parsed = SocketConfig::parse(&format!(
+            "{BASE}socket.fast_open_client_enabled={enabled}\n"
+        ))
+        .unwrap();
+        assert_eq!(parsed.socket.fast_open_client_enabled, enabled);
+        assert!(parsed.validate().is_ok());
+    }
+    for value in [
+        "0",
+        "1",
+        "TRUE",
+        "false # comment",
+        "false\nsocket.fast_open_client_enabled=true",
+    ] {
+        assert!(
+            SocketConfig::parse(&format!("{BASE}socket.fast_open_client_enabled={value}\n"))
+                .is_err()
+        );
+    }
+}

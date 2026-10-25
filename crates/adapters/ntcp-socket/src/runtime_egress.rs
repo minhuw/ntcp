@@ -163,6 +163,10 @@ impl Owner {
         Ok(())
     }
     pub(super) fn command_held(&self, id: u64, op: &Op) -> bool {
+        // This policy-only command cannot rewrite a held packet or its owner.
+        if matches!(op, Op::SetFastOpenClientEnabled(_)) {
+            return false;
+        }
         if self.reservation.is_some() {
             return true;
         } // Explicit legacy test path only.

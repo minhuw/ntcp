@@ -1863,3 +1863,101 @@ fn timestamp_control_abi_changes_only_future_connection_defaults() {
         );
     }
 }
+
+#[test]
+fn client_tfo_permission_native_api_and_control_abi_share_policy() {
+    if isolated("tests::client_tfo_permission_native_api_and_control_abi_share_policy") {
+        return;
+    }
+    // A premature management call does not commit either configuration singleton.
+    assert_eq!(
+        ntcp_socket::set_fast_open_client_enabled(false)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(EINVAL)
+    );
+    ntcp_socket::configure(ntcp_socket::SocketConfig::new("unused", local())).unwrap();
+    let adapter = Adapter::start((local(), upstream_tests("no-timestamps,budget224m"))).unwrap();
+    let set_option = |fd: i32| unsafe {
+        let value = 1i32;
+        ntcp_socket::setsockopt(
+            fd,
+            IPPROTO_TCP,
+            TCP_FASTOPEN_CONNECT,
+            (&value as *const i32).cast(),
+            4,
+        )
+    };
+    let fd = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+        .unwrap()
+        .value as i32;
+    assert_eq!(
+        unsafe { ntcp_packetdrill_control(USERDATA, c"ntcp-local-tfo-client-off".as_ptr()) },
+        0
+    );
+    assert_eq!(set_option(fd), -1);
+    assert_eq!(errno(), EOPNOTSUPP);
+    assert_eq!(
+        unsafe { ntcp_packetdrill_control(USERDATA, c"ntcp-local-tfo-client-on; true".as_ptr()) },
+        -1
+    );
+    assert_eq!(errno(), EOPNOTSUPP);
+    assert_eq!(set_option(fd), -1); // The rejected command did not re-enable TFO.
+    ntcp_socket::set_fast_open_client_enabled(true).unwrap();
+    assert_eq!(set_option(fd), 0);
+    ntcp_socket::set_fast_open_client_enabled(false).unwrap();
+    assert_eq!(
+        call(
+            &adapter,
+            5,
+            fd,
+            0,
+            encode_addr("192.0.2.2:8080".parse().unwrap()),
+            0
+        )
+        .err(),
+        Some(EINPROGRESS)
+    );
+    let bytes = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+    let (ip, tcp) = parse_frame(&bytes).unwrap();
+    assert!(
+        ntcp::wire::parse(ip, tcp)
+            .unwrap()
+            .options
+            .fast_open
+            .is_none()
+    );
+    assert_eq!(
+        unsafe { ntcp_packetdrill_control(USERDATA, c"ntcp-local-tfo-client-on".as_ptr()) },
+        0
+    );
+    let second = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+        .unwrap()
+        .value as i32;
+    assert_eq!(set_option(second), 0);
+    assert_eq!(
+        call(
+            &adapter,
+            5,
+            second,
+            0,
+            encode_addr("192.0.2.2:8080".parse().unwrap()),
+            0
+        )
+        .err(),
+        Some(EINPROGRESS)
+    );
+    let bytes = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+    let (ip, tcp) = parse_frame(&bytes).unwrap();
+    assert_eq!(
+        ntcp::wire::parse(ip, tcp).unwrap().options.fast_open,
+        Some(ntcp::wire::FastOpenCookie::request())
+    );
+    drop(adapter);
+    assert_eq!(
+        ntcp_socket::set_fast_open_client_enabled(false)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(ECANCELED)
+    );
+}

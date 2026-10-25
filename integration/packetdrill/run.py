@@ -272,6 +272,14 @@ UPSTREAM_OPTION_AUDIT['fastopen/client/nonblocking-sendto.pkt'] = {
     'no-timestamps': 'Original setup disables timestamps until the exact timed event enables future negotiation.',
     'budget224m': 'Seven sequential client connections retain charged warmup/TIME-WAIT and active storage across an explicit client-cache flush; the existing bounded budget preserves native per-socket accounting.',
 }
+UPSTREAM_OPTION_AUDIT['fastopen/client/nonblocking-sendto-errnos.pkt'] = {
+    'budget224m': 'Original sequential client connections retain active and closing storage across the error/state sequence; the existing bounded budget preserves native per-socket accounting.',
+    'no-timestamps': 'Exact initial setup disables timestamps throughout the original script.',
+}
+UPSTREAM_OPTION_AUDIT['fastopen/client/nonblocking-connect-bypass-errno.pkt'] = {
+    'budget224m': 'Original sequential client connections retain active and closing storage across the error/state sequence; the existing bounded budget preserves native per-socket accounting.',
+    'no-timestamps': 'Exact initial setup disables timestamps throughout the original script.',
+}
 UPSTREAM_OPTION_AUDIT['zerocopy/maxfrags.pkt'] = {
     'budget224m': 'Original SO_SNDBUF=2000000 needs the existing bounded budget for native doubled/clamped capacity and resize staging. Linux page-fragment accounting is not emulated.',
 }
@@ -364,6 +372,22 @@ CACHE_FLUSH_RESTORE = b'`/tmp/sysctl_restore_${PPID}.sh`\n'
 CACHE_FLUSH_RESTORED = b'// ntcp profile is process-local; no host sysctls to restore.\n'
 
 
+TFO_PERMISSION_SOURCES = {'fastopen/client/nonblocking-sendto-errnos.pkt': 'e31c659677f65cee707518939e6e13b00a919975ea79446e261c54012f18795b',
+ 'fastopen/client/nonblocking-connect-bypass-errno.pkt': 'fe165852a52c2163edb9d4b12d3687e8abb7c2b5c3111fc84ca5d71653461751'}
+TFO_PERMISSION_SETUP = b'`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0\\\n\t\t\t     /proc/sys/net/ipv4/tcp_fastopen_blackhole_timeout_sec=0\\\n`\n'
+TFO_PERMISSION_EVENTS = {'fastopen/client/nonblocking-sendto-errnos.pkt': ((b'   +0 `sysctl -q net.ipv4.tcp_fastopen=0`\n',
+                                                    b'   +0 `ntcp-local-tfo-client-off`\n'),
+                                                   (b'+.005 `sysctl -q net.ipv4.tcp_fastopen=1`\n',
+                                                    b'+.005 `ntcp-local-tfo-client-on`\n')),
+ 'fastopen/client/nonblocking-connect-bypass-errno.pkt': ((b'   +0 `sysctl -q net.ipv4.tcp_fastop'
+                                                           b'en=0`\n',
+                                                           b'   +0 `ntcp-local-tfo-client-off`\n'),
+                                                          (b' +.01 `sysctl -q net.ipv4.tcp_fastop'
+                                                           b'en=1`\n',
+                                                           b' +.01 `ntcp-local-tfo-client-on`\n'))}
+TFO_PERMISSION_RESTORE = b'`/tmp/sysctl_restore_${PPID}.sh`\n'
+TFO_PERMISSION_RESTORED = b'// ntcp profile is process-local; no host sysctls to restore.\n'
+
 
 TCP_INFO_FIELDS = {'tcpi_state', 'tcpi_ca_state', 'tcpi_probes', 'tcpi_backoff', 'tcpi_unacked', 'tcpi_sacked',
                    'tcpi_lost', 'tcpi_retrans', 'tcpi_reordering',
@@ -443,7 +467,7 @@ def runner_provenance(runner):
     return provenance
 
 
-def preflight(text, embedded_tcp_info=False, resource_control=False, timestamp_control=False, cache_flush_control=False):
+def preflight(text, embedded_tcp_info=False, resource_control=False, timestamp_control=False, cache_flush_control=False, tfo_permission_control=False):
     # Conservative safety/capability screening, NOT a second packetdrill parser.
     # Upstream --dry_run remains the authority for script syntax.
     # Inspect raw text conservatively, including comments: do not accidentally
@@ -456,6 +480,12 @@ def preflight(text, embedded_tcp_info=False, resource_control=False, timestamp_c
         shell_text = shell_text.replace(TIMESTAMP_CONTROL.decode(), '', 1)
     if cache_flush_control and text.count(CACHE_FLUSH_CONTROL.decode()) == 1:
         shell_text = shell_text.replace(CACHE_FLUSH_CONTROL.decode(), '', 1)
+    if tfo_permission_control:
+        for events in TFO_PERMISSION_EVENTS.values():
+            if all(text.count(control.decode()) == 1 for _, control in events):
+                for _, control in events:
+                    shell_text = shell_text.replace(control.decode(), '', 1)
+                break
     if '`' in shell_text:
         reasons.append('shell setup/assertions target Linux, not the ntcp backend')
     if '%{' in text or '}%' in text:
@@ -504,6 +534,36 @@ def adapt_source(directory, relative, manifest, so_flags):
         data = (directory / extra['path']).read_bytes()
         if hashlib.sha256(data).hexdigest() != extra['sha256']:
             raise ValueError(f"setup {extra['path']} hash differs from audited adaptation")
+    if relative in TFO_PERMISSION_SOURCES and not entry.get('blocked_reasons'):
+        events = TFO_PERMISSION_EVENTS[relative]
+        expected_commands = [TFO_PERMISSION_SETUP.rstrip(b'\n'),
+                             *(event[event.index(b'`'):].rstrip(b'\n') for event, _ in events),
+                             TFO_PERMISSION_RESTORE.rstrip(b'\n')]
+        replacement = b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n' + b'\n' * (TFO_PERMISSION_SETUP.count(b'\n') - 1)
+        if (hashlib.sha256(source).hexdigest() != TFO_PERMISSION_SOURCES[relative]
+                or entry['command_line'].encode() != TFO_PERMISSION_SETUP
+                or entry['replacement_line'].encode() != replacement
+                or entry.get('command_sha256') != hashlib.sha256(TFO_PERMISSION_SETUP).hexdigest()
+                or entry.get('expected_command_count') != 4
+                or re.findall(rb'`[^`]*`', source) != expected_commands
+                or [(c['command'], c['sha256']) for c in entry.get('audited_shell_commands', [])]
+                    != [(c.decode(), hashlib.sha256(c).hexdigest()) for c in expected_commands]
+                or entry.get('tfo_permission_control') is not True
+                or entry.get('tfo_permission_event_sha256') != [hashlib.sha256(event).hexdigest() for event, _ in events]
+                or entry.get('restore_line', '').encode() != TFO_PERMISSION_RESTORE
+                or entry.get('restore_sha256') != hashlib.sha256(TFO_PERMISSION_RESTORE).hexdigest()
+                or entry.get('restore_replacement_line', '').encode() != TFO_PERMISSION_RESTORED
+                or entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
+                or metadata['timestamps'] or not metadata['fast_open_client_enabled']
+                or any(source.count(event) != 1 for event, _ in events)):
+            raise ValueError('expected exact audited TFO permission setup and timed commands')
+        generated = source.replace(TFO_PERMISSION_SETUP, replacement, 1).replace(TFO_PERMISSION_RESTORE, TFO_PERMISSION_RESTORED, 1)
+        for event, control in events:
+            generated = generated.replace(event, control, 1)
+        reasons = preflight(generated.decode(), True, tfo_permission_control=True)
+        if reasons:
+            raise ValueError('; '.join(reasons))
+        return generated, {**entry, 'generated_sha256': hashlib.sha256(generated).hexdigest()}
     if relative == CACHE_FLUSH_SCRIPT and not entry.get('blocked_reasons'):
         expected_commands = [CACHE_FLUSH_SETUP.rstrip(b'\n'),
                              CACHE_FLUSH_EVENT[CACHE_FLUSH_EVENT.index(b'`'):].rstrip(b'\n'),
@@ -855,7 +915,7 @@ def profile_metadata(so_flags):
         return {key: value if key == 'profile' else None for key, value in metadata.items()}
     if upstream:
         metadata.update(
-            options=sorted(options), sack=True, timestamps='no-timestamps' not in options,
+            options=sorted(options), fast_open_client_enabled=True, sack=True, timestamps='no-timestamps' not in options,
             initial_window='Iw10', fast_open_early_response='early-response' in options, rack=True, prr='Rfc9937',
             tlp=True, tlp_timer_margin_us=2000, rto_min_us=200000, preallocate_connections=4 if 'prealloc4' in options else 3 if 'prealloc3' in options else 1,
             ecn='ecn' in options, mss=1460,
@@ -1045,7 +1105,8 @@ def main():
                     reasons = preflight(text, embedded_tcp_info,
                                         resource_control=(row['adapted'] and row['adaptation'].get('resource_control') is True),
                                         timestamp_control=(row['adapted'] and row['adaptation'].get('timestamp_control') is True),
-                                        cache_flush_control=(row['adapted'] and row['adaptation'].get('cache_flush_control') is True))
+                                        cache_flush_control=(row['adapted'] and row['adaptation'].get('cache_flush_control') is True),
+                                        tfo_permission_control=(row['adapted'] and row['adaptation'].get('tfo_permission_control') is True))
                     if variant not in ('native-ipv4', 'ipv4'):
                         reasons.append('the adapter implements IPv4 only')
                     if reasons:

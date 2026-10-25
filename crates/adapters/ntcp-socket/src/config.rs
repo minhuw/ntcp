@@ -29,12 +29,14 @@ pub struct SocketConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SocketPolicy {
     pub notsent_lowat: u32,
+    pub fast_open_client_enabled: bool,
 }
 
 impl Default for SocketPolicy {
     fn default() -> Self {
         Self {
             notsent_lowat: u32::MAX,
+            fast_open_client_enabled: true,
         }
     }
 }
@@ -172,6 +174,13 @@ impl SocketConfig {
                 return Err(invalid());
             }
             match key {
+                "socket.fast_open_client_enabled" => {
+                    config.socket.fast_open_client_enabled = match value {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err(invalid()),
+                    };
+                }
                 "socket.fast_open_cookie" => cookie_mode = value,
                 "socket.fast_open_key" => cookie_key = Some(value),
                 "socket.notsent_lowat" => config.socket.notsent_lowat = number(value)?,

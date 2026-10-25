@@ -50,6 +50,7 @@ pub enum Op {
     New(i32),
     Wait(Box<Op>, Option<std::time::Duration>),
     FinishConnect,
+    SetFastOpenClientEnabled(bool),
     #[cfg(all(test, feature = "packet-test"))]
     BlockingConnect(SocketAddr),
     Bind(SocketAddr),
@@ -777,6 +778,9 @@ impl Owner {
         false
     }
     fn admission_command(&self, op: &Op) -> bool {
+        if matches!(op, Op::SetFastOpenClientEnabled(_)) {
+            return true;
+        }
         #[cfg(feature = "packet-test")]
         if self.packet_backend()
             && matches!(
@@ -1527,6 +1531,10 @@ impl Owner {
     fn dispatch(&mut self, id: u64, op: Op) -> Result<Reply> {
         self.prune_child_timeouts();
         let mut out = Reply::default();
+        if let Op::SetFastOpenClientEnabled(enabled) = op {
+            self.socket_policy.fast_open_client_enabled = enabled;
+            return Ok(out);
+        }
         #[cfg(feature = "packet-test")]
         match &op {
             Op::Inject(bytes) => {
@@ -1788,7 +1796,11 @@ impl Owner {
                     return Err(EINVAL);
                 }
                 let local = self.connect_local(id)?;
-                if self.sockets[&id].fast_open_connect {
+                // Previously saved options do not authorize a new TFO open
+                // after administrative disablement. Ordinary connect still works.
+                if self.sockets[&id].fast_open_connect
+                    && self.socket_policy.fast_open_client_enabled
+                {
                     self.endpoint.enable_fast_open().map_err(engine)?;
                     if self
                         .endpoint
@@ -2131,6 +2143,16 @@ impl Owner {
                 self.timestamp_options(id, name, value as u32)?;
             }
             Op::Set(level, name, value) => {
+                // Reject an unauthorized request before option cloning or any
+                // completion/staging capacity is required for a transaction.
+                if level == IPPROTO_TCP && name == TCP_FASTOPEN_CONNECT {
+                    if !(0..=1).contains(&value) {
+                        return Err(EINVAL);
+                    }
+                    if !self.socket_policy.fast_open_client_enabled {
+                        return Err(EOPNOTSUPP);
+                    }
+                }
                 // Account for the transient option snapshot as well as retained
                 // queue capacity; cloning Arc packet references copies no payload.
                 if self.timestamp_charge()
@@ -2213,10 +2235,7 @@ impl Owner {
                         s.fast_open_limit = value.min(self.defaults.max_connections as i32);
                     }
                     (IPPROTO_TCP, TCP_FASTOPEN_CONNECT) => {
-                        if !(0..=1).contains(&value)
-                            || !matches!(s.handle, Handle::Fresh)
-                            || s.deferred_peer.is_some()
-                        {
+                        if !matches!(s.handle, Handle::Fresh) || s.deferred_peer.is_some() {
                             return Err(EINVAL);
                         }
                         s.fast_open_connect = value != 0;
@@ -2485,7 +2504,7 @@ impl Owner {
             }
             Op::FinishConnect => self.complete_connect(id)?,
             Op::Wait(_, _) => unreachable!(),
-            Op::New(_) => unreachable!(),
+            Op::New(_) | Op::SetFastOpenClientEnabled(_) => unreachable!(),
             #[cfg(feature = "packet-test")]
             Op::Inject(_)
             | Op::Capture(_)
@@ -2605,6 +2624,65 @@ mod tests {
             owner.execute(0, Op::ClearFastOpenClientCache).err(),
             Some(EOPNOTSUPP)
         );
+    }
+
+    #[test]
+    fn client_tfo_permission_native_configuration_and_management() {
+        let mut owner = owner(2);
+        let mut config = SocketConfig::new("test", Ipv4Addr::new(10, 73, 0, 2));
+        config.socket.fast_open_client_enabled = false;
+        owner.apply_socket_config(&config);
+        let id = new(&mut owner, SOCK_NONBLOCK);
+        assert_eq!(
+            owner
+                .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
+                .unwrap_err(),
+            EOPNOTSUPP
+        );
+        owner
+            .execute(0, Op::SetFastOpenClientEnabled(true))
+            .unwrap();
+        assert_eq!(
+            owner
+                .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
+                .unwrap()
+                .value,
+            0
+        );
+    }
+
+    #[test]
+    fn client_tfo_permission_management_progresses_with_full_waiter_queue() {
+        let (mut a, _b, client, _, _) = pair();
+        a.execute(client, Op::Flags(F_SETFL, 0)).unwrap();
+        let (reply, _) = mpsc::sync_channel(1);
+        for _ in 0..a.socket_limit() {
+            let mut request = Request {
+                id: client,
+                op: Op::Wait(Box::new(Op::Read(1)), None),
+                reply: reply.clone(),
+                deadline: None,
+                send: None,
+                closing: None,
+            };
+            assert!(!a.service(&mut request));
+            a.pending.push_back(request);
+        }
+        let (reply, result) = mpsc::sync_channel(1);
+        let mut control = Request {
+            id: 0,
+            op: Op::SetFastOpenClientEnabled(false),
+            reply,
+            deadline: None,
+            send: None,
+            closing: None,
+        };
+        assert_eq!(a.pending.len(), a.socket_limit());
+        assert!(!a.admission_full(&control));
+        assert!(a.service(&mut control));
+        assert!(result.try_recv().unwrap().is_ok());
+        assert!(!a.socket_policy.fast_open_client_enabled);
+        assert_eq!(a.pending.len(), a.socket_limit());
     }
 
     #[test]

@@ -23,6 +23,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -91,6 +92,7 @@
           "options": [
             "immediate-ack"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -162,6 +164,7 @@
           "options": [
             "immediate-ack"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -235,6 +238,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -302,6 +306,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -373,6 +378,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -440,6 +446,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -507,6 +514,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -575,6 +583,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -643,6 +652,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -711,6 +721,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -778,6 +789,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -845,6 +857,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -912,6 +925,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -979,6 +993,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -1046,6 +1061,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -1115,6 +1131,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -1207,6 +1224,7 @@
           "options": [
             "ecn"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -1277,6 +1295,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -1344,6 +1363,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -1411,6 +1431,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -1478,6 +1499,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -1545,6 +1567,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -1612,6 +1635,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -1679,6 +1703,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -1746,6 +1771,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -1813,6 +1839,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -1880,6 +1907,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -1947,6 +1975,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -2014,6 +2043,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -2082,6 +2112,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -2165,6 +2196,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -2233,6 +2265,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -2301,6 +2334,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -2369,6 +2403,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -2437,6 +2472,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -2500,6 +2536,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -2584,6 +2621,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -2668,6 +2706,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -2750,6 +2789,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -2832,6 +2872,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -2919,6 +2960,7 @@
           "options": [
             "budget128m"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -2990,6 +3032,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -3060,6 +3103,7 @@
           "options": [
             "ecn"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -3142,6 +3186,7 @@
           "options": [
             "budget128m"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -3222,6 +3267,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -3290,6 +3336,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -3360,6 +3407,7 @@
           "options": [
             "budget128m"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -3442,6 +3490,7 @@
           "options": [
             "budget128m"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -3522,6 +3571,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -3615,6 +3665,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -3710,6 +3761,7 @@
           "options": [
             "budget128m"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -3783,6 +3835,7 @@
           "options": [
             "budget128m"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -3854,6 +3907,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -3942,6 +3996,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -4038,6 +4093,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -4111,6 +4167,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -4178,6 +4235,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -4245,6 +4303,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -4312,6 +4371,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -4379,6 +4439,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -4447,6 +4508,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -4531,6 +4593,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -4615,6 +4678,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -4698,6 +4762,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -4765,6 +4830,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -4835,6 +4901,7 @@
           "options": [
             "no-timestamps"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -4926,6 +4993,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -4993,6 +5061,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -5061,6 +5130,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -5149,6 +5219,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -5219,6 +5290,7 @@
           "options": [
             "lowat4000"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -5298,6 +5370,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -5372,6 +5445,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -5440,6 +5514,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -5509,6 +5584,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -5579,6 +5655,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -5647,6 +5724,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -5715,6 +5793,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -5783,6 +5862,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -5845,6 +5925,7 @@
           "options": [
             "linux-cookie"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -5934,6 +6015,7 @@
           "options": [
             "linux-cookie"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -6023,6 +6105,7 @@
           "options": [
             "linux-cookie"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -6119,6 +6202,7 @@
             "pmtud1500",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -6224,6 +6308,7 @@
             "pmtud1500",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -6329,6 +6414,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -6433,6 +6519,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -6537,6 +6624,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -6640,6 +6728,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -6741,6 +6830,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -6842,6 +6932,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -6943,6 +7034,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -7044,6 +7136,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -7145,6 +7238,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -7246,6 +7340,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -7347,6 +7442,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -7448,6 +7544,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -7545,6 +7642,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -7625,6 +7723,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -7726,6 +7825,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -7827,6 +7927,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -7928,6 +8029,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -8025,6 +8127,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -8115,6 +8218,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -8206,6 +8310,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -8305,6 +8410,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -8408,6 +8514,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -8471,34 +8578,32 @@
       "command_line": "`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0\\\n\t\t\t     /proc/sys/net/ipv4/tcp_fastopen_blackhole_timeout_sec=0\\\n`\n",
       "command_sha256": "62208032c5c01b86b10a18d9785a5ec15d7aa07b917ff4bfbd90191804d82eab",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n\n\n",
-      "adapter_flags": "upstream,local=192.168.0.1",
+      "adapter_flags": "upstream,local=192.168.0.1,budget224m,no-timestamps",
       "embedded_tcp_info": true,
       "inventory_audit": {
         "source_family": "fastopen",
-        "blocked_capabilities": [
-          "dynamic"
-        ]
+        "blocked_capabilities": []
       },
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0\\\n\t\t\t     /proc/sys/net/ipv4/tcp_fastopen_blackhole_timeout_sec=0\\\n`",
           "sha256": "fff746a47413fa3b4d467277713a68497e72f0d2f699eb7f618fbb345c88337c",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "semantic_mapping": "Initial no-timestamps common profile with client permission allowed. Linux global blackhole detector is absent in ntcp; its requested disablement does not disable ntcp service negative caching. No host setup executes."
         },
         {
           "command": "`sysctl -q net.ipv4.tcp_fastopen=0`",
           "sha256": "e3b286bec72ee13a24988117d8a2ebad7d322c38828f53b5a29cd02c29693aba",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "semantic_mapping": "Exact timed callback disables new client TFO admission; connections, caches and server listeners remain intact."
         },
         {
           "command": "`sysctl -q net.ipv4.tcp_fastopen=1`",
           "sha256": "f755bb2b76f19c1b35a1cc77a0e5e2fc30e10de23f56c2955d6890517b09f7e0",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "semantic_mapping": "Exact timed callback re-enables shared client TFO permission; socket opt-in remains separate."
         },
         {
           "command": "`/tmp/sysctl_restore_${PPID}.sh`",
           "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "semantic_mapping": "Runtime teardown restores no host settings."
         }
       ],
       "mapping": {
@@ -8514,9 +8619,13 @@
           "capture_clock": "realtime epoch microseconds at backend submission",
           "hardware_tso": false,
           "gro": false,
-          "options": [],
+          "options": [
+            "budget224m",
+            "no-timestamps"
+          ],
+          "fast_open_client_enabled": true,
           "sack": true,
-          "timestamps": true,
+          "timestamps": false,
           "initial_window": "Iw10",
           "fast_open_early_response": false,
           "rack": true,
@@ -8529,7 +8638,7 @@
           "mss": 1460,
           "receive_capacity": 8388608,
           "window_scale": 8,
-          "endpoint_max_buffer_bytes": 33554432,
+          "endpoint_max_buffer_bytes": 234881024,
           "congestion_control": "Cubic",
           "cubic_hystart": true,
           "cubic_fast_convergence": true,
@@ -8550,12 +8659,15 @@
         },
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
-        "claim": "Capability audit only; source is retained and not executed.",
+        "claim": "Exact runtime client-permission off/on setup with original socket, packet, error and TCP_INFO assertions.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "Client permission is distinct from per-socket opt-in and cached service failures. Existing sends continue; new preconfigured connect falls back to ordinary TCP while disabled."
         ],
-        "option_reasons": {}
+        "option_reasons": {
+          "budget224m": "Original sequential client connections retain active and closing storage across the error/state sequence; the existing bounded budget preserves native per-socket accounting.",
+          "no-timestamps": "Exact initial setup disables timestamps throughout the original script."
+        }
       },
       "additional_setup_files": [
         {
@@ -8563,9 +8675,14 @@
           "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
         }
       ],
-      "blocked_reasons": [
-        "The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
-      ]
+      "tfo_permission_control": true,
+      "tfo_permission_event_sha256": [
+        "d9a8d4a84c6845122fa1d79f11144085559637103ce64f1ec0a97a7ad771cbec",
+        "a56f546437067fad6d4031bd479f243c4d0175d021e0d5220efc0342864b8b0f"
+      ],
+      "restore_line": "`/tmp/sysctl_restore_${PPID}.sh`\n",
+      "restore_sha256": "60a62f306d37841760269f429facc4f42420d9a0f3331bcb8ac55a14f7e84b48",
+      "restore_replacement_line": "// ntcp profile is process-local; no host sysctls to restore.\n"
     },
     "fastopen/client/nonblocking-sendto-errnos.pkt": {
       "source_sha256": "e31c659677f65cee707518939e6e13b00a919975ea79446e261c54012f18795b",
@@ -8576,34 +8693,32 @@
       "command_line": "`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0\\\n\t\t\t     /proc/sys/net/ipv4/tcp_fastopen_blackhole_timeout_sec=0\\\n`\n",
       "command_sha256": "62208032c5c01b86b10a18d9785a5ec15d7aa07b917ff4bfbd90191804d82eab",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n\n\n",
-      "adapter_flags": "upstream,local=192.168.0.1",
+      "adapter_flags": "upstream,local=192.168.0.1,budget224m,no-timestamps",
       "embedded_tcp_info": true,
       "inventory_audit": {
         "source_family": "fastopen",
-        "blocked_capabilities": [
-          "dynamic"
-        ]
+        "blocked_capabilities": []
       },
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0\\\n\t\t\t     /proc/sys/net/ipv4/tcp_fastopen_blackhole_timeout_sec=0\\\n`",
           "sha256": "fff746a47413fa3b4d467277713a68497e72f0d2f699eb7f618fbb345c88337c",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "semantic_mapping": "Initial no-timestamps common profile with client permission allowed. Linux global blackhole detector is absent in ntcp; its requested disablement does not disable ntcp service negative caching. No host setup executes."
         },
         {
           "command": "`sysctl -q net.ipv4.tcp_fastopen=0`",
           "sha256": "e3b286bec72ee13a24988117d8a2ebad7d322c38828f53b5a29cd02c29693aba",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "semantic_mapping": "Exact timed callback disables new client TFO admission; connections, caches and server listeners remain intact."
         },
         {
           "command": "`sysctl -q net.ipv4.tcp_fastopen=1`",
           "sha256": "f755bb2b76f19c1b35a1cc77a0e5e2fc30e10de23f56c2955d6890517b09f7e0",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "semantic_mapping": "Exact timed callback re-enables shared client TFO permission; socket opt-in remains separate."
         },
         {
           "command": "`/tmp/sysctl_restore_${PPID}.sh`",
           "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "semantic_mapping": "Runtime teardown restores no host settings."
         }
       ],
       "mapping": {
@@ -8619,9 +8734,13 @@
           "capture_clock": "realtime epoch microseconds at backend submission",
           "hardware_tso": false,
           "gro": false,
-          "options": [],
+          "options": [
+            "budget224m",
+            "no-timestamps"
+          ],
+          "fast_open_client_enabled": true,
           "sack": true,
-          "timestamps": true,
+          "timestamps": false,
           "initial_window": "Iw10",
           "fast_open_early_response": false,
           "rack": true,
@@ -8634,7 +8753,7 @@
           "mss": 1460,
           "receive_capacity": 8388608,
           "window_scale": 8,
-          "endpoint_max_buffer_bytes": 33554432,
+          "endpoint_max_buffer_bytes": 234881024,
           "congestion_control": "Cubic",
           "cubic_hystart": true,
           "cubic_fast_convergence": true,
@@ -8655,12 +8774,15 @@
         },
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
-        "claim": "Capability audit only; source is retained and not executed.",
+        "claim": "Exact runtime client-permission off/on setup with original socket, packet, error and TCP_INFO assertions.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "Client permission is distinct from per-socket opt-in and cached service failures. Existing sends continue; new preconfigured connect falls back to ordinary TCP while disabled."
         ],
-        "option_reasons": {}
+        "option_reasons": {
+          "budget224m": "Original sequential client connections retain active and closing storage across the error/state sequence; the existing bounded budget preserves native per-socket accounting.",
+          "no-timestamps": "Exact initial setup disables timestamps throughout the original script."
+        }
       },
       "additional_setup_files": [
         {
@@ -8668,9 +8790,14 @@
           "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
         }
       ],
-      "blocked_reasons": [
-        "The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
-      ]
+      "tfo_permission_control": true,
+      "tfo_permission_event_sha256": [
+        "d9a8d4a84c6845122fa1d79f11144085559637103ce64f1ec0a97a7ad771cbec",
+        "9acb6e76e1f7c469cbf84d596442b6c2416025ac560ef8ae3e1c2c4a98610fd6"
+      ],
+      "restore_line": "`/tmp/sysctl_restore_${PPID}.sh`\n",
+      "restore_sha256": "60a62f306d37841760269f429facc4f42420d9a0f3331bcb8ac55a14f7e84b48",
+      "restore_replacement_line": "// ntcp profile is process-local; no host sysctls to restore.\n"
     },
     "fastopen/client/nonblocking-sendto.pkt": {
       "source_sha256": "d72c1847f685d9ea14a7518c508c8b61c427d661c71c48bc506e9bbc81e29f36",
@@ -8721,6 +8848,7 @@
             "budget224m",
             "no-timestamps"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -8821,6 +8949,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -8916,6 +9045,7 @@
           "options": [
             "budget224m"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -9009,6 +9139,7 @@
             "no-timestamps",
             "prealloc4"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -9112,6 +9243,7 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
           "initial_window": "Iw10",
@@ -9218,6 +9350,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -9313,6 +9446,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -9403,6 +9537,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -9487,6 +9622,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -9572,6 +9708,7 @@
             "early-response",
             "linux-cookie"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -9664,6 +9801,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -9759,6 +9897,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -9845,6 +9984,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -9929,6 +10069,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -10015,6 +10156,7 @@
             "linux-cookie",
             "tfo-listen"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -10112,6 +10254,7 @@
             "linux-cookie",
             "tfo-listen"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -10218,6 +10361,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -10303,6 +10447,7 @@
             "linux-cookie",
             "tfo-listen"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -10412,6 +10557,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -10497,6 +10643,7 @@
             "linux-cookie",
             "tfo-listen"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -10592,6 +10739,7 @@
             "linux-cookie",
             "tfo-listen"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -10686,6 +10834,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -10770,6 +10919,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -10854,6 +11004,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -10939,6 +11090,7 @@
             "linux-cookie",
             "tfo-listen"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -11053,6 +11205,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -11143,6 +11296,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -11227,6 +11381,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -11311,6 +11466,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -11395,6 +11551,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -11485,6 +11642,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -11583,6 +11741,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -11681,6 +11840,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -11778,6 +11938,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -11868,6 +12029,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -11952,6 +12114,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -12041,6 +12204,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -12124,6 +12288,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -12204,6 +12369,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -12284,6 +12450,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -12375,6 +12542,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -12476,6 +12644,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -12566,6 +12735,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -12645,6 +12815,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -12724,6 +12895,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -12802,6 +12974,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -12880,6 +13053,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -12959,6 +13133,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -13038,6 +13213,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -13123,6 +13299,7 @@
           "options": [
             "budget128m"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -13214,6 +13391,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -13304,6 +13482,7 @@
           "options": [
             "budget224m"
           ],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -13385,6 +13564,7 @@
           "hardware_tso": false,
           "gro": false,
           "options": [],
+          "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",

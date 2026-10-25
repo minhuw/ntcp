@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from expectations import PORTED_SCRIPTS
 
-from run import (CACHE_FLUSH_SCRIPT, SYN_DATA_ACK_SCRIPTS, TIMESTAMP_SOURCES, RESOURCE_SCRIPT, RESOURCE_EVENT, RESOURCE_CONTROL, SLOW_START_ACK_SCRIPTS, FASTOPEN_CLIENT_SCRIPTS, NON_TFO_SETUP_COMMANDS, ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
+from run import (TFO_PERMISSION_SOURCES, CACHE_FLUSH_SCRIPT, SYN_DATA_ACK_SCRIPTS, TIMESTAMP_SOURCES, RESOURCE_SCRIPT, RESOURCE_EVENT, RESOURCE_CONTROL, SLOW_START_ACK_SCRIPTS, FASTOPEN_CLIENT_SCRIPTS, NON_TFO_SETUP_COMMANDS, ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
                  fixture_command, HERE, PIN, adapt_source, check_plugin_hash, invoke, main, outcome,
                  preflight, profile_metadata, select_cases, variants, verify_backend)
 
@@ -507,6 +507,8 @@ class AdaptationChecks(unittest.TestCase):
         # separate capability tests; generic synthetic sources cannot enable it.
         self.manifest['scripts'].pop(RESOURCE_SCRIPT)
         self.manifest['scripts'].pop(CACHE_FLUSH_SCRIPT)
+        for name in TFO_PERMISSION_SOURCES:
+            self.manifest['scripts'].pop(name)
         for name in TIMESTAMP_SOURCES:
             self.manifest['scripts'].pop(name)
         # Synthetic generic sources have no IPv6-only filename constraints.

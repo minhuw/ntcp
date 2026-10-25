@@ -267,6 +267,26 @@ pub fn configure(config: SocketConfig) -> std::io::Result<()> {
         .map_err(std::io::Error::from_raw_os_error)
 }
 
+// Per-runtime administration, serialized with socket operations. This changes
+// admission only; it does not revoke pending sends or clear transport/cache state.
+pub fn set_fast_open_client_enabled(enabled: bool) -> std::io::Result<()> {
+    let apply = || -> Result<()> {
+        mutation_context()?;
+        // Requiring selected configuration avoids committing either singleton
+        // on an unconfigured management call. Packet runtimes are already live.
+        if RUNTIME.get().is_none() {
+            match CONFIG.get() {
+                Some(Ok(Some(_))) => (),
+                Some(Err(error)) => return Err(*error),
+                _ => return Err(EINVAL),
+            }
+        }
+        runtime()?.call(0, Op::SetFastOpenClientEnabled(enabled))?;
+        Ok(())
+    };
+    apply().map_err(std::io::Error::from_raw_os_error)
+}
+
 fn configured() -> Result<bool> {
     select_config(None).map(Option::is_some)
 }

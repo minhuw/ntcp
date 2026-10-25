@@ -507,3 +507,27 @@ fn initial_tfo_copy_completion_fault_and_full_queue_do_not_start_or_consume_id()
         }
     }
 }
+
+#[test]
+fn client_tfo_permission_admitted_blocking_send_and_completion_survive_disable() {
+    for (deferred, warm) in [(false,false), (false,true), (true,true)] {
+        let mut f = Flight::new(deferred, warm, false, 500);
+        assert!(!f.initial_done);
+        assert_eq!(f.request.send.as_ref().unwrap().accepted, if warm {500} else {0});
+        assert_eq!(f.a.sockets[&f.client].zc_reserved, usize::from(warm));
+        f.a.execute(0, Op::SetFastOpenClientEnabled(false)).unwrap();
+        exchange(&mut f.a, &mut f.b);
+        for _ in 0..16 {
+            if f.a.service(&mut f.request) {break;}
+            exchange(&mut f.a, &mut f.b);
+        }
+        assert_eq!(f.result.try_recv().unwrap().unwrap().value, 500);
+        let s = &f.a.sockets[&f.client];
+        assert_eq!((s.zc_next, s.zc_reserved, s.completions.len()), (1, 0, 1));
+        assert!(matches!(s.completions.front(), Some(Completion::ZeroCopy(0,0))));
+        // Copied completion releases the user's buffer; it is not wire delivery.
+        exchange(&mut f.a, &mut f.b);
+        let server = f.b.execute(f.listener, Op::Accept(SOCK_NONBLOCK)).unwrap().value as u64;
+        assert_eq!(f.b.execute(server, Op::Read(BYTES)).unwrap().bytes, f.payload);
+    }
+}

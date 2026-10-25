@@ -726,3 +726,7 @@ mod accept_reset {
 mod tfo_copied_completion {
     include!("runtime_tfo_copied_completion_tests.rs");
 }
+
+mod client_tfo_permission {
+    include!("runtime_tfo_permission_tests.rs");
+}
