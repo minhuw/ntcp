@@ -103,10 +103,15 @@ class PmtudInventory(unittest.TestCase):
             for fragment in fragments:
                 self.assertTrue(any(fragment in q for q in spans), (n, fragment))
         # Known implementation gaps must not silently become scope exceptions.
-        for n, numbers in {8201: (76,), 4821: (71, 119)}.items():
+        for n, numbers in {8201: (76,)}.items():
             rows = {p["id"]: p for p in self.inventory(n)["paragraphs"]}
             for i in numbers:
                 self.assertEqual(rows[f"{n}-{i:03}"]["status"], "TODO")
+        for number in (71, 119):
+            row = {p["id"]: p for p in self.inventory(4821)["paragraphs"]}[f"4821-{number:03}"]
+            self.assertEqual(row["status"], "covered")
+            self.assertIn("destination-policy", row["reason"])
+            self.assertEqual(len(row["evidence"]), 2)
         # RFC5927 documents nonstandard mitigations, not a mandatory historical
         # algorithm. Keep each selected policy deviation explicit and quoted.
         rows = {p["id"]: p for p in self.inventory(5927)["paragraphs"]}
@@ -171,14 +176,14 @@ class PmtudInventory(unittest.TestCase):
         rows = {p["id"]: p for n in RFCS for p in self.inventory(n)["paragraphs"]}
         self.assertEqual({n: sum(p["status"] == "TODO"
                                  for p in self.inventory(n)["paragraphs"])
-                          for n in RFCS}, {1191: 23, 8201: 16, 4821: 19, 5927: 2})
+                          for n in RFCS}, {1191: 23, 8201: 16, 4821: 17, 5927: 2})
         for id in ("1191-068", "1191-095", "8201-069", "8201-084"):
             self.assertEqual(rows[id]["status"], "covered")
             for fragment in ("0030a96", "Infinity", ">=300", "Endpoint::set_pmtud_policy",
                              "independent mandatory 600-second PTB hold"):
                 self.assertIn(fragment, rows[id]["reason"], id)
         expected = {
-            "4821-113": ("initial_search_low", "Per-route policy remains open"),
+            "4821-113": ("initial_search_low", "Destination policy configuration"),
             "4821-066": ("logical window", "PRR admission", "strict extra", "deadline"),
             "4821-143": ("actual TCP RTO", "one-MSS cwnd", "five times cooldown"),
             "8201-075": ("two successively smaller router PTBs", "wrapping sequences",
@@ -192,8 +197,6 @@ class PmtudInventory(unittest.TestCase):
             "1191-099": ("runtime", "912cf80", "up-to-date reference"),
             "4821-011": ("apply_ptb cancels", "committed normal congestion response"),
             "4821-012": ("fivefold timeout hold", "integrated next-probe assertion"),
-            "4821-071": ("per-connection", "No per-route policy"),
-            "4821-119": ("initial_mtu/initial_search_low/initial_search_high", "No per-route"),
             "4821-136": ("suppression", "same-sized next probe"),
         }
         for id, fragments in partials.items():
@@ -235,9 +238,9 @@ class PmtudInventory(unittest.TestCase):
         self.assertIn("strict extra interval/tick", rows["4821-066"]["reason"])
         counts = {n: len(tomllib.loads((ROOT / f"duvet/rfc{n}-todos.toml").read_text())
                          .get("TODO", [])) for n in RFCS}
-        self.assertEqual(sum(counts.values()), 60)
+        self.assertEqual(sum(counts.values()), 58)
         self.assertEqual(sum(len(tomllib.loads(p.read_text()).get("TODO", []))
-                             for p in (ROOT / "duvet").glob("rfc*-todos.toml")), 63)
+                             for p in (ROOT / "duvet").glob("rfc*-todos.toml")), 61)
 
     def test_paws_discovery_gap_names_concrete_supplied_embedding(self):
         todos = tomllib.loads((ROOT / "duvet/rfc7323-todos.toml").read_text())["TODO"]

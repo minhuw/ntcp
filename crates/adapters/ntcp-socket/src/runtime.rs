@@ -51,6 +51,7 @@ pub enum Op {
     Wait(Box<Op>, Option<std::time::Duration>),
     FinishConnect,
     SetFastOpenClientEnabled(bool),
+    SetDestinationRoute(Ipv4Addr, Option<ntcp::RoutePolicy>),
     #[cfg(all(test, feature = "packet-test"))]
     BlockingConnect(SocketAddr),
     Bind(SocketAddr),
@@ -620,14 +621,21 @@ impl Owner {
         }
         let tcp = backend::backend_config(config.tcp.clone(), &tun)?;
         let mut owner = Self::with_config(local, subnet, secret, Some(tun), tcp)?;
-        owner.apply_socket_config(config);
+        owner.apply_socket_config(config)?;
         owner.enable_reservations(&config.io, index)?;
         Ok(owner)
     }
-    fn apply_socket_config(&mut self, config: &SocketConfig) {
+    fn apply_socket_config(&mut self, config: &SocketConfig) -> Result<()> {
         self.socket_policy = config.socket;
         self.endpoint
             .set_fast_open_cookie_policy(config.fast_open_cookie_policy.clone());
+        let now = self.now();
+        for &(destination, policy) in &config.routes {
+            self.endpoint
+                .set_destination_route(now, destination.into(), Some(policy))
+                .map_err(engine)?;
+        }
+        Ok(())
     }
     fn with_config(
         local: Ipv4Addr,
@@ -780,7 +788,10 @@ impl Owner {
         false
     }
     fn admission_command(&self, op: &Op) -> bool {
-        if matches!(op, Op::SetFastOpenClientEnabled(_)) {
+        if matches!(
+            op,
+            Op::SetFastOpenClientEnabled(_) | Op::SetDestinationRoute(..)
+        ) {
             return true;
         }
         #[cfg(feature = "packet-test")]
@@ -1523,6 +1534,22 @@ impl Owner {
         Ok(bits)
     }
     fn execute(&mut self, id: u64, op: Op) -> Result<Reply> {
+        if let Op::SetDestinationRoute(destination, policy) = op {
+            if !unicast(destination) {
+                return Err(EINVAL);
+            }
+            self.endpoint
+                .set_destination_route(self.now(), destination.into(), policy)
+                .map_err(|error| {
+                    if error == EndpointError::OutputReserved {
+                        EAGAIN
+                    } else {
+                        engine(error)
+                    }
+                })?;
+            self.events();
+            return Ok(Reply::default());
+        }
         // Observer snapshots do not drive clocks/timers or consume events.
         #[cfg(feature = "packet-test")]
         if let Op::ListenerPresent(port) = op {
@@ -1542,6 +1569,9 @@ impl Owner {
     fn dispatch(&mut self, id: u64, op: Op) -> Result<Reply> {
         self.prune_child_timeouts();
         let mut out = Reply::default();
+        if matches!(op, Op::SetDestinationRoute(..)) {
+            unreachable!("route control uses execute preflight");
+        }
         if let Op::SetFastOpenClientEnabled(enabled) = op {
             self.socket_policy.fast_open_client_enabled = enabled;
             return Ok(out);
@@ -2515,7 +2545,9 @@ impl Owner {
             }
             Op::FinishConnect => self.complete_connect(id)?,
             Op::Wait(_, _) => unreachable!(),
-            Op::New(_) | Op::SetFastOpenClientEnabled(_) => unreachable!(),
+            Op::New(_) | Op::SetFastOpenClientEnabled(_) | Op::SetDestinationRoute(..) => {
+                unreachable!()
+            }
             #[cfg(feature = "packet-test")]
             Op::Inject(_)
             | Op::Capture(_)
@@ -2547,6 +2579,9 @@ mod tests {
     }
     include!("runtime_syncnt_tests.rs");
     include!("runtime_mss_mark_tests.rs");
+    mod route_policy {
+        include!("runtime_route_tests.rs");
+    }
     fn owner(last: u8) -> Owner {
         owner_with_config(
             last,
@@ -2647,7 +2682,7 @@ mod tests {
         let mut owner = owner(2);
         let mut config = SocketConfig::new("test", Ipv4Addr::new(10, 73, 0, 2));
         config.socket.fast_open_client_enabled = false;
-        owner.apply_socket_config(&config);
+        owner.apply_socket_config(&config).unwrap();
         let id = new(&mut owner, SOCK_NONBLOCK);
         assert_eq!(
             owner

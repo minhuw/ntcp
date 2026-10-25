@@ -37,6 +37,8 @@ mod pmtud;
 pub use pmtud::PathMtuInfo;
 mod pmtud_config;
 pub use pmtud_config::{Ipv4Plateaus, PmtudConfig, PmtudPolicy, SearchAging};
+mod route_policy;
+pub use route_policy::RoutePolicy;
 mod rack;
 mod recovery;
 mod rx_timestamp;
@@ -69,3 +71,6 @@ pub use rx_timestamp::{
     RxPacketTimestamps, RxReadTimestamps, RxTimestamp, RxTimestampStatus, SendProgress,
     TimestampClock, TimestampSource,
 };
+
+#[cfg(test)]
+mod destination_route_tests;

@@ -37,6 +37,11 @@ unsafe extern "C" fn ntcp_packetdrill_control(
                 packet_test::timestamp_default(true)?;
                 packet_test::clear_fast_open_client_cache()?;
             }
+            command if command.starts_with(b"ntcp-local-route-") => {
+                let (destination, policy) = route_command(command)?;
+                ntcp_socket::set_destination_route(destination, policy)
+                    .map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
+            }
             command if command.starts_with(b"ntcp-local-assert-listener ") => {
                 let port = listener_assertion_port(command)?;
                 if !packet_test::listener_present(port)? {
@@ -48,6 +53,53 @@ unsafe extern "C" fn ntcp_packetdrill_control(
         Ok(0)
     }) as i32
 }
+fn route_command(
+    command: &[u8],
+) -> Result<(std::net::Ipv4Addr, Option<ntcp_socket::RoutePolicy>), i32> {
+    if command.len() > 96 {
+        return Err(EOPNOTSUPP);
+    }
+    let text = std::str::from_utf8(command).map_err(|_| EOPNOTSUPP)?;
+    let fields: Vec<_> = text.split(' ').collect();
+    if fields.len() < 2 {
+        return Err(EOPNOTSUPP);
+    }
+    let destination: std::net::Ipv4Addr = fields[1].parse().map_err(|_| EOPNOTSUPP)?;
+    if destination.to_string() != fields[1] {
+        return Err(EOPNOTSUPP);
+    }
+    fn number(text: &str) -> Result<Option<u32>, i32> {
+        if text == "-" {
+            return Ok(None);
+        }
+        if text.is_empty() || text.starts_with('0') || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(EOPNOTSUPP);
+        }
+        text.parse().map(Some).map_err(|_| EOPNOTSUPP)
+    }
+    match (fields[0], fields.len()) {
+        ("ntcp-local-route-remove", 2) => Ok((destination, None)),
+        ("ntcp-local-route-set", 5) => {
+            let mtu = number(fields[2])?;
+            let advertised_mss = number(fields[3])?
+                .map(u16::try_from)
+                .transpose()
+                .map_err(|_| EOPNOTSUPP)?;
+            let initial_search_low = number(fields[4])?;
+            Ok((
+                destination,
+                Some(ntcp_socket::RoutePolicy {
+                    mtu,
+                    advertised_mss,
+                    initial_search_low,
+                    ..Default::default()
+                }),
+            ))
+        }
+        _ => Err(EOPNOTSUPP),
+    }
+}
+
 // Canonical decimal ports only; no shell fragments or alternate spellings.
 fn listener_assertion_port(command: &[u8]) -> Result<u16, i32> {
     let port = command

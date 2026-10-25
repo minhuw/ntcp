@@ -24,6 +24,7 @@ pub struct SocketConfig {
     pub socket: SocketPolicy,
     pub fast_open_cookie_policy: ntcp::FastOpenCookiePolicy,
     pub io: IoConfig,
+    pub routes: Vec<(Ipv4Addr, ntcp::RoutePolicy)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +76,7 @@ impl SocketConfig {
             tcp,
             socket: SocketPolicy::default(),
             fast_open_cookie_policy: ntcp::FastOpenCookiePolicy::default(),
+            routes: Vec::new(),
             io: IoConfig {
                 backend: Backend::Tun,
                 interface: interface.into(),
@@ -128,6 +130,30 @@ impl SocketConfig {
             (Backend::AfPacket, Some(mac)) if mac != [0; 6] && mac[0] & 1 == 0 => {}
             _ => return Err(invalid()),
         }
+        // Before IO opens, validate against configured allocation ceilings.
+        // Backend startup repeats policy validation with the actual interface MTU.
+        let mut route_defaults = self.tcp.connection.clone();
+        let bound = (u32::from(route_defaults.send_ip_payload_limit) + 20).min(65535);
+        route_defaults
+            .pmtud
+            .get_or_insert(ntcp::PmtudConfig::new(bound));
+        if self.routes.len() > self.tcp.max_route_policies {
+            return Err(invalid());
+        }
+        for (i, (destination, policy)) in self.routes.iter().enumerate() {
+            if destination.is_loopback()
+                || destination.octets()[0] == 0
+                || destination.octets()[0] >= 224
+                || self.routes[..i]
+                    .iter()
+                    .any(|(other, _)| other == destination)
+            {
+                return Err(invalid());
+            }
+            policy
+                .validate(&route_defaults, true)
+                .map_err(|_| invalid())?;
+        }
         self.tcp.validate().map_err(|_| invalid())?;
         let c = &self.tcp.connection;
         c.validate(true).map_err(|_| invalid())?;
@@ -172,6 +198,30 @@ impl SocketConfig {
             let (key, value) = (key.trim(), value.trim());
             if !seen.insert(key) || value.is_empty() {
                 return Err(invalid());
+            }
+            if let Some(route) = key.strip_prefix("route.") {
+                let (address, field) = route.rsplit_once('.').ok_or_else(invalid)?;
+                let address: Ipv4Addr = address.parse().map_err(|_| invalid())?;
+                let index = match config.routes.iter().position(|(ip, _)| *ip == address) {
+                    Some(index) => index,
+                    None => {
+                        if config.routes.len() == config.tcp.max_route_policies {
+                            return Err(invalid());
+                        }
+                        config.routes.push((address, ntcp::RoutePolicy::default()));
+                        config.routes.len() - 1
+                    }
+                };
+                let policy = &mut config.routes[index].1;
+                match field {
+                    "mtu" => policy.mtu = Some(number(value)?),
+                    "advertised_mss" => policy.advertised_mss = Some(number(value)?),
+                    "initial_mtu" => policy.initial_mtu = Some(number(value)?),
+                    "initial_search_low" => policy.initial_search_low = Some(number(value)?),
+                    "initial_search_high" => policy.initial_search_high = Some(number(value)?),
+                    _ => return Err(invalid()),
+                }
+                continue;
             }
             match key {
                 "socket.fast_open_client_enabled" => {

@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from expectations import PORTED_SCRIPTS
 
-from run import (LISTENER_ASSERT_SCRIPT, TFO_PERMISSION_SOURCES, CACHE_FLUSH_SCRIPT, SYN_DATA_ACK_SCRIPTS, TIMESTAMP_SOURCES, RESOURCE_SCRIPT, RESOURCE_EVENT, RESOURCE_CONTROL, SLOW_START_ACK_SCRIPTS, FASTOPEN_CLIENT_SCRIPTS, NON_TFO_SETUP_COMMANDS, ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
+from run import (ROUTE_SCRIPT, LISTENER_ASSERT_SCRIPT, TFO_PERMISSION_SOURCES, CACHE_FLUSH_SCRIPT, SYN_DATA_ACK_SCRIPTS, TIMESTAMP_SOURCES, RESOURCE_SCRIPT, RESOURCE_EVENT, RESOURCE_CONTROL, SLOW_START_ACK_SCRIPTS, FASTOPEN_CLIENT_SCRIPTS, NON_TFO_SETUP_COMMANDS, ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
                  fixture_command, HERE, PIN, adapt_source, check_plugin_hash, invoke, main, outcome,
                  preflight, profile_metadata, select_cases, variants, verify_backend)
 
@@ -505,6 +505,7 @@ class AdaptationChecks(unittest.TestCase):
         self.manifest = json.loads((HERE / 'adaptations.json').read_text())
         # Timed resource commands require the exact real source/hash and have
         # separate capability tests; generic synthetic sources cannot enable it.
+        self.manifest['scripts'].pop(ROUTE_SCRIPT)
         self.manifest['scripts'].pop(RESOURCE_SCRIPT)
         self.manifest['scripts'].pop(CACHE_FLUSH_SCRIPT)
         self.manifest['scripts'].pop(LISTENER_ASSERT_SCRIPT)
@@ -939,7 +940,7 @@ class AdaptationChecks(unittest.TestCase):
         self.assertEqual(data['coverage'], {'selected_script_files': count,
                                           'upstream_script_files': inventory_count,
                                           'selection': 'adaptation_allowlist'})
-        self.assertEqual(data['counts'], {'failed': count - 1, 'passed': 1, 'unsupported': 2 * count - 1})
+        self.assertEqual(data['counts'], {'failed': count - 1, 'passed': 1, 'unsupported': 2 * count})
         self.assertFalse(data['all_passed'])
         self.assertEqual(len(calls), 2 * count)
         for row in data['results']:
@@ -1000,10 +1001,10 @@ class AdaptationChecks(unittest.TestCase):
             data = json.loads(report.read_text())
             self.assertEqual(data['counts'], expected_counts)
             self.assertEqual(data['all_passed'], expected_counts == {'passed': 1})
-            self.assertEqual(data['eligible_total'], 3 * inventory_count - 1)
+            self.assertEqual(data['eligible_total'], 3 * inventory_count)
             self.assertEqual(data['eligible_script_files'], inventory_count)
             self.assertEqual(data['selected_total'], sum(expected_counts.values()))
-            self.assertEqual(data['excluded_total'], 3 * inventory_count - 1 - data['selected_total'])
+            self.assertEqual(data['excluded_total'], 3 * inventory_count - data['selected_total'])
             self.assertEqual(len(calls), expected_calls)
             self.assertEqual(data['adaptation_manifest_sha256'],
                              hashlib.sha256((manifest_dir / 'adaptations.json').read_bytes()).hexdigest())
@@ -1031,7 +1032,7 @@ class AdaptationChecks(unittest.TestCase):
                      '--suite', 'upstream', '--report', str(report), '--so-flags', 'baseline']):
             self.assertEqual(main(), 1)
             execute.assert_not_called()
-        self.assertEqual(json.loads(report.read_text())['counts'], {'adaptation_rejected': 3 * count - 1})
+        self.assertEqual(json.loads(report.read_text())['counts'], {'adaptation_rejected': 3 * count})
 
 
 class FileFixtureChecks(unittest.TestCase):

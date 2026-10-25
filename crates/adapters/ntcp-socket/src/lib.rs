@@ -31,9 +31,9 @@ macro_rules! boundary_entry {
 
 mod config;
 pub use config::{Backend, IoConfig, SocketConfig, SocketPolicy};
-pub use ntcp::FastOpenCookiePolicy;
 #[cfg(feature = "tfo-linux-cookie")]
 pub use ntcp::LinuxSipHash24Key;
+pub use ntcp::{FastOpenCookiePolicy, RoutePolicy};
 mod file_transfer;
 #[cfg(feature = "packet-test")]
 pub mod packet_profile;
@@ -282,6 +282,28 @@ pub fn set_fast_open_client_enabled(enabled: bool) -> std::io::Result<()> {
             }
         }
         runtime()?.call(0, Op::SetFastOpenClientEnabled(enabled))?;
+        Ok(())
+    };
+    apply().map_err(std::io::Error::from_raw_os_error)
+}
+
+// Per-destination same-path transport policy, serialized with the owner. None
+// removes the override. MTU changes cover existing connections; creation hints
+// affect future connections only. A held affected output returns WouldBlock.
+pub fn set_destination_route(
+    destination: Ipv4Addr,
+    policy: Option<RoutePolicy>,
+) -> std::io::Result<()> {
+    let apply = || -> Result<()> {
+        mutation_context()?;
+        if RUNTIME.get().is_none() {
+            match CONFIG.get() {
+                Some(Ok(Some(_))) => (),
+                Some(Err(error)) => return Err(*error),
+                _ => return Err(EINVAL),
+            }
+        }
+        runtime()?.call(0, Op::SetDestinationRoute(destination, policy))?;
         Ok(())
     };
     apply().map_err(std::io::Error::from_raw_os_error)

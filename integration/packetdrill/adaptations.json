@@ -12574,30 +12574,28 @@
       "expected_command_count": 3,
       "command_line": "`../common/defaults.sh\n ../common/set_sysctls.py \\\n\t/proc/sys/net/ipv4/tcp_mtu_probing=2 \\\n\t/proc/sys/net/ipv4/tcp_base_mss=512\n ip route change 192.0.2.1 via 192.168.0.2 dev tun0 advmss 600 mtu lock 640 initcwnd 11\n ethtool -K tun0 gso off tso off\n`\n",
       "command_sha256": "12c57c5289ebd51e6b17f55de0bb108fce815358eb0f6fb4d433ec646458bfef",
-      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n\n\n\n\n\n",
-      "adapter_flags": "upstream,local=192.168.0.1",
+      "replacement_line": "0 `ntcp-local-route-set 192.0.2.1 640 600 552`\n\n\n\n\n\n\n",
+      "adapter_flags": "upstream,local=192.168.0.1,no-gso,pmtud1500",
       "embedded_tcp_info": false,
       "inventory_audit": {
         "source_family": "mtu_probe",
-        "blocked_capabilities": [
-          "mtu"
-        ]
+        "blocked_capabilities": []
       },
       "audited_shell_commands": [
         {
           "command": "`../common/defaults.sh\n ../common/set_sysctls.py \\\n\t/proc/sys/net/ipv4/tcp_mtu_probing=2 \\\n\t/proc/sys/net/ipv4/tcp_base_mss=512\n ip route change 192.0.2.1 via 192.168.0.2 dev tun0 advmss 600 mtu lock 640 initcwnd 11\n ethtool -K tun0 gso off tso off\n`",
           "sha256": "6e3e04ad17464f561a143c64599b1dc67a41820e80a46dcce4e0b202d7379262",
-          "semantic_mapping": "Unavailable: source is retained and never executed: No audited control maps tcp_mtu_probing=2, tcp_base_mss=512, per-route advmss/locked MTU/initcwnd11, GSO disablement, and the timed route-MTU increase to this backend. ICMP PMTUD alone does not reproduce this PLPMTUD setup."
+          "semantic_mapping": "Exact process-local destination-policy command or teardown translation; no shell/host network commands. Policy scope and retained IW10/DF differences are explicit in destination_route."
         },
         {
           "command": "`ip route change 192.0.2.1 via 192.168.0.2 dev tun0 advmss 1460 mtu lock 1500`",
           "sha256": "06696fb266a4c666d4b80de026c6dbf80aa8756890236b73863824736767a938",
-          "semantic_mapping": "Unavailable: source is retained and never executed: No audited control maps tcp_mtu_probing=2, tcp_base_mss=512, per-route advmss/locked MTU/initcwnd11, GSO disablement, and the timed route-MTU increase to this backend. ICMP PMTUD alone does not reproduce this PLPMTUD setup."
+          "semantic_mapping": "Exact process-local destination-policy command or teardown translation; no shell/host network commands. Policy scope and retained IW10/DF differences are explicit in destination_route."
         },
         {
           "command": "`/tmp/sysctl_restore_${PPID}.sh`",
           "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
-          "semantic_mapping": "Unavailable: source is retained and never executed: No audited control maps tcp_mtu_probing=2, tcp_base_mss=512, per-route advmss/locked MTU/initcwnd11, GSO disablement, and the timed route-MTU increase to this backend. ICMP PMTUD alone does not reproduce this PLPMTUD setup."
+          "semantic_mapping": "Exact process-local destination-policy command or teardown translation; no shell/host network commands. Policy scope and retained IW10/DF differences are explicit in destination_route."
         }
       ],
       "mapping": {
@@ -12608,12 +12606,15 @@
           "transmit_batch_clock": "monotonic sample per selection/accept",
           "egress_pipeline": "shared production scheduler",
           "general_pacing": false,
-          "software_gso": true,
+          "software_gso": false,
           "capture_boundary": "individual raw IPv4 TCP wire segments",
           "capture_clock": "realtime epoch microseconds at backend submission",
           "hardware_tso": false,
           "gro": false,
-          "options": [],
+          "options": [
+            "no-gso",
+            "pmtud1500"
+          ],
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -12646,16 +12647,32 @@
           "fast_open_listener_default": false,
           "fast_open_cache": "fresh runtime",
           "fast_open_cookie_policy": "hmac-sha256",
-          "pacing_config": null
+          "pacing_config": null,
+          "pmtud_first_hop_mtu": 1500
         },
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
-        "claim": "Capability audit only; source is retained and not executed.",
+        "claim": "Audited destination-policy setup with standard IW10 and DF retained; Linux-specific cwnd>=11 gate is replaced by actual byte/window/queue probe admission. Original packet/syscall assertions remain unchanged; packetization mismatches remain failures.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "No audited control maps tcp_mtu_probing=2, tcp_base_mss=512, per-route advmss/locked MTU/initcwnd11, GSO disablement, and the timed route-MTU increase to this backend. ICMP PMTUD alone does not reproduce this PLPMTUD setup."
+          "Actual1500-byte local interface bound; destination route cap and search-low are independently configured through the shared owner API.",
+          "Original disables GSO/TSO and uses strict segment checking; disable software aggregation, retaining individual wire packets."
         ],
-        "option_reasons": {}
+        "option_reasons": {
+          "pmtud1500": "Actual1500-byte local interface bound; destination route cap and search-low are independently configured through the shared owner API.",
+          "no-gso": "Original disables GSO/TSO and uses strict segment checking; disable software aggregation, retaining individual wire packets."
+        },
+        "destination_route": {
+          "destination": "192.0.2.1",
+          "initial_mtu_cap": 640,
+          "initial_advertised_mss": 600,
+          "initial_search_low": 552,
+          "updated_mtu_cap": 1500,
+          "future_advertised_mss": 1460,
+          "initial_window": "Common RFC6928 IW10; byte/window/queued-tail admission already permits this probe, without Linux-specific cwnd>=11 gate.",
+          "scope": "Runtime-owned destination transport policy; synthetic packet context does not configure host gateway/device. Strict scalar capture, no offload.",
+          "locked_route": "Administrative MTU ceiling; ordinary validated ICMP and DF policy retained. No claim of Linux route locking/discovery-disable equivalence."
+        }
       },
       "additional_setup_files": [
         {
@@ -12663,9 +12680,11 @@
           "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
         }
       ],
-      "blocked_reasons": [
-        "No audited control maps tcp_mtu_probing=2, tcp_base_mss=512, per-route advmss/locked MTU/initcwnd11, GSO disablement, and the timed route-MTU increase to this backend. ICMP PMTUD alone does not reproduce this PLPMTUD setup."
-      ]
+      "route_control": true,
+      "route_event_sha256": "c7b87eae6b6ca6c7ba39f7dad5d5f7526495c64bcaf7d41196beb6870efac7f4",
+      "restore_line": "`/tmp/sysctl_restore_${PPID}.sh`\n",
+      "restore_sha256": "60a62f306d37841760269f429facc4f42420d9a0f3331bcb8ac55a14f7e84b48",
+      "restore_replacement_line": "// ntcp destination routes are local to this runtime.\n"
     },
     "mtu_probe/basic-v6.pkt": {
       "source_sha256": "d7061284181020bb8b6f6d3e979a14b753e4f1281605031471b0eca08314bb5c",

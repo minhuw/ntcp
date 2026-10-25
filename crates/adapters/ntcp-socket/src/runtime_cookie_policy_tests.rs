@@ -62,7 +62,7 @@ fn typed_default_staging_rotation_isolation_and_failed_handles() {
         Owner::with_config(local, (local, 32), [42; 32], None, config.tcp.clone()).unwrap();
     owner.test_now = Some(0);
     let budget = owner.endpoint.buffer_bytes();
-    owner.apply_socket_config(&config);
+    owner.apply_socket_config(&config).unwrap();
     let a = listener(&mut owner, 8080);
     set(&mut owner, a, 2).unwrap();
     owner.execute(a, Op::Listen(8)).unwrap();
@@ -91,7 +91,7 @@ fn typed_default_staging_rotation_isolation_and_failed_handles() {
     let inherited = response(&mut owner).unwrap();
     assert_ne!(inherited, old);
     config.fast_open_cookie_policy = policy(2);
-    owner.apply_socket_config(&config);
+    owner.apply_socket_config(&config).unwrap();
     syn(&mut owner, 8081, 40005);
     assert_eq!(response(&mut owner), Some(old));
 

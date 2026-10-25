@@ -663,3 +663,72 @@ fn advertised_receive_mss_config_is_independent_of_send_and_receive_capacity() {
     invalid.tcp.connection.advertised_mss = Some(0);
     assert!(invalid.validate().is_err());
 }
+
+#[test]
+fn destination_route_parser_and_typed_bounds() {
+    let config = SocketConfig::parse(&format!("{BASE}route.192.0.2.1.mtu=640\nroute.192.0.2.1.advertised_mss=600\nroute.192.0.2.1.initial_search_low=552\nroute.192.0.2.2.mtu=1400\n")).unwrap();
+    assert_eq!(config.routes.len(), 2);
+    assert_eq!(
+        config.routes[0],
+        (
+            "192.0.2.1".parse().unwrap(),
+            ntcp::RoutePolicy {
+                mtu: Some(640),
+                advertised_mss: Some(600),
+                initial_search_low: Some(552),
+                ..Default::default()
+            }
+        )
+    );
+    assert!(config.tcp.connection.pmtud.is_none()); // Actual first-hop comes from IO.
+    for suffix in [
+        "route.0.0.0.0.mtu=640",
+        "route.127.0.0.1.mtu=640",
+        "route.224.0.0.1.mtu=640",
+        "route.192.0.2.1.mtu=0",
+        "route.192.0.2.1.mtu=65536",
+        "route.192.0.2.1.advertised_mss=0",
+        "route.192.0.2.1.mtu=640\nroute.192.0.2.1.initial_search_low=700",
+        "route.192.0.2.1.mtu=640\nroute.192.0.2.1.mtu=700",
+        "route.192.0.2.1.unknown=640",
+        "route.192.0.2.1.mtu=+640",
+    ] {
+        assert!(
+            SocketConfig::parse(&format!("{BASE}{suffix}\n")).is_err(),
+            "{suffix}"
+        );
+    }
+    let mut bad = config.clone();
+    bad.routes.push(bad.routes[0]);
+    assert!(bad.validate().is_err());
+    let mut bad = config;
+    bad.tcp.max_route_policies = 1;
+    assert!(bad.validate().is_err());
+}
+
+#[test]
+fn destination_route_api_before_config_does_not_select_runtime() {
+    const CHILD: &str = "NTCP_ROUTE_NO_CONFIG_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        assert!(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "config::tests::destination_route_api_before_config_does_not_select_runtime",
+                    "--test-threads=1"
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap()
+                .success()
+        );
+        return;
+    }
+    assert_eq!(
+        crate::set_destination_route("192.0.2.1".parse().unwrap(), None)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EINVAL)
+    );
+    assert!(crate::CONFIG.get().is_none() && crate::RUNTIME.get().is_none());
+}

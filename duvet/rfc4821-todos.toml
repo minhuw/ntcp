@@ -88,13 +88,6 @@ quote = '''
 Normal congestion control algorithms MUST remain in effect under all conditions except when only an isolated probe packet is detected as lost. In this case alone, the normal congestion (window or data rate) reduction SHOULD be suppressed. If any other data loss is detected, standard congestion control MUST take place.
 '''
 
-# 4821-071
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-4"
-reason = "Partial gap after 0030a96: independent per-connection creation initial_mtu and initial_search_high limits are implemented and validated, with independent initial_search_low and retained administrative high ceiling. No per-route policy service supplies the full per-protocol/per-route recommendation. Optional other-protocol heuristics/defaults do not require TCP to implement other protocols."
-quote = '''
-Implementations MAY use different heuristics to select the initial effective Path MTU for each protocol. Connectionless protocols and protocols that do not support PLPMTUD SHOULD have their own default value for the initial effective Path MTU, which can be set to a more conservative (smaller) value than the initial value used by TCP and other protocols that are well suited to PLPMTUD. There SHOULD be per-protocol and per-route limits on the initial effective Path MTU (eff_pmtu) and the upper searching limit (search_high). See Section 7.2 for further discussion.
-'''
 
 # 4821-076
 [[exception]]
@@ -219,7 +212,7 @@ In a few cases, there may be no reasonable mechanisms to generate probes within 
 # 4821-116
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
-reason = "Optional initial-value/search heuristics for other environments/protocols are not selected; interface-bound initial eff and binary explicit-probe search are used. Configuration SHOULD remains TODO."
+reason = "Optional initial-value/search heuristics for other environments/protocols are not selected; interface-bound initial eff and binary explicit-probe search are used. Destination configuration is exercised by destination_route_tests; protocol-specific heuristics beyond TCP are not claimed."
 quote = '''
 In some cases, where it is known that classical PMTUD is likely to fail (for example, if ICMP PTB messages are administratively disabled for security reasons), using a small initial eff_pmtu will avoid the costly timeouts required for black hole detection. The trade-off is that using a smaller than necessary initial eff_pmtu might cause reduced performance.
 '''
@@ -235,23 +228,16 @@ Note that the initial eff_pmtu can be any value in the range search_low to searc
 # 4821-118
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
-reason = "Optional initial-value/search heuristics for other environments/protocols are not selected; interface-bound initial eff and binary explicit-probe search are used. Configuration SHOULD remains TODO."
+reason = "Optional initial-value/search heuristics for other environments/protocols are not selected; interface-bound initial eff and binary explicit-probe search are used. Destination configuration is exercised by destination_route_tests; protocol-specific heuristics beyond TCP are not claimed."
 quote = '''
 Since the cost of PLPMTUD is dominated by the protocol specific overheads of generating and processing probes, it is probably desirable for each protocol to have its own heuristics to select the initial eff_pmtu. It is especially important that connectionless protocols and other protocols that may not receive clear indications of ICMP black holes use conservative (smaller) initial values for eff_pmtu, as described in Section 10.3.
 '''
 
-# 4821-119
-[[TODO]]
-target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
-reason = "Partial gap after 0030a96: PmtudConfig provides validated independent creation-only initial_mtu/initial_search_low/initial_search_high overrides. No per-route policy configuration/service exists; the per-connection API does not establish the complete per-protocol/per-route clause."
-quote = '''
-There SHOULD be per-protocol and per-route configuration options to override initial values for eff_pmtu and other PLPMTUD state variables.
-'''
 
 # 4821-121
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.3"
-reason = "Optional initial-value/search heuristics for other environments/protocols are not selected; interface-bound initial eff and binary explicit-probe search are used. Configuration SHOULD remains TODO."
+reason = "Optional initial-value/search heuristics for other environments/protocols are not selected; interface-bound initial eff and binary explicit-probe search are used. Destination configuration is exercised by destination_route_tests; protocol-specific heuristics beyond TCP are not claimed."
 quote = '''
 As an optimization, it may be appropriate to probe at certain common or expected MTU sizes, for example, 1500 bytes for standard Ethernet, or 1500 bytes minus header sizes for tunnel protocols.
 '''
@@ -259,7 +245,7 @@ As an optimization, it may be appropriate to probe at certain common or expected
 # 4821-122
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc4821#section-7.3"
-reason = "Optional initial-value/search heuristics for other environments/protocols are not selected; interface-bound initial eff and binary explicit-probe search are used. Configuration SHOULD remains TODO."
+reason = "Optional initial-value/search heuristics for other environments/protocols are not selected; interface-bound initial eff and binary explicit-probe search are used. Destination configuration is exercised by destination_route_tests; protocol-specific heuristics beyond TCP are not claimed."
 quote = '''
 Some protocols may use other mechanisms to choose the probe sizes. For example, protocols that have certain natural data block sizes might simply assemble messages from a number of blocks until the total size is smaller than search_high, and if possible larger than search_low.
 '''

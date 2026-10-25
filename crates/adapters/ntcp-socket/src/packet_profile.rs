@@ -45,6 +45,7 @@ pub struct UpstreamOptions {
     pub coalesce_read_window: bool,
     pub reno: bool,
     pub paced: bool,
+    pub no_gso: bool,
     pub receive64k: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +88,7 @@ impl Profile {
                     (options.coalesce_read_window, "coalesce-read-window"),
                     (options.reno, "reno"),
                     (options.paced, "paced"),
+                    (options.no_gso, "no-gso"),
                     (options.receive64k, "receive64k"),
                 ] {
                     if enabled {
@@ -173,6 +175,7 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
                 "coalesce-read-window" => &mut options.coalesce_read_window,
                 "reno" => &mut options.reno,
                 "paced" => &mut options.paced,
+                "no-gso" => &mut options.no_gso,
                 "receive64k" => &mut options.receive64k,
                 _ => return Err(unsupported("unknown so_flags token")),
             };
@@ -300,14 +303,16 @@ pub(crate) fn cookie_policy(profile: Profile) -> ntcp::FastOpenCookiePolicy {
     ntcp::FastOpenCookiePolicy::HmacSha256
 }
 pub(crate) fn gso(profile: Profile) -> Option<ntcp::GsoLimits> {
-    matches!(
-        profile,
-        Profile::PipelineGso | Profile::PipelinePacedGso | Profile::Upstream(_)
-    )
-    .then_some(ntcp::GsoLimits {
-        max_bytes: 65536,
-        max_segments: 16,
-    })
+    if matches!(profile, Profile::PipelineGso | Profile::PipelinePacedGso)
+        || matches!(profile, Profile::Upstream(o) if !o.no_gso)
+    {
+        Some(ntcp::GsoLimits {
+            max_bytes: 65536,
+            max_segments: 16,
+        })
+    } else {
+        None
+    }
 }
 // Injection admits only the ICMP feedback understood by production input_ip.
 // Keep parse_frame TCP-only: its callers consume the payload as TCP.
@@ -900,5 +905,27 @@ mod custom_cookie_key_tests {
             let synack = ntcp::wire::parse(output.ip, &bytes[..output.len]).unwrap();
             assert_eq!(synack.options.fast_open.unwrap().as_bytes(), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod no_gso_tests {
+    use super::*;
+    #[test]
+    fn explicit_scalar_backend_leaves_transport_policy_unchanged() {
+        let base = profile("upstream,local=192.0.2.1").unwrap().1;
+        let scalar = profile("upstream,local=192.0.2.1,no-gso").unwrap().1;
+        assert!(gso(base).is_some());
+        assert_eq!(gso(scalar), None);
+        assert_eq!(
+            format!("{:?}", config(base)),
+            format!("{:?}", config(scalar))
+        );
+        assert_eq!(
+            profile(&format!("{},local=192.0.2.1", scalar.flags()))
+                .unwrap()
+                .1,
+            scalar
+        );
     }
 }

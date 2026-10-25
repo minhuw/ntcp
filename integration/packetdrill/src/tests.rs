@@ -2043,3 +2043,103 @@ fn listener_assertion_control_uses_real_membership_at_requested_port() {
     assert_eq!(assertion(43210), -1);
     assert_eq!(errno(), ENOENT);
 }
+
+#[test]
+fn destination_route_command_is_canonical_and_bounded() {
+    let (destination, policy) =
+        route_command(b"ntcp-local-route-set 192.0.2.1 640 600 552").unwrap();
+    assert_eq!(destination, "192.0.2.1".parse::<Ipv4Addr>().unwrap());
+    assert_eq!(policy.unwrap().mtu, Some(640));
+    assert_eq!(
+        route_command(b"ntcp-local-route-remove 192.0.2.1")
+            .unwrap()
+            .1,
+        None
+    );
+    assert_eq!(
+        route_command(b"ntcp-local-route-set 192.0.2.1 - - -")
+            .unwrap()
+            .1,
+        Some(ntcp_socket::RoutePolicy::default())
+    );
+    for bad in [
+        "ntcp-local-route-set 192.0.2.1 640 600 552; true",
+        "ntcp-local-route-set 192.0.2.1 0640 600 552",
+        "ntcp-local-route-set 192.0.2.1 640 65536 552",
+        "ntcp-local-route-set 192.0.2.1 4294967296 600 552",
+        "ntcp-local-route-set 192.0.2.1 640 600",
+        "ntcp-local-route-set 192.0.2.1  640 600 552",
+        "ntcp-local-route-remove 192.0.2.1\n",
+        "ntcp-local-route-remove 192.0.2.1 trailing",
+        "ntcp-local-route-set ::1 640 600 552",
+    ] {
+        assert_eq!(route_command(bad.as_bytes()), Err(EOPNOTSUPP), "{bad}");
+    }
+}
+
+#[test]
+fn destination_route_control_and_native_api_share_actual_future_syn_policy() {
+    if isolated("tests::destination_route_control_and_native_api_share_actual_future_syn_policy") {
+        return;
+    }
+    let profile = ntcp_socket::packet_test::profile(&format!(
+        "upstream,local={},pmtud1500,budget128m,no-gso",
+        local()
+    ))
+    .unwrap()
+    .1;
+    let adapter = Adapter::start((local(), profile)).unwrap();
+    let control = |text: &str| {
+        let command = std::ffi::CString::new(text).unwrap();
+        unsafe { ntcp_packetdrill_control(USERDATA, command.as_ptr()) }
+    };
+    assert_eq!(control("ntcp-local-route-set 192.0.2.2 640 600 552"), 0);
+    let open = || {
+        let fd = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+            .unwrap()
+            .value as i32;
+        assert_eq!(
+            call(
+                &adapter,
+                5,
+                fd,
+                0,
+                encode_addr("192.0.2.2:8080".parse().unwrap()),
+                0
+            )
+            .err(),
+            Some(EINPROGRESS)
+        );
+        let b = call(&adapter, 15, 0, 0, vec![], 65535).unwrap().bytes;
+        ntcp::wire::parse(
+            ntcp::IpMetadata {
+                source: local().into(),
+                destination: "192.0.2.2".parse().unwrap(),
+            },
+            &b[20..],
+        )
+        .unwrap()
+        .options
+        .mss
+        .unwrap()
+    };
+    assert_eq!(open(), 600);
+    assert_eq!(
+        control("ntcp-local-route-set 192.0.2.2 1500 1460 552; false"),
+        -1
+    );
+    assert_eq!(errno(), EOPNOTSUPP);
+    ntcp_socket::set_destination_route(
+        "192.0.2.2".parse().unwrap(),
+        Some(ntcp_socket::RoutePolicy {
+            mtu: Some(1500),
+            advertised_mss: Some(1460),
+            initial_search_low: Some(552),
+            ..Default::default()
+        }),
+    )
+    .unwrap();
+    assert_eq!(open(), 1460);
+    assert_eq!(control("ntcp-local-route-remove 192.0.2.2"), 0);
+    assert_eq!(open(), 1460);
+}

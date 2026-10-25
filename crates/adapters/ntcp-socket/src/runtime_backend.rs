@@ -84,7 +84,12 @@ pub(super) fn backend_config(
         .connection
         .send_ip_payload_limit
         .min((ip_capacity - 20) as u16);
-    config.connection.pmtud = Some(ntcp::PmtudConfig::new(mtu));
+    let mut policy = config
+        .connection
+        .pmtud
+        .unwrap_or(ntcp::PmtudConfig::new(mtu));
+    policy.first_hop_mtu = mtu;
+    config.connection.pmtud = Some(policy);
     config.validate().map_err(engine)?;
     Ok(config)
 }
@@ -165,7 +170,7 @@ impl Owner {
             None,
             backend_config(config.tcp.clone(), &io)?,
         )?;
-        owner.apply_socket_config(config);
+        owner.apply_socket_config(config)?;
         owner.ethernet = Some(EthernetBackend {
             io: Box::new(io),
             local: hardware,

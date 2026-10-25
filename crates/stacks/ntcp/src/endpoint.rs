@@ -91,6 +91,7 @@ pub struct EndpointConfig {
     pub max_control_packets: usize,
     // Bounded FIFO of local/remote IP pairs with inferred initial/restart loss.
     pub max_setup_cache_entries: usize,
+    pub max_route_policies: usize,
     pub max_buffer_bytes: usize,
     pub hop_limit: u8,
     pub dscp: u8,
@@ -100,6 +101,7 @@ pub struct EndpointConfig {
 impl EndpointConfig {
     pub fn validate(&self) -> Result<(), EndpointError> {
         if !(1..=1_024).contains(&self.max_setup_cache_entries)
+            || self.max_route_policies > 1024
             || self.connection.advertised_mss == Some(0)
             || self.connection.pmtud.is_some_and(|p| p.first_hop_mtu < 68)
             || !self.connection.valid_timestamp_timebase()
@@ -163,6 +165,7 @@ impl Default for EndpointConfig {
             max_listeners: 64,
             max_control_packets: 64,
             max_setup_cache_entries: 64,
+            max_route_policies: 64,
             max_buffer_bytes: 256 * 1024 * 1024,
             hop_limit: 64,
             dscp: 0,
@@ -372,6 +375,7 @@ pub struct Endpoint {
     reservations: Vec<crate::output_reservation::OutputReservation>,
     address_policy: Box<dyn Fn(AddressValidation) -> bool>,
     config: EndpointConfig,
+    routes: Vec<(IpAddr, crate::RoutePolicy)>,
     secret: [u8; 32],
     now: Instant,
     isn_clock: u32,
@@ -490,6 +494,7 @@ impl Endpoint {
             deadlines: Deadlines::new(count).map_err(|_| Error::NoMemory)?,
             isn_clock: (now / config.connection.timebase.ticks_from_us(4)) as u32,
             config,
+            routes: Vec::new(),
             secret,
             setup_loss_cache,
             now,
@@ -507,6 +512,96 @@ impl Endpoint {
             per_connection_bytes,
             receive_pool,
         })
+    }
+
+    /// Resolved destination policy snapshot; no route lookup or clock mutation.
+    pub fn destination_route(&self, destination: IpAddr) -> Option<crate::RoutePolicy> {
+        self.routes
+            .iter()
+            .find(|(ip, _)| *ip == destination)
+            .map(|(_, policy)| *policy)
+    }
+
+    /// Update caller-owned same-path parameters for one destination. Creation
+    /// hints apply only to future active/passive children. A changed MTU ceiling
+    /// applies to all matching retained connections, atomically after preflight.
+    /// This is not an OS route table or a notification of a different path.
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-4
+    //= reason=TCP destination-policy creation parameters are selected before active/passive allocation; no shared IP cache or other-protocol implementation claim.
+    //# Implementations MAY use different heuristics to select the initial effective Path MTU for each protocol. Connectionless protocols and protocols that do not support PLPMTUD SHOULD have their own default value for the initial effective Path MTU, which can be set to a more conservative (smaller) value than the initial value used by TCP and other protocols that are well suited to PLPMTUD. There SHOULD be per-protocol and per-route limits on the initial effective Path MTU (eff_pmtu) and the upper searching limit (search_high). See Section 7.2 for further discussion.
+    //= https://www.rfc-editor.org/rfc/rfc4821#section-7.2
+    //= reason=TCP destination-policy creation parameters are selected before active/passive allocation; no shared IP cache or other-protocol implementation claim.
+    //# There SHOULD be per-protocol and per-route configuration options to override initial values for eff_pmtu and other PLPMTUD state variables.
+    pub fn set_destination_route(
+        &mut self,
+        now: Instant,
+        destination: IpAddr,
+        policy: Option<crate::RoutePolicy>,
+    ) -> Result<(), EndpointError> {
+        self.check_clock(now)?;
+        if !valid_address(destination) {
+            return Err(EndpointError::InvalidAddress);
+        }
+        if let Some(policy) = policy {
+            policy.validate(&self.config.connection, destination.is_ipv4())?;
+        }
+        let index = self.routes.iter().position(|(ip, _)| *ip == destination);
+        if policy.is_some()
+            && index.is_none()
+            && self.routes.len() == self.config.max_route_policies
+        {
+            return Err(EndpointError::LimitReached);
+        }
+        let old = self
+            .destination_route(destination)
+            .unwrap_or_default()
+            .route_mtu(&self.config.connection);
+        let new = policy
+            .unwrap_or_default()
+            .route_mtu(&self.config.connection);
+        if old != new {
+            for (index, slot) in self
+                .slots
+                .iter()
+                .enumerate()
+                .filter_map(|(index, slot)| slot.as_ref().map(|s| (index, s)))
+            {
+                if slot.connection.tuple().remote.ip() == destination {
+                    if self.is_output_reserved(self.id(index)) {
+                        return Err(EndpointError::OutputReserved);
+                    }
+                    slot.connection.validate_route_mtu(now, new)?;
+                }
+            }
+        }
+        if policy.is_some() && index.is_none() {
+            self.routes.try_reserve(1).map_err(|_| Error::NoMemory)?;
+        }
+        self.clock(now)?;
+        if old != new {
+            for i in 0..self.slots.len() {
+                if self.slots[i]
+                    .as_ref()
+                    .is_some_and(|s| s.connection.tuple().remote.ip() == destination)
+                {
+                    self.slots[i]
+                        .as_mut()
+                        .unwrap()
+                        .connection
+                        .set_route_mtu(now, new)?;
+                    self.refresh(i);
+                }
+            }
+        }
+        match (index, policy) {
+            (Some(i), Some(policy)) => self.routes[i].1 = policy,
+            (None, Some(policy)) => self.routes.push((destination, policy)),
+            (Some(i), None) => {
+                self.routes.swap_remove(i);
+            }
+            (None, None) => (),
+        }
+        Ok(())
     }
 
     fn valid_route(&self, source: IpAddr, destination: IpAddr, hop: IpAddr) -> bool {
@@ -967,7 +1062,6 @@ impl Endpoint {
         // drop it while returning pooled storage through the existing path.
         let mut rx_timestamps = RxTimestamps::default();
         rx_timestamps.resize(rx_ranges, available - charge)?;
-        let mut receive = pool_index.map(|index| self.receive_pool.swap_remove(index));
         let mut connection_config = self.config.connection.clone();
         connection_config.timestamps = self.new_connection_timestamps();
         connection_config.send_capacity = capacities.0;
@@ -988,6 +1082,10 @@ impl Endpoint {
         {
             connection_config.initial_window = crate::InitialWindow::Rfc5681;
         }
+        if let Some(route) = self.destination_route(tuple.remote.ip()) {
+            route.apply(&mut connection_config)?;
+        }
+        let mut receive = pool_index.map(|index| self.receive_pool.swap_remove(index));
         // Apply the same policy to ordinary passive opens and TIME-WAIT reuse.
         let mut fast_open_response = None;
         let mut early = false;
@@ -4190,9 +4288,13 @@ impl Endpoint {
                         }
                         _ => 40,
                     };
+                    let route_mtu = self
+                        .destination_route(ip.destination)
+                        .and_then(|route| route.mtu);
                     let mtu = policy
                         .first_hop_mtu
-                        .min(policy.route_mtu.unwrap_or(u32::MAX));
+                        .min(policy.route_mtu.unwrap_or(u32::MAX))
+                        .min(route_mtu.unwrap_or(u32::MAX));
                     let budget = mtu.saturating_sub(ip_len);
                     if budget < 20 {
                         // Stateless replies cannot fragment or drop a required source route.

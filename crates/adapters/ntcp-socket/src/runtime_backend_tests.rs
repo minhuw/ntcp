@@ -2499,3 +2499,25 @@ fn software_gso_cpu_sample() {
 mod local_repair {
     include!("runtime_local_repair_tests.rs");
 }
+
+#[test]
+fn backend_first_hop_refresh_preserves_configured_path_policy() {
+    let state = Arc::new(Mutex::new(State {
+        mtu: Some(1500),
+        ..Default::default()
+    }));
+    let io = Fixture(state.clone());
+    let mut config = SocketConfig::new("test", Ipv4Addr::new(10, 73, 0, 2)).tcp;
+    let mut policy = ntcp::PmtudConfig::new(9000);
+    policy.route_mtu = Some(1400);
+    policy.initial_mtu = Some(1300);
+    policy.initial_search_low = Some(1280);
+    policy.initial_search_high = Some(1400);
+    policy.policy.search_aging = ntcp::SearchAging::Infinity;
+    config.connection.pmtud = Some(policy);
+    let actual = backend_config(config.clone(), &io).unwrap();
+    policy.first_hop_mtu = 1500;
+    assert_eq!(actual.connection.pmtud, Some(policy));
+    state.lock().unwrap().mtu = Some(1280);
+    assert!(backend_config(config, &io).is_err());
+}

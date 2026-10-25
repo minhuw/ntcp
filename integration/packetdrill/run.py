@@ -325,6 +325,12 @@ for _name in CUSTOM_TFO_SOURCES:
 UPSTREAM_OPTION_AUDIT['fastopen/server/opt34/simple3.pkt']['early-response'] = 'Original script writes15000 bytes before the final handshake ACK; enable existing authenticated early response without changing window or grouping policy.'
 
 
+UPSTREAM_OPTION_AUDIT['mtu_probe/basic-v4.pkt'] = {
+    'pmtud1500': 'Actual1500-byte local interface bound; destination route cap and search-low are independently configured through the shared owner API.',
+    'no-gso': 'Original disables GSO/TSO and uses strict segment checking; disable software aggregation, retaining individual wire packets.',
+}
+
+
 def upstream_flags(relative):
     local = CUSTOM_TFO_SOURCES[relative][1] if relative in CUSTOM_TFO_SOURCES else '192.168.0.1'
     return "upstream,local=" + local + "".join("," + token for token in sorted(UPSTREAM_OPTION_AUDIT.get(relative, {})))
@@ -426,6 +432,23 @@ LISTENER_ASSERT_EVENT = b'   +0 `grep " 0A " /proc/net/tcp /proc/net/tcp6 | grep
 LISTENER_ASSERT_CONTROL = b'   +0 `ntcp-local-assert-listener 8080`\n'
 
 
+ROUTE_SCRIPT = 'mtu_probe/basic-v4.pkt'
+ROUTE_SOURCE_SHA256 = '0a1d1b8575030cd7db5ad33e0eac66d46863a448f251472ffac38243edc431d0'
+ROUTE_SETUP = b'`../common/defaults.sh\n ../common/set_sysctls.py \\\n\t/proc/sys/net/ipv4/tcp_mtu_probing=2 \\\n\t/proc/sys/net/ipv4/tcp_base_mss=512\n ip route change 192.0.2.1 via 192.168.0.2 dev tun0 advmss 600 mtu lock 640 initcwnd 11\n ethtool -K tun0 gso off tso off\n`\n'
+ROUTE_INITIAL = b'0 `ntcp-local-route-set 192.0.2.1 640 600 552`\n\n\n\n\n\n\n'
+ROUTE_EVENT = b'   +0 `ip route change 192.0.2.1 via 192.168.0.2 dev tun0 advmss 1460 mtu lock 1500`\n'
+ROUTE_CONTROL = b'   +0 `ntcp-local-route-set 192.0.2.1 1500 1460 552`\n'
+ROUTE_RESTORE = b'`/tmp/sysctl_restore_${PPID}.sh`\n'
+ROUTE_RESTORED = b'// ntcp destination routes are local to this runtime.\n'
+ROUTE_MAPPING = {
+    'destination': '192.0.2.1', 'initial_mtu_cap': 640, 'initial_advertised_mss': 600,
+    'initial_search_low': 552, 'updated_mtu_cap': 1500, 'future_advertised_mss': 1460,
+    'initial_window': 'Common RFC6928 IW10; byte/window/queued-tail admission already permits this probe, without Linux-specific cwnd>=11 gate.',
+    'scope': 'Runtime-owned destination transport policy; synthetic packet context does not configure host gateway/device. Strict scalar capture, no offload.',
+    'locked_route': 'Administrative MTU ceiling; ordinary validated ICMP and DF policy retained. No claim of Linux route locking/discovery-disable equivalence.',
+}
+
+
 TCP_INFO_FIELDS = {'tcpi_state', 'tcpi_ca_state', 'tcpi_probes', 'tcpi_backoff', 'tcpi_unacked', 'tcpi_sacked',
                    'tcpi_lost', 'tcpi_retrans', 'tcpi_reordering',
                    'tcpi_snd_cwnd', 'tcpi_snd_ssthresh', 'tcpi_rtt', 'tcpi_min_rtt', 'tcpi_reord_seen',
@@ -504,7 +527,7 @@ def runner_provenance(runner):
     return provenance
 
 
-def preflight(text, embedded_tcp_info=False, resource_control=False, timestamp_control=False, cache_flush_control=False, tfo_permission_control=False, listener_assertion_control=False):
+def preflight(text, embedded_tcp_info=False, resource_control=False, timestamp_control=False, cache_flush_control=False, tfo_permission_control=False, listener_assertion_control=False, route_control=False):
     # Conservative safety/capability screening, NOT a second packetdrill parser.
     # Upstream --dry_run remains the authority for script syntax.
     # Inspect raw text conservatively, including comments: do not accidentally
@@ -525,6 +548,9 @@ def preflight(text, embedded_tcp_info=False, resource_control=False, timestamp_c
                 break
     if listener_assertion_control and text.count(LISTENER_ASSERT_CONTROL.decode()) == 1:
         shell_text = shell_text.replace(LISTENER_ASSERT_CONTROL.decode(), '', 1)
+    if route_control and all(shell_text.count(c.decode()) == 1 for c in (ROUTE_INITIAL, ROUTE_CONTROL)):
+        for command in (ROUTE_INITIAL, ROUTE_CONTROL):
+            shell_text = shell_text.replace(command.decode(), '', 1)
     if '`' in shell_text:
         reasons.append('shell setup/assertions target Linux, not the ntcp backend')
     if '%{' in text or '}%' in text:
@@ -573,6 +599,31 @@ def adapt_source(directory, relative, manifest, so_flags):
         data = (directory / extra['path']).read_bytes()
         if hashlib.sha256(data).hexdigest() != extra['sha256']:
             raise ValueError(f"setup {extra['path']} hash differs from audited adaptation")
+    if relative == ROUTE_SCRIPT and not entry.get('blocked_reasons'):
+        commands = [ROUTE_SETUP.rstrip(b'\n'), ROUTE_EVENT[ROUTE_EVENT.index(b'`'):].rstrip(b'\n'), ROUTE_RESTORE.rstrip(b'\n')]
+        if (hashlib.sha256(source).hexdigest() != ROUTE_SOURCE_SHA256
+                or entry['command_line'].encode() != ROUTE_SETUP
+                or entry['replacement_line'].encode() != ROUTE_INITIAL
+                or entry.get('command_sha256') != hashlib.sha256(ROUTE_SETUP).hexdigest()
+                or entry.get('expected_command_count') != 3
+                or re.findall(rb'`[^`]*`', source) != commands
+                or [(c['command'], c['sha256']) for c in entry.get('audited_shell_commands', [])]
+                    != [(c.decode(), hashlib.sha256(c).hexdigest()) for c in commands]
+                or entry.get('route_control') is not True
+                or entry.get('route_event_sha256') != hashlib.sha256(ROUTE_EVENT).hexdigest()
+                or entry['mapping'].get('destination_route') != ROUTE_MAPPING
+                or entry.get('restore_line', '').encode() != ROUTE_RESTORE
+                or entry.get('restore_sha256') != hashlib.sha256(ROUTE_RESTORE).hexdigest()
+                or entry.get('restore_replacement_line', '').encode() != ROUTE_RESTORED
+                or entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
+                or not any(extra['path'] == 'common/set_sysctls.py' for extra in entry.get('additional_setup_files', []))
+                or source.count(ROUTE_EVENT) != 1):
+            raise ValueError('expected exact audited route setup and timed command')
+        generated = source.replace(ROUTE_SETUP, ROUTE_INITIAL, 1).replace(ROUTE_EVENT, ROUTE_CONTROL, 1).replace(ROUTE_RESTORE, ROUTE_RESTORED, 1)
+        reasons = preflight(generated.decode(), route_control=True)
+        if reasons:
+            raise ValueError('; '.join(reasons))
+        return generated, {**entry, 'generated_sha256': hashlib.sha256(generated).hexdigest()}
     if relative == LISTENER_ASSERT_SCRIPT and not entry.get('blocked_reasons'):
         expected_commands = [LISTENER_ASSERT_SETUP.rstrip(b'\n'),
                              LISTENER_ASSERT_EVENT[LISTENER_ASSERT_EVENT.index(b'`'):].rstrip(b'\n')]
@@ -730,7 +781,7 @@ def adapt_source(directory, relative, manifest, so_flags):
             raise ValueError('expected exact audited custom TFO key source and addresses')
     if LINUX_COOKIE_OPTION in so_flags.split(',') and relative not in LINUX_COOKIE_SCRIPTS | CUSTOM_TFO_SOURCES.keys():
         raise ValueError('Linux cookie setup is limited to audited explicit listeners')
-    if FASTOPEN_PMTUD_OPTION in so_flags.split(',') and relative not in FASTOPEN_PMTUD_SCRIPTS:
+    if FASTOPEN_PMTUD_OPTION in so_flags.split(',') and relative not in FASTOPEN_PMTUD_SCRIPTS | {ROUTE_SCRIPT}:
         raise ValueError('Fast Open PMTUD setup is limited to two audited ICMP cases')
     if ADAPTIVE_ACK_OPTION in so_flags.split(',') and relative not in ADAPTIVE_ACK_SCRIPTS:
         raise ValueError('Adaptive ACK setup is limited to three audited blocking clients')
@@ -949,7 +1000,7 @@ UPSTREAM_OPTIONS = {
     'no-timestamps', 'ecn', 'adaptive-ack', 'lowat4000', 'linux-cookie', 'pmtud1500',
     'budget128m', 'budget224m', 'prealloc3', 'prealloc4', 'immediate-ack', 'peer-ack-delay200ms',
     'abort-with-ack', 'coalesce-read-window',
-    'reno', 'paced', 'receive64k', 'tfo-listen', 'early-response',
+    'reno', 'paced', 'receive64k', 'tfo-listen', 'early-response', 'no-gso',
 }
 
 
@@ -984,7 +1035,7 @@ def profile_metadata(so_flags):
         'transmit_batch_clock': 'monotonic sample per selection/accept',
         'egress_pipeline': 'shared production scheduler',
         'general_pacing': ('paced' in options if upstream else profile in {'pipeline-paced', 'pipeline-paced-gso'}),
-        'software_gso': upstream or profile in {'pipeline-gso', 'pipeline-paced-gso'},
+        'software_gso': (upstream and 'no-gso' not in options) or profile in {'pipeline-gso', 'pipeline-paced-gso'},
         'capture_boundary': 'individual raw IPv4 TCP wire segments',
         'capture_clock': 'realtime epoch microseconds at backend submission',
         'hardware_tso': False, 'gro': False,
@@ -1187,7 +1238,8 @@ def main():
                                         timestamp_control=(row['adapted'] and row['adaptation'].get('timestamp_control') is True),
                                         cache_flush_control=(row['adapted'] and row['adaptation'].get('cache_flush_control') is True),
                                         tfo_permission_control=(row['adapted'] and row['adaptation'].get('tfo_permission_control') is True),
-                                        listener_assertion_control=(row['adapted'] and row['adaptation'].get('listener_assertion_control') is True))
+                                        listener_assertion_control=(row['adapted'] and row['adaptation'].get('listener_assertion_control') is True),
+                                        route_control=(row['adapted'] and row['adaptation'].get('route_control') is True))
                     if variant not in ('native-ipv4', 'ipv4'):
                         reasons.append('the adapter implements IPv4 only')
                     if reasons:

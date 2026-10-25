@@ -563,9 +563,13 @@
       "id": "4821-071",
       "section": "4",
       "quote": "Implementations MAY use different heuristics to select the initial effective Path MTU for each protocol. Connectionless protocols and protocols that do not support PLPMTUD SHOULD have their own default value for the initial effective Path MTU, which can be set to a more conservative (smaller) value than the initial value used by TCP and other protocols that are well suited to PLPMTUD. There SHOULD be per-protocol and per-route limits on the initial effective Path MTU (eff_pmtu) and the upper searching limit (search_high). See Section 7.2 for further discussion.",
-      "status": "TODO",
-      "reason": "Partial gap after 0030a96: independent per-connection creation initial_mtu and initial_search_high limits are implemented and validated, with independent initial_search_low and retained administrative high ceiling. No per-route policy service supplies the full per-protocol/per-route recommendation. Optional other-protocol heuristics/defaults do not require TCP to implement other protocols.",
-      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4"
+      "status": "covered",
+      "reason": "TCP destination-policy configuration selects independent initial_mtu/initial_search_low/initial_search_high and receive MSS from the actual peer before active/passive construction, with protocol defaults for unmatched peers and transactional updates. IPv4/IPv6 and native parser/IO preservation are exercised. Other-protocol defaults are outside this TCP actor; IP shared-cache and new-path integration are not claimed.",
+      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-4",
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::pub fn set_destination_route",
+        "crates/stacks/ntcp/src/destination_route_tests.rs::fn destination_initial_effective_and_search_bounds_are_independent"
+      ]
     },
     {
       "id": "4821-072",
@@ -934,7 +938,7 @@
       "section": "7.2",
       "quote": "It is RECOMMENDED that search_low be initially set to an MTU size that is likely to work over a very wide range of environments. Given today's technologies, a value of 1024 bytes is probably safe enough. The initial value for search_low SHOULD be configurable.",
       "status": "covered",
-      "reason": "Reviewed 0030a96: independent creation-only initial_search_low is validated with initial_mtu/initial_search_high, family and allocation bounds. Defaults remain conservative IPv4 min(mtu,1024) and IPv6 min(mtu,1280); dual-family tests assert defaults, independent overrides, rejection rather than silent clamping, and subsequent peer caps. Per-route policy remains open at 071/119.",
+      "reason": "Reviewed 0030a96: independent creation-only initial_search_low is validated with initial_mtu/initial_search_high, family and allocation bounds. Defaults remain conservative IPv4 min(mtu,1024) and IPv6 min(mtu,1280); dual-family tests assert defaults, independent overrides, rejection rather than silent clamping, and subsequent peer caps. Destination policy configuration is independently covered at071/119.",
       "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.2",
       "evidence": [
         "crates/stacks/ntcp/src/pmtud_config.rs::    pub(crate) fn initial_values(",
@@ -983,9 +987,13 @@
       "id": "4821-119",
       "section": "7.2",
       "quote": "There SHOULD be per-protocol and per-route configuration options to override initial values for eff_pmtu and other PLPMTUD state variables.",
-      "status": "TODO",
-      "reason": "Partial gap after 0030a96: PmtudConfig provides validated independent creation-only initial_mtu/initial_search_low/initial_search_high overrides. No per-route policy configuration/service exists; the per-connection API does not establish the complete per-protocol/per-route clause.",
-      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.2"
+      "status": "covered",
+      "reason": "TCP destination-policy configuration selects independent initial_mtu/initial_search_low/initial_search_high and receive MSS from the actual peer before active/passive construction, with protocol defaults for unmatched peers and transactional updates. IPv4/IPv6 and native parser/IO preservation are exercised. Other-protocol defaults are outside this TCP actor; IP shared-cache and new-path integration are not claimed.",
+      "target": "https://www.rfc-editor.org/rfc/rfc4821#section-7.2",
+      "evidence": [
+        "crates/stacks/ntcp/src/endpoint.rs::pub fn set_destination_route",
+        "crates/stacks/ntcp/src/destination_route_tests.rs::fn destination_initial_effective_and_search_bounds_are_independent"
+      ]
     },
     {
       "id": "4821-120",

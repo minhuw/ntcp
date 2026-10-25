@@ -180,11 +180,11 @@ class SetupProfiles(unittest.TestCase):
 
     def test_fastopen_pmtud_only_two_exact_setup_mappings(self):
         from run import (FASTOPEN_PMTUD_OPTION, FASTOPEN_PMTUD_SCRIPTS,
-                         FASTOPEN_PMTUD_SETTINGS, preflight)
+                         FASTOPEN_PMTUD_SETTINGS, ROUTE_SCRIPT, preflight)
         manifest = json.loads((HERE / 'adaptations.json').read_text())
         self.assertEqual({name for name, entry in manifest['scripts'].items()
                           if FASTOPEN_PMTUD_OPTION in entry['adapter_flags'].split(',')},
-                         FASTOPEN_PMTUD_SCRIPTS)
+                         FASTOPEN_PMTUD_SCRIPTS | {ROUTE_SCRIPT})
         self.assertEqual(len(FASTOPEN_PMTUD_SCRIPTS), 2)
         directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
         if not directory.is_dir():
