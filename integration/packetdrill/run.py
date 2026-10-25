@@ -31,6 +31,25 @@ LINUX_COOKIE_SCRIPTS = {
     'fastopen/server/opt34/' + name + '.pkt'
     for name in ('fin-close-socket', 'reset-after-accept', 'reset-before-accept')} | IMPLICIT_TFO_LISTENER_SCRIPTS | {
     'fastopen/server/client-ack-dropped-then-recovery-ms-timestamps.pkt'}
+def linux_key_words(text):
+    # sysctl parses four hex u32 words, then cpu_to_le32; socket keys are raw.
+    if re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{8}){3}', text) is None:
+        raise ValueError('invalid Linux TFO sysctl key words')
+    return b''.join(int(word, 16).to_bytes(4, 'little') for word in text.split('-')).hex()
+
+
+CUSTOM_TFO_KEY_WORDS = 'a0bf63f7-ed803d81-cd641d30-cebc4a90'
+CUSTOM_TFO_KEY_OPTION = 'tfo-key=' + linux_key_words(CUSTOM_TFO_KEY_WORDS)
+CUSTOM_TFO_SETUP = (b'`../../../common/defaults.sh\nsysctl -q \\\n'
+                    b'  net.ipv4.tcp_fastopen=0x30403 \\\n'
+                    b'  net.ipv4.tcp_fastopen_key=' + CUSTOM_TFO_KEY_WORDS.encode() + b'`\n')
+CUSTOM_TFO_SOURCES = {
+    'fastopen/server/opt34/simple1.pkt': ('9e45042fd5b0a54e9945c29b1e68a56a371f269fc65764def26b7b1eef55fb97', '192.168.0.2', '10.248.0.2'),
+    'fastopen/server/opt34/simple2.pkt': ('0f9820906d0cd370315843bf0dd906756b05cb22f98d6531a9523f3178844e49', '192.168.0.2', '10.248.0.3'),
+    'fastopen/server/opt34/simple3.pkt': ('56c755f8291fe24914faa31fbf1187bfbef16257bb51a418a108c0f8c4fb226f', '192.168.0.3', '10.248.0.3'),
+}
+
+
 LINUX_COOKIE_SETTINGS = {
     'fast_open_client_default': False, 'fast_open_listener_default': False,
     'fast_open_cache': 'fresh runtime', 'fast_open_cookie_policy': 'linux-siphash24',
@@ -295,8 +314,20 @@ UPSTREAM_OPTION_AUDIT['fastopen/client/syn-data-only-syn-acked.pkt'].pop('preall
 UPSTREAM_OPTION_AUDIT['fastopen/client/syn-data-only-syn-acked.pkt']['prealloc4'] = 'The unchanged source creates four distinct client connections including retained warmup/TIME_WAIT storage; pre-touch four charged pools within budget224m before timed events.'
 
 
+for _name in CUSTOM_TFO_SOURCES:
+    UPSTREAM_OPTION_AUDIT[_name] = {
+        'linux-cookie': 'Original custom master key and kind34 cookies use the existing feature-gated Linux SipHash policy.',
+        CUSTOM_TFO_KEY_OPTION: 'Exact four sysctl hex words become16 raw key bytes, little-endian per word, before listener creation; reused listeners inherit the endpoint policy.',
+        'tfo-listen': 'Exact tcp_fastopen=0x30403 includes implicit server listener enablement; use existing bounded authenticated listener machinery. No FOEXP or cookieless behavior is enabled.',
+        'budget128m': 'The first accepted child retains TIME_WAIT storage while a new listener admits the second child; bounded128MiB budget preserves per-socket accounting.',
+        'prealloc3': 'Pre-touch three charged connection pools before timed events; no unbounded allocation or timing tolerance changes.',
+    }
+UPSTREAM_OPTION_AUDIT['fastopen/server/opt34/simple3.pkt']['early-response'] = 'Original script writes15000 bytes before the final handshake ACK; enable existing authenticated early response without changing window or grouping policy.'
+
+
 def upstream_flags(relative):
-    return "upstream,local=192.168.0.1" + "".join("," + token for token in sorted(UPSTREAM_OPTION_AUDIT.get(relative, {})))
+    local = CUSTOM_TFO_SOURCES[relative][1] if relative in CUSTOM_TFO_SOURCES else '192.168.0.1'
+    return "upstream,local=" + local + "".join("," + token for token in sorted(UPSTREAM_OPTION_AUDIT.get(relative, {})))
 
 
 SENDFILE_FIXTURE = 'sendfile-five-zero-bytes'
@@ -688,7 +719,16 @@ def adapt_source(directory, relative, manifest, so_flags):
         setup_commands[name] = (b'`../../../common/defaults.sh`\n'
                                 if name.startswith('fastopen/server/opt34/')
                                 else b'`../../common/defaults.sh`\n')
-    if LINUX_COOKIE_OPTION in so_flags.split(',') and relative not in LINUX_COOKIE_SCRIPTS:
+    for name in CUSTOM_TFO_SOURCES:
+        setup_commands[name] = CUSTOM_TFO_SETUP
+    if relative in CUSTOM_TFO_SOURCES:
+        digest, local, remote = CUSTOM_TFO_SOURCES[relative]
+        if (hashlib.sha256(source).hexdigest() != digest
+                or re.findall(rb'^--(?:local|remote)_ip=.*$', source, re.M)
+                    != [f'--local_ip={local}'.encode(), f'--remote_ip={remote}'.encode()]
+                or entry['mapping'].get('packetdrill_addresses') != {'local': local, 'remote': remote}):
+            raise ValueError('expected exact audited custom TFO key source and addresses')
+    if LINUX_COOKIE_OPTION in so_flags.split(',') and relative not in LINUX_COOKIE_SCRIPTS | CUSTOM_TFO_SOURCES.keys():
         raise ValueError('Linux cookie setup is limited to audited explicit listeners')
     if FASTOPEN_PMTUD_OPTION in so_flags.split(',') and relative not in FASTOPEN_PMTUD_SCRIPTS:
         raise ValueError('Fast Open PMTUD setup is limited to two audited ICMP cases')
@@ -716,7 +756,7 @@ def adapt_source(directory, relative, manifest, so_flags):
         if (relative in FASTOPEN_PMTUD_SCRIPTS | ADAPTIVE_ACK_SCRIPTS | FASTOPEN_CLIENT_SCRIPTS | SLOW_START_ACK_SCRIPTS
                 or relative in NON_TFO_SETUP_COMMANDS and expected.count(b'\n') == 2):
             expected_replacement += b'\n'  # Keep the audited two-line setup's line numbers.
-        if relative in SYN_DATA_ACK_SCRIPTS:
+        if relative in SYN_DATA_ACK_SCRIPTS | CUSTOM_TFO_SOURCES.keys():
             expected_replacement += b'\n' * (expected.count(b'\n') - 1)
         if (command != expected or so_flags != upstream_flags(relative)
                 or entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
@@ -891,6 +931,11 @@ def select_cases(scripts, directory, suite, selected_variants=None, selected_scr
                     exclusion['ported_to'] = 'ntcp-ported'
                 excluded.append(exclusion)
             else:
+                if suite == 'upstream' and variant == 'ipv4' and relative in CUSTOM_TFO_SOURCES:
+                    _, local, remote = CUSTOM_TFO_SOURCES[relative]
+                    flags = [f'--local_ip={local}' if token.startswith('--local_ip=')
+                             else f'--remote_ip={remote}' if token.startswith('--remote_ip=')
+                             else token for token in flags]
                 selected.append((script, variant, flags))
     if not selected and not any(PORTED_EXCLUSION in row['reasons'] for row in excluded):
         raise ValueError('selection matches no eligible packetdrill cases')
@@ -921,8 +966,12 @@ def profile_metadata(so_flags):
         valid_local = len(local) == 1 and isinstance(ipaddress.ip_address(local[0]), ipaddress.IPv4Address)
     except ValueError:
         valid_local = False
-    known = (valid_local and profile is not None and len(tokens) == len(set(tokens))
-             and (not options or profile == 'upstream' and options <= UPSTREAM_OPTIONS)
+    keys = [token[8:] for token in policies if token.startswith('tfo-key=')]
+    key_tokens = {token for token in options if token.startswith('tfo-key=')}
+    valid_key = (not keys or len(keys) == 1 and re.fullmatch(r'[0-9a-f]{32}', keys[0]) is not None
+                 and 'linux-cookie' in options)
+    known = (valid_local and valid_key and profile is not None and len(tokens) == len(set(tokens))
+             and (not options or profile == 'upstream' and options - key_tokens <= UPSTREAM_OPTIONS)
              and not {'budget128m', 'budget224m'} <= options
              and not {'immediate-ack', 'adaptive-ack'} <= options
              and not {'prealloc3', 'prealloc4'} <= options)
@@ -966,6 +1015,8 @@ def profile_metadata(so_flags):
             pacing_config={'rate_gain_percent': 125, 'max_bytes_per_second': None, 'max_burst_segments': 2} if 'paced' in options else None)
         if 'linux-cookie' in options:
             metadata.update(LINUX_COOKIE_SETTINGS)
+            if keys:
+                metadata['fast_open_key_hex'] = keys[0]
         if 'tfo-listen' in options:
             metadata.update(fast_open_listener_default=True,
                             implicit_listener_enablement=True,

@@ -508,6 +508,9 @@ class AdaptationChecks(unittest.TestCase):
         self.manifest['scripts'].pop(RESOURCE_SCRIPT)
         self.manifest['scripts'].pop(CACHE_FLUSH_SCRIPT)
         self.manifest['scripts'].pop(LISTENER_ASSERT_SCRIPT)
+        from run import CUSTOM_TFO_SOURCES
+        for name in CUSTOM_TFO_SOURCES:
+            self.manifest['scripts'].pop(name)
         for name in TFO_PERMISSION_SOURCES:
             self.manifest['scripts'].pop(name)
         for name in TIMESTAMP_SOURCES:
@@ -875,6 +878,9 @@ class AdaptationChecks(unittest.TestCase):
                    if 'budget128m' in entry['mapping']['option_reasons']}
         retained = reasons.pop('zerocopy/fastopen-client.pkt')
         self.assertIn('Two client connections retain', retained)
+        from run import CUSTOM_TFO_SOURCES
+        for name in CUSTOM_TFO_SOURCES:
+            self.assertIn('TIME_WAIT storage', reasons.pop(name))
         self.assertEqual(len(reasons), 6)
         self.assertTrue(all('SO_SNDBUF=200000' in reason and 'staged' in reason for reason in reasons.values()))
         for entry in manifest['scripts'].values():

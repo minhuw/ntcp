@@ -10805,19 +10805,17 @@
       "command_line": "`../../../common/defaults.sh\nsysctl -q \\\n  net.ipv4.tcp_fastopen=0x30403 \\\n  net.ipv4.tcp_fastopen_key=a0bf63f7-ed803d81-cd641d30-cebc4a90`\n",
       "command_sha256": "32671c8fb5c90802c129b1be5b90bf58dca599ea23f986868fc1fee9f8932db5",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n\n\n",
-      "adapter_flags": "upstream,local=192.168.0.1",
+      "adapter_flags": "upstream,local=192.168.0.2,budget128m,linux-cookie,prealloc3,tfo-key=f763bfa0813d80ed301d64cd904abcce,tfo-listen",
       "embedded_tcp_info": false,
       "inventory_audit": {
         "source_family": "fastopen",
-        "blocked_capabilities": [
-          "implicit"
-        ]
+        "blocked_capabilities": []
       },
       "audited_shell_commands": [
         {
           "command": "`../../../common/defaults.sh\nsysctl -q \\\n  net.ipv4.tcp_fastopen=0x30403 \\\n  net.ipv4.tcp_fastopen_key=a0bf63f7-ed803d81-cd641d30-cebc4a90`",
           "sha256": "db7797df678de08ae45e1fb7c4b736d75db88d3775ed0288022927c0dc14f21f",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script requires implicit Fast Open listener enablement and a non-default master key/address setup; the existing defaults-key option does not map this exact setup."
+          "semantic_mapping": "Process-local common baseline with custom raw default cookie key and implicit authenticated TFO listener. Exact word-to-little-endian key conversion and original addresses; no host sysctl or shell execution. Original non-setup bytes unchanged."
         }
       ],
       "mapping": {
@@ -10833,7 +10831,13 @@
           "capture_clock": "realtime epoch microseconds at backend submission",
           "hardware_tso": false,
           "gro": false,
-          "options": [],
+          "options": [
+            "budget128m",
+            "linux-cookie",
+            "prealloc3",
+            "tfo-key=f763bfa0813d80ed301d64cd904abcce",
+            "tfo-listen"
+          ],
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -10844,12 +10848,12 @@
           "tlp": true,
           "tlp_timer_margin_us": 2000,
           "rto_min_us": 200000,
-          "preallocate_connections": 1,
+          "preallocate_connections": 3,
           "ecn": false,
           "mss": 1460,
           "receive_capacity": 8388608,
           "window_scale": 8,
-          "endpoint_max_buffer_bytes": 33554432,
+          "endpoint_max_buffer_bytes": 134217728,
           "congestion_control": "Cubic",
           "cubic_hystart": true,
           "cubic_fast_convergence": true,
@@ -10863,23 +10867,43 @@
           "global_notsent_lowat": 4294967295,
           "socket_notsent_lowat": 0,
           "fast_open_client_default": false,
-          "fast_open_listener_default": false,
+          "fast_open_listener_default": true,
           "fast_open_cache": "fresh runtime",
-          "fast_open_cookie_policy": "hmac-sha256",
-          "pacing_config": null
+          "fast_open_cookie_policy": "linux-siphash24",
+          "pacing_config": null,
+          "fast_open_key_hex": "f763bfa0813d80ed301d64cd904abcce",
+          "fast_open_cookie_input": "remote address bytes + local address bytes",
+          "fast_open_cookie_epoch": false,
+          "fast_open_option_kind": 34,
+          "required_feature": "tfo-linux-cookie",
+          "implicit_listener_enablement": true,
+          "cookieless": false,
+          "foexp": false,
+          "fast_open_listener_limit": 128
         },
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
-        "claim": "Capability audit only; source is retained and not executed.",
+        "claim": "Setup-only mapping; behavioral mismatches remain failures.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "The script requires implicit Fast Open listener enablement and a non-default master key/address setup; the existing defaults-key option does not map this exact setup."
+          "Original custom master key and kind34 cookies use the existing feature-gated Linux SipHash policy.",
+          "Exact four sysctl hex words become16 raw key bytes, little-endian per word, before listener creation; reused listeners inherit the endpoint policy.",
+          "Exact tcp_fastopen=0x30403 includes implicit server listener enablement; use existing bounded authenticated listener machinery. No FOEXP or cookieless behavior is enabled.",
+          "The first accepted child retains TIME_WAIT storage while a new listener admits the second child; bounded128MiB budget preserves per-socket accounting.",
+          "Pre-touch three charged connection pools before timed events; no unbounded allocation or timing tolerance changes."
         ],
-        "option_reasons": {}
-      },
-      "blocked_reasons": [
-        "The script requires implicit Fast Open listener enablement and a non-default master key/address setup; the existing defaults-key option does not map this exact setup."
-      ]
+        "option_reasons": {
+          "linux-cookie": "Original custom master key and kind34 cookies use the existing feature-gated Linux SipHash policy.",
+          "tfo-key=f763bfa0813d80ed301d64cd904abcce": "Exact four sysctl hex words become16 raw key bytes, little-endian per word, before listener creation; reused listeners inherit the endpoint policy.",
+          "tfo-listen": "Exact tcp_fastopen=0x30403 includes implicit server listener enablement; use existing bounded authenticated listener machinery. No FOEXP or cookieless behavior is enabled.",
+          "budget128m": "The first accepted child retains TIME_WAIT storage while a new listener admits the second child; bounded128MiB budget preserves per-socket accounting.",
+          "prealloc3": "Pre-touch three charged connection pools before timed events; no unbounded allocation or timing tolerance changes."
+        },
+        "packetdrill_addresses": {
+          "local": "192.168.0.2",
+          "remote": "10.248.0.2"
+        }
+      }
     },
     "fastopen/server/opt34/simple2.pkt": {
       "source_sha256": "0f9820906d0cd370315843bf0dd906756b05cb22f98d6531a9523f3178844e49",
@@ -10890,19 +10914,17 @@
       "command_line": "`../../../common/defaults.sh\nsysctl -q \\\n  net.ipv4.tcp_fastopen=0x30403 \\\n  net.ipv4.tcp_fastopen_key=a0bf63f7-ed803d81-cd641d30-cebc4a90`\n",
       "command_sha256": "32671c8fb5c90802c129b1be5b90bf58dca599ea23f986868fc1fee9f8932db5",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n\n\n",
-      "adapter_flags": "upstream,local=192.168.0.1",
+      "adapter_flags": "upstream,local=192.168.0.2,budget128m,linux-cookie,prealloc3,tfo-key=f763bfa0813d80ed301d64cd904abcce,tfo-listen",
       "embedded_tcp_info": false,
       "inventory_audit": {
         "source_family": "fastopen",
-        "blocked_capabilities": [
-          "implicit"
-        ]
+        "blocked_capabilities": []
       },
       "audited_shell_commands": [
         {
           "command": "`../../../common/defaults.sh\nsysctl -q \\\n  net.ipv4.tcp_fastopen=0x30403 \\\n  net.ipv4.tcp_fastopen_key=a0bf63f7-ed803d81-cd641d30-cebc4a90`",
           "sha256": "db7797df678de08ae45e1fb7c4b736d75db88d3775ed0288022927c0dc14f21f",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script requires implicit Fast Open listener enablement and a non-default master key/address setup; the existing defaults-key option does not map this exact setup."
+          "semantic_mapping": "Process-local common baseline with custom raw default cookie key and implicit authenticated TFO listener. Exact word-to-little-endian key conversion and original addresses; no host sysctl or shell execution. Original non-setup bytes unchanged."
         }
       ],
       "mapping": {
@@ -10918,7 +10940,13 @@
           "capture_clock": "realtime epoch microseconds at backend submission",
           "hardware_tso": false,
           "gro": false,
-          "options": [],
+          "options": [
+            "budget128m",
+            "linux-cookie",
+            "prealloc3",
+            "tfo-key=f763bfa0813d80ed301d64cd904abcce",
+            "tfo-listen"
+          ],
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -10929,12 +10957,12 @@
           "tlp": true,
           "tlp_timer_margin_us": 2000,
           "rto_min_us": 200000,
-          "preallocate_connections": 1,
+          "preallocate_connections": 3,
           "ecn": false,
           "mss": 1460,
           "receive_capacity": 8388608,
           "window_scale": 8,
-          "endpoint_max_buffer_bytes": 33554432,
+          "endpoint_max_buffer_bytes": 134217728,
           "congestion_control": "Cubic",
           "cubic_hystart": true,
           "cubic_fast_convergence": true,
@@ -10948,23 +10976,43 @@
           "global_notsent_lowat": 4294967295,
           "socket_notsent_lowat": 0,
           "fast_open_client_default": false,
-          "fast_open_listener_default": false,
+          "fast_open_listener_default": true,
           "fast_open_cache": "fresh runtime",
-          "fast_open_cookie_policy": "hmac-sha256",
-          "pacing_config": null
+          "fast_open_cookie_policy": "linux-siphash24",
+          "pacing_config": null,
+          "fast_open_key_hex": "f763bfa0813d80ed301d64cd904abcce",
+          "fast_open_cookie_input": "remote address bytes + local address bytes",
+          "fast_open_cookie_epoch": false,
+          "fast_open_option_kind": 34,
+          "required_feature": "tfo-linux-cookie",
+          "implicit_listener_enablement": true,
+          "cookieless": false,
+          "foexp": false,
+          "fast_open_listener_limit": 128
         },
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
-        "claim": "Capability audit only; source is retained and not executed.",
+        "claim": "Setup-only mapping; behavioral mismatches remain failures.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "The script requires implicit Fast Open listener enablement and a non-default master key/address setup; the existing defaults-key option does not map this exact setup."
+          "Original custom master key and kind34 cookies use the existing feature-gated Linux SipHash policy.",
+          "Exact four sysctl hex words become16 raw key bytes, little-endian per word, before listener creation; reused listeners inherit the endpoint policy.",
+          "Exact tcp_fastopen=0x30403 includes implicit server listener enablement; use existing bounded authenticated listener machinery. No FOEXP or cookieless behavior is enabled.",
+          "The first accepted child retains TIME_WAIT storage while a new listener admits the second child; bounded128MiB budget preserves per-socket accounting.",
+          "Pre-touch three charged connection pools before timed events; no unbounded allocation or timing tolerance changes."
         ],
-        "option_reasons": {}
-      },
-      "blocked_reasons": [
-        "The script requires implicit Fast Open listener enablement and a non-default master key/address setup; the existing defaults-key option does not map this exact setup."
-      ]
+        "option_reasons": {
+          "linux-cookie": "Original custom master key and kind34 cookies use the existing feature-gated Linux SipHash policy.",
+          "tfo-key=f763bfa0813d80ed301d64cd904abcce": "Exact four sysctl hex words become16 raw key bytes, little-endian per word, before listener creation; reused listeners inherit the endpoint policy.",
+          "tfo-listen": "Exact tcp_fastopen=0x30403 includes implicit server listener enablement; use existing bounded authenticated listener machinery. No FOEXP or cookieless behavior is enabled.",
+          "budget128m": "The first accepted child retains TIME_WAIT storage while a new listener admits the second child; bounded128MiB budget preserves per-socket accounting.",
+          "prealloc3": "Pre-touch three charged connection pools before timed events; no unbounded allocation or timing tolerance changes."
+        },
+        "packetdrill_addresses": {
+          "local": "192.168.0.2",
+          "remote": "10.248.0.3"
+        }
+      }
     },
     "fastopen/server/opt34/simple3.pkt": {
       "source_sha256": "56c755f8291fe24914faa31fbf1187bfbef16257bb51a418a108c0f8c4fb226f",
@@ -10975,19 +11023,17 @@
       "command_line": "`../../../common/defaults.sh\nsysctl -q \\\n  net.ipv4.tcp_fastopen=0x30403 \\\n  net.ipv4.tcp_fastopen_key=a0bf63f7-ed803d81-cd641d30-cebc4a90`\n",
       "command_sha256": "32671c8fb5c90802c129b1be5b90bf58dca599ea23f986868fc1fee9f8932db5",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n\n\n",
-      "adapter_flags": "upstream,local=192.168.0.1",
+      "adapter_flags": "upstream,local=192.168.0.3,budget128m,early-response,linux-cookie,prealloc3,tfo-key=f763bfa0813d80ed301d64cd904abcce,tfo-listen",
       "embedded_tcp_info": false,
       "inventory_audit": {
         "source_family": "fastopen",
-        "blocked_capabilities": [
-          "implicit"
-        ]
+        "blocked_capabilities": []
       },
       "audited_shell_commands": [
         {
           "command": "`../../../common/defaults.sh\nsysctl -q \\\n  net.ipv4.tcp_fastopen=0x30403 \\\n  net.ipv4.tcp_fastopen_key=a0bf63f7-ed803d81-cd641d30-cebc4a90`",
           "sha256": "db7797df678de08ae45e1fb7c4b736d75db88d3775ed0288022927c0dc14f21f",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script requires implicit Fast Open listener enablement and a non-default master key/address setup; the existing defaults-key option does not map this exact setup."
+          "semantic_mapping": "Process-local common baseline with custom raw default cookie key and implicit authenticated TFO listener. Exact word-to-little-endian key conversion and original addresses; no host sysctl or shell execution. Original non-setup bytes unchanged."
         }
       ],
       "mapping": {
@@ -11003,23 +11049,30 @@
           "capture_clock": "realtime epoch microseconds at backend submission",
           "hardware_tso": false,
           "gro": false,
-          "options": [],
+          "options": [
+            "budget128m",
+            "early-response",
+            "linux-cookie",
+            "prealloc3",
+            "tfo-key=f763bfa0813d80ed301d64cd904abcce",
+            "tfo-listen"
+          ],
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
-          "fast_open_early_response": false,
+          "fast_open_early_response": true,
           "rack": true,
           "prr": "Rfc9937",
           "tlp": true,
           "tlp_timer_margin_us": 2000,
           "rto_min_us": 200000,
-          "preallocate_connections": 1,
+          "preallocate_connections": 3,
           "ecn": false,
           "mss": 1460,
           "receive_capacity": 8388608,
           "window_scale": 8,
-          "endpoint_max_buffer_bytes": 33554432,
+          "endpoint_max_buffer_bytes": 134217728,
           "congestion_control": "Cubic",
           "cubic_hystart": true,
           "cubic_fast_convergence": true,
@@ -11033,23 +11086,45 @@
           "global_notsent_lowat": 4294967295,
           "socket_notsent_lowat": 0,
           "fast_open_client_default": false,
-          "fast_open_listener_default": false,
+          "fast_open_listener_default": true,
           "fast_open_cache": "fresh runtime",
-          "fast_open_cookie_policy": "hmac-sha256",
-          "pacing_config": null
+          "fast_open_cookie_policy": "linux-siphash24",
+          "pacing_config": null,
+          "fast_open_key_hex": "f763bfa0813d80ed301d64cd904abcce",
+          "fast_open_cookie_input": "remote address bytes + local address bytes",
+          "fast_open_cookie_epoch": false,
+          "fast_open_option_kind": 34,
+          "required_feature": "tfo-linux-cookie",
+          "implicit_listener_enablement": true,
+          "cookieless": false,
+          "foexp": false,
+          "fast_open_listener_limit": 128
         },
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
-        "claim": "Capability audit only; source is retained and not executed.",
+        "claim": "Setup-only mapping; behavioral mismatches remain failures.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "The script requires implicit Fast Open listener enablement and a non-default master key/address setup; the existing defaults-key option does not map this exact setup."
+          "Original custom master key and kind34 cookies use the existing feature-gated Linux SipHash policy.",
+          "Exact four sysctl hex words become16 raw key bytes, little-endian per word, before listener creation; reused listeners inherit the endpoint policy.",
+          "Exact tcp_fastopen=0x30403 includes implicit server listener enablement; use existing bounded authenticated listener machinery. No FOEXP or cookieless behavior is enabled.",
+          "The first accepted child retains TIME_WAIT storage while a new listener admits the second child; bounded128MiB budget preserves per-socket accounting.",
+          "Pre-touch three charged connection pools before timed events; no unbounded allocation or timing tolerance changes.",
+          "Original script writes15000 bytes before the final handshake ACK; enable existing authenticated early response without changing window or grouping policy."
         ],
-        "option_reasons": {}
-      },
-      "blocked_reasons": [
-        "The script requires implicit Fast Open listener enablement and a non-default master key/address setup; the existing defaults-key option does not map this exact setup."
-      ]
+        "option_reasons": {
+          "linux-cookie": "Original custom master key and kind34 cookies use the existing feature-gated Linux SipHash policy.",
+          "tfo-key=f763bfa0813d80ed301d64cd904abcce": "Exact four sysctl hex words become16 raw key bytes, little-endian per word, before listener creation; reused listeners inherit the endpoint policy.",
+          "tfo-listen": "Exact tcp_fastopen=0x30403 includes implicit server listener enablement; use existing bounded authenticated listener machinery. No FOEXP or cookieless behavior is enabled.",
+          "budget128m": "The first accepted child retains TIME_WAIT storage while a new listener admits the second child; bounded128MiB budget preserves per-socket accounting.",
+          "prealloc3": "Pre-touch three charged connection pools before timed events; no unbounded allocation or timing tolerance changes.",
+          "early-response": "Original script writes15000 bytes before the final handshake ACK; enable existing authenticated early response without changing window or grouping policy."
+        },
+        "packetdrill_addresses": {
+          "local": "192.168.0.3",
+          "remote": "10.248.0.3"
+        }
+      }
     },
     "fastopen/server/opt34/unread-data-closed-trigger-rst.pkt": {
       "source_sha256": "55323c1a87f71e2a3d1fcb3bb07d67a4b6ded1b77dac895d757a3578c6e7c14c",

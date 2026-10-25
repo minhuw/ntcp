@@ -14,6 +14,14 @@ pub fn unsupported(reason: &str) -> i32 {
     diagnostic("UNSUPPORTED", reason);
     ENOSYS
 }
+// Raw socket-key bytes; sysctl word decoding belongs to the audited runner.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CookieKey([u8; 16]);
+impl std::fmt::Debug for CookieKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UpstreamOptions {
     pub no_timestamps: bool,
@@ -21,6 +29,7 @@ pub struct UpstreamOptions {
     pub adaptive_ack: bool,
     pub lowat4000: bool,
     pub linux_cookie: bool,
+    pub cookie_key: Option<CookieKey>,
     pub tfo_listen: bool,
     pub early_response: bool,
     pub pmtud1500: bool,
@@ -85,6 +94,13 @@ impl Profile {
                         flags.push_str(token);
                     }
                 }
+                if let Some(key) = options.cookie_key {
+                    flags.push_str(",tfo-key=");
+                    for byte in key.0 {
+                        use std::fmt::Write;
+                        write!(flags, "{byte:02x}").unwrap();
+                    }
+                }
                 flags
             }
         }
@@ -104,6 +120,23 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
                 ip.parse()
                     .map_err(|_| unsupported("invalid local IPv4 in so_flags"))?,
             );
+            continue;
+        }
+        if let Some(hex) = flag.strip_prefix("tfo-key=") {
+            if options.cookie_key.is_some()
+                || hex.len() != 32
+                || !hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err(unsupported("invalid or duplicate raw TFO key in so_flags"));
+            }
+            let mut bytes = [0; 16];
+            for (byte, digits) in bytes.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+                *byte = u8::from_str_radix(std::str::from_utf8(digits).unwrap(), 16).unwrap();
+            }
+            options.cookie_key = Some(CookieKey(bytes));
+            has_options = true;
             continue;
         }
         let selection = match flag {
@@ -156,6 +189,7 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
         if options.budget128m && options.budget224m
             || options.adaptive_ack && options.immediate_ack
             || options.prealloc3 && options.prealloc4
+            || options.cookie_key.is_some() && !options.linux_cookie
         {
             return Err(unsupported("conflicting upstream options"));
         }
@@ -244,20 +278,23 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
     }
     config
 }
-// Fixed defaults.sh key is opt-in and restricted to exact scripts by the runner.
+// Linux defaults key unless an explicit raw key was configured before startup.
 pub(crate) fn cookie_policy(profile: Profile) -> ntcp::FastOpenCookiePolicy {
     #[cfg(feature = "tfo-linux-cookie")]
-    if matches!(
-        profile,
-        Profile::Upstream(UpstreamOptions {
-            linux_cookie: true,
-            ..
-        })
-    ) {
-        return ntcp::FastOpenCookiePolicy::LinuxSipHash24(ntcp::LinuxSipHash24Key::new([
-            0xa1, 0xa1, 0xa1, 0xa1, 0xb2, 0xb2, 0xb2, 0xb2, 0xc3, 0xc3, 0xc3, 0xc3, 0xd4, 0xd4,
-            0xd4, 0xd4,
-        ]));
+    if let Profile::Upstream(UpstreamOptions {
+        linux_cookie: true,
+        cookie_key,
+        ..
+    }) = profile
+    {
+        let key = cookie_key.map_or(
+            [
+                0xa1, 0xa1, 0xa1, 0xa1, 0xb2, 0xb2, 0xb2, 0xb2, 0xc3, 0xc3, 0xc3, 0xc3, 0xd4, 0xd4,
+                0xd4, 0xd4,
+            ],
+            |key| key.0,
+        );
+        return ntcp::FastOpenCookiePolicy::LinuxSipHash24(ntcp::LinuxSipHash24Key::new(key));
     }
     let _ = profile;
     ntcp::FastOpenCookiePolicy::HmacSha256
@@ -760,5 +797,108 @@ mod early_response_pool_tests {
             selected
         );
         assert!(profile("upstream,local=192.0.2.1,prealloc3,prealloc4").is_err());
+    }
+}
+
+#[cfg(test)]
+mod custom_cookie_key_tests {
+    use super::*;
+
+    #[test]
+    fn raw_key_requires_explicit_policy_and_feature_and_is_redacted() {
+        let key = "00112233445566778899aabbccddeeff";
+        let base = "upstream,local=192.0.2.1";
+        let flags = format!("{base},linux-cookie,tfo-key={key}");
+        let result = profile(&flags);
+        assert_eq!(result.is_ok(), cfg!(feature = "tfo-linux-cookie"));
+        if let Ok((_, selected)) = result {
+            assert!(!format!("{selected:?}").contains(key));
+            assert!(format!("{selected:?}").contains("[REDACTED]"));
+            assert_eq!(
+                profile(&format!("{},local=192.0.2.1", selected.flags()))
+                    .unwrap()
+                    .1,
+                selected
+            );
+            let base = config(profile(&format!("{base},linux-cookie")).unwrap().1);
+            assert_eq!(format!("{:?}", config(selected)), format!("{base:?}"));
+        }
+        for invalid in [
+            format!("{base},tfo-key={key}"),
+            format!("{flags},tfo-key={key}"),
+            format!("{flags},tfo-key={}", "0".repeat(32)),
+            flags.replace("upstream", "baseline"),
+            flags.replace(key, ""),
+            flags.replace(key, "00112233445566778899AABBCCDDEEFF"),
+            flags.replace(key, "00112233445566778899aabbccddeefg"),
+            flags.replace(key, "00112233445566778899aabbccddeef"),
+            format!("{flags}0"),
+        ] {
+            assert!(profile(&invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[cfg(feature = "tfo-linux-cookie")]
+    #[test]
+    fn custom_default_key_issues_three_address_bound_vectors() {
+        let selected = profile(
+            "upstream,local=192.168.0.2,linux-cookie,tfo-key=f763bfa0813d80ed301d64cd904abcce",
+        )
+        .unwrap()
+        .1;
+        for (local, remote, expected) in [
+            (
+                "192.168.0.2",
+                "10.248.0.2",
+                [0x00, 0xab, 0xaa, 0xab, 0xe8, 0xe9, 0x54, 0xc2],
+            ),
+            (
+                "192.168.0.2",
+                "10.248.0.3",
+                [0x13, 0x13, 0xa2, 0xda, 0x99, 0x4a, 0x09, 0x51],
+            ),
+            (
+                "192.168.0.3",
+                "10.248.0.3",
+                [0x76, 0xd2, 0xc1, 0xc5, 0x30, 0xf5, 0x1f, 0x79],
+            ),
+        ] {
+            let mut endpoint =
+                ntcp::Endpoint::new(EndpointConfig::default(), [42; 32], 0, |_| true).unwrap();
+            endpoint.set_fast_open_cookie_policy(cookie_policy(selected));
+            endpoint.enable_fast_open().unwrap();
+            let local: IpAddr = local.parse().unwrap();
+            let listener = endpoint.listen(SocketAddr::new(local, 8080), 1).unwrap();
+            endpoint.set_listener_fast_open(listener, 1).unwrap();
+            let ip = ntcp::IpMetadata {
+                source: remote.parse().unwrap(),
+                destination: local,
+            };
+            let mut bytes = [0; 2048];
+            let n = ntcp::wire::encode(
+                ip,
+                ntcp::wire::Header {
+                    source_port: 40000,
+                    destination_port: 8080,
+                    sequence: 1,
+                    acknowledgment: 0,
+                    flags: ntcp::wire::SYN,
+                    window: 10000,
+                    urgent_pointer: 0,
+                },
+                &[34, 2, 1, 1],
+                &[],
+                &mut bytes,
+            )
+            .unwrap();
+            endpoint.input(0, ip, &bytes[..n]).unwrap();
+            let output = endpoint
+                .poll_transmit(0, &mut bytes, 64)
+                .unwrap()
+                .packet
+                .unwrap();
+            let synack = ntcp::wire::parse(output.ip, &bytes[..output.len]).unwrap();
+            assert_eq!(synack.options.fast_open.unwrap().as_bytes(), expected);
+        }
     }
 }

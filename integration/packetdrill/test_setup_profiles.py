@@ -129,14 +129,14 @@ class SetupProfiles(unittest.TestCase):
 
     def test_linux_cookie_explicit_listener_setup_and_capability_metadata(self):
         from run import (LINUX_COOKIE_OPTION, LINUX_COOKIE_SCRIPTS,
-                         LINUX_COOKIE_SETTINGS, IMPLICIT_TFO_LISTENER_SCRIPTS, preflight, tcp_info_only)
+                         LINUX_COOKIE_SETTINGS, IMPLICIT_TFO_LISTENER_SCRIPTS, CUSTOM_TFO_SOURCES, preflight, tcp_info_only)
         directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
         if not directory.is_dir():
             self.skipTest('pinned checkout unavailable')
         manifest = json.loads((HERE / 'adaptations.json').read_text())
         self.assertEqual({name for name, entry in manifest['scripts'].items()
                           if LINUX_COOKIE_OPTION in entry['adapter_flags'].split(',')},
-                         LINUX_COOKIE_SCRIPTS)
+                         LINUX_COOKIE_SCRIPTS | CUSTOM_TFO_SOURCES.keys())
         for name in sorted(LINUX_COOKIE_SCRIPTS):
             entry = manifest['scripts'][name]
             source = (directory / name).read_bytes()
@@ -169,7 +169,7 @@ class SetupProfiles(unittest.TestCase):
                 changed['scripts'][name][key] = value
                 with self.subTest(name=name, key=key), self.assertRaises(ValueError):
                     adapt_source(directory, name, changed, changed['scripts'][name]['adapter_flags'])
-        # No mapping of implicit-listener/address-mismatch cases, FOEXP or nstat assertions.
+        # Custom-key/address setup is audited separately; FOEXP remains unavailable.
         for name in ('fastopen/server/opt34/simple1.pkt',
                      'fastopen/server/fin-close-socket.pkt'):
             self.assertNotIn(name, LINUX_COOKIE_SCRIPTS)
