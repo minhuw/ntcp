@@ -730,3 +730,7 @@ mod tfo_copied_completion {
 mod client_tfo_permission {
     include!("runtime_tfo_permission_tests.rs");
 }
+
+mod listener_query {
+    include!("runtime_listener_query_tests.rs");
+}

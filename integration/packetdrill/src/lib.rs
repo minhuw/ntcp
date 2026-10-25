@@ -37,11 +37,32 @@ unsafe extern "C" fn ntcp_packetdrill_control(
                 packet_test::timestamp_default(true)?;
                 packet_test::clear_fast_open_client_cache()?;
             }
+            command if command.starts_with(b"ntcp-local-assert-listener ") => {
+                let port = listener_assertion_port(command)?;
+                if !packet_test::listener_present(port)? {
+                    return Err(ENOENT);
+                }
+            }
             _ => return Err(EOPNOTSUPP),
         };
         Ok(0)
     }) as i32
 }
+// Canonical decimal ports only; no shell fragments or alternate spellings.
+fn listener_assertion_port(command: &[u8]) -> Result<u16, i32> {
+    let port = command
+        .strip_prefix(b"ntcp-local-assert-listener ")
+        .ok_or(EOPNOTSUPP)?;
+    if port.is_empty() || port.len() > 5 || port[0] == b'0' || !port.iter().all(u8::is_ascii_digit)
+    {
+        return Err(EOPNOTSUPP);
+    }
+    std::str::from_utf8(port)
+        .map_err(|_| EOPNOTSUPP)?
+        .parse::<u16>()
+        .map_err(|_| EOPNOTSUPP)
+}
+
 const USERDATA: *mut c_void = ptr::dangling_mut::<c_void>();
 unsafe extern "C" {
     fn ntcp_fill(interface: *mut c_void, userdata: *mut c_void);

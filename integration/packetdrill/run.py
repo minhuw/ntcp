@@ -388,6 +388,12 @@ TFO_PERMISSION_EVENTS = {'fastopen/client/nonblocking-sendto-errnos.pkt': ((b'  
 TFO_PERMISSION_RESTORE = b'`/tmp/sysctl_restore_${PPID}.sh`\n'
 TFO_PERMISSION_RESTORED = b'// ntcp profile is process-local; no host sysctls to restore.\n'
 
+LISTENER_ASSERT_SCRIPT = 'md5/md5-only-on-client-ack.pkt'
+LISTENER_ASSERT_SOURCE_SHA256 = 'fff237a75cdf9e0f403d673f80c99e7b7e3ffebefa75d63d240803472c0a2a17'
+LISTENER_ASSERT_SETUP = b'`../../common/defaults.sh`\n'
+LISTENER_ASSERT_EVENT = b'   +0 `grep " 0A " /proc/net/tcp /proc/net/tcp6 | grep ":1F90"`\n'
+LISTENER_ASSERT_CONTROL = b'   +0 `ntcp-local-assert-listener 8080`\n'
+
 
 TCP_INFO_FIELDS = {'tcpi_state', 'tcpi_ca_state', 'tcpi_probes', 'tcpi_backoff', 'tcpi_unacked', 'tcpi_sacked',
                    'tcpi_lost', 'tcpi_retrans', 'tcpi_reordering',
@@ -467,7 +473,7 @@ def runner_provenance(runner):
     return provenance
 
 
-def preflight(text, embedded_tcp_info=False, resource_control=False, timestamp_control=False, cache_flush_control=False, tfo_permission_control=False):
+def preflight(text, embedded_tcp_info=False, resource_control=False, timestamp_control=False, cache_flush_control=False, tfo_permission_control=False, listener_assertion_control=False):
     # Conservative safety/capability screening, NOT a second packetdrill parser.
     # Upstream --dry_run remains the authority for script syntax.
     # Inspect raw text conservatively, including comments: do not accidentally
@@ -486,6 +492,8 @@ def preflight(text, embedded_tcp_info=False, resource_control=False, timestamp_c
                 for _, control in events:
                     shell_text = shell_text.replace(control.decode(), '', 1)
                 break
+    if listener_assertion_control and text.count(LISTENER_ASSERT_CONTROL.decode()) == 1:
+        shell_text = shell_text.replace(LISTENER_ASSERT_CONTROL.decode(), '', 1)
     if '`' in shell_text:
         reasons.append('shell setup/assertions target Linux, not the ntcp backend')
     if '%{' in text or '}%' in text:
@@ -534,6 +542,27 @@ def adapt_source(directory, relative, manifest, so_flags):
         data = (directory / extra['path']).read_bytes()
         if hashlib.sha256(data).hexdigest() != extra['sha256']:
             raise ValueError(f"setup {extra['path']} hash differs from audited adaptation")
+    if relative == LISTENER_ASSERT_SCRIPT and not entry.get('blocked_reasons'):
+        expected_commands = [LISTENER_ASSERT_SETUP.rstrip(b'\n'),
+                             LISTENER_ASSERT_EVENT[LISTENER_ASSERT_EVENT.index(b'`'):].rstrip(b'\n')]
+        if (hashlib.sha256(source).hexdigest() != LISTENER_ASSERT_SOURCE_SHA256
+                or entry['command_line'].encode() != LISTENER_ASSERT_SETUP
+                or entry['replacement_line'].encode() != b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n'
+                or entry.get('command_sha256') != hashlib.sha256(LISTENER_ASSERT_SETUP).hexdigest()
+                or entry.get('expected_command_count') != 2
+                or re.findall(rb'`[^`]*`', source) != expected_commands
+                or [(c['command'], c['sha256']) for c in entry.get('audited_shell_commands', [])]
+                    != [(c.decode(), hashlib.sha256(c).hexdigest()) for c in expected_commands]
+                or entry.get('listener_assertion_control') is not True
+                or entry.get('listener_assertion_event_sha256') != hashlib.sha256(LISTENER_ASSERT_EVENT).hexdigest()
+                or entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
+                or source.count(LISTENER_ASSERT_EVENT) != 1):
+            raise ValueError('expected exact audited listener assertion setup and timed command')
+        generated = source.replace(LISTENER_ASSERT_SETUP, entry['replacement_line'].encode(), 1).replace(LISTENER_ASSERT_EVENT, LISTENER_ASSERT_CONTROL, 1)
+        reasons = preflight(generated.decode(), listener_assertion_control=True)
+        if reasons:
+            raise ValueError('; '.join(reasons))
+        return generated, {**entry, 'generated_sha256': hashlib.sha256(generated).hexdigest()}
     if relative in TFO_PERMISSION_SOURCES and not entry.get('blocked_reasons'):
         events = TFO_PERMISSION_EVENTS[relative]
         expected_commands = [TFO_PERMISSION_SETUP.rstrip(b'\n'),
@@ -1106,7 +1135,8 @@ def main():
                                         resource_control=(row['adapted'] and row['adaptation'].get('resource_control') is True),
                                         timestamp_control=(row['adapted'] and row['adaptation'].get('timestamp_control') is True),
                                         cache_flush_control=(row['adapted'] and row['adaptation'].get('cache_flush_control') is True),
-                                        tfo_permission_control=(row['adapted'] and row['adaptation'].get('tfo_permission_control') is True))
+                                        tfo_permission_control=(row['adapted'] and row['adaptation'].get('tfo_permission_control') is True),
+                                        listener_assertion_control=(row['adapted'] and row['adaptation'].get('listener_assertion_control') is True))
                     if variant not in ('native-ipv4', 'ipv4'):
                         reasons.append('the adapter implements IPv4 only')
                     if reasons:

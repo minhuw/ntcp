@@ -12174,20 +12174,18 @@
       "embedded_tcp_info": false,
       "inventory_audit": {
         "source_family": "md5",
-        "blocked_capabilities": [
-          "md5"
-        ]
+        "blocked_capabilities": []
       },
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh`",
           "sha256": "db987cbec339a8140034dc0a76556fcd8346c3b83c75c17b92ce643980e7c17b",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The original timed assertion inspects Linux /proc/net/tcp and /proc/net/tcp6 listener state after unexpected MD5 options; ntcp sockets have no such /proc representation or audited equivalent."
+          "semantic_mapping": "Common process-local upstream baseline; no host defaults command executes."
         },
         {
           "command": "`grep \" 0A \" /proc/net/tcp /proc/net/tcp6 | grep \":1F90\"`",
           "sha256": "fb4e05760d654d856d410d5c1cbeeb91a25562f9a6e87e4ab6fef6b456fe56f8",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The original timed assertion inspects Linux /proc/net/tcp and /proc/net/tcp6 listener state after unexpected MD5 options; ntcp sockets have no such /proc representation or audited equivalent."
+          "semantic_mapping": "Exact read-only assertion of a managed listener at local port8080, with core generation and live-listener validation. No host /proc read; no fabricated reference count or MD5 authentication claim."
         }
       ],
       "mapping": {
@@ -12240,16 +12238,15 @@
         },
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
-        "claim": "Capability audit only; source is retained and not executed.",
+        "claim": "Original packet/syscall assertions and exact listener-presence observation retained with a read-only callback. MD5 is an unimplemented option, not an enabled authentication policy.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "The original timed assertion inspects Linux /proc/net/tcp and /proc/net/tcp6 listener state after unexpected MD5 options; ntcp sockets have no such /proc representation or audited equivalent."
+          "Replace only the exact /proc LISTEN-state port8080 assertion with managed socket binding plus valid, nonclosing core ListenerId observation. Do not change unknown-MD5 handling or claim Linux rejection semantics."
         ],
         "option_reasons": {}
       },
-      "blocked_reasons": [
-        "The original timed assertion inspects Linux /proc/net/tcp and /proc/net/tcp6 listener state after unexpected MD5 options; ntcp sockets have no such /proc representation or audited equivalent."
-      ]
+      "listener_assertion_control": true,
+      "listener_assertion_event_sha256": "00e7f6fcfe2645b12b1ec6c72005306153c6db13cea2875ec9beb112481c03a3"
     },
     "mss/mss-getsockopt-tcp_maxseg-server.pkt": {
       "source_sha256": "b619f10e66f4602f30f22ee391d960fc30e4e4bc9be50a3ed45e30abffb40183",

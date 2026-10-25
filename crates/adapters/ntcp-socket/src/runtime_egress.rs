@@ -167,6 +167,10 @@ impl Owner {
         if matches!(op, Op::SetFastOpenClientEnabled(_)) {
             return false;
         }
+        #[cfg(feature = "packet-test")]
+        if matches!(op, Op::ListenerPresent(_)) {
+            return false;
+        }
         if self.reservation.is_some() {
             return true;
         } // Explicit legacy test path only.

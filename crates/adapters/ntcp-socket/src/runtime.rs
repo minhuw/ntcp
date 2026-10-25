@@ -91,6 +91,8 @@ pub enum Op {
     TimestampDefault(bool),
     #[cfg(feature = "packet-test")]
     ClearFastOpenClientCache,
+    #[cfg(feature = "packet-test")]
+    ListenerPresent(u16),
     Close,
     Shutdown(i32),
     Flags(i32, i32),
@@ -790,6 +792,7 @@ impl Owner {
                     | Op::LocalResourceReject(_)
                     | Op::TimestampDefault(_)
                     | Op::ClearFastOpenClientCache
+                    | Op::ListenerPresent(_)
             )
         {
             return true;
@@ -1520,6 +1523,14 @@ impl Owner {
         Ok(bits)
     }
     fn execute(&mut self, id: u64, op: Op) -> Result<Reply> {
+        // Observer snapshots do not drive clocks/timers or consume events.
+        #[cfg(feature = "packet-test")]
+        if let Op::ListenerPresent(port) = op {
+            return self.packet_listener_present(port).map(|present| Reply {
+                value: i32::from(present),
+                ..Reply::default()
+            });
+        }
         if self.command_held(id, &op) {
             return Err(EAGAIN);
         }
@@ -2510,7 +2521,8 @@ impl Owner {
             | Op::Capture(_)
             | Op::LocalResourceReject(_)
             | Op::TimestampDefault(_)
-            | Op::ClearFastOpenClientCache => unreachable!(),
+            | Op::ClearFastOpenClientCache
+            | Op::ListenerPresent(_) => unreachable!(),
         }
         Ok(out)
     }
@@ -2622,6 +2634,10 @@ mod tests {
         }
         assert_eq!(
             owner.execute(0, Op::ClearFastOpenClientCache).err(),
+            Some(EOPNOTSUPP)
+        );
+        assert_eq!(
+            owner.execute(0, Op::ListenerPresent(8080)).err(),
             Some(EOPNOTSUPP)
         );
     }

@@ -96,6 +96,14 @@ pub fn clear_fast_open_client_cache() -> Result<()> {
     Ok(())
 }
 
+// Inspect managed listener membership at one local port, including core
+// generation validity. This neither accepts children nor services TCP work.
+pub fn listener_present(port: u16) -> Result<bool> {
+    runtime()?
+        .call(0, Op::ListenerPresent(port))
+        .map(|reply| reply.value != 0)
+}
+
 // Called only by the patched runner's exact, audited command capability.
 pub fn local_resource_rejection(enabled: bool) -> Result<()> {
     runtime()?.call(0, Op::LocalResourceReject(enabled))?;

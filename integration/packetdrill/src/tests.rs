@@ -1961,3 +1961,85 @@ fn client_tfo_permission_native_api_and_control_abi_share_policy() {
         Some(ECANCELED)
     );
 }
+
+#[test]
+fn listener_assertion_port_rejects_noncanonical_or_shell_arguments() {
+    for (text, expected) in [("1", 1), ("8080", 8080), ("65535", 65535)] {
+        assert_eq!(
+            listener_assertion_port(format!("ntcp-local-assert-listener {text}").as_bytes()),
+            Ok(expected)
+        );
+    }
+    for text in [
+        "",
+        "0",
+        "00",
+        "08080",
+        "+1",
+        "-1",
+        "65536",
+        "123456",
+        "0x1F90",
+        "1 ",
+        "1\n",
+        "1\0x",
+        "8080; true",
+        "8080 && true",
+    ] {
+        assert_eq!(
+            listener_assertion_port(format!("ntcp-local-assert-listener {text}").as_bytes()),
+            Err(EOPNOTSUPP)
+        );
+    }
+    assert_eq!(
+        listener_assertion_port(b"ntcp-local-assert-listener"),
+        Err(EOPNOTSUPP)
+    );
+}
+
+#[test]
+fn listener_assertion_control_uses_real_membership_at_requested_port() {
+    if isolated("tests::listener_assertion_control_uses_real_membership_at_requested_port") {
+        return;
+    }
+    let assertion = |port: u16| {
+        let command = std::ffi::CString::new(format!("ntcp-local-assert-listener {port}")).unwrap();
+        unsafe { ntcp_packetdrill_control(USERDATA, command.as_ptr()) }
+    };
+    assert_eq!(assertion(43210), -1);
+    assert_eq!(errno(), EINVAL);
+    let adapter = Adapter::start((local(), Profile::Upstream(Default::default()))).unwrap();
+    assert_eq!(assertion(43210), -1);
+    assert_eq!(errno(), ENOENT);
+    let fd = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+        .unwrap()
+        .value as i32;
+    call(
+        &adapter,
+        2,
+        fd,
+        0,
+        encode_addr(SocketAddr::new(local().into(), 43210)),
+        0,
+    )
+    .unwrap();
+    assert_eq!(assertion(43210), -1); // A bound stream socket is not listening.
+    assert_eq!(errno(), ENOENT);
+    call(&adapter, 3, fd, 4, vec![], 0).unwrap();
+    assert_eq!(assertion(43210), 0);
+    for port in [8080, 43211] {
+        assert_eq!(assertion(port), -1);
+        assert_eq!(errno(), ENOENT);
+    }
+    unsafe {
+        assert_eq!(
+            ntcp_packetdrill_control(USERDATA, c"ntcp-local-assert-listener 43210; true".as_ptr()),
+            -1
+        );
+        assert_eq!(errno(), EOPNOTSUPP);
+    }
+    assert_eq!(assertion(43210), 0);
+    call(&adapter, 8, fd, 0, vec![], 0).unwrap();
+    assert_eq!(assertion(43210), -1);
+    assert_eq!(errno(), ENOENT);
+}

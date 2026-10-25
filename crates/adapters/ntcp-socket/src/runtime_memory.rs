@@ -86,6 +86,24 @@ impl PacketIo for PacketBackend {
     }
 }
 
+impl Owner {
+    pub(super) fn packet_listener_present(&self, port: u16) -> Result<bool> {
+        self.packets.as_ref().ok_or(EOPNOTSUPP)?;
+        if port == 0 {
+            return Err(EINVAL);
+        }
+        // A socket label alone can outlive its core handle. Binding is immutable
+        // while a listener generation is live; resolve it in the core as well.
+        Ok(self.sockets.values().any(|socket| {
+            let Handle::Listener(listener) = socket.handle else {
+                return false;
+            };
+            socket.local.is_some_and(|address| address.port() == port)
+                && self.endpoint.listener_queue_info(listener).is_ok()
+        }))
+    }
+}
+
 #[cfg(test)]
 #[path = "runtime_memory_tests.rs"]
 mod tests;
