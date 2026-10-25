@@ -1831,3 +1831,7 @@ fn inventory_tfo_syn_only_rejection_keeps_cookie_but_suppresses_after_data_ack()
         );
     }
 }
+
+mod active_open_options {
+    include!("fast_open_active_options_tests.rs");
+}

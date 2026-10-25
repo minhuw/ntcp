@@ -82,28 +82,20 @@ impl Owner {
             return Err(EINVAL);
         }
         let options = self.sockets[&id].clone();
+        let open = ntcp::ActiveOpenOptions {
+            send_capacity: options.send_capacity,
+            receive_capacity: options.receive_capacity,
+            user_mss: options.user_mss,
+        };
         let (cid, accepted) = if let Some(initial) = initial {
             self.endpoint.enable_fast_open().map_err(engine)?;
             self.endpoint
-                .connect_fast_open_with_buffer_capacities(
-                    self.now(),
-                    local,
-                    remote,
-                    initial,
-                    options.send_capacity,
-                    options.receive_capacity,
-                )
+                .connect_fast_open_with_options(self.now(), local, remote, initial, open)
                 .map_err(engine)?
         } else {
             (
                 self.endpoint
-                    .connect_with_buffer_capacities(
-                        self.now(),
-                        local,
-                        remote,
-                        options.send_capacity,
-                        options.receive_capacity,
-                    )
+                    .connect_with_options(self.now(), local, remote, open)
                     .map_err(engine)?,
                 0,
             )

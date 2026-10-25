@@ -21,6 +21,34 @@ use crate::{
     wire::{self, ACK, Header, IpMetadata, RST, SYN},
 };
 
+// Per-active-open parameters; endpoint allocation and protocol policy remain authoritative.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActiveOpenOptions {
+    pub send_capacity: usize,
+    pub receive_capacity: usize,
+    // None removes the per-open application cap. Legacy wrappers inherit the
+    // endpoint setting through From<&ConnectionConfig>.
+    pub user_mss: Option<u16>,
+}
+impl From<&ConnectionConfig> for ActiveOpenOptions {
+    fn from(config: &ConnectionConfig) -> Self {
+        Self {
+            send_capacity: config.send_capacity,
+            receive_capacity: config.receive_capacity,
+            user_mss: config.user_mss,
+        }
+    }
+}
+impl ActiveOpenOptions {
+    fn validate(self) -> Result<(), Error> {
+        Connection::validate_buffer_capacities(self.send_capacity, self.receive_capacity)?;
+        if self.user_mss == Some(0) {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectionId {
     slot: usize,
@@ -855,7 +883,31 @@ impl Endpoint {
         rx_ranges: usize,
         timestamps: RxPacketTimestamps,
     ) -> Result<Connection, Error> {
-        Connection::validate_buffer_capacities(capacities.0, capacities.1)?;
+        self.new_connection_with_options(
+            tuple,
+            iss,
+            syn,
+            ActiveOpenOptions {
+                send_capacity: capacities.0,
+                receive_capacity: capacities.1,
+                ..ActiveOpenOptions::from(&self.config.connection)
+            },
+            rx_ranges,
+            timestamps,
+        )
+    }
+
+    fn new_connection_with_options(
+        &mut self,
+        tuple: Tuple,
+        iss: u32,
+        syn: Option<&wire::Segment<'_>>,
+        options: ActiveOpenOptions,
+        rx_ranges: usize,
+        timestamps: RxPacketTimestamps,
+    ) -> Result<Connection, Error> {
+        options.validate()?;
+        let capacities = (options.send_capacity, options.receive_capacity);
         let charge = Connection::allocation_bytes(
             capacities.0,
             capacities.1,
@@ -890,6 +942,7 @@ impl Endpoint {
         let mut connection_config = self.config.connection.clone();
         connection_config.send_capacity = capacities.0;
         connection_config.receive_capacity = capacities.1;
+        connection_config.user_mss = options.user_mss;
         if syn.is_some()
             && let Some(listener) = self.match_listener(tuple.local)
         {
@@ -1256,21 +1309,42 @@ impl Endpoint {
         send_capacity: usize,
         receive_capacity: usize,
     ) -> Result<(ConnectionId, usize), EndpointError> {
+        self.connect_fast_open_with_options(
+            now,
+            local,
+            remote,
+            initial,
+            ActiveOpenOptions {
+                send_capacity,
+                receive_capacity,
+                ..ActiveOpenOptions::from(&self.config.connection)
+            },
+        )
+    }
+
+    pub fn connect_fast_open_with_options(
+        &mut self,
+        now: Instant,
+        local: SocketAddr,
+        remote: SocketAddr,
+        initial: &[u8],
+        options: ActiveOpenOptions,
+    ) -> Result<(ConnectionId, usize), EndpointError> {
+        options.validate()?;
         self.check_clock(now)?;
         let service = self.fast_open.as_ref().ok_or(Error::InvalidState)?;
         let suppressed =
             service.suppressed(now, self.fast_open_negative_lifetime(), local.ip(), remote);
         let cached = service.get(now, self.fast_open_lifetime(), local.ip(), remote.ip());
         let tuple = Tuple { local, remote };
-        Connection::validate_buffer_capacities(send_capacity, receive_capacity)?;
-        self.admission_with_buffers(tuple, (send_capacity, receive_capacity))?;
+        self.admission_with_buffers(tuple, (options.send_capacity, options.receive_capacity))?;
         self.clock(now)?;
         let iss = self.isn(tuple);
-        let mut connection = self.new_connection_with_buffers(
+        let mut connection = self.new_connection_with_options(
             tuple,
             iss,
             None,
-            (send_capacity, receive_capacity),
+            options,
             0,
             RxPacketTimestamps::default(),
         )?;
@@ -1310,16 +1384,35 @@ impl Endpoint {
         send: usize,
         receive: usize,
     ) -> Result<ConnectionId, EndpointError> {
+        self.connect_with_options(
+            now,
+            local,
+            remote,
+            ActiveOpenOptions {
+                send_capacity: send,
+                receive_capacity: receive,
+                ..ActiveOpenOptions::from(&self.config.connection)
+            },
+        )
+    }
+
+    pub fn connect_with_options(
+        &mut self,
+        now: Instant,
+        local: SocketAddr,
+        remote: SocketAddr,
+        options: ActiveOpenOptions,
+    ) -> Result<ConnectionId, EndpointError> {
+        options.validate()?;
         self.clock(now)?;
         let tuple = Tuple { local, remote };
-        Connection::validate_buffer_capacities(send, receive)?;
-        self.admission_with_buffers(tuple, (send, receive))?;
+        self.admission_with_buffers(tuple, (options.send_capacity, options.receive_capacity))?;
         let iss = self.isn(tuple);
-        let connection = self.new_connection_with_buffers(
+        let connection = self.new_connection_with_options(
             tuple,
             iss,
             None,
-            (send, receive),
+            options,
             0,
             RxPacketTimestamps::default(),
         )?;

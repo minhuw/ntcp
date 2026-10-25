@@ -714,3 +714,7 @@ fn icmp_synrecv_baseline_soft_errors_preserve_handshake() {
 }
 
 include!("runtime_icmp_tests.rs");
+
+mod fast_open_mss {
+    include!("runtime_fast_open_mss_tests.rs");
+}
