@@ -131,6 +131,9 @@ pub struct PacketTimestamps {
 pub struct ReceivedPacket {
     pub len: usize,
     pub timestamps: PacketTimestamps,
+    // Original full TCP segment payload size of a checksummed aggregate.
+    // None means ordinary raw ingress, never an inferred segmentation hint.
+    pub tcp_segment_size: Option<std::num::NonZeroU16>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -275,6 +278,7 @@ pub trait PacketIo {
             packet.map(|len| ReceivedPacket {
                 len,
                 timestamps: PacketTimestamps::default(),
+                tcp_segment_size: None,
             })
         })
     }
@@ -381,6 +385,7 @@ mod tests {
             Some(ReceivedPacket {
                 len: 1,
                 timestamps: PacketTimestamps::default(),
+                tcp_segment_size: None,
             })
         );
         assert_eq!(out, [7]);

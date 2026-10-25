@@ -21,6 +21,7 @@ struct RxSlot {
     bytes: Vec<u8>,
     owner: Option<ConnectionId>,
     stamps: ntcp::RxPacketTimestamps,
+    segment_size: Option<core::num::NonZeroU16>,
 }
 pub(super) struct Egress {
     scheduler: Scheduler<usize>,
@@ -72,6 +73,7 @@ impl Egress {
                 bytes: buffer(packet_capacity)?,
                 owner: None,
                 stamps: ntcp::RxPacketTimestamps::default(),
+                segment_size: None,
             });
         }
         Ok(Self {
@@ -569,7 +571,7 @@ impl Owner {
                 }
                 // A retained generation never migrates to a tuple's new owner.
                 if self.ingress_owner(&slot.bytes) == Some(owner) {
-                    self.input_ip(&slot.bytes, slot.stamps);
+                    self.input_ip_metadata(&slot.bytes, slot.stamps, slot.segment_size);
                 }
                 slot.owner = None;
                 slot.bytes.clear();
@@ -614,9 +616,10 @@ impl Owner {
                     slot.bytes.extend_from_slice(bytes);
                     slot.owner = Some(owner);
                     slot.stamps = stamps;
+                    slot.segment_size = received.tcp_segment_size;
                     egress.received.push_back(index);
                 } else {
-                    self.input_ip(bytes, stamps);
+                    self.input_ip_metadata(bytes, stamps, received.tcp_segment_size);
                 }
             }
             Ok(())

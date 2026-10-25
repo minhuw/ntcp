@@ -367,6 +367,7 @@ impl PacketIo for Dpdk {
             0 => Ok(None),
             1 => Ok(Some(ReceivedPacket {
                 len,
+                tcp_segment_size: None,
                 timestamps: PacketTimestamps {
                     software: None,
                     hardware: config.filter(|_| valid != 0).map(|c| PacketTimestamp {

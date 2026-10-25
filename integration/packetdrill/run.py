@@ -454,7 +454,7 @@ TCP_INFO_FIELDS = {'tcpi_state', 'tcpi_ca_state', 'tcpi_probes', 'tcpi_backoff',
                    'tcpi_snd_cwnd', 'tcpi_snd_ssthresh', 'tcpi_rtt', 'tcpi_min_rtt', 'tcpi_reord_seen',
                    'tcpi_notsent_bytes', 'tcpi_last_data_recv', 'tcpi_busy_time',
                    'tcpi_rwnd_limited', 'tcpi_sndbuf_limited', 'tcpi_delivered',
-                   'tcpi_options', 'tcpi_snd_wscale', 'tcpi_rcv_wscale', 'tcpi_snd_mss', 'tcpi_advmss'}
+                   'tcpi_options', 'tcpi_snd_wscale', 'tcpi_rcv_wscale', 'tcpi_snd_mss', 'tcpi_rcv_mss', 'tcpi_advmss'}
 
 
 TCP_INFO_OPTION_BITS = {'TCPI_OPT_TIMESTAMPS': 1, 'TCPI_OPT_SACK': 2,
@@ -1038,7 +1038,7 @@ def profile_metadata(so_flags):
         'software_gso': (upstream and 'no-gso' not in options) or profile in {'pipeline-gso', 'pipeline-paced-gso'},
         'capture_boundary': 'individual raw IPv4 TCP wire segments',
         'capture_clock': 'realtime epoch microseconds at backend submission',
-        'hardware_tso': False, 'gro': False,
+        'hardware_tso': False, 'gro': False, 'receive_tcp_segmentation_metadata': True,
     }
     if not known:
         return {key: value if key == 'profile' else None for key, value in metadata.items()}

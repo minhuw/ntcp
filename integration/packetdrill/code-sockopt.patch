@@ -8,7 +8,7 @@
  #include <signal.h>
  #include <stdio.h>
  #include <stdlib.h>
-@@ -140,11 +141,110 @@
+@@ -140,11 +141,111 @@
  
  #ifdef linux
  
@@ -21,6 +21,7 @@
 +	X(tcpi_backoff) \
 +	X(tcpi_options) \
 +	X(tcpi_snd_mss) \
++	X(tcpi_rcv_mss) \
 +	X(tcpi_advmss) \
 +	X(tcpi_unacked) \
 +	X(tcpi_sacked) \
@@ -119,7 +120,7 @@
  	assert(len >= sizeof(struct _tcp_info));
  
  	write_symbols(code);
-@@ -559,6 +659,11 @@
+@@ -559,6 +660,11 @@
  	if (strcmp(config->code_sockopt, "") == 0) {
  		code->data_type = DATA_NONE;		/* auto-detect */
  #if HAVE_TCP_INFO
@@ -131,7 +132,7 @@
  	} else if (strcmp(config->code_sockopt, "TCP_INFO") == 0) {
  		code->data_type = DATA_TCP_INFO;
  #endif
-@@ -710,7 +815,8 @@
+@@ -710,7 +816,8 @@
  #if HAVE_TCP_INFO
  	case DATA_TCP_INFO:
  		opt_name = TCP_INFO;
@@ -141,7 +142,7 @@
  		level = SOL_TCP;
  		break;
  #endif  /* HAVE_TCP_INFO */
-@@ -740,6 +846,16 @@
+@@ -740,6 +847,16 @@
  		free(data);
  		return NULL;
  	}
@@ -158,7 +159,7 @@
  	*len = opt_len;
  	return data;
  }
-@@ -760,44 +876,28 @@
+@@ -760,44 +877,28 @@
  	}
  	int fd = state->socket_under_test->fd.live_fd;
  	struct code_state *code = state->code;
@@ -570,27 +571,255 @@
  
 --- a/gtests/net/packetdrill/so_testing.c
 +++ b/gtests/net/packetdrill/so_testing.c
-@@ -25,6 +25,8 @@
- #include "so_testing.h"
- 
- #include <dlfcn.h>
+@@ -1,163 +1,247 @@
+-/*
+- * Copyright 2015 Google Inc.
+- *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public License
+- * as published by the Free Software Foundation; either version 2
+- * of the License, or (at your option) any later version.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program; if not, write to the Free Software
+- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+- * 02110-1301, USA.
+- */
+-/*
+- * Author: xiaoj@google.com (Xiao Jia)
+- *
+- * Testing against a shared object (*.so) file.
+- */
+-
+-#include "so_testing.h"
+-
+-#include <dlfcn.h>
+-
+-#include "logging.h"
+-#include "netdev.h"
+-#include "packetdrill.h"
+-#include "run.h"
+-
+-struct so_netdev {
+-	struct netdev netdev;		/* "inherit" from netdev */
+-	struct packetdrill_interface *ifc;	/* to be filled in later */
+-};
+-
+-/* "Downcast" an abstract netdev to our flavor. */
+-static inline struct so_netdev *to_so_netdev(struct netdev *netdev)
+-{
+-	return (struct so_netdev *)netdev;
+-}
+-
+-static void so_netdev_free(struct netdev *a_netdev)
+-{
+-	struct so_netdev *netdev = to_so_netdev(a_netdev);
+-
+-	memset(netdev, 0, sizeof(*netdev));  /* paranoia */
+-	free(netdev);
+-}
+-
+-static int so_netdev_send(struct netdev *a_netdev, struct packet *packet)
+-{
+-	struct so_netdev *netdev = to_so_netdev(a_netdev);
+-
+-	assert(packet->ip_bytes > 0);
+-	/* We do IPv4 and IPv6 */
+-	assert(packet->ipv4 || packet->ipv6);
+-	/* We only do TCP and ICMP */
+-	assert(packet->tcp || packet->udp || packet->icmpv4 || packet->icmpv6);
+-
+-	return netdev->ifc->netdev_send(netdev->ifc->userdata,
+-					packet_start(packet),
+-					packet->ip_bytes);
+-}
+-
+-static int so_netdev_receive(struct netdev *a_netdev, s32 timeout_secs,
+-			     struct packet **packet, char **error)
+-{
+-	struct so_netdev *netdev = to_so_netdev(a_netdev);
+-	enum packet_parse_result_t result;
+-	enum packet_layer_t layer = PACKET_LAYER_3_IP;
+-	size_t in_bytes;
+-
+-	assert(*packet == NULL);	/* should be no packet yet */
+-
+-	for (;;) {
+-		*packet = packet_new(PACKET_READ_BYTES);
+-		in_bytes = (*packet)->buffer_bytes;
+-
+-		/* Sniff the next outbound packet from the stack under test. */
+-		if (netdev->ifc->netdev_receive(netdev->ifc->userdata,
+-						(*packet)->buffer, &in_bytes,
+-						&((*packet)->time_usecs)))
+-			goto next;
+-
+-		result = parse_packet(*packet, in_bytes, layer, error);
+-
+-		if (result == PACKET_OK)
+-			return STATUS_OK;
+-
+-		if (result == PACKET_BAD)
+-			return STATUS_ERR;
+-
+-		DEBUGP("parse_result:%d; error parsing packet: %s\n",
+-		       result, *error);
+-next:
+-		packet_free(*packet);
+-		*packet = NULL;
+-	}
+-
+-	assert(!"should not be reached");
+-	return STATUS_ERR;	/* not reached */
+-}
+-
+-static struct netdev_ops so_netdev_ops = {
+-	.free = so_netdev_free,
+-	.send = so_netdev_send,
+-	.receive = so_netdev_receive,
+-};
+-
+-struct netdev *so_netdev_new(struct config *config)
+-{
+-	struct so_netdev *netdev = calloc(1, sizeof(struct so_netdev));
+-
+-	netdev->netdev.ops = &so_netdev_ops;
+-	return (struct netdev *)netdev;
+-}
+-
+-struct so_instance *so_instance_new(void)
+-{
+-	return calloc(1, sizeof(struct so_instance));
+-}
+-
+-int so_instance_init(struct so_instance *instance,
+-		     const struct config *config,
+-		     const struct script *script,
+-		     const struct state *state)
+-{
+-	packetdrill_interface_init_t init;
+-	char *error;
+-
+-	instance->handle = dlopen(config->so_filename,
+-				  RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE |
+-				  RTLD_DEEPBIND);
+-	if (!instance->handle)
+-		die("%s\n", dlerror());
+-	dlerror();  /* clear any existing error */
+-
+-	init = dlsym(instance->handle, "packetdrill_interface_init");
+-	error = dlerror();
+-	if (error)
+-		die("%s\n", error);
+-
+-	init(config->so_flags, &instance->ifc);
+-	to_so_netdev(state->netdev)->ifc = &instance->ifc;
+-	return STATUS_OK;
+-}
+-
+-void so_instance_free(struct so_instance *instance)
+-{
+-	if (!instance)
+-		return;
+-
+-	instance->ifc.free(instance->ifc.userdata);
+-
+-	if (instance->handle)
+-		dlclose(instance->handle);
+-
+-	memset(instance, 0, sizeof(*instance));
+-	free(instance);
+-}
++/*
++ * Copyright 2015 Google Inc.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
++ * 02110-1301, USA.
++ */
++/*
++ * Author: xiaoj@google.com (Xiao Jia)
++ *
++ * Testing against a shared object (*.so) file.
++ */
++
++#include "so_testing.h"
++
++#include <dlfcn.h>
 +#include <errno.h>
 +#include <time.h>
- 
- #include "logging.h"
- #include "netdev.h"
-@@ -34,6 +36,7 @@
- struct so_netdev {
- 	struct netdev netdev;		/* "inherit" from netdev */
- 	struct packetdrill_interface *ifc;	/* to be filled in later */
++
++#include "logging.h"
++#include "netdev.h"
++#include "packetdrill.h"
++#include "run.h"
++
++typedef int (*send_segmented_t)(void *, const void *, size_t, u16);
++
++struct so_netdev {
++	struct netdev netdev;		/* "inherit" from netdev */
++	struct packetdrill_interface *ifc;	/* to be filled in later */
++	send_segmented_t send_segmented;
 +	s64 receive_deadline; /* host monotonic usecs; zero means unbounded */
- };
- 
- /* "Downcast" an abstract netdev to our flavor. */
-@@ -65,43 +68,105 @@
- 					packet->ip_bytes);
- }
- 
++};
++
++/* "Downcast" an abstract netdev to our flavor. */
++static inline struct so_netdev *to_so_netdev(struct netdev *netdev)
++{
++	return (struct so_netdev *)netdev;
++}
++
++static void so_netdev_free(struct netdev *a_netdev)
++{
++	struct so_netdev *netdev = to_so_netdev(a_netdev);
++
++	memset(netdev, 0, sizeof(*netdev));  /* paranoia */
++	free(netdev);
++}
++
++static int so_netdev_send(struct netdev *a_netdev, struct packet *packet)
++{
++	struct so_netdev *netdev = to_so_netdev(a_netdev);
++
++	assert(packet->ip_bytes > 0);
++	/* We do IPv4 and IPv6 */
++	assert(packet->ipv4 || packet->ipv6);
++	/* We only do TCP and ICMP */
++	assert(packet->tcp || packet->udp || packet->icmpv4 || packet->icmpv6);
++
++	/* Preserve original incoming segment size only when an aggregate
++	 * actually contains at least one full segment. Legacy raw ingress
++	 * cannot represent this metadata; never silently drop it. */
++	if (packet->tcp && packet->mss > 0 &&
++	    packet_payload_len(packet) >= packet->mss) {
++		if (!netdev->send_segmented || packet->mss > 65535) {
++			errno = EOPNOTSUPP;
++			return STATUS_ERR;
++		}
++		return netdev->send_segmented(netdev->ifc->userdata,
++			packet_start(packet), packet->ip_bytes, packet->mss);
++	}
++	return netdev->ifc->netdev_send(netdev->ifc->userdata,
++					packet_start(packet),
++					packet->ip_bytes);
++}
++
 +/* Capture timestamps stay in the plugin's realtime domain. Only waiting uses
 + * the host monotonic clock; never use the plugin's script clock for deadlines. */
 +static s64 receive_now(void)
@@ -623,16 +852,7 @@
 +	to_so_netdev(a_netdev)->receive_deadline = 0;
 +}
 +
- static int so_netdev_receive(struct netdev *a_netdev, s32 timeout_secs,
--			     struct packet **packet, char **error)
--{
--	struct so_netdev *netdev = to_so_netdev(a_netdev);
--	enum packet_parse_result_t result;
--	enum packet_layer_t layer = PACKET_LAYER_3_IP;
--	size_t in_bytes;
--
--	assert(*packet == NULL);	/* should be no packet yet */
--
++static int so_netdev_receive(struct netdev *a_netdev, s32 timeout_secs,
 +                            struct packet **packet, char **error)
 +{
 +	struct so_netdev *netdev = to_so_netdev(a_netdev);
@@ -647,7 +867,7 @@
 +	    (!deadline || netdev->receive_deadline < deadline))
 +		deadline = netdev->receive_deadline;
 +	assert(*packet == NULL);
- 	for (;;) {
++	for (;;) {
 +		now = receive_now();
 +		if (now < 0) {
 +			asprintf(error, "capture clock_gettime: %s", strerror(errno));
@@ -655,21 +875,7 @@
 +		}
 +		if (deadline && now >= deadline)
 +			return STATUS_TIMEOUT;
- 		*packet = packet_new(PACKET_READ_BYTES);
--		in_bytes = (*packet)->buffer_bytes;
--
--		/* Sniff the next outbound packet from the stack under test. */
--		if (netdev->ifc->netdev_receive(netdev->ifc->userdata,
--						(*packet)->buffer, &in_bytes,
--						&((*packet)->time_usecs)))
--			goto next;
--
--		result = parse_packet(*packet, in_bytes, layer, error);
--
--		if (result == PACKET_OK)
--			return STATUS_OK;
--
--		if (result == PACKET_BAD)
++		*packet = packet_new(PACKET_READ_BYTES);
 +		size_t in_bytes = (*packet)->buffer_bytes;
 +		errno = 0;
 +		int status = netdev->ifc->netdev_receive(netdev->ifc->userdata,
@@ -683,11 +889,7 @@
 +			packet_free(*packet);
 +			*packet = NULL;
 +			errno = saved_errno;
- 			return STATUS_ERR;
--
--		DEBUGP("parse_result:%d; error parsing packet: %s\n",
--		       result, *error);
--next:
++			return STATUS_ERR;
 +		}
 +		if (!status && in_bytes) {
 +			enum packet_parse_result_t result = parse_packet(*packet,
@@ -703,8 +905,8 @@
 +			free(*error);
 +			*error = NULL;
 +		}
- 		packet_free(*packet);
- 		*packet = NULL;
++		packet_free(*packet);
++		*packet = NULL;
 +		now = receive_now();
 +		if (now < 0) {
 +			asprintf(error, "capture clock_gettime: %s", strerror(errno));
@@ -716,13 +918,70 @@
 +		s64 delay = deadline ? min((s64)1000, deadline - now) : 1000;
 +		struct timespec pause = {.tv_sec = 0, .tv_nsec = delay * 1000};
 +		nanosleep(&pause, NULL);
- 	}
--
--	assert(!"should not be reached");
--	return STATUS_ERR;	/* not reached */
- }
- 
- static struct netdev_ops so_netdev_ops = {
++	}
++}
++
++static struct netdev_ops so_netdev_ops = {
++	.free = so_netdev_free,
++	.send = so_netdev_send,
++	.receive = so_netdev_receive,
++};
++
++struct netdev *so_netdev_new(struct config *config)
++{
++	struct so_netdev *netdev = calloc(1, sizeof(struct so_netdev));
++
++	netdev->netdev.ops = &so_netdev_ops;
++	return (struct netdev *)netdev;
++}
++
++struct so_instance *so_instance_new(void)
++{
++	return calloc(1, sizeof(struct so_instance));
++}
++
++int so_instance_init(struct so_instance *instance,
++		     const struct config *config,
++		     const struct script *script,
++		     const struct state *state)
++{
++	packetdrill_interface_init_t init;
++	char *error;
++
++	instance->handle = dlopen(config->so_filename,
++				  RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE |
++				  RTLD_DEEPBIND);
++	if (!instance->handle)
++		die("%s\n", dlerror());
++	dlerror();  /* clear any existing error */
++
++	init = dlsym(instance->handle, "packetdrill_interface_init");
++	error = dlerror();
++	if (error)
++		die("%s\n", error);
++
++	init(config->so_flags, &instance->ifc);
++	to_so_netdev(state->netdev)->ifc = &instance->ifc;
++	to_so_netdev(state->netdev)->send_segmented =
++		dlsym(instance->handle, "ntcp_packetdrill_net_send_segmented");
++	/* Absence is permitted for old raw-input plugins. */
++	dlerror();
++	return STATUS_OK;
++}
++
++void so_instance_free(struct so_instance *instance)
++{
++	if (!instance)
++		return;
++
++	instance->ifc.free(instance->ifc.userdata);
++
++	if (instance->handle)
++		dlclose(instance->handle);
++
++	memset(instance, 0, sizeof(*instance));
++	free(instance);
++}
 --- a/gtests/net/packetdrill/so_testing.h
 +++ b/gtests/net/packetdrill/so_testing.h
 @@ -26,6 +26,7 @@

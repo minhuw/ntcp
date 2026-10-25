@@ -14,6 +14,7 @@ from run import HERE, PIN, check_checkout, preflight, runner_provenance, tcp_inf
 class SelectionChecks(unittest.TestCase):
     def test_only_supported_assertions(self):
         self.assertTrue(tcp_info_only('0 %{ assert tcpi_lost == 0 }%'))
+        self.assertTrue(tcp_info_only('0 %{ assert tcpi_rcv_mss == 1000 }%'))
         for snippet in ('assert tcpi_min_rtt == 20000', 'assert tcpi_reord_seen == 2'):
             self.assertTrue(tcp_info_only('0 %{ ' + snippet + ' }%'))
             self.assertEqual(preflight('0 %{ ' + snippet + ' }%', True), [])
@@ -171,7 +172,7 @@ class CompiledSnapshotChecks(unittest.TestCase):
 
     def test_prefix_field_layout_matches_audited_fields(self):
         ends = {'tcpi_state': 1, 'tcpi_ca_state': 2, 'tcpi_probes': 4, 'tcpi_backoff': 5, 'tcpi_options': 6, 'tcpi_snd_wscale': 7,
-                'tcpi_rcv_wscale': 7, 'tcpi_snd_mss': 20, 'tcpi_advmss': 88, 'tcpi_unacked': 28, 'tcpi_sacked': 32,
+                'tcpi_rcv_wscale': 7, 'tcpi_snd_mss': 20, 'tcpi_rcv_mss': 24, 'tcpi_advmss': 88, 'tcpi_unacked': 28, 'tcpi_sacked': 32,
                 'tcpi_lost': 36, 'tcpi_retrans': 40, 'tcpi_last_data_recv': 56,
                 'tcpi_rtt': 72, 'tcpi_snd_ssthresh': 80, 'tcpi_snd_cwnd': 84,
                 'tcpi_reordering': 92, 'tcpi_notsent_bytes': 148,
@@ -213,7 +214,7 @@ class CompiledSnapshotChecks(unittest.TestCase):
                          ['requested TCP_INFO 152', 'requested TCP_INFO 6'])
 
     def test_mss_prefix_reports_actual_fields_and_rejects_short_snapshots(self):
-        for field, size in [('tcpi_snd_mss', 20), ('tcpi_advmss', 88)]:
+        for field, size in [('tcpi_snd_mss', 20), ('tcpi_rcv_mss', 24), ('tcpi_advmss', 88)]:
             with self.subTest(field=field):
                 result = self.execute('TCP_INFO_PREFIX', 0, f'assert {field} == 0', 0,
                                       env={'TCP_INFO_TRACE': '1'})
@@ -235,6 +236,8 @@ class CompiledSnapshotChecks(unittest.TestCase):
                 ('assert tcpi_reord_seen == 0', {'TCP_INFO_RETURN_LEN': '223'},
                  "can't get requested"),
                 ('assert tcpi_reord_seen == 0', {'TCP_INFO_RETURN_LEN': '225'},
+                 "can't get requested"),
+                ('assert tcpi_rcv_mss == 0', {'TCP_INFO_RETURN_LEN': '23'},
                  "can't get requested"),
                 ('assert tcpi_unacked == 0', {'TCP_INFO_RETURN_LEN': '27'},
                  "can't get requested"),

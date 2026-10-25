@@ -2143,3 +2143,85 @@ fn destination_route_control_and_native_api_share_actual_future_syn_policy() {
     assert_eq!(control("ntcp-local-route-remove 192.0.2.2"), 0);
     assert_eq!(open(), 1460);
 }
+
+#[test]
+fn segmented_receive_abi_preserves_observed_size_and_rejects_invalid_metadata() {
+    if isolated("tests::segmented_receive_abi_preserves_observed_size_and_rejects_invalid_metadata")
+    {
+        return;
+    }
+    let adapter = Adapter::start((local(), upstream_tests("no-timestamps,immediate-ack"))).unwrap();
+    let (_, fd, ip, header) = connect_listener(&adapter, 8080, false, None);
+    let mut tcp = vec![0; 10037 + 20];
+    ntcp::wire::encode(ip, header, &[], &vec![0x63; 10037], &mut tcp).unwrap();
+    let packet = frame(
+        ntcp::Transmit {
+            connection: None,
+            tx_timestamp: None,
+            ip,
+            len: tcp.len(),
+            hop_limit: 64,
+            dscp: 0,
+            ecn: 0,
+            ipv4_options: Default::default(),
+        },
+        &tcp,
+    )
+    .unwrap();
+    unsafe {
+        for size in [0, 60000] {
+            assert_eq!(
+                ntcp_packetdrill_net_send_segmented(
+                    USERDATA,
+                    packet.as_ptr().cast(),
+                    packet.len(),
+                    size
+                ),
+                -1
+            );
+            assert_eq!(errno(), EINVAL);
+        }
+        let mut bad = packet.clone();
+        bad[40] ^= 1;
+        assert_eq!(
+            ntcp_packetdrill_net_send_segmented(USERDATA, bad.as_ptr().cast(), bad.len(), 1000),
+            -1
+        );
+        assert_eq!(errno(), EINVAL);
+        assert_eq!(
+            ntcp_packetdrill_net_send_segmented(
+                USERDATA,
+                packet.as_ptr().cast(),
+                packet.len(),
+                1000
+            ),
+            0
+        );
+    }
+    let ack = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+    assert_eq!(
+        packet_header(&ack).acknowledgment,
+        header.sequence.wrapping_add(10037)
+    );
+    let info = call(&adapter, 18, fd, 1, vec![], 24).unwrap().bytes;
+    assert_eq!(u32::from_ne_bytes(info[20..24].try_into().unwrap()), 1000);
+    let mut data = vec![0u8; 10037];
+    assert_eq!(
+        unsafe { ntcp_socket::read(fd, data.as_mut_ptr().cast(), data.len()) },
+        10037
+    );
+    assert_eq!(data, vec![0x63; 10037]);
+    drop(adapter);
+    assert_eq!(
+        unsafe {
+            ntcp_packetdrill_net_send_segmented(
+                USERDATA,
+                packet.as_ptr().cast(),
+                packet.len(),
+                1000,
+            )
+        },
+        -1
+    );
+    assert_eq!(errno(), EIO);
+}

@@ -2208,6 +2208,30 @@ impl Endpoint {
         bytes: &[u8],
         timestamps: RxPacketTimestamps,
     ) -> Result<InputDisposition, EndpointError> {
+        self.input_with_metadata(
+            now,
+            ip,
+            traffic_class,
+            options,
+            bytes,
+            crate::RxPacketMetadata {
+                timestamps,
+                tcp_segment_size: None,
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn input_with_metadata(
+        &mut self,
+        now: Instant,
+        ip: IpMetadata,
+        traffic_class: u8,
+        options: Ipv4Options,
+        bytes: &[u8],
+        metadata: crate::RxPacketMetadata,
+    ) -> Result<InputDisposition, EndpointError> {
+        let timestamps = metadata.timestamps;
         timestamps.validate(self.config.connection.timebase)?;
         if !options.is_empty()
             && (!self.config.ipv4_options_enabled
@@ -2256,6 +2280,7 @@ impl Endpoint {
             Ok(segment) => segment,
             Err(_) => return Ok(InputDisposition::Dropped),
         };
+        metadata.validate_segment(&segment)?;
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
         //# A passive OPEN call with a specified "local IP address" parameter
         //# will await an incoming connection request to that address.  If the
@@ -2286,7 +2311,7 @@ impl Endpoint {
             let slot = self.slots[index].as_mut().unwrap();
             slot.received_dscp = Some(traffic_class >> 2);
             slot.connection
-                .input_with_timestamps(now, traffic_class, &segment, timestamps)?;
+                .input_with_metadata(now, traffic_class, &segment, metadata)?;
             if slot.connection.accepted_metadata {
                 Self::save_ipv4_options(slot, options, route);
             }

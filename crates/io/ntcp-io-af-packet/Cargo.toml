@@ -11,4 +11,6 @@ ntcp-io = { version = "0.0.1", path = "../ntcp-io" }
 libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+ntcp = { path = "../../stacks/ntcp" }
+ntcp-ip = { path = "../../stacks/ntcp-ip" }
 ntcp-io-tun = { version = "0.0.1", path = "../ntcp-io-tun" }

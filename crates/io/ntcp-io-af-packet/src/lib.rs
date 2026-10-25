@@ -2,6 +2,7 @@
 
 mod scheduling;
 mod timestamp;
+mod vnet;
 use ntcp_io::{
     PacketIo, PacketLayer, ReceivedPacket, TimestampCapabilities, TransmitTime, TxOutcome,
     TxSchedulingCapabilities, TxSchedulingError, TxTimestampCompletion, TxTimestampRequest,
@@ -21,9 +22,34 @@ pub struct AfPacket {
     scheduling: Option<TxSchedulingConfig>,
     scheduling_error: Option<TxSchedulingError>,
     packet_mark: u32,
+    vnet_header: bool,
 }
 
 impl AfPacket {
+    // Socket-local opt-in. RX retains original TCP segment size; ordinary TX
+    // remains fully checksummed and carries an empty virtio header. No host
+    // interface, qdisc or offload setting is changed.
+    pub fn enable_receive_aggregation(&mut self) -> io::Result<()> {
+        if self.vnet_header {
+            return Ok(());
+        }
+        let enabled: libc::c_int = 1;
+        // SAFETY: private live socket, correctly sized option, no retained pointer.
+        if unsafe {
+            libc::setsockopt(
+                self.as_raw_fd(),
+                libc::SOL_PACKET,
+                libc::PACKET_VNET_HDR,
+                (&enabled as *const libc::c_int).cast(),
+                std::mem::size_of_val(&enabled) as _,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        self.vnet_header = true;
+        Ok(())
+    }
     // Protocol is a host-order EtherType (e.g. ETH_P_ALL). No interface settings
     // or promiscuous membership are changed. CAP_NET_RAW is required.
     pub fn bind(ifindex: u32, protocol: u16) -> io::Result<Self> {
@@ -151,6 +177,7 @@ impl AfPacket {
             scheduling: None,
             scheduling_error: None,
             packet_mark: 0,
+            vnet_header: false,
         })
     }
 
@@ -253,14 +280,22 @@ impl AfPacket {
         if let Some(when) = when {
             control.append(&mut length, libc::SOL_SOCKET, libc::SCM_TXTIME, when.value);
         }
-        let mut vector = libc::iovec {
-            iov_base: packet.as_ptr().cast_mut().cast(),
-            iov_len: packet.len(),
-        };
+        let mut header = [0u8; vnet::LEN];
+        let prefix = if self.vnet_header { header.len() } else { 0 };
+        let mut vectors = [
+            libc::iovec {
+                iov_base: header.as_mut_ptr().cast(),
+                iov_len: prefix,
+            },
+            libc::iovec {
+                iov_base: packet.as_ptr().cast_mut().cast(),
+                iov_len: packet.len(),
+            },
+        ];
         // SAFETY: pointers remain live through sendmsg; send does not mutate iov.
         let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-        message.msg_iov = &mut vector;
-        message.msg_iovlen = 1;
+        message.msg_iov = vectors.as_mut_ptr();
+        message.msg_iovlen = vectors.len() as _;
         control.attach(&mut message);
         message.msg_controllen = length as _;
         // SAFETY: message and its readable packet/control buffers are live.
@@ -279,7 +314,7 @@ impl AfPacket {
         {
             return Err(timestamp::unsupported());
         }
-        let outcome = transmitted(count, packet.len())?;
+        let outcome = transmitted(count, packet.len() + prefix)?;
         if outcome == TxOutcome::Submitted
             && let Some((id, request)) = prepared
         {
@@ -441,15 +476,23 @@ impl PacketIo for AfPacket {
     #[allow(clippy::unnecessary_cast)] // msghdr lengths differ on musl/glibc
     fn receive_with_metadata(&mut self, out: &mut [u8]) -> io::Result<Option<ReceivedPacket>> {
         // MSG_TRUNC reports full packet length; AUXDATA still rejects VLAN loss.
-        let mut vector = libc::iovec {
-            iov_base: out.as_mut_ptr().cast(),
-            iov_len: out.len(),
-        };
+        let mut header = [0u8; vnet::LEN];
+        let prefix = if self.vnet_header { header.len() } else { 0 };
+        let mut vectors = [
+            libc::iovec {
+                iov_base: header.as_mut_ptr().cast(),
+                iov_len: prefix,
+            },
+            libc::iovec {
+                iov_base: out.as_mut_ptr().cast(),
+                iov_len: out.len(),
+            },
+        ];
         let mut control = Control::new();
         // SAFETY: zero is valid; all pointers below stay live through recvmsg.
         let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-        message.msg_iov = &mut vector;
-        message.msg_iovlen = 1;
+        message.msg_iov = vectors.as_mut_ptr();
+        message.msg_iovlen = vectors.len() as _;
         control.attach(&mut message);
         // SAFETY: message references writable stack buffers, none retained.
         let count = unsafe {
@@ -459,8 +502,17 @@ impl PacketIo for AfPacket {
                 libc::MSG_TRUNC | libc::MSG_DONTWAIT,
             )
         };
-        let Some(len) = received(count, out.len())? else {
+        let Some(length) = received(count, out.len() + prefix)? else {
             return Ok(None);
+        };
+        if length < prefix {
+            return Err(timestamp::invalid("short virtio header"));
+        }
+        let len = length - prefix;
+        let tcp_segment_size = if self.vnet_header {
+            vnet::decode(&header, &mut out[..len])?
+        } else {
+            None
         };
         if message.msg_flags & libc::MSG_TRUNC != 0 {
             return Err(timestamp::invalid("truncated packet"));
@@ -484,7 +536,11 @@ impl PacketIo for AfPacket {
         if !config.rx_hardware {
             timestamps.hardware = None;
         }
-        Ok(Some(ReceivedPacket { len, timestamps }))
+        Ok(Some(ReceivedPacket {
+            len,
+            timestamps,
+            tcp_segment_size,
+        }))
     }
 
     fn tx_scheduling_capabilities(&self) -> Option<TxSchedulingCapabilities> {
@@ -556,6 +612,9 @@ impl PacketIo for AfPacket {
     }
 
     fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
+        if self.vnet_header {
+            return self.send_controlled(packet, None, None);
+        }
         // SAFETY: packet remains readable for the duration of the single send.
         let count = unsafe {
             libc::send(
@@ -631,6 +690,7 @@ pub(crate) mod tests {
             scheduling: None,
             scheduling_error: None,
             packet_mark: 0,
+            vnet_header: false,
         };
         let mut b = AfPacket {
             ifindex: 0,
@@ -639,6 +699,7 @@ pub(crate) mod tests {
             scheduling: None,
             scheduling_error: None,
             packet_mark: 0,
+            vnet_header: false,
         };
         let when = TransmitTime {
             value: scheduling::now().unwrap() + 500_000_000,
@@ -814,6 +875,57 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn receive_aggregation_option_is_socket_local_and_failure_is_atomic() {
+        let fd = match socket(libc::AF_PACKET, libc::SOCK_RAW, 0) {
+            Ok(fd) => fd,
+            Err(e) => {
+                assert_eq!(e.raw_os_error(), Some(libc::EPERM));
+                return;
+            }
+        };
+        let mut io = AfPacket {
+            fd,
+            ifindex: 0,
+            timestamps: None,
+            scheduling: None,
+            scheduling_error: None,
+            packet_mark: 0,
+            vnet_header: false,
+        };
+        io.enable_receive_aggregation().unwrap();
+        io.enable_receive_aggregation().unwrap();
+        let mut actual = 0;
+        let mut len = std::mem::size_of_val(&actual) as libc::socklen_t;
+        // SAFETY: private live socket and correctly sized writable option buffer.
+        assert_eq!(
+            unsafe {
+                libc::getsockopt(
+                    io.as_raw_fd(),
+                    libc::SOL_PACKET,
+                    libc::PACKET_VNET_HDR,
+                    (&mut actual as *mut libc::c_int).cast(),
+                    &mut len,
+                )
+            },
+            0
+        );
+        assert_eq!(actual, 1);
+        assert!(io.vnet_header);
+        let (fd, _peer) = pair();
+        let mut wrong = AfPacket {
+            fd,
+            ifindex: 0,
+            timestamps: None,
+            scheduling: None,
+            scheduling_error: None,
+            packet_mark: 0,
+            vnet_header: false,
+        };
+        assert!(wrong.enable_receive_aggregation().is_err());
+        assert!(!wrong.vnet_header);
+    }
+
+    #[test]
     fn output_mark_reaches_private_kernel_socket_and_can_be_cleared() {
         let mut io = AfPacket {
             fd: socket(libc::AF_INET, libc::SOCK_DGRAM, 0).unwrap(),
@@ -822,6 +934,7 @@ pub(crate) mod tests {
             scheduling: None,
             scheduling_error: None,
             packet_mark: 0,
+            vnet_header: false,
         };
         assert!(io.packet_mark_supported());
         if let Err(error) = io.set_packet_mark(u32::MAX) {
@@ -859,6 +972,7 @@ pub(crate) mod tests {
             scheduling: None,
             scheduling_error: None,
             packet_mark: 0,
+            vnet_header: false,
         };
         let mut b = AfPacket {
             ifindex: 0,
@@ -867,6 +981,7 @@ pub(crate) mod tests {
             scheduling: None,
             scheduling_error: None,
             packet_mark: 0,
+            vnet_header: false,
         };
         flags(a.as_raw_fd());
         assert_eq!(a.layer(), PacketLayer::Ethernet);

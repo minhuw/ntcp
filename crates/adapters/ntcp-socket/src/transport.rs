@@ -48,6 +48,7 @@ pub(crate) fn transport_option_prefix(
     }
     put(8, info.rto_us);
     put(16, info.mss as u64);
+    put(20, info.received_mss as u64);
     put(24, info.unacked as u64);
     put(28, info.sacked as u64);
     put(32, info.lost as u64);
@@ -384,6 +385,7 @@ mod tests {
             cwnd: 10000,
             ssthresh: 8000,
             mss: 1000,
+            received_mss: 900,
             advertised_mss: 1200,
             max_send_window: 32000,
             rtt_us: Some(12000),
@@ -450,6 +452,7 @@ mod tests {
         for (offset, value) in [
             (8, 200000u32),
             (16, 1000),
+            (20, 900),
             (24, 3),
             (28, 1),
             (52, 789),
@@ -476,7 +479,7 @@ mod tests {
             0..2,
             5..7,
             8..12,
-            16..20,
+            16..24,
             24..40,
             52..56,
             68..88,

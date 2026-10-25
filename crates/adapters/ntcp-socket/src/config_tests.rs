@@ -732,3 +732,19 @@ fn destination_route_api_before_config_does_not_select_runtime() {
     );
     assert!(crate::CONFIG.get().is_none() && crate::RUNTIME.get().is_none());
 }
+
+#[test]
+fn receive_aggregation_is_explicit_native_socket_capability() {
+    let base = SocketConfig::parse(BASE).unwrap();
+    assert!(!base.io.receive_aggregation);
+    assert!(SocketConfig::parse(&format!("{BASE}io.receive_aggregation=true\n")).is_err());
+    let mut af = base.clone();
+    af.io.backend = Backend::AfPacket;
+    af.io.next_hop_mac = Some([2, 0, 0, 0, 0, 1]);
+    af.io.receive_aggregation = true;
+    assert!(af.validate().is_ok());
+    for value in ["1", "on", "TRUE", ""] {
+        assert!(SocketConfig::parse(&format!("{BASE}io.receive_aggregation={value}\n")).is_err());
+    }
+    assert!(SocketConfig::parse(&format!("{BASE}io.receive_aggregation=false\n")).is_ok());
+}

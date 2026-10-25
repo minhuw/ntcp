@@ -58,6 +58,15 @@ pub fn inject(bytes: Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+// Inject one checksummed aggregate together with actual producer segment size.
+pub fn inject_segmented(bytes: Vec<u8>, segment_size: core::num::NonZeroU16) -> Result<()> {
+    if bytes.len() > packet_profile::BYTES {
+        return Err(EMSGSIZE);
+    }
+    runtime()?.call(0, Op::InjectSegmented(bytes, segment_size))?;
+    Ok(())
+}
+
 // Capture host-local output policy metadata separately from on-wire bytes.
 pub fn try_capture_with_mark(capacity: usize) -> Result<(Vec<u8>, i64, u32)> {
     let reply = runtime()?.call(0, Op::Capture(capacity))?;

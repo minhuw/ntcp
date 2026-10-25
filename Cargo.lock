@@ -141,8 +141,10 @@ name = "ntcp-io-af-packet"
 version = "0.0.1"
 dependencies = [
  "libc",
+ "ntcp",
  "ntcp-io",
  "ntcp-io-tun",
+ "ntcp-ip",
 ]
 
 [[package]]

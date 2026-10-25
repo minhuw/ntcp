@@ -40,8 +40,12 @@ pub use pmtud_config::{Ipv4Plateaus, PmtudConfig, PmtudPolicy, SearchAging};
 mod route_policy;
 pub use route_policy::RoutePolicy;
 mod rack;
+mod receive_metadata;
+#[cfg(test)]
+mod receive_metadata_tests;
 mod recovery;
 mod rx_timestamp;
+pub use receive_metadata::RxPacketMetadata;
 mod sack;
 mod schedule;
 mod seq;

@@ -478,6 +478,8 @@ pub struct TransportInfo {
     pub cwnd: u32,
     pub ssthresh: u32,
     pub mss: u32,
+    // Current observed incoming full-segment payload estimate, not the peer MSS offer.
+    pub received_mss: u32,
     // Receive MSS offer, without TCP option overhead or the peer's send limit.
     pub advertised_mss: u32,
     // Largest accepted peer window, in bytes; useful for bounded host batching.
@@ -729,6 +731,8 @@ pub(crate) struct Connection {
     last_pmtu_output: Option<(Seq, Seq)>,
     pub(crate) rx_timestamps: RxTimestamps,
     input_timestamps: RxPacketTimestamps,
+    input_segment_size: Option<core::num::NonZeroU16>,
+    received_mss: crate::receive_metadata::ReceiveMss,
     received_read: u64,
     received_total: u64,
     snd_up: Option<Seq>,
@@ -924,6 +928,7 @@ impl Connection {
             tuple,
             peer_mss: config.mss,
             receive_mss_offer: config.receive_mss_offer(),
+            received_mss: crate::receive_metadata::ReceiveMss::new(config.receive_mss_offer()),
             send_mss_limit: config.mss,
             ip_header_len,
             pmtud,
@@ -1024,6 +1029,7 @@ impl Connection {
             last_pmtu_output: None,
             rx_timestamps: RxTimestamps::default(),
             input_timestamps: RxPacketTimestamps::default(),
+            input_segment_size: None,
             received_read: 0,
             received_total: 0,
             snd_up: None,
@@ -1496,6 +1502,7 @@ impl Connection {
             cwnd: self.congestion.cwnd(),
             ssthresh: self.congestion.ssthresh(),
             mss: self.mss as u32,
+            received_mss: u32::from(self.received_mss.value(self.receive_mss())),
             advertised_mss: u32::from(self.receive_mss()),
             max_send_window: self.max_snd_wnd,
             rtt_us: self
@@ -2069,6 +2076,7 @@ impl Connection {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn input_with_timestamps(
         &mut self,
         now: Instant,
@@ -2076,13 +2084,31 @@ impl Connection {
         segment: &Segment<'_>,
         timestamps: RxPacketTimestamps,
     ) -> Result<(), Error> {
-        timestamps.validate(self.config.timebase)?;
-        if !self.rx_timestamps.enabled() || timestamps == RxPacketTimestamps::default() {
-            return self.input_with_traffic_class(now, traffic_class, segment);
-        }
-        self.input_timestamps = timestamps;
+        self.input_with_metadata(
+            now,
+            traffic_class,
+            segment,
+            crate::RxPacketMetadata {
+                timestamps,
+                tcp_segment_size: None,
+            },
+        )
+    }
+
+    pub(crate) fn input_with_metadata(
+        &mut self,
+        now: Instant,
+        traffic_class: u8,
+        segment: &Segment<'_>,
+        metadata: crate::RxPacketMetadata,
+    ) -> Result<(), Error> {
+        metadata.timestamps.validate(self.config.timebase)?;
+        metadata.validate_segment(segment)?;
+        self.input_timestamps = metadata.timestamps;
+        self.input_segment_size = metadata.tcp_segment_size;
         let result = self.input_with_traffic_class(now, traffic_class, segment);
         self.input_timestamps = RxPacketTimestamps::default();
+        self.input_segment_size = None;
         result
     }
 
@@ -6392,6 +6418,15 @@ impl Connection {
         self.receive_used += outcome.new_bytes;
         if outcome.new_bytes != 0 {
             self.last_data_received = self.now;
+            let offer = self.receive_mss();
+            let size = self
+                .input_segment_size
+                .map_or(payload.len(), |s| usize::from(s.get()));
+            let terminal = flags & (PSH | FIN) != 0 && size == payload.len();
+            self.received_mss.observe(size, terminal, offer);
+            if self.input_segment_size.is_some() && payload.len() / size >= 2 {
+                self.received_mss.observe(size, false, offer);
+            }
         }
         if outcome.sack_overflow && self.sack_send {
             self.sack_omit = true;
@@ -6451,7 +6486,18 @@ impl Connection {
                 .saturating_add(advanced.saturating_sub(u32::from(outcome.fin)));
             let rmss = self.receive_mss();
             if outcome.new_bytes != 0 {
-                self.unacked_segments = self.unacked_segments.saturating_add(1);
+                let segments = self
+                    .input_segment_size
+                    .filter(|_| {
+                        skip == 0 && count == payload.len() && outcome.new_bytes == payload.len()
+                    })
+                    .map_or(1, |size| {
+                        payload
+                            .len()
+                            .div_ceil(usize::from(size.get()))
+                            .min(usize::from(u8::MAX)) as u8
+                    });
+                self.unacked_segments = self.unacked_segments.saturating_add(segments);
             }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
             //# o A TCP implementation MAY send an ACK segment acknowledging RCV.NXT

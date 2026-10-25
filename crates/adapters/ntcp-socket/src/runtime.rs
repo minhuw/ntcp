@@ -85,6 +85,8 @@ pub enum Op {
     #[cfg(feature = "packet-test")]
     Inject(Vec<u8>),
     #[cfg(feature = "packet-test")]
+    InjectSegmented(Vec<u8>, core::num::NonZeroU16),
+    #[cfg(feature = "packet-test")]
     Capture(usize),
     #[cfg(feature = "packet-test")]
     LocalResourceReject(bool),
@@ -799,6 +801,7 @@ impl Owner {
             && matches!(
                 op,
                 Op::Inject(_)
+                    | Op::InjectSegmented(..)
                     | Op::Capture(_)
                     | Op::LocalResourceReject(_)
                     | Op::TimestampDefault(_)
@@ -1156,6 +1159,7 @@ impl Owner {
         };
         self.input_stamped(now, ip, traffic_class, bytes, stamps)
     }
+    #[cfg(test)]
     fn input_stamped(
         &mut self,
         now: u64,
@@ -1163,6 +1167,17 @@ impl Owner {
         traffic_class: u8,
         bytes: &[u8],
         stamps: ntcp::RxPacketTimestamps,
+    ) -> std::result::Result<ntcp::InputDisposition, EndpointError> {
+        self.input_segmented(now, ip, traffic_class, bytes, stamps, None)
+    }
+    fn input_segmented(
+        &mut self,
+        now: u64,
+        ip: ntcp::IpMetadata,
+        traffic_class: u8,
+        bytes: &[u8],
+        stamps: ntcp::RxPacketTimestamps,
+        segment_size: Option<core::num::NonZeroU16>,
     ) -> std::result::Result<ntcp::InputDisposition, EndpointError> {
         // Endpoint validates the packet; the ports are only used to observe
         // generation-aware tuple ownership before and after passive admission.
@@ -1206,13 +1221,16 @@ impl Owner {
         }
 
         let pair = ClockPair::sample(self);
-        let result = self.endpoint.input_with_timestamps(
+        let result = self.endpoint.input_with_metadata(
             now,
             ip,
             traffic_class,
             ntcp::Ipv4Options::default(),
             bytes,
-            stamps,
+            ntcp::RxPacketMetadata {
+                timestamps: stamps,
+                tcp_segment_size: segment_size,
+            },
         );
         self.drain_timestamps(pair);
         self.prune_child_timeouts();
@@ -1578,7 +1596,7 @@ impl Owner {
         }
         #[cfg(feature = "packet-test")]
         match &op {
-            Op::Inject(bytes) => {
+            Op::Inject(bytes) | Op::InjectSegmented(bytes, _) => {
                 if self.packets.is_none() {
                     return Err(EOPNOTSUPP);
                 }
@@ -1587,10 +1605,26 @@ impl Owner {
                 }
                 crate::packet_profile::validate_injection(bytes)?;
                 // Admission is not TCP processing: retained RX may delay delivery.
-                let Op::Inject(bytes) = op else {
-                    unreachable!()
+                let (bytes, segment_size) = match op {
+                    Op::Inject(bytes) => (bytes, None),
+                    Op::InjectSegmented(bytes, size) => (bytes, Some(size)),
+                    _ => unreachable!(),
                 };
-                self.packets.as_mut().unwrap().inject(bytes)?;
+                if let Some(size) = segment_size {
+                    let packet = crate::packet_profile::parse_frame(&bytes)?;
+                    let segment =
+                        ntcp::wire::parse(packet.ip, packet.payload).map_err(|_| EINVAL)?;
+                    ntcp::RxPacketMetadata {
+                        timestamps: Default::default(),
+                        tcp_segment_size: Some(size),
+                    }
+                    .validate_segment(&segment)
+                    .map_err(|_| EINVAL)?;
+                }
+                self.packets
+                    .as_mut()
+                    .unwrap()
+                    .inject_segmented(bytes, segment_size)?;
                 return Ok(out);
             }
             Op::TimestampDefault(enabled) => {
@@ -2550,6 +2584,7 @@ impl Owner {
             }
             #[cfg(feature = "packet-test")]
             Op::Inject(_)
+            | Op::InjectSegmented(..)
             | Op::Capture(_)
             | Op::LocalResourceReject(_)
             | Op::TimestampDefault(_)

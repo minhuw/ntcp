@@ -31,6 +31,7 @@ struct State {
     block_port: Option<u16>,
     block_after: Option<(u16, usize)>,
     rx_stamps: PacketTimestamps,
+    rx_segment_size: Option<core::num::NonZeroU16>,
     interrupted: bool,
     cancel_error: Option<i32>,
     error: Option<io::ErrorKind>,
@@ -69,9 +70,11 @@ impl PacketIo for Fixture {
     }
     fn receive_with_metadata(&mut self, out: &mut [u8]) -> io::Result<Option<ReceivedPacket>> {
         let len = self.receive(out)?;
+        let state = self.0.lock().unwrap();
         Ok(len.map(|len| ReceivedPacket {
             len,
-            timestamps: self.0.lock().unwrap().rx_stamps,
+            timestamps: state.rx_stamps,
+            tcp_segment_size: state.rx_segment_size,
         }))
     }
     fn transmit(&mut self, bytes: &[u8]) -> io::Result<TxOutcome> {
@@ -2520,4 +2523,87 @@ fn backend_first_hop_refresh_preserves_configured_path_policy() {
     assert_eq!(actual.connection.pmtud, Some(policy));
     state.lock().unwrap().mtu = Some(1280);
     assert!(backend_config(config, &io).is_err());
+}
+
+#[test]
+fn retained_native_receive_preserves_original_segment_size_through_reservation() {
+    let (mut a, b, clients, servers, state) = scheduled_pair(2);
+    let cid = connection(&a, clients[0]);
+    let peer = connection(&b, servers[0]);
+    a.execute(clients[0], Op::Write(vec![1; 100])).unwrap();
+    state.lock().unwrap().block = true;
+    a.service_egress().unwrap();
+    assert!(a.endpoint.is_output_reserved(cid));
+    let before = a.endpoint.transport_info(cid).unwrap().received_mss;
+    let tuple = a.endpoint.tuple(cid).unwrap();
+    let ip = ntcp::IpMetadata {
+        source: tuple.remote.ip(),
+        destination: tuple.local.ip(),
+    };
+    let seq = b.endpoint.send_progress(peer).unwrap().next_write_sequence;
+    let ack = a
+        .endpoint
+        .send_progress(cid)
+        .unwrap()
+        .unacknowledged_sequence;
+    let options = if a
+        .endpoint
+        .transport_info(cid)
+        .unwrap()
+        .timestamps_negotiated
+    {
+        &[1, 1, 8, 10, 0, 0, 0, 2, 0, 0, 0, 0][..]
+    } else {
+        &[]
+    };
+    let mut tcp = vec![0; 10037 + 20 + options.len()];
+    ntcp::wire::encode(
+        ip,
+        ntcp::wire::Header {
+            source_port: tuple.remote.port(),
+            destination_port: tuple.local.port(),
+            sequence: seq,
+            acknowledgment: ack,
+            flags: ntcp::wire::ACK,
+            window: 32000,
+            urgent_pointer: 0,
+        },
+        options,
+        &vec![0x51; 10037],
+        &mut tcp,
+    )
+    .unwrap();
+    let packet = a
+        .frame(
+            ntcp::Transmit {
+                connection: None,
+                tx_timestamp: None,
+                ip,
+                len: tcp.len(),
+                hop_limit: 64,
+                dscp: 0,
+                ecn: 0,
+                ipv4_options: Default::default(),
+            },
+            &tcp,
+        )
+        .unwrap();
+    state.lock().unwrap().rx_segment_size = core::num::NonZeroU16::new(1000);
+    ingress(&mut a, &state, &packet);
+    assert_eq!(a.endpoint.transport_info(cid).unwrap().received_mss, before);
+    state.lock().unwrap().block = false;
+    advance(&mut a, 1000);
+    a.service_egress().unwrap();
+    assert!(!a.endpoint.is_output_reserved(cid));
+    a.receive_batch(&mut vec![0; 65549]).unwrap();
+    assert_eq!(a.endpoint.transport_info(cid).unwrap().received_mss, 1000);
+    let info = a
+        .execute(clients[0], Op::TransportPrefix(1, 24))
+        .unwrap()
+        .bytes;
+    assert_eq!(u32::from_ne_bytes(info[20..24].try_into().unwrap()), 1000);
+    assert_eq!(
+        a.execute(clients[0], Op::Read(10037)).unwrap().bytes,
+        vec![0x51; 10037]
+    );
 }

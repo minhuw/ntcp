@@ -216,6 +216,43 @@ unsafe extern "C" fn ntcp_net_send(userdata: *mut c_void, input: *const c_void, 
         Ok(0)
     }) as i32
 }
+// Optional extension leaves packetdrill_interface layout intact. The C guard
+// disables pthread cancellation while Rust owns an input buffer/runtime lock.
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ntcp_packetdrill_net_send_segmented(
+    userdata: *mut c_void,
+    input: *const c_void,
+    len: usize,
+    segment_size: u16,
+) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    core::arch::naked_asm!("jmp ntcp_c_packet_net_send_segmented");
+    #[cfg(target_arch = "aarch64")]
+    core::arch::naked_asm!("b ntcp_c_packet_net_send_segmented");
+}
+#[unsafe(no_mangle)]
+unsafe extern "C" fn ntcp_net_send_segmented_impl(
+    userdata: *mut c_void,
+    input: *const c_void,
+    len: usize,
+    segment_size: u16,
+) -> i32 {
+    result(|| {
+        if ntcp_plugin_active(userdata) == 0 {
+            return Err(EIO);
+        }
+        let size = core::num::NonZeroU16::new(segment_size).ok_or(EINVAL)?;
+        if len > 65535 {
+            return Err(EMSGSIZE);
+        }
+        let mut bytes = vec![0; len];
+        memory(bytes.as_mut_ptr(), input.cast_mut().cast(), len, false)?;
+        packet_test::inject_segmented(bytes, size)?;
+        Ok(0)
+    }) as i32
+}
+
 #[unsafe(no_mangle)]
 unsafe extern "C" fn ntcp_net_receive(
     userdata: *mut c_void,

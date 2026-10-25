@@ -4,7 +4,7 @@ use super::*;
 
 pub(super) struct PacketBackend {
     pub(super) profile: crate::packet_profile::Profile,
-    input: VecDeque<Vec<u8>>,
+    input: VecDeque<(Vec<u8>, Option<core::num::NonZeroU16>)>,
     pub(super) output: VecDeque<Reply>,
     capacity: usize,
     pub(super) local_reject: bool,
@@ -25,11 +25,19 @@ impl PacketBackend {
             mark: 0,
         })
     }
+    #[cfg(test)]
     pub(super) fn inject(&mut self, bytes: Vec<u8>) -> Result<()> {
+        self.inject_segmented(bytes, None)
+    }
+    pub(super) fn inject_segmented(
+        &mut self,
+        bytes: Vec<u8>,
+        size: Option<core::num::NonZeroU16>,
+    ) -> Result<()> {
         if self.input.len() == self.capacity {
             return Err(EAGAIN);
         }
-        self.input.push_back(bytes);
+        self.input.push_back((bytes, size));
         Ok(())
     }
 }
@@ -48,15 +56,25 @@ impl PacketIo for PacketBackend {
         Ok(())
     }
     fn receive(&mut self, out: &mut [u8]) -> std::io::Result<Option<usize>> {
-        let Some(packet) = self.input.front() else {
+        self.receive_with_metadata(out).map(|r| r.map(|p| p.len))
+    }
+    fn receive_with_metadata(
+        &mut self,
+        out: &mut [u8],
+    ) -> std::io::Result<Option<ntcp_io::ReceivedPacket>> {
+        let Some((packet, _)) = self.input.front() else {
             return Ok(None);
         };
         if packet.len() > out.len() {
             return Err(std::io::Error::from_raw_os_error(EMSGSIZE));
         }
-        let packet = self.input.pop_front().unwrap();
+        let (packet, tcp_segment_size) = self.input.pop_front().unwrap();
         out[..packet.len()].copy_from_slice(&packet);
-        Ok(Some(packet.len()))
+        Ok(Some(ntcp_io::ReceivedPacket {
+            len: packet.len(),
+            timestamps: Default::default(),
+            tcp_segment_size,
+        }))
     }
     fn transmit(&mut self, packet: &[u8]) -> std::io::Result<TxOutcome> {
         if self.local_reject {

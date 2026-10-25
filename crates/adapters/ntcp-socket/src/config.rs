@@ -52,6 +52,7 @@ pub struct IoConfig {
     pub output_reservation_timeout_ms: u32,
     pub egress_capacity: usize,
     pub gso: Option<ntcp::GsoLimits>,
+    pub receive_aggregation: bool,
 }
 
 fn invalid() -> io::Error {
@@ -86,11 +87,15 @@ impl SocketConfig {
                 output_reservation_timeout_ms: 1000,
                 egress_capacity: crate::runtime::BUDGET,
                 gso: None,
+                receive_aggregation: false,
             },
         }
     }
 
     pub fn validate(&self) -> io::Result<()> {
+        if self.io.receive_aggregation && self.io.backend != Backend::AfPacket {
+            return Err(invalid());
+        }
         if self.io.gso.is_some_and(|limits| {
             limits.max_bytes == 0
                 || limits.max_bytes > u32::MAX as usize / 2
@@ -245,6 +250,13 @@ impl SocketConfig {
                 "io.address" => config.io.address = value.parse().map_err(|_| invalid())?,
                 "io.prefix" => config.io.prefix = Some(number(value)?),
                 "io.egress_capacity" => config.io.egress_capacity = number(value)?,
+                "io.receive_aggregation" => {
+                    config.io.receive_aggregation = match value {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err(invalid()),
+                    }
+                }
                 "io.gso_max_bytes" => gso_bytes = Some(number(value)?),
                 "io.gso_max_segments" => gso_segments = Some(number(value)?),
                 "io.output_reservation_timeout_ms" => {

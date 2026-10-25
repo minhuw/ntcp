@@ -20,6 +20,10 @@ extern void ntcp_free(void *);
 extern int ntcp_plugin_active(void *);
 extern int ntcp_net_send(void *, const void *, size_t);
 extern int ntcp_net_receive(void *, void *, size_t *, long long *);
+extern int ntcp_net_send_segmented_impl(void *, const void *, size_t, uint16_t);
+int ntcp_c_packet_net_send_segmented(void *u,const void *p,size_t n,uint16_t size) {
+    return NTCP_RUST_CALL(int, ntcp_net_send_segmented_impl(u,p,n,size));
+}
 static int unsupported(const char *why) {
     fprintf(stderr, "NTCP_PACKETDRILL_UNSUPPORTED: %s\n", why);
     errno = ENOSYS; return -1;

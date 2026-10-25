@@ -107,6 +107,10 @@ impl Owner {
         let next_hop = config.io.next_hop_mac.ok_or(EINVAL)?;
         let mut io = AfPacket::bind(index, ntcp_ethernet::ETHERTYPE_IPV4)
             .map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
+        if config.io.receive_aggregation {
+            io.enable_receive_aggregation()
+                .map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
+        }
         let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
         if name.as_bytes_with_nul().len() > request.ifr_name.len() {
             return Err(EINVAL);
@@ -189,32 +193,30 @@ impl Owner {
             return backend.io.receive_with_metadata(out);
         }
         let software = self.software_rx_enabled();
-        let Some(len) = self.receive_ip_backend(out)? else {
+        let Some(mut packet) = self.receive_ip_backend(out)? else {
             return Ok(None);
         };
-        Ok(Some(ReceivedPacket {
-            len,
-            timestamps: PacketTimestamps {
-                software: software.then(|| PacketTimestamp {
-                    value: timestamps::realtime(),
-                    source: TimestampSource::Software,
-                    point: TimestampPoint::UserReceive,
-                    clock: ntcp_io::ClockDescriptor {
-                        domain: ClockDomain::Realtime,
-                        unit: TimestampUnit::Nanoseconds,
-                    },
-                }),
-                hardware: None,
-            },
-        }))
+        packet.timestamps = PacketTimestamps {
+            software: software.then(|| PacketTimestamp {
+                value: timestamps::realtime(),
+                source: TimestampSource::Software,
+                point: TimestampPoint::UserReceive,
+                clock: ntcp_io::ClockDescriptor {
+                    domain: ClockDomain::Realtime,
+                    unit: TimestampUnit::Nanoseconds,
+                },
+            }),
+            hardware: None,
+        };
+        Ok(Some(packet))
     }
-    fn receive_ip_backend(&mut self, out: &mut [u8]) -> std::io::Result<Option<usize>> {
+    fn receive_ip_backend(&mut self, out: &mut [u8]) -> std::io::Result<Option<ReceivedPacket>> {
         #[cfg(feature = "packet-test")]
         if let Some(packets) = &mut self.packets {
-            return packets.receive(out);
+            return packets.receive_with_metadata(out);
         }
         match &mut self.tun {
-            Some(tun) => tun.receive(out),
+            Some(tun) => tun.receive_with_metadata(out),
             None => Ok(None),
         }
     }
@@ -280,7 +282,11 @@ impl Owner {
                     } else {
                         bytes
                     };
-                    self.input_ip(bytes, core_stamps(received.timestamps));
+                    self.input_ip_metadata(
+                        bytes,
+                        core_stamps(received.timestamps),
+                        received.tcp_segment_size,
+                    );
                 }
                 Ok(None) => break,
                 Err(e)
@@ -299,7 +305,16 @@ impl Owner {
     //= reason=Native IPv4 input validates codec output then dispatches quoted tuple/sequence to endpoint policy; tests reject wrong checksum/tuple/window and observe bounded output after valid PTB.
     //# Upon receipt of such a message (henceforth called a "Datagram Too Big" message), the
     //# source host reduces its assumed PMTU for the path.
+    #[cfg(test)]
     pub(super) fn input_ip(&mut self, bytes: &[u8], stamps: ntcp::RxPacketTimestamps) {
+        self.input_ip_metadata(bytes, stamps, None);
+    }
+    pub(super) fn input_ip_metadata(
+        &mut self,
+        bytes: &[u8],
+        stamps: ntcp::RxPacketTimestamps,
+        segment_size: Option<core::num::NonZeroU16>,
+    ) {
         let Ok(p) = ntcp_ip::parse(bytes, false) else {
             return;
         };
@@ -307,7 +322,14 @@ impl Owner {
             return;
         }
         if p.protocol == 6 {
-            let _ = self.input_stamped(self.now(), p.ip, p.traffic_class, p.payload, stamps);
+            let _ = self.input_segmented(
+                self.now(),
+                p.ip,
+                p.traffic_class,
+                p.payload,
+                stamps,
+                segment_size,
+            );
         } else if let Ok(feedback) = ntcp_icmp::decode_icmp(bytes) {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2
             //= reason=Validated native IPv4 ICMP is correlated using its quoted outbound tuple and live sequence at Endpoint; soft errors stay nonterminal, PTB keeps its exact-sent PMTU validation.
