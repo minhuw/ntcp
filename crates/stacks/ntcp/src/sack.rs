@@ -53,6 +53,10 @@ impl Scoreboard {
         self.ranges.capacity() * core::mem::size_of::<(Seq, Seq)>()
     }
 
+    pub(crate) fn admits_bytes(&self, bytes: usize) -> bool {
+        bytes.div_ceil(2) <= self.capacity
+    }
+
     pub(crate) fn grown(&self, send_capacity: usize) -> Result<Self, ()> {
         let mut result = Self::with_capacity(send_capacity)?;
         result.ranges[..self.len].copy_from_slice(&self.ranges[..self.len]);
@@ -87,7 +91,7 @@ impl Scoreboard {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc2018#section-5
-    //= reason=Admission preallocates ceil(send_capacity/2) intervals plus four temporary slots: every possible disjoint byte union inside the configured flight fits, without incoming-SACK allocation.
+    //= reason=Write admission backs ceil(admitted_send_bytes/2) intervals plus four temporary slots: every possible disjoint byte union inside the admitted flight fits, without incoming-SACK allocation.
     //# When receiving an ACK containing a SACK option, the data sender SHOULD
     //# record the selective acknowledgment for future reference.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-3
@@ -525,7 +529,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc2018#section-5
     //= type=test
-    //= reason=Admission preallocates ceil(send_capacity/2) intervals plus four temporary slots: every possible disjoint byte union inside the configured flight fits, without incoming-SACK allocation.
+    //= reason=Write admission backs ceil(admitted_send_bytes/2) intervals plus four temporary slots: every possible disjoint byte union inside the admitted flight fits, without incoming-SACK allocation.
     //# When receiving an ACK containing a SACK option, the data sender SHOULD
     //# record the selective acknowledgment for future reference.
     //= https://www.rfc-editor.org/rfc/rfc6675#section-3

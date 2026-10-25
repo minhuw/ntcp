@@ -909,10 +909,8 @@ impl Connection {
         //= reason=All initial-window choices share RFC6298 estimator and connection timer/sampling implementation. Default/configured >=1s floors retain the recommended floor; explicit subsecond Linux compatibility is a scoped departure, not universal inherited conformance.
         //# Implementations must also follow RFC 6298 [RFC6298] in order to avoid spurious RTO as described in Section 9.
         let rtt = RttEstimator::with_timebase(config.rto_min_us, config.timebase);
-        let rack = Rack::with_timebase(config.send_capacity + 2, config.timebase)
-            .map_err(|_| Error::NoMemory)?;
-        let scoreboard =
-            Scoreboard::with_capacity(config.send_capacity).map_err(|_| Error::NoMemory)?;
+        let rack = Rack::with_timebase(2, config.timebase).map_err(|_| Error::NoMemory)?;
+        let scoreboard = Scoreboard::with_capacity(0).map_err(|_| Error::NoMemory)?;
         // Take pooled storage only after every fallible allocation has succeeded.
         let receive = match receive.take() {
             Some(receive) => receive,
@@ -1254,11 +1252,7 @@ impl Connection {
         let grow_send = send > self.send.allocation_capacity();
         // Stage every allocation before changing any quota or live protocol state.
         let sender = if grow_send {
-            Some((
-                self.send.resized(send).map_err(|_| Error::NoMemory)?,
-                self.scoreboard.grown(send).map_err(|_| Error::NoMemory)?,
-                self.rack.grown(send).map_err(|_| Error::NoMemory)?,
-            ))
+            Some(self.send.resized(send).map_err(|_| Error::NoMemory)?)
         } else {
             None
         };
@@ -1267,9 +1261,8 @@ impl Connection {
         } else {
             None
         };
-        let staged_bytes = sender.as_ref().map_or(0, |(send, scoreboard, rack)| {
-            send.storage_bytes() + scoreboard.storage_bytes() + rack.allocation_bytes()
-        }) + receiver.as_ref().map_or(0, ReceiveBuffer::storage_bytes);
+        let staged_bytes = sender.as_ref().map_or(0, SendBuffer::storage_bytes)
+            + receiver.as_ref().map_or(0, ReceiveBuffer::storage_bytes);
         if self
             .buffer_charge()
             .checked_add(staged_bytes)
@@ -1278,15 +1271,12 @@ impl Connection {
             return Err(Error::NoMemory);
         }
         // The final retained charge is distinct from the transient peak.
-        let (staged_send, staged_scoreboard, staged_rack) = sender.as_ref().map_or(
-            (&self.send, &self.scoreboard, &self.rack),
-            |(send, scoreboard, rack)| (send, scoreboard, rack),
-        );
+        let staged_send = sender.as_ref().unwrap_or(&self.send);
         if Self::retained_charge(
             staged_send,
             receiver.as_ref().unwrap_or(&self.receive),
-            staged_scoreboard,
-            staged_rack,
+            &self.scoreboard,
+            &self.rack,
             self.scratch.capacity(),
         ) + self.tx_timestamps.storage_bytes()
             + self.rx_timestamps.storage_bytes()
@@ -1294,10 +1284,8 @@ impl Connection {
         {
             return Err(Error::NoMemory);
         }
-        if let Some((buffer, scoreboard, rack)) = sender {
+        if let Some(buffer) = sender {
             self.send = buffer;
-            self.scoreboard = scoreboard;
-            self.rack = rack;
         }
         if let Some(buffer) = receiver {
             self.receive = buffer;
@@ -1355,10 +1343,19 @@ impl Connection {
         self.handshake_complete
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_fast_open(
         &mut self,
         cached: Option<crate::fast_open::CachedCookie>,
         initial: &[u8],
+    ) -> Result<usize, Error> {
+        self.prepare_fast_open_with_budget(cached, initial, usize::MAX)
+    }
+    pub(crate) fn prepare_fast_open_with_budget(
+        &mut self,
+        cached: Option<crate::fast_open::CachedCookie>,
+        initial: &[u8],
+        max_charge: usize,
     ) -> Result<usize, Error> {
         self.fast_open = Some(cached.map_or(wire::FastOpenCookie::request(), |c| c.cookie));
         let Some(cached) = cached else {
@@ -1382,6 +1379,7 @@ impl Connection {
         }
         // Defer the internal automatic PUSH; explicit application marks still
         // apply to SYN data and are never suppressed by the output path.
+        self.prepare_send_metadata(count, None, max_charge, None)?;
         let count = self.write_with_push(&initial[..count], false)?;
         self.fast_open_initial = count;
         self.deferred_tfo_push = true;
@@ -4010,6 +4008,103 @@ impl Connection {
             .min(usize::try_from(cursor_room).unwrap_or(usize::MAX))
     }
 
+    // Stage both sender ledgers before accepting any bytes. The existing
+    // conservative connection charge still reserves the configured worst case;
+    // physical backing follows admitted live bytes, with geometric growth and
+    // no allocation from ACK, output, SACK or timeout processing.
+    pub(crate) fn prepare_send_metadata(
+        &mut self,
+        bytes: usize,
+        lowat: Option<u32>,
+        max_charge: usize,
+        timestamp: Option<TxTimestampRequest>,
+    ) -> Result<(), Error> {
+        if self.shutdown
+            || !matches!(
+                self.state,
+                State::SynSent | State::SynReceived | State::Established | State::CloseWait
+            )
+        {
+            return Err(Error::InvalidState);
+        }
+        if bytes == 0 {
+            return Ok(());
+        }
+        if let Some(request) = timestamp {
+            self.tx_timestamps.admit(request)?;
+        }
+        let accepted = bytes.min(self.send_admission_room(lowat));
+        if accepted == 0 {
+            return Ok(());
+        }
+        let live = self
+            .send
+            .len()
+            .checked_add(accepted)
+            .ok_or(Error::NoMemory)?;
+        let grow_rack = !self.rack.admits_bytes(live);
+        let grow_scoreboard = !self.scoreboard.admits_bytes(live);
+        if !grow_rack && !grow_scoreboard {
+            return Ok(());
+        }
+        let limit = self.send.allocation_capacity();
+        let target = live.checked_next_power_of_two().unwrap_or(limit).min(limit);
+        let existing = self.send.storage_bytes()
+            + self.receive.storage_bytes()
+            + self.rack.allocation_bytes()
+            + self.scoreboard.storage_bytes()
+            + self.scratch.capacity()
+            + self.tx_timestamps.storage_bytes()
+            + self.rx_timestamps.storage_bytes();
+        let staged = if grow_rack {
+            self.rack.growth_bytes(target).ok_or(Error::NoMemory)?
+        } else {
+            0
+        };
+        let staged = staged
+            .checked_add(if grow_scoreboard {
+                Scoreboard::allocation_bytes(target).ok_or(Error::NoMemory)?
+            } else {
+                0
+            })
+            .ok_or(Error::NoMemory)?;
+        if existing
+            .checked_add(staged)
+            .is_none_or(|peak| peak > max_charge)
+        {
+            return Err(Error::NoMemory);
+        }
+        let rack = if grow_rack {
+            Some(
+                self.rack
+                    .prepare_growth(target)
+                    .map_err(|_| Error::NoMemory)?,
+            )
+        } else {
+            None
+        };
+        let scoreboard = if grow_scoreboard {
+            Some(self.scoreboard.grown(target).map_err(|_| Error::NoMemory)?)
+        } else {
+            None
+        };
+        let actual = rack.as_ref().map_or(0, |growth| growth.allocation_bytes())
+            + scoreboard.as_ref().map_or(0, Scoreboard::storage_bytes);
+        if existing
+            .checked_add(actual)
+            .is_none_or(|peak| peak > max_charge)
+        {
+            return Err(Error::NoMemory);
+        }
+        if let Some(rack) = rack {
+            self.rack.commit_growth(rack, target);
+        }
+        if let Some(scoreboard) = scoreboard {
+            self.scoreboard = scoreboard;
+        }
+        Ok(())
+    }
+
     fn queue_write(
         &mut self,
         data: &[u8],
@@ -4033,6 +4128,7 @@ impl Connection {
             }
             return Ok(0);
         }
+        self.prepare_send_metadata(data.len(), lowat, usize::MAX, None)?;
         let application_idle = !self.application_timer_needed();
         let idle = !self.user_timer_needed();
         let room = self.send_admission_room(lowat);
@@ -10497,6 +10593,10 @@ mod tests {
         (a, b)
     }
 
+    mod sender_metadata {
+        include!("connection_sender_metadata_tests.rs");
+    }
+
     mod pto_margin {
         include!("connection_pto_margin_tests.rs");
     }
@@ -11312,7 +11412,7 @@ mod tests {
             ],
         );
         let before_sack = a.scoreboard.ranges().to_vec();
-        for allocation in 0..6 {
+        for allocation in 0..4 {
             let result = crate::allocation_tests::fail_after(allocation, || {
                 a.set_buffer_capacities(256, 256, usize::MAX)
             });
@@ -11324,9 +11424,7 @@ mod tests {
         }
         a.set_buffer_capacities(256, 256, usize::MAX).unwrap();
         assert_eq!(a.scoreboard.ranges(), &before_sack);
-        let mut rack_debug = alloc::format!("{:?}", a.rack);
-        rack_debug = rack_debug.replace("capacity: 258", "capacity: 130");
-        assert_eq!(rack_debug, before_rack);
+        assert_eq!(alloc::format!("{:?}", a.rack), before_rack);
         a.set_buffer_capacities(4, 4, usize::MAX).unwrap();
         assert_eq!(a.write(b"!"), Err(Error::WouldBlock));
         assert!(!a.take_events().writable);

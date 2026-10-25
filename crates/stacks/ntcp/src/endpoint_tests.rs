@@ -4559,7 +4559,7 @@ fn buffer_quotas_live_resize_retention_failure_and_reclamation() {
     );
     a.set_buffer_capacities(client, 128, 128).unwrap();
     assert_eq!(a.buffer_bytes(), grown_charge);
-    for allocation in 0..6 {
+    for allocation in 0..4 {
         assert_eq!(
             crate::allocation_tests::fail_after(allocation, || a
                 .set_buffer_capacities(client, 4096, 4096)),
@@ -4766,6 +4766,10 @@ fn tx_timestamp_backend_backpressure_coalesced_callbacks_and_late_hardware() {
         Err(EndpointError::Connection(Error::WouldBlock))
     );
     a.set_tx_timestamp_capacity(client, 8).unwrap();
+    assert_eq!(
+        a.prepare_write_admission(client, 4, None, request(1)),
+        Ok(4)
+    );
     for (cookie, bytes, more) in [(1, &b"ab"[..], true), (2, &b"cd"[..], false)] {
         crate::allocation_tests::fail_after(0, || {
             assert_eq!(
@@ -5450,6 +5454,7 @@ fn checked_external_write_admission_covers_bytes_phases_and_shutdown() {
     a.set_tx_timestamp_capacity(client, 3).unwrap();
     a.set_buffer_capacities(client, 32, 32).unwrap();
     let charged = a.buffer_bytes();
+    assert_eq!(a.prepare_write_admission(client, 32, None, request), Ok(32));
     crate::allocation_tests::fail_after(0, || {
         assert_eq!(a.check_write_admission(client, None, request), Ok(32));
         assert_eq!(

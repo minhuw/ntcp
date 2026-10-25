@@ -5,6 +5,7 @@ use crate::{
     sack::Scoreboard,
     seq::Seq,
 };
+#[cfg(test)]
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
@@ -121,7 +122,7 @@ pub(crate) struct Counts {
 pub(crate) struct Rack {
     // No Clone/snapshot on packet paths: split copies one Interval and all
     // pushes/inserts stay inside the fallibly reserved admission capacity.
-    intervals: Vec<Interval>,
+    intervals: storage::Intervals,
     capacity: usize,
     selection_generation: u64,
     departure_selection: Option<DepartureSelection>,
@@ -152,6 +153,10 @@ fn sent_after(a: (u64, Seq), b: (u64, Seq)) -> bool {
     a.0 > b.0 || a.0 == b.0 && after(a.1, b.1)
 }
 
+mod storage {
+    include!("rack_storage.rs");
+}
+
 impl Rack {
     #[cfg(test)]
     fn new() -> Result<Self, ()> {
@@ -161,14 +166,22 @@ impl Rack {
     // One interval per outstanding octet is the worst case after arbitrary
     // retransmission/SACK splits; reserve control space as well.
     pub(crate) fn allocation_bytes(&self) -> usize {
-        self.intervals.capacity() * core::mem::size_of::<Interval>()
+        self.intervals.allocation_bytes()
     }
 
+    pub(crate) fn admits_bytes(&self, bytes: usize) -> bool {
+        bytes
+            .checked_add(2)
+            .is_some_and(|needed| needed <= self.capacity)
+    }
+
+    #[cfg(test)]
     pub(crate) fn grown(&self, send_capacity: usize) -> Result<Self, ()> {
         let capacity = send_capacity.checked_add(2).ok_or(())?;
-        let mut intervals = Vec::new();
-        intervals.try_reserve_exact(capacity).map_err(|_| ())?;
-        intervals.extend_from_slice(&self.intervals);
+        let mut intervals = storage::Intervals::new(capacity)?;
+        for interval in self.intervals.iter() {
+            intervals.push(*interval);
+        }
         Ok(Self {
             intervals,
             capacity,
@@ -176,10 +189,22 @@ impl Rack {
         })
     }
 
+    pub(crate) fn growth_bytes(&self, send_capacity: usize) -> Option<usize> {
+        self.intervals.growth_bytes(send_capacity.checked_add(2)?)
+    }
+
+    pub(crate) fn prepare_growth(&self, send_capacity: usize) -> Result<storage::Growth, ()> {
+        self.intervals
+            .prepare_growth(send_capacity.checked_add(2).ok_or(())?)
+    }
+
+    pub(crate) fn commit_growth(&mut self, growth: storage::Growth, send_capacity: usize) {
+        self.intervals.commit_growth(growth);
+        self.capacity = send_capacity + 2;
+    }
+
     pub(crate) fn storage_bytes(send_capacity: usize) -> Option<usize> {
-        send_capacity
-            .checked_add(2)?
-            .checked_mul(core::mem::size_of::<Interval>())
+        storage::Intervals::storage_bytes(send_capacity.checked_add(2)?)
     }
 
     #[cfg(test)]
@@ -188,8 +213,7 @@ impl Rack {
     }
 
     pub(crate) fn with_timebase(capacity: usize, timebase: CallerTimebase) -> Result<Self, ()> {
-        let mut intervals = Vec::new();
-        intervals.try_reserve_exact(capacity).map_err(|_| ())?;
+        let intervals = storage::Intervals::new(capacity)?;
         Ok(Self {
             intervals,
             capacity,
@@ -246,8 +270,9 @@ impl Rack {
             .iter()
             .position(|r| !after(r.start, seq) && after(r.end, seq))?;
         let head = self.intervals[index];
-        let end = self.intervals[index..]
-            .iter()
+        let end = self
+            .intervals
+            .range(index, self.intervals.len())
             .take_while(|r| {
                 r.original_start == head.original_start
                     && r.original_end == head.original_end
@@ -301,8 +326,9 @@ impl Rack {
             .iter()
             .position(|r| !after(r.start, start) && after(r.end, start))?;
         let head = self.intervals[first];
-        let end = self.intervals[first..]
-            .iter()
+        let end = self
+            .intervals
+            .range(first, self.intervals.len())
             .take_while(|r| {
                 r.sent == head.sent
                     && r.transmission_start == head.transmission_start
@@ -622,7 +648,7 @@ impl Rack {
     }
 
     // Called only after encoding succeeds. Production reserves one interval
-    // per send-buffer byte plus control space; byte-edge splits cannot exhaust
+    // per admitted send-buffer byte plus control space; byte-edge splits cannot exhaust
     // that backing. Undersized synthetic ledgers retain a defensive fallback.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-4
     //= reason=Capacity-backed intervals retain every committed original/retransmission timestamp, including arbitrary byte splits, in caller ticks without microsecond truncation. Physical precision finer than min_RTT/4 is a caller precondition, never measured or runtime-gated; violation leaves protocol timing guarantees unspecified, not Rust UB or memory-safety violations.
@@ -658,18 +684,24 @@ impl Rack {
                 self.abandon(boundary);
                 return;
             }
-            for segment in self.intervals.chunk_by_mut(|a, b| {
-                a.original_wire_start == b.original_wire_start
-                    && a.original_wire_end == b.original_wire_end
-            }) {
-                if segment
-                    .iter()
-                    .any(|r| after(end, r.start) && after(r.end, start))
+            let mut first = 0;
+            while first < self.intervals.len() {
+                let head = self.intervals[first];
+                let mut last = first + 1;
+                while last < self.intervals.len()
+                    && self.intervals[last].original_wire_start == head.original_wire_start
+                    && self.intervals[last].original_wire_end == head.original_wire_end
                 {
-                    for r in segment {
-                        r.original_retransmitted = true;
+                    last += 1;
+                }
+                if (first..last).any(|i| {
+                    after(end, self.intervals[i].start) && after(self.intervals[i].end, start)
+                }) {
+                    for i in first..last {
+                        self.intervals[i].original_retransmitted = true;
                     }
                 }
+                first = last;
             }
             for r in &mut self.intervals {
                 if !after(start, r.start) && !after(r.end, end) {
@@ -741,8 +773,7 @@ impl Rack {
             if !self.intervals[end].stats_flag(DELIVERY_END) {
                 continue;
             }
-            let packet = &mut self.intervals[start..=end];
-            let complete = packet.iter().all(|r| {
+            let complete = self.intervals.range(start, end + 1).all(|r| {
                 r.departure_committed
                     && (!after(r.end, ack)
                         || scoreboard.is_some_and(|s| {
@@ -751,14 +782,18 @@ impl Rack {
                         }))
             });
             if complete {
-                let newly_delivered = packet
-                    .iter()
+                let newly_delivered = self
+                    .intervals
+                    .range(start, end + 1)
                     .any(|r| !r.stats_flag(PACKET_DELIVERED) && !r.stats_flag(SYN_PAYLOAD));
-                let includes_fin = packet.iter().any(|r| r.stats_flag(PACKET_INCLUDES_FIN));
+                let includes_fin = self
+                    .intervals
+                    .range(start, end + 1)
+                    .any(|r| r.stats_flag(PACKET_INCLUDES_FIN));
                 if newly_delivered && self.delivered_segments_valid {
                     self.delivered_segments = self.delivered_segments.saturating_add(1);
                 }
-                for r in packet {
+                for r in self.intervals.range_mut(start, end + 1) {
                     r.set_stats_flag(PACKET_DELIVERED, true);
                     if includes_fin && newly_delivered {
                         r.set_stats_flag(PACKET_INCLUDES_FIN, true);
@@ -1249,11 +1284,11 @@ impl Rack {
             if !self.intervals[end].stats_flag(DELIVERY_END) {
                 continue;
             }
-            let packet = &self.intervals[start..=end];
+            let packet = || self.intervals.range(start, end + 1);
             counts.unacked += 1;
-            counts.sacked += u32::from(packet.iter().all(|r| r.sacked));
-            counts.lost += u32::from(packet.iter().any(|r| r.original_lost && !r.sacked));
-            counts.retransmitted += u32::from(packet.iter().any(|r| {
+            counts.sacked += u32::from(packet().all(|r| r.sacked));
+            counts.lost += u32::from(packet().any(|r| r.original_lost && !r.sacked));
+            counts.retransmitted += u32::from(packet().any(|r| {
                 r.stats_flag(DIAGNOSTIC_RETRY) && !r.stats_flag(DIAGNOSTIC_LOST) && !r.sacked
             }));
             start = end + 1;
@@ -1267,22 +1302,30 @@ impl Rack {
 
     fn count_by_original(&self, physical: bool) -> Counts {
         let mut counts = Counts::default();
-        for segment in self.intervals.chunk_by(|a, b| {
-            if physical {
-                a.original_wire_start == b.original_wire_start
-                    && a.original_wire_end == b.original_wire_end
-            } else {
-                a.original_end == b.original_end
+        let mut first = 0;
+        while first < self.intervals.len() {
+            let a = self.intervals[first];
+            let mut last = first + 1;
+            while last < self.intervals.len() {
+                let b = self.intervals[last];
+                let same = if physical {
+                    a.original_wire_start == b.original_wire_start
+                        && a.original_wire_end == b.original_wire_end
+                } else {
+                    a.original_end == b.original_end
+                };
+                if !same {
+                    break;
+                }
+                last += 1;
             }
-        }) {
+            let segment = || self.intervals.range(first, last);
             counts.unacked += 1;
-            counts.sacked += u32::from(segment.iter().all(|r| r.sacked));
-            counts.lost += u32::from(segment.iter().any(|r| r.original_lost && !r.sacked));
-            counts.retransmitted += u32::from(
-                segment
-                    .iter()
-                    .any(|r| r.retransmitted && !r.sacked && !r.needs_retransmit),
-            );
+            counts.sacked += u32::from(segment().all(|r| r.sacked));
+            counts.lost += u32::from(segment().any(|r| r.original_lost && !r.sacked));
+            counts.retransmitted +=
+                u32::from(segment().any(|r| r.retransmitted && !r.sacked && !r.needs_retransmit));
+            first = last;
         }
         counts
     }
@@ -1294,6 +1337,43 @@ mod tests {
 
     mod statistics {
         include!("rack_statistics_tests.rs");
+    }
+
+    #[test]
+    fn blocked_storage_preserves_cross_block_packet_identity_and_byte_splits() {
+        let mut rack = Rack::with_capacity(2048).unwrap();
+        let base = Seq(u32::MAX - 1000);
+        let end = base.wrapping_add(2048);
+        rack.transmit(base, end, 10, false);
+        let token = rack.departure_selection().unwrap();
+        assert!(rack.commit_departure(token, base, end, 10));
+        crate::allocation_tests::fail_after(0, || {
+            for byte in 0..2048 {
+                rack.transmit(
+                    base.wrapping_add(byte),
+                    base.wrapping_add(byte + 1),
+                    20,
+                    true,
+                );
+            }
+            assert!(rack.valid());
+            assert_eq!(rack.intervals.len(), 2048);
+            assert_eq!(rack.counts().unacked, 1);
+            assert_eq!(rack.counts().retransmitted, 1);
+            assert_eq!(
+                rack.head_transmission(base),
+                Some((base.wrapping_add(1), 20))
+            );
+        });
+        let first = rack.intervals.as_ptr();
+        let grown = rack.prepare_growth(4094).unwrap();
+        rack.commit_growth(grown, 4094);
+        assert_eq!(rack.intervals.as_ptr(), first); // Full blocks never move.
+        crate::allocation_tests::fail_after(0, || rack.trim_cumulative(base.wrapping_add(1500)));
+        assert_eq!(rack.intervals.len(), 548);
+        assert_eq!(rack.intervals[0].start, base.wrapping_add(1500));
+        assert_eq!(rack.intervals.last().unwrap().end, end);
+        assert_eq!(rack.counts().unacked, 1);
     }
 
     mod local_repair {

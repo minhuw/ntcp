@@ -409,6 +409,15 @@ impl Owner {
             }
             room
         };
+        // Reserve fallible sender metadata before a pipe/file producer can
+        // consume bytes. The owner keeps this admission transaction exclusive.
+        let room = if capacity == 0 {
+            0
+        } else {
+            self.endpoint
+                .prepare_write_admission(cid, capacity.min(room), lowat, request)
+                .map_err(engine)?
+        };
         let produced = produce(capacity.min(room))?;
         let bytes = produced.as_ref();
         assert!(bytes.len() <= capacity.min(room));

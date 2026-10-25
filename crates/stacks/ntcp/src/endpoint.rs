@@ -1488,10 +1488,18 @@ impl Endpoint {
             0,
             RxPacketTimestamps::default(),
         )?;
+        let old_charge = connection.buffer_charge();
         let accepted = match if suppressed {
             Ok(0)
         } else {
-            connection.prepare_fast_open(cached, initial)
+            connection.prepare_fast_open_with_budget(
+                cached,
+                initial,
+                self.config
+                    .max_buffer_bytes
+                    .saturating_sub(self.buffer_bytes)
+                    .saturating_add(connection.buffer_charge()),
+            )
         } {
             Ok(count) => count,
             Err(error) => {
@@ -1499,6 +1507,7 @@ impl Endpoint {
                 return Err(error.into());
             }
         };
+        self.buffer_bytes = self.buffer_bytes - old_charge + connection.buffer_charge();
         self.insert(connection, None, None).map(|id| (id, accepted))
     }
 
@@ -2469,10 +2478,34 @@ impl Endpoint {
         Ok(InputDisposition::Processed)
     }
 
-    pub fn write(&mut self, id: ConnectionId, bytes: &[u8]) -> Result<usize, EndpointError> {
+    fn prepare_write_metadata(
+        &mut self,
+        id: ConnectionId,
+        len: usize,
+        lowat: Option<u32>,
+        timestamp: Option<TxTimestampRequest>,
+    ) -> Result<(), EndpointError> {
         if self.is_output_reserved(id) {
             return Err(EndpointError::OutputReserved);
         }
+        let own_charge = self.slot(id)?.connection.buffer_charge();
+        let available = self
+            .config
+            .max_buffer_bytes
+            .saturating_sub(self.buffer_bytes)
+            .saturating_add(own_charge);
+        self.slot_mut(id)?
+            .connection
+            .prepare_send_metadata(len, lowat, available, timestamp)?;
+        // The conservative reservation normally covers all physical backing;
+        // retain exact accounting if an allocator rounds a block above it.
+        self.buffer_bytes =
+            self.buffer_bytes - own_charge + self.slot(id)?.connection.buffer_charge();
+        Ok(())
+    }
+
+    pub fn write(&mut self, id: ConnectionId, bytes: &[u8]) -> Result<usize, EndpointError> {
+        self.prepare_write_metadata(id, bytes.len(), None, None)?;
         let count = self.slot_mut(id)?.connection.write(bytes)?;
         self.refresh(id.slot);
         Ok(count)
@@ -2483,9 +2516,7 @@ impl Endpoint {
         bytes: &[u8],
         push: bool,
     ) -> Result<usize, EndpointError> {
-        if self.is_output_reserved(id) {
-            return Err(EndpointError::OutputReserved);
-        }
+        self.prepare_write_metadata(id, bytes.len(), None, None)?;
         let count = self.slot_mut(id)?.connection.write_with_push(bytes, push)?;
         self.refresh(id.slot);
         Ok(count)
@@ -2499,9 +2530,7 @@ impl Endpoint {
         more: bool,
         end_of_record: bool,
     ) -> Result<usize, EndpointError> {
-        if self.is_output_reserved(id) {
-            return Err(EndpointError::OutputReserved);
-        }
+        self.prepare_write_metadata(id, bytes.len(), None, None)?;
         let count = self
             .slot_mut(id)?
             .connection
@@ -2520,9 +2549,7 @@ impl Endpoint {
         end_of_record: bool,
         lowat: Option<u32>,
     ) -> Result<usize, EndpointError> {
-        if self.is_output_reserved(id) {
-            return Err(EndpointError::OutputReserved);
-        }
+        self.prepare_write_metadata(id, bytes.len(), lowat, None)?;
         let count = self
             .slot_mut(id)?
             .connection
@@ -2611,6 +2638,23 @@ impl Endpoint {
             .check_write_admission(lowat, request)?)
     }
 
+    /// Prepare bookkeeping for at most `capacity` bytes before consuming an
+    /// external producer. No bytes or timestamp requests are committed here.
+    /// Keep exclusive transaction ownership until the corresponding write;
+    /// another intervening write can consume the checked byte/phase credit.
+    pub fn prepare_write_admission(
+        &mut self,
+        id: ConnectionId,
+        capacity: usize,
+        lowat: Option<u32>,
+        request: TxTimestampRequest,
+    ) -> Result<usize, EndpointError> {
+        let room = self.check_write_admission(id, lowat, request)?;
+        let count = capacity.min(room);
+        self.prepare_write_metadata(id, count, lowat, Some(request))?;
+        Ok(count)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn write_with_timestamp(
         &mut self,
@@ -2621,9 +2665,7 @@ impl Endpoint {
         lowat: Option<u32>,
         request: TxTimestampRequest,
     ) -> Result<usize, EndpointError> {
-        if self.is_output_reserved(id) {
-            return Err(EndpointError::OutputReserved);
-        }
+        self.prepare_write_metadata(id, bytes.len(), lowat, Some(request))?;
         let count = self.slot_mut(id)?.connection.write_with_timestamp(
             bytes,
             more,
@@ -2803,9 +2845,7 @@ impl Endpoint {
         Ok(())
     }
     pub fn write_urgent(&mut self, id: ConnectionId, bytes: &[u8]) -> Result<usize, EndpointError> {
-        if self.is_output_reserved(id) {
-            return Err(EndpointError::OutputReserved);
-        }
+        self.prepare_write_metadata(id, bytes.len(), None, None)?;
         let count = self.slot_mut(id)?.connection.write_urgent(bytes)?;
         self.refresh(id.slot);
         Ok(count)
@@ -4619,6 +4659,51 @@ mod recovery_observation_tests {
             };
             assert_eq!(trace(1), trace(1000));
         }
+    }
+
+    #[test]
+    fn sender_metadata_global_peak_precedes_external_producer_admission() {
+        let config = EndpointConfig {
+            preallocate_connections: 0,
+            connection: ConnectionConfig {
+                send_capacity: 128,
+                receive_capacity: 1,
+                mss: 64,
+                ..ConnectionConfig::default()
+            },
+            ..EndpointConfig::default()
+        };
+        let mut endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
+        let id = endpoint
+            .connect(
+                0,
+                "192.0.2.1:40000".parse().unwrap(),
+                "192.0.2.2:8080".parse().unwrap(),
+            )
+            .unwrap();
+        let charged = endpoint.buffer_bytes();
+        endpoint.config.max_buffer_bytes = charged;
+        let request = TxTimestampRequest::default();
+        let result = crate::allocation_tests::fail_after(0, || {
+            endpoint.prepare_write_admission(id, 128, None, request)
+        });
+        assert_eq!(result, Err(Error::NoMemory.into()));
+        assert_eq!(endpoint.send_progress(id).unwrap().queued_end, 0);
+        assert_eq!(endpoint.buffer_bytes(), charged);
+        // The configured worst-case quota reserves final backing. A transient
+        // replacement also needs the previous two control-only ledgers alive.
+        endpoint.config.max_buffer_bytes += 4096;
+        assert_eq!(
+            endpoint.prepare_write_admission(id, 128, None, request),
+            Ok(128)
+        );
+        crate::allocation_tests::fail_after(0, || {
+            assert_eq!(
+                endpoint.write_with_timestamp(id, &[1; 128], false, true, None, request),
+                Ok(128)
+            );
+        });
+        assert_eq!(endpoint.buffer_bytes(), charged);
     }
 
     #[test]

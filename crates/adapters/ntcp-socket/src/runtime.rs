@@ -2617,6 +2617,49 @@ mod tests {
     mod route_policy {
         include!("runtime_route_tests.rs");
     }
+    #[test]
+    fn sender_metadata_failure_does_not_consume_external_producer() {
+        let mut config = SocketConfig::new("test", Ipv4Addr::new(10, 73, 0, 2)).tcp;
+        config.preallocate_connections = 0;
+        config.connection.send_capacity = 128;
+        config.connection.receive_capacity = 1;
+        config.connection.mss = 64;
+        let mut probe = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
+        probe
+            .connect(
+                0,
+                "10.73.0.2:40000".parse().unwrap(),
+                "10.73.0.3:8080".parse().unwrap(),
+            )
+            .unwrap();
+        config.max_buffer_bytes = probe.buffer_bytes();
+        let mut a = owner_with_config(2, config);
+        let mut b = owner(3);
+        let listener = new(&mut b, SOCK_NONBLOCK);
+        b.execute(listener, Op::Bind("10.73.0.3:8080".parse().unwrap()))
+            .unwrap();
+        b.execute(listener, Op::Listen(1)).unwrap();
+        let id = new(&mut a, SOCK_NONBLOCK);
+        assert_eq!(
+            a.execute(id, Op::Connect("10.73.0.3:8080".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        pump(&mut a, &mut b);
+        let Handle::Connection(cid) = a.sockets[&id].handle else {
+            panic!()
+        };
+        let before = a.endpoint.send_progress(cid).unwrap();
+        let mut consumed = false;
+        let result = a.timestamp_write_from(id, cid, 128, 0, 0, |room| {
+            consumed = true;
+            Ok(vec![1; room])
+        });
+        assert_eq!(result, Err(ENOMEM));
+        assert!(!consumed);
+        assert_eq!(a.endpoint.send_progress(cid).unwrap(), before);
+    }
+
     fn owner(last: u8) -> Owner {
         owner_with_config(
             last,

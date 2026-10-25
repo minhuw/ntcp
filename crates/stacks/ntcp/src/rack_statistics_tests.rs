@@ -197,7 +197,11 @@ fn statistics_mixed_credit_is_checked_per_accepted_packet_not_reservation() {
         assert_eq!(sack(&mut rack, &mut scoreboard, 20, 20, 2000, &[]), 20);
         assert_eq!(
             rack.delivered_segments,
-            if ends.len() == 1 { 2 } else { ends.len() as u64 }
+            if ends.len() == 1 {
+                2
+            } else {
+                ends.len() as u64
+            }
         );
         assert!(rack.valid());
     }
@@ -241,8 +245,14 @@ fn statistics_fin_credit_follows_the_credited_packet_not_an_uncredited_old_copy(
 fn statistics_interval_fits_original_allocation_budget() {
     let size = core::mem::size_of::<Interval>();
     assert!(size <= 64, "Interval grew to {size} bytes");
-    assert_eq!(Rack::storage_bytes(400_000), Some(400_002 * size));
-    assert!(Rack::storage_bytes(400_000).unwrap() <= 25_600_128);
+    assert_eq!(
+        Rack::storage_bytes(400_000),
+        Some(
+            400_002 * size
+                + 400_002_usize.div_ceil(64 * 1024 / size) * core::mem::size_of::<Vec<Interval>>()
+        )
+    );
+    assert!(Rack::storage_bytes(400_000).unwrap() <= 26_000_000);
 }
 
 #[test]
@@ -316,7 +326,14 @@ fn statistics_syn_payload_pmtu_partial_retry_retains_packet_count_and_byte_ledge
             commit(&mut rack, seq(first_len), seq(1000), 20, true);
             let mut scoreboard = Scoreboard::with_capacity(32).unwrap();
             assert_eq!(
-                sack(&mut rack, &mut scoreboard, seq(1000).0, seq(1000).0, 40, &[]),
+                sack(
+                    &mut rack,
+                    &mut scoreboard,
+                    seq(1000).0,
+                    seq(1000).0,
+                    40,
+                    &[]
+                ),
                 1000
             );
             assert!(rack.valid());
@@ -338,9 +355,23 @@ fn statistics_overlapping_repacketization_sack_and_ack_keep_independent_units() 
         commit(&mut rack, seq(4), seq(12), 20, true);
         // Current queued units are [0,4) and [4,12), independent of the
         // old [0,8) latest transmission still retained for the first bytes.
-        sack(&mut rack, &mut scoreboard, base.0, seq(12).0, 30, &[(seq(4).0, seq(10).0)]);
+        sack(
+            &mut rack,
+            &mut scoreboard,
+            base.0,
+            seq(12).0,
+            30,
+            &[(seq(4).0, seq(10).0)],
+        );
         assert_eq!(rack.delivered_segments, 0);
-        sack(&mut rack, &mut scoreboard, base.0, seq(12).0, 40, &[(seq(4).0, seq(12).0)]);
+        sack(
+            &mut rack,
+            &mut scoreboard,
+            base.0,
+            seq(12).0,
+            40,
+            &[(seq(4).0, seq(12).0)],
+        );
         assert_eq!(rack.delivered_segments, 1);
         sack(&mut rack, &mut scoreboard, seq(2).0, seq(12).0, 50, &[]);
         assert_eq!(rack.delivered_segments, 1);
@@ -370,7 +401,10 @@ fn statistics_every_single_subrange_retry_counts_queued_units_once() {
                     let expected = u64::from(start != 0 && ack >= start)
                         + u64::from(ack >= end)
                         + u64::from(end != 20 && ack == 20);
-                    assert_eq!(rack.delivered_segments, expected, "start={start}, end={end}, ack={ack}");
+                    assert_eq!(
+                        rack.delivered_segments, expected,
+                        "start={start}, end={end}, ack={ack}"
+                    );
                 }
                 sack(&mut rack, &mut scoreboard, seq(20).0, seq(20).0, 300, &[]);
                 assert_eq!(rack.delivered_segments, units);
@@ -393,11 +427,25 @@ fn physical_packet_counts_keep_logical_admissions_and_retry_units_separate() {
         }
         assert_eq!(rack.counts().unacked, 1);
         assert_eq!(rack.packet_counts().unacked, 4);
-        sack(&mut rack, &mut scoreboard, base.0, seq(40).0, 10, &[(seq(10).0, seq(35).0)]);
+        sack(
+            &mut rack,
+            &mut scoreboard,
+            base.0,
+            seq(40).0,
+            10,
+            &[(seq(10).0, seq(35).0)],
+        );
         assert_eq!(rack.counts().sacked, 0);
         assert_eq!(rack.packet_counts().sacked, 2);
         assert!(rack.reo_window(false, Some(100)) > 0);
-        sack(&mut rack, &mut scoreboard, base.0, seq(40).0, 11, &[(seq(35).0, seq(40).0)]);
+        sack(
+            &mut rack,
+            &mut scoreboard,
+            base.0,
+            seq(40).0,
+            11,
+            &[(seq(35).0, seq(40).0)],
+        );
         assert_eq!(rack.packet_counts().sacked, 3);
         assert_eq!(rack.reo_window(false, Some(100)), 0);
         // One original packet retried in smaller pieces remains one original
