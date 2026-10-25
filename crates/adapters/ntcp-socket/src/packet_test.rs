@@ -58,6 +58,11 @@ pub fn inject(bytes: Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+// Capture host-local output policy metadata separately from on-wire bytes.
+pub fn try_capture_with_mark(capacity: usize) -> Result<(Vec<u8>, i64, u32)> {
+    let reply = runtime()?.call(0, Op::Capture(capacity))?;
+    Ok((reply.bytes, reply.stamp, reply.packet_mark))
+}
 pub fn try_capture(capacity: usize) -> Result<(Vec<u8>, i64)> {
     let reply = runtime()?.call(0, Op::Capture(capacity))?;
     Ok((reply.bytes, reply.stamp))

@@ -107,6 +107,8 @@ pub struct Reply {
     pub addr: Option<SocketAddr>,
     #[cfg(feature = "packet-test")]
     pub stamp: i64,
+    #[cfg(feature = "packet-test")]
+    pub packet_mark: u32,
 }
 struct Request {
     id: u64,
@@ -342,6 +344,8 @@ struct Socket {
     cork: bool,
     inq: bool,
     notsent_lowat: u32,
+    user_mss: Option<u16>,
+    mark: u32,
     send_batch: Option<send::SendBatch>,
     send_finish: Option<send::SendFinish>,
     fast_open_limit: i32,
@@ -394,6 +398,8 @@ impl Socket {
             cork: false,
             inq: false,
             notsent_lowat: 0,
+            user_mss: None,
+            mark: 0,
             send_batch: None,
             send_finish: None,
             fast_open_limit: 0,
@@ -515,7 +521,7 @@ struct Owner {
     child_timestamps: Vec<(ConnectionId, crate::timestamping::Options)>,
     pending: VecDeque<Request>,
     child_timeouts: Vec<ChildOptionsSnapshot>,
-    connection_options: Vec<(ConnectionId, u8, i32, Option<bool>)>,
+    connection_options: Vec<(ConnectionId, u8, i32, Option<bool>, u32)>,
     #[cfg(feature = "packet-test")]
     packets: Option<PacketBackend>,
 }
@@ -737,6 +743,7 @@ impl Owner {
             let config = crate::packet_profile::config(packets.profile);
             socket.receive_capacity = config.connection.receive_capacity;
             socket.send_capacity = config.connection.send_capacity;
+            socket.user_mss = config.connection.user_mss;
             if matches!(packets.profile, crate::packet_profile::Profile::Upstream(o) if o.tfo_listen)
             {
                 socket.fast_open_limit = config.max_connections as i32;
@@ -747,6 +754,7 @@ impl Owner {
         let c = &self.defaults.connection;
         socket.send_capacity = c.send_capacity;
         socket.receive_capacity = c.receive_capacity;
+        socket.user_mss = c.user_mss;
         socket.nodelay = !c.nagle;
         socket.tos = self.defaults.dscp << 2;
         if let Some(k) = c.keepalive {
@@ -1148,7 +1156,7 @@ impl Owner {
                                 && (local.ip().is_unspecified() || local == tuple.local)
                         })
                 })
-                .map(|s| (s.tos, s.discover, s.zerocopy))
+                .map(|s| (s.tos, s.discover, s.zerocopy, s.mark))
         });
         // Reserve only for checked passive SYNs: LISTEN ACKs need stateless
         // resets, and existing TIME-WAIT traffic still needs core processing.
@@ -1224,10 +1232,11 @@ impl Owner {
                 s.readiness_generations[0] = s.readiness_generations[0].wrapping_add(1);
             }
             if Some(cid) != before
-                && let Some((tos, discover, _)) = listener_options
+                && let Some((tos, discover, _, mark)) = listener_options
             {
                 self.endpoint.set_dscp(cid, tos >> 2)?;
-                self.connection_options.push((cid, tos, discover, None));
+                self.connection_options
+                    .push((cid, tos, discover, None, mark));
             }
             // Snapshot at accept eligibility, before the adapter publishes the
             // child. Only authenticated TFO data is readable in SynReceived;
@@ -1335,6 +1344,9 @@ impl Owner {
             .map_err(engine)?;
         self.endpoint
             .set_handshake_retransmission_limit(cid, s.syn_retries)
+            .map_err(engine)?;
+        self.endpoint
+            .set_user_mss(cid, s.user_mss)
             .map_err(engine)?;
         self.endpoint.set_dscp(cid, s.tos >> 2).map_err(engine)?;
         self.endpoint.set_nagle(cid, !s.nodelay).map_err(engine)?;
@@ -1593,6 +1605,7 @@ impl Owner {
                 let capacities = (s.send_capacity, s.receive_capacity);
                 let application_timeout = user_timeout_us(s.user_timeout_ms)?;
                 let syn_retries = s.syn_retries;
+                let user_mss = s.user_mss;
                 let local = match s.local {
                     Some(a) => a,
                     None => SocketAddr::new(self.local.into(), self.port()?),
@@ -1601,6 +1614,10 @@ impl Owner {
                     .endpoint
                     .listen(local, backlog.clamp(1, LIMIT as i32) as usize)
                     .map_err(engine)?;
+                if let Err(e) = self.endpoint.set_listener_user_mss(listener, user_mss) {
+                    let _ = self.endpoint.close_listener(listener);
+                    return Err(engine(e));
+                }
                 if let Err(e) = self.endpoint.set_listener_buffer_capacities(
                     listener,
                     capacities.0,
@@ -1705,6 +1722,7 @@ impl Owner {
                         return Err(e);
                     }
                 };
+                child.user_mss = self.endpoint.user_mss(cid).map_err(engine)?;
                 child.syn_retries = self
                     .endpoint
                     .handshake_retransmission_limit(cid)
@@ -1718,6 +1736,7 @@ impl Owner {
                     child.tos = p.1;
                     child.discover = p.2;
                     child.zerocopy = p.3.unwrap_or(false);
+                    child.mark = p.4;
                 }
                 if let Some(index) = self.child_timestamps.iter().position(|p| p.0 == cid) {
                     child.timestamps.options = self.child_timestamps.swap_remove(index).1;
@@ -2113,6 +2132,15 @@ impl Owner {
                     .map_err(|_| ENOBUFS)?;
                 let s = &mut candidate;
                 match (level, name) {
+                    (SOL_SOCKET, SO_MARK) => {
+                        if value != 0 && !self.packet_mark_supported() {
+                            return Err(EOPNOTSUPP);
+                        }
+                        // Validate backend privileges and support before committing the option.
+                        self.set_backend_mark(value as u32)
+                            .map_err(|e| e.raw_os_error().unwrap_or(EOPNOTSUPP))?;
+                        s.mark = value as u32;
+                    }
                     (SOL_SOCKET, SO_REUSEADDR) => s.reuse = value != 0,
                     (SOL_SOCKET, SO_KEEPALIVE) => s.keepalive = value != 0,
                     (SOL_SOCKET, SO_SNDBUF) => s.send_capacity = socket_buffer_value(name, value),
@@ -2138,6 +2166,13 @@ impl Owner {
                             _ => return Err(EINVAL),
                         }
                         s.discover = value;
+                    }
+                    (IPPROTO_TCP, TCP_MAXSEG) => {
+                        // Linux TCP_MIN_MSS=88, MAX_TCP_WINDOW=32767; zero clears the override.
+                        if value != 0 && !(88..=32767).contains(&value) {
+                            return Err(EINVAL);
+                        }
+                        s.user_mss = (value != 0).then_some(value as u16);
                     }
                     (IPPROTO_TCP, TCP_SYNCNT) => {
                         if !(1..=127).contains(&value) {
@@ -2217,6 +2252,11 @@ impl Owner {
                     // NODELAY is an explicit flush, including when already set. Do
                     // not reapply it for unrelated option changes on a corked stream.
                     match (level, name) {
+                        (IPPROTO_TCP, TCP_MAXSEG) => {
+                            self.endpoint
+                                .set_user_mss(cid, s.user_mss)
+                                .map_err(engine)?;
+                        }
                         (IPPROTO_TCP, TCP_NODELAY) => {
                             self.endpoint.set_nagle(cid, !s.nodelay).map_err(engine)?
                         }
@@ -2247,8 +2287,12 @@ impl Owner {
                 {
                     p.1 = s.tos;
                     p.2 = s.discover;
+                    p.4 = s.mark;
                 }
                 if let Handle::Listener(listener) = s.handle {
+                    self.endpoint
+                        .set_listener_user_mss(listener, s.user_mss)
+                        .map_err(engine)?;
                     self.endpoint
                         .set_listener_application_timeout(
                             listener,
@@ -2303,12 +2347,27 @@ impl Owner {
                     (SOL_SOCKET, SO_ACCEPTCONN) => {
                         i32::from(matches!(s.handle, Handle::Listener(_)))
                     }
+                    (SOL_SOCKET, SO_MARK) => s.mark as i32,
                     (SOL_SOCKET, SO_REUSEADDR) => s.reuse as i32,
                     (SOL_SOCKET, SO_KEEPALIVE) => s.keepalive as i32,
                     (SOL_SOCKET, SO_SNDBUF) => s.send_capacity as i32,
                     (SOL_SOCKET, SO_RCVBUF) => s.receive_capacity as i32,
                     (IPPROTO_TCP, TCP_FASTOPEN) => s.fast_open_limit,
                     (IPPROTO_TCP, TCP_FASTOPEN_CONNECT) => s.fast_open_connect as i32,
+                    (IPPROTO_TCP, TCP_MAXSEG) => match s.handle {
+                        Handle::Connection(cid) => {
+                            self.endpoint.transport_info(cid).map_err(engine)?.mss as i32
+                        }
+                        _ => s.user_mss.map_or(
+                            i32::from(
+                                self.defaults
+                                    .connection
+                                    .mss
+                                    .min(self.defaults.connection.send_ip_payload_limit - 20),
+                            ),
+                            i32::from,
+                        ),
+                    },
                     (IPPROTO_TCP, TCP_NODELAY) => s.nodelay as i32,
                     (IPPROTO_TCP, TCP_CORK) => s.cork as i32,
                     (IPPROTO_TCP, TCP_INQ) => s.inq as i32,
@@ -2434,6 +2493,7 @@ mod tests {
         include!("runtime_timestamp_partial_tests.rs");
     }
     include!("runtime_syncnt_tests.rs");
+    include!("runtime_mss_mark_tests.rs");
     fn owner(last: u8) -> Owner {
         owner_with_config(
             last,

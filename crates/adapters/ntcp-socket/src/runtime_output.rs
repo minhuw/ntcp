@@ -178,6 +178,8 @@ impl Owner {
     }
 
     pub(super) fn submit_reserved_packet(&mut self) -> Result<TxOutcome> {
+        self.set_backend_mark(self.output_mark(self.reservation_owner))
+            .map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
         let result = if let Some(tun) = &mut self.tun {
             submit_packet(tun, &mut self.pending_packet)
         } else {

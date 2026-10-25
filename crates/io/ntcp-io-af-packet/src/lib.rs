@@ -20,6 +20,7 @@ pub struct AfPacket {
     timestamps: Option<State>,
     scheduling: Option<TxSchedulingConfig>,
     scheduling_error: Option<TxSchedulingError>,
+    packet_mark: u32,
 }
 
 impl AfPacket {
@@ -149,6 +150,7 @@ impl AfPacket {
             timestamps: None,
             scheduling: None,
             scheduling_error: None,
+            packet_mark: 0,
         })
     }
 
@@ -405,6 +407,31 @@ impl PacketIo for AfPacket {
             .map(|packet| packet.map(|packet| packet.len))
     }
 
+    fn packet_mark_supported(&self) -> bool {
+        true
+    }
+
+    fn set_packet_mark(&mut self, mark: u32) -> io::Result<()> {
+        if self.packet_mark == mark {
+            return Ok(());
+        }
+        // SAFETY: a live private socket and a correctly sized u32 socket option.
+        if unsafe {
+            libc::setsockopt(
+                self.fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_MARK,
+                (&mark as *const u32).cast(),
+                std::mem::size_of_val(&mark) as libc::socklen_t,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        self.packet_mark = mark;
+        Ok(())
+    }
+
     fn timestamp_capabilities(&self) -> TimestampCapabilities {
         self.timestamps
             .as_ref()
@@ -603,6 +630,7 @@ pub(crate) mod tests {
             timestamps: None,
             scheduling: None,
             scheduling_error: None,
+            packet_mark: 0,
         };
         let mut b = AfPacket {
             ifindex: 0,
@@ -610,6 +638,7 @@ pub(crate) mod tests {
             timestamps: None,
             scheduling: None,
             scheduling_error: None,
+            packet_mark: 0,
         };
         let when = TransmitTime {
             value: scheduling::now().unwrap() + 500_000_000,
@@ -785,6 +814,42 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn output_mark_reaches_private_kernel_socket_and_can_be_cleared() {
+        let mut io = AfPacket {
+            fd: socket(libc::AF_INET, libc::SOCK_DGRAM, 0).unwrap(),
+            ifindex: 0,
+            timestamps: None,
+            scheduling: None,
+            scheduling_error: None,
+            packet_mark: 0,
+        };
+        assert!(io.packet_mark_supported());
+        if let Err(error) = io.set_packet_mark(u32::MAX) {
+            assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+            assert_eq!(io.packet_mark, 0);
+            return; // Unprivileged test process; packet metadata isolation is tested separately.
+        }
+        for mark in [u32::MAX, 0, 666] {
+            io.set_packet_mark(mark).unwrap();
+            let mut actual = 0u32;
+            let mut len = std::mem::size_of_val(&actual) as libc::socklen_t;
+            // SAFETY: live socket and correctly sized writable option buffers.
+            assert_eq!(
+                unsafe {
+                    libc::getsockopt(
+                        io.fd.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_MARK,
+                        (&mut actual as *mut u32).cast(),
+                        &mut len,
+                    )
+                },
+                0
+            );
+            assert_eq!(actual, mark);
+        }
+    }
+    #[test]
     fn packets_and_ownership() {
         let (a, b) = pair();
         let mut a = AfPacket {
@@ -793,6 +858,7 @@ pub(crate) mod tests {
             timestamps: None,
             scheduling: None,
             scheduling_error: None,
+            packet_mark: 0,
         };
         let mut b = AfPacket {
             ifindex: 0,
@@ -800,6 +866,7 @@ pub(crate) mod tests {
             timestamps: None,
             scheduling: None,
             scheduling_error: None,
+            packet_mark: 0,
         };
         flags(a.as_raw_fd());
         assert_eq!(a.layer(), PacketLayer::Ethernet);

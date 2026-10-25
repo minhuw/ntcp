@@ -8,6 +8,7 @@ pub(super) struct PacketBackend {
     pub(super) output: VecDeque<Reply>,
     capacity: usize,
     pub(super) local_reject: bool,
+    mark: u32,
 }
 impl PacketBackend {
     pub(super) fn new(profile: crate::packet_profile::Profile, capacity: usize) -> Result<Self> {
@@ -21,6 +22,7 @@ impl PacketBackend {
             output,
             capacity,
             local_reject: false,
+            mark: 0,
         })
     }
     pub(super) fn inject(&mut self, bytes: Vec<u8>) -> Result<()> {
@@ -37,6 +39,13 @@ impl PacketIo for PacketBackend {
     }
     fn max_packet_len(&self) -> Option<usize> {
         Some(crate::packet_profile::BYTES)
+    }
+    fn packet_mark_supported(&self) -> bool {
+        true
+    }
+    fn set_packet_mark(&mut self, mark: u32) -> std::io::Result<()> {
+        self.mark = mark;
+        Ok(())
     }
     fn receive(&mut self, out: &mut [u8]) -> std::io::Result<Option<usize>> {
         let Some(packet) = self.input.front() else {
@@ -68,6 +77,7 @@ impl PacketIo for PacketBackend {
         // not capture dequeue. Protocol timers continue to use Owner::now().
         self.output.push_back(Reply {
             value: bytes.len() as i32,
+            packet_mark: self.mark,
             bytes,
             stamp: (timestamps::realtime() / 1000).min(i64::MAX as u64) as i64,
             ..Reply::default()

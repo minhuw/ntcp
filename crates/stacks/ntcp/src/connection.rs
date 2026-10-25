@@ -128,6 +128,8 @@ pub struct ConnectionConfig {
     pub send_capacity: usize,
     pub receive_capacity: usize,
     pub mss: u16,
+    // Application maximum segment size; independent of path MTU and storage ceiling.
+    pub user_mss: Option<u16>,
     pub pmtud: Option<crate::PmtudConfig>,
     // Maximum TCP segment bytes after IP headers/extensions are subtracted from
     // the reassembly bound; use the smallest bound if it varies.
@@ -269,6 +271,7 @@ impl ConnectionConfig {
             || self.receive_capacity > (65535usize << 14)
             || self.receive_ip_payload_limit < 21
             || self.send_ip_payload_limit < self.minimum_send_budget()
+            || self.user_mss == Some(0)
             || self.mss == 0
             || self.mss > if ipv4 { 65495 } else { 65515 }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.3
@@ -333,6 +336,7 @@ impl Default for ConnectionConfig {
             send_capacity: 65536,
             receive_capacity: 65536,
             mss: 1460,
+            user_mss: None,
             pmtud: None,
             receive_ip_payload_limit: u16::MAX,
             send_ip_payload_limit: u16::MAX,
@@ -462,6 +466,8 @@ pub struct TransportInfo {
     pub cwnd: u32,
     pub ssthresh: u32,
     pub mss: u32,
+    // Receive MSS offer, without TCP option overhead or the peer's send limit.
+    pub advertised_mss: u32,
     // Largest accepted peer window, in bytes; useful for bounded host batching.
     pub max_send_window: u32,
     pub rtt_us: Option<u64>,
@@ -686,6 +692,7 @@ pub(crate) struct Connection {
     last_timestamp_sent_at: Option<Instant>,
     mss: usize,
     peer_mss: u16,
+    receive_mss_offer: u16,
     send_mss_limit: u16,
     ip_header_len: u16,
     //= https://www.rfc-editor.org/rfc/rfc4821#section-5.2
@@ -855,7 +862,10 @@ impl Connection {
                 config.timebase.ticks_from_us(600_000_000),
             )
         });
-        let mss = config.mss.min(config.send_ip_payload_limit - 20) as usize;
+        let mss = config
+            .mss
+            .min(config.user_mss.unwrap_or(u16::MAX))
+            .min(config.send_ip_payload_limit - 20) as usize;
         let mss = pmtud.as_ref().map_or(mss, |p| {
             mss.min(
                 p.info
@@ -899,6 +909,10 @@ impl Connection {
         Ok(Self {
             tuple,
             peer_mss: config.mss,
+            receive_mss_offer: config
+                .mss
+                .min(config.user_mss.unwrap_or(u16::MAX))
+                .min(config.receive_ip_payload_limit - 20),
             send_mss_limit: config.mss,
             ip_header_len,
             pmtud,
@@ -1333,10 +1347,15 @@ impl Connection {
         self.peer_mss = cached.mss;
         // Reserve the entire option budget, including cookies up to 16 bytes.
         // A changed path may clip the SYN further; all accepted bytes remain queued.
-        let limit = usize::from(cached.mss.min(self.config.mss))
-            .saturating_sub(40)
-            .min(self.path_payload_limit().saturating_sub(60))
-            .min(self.scratch.len());
+        let limit = usize::from(
+            cached
+                .mss
+                .min(self.config.mss)
+                .min(self.config.user_mss.unwrap_or(u16::MAX)),
+        )
+        .saturating_sub(40)
+        .min(self.path_payload_limit().saturating_sub(60))
+        .min(self.scratch.len());
         let count = initial.len().min(limit).min(self.send.remaining());
         if count == 0 {
             return Ok(0);
@@ -1463,6 +1482,7 @@ impl Connection {
             cwnd: self.congestion.cwnd(),
             ssthresh: self.congestion.ssthresh(),
             mss: self.mss as u32,
+            advertised_mss: u32::from(self.receive_mss()),
             max_send_window: self.max_snd_wnd,
             rtt_us: self
                 .rtt
@@ -2372,10 +2392,14 @@ impl Connection {
             .max(1) as usize;
         let base = if self.tuple.local.is_ipv4() { 20 } else { 40 };
         let options = usize::from(self.ip_header_len - base) + if self.timestamps { 12 } else { 0 };
-        let ceiling = usize::from(self.peer_mss.min(self.send_mss_limit))
-            .min(self.scratch.len())
-            .saturating_sub(options)
-            .max(1);
+        let ceiling = usize::from(
+            self.peer_mss
+                .min(self.send_mss_limit)
+                .min(self.config.user_mss.unwrap_or(u16::MAX)),
+        )
+        .min(self.scratch.len())
+        .saturating_sub(options)
+        .max(1);
         let budget = (self.config.send_ip_payload_limit as usize)
             .saturating_sub(20 + if self.timestamps { 12 } else { 0 })
             .max(1);
@@ -2946,6 +2970,42 @@ impl Connection {
             .saturating_add(1)
     }
 
+    pub(crate) fn user_mss(&self) -> Option<u16> {
+        self.config.user_mss
+    }
+
+    pub(crate) fn set_user_mss(&mut self, mss: Option<u16>) -> Result<(), Error> {
+        if mss == Some(0) {
+            return Err(Error::InvalidArgument);
+        }
+        if self.config.user_mss == mss {
+            return Ok(());
+        }
+        self.config.user_mss = mss;
+        // An application can limit future sends after establishment, but cannot
+        // retroactively change the receive capability advertised in its SYN.
+        if !self.syn_committed {
+            self.receive_mss_offer = self
+                .config
+                .mss
+                .min(mss.unwrap_or(u16::MAX))
+                .min(self.config.receive_ip_payload_limit - 20);
+        }
+        if self.pmtud.is_some() {
+            self.refresh_path_mss();
+        } else {
+            let effective = self
+                .peer_mss
+                .min(self.send_mss_limit)
+                .min(mss.unwrap_or(u16::MAX))
+                .saturating_sub(if self.timestamps { 12 } else { 0 })
+                .max(1)
+                .min(self.config.send_ip_payload_limit - 20 - if self.timestamps { 12 } else { 0 });
+            self.set_path_mss(usize::from(effective));
+        }
+        Ok(())
+    }
+
     pub(crate) fn lower_mss(&mut self, mss: u16) -> Result<(), Error> {
         if self.pmtud.is_some() {
             // Administrative reductions are independent of the transient path MSS.
@@ -2967,6 +3027,7 @@ impl Connection {
         }
         // Legacy explicit MSS override retains its original SYN behavior.
         self.config.mss = self.config.mss.min(mss);
+        self.receive_mss_offer = self.receive_mss_offer.min(mss);
         self.send_mss_limit = self.send_mss_limit.min(mss);
         self.set_path_mss(effective as usize);
         Ok(())
@@ -3266,6 +3327,7 @@ impl Connection {
             .unwrap_or(default_mss)
             .max(1)
             .min(self.config.mss)
+            .min(self.config.user_mss.unwrap_or(u16::MAX))
             .saturating_sub(if self.timestamps { 12 } else { 0 })
             .max(1)
             .min(self.config.send_ip_payload_limit - 20 - if self.timestamps { 12 } else { 0 })
@@ -6427,9 +6489,7 @@ impl Connection {
     }
 
     fn receive_mss(&self) -> u16 {
-        self.config
-            .mss
-            .min(self.config.receive_ip_payload_limit - 20)
+        self.receive_mss_offer
     }
 
     fn window_threshold(&self) -> u32 {
@@ -7406,7 +7466,14 @@ impl Connection {
                     .fast_open_initial
                     .min(packet_mss)
                     .min(timestamp_credit.saturating_sub(1) as usize)
-                    .min(usize::from(self.peer_mss).saturating_sub(option_len));
+                    .min(
+                        usize::from(
+                            self.peer_mss
+                                .min(self.send_mss_limit)
+                                .min(self.config.user_mss.unwrap_or(u16::MAX)),
+                        )
+                        .saturating_sub(option_len),
+                    );
                 count = self.send.copy(0, &mut self.scratch[..limit]);
             }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
@@ -7757,7 +7824,12 @@ impl Connection {
                         .is_none()
                 });
                 let base = if self.tuple.local.is_ipv4() { 20 } else { 40 };
-                let ceiling = u32::from(self.peer_mss.min(self.send_mss_limit)) + base + 20;
+                let ceiling = u32::from(
+                    self.peer_mss
+                        .min(self.send_mss_limit)
+                        .min(self.config.user_mss.unwrap_or(u16::MAX)),
+                ) + base
+                    + 20;
                 (size <= ceiling
                     && size
                         <= u32::from(self.config.send_ip_payload_limit)

@@ -11,6 +11,7 @@ struct Entry {
     deadline: Option<u64>,
     not_before: u64,
     waiting_mtu: bool,
+    mark: u32,
 }
 struct TxSlot {
     bytes: Vec<u8>,
@@ -328,6 +329,7 @@ impl Owner {
                 deadline: None,
                 not_before: now,
                 waiting_mtu: false,
+                mark: self.output_mark(owner),
             });
         }
         let slot = &mut egress.tx[index];
@@ -409,6 +411,8 @@ impl Owner {
                     .timestamp
                     .map(|t| self.backend_sources(t))
                     .unwrap_or_default();
+                self.set_backend_mark(entry.mark)
+                    .map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
                 let submitted = if let Some(backend) = &mut self.ethernet {
                     backend.transmit_frame(
                         &mut self.endpoint,

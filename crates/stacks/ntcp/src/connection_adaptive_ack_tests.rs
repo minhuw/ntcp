@@ -669,14 +669,16 @@ fn quick_budget_uses_local_unscaled_window_and_receive_mss_with_safe_bounds() {
         a.advertised_edge = a.receive.next().wrapping_add(window);
         assert_eq!(a.adaptive_quick_budget(), expected, "window={window}");
     }
-    // Receive MSS is also constrained by the local receive IP payload limit.
-    a.config.mss = u16::MAX;
-    a.config.receive_ip_payload_limit = 520;
-    a.advertised_edge = a.receive.next().wrapping_add(3000);
-    assert_eq!(a.adaptive_quick_budget(), 3);
-    a.config.receive_ip_payload_limit = u16::MAX;
-    a.advertised_edge = a.receive.next().wrapping_add(131_030);
-    assert_eq!(a.adaptive_quick_budget(), 1);
+    // Receive MSS is constrained by the actual local SYN offer. Configure each
+    // connection before its handshake rather than rewriting an advertised offer.
+    for (limit, window, expected) in [(520, 3000, 3), (u16::MAX, 131_030, 1)] {
+        let mut cfg = adaptive_config();
+        cfg.mss = 65495; // Maximum legal IPv4 MSS, before the receive-IP clamp.
+        cfg.receive_ip_payload_limit = limit;
+        let (mut a, _) = pair(cfg, 100);
+        a.advertised_edge = a.receive.next().wrapping_add(window);
+        assert_eq!(a.adaptive_quick_budget(), expected);
+    }
 
     for (capacity, expected) in [(1, 2), (2000, 2), (2001, 1), (4001, 2), (64001, 16)] {
         let mut cfg = adaptive_config();

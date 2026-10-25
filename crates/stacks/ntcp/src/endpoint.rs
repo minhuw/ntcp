@@ -313,6 +313,7 @@ struct Listener {
     buffer_capacities: (usize, usize),
     application_timeout_us: Option<u64>,
     handshake_retransmission_limit: Option<NonZeroU8>,
+    user_mss: Option<u16>,
     address: SocketAddr,
     backlog: usize,
     children: Vec<ConnectionId>,
@@ -665,6 +666,7 @@ impl Endpoint {
             ),
             application_timeout_us: None,
             handshake_retransmission_limit: None,
+            user_mss: self.config.connection.user_mss,
             address,
             backlog,
             children,
@@ -888,6 +890,14 @@ impl Endpoint {
         let mut connection_config = self.config.connection.clone();
         connection_config.send_capacity = capacities.0;
         connection_config.receive_capacity = capacities.1;
+        if syn.is_some()
+            && let Some(listener) = self.match_listener(tuple.local)
+        {
+            connection_config.user_mss = self
+                .listener(listener)
+                .map_err(|_| Error::InvalidArgument)?
+                .user_mss;
+        }
         if connection_config.initial_window == crate::InitialWindow::Iw10
             && self
                 .setup_loss_cache
@@ -2796,6 +2806,36 @@ impl Endpoint {
         id: ConnectionId,
     ) -> Result<Option<crate::PathMtuInfo>, EndpointError> {
         Ok(self.slot(id)?.connection.path_mtu_info())
+    }
+
+    pub fn set_user_mss(
+        &mut self,
+        id: ConnectionId,
+        mss: Option<u16>,
+    ) -> Result<(), EndpointError> {
+        if self.is_output_reserved(id) {
+            return Err(EndpointError::OutputReserved);
+        }
+        self.slot_mut(id)?.connection.set_user_mss(mss)?;
+        self.refresh(id.slot);
+        Ok(())
+    }
+
+    pub fn user_mss(&self, id: ConnectionId) -> Result<Option<u16>, EndpointError> {
+        Ok(self.slot(id)?.connection.user_mss())
+    }
+
+    pub fn set_listener_user_mss(
+        &mut self,
+        id: ListenerId,
+        mss: Option<u16>,
+    ) -> Result<(), EndpointError> {
+        self.listener(id)?;
+        if mss == Some(0) {
+            return Err(Error::InvalidArgument.into());
+        }
+        self.listeners[id.slot].as_mut().unwrap().user_mss = mss;
+        Ok(())
     }
 
     pub fn lower_mss(&mut self, id: ConnectionId, mss: u16) -> Result<(), EndpointError> {

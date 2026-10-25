@@ -171,7 +171,7 @@ class CompiledSnapshotChecks(unittest.TestCase):
 
     def test_prefix_field_layout_matches_audited_fields(self):
         ends = {'tcpi_state': 1, 'tcpi_ca_state': 2, 'tcpi_probes': 4, 'tcpi_backoff': 5, 'tcpi_options': 6, 'tcpi_snd_wscale': 7,
-                'tcpi_rcv_wscale': 7, 'tcpi_unacked': 28, 'tcpi_sacked': 32,
+                'tcpi_rcv_wscale': 7, 'tcpi_snd_mss': 20, 'tcpi_advmss': 88, 'tcpi_unacked': 28, 'tcpi_sacked': 32,
                 'tcpi_lost': 36, 'tcpi_retrans': 40, 'tcpi_last_data_recv': 56,
                 'tcpi_rtt': 72, 'tcpi_snd_ssthresh': 80, 'tcpi_snd_cwnd': 84,
                 'tcpi_reordering': 92, 'tcpi_notsent_bytes': 148,
@@ -211,6 +211,16 @@ class CompiledSnapshotChecks(unittest.TestCase):
                                    'TCP_INFO_SECOND_SNIPPET': 'assert tcpi_options == 0'})
         self.assertEqual(result.stderr.splitlines(),
                          ['requested TCP_INFO 152', 'requested TCP_INFO 6'])
+
+    def test_mss_prefix_reports_actual_fields_and_rejects_short_snapshots(self):
+        for field, size in [('tcpi_snd_mss', 20), ('tcpi_advmss', 88)]:
+            with self.subTest(field=field):
+                result = self.execute('TCP_INFO_PREFIX', 0, f'assert {field} == 0', 0,
+                                      env={'TCP_INFO_TRACE': '1'})
+                self.assertEqual(result.stderr.splitlines(), [f'requested TCP_INFO {size}'] * 2)
+                self.execute('TCP_INFO_PREFIX', 0, f'assert {field} == 0', 42,
+                             "can't get requested", {'TCP_INFO_LIMIT': str(size - 1)})
+                self.execute('TCP_INFO_PREFIX', 0, f'assert {field} == 1', 1, 'AssertionError')
 
     def test_prefix_refuses_unavailable_short_unknown_and_false_values(self):
         for snippet, env, message in (

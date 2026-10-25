@@ -9,10 +9,38 @@ struct Registration {
     events: u32,
     data: u64,
     seen: Option<[u64; 5]>,
+    exclusive_grant: u32,
+    exclusive_seen: [Option<u64>; 5],
 }
+fn eligible_bits(r: &Registration, ready: u32, observed: [u64; 5]) -> u32 {
+    if r.events & EPOLLEXCLUSIVE as u32 == 0 {
+        return if r.events & EPOLLET as u32 == 0
+            || socket_options::edge_changed(ready, r.seen, observed)
+        {
+            ready
+        } else {
+            0
+        };
+    }
+    socket_options::EDGE_BITS
+        .iter()
+        .enumerate()
+        .fold(0, |bits, (i, bit)| {
+            let bit = *bit as u32;
+            let distance = r.exclusive_seen[i].map(|seen| observed[i].wrapping_sub(seen));
+            let current = distance.is_none_or(|d| d < (1 << 63));
+            let changed = distance.is_none_or(|d| d != 0 && d < (1 << 63));
+            let level = r.events & EPOLLET as u32 == 0 && r.exclusive_grant & bit != 0;
+            if ready & bit != 0 && current && (changed || level) {
+                bits | bit
+            } else {
+                bits
+            }
+        })
+}
+#[cfg(test)]
 fn eligible(r: &Registration, ready: u32, observed: [u64; 5]) -> bool {
-    ready != 0
-        && (r.events & EPOLLET as u32 == 0 || socket_options::edge_changed(ready, r.seen, observed))
+    eligible_bits(r, ready, observed) != 0
 }
 struct Epoll {
     slot: usize,
@@ -60,7 +88,12 @@ pub fn close_epoll(fd: i32) -> Result<()> {
         return Ok(());
     }
     is_epoll(fd)?;
-    EPOLLS.lock().map_err(|_| EIO)?.remove(&fd);
+    let mut map = EPOLLS.lock().map_err(|_| EIO)?;
+    if let Some(ep) = map.remove(&fd) {
+        for r in ep.regs.values().filter(|r| r.exclusive_grant != 0) {
+            release_exclusive(&mut map, r.id);
+        }
+    }
     Ok(())
 }
 #[cfg(feature = "packet-test")]
@@ -75,6 +108,56 @@ pub fn closed(id: u64) {
     if let Ok(mut map) = EPOLLS.lock() {
         for ep in map.values_mut() {
             ep.regs.retain(|&(_, registered_id), _| registered_id != id);
+        }
+    }
+}
+// EPOLLS serializes a readiness-generation claim with successful copyout.
+// A source wakes every ordinary registration and one exclusive registration;
+// competing pollers revalidate after the winner has consumed the generation.
+// LT winners retain readiness; ET winners require a subsequent source event.
+fn claim_exclusive(
+    map: &mut BTreeMap<i32, Epoll>,
+    epfd: i32,
+    key: (i32, u64),
+    observed: [u64; 5],
+    ready: u32,
+) {
+    for (&other_epfd, ep) in map.iter_mut() {
+        for (&other_key, r) in ep.regs.iter_mut() {
+            if r.id == key.1 && r.events & EPOLLEXCLUSIVE as u32 != 0 {
+                for (i, bit) in socket_options::EDGE_BITS.iter().enumerate() {
+                    let bit = *bit as u32;
+                    if ready & bit == 0 {
+                        continue;
+                    }
+                    // Do not consume readiness classes absent from this output,
+                    // or rewind a newer observation staged by another waiter.
+                    if r.exclusive_seen[i]
+                        .is_some_and(|seen| observed[i].wrapping_sub(seen) >= (1 << 63))
+                    {
+                        continue;
+                    }
+                    r.exclusive_seen[i] = Some(observed[i]);
+                    if other_epfd == epfd && other_key == key {
+                        r.exclusive_grant |= bit;
+                    } else {
+                        r.exclusive_grant &= !bit;
+                    }
+                }
+            }
+        }
+    }
+}
+fn release_exclusive(map: &mut BTreeMap<i32, Epoll>, id: u64) {
+    for ep in map.values_mut() {
+        for r in ep
+            .regs
+            .values_mut()
+            .filter(|r| r.id == id && r.events & EPOLLEXCLUSIVE as u32 != 0)
+        {
+            r.seen = None;
+            r.exclusive_grant = 0;
+            r.exclusive_seen = [None; 5];
         }
     }
 }
@@ -134,10 +217,16 @@ pub unsafe extern "C" fn ntcp_managed_epoll_ctl(
                 | EPOLLHUP as u32
                 | EPOLLRDHUP as u32
                 | EPOLLONESHOT as u32
-                | EPOLLET as u32)
+                | EPOLLET as u32
+                | EPOLLEXCLUSIVE as u32)
             != 0
         {
             return Err(EOPNOTSUPP);
+        }
+        if event.events & EPOLLEXCLUSIVE as u32 != 0
+            && (op != EPOLL_CTL_ADD || event.events & (EPOLLONESHOT | EPOLLRDHUP) as u32 != 0)
+        {
+            return Err(EINVAL);
         }
         // Lock order is TOKENS -> EPOLLS. Pin this alias through registration
         // so a concurrent final close cannot clean up before our ADD commits.
@@ -218,11 +307,16 @@ pub unsafe extern "C" fn ntcp_managed_epoll_ctl(
                         events: event.events,
                         data: event.u64,
                         seen: None,
+                        exclusive_grant: 0,
+                        exclusive_seen: [None; 5],
                     },
                 );
             }
             EPOLL_CTL_MOD => {
                 let r = ep.regs.get_mut(&key).ok_or(ENOENT)?;
+                if r.events & EPOLLEXCLUSIVE as u32 != 0 {
+                    return Err(EINVAL);
+                }
                 *r = Registration {
                     id,
                     generation,
@@ -230,10 +324,15 @@ pub unsafe extern "C" fn ntcp_managed_epoll_ctl(
                     events: event.events,
                     data: event.u64,
                     seen: None,
+                    exclusive_grant: 0,
+                    exclusive_seen: [None; 5],
                 };
             }
             EPOLL_CTL_DEL => {
-                ep.regs.remove(&key).ok_or(ENOENT)?;
+                let removed = ep.regs.remove(&key).ok_or(ENOENT)?;
+                if removed.exclusive_grant != 0 {
+                    release_exclusive(&mut map, removed.id);
+                }
             }
             _ => return Err(EINVAL),
         }
@@ -303,7 +402,7 @@ unsafe fn epwait(
                 Err(e) => return Err(e),
             };
             let ready = reply.value as u32 & (r.events | EPOLLERR as u32 | EPOLLHUP as u32);
-            if eligible(&r, ready, reply.readiness_generations) {
+            if eligible_bits(&r, ready, reply.readiness_generations) != 0 {
                 virtual_events.push((
                     key,
                     r.generation,
@@ -335,7 +434,7 @@ unsafe fn epwait(
                 r.armed
                     && r.generation == *generation
                     && tokens.values().any(|t| t.id == r.id)
-                    && eligible(r, event.events, *observed)
+                    && eligible_bits(r, event.events, *observed) != 0
             })
         });
         let mut output = Vec::with_capacity(available);
@@ -344,8 +443,12 @@ unsafe fn epwait(
             if output.len() == available {
                 break;
             }
+            // Like poll, report all currently ready requested bits once an
+            // event triggers delivery. Only consume classes actually eligible
+            // for this exclusive claim (e.g. a new ERR may accompany old OUT).
+            let claim = eligible_bits(&ep.regs[&key], event.events, observed);
             output.push(event);
-            delivered.push((key, generation, observed));
+            delivered.push((key, generation, observed, claim));
         }
         if let Err(e) = store_array(p.wrapping_add(native_count), &output) {
             return if native_count != 0 {
@@ -354,8 +457,17 @@ unsafe fn epwait(
                 Err(e)
             };
         }
-        for (key, generation, observed) in delivered {
-            if let Some(r) = ep.regs.get_mut(&key)
+        for (key, generation, observed, ready) in delivered {
+            let exclusive = map
+                .get(&epfd)
+                .and_then(|ep| ep.regs.get(&key))
+                .is_some_and(|r| {
+                    r.generation == generation && r.events & EPOLLEXCLUSIVE as u32 != 0
+                });
+            if exclusive {
+                claim_exclusive(&mut map, epfd, key, observed, ready);
+            }
+            if let Some(r) = map.get_mut(&epfd).and_then(|ep| ep.regs.get_mut(&key))
                 && r.generation == generation
             {
                 r.seen = Some(observed);
@@ -857,6 +969,130 @@ pub unsafe extern "C" fn ntcp_managed___ppoll_chk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn exclusive_fixture(events: u32) -> Epoll {
+        Epoll {
+            slot: 0,
+            retained: -1,
+            dev: 0,
+            ino: 0,
+            generation: 1,
+            cursor: 0,
+            native_first: false,
+            regs: BTreeMap::from([(
+                (4, 42),
+                Registration {
+                    id: 42,
+                    generation: 1,
+                    armed: true,
+                    events,
+                    data: 4,
+                    seen: None,
+                    exclusive_grant: 0,
+                    exclusive_seen: [None; 5],
+                },
+            )]),
+        }
+    }
+    #[test]
+    fn exclusive_arbitration_preserves_ordinary_observers_edges_and_handoff() {
+        for edge in [0, EPOLLET] {
+            let mask = (EPOLLIN | EPOLLEXCLUSIVE | edge) as u32;
+            let mut map = BTreeMap::from([
+                (1, exclusive_fixture(mask)),
+                (2, exclusive_fixture(mask)),
+                (3, exclusive_fixture((EPOLLIN | EPOLLET) as u32)),
+            ]);
+            let first = [1, 0, 0, 0, 0];
+            assert!(eligible(&map[&1].regs[&(4, 42)], EPOLLIN as u32, first));
+            // A failed copyout does not claim the source; another waiter remains eligible.
+            assert!(eligible(&map[&2].regs[&(4, 42)], EPOLLIN as u32, first));
+            claim_exclusive(&mut map, 1, (4, 42), first, EPOLLIN as u32);
+            assert!(!eligible(&map[&2].regs[&(4, 42)], EPOLLIN as u32, first));
+            assert!(eligible(&map[&3].regs[&(4, 42)], EPOLLIN as u32, first));
+            assert_eq!(
+                eligible(&map[&1].regs[&(4, 42)], EPOLLIN as u32, first),
+                edge == 0
+            );
+            let second = [2, 0, 0, 0, 0];
+            assert!(eligible(&map[&2].regs[&(4, 42)], EPOLLIN as u32, second));
+            claim_exclusive(&mut map, 2, (4, 42), second, EPOLLIN as u32);
+            assert!(!eligible(&map[&1].regs[&(4, 42)], EPOLLIN as u32, second));
+            assert!(!eligible(&map[&2].regs[&(4, 42)], EPOLLIN as u32, first));
+            map.remove(&2);
+            release_exclusive(&mut map, 42);
+            assert!(eligible(&map[&1].regs[&(4, 42)], EPOLLIN as u32, second));
+        }
+    }
+    #[test]
+    fn exclusive_claims_do_not_consume_other_readiness_classes() {
+        let mask = (EPOLLIN | EPOLLOUT | EPOLLET | EPOLLEXCLUSIVE) as u32;
+        let mut map = BTreeMap::from([(1, exclusive_fixture(mask)), (2, exclusive_fixture(mask))]);
+        let observed = [1, 1, 0, 0, 0];
+        claim_exclusive(&mut map, 1, (4, 42), observed, EPOLLIN as u32);
+        assert_eq!(
+            eligible_bits(
+                &map[&2].regs[&(4, 42)],
+                (EPOLLIN | EPOLLOUT) as u32,
+                observed
+            ),
+            EPOLLOUT as u32
+        );
+        claim_exclusive(&mut map, 2, (4, 42), observed, EPOLLOUT as u32);
+        assert_eq!(
+            eligible_bits(
+                &map[&1].regs[&(4, 42)],
+                (EPOLLIN | EPOLLOUT) as u32,
+                observed
+            ),
+            0
+        );
+        let next = [2, 1, 0, 0, 0];
+        assert_eq!(
+            eligible_bits(&map[&2].regs[&(4, 42)], (EPOLLIN | EPOLLOUT) as u32, next),
+            EPOLLIN as u32
+        );
+    }
+    #[test]
+    fn exclusive_abi_rejects_mod_oneshot_and_rdhup() {
+        let (fd, t) = token(SOCK_CLOEXEC).unwrap();
+        install(fd, t, 982).unwrap();
+        PID.store(unsafe { syscall(SYS_getpid) as i32 }, Ordering::Release);
+        let epfd = unsafe { syscall(SYS_epoll_create1, EPOLL_CLOEXEC) as i32 };
+        assert!(epfd >= 0);
+        let mut event = epoll_event {
+            events: (EPOLLIN | EPOLLEXCLUSIVE) as u32,
+            u64: 7,
+        };
+        for extra in [EPOLLONESHOT, EPOLLRDHUP] {
+            event.events = (EPOLLIN | EPOLLEXCLUSIVE | extra) as u32;
+            assert_eq!(
+                unsafe { ntcp_managed_epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &mut event) },
+                -1
+            );
+            assert_eq!(errno(), EINVAL);
+        }
+        event.events = (EPOLLIN | EPOLLEXCLUSIVE) as u32;
+        assert_eq!(
+            unsafe { ntcp_managed_epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &mut event) },
+            0
+        );
+        event.events = EPOLLIN as u32;
+        assert_eq!(
+            unsafe { ntcp_managed_epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &mut event) },
+            -1
+        );
+        assert_eq!(errno(), EINVAL);
+        assert_eq!(
+            unsafe { ntcp_managed_epoll_ctl(epfd, EPOLL_CTL_DEL, fd, ptr::null_mut()) },
+            0
+        );
+        close_epoll(epfd).unwrap();
+        TOKENS.lock().unwrap().remove(&fd);
+        unsafe {
+            syscall(SYS_close, fd);
+            syscall(SYS_close, epfd);
+        }
+    }
     #[test]
     fn native_close_bypasses_locked_epoll_registry() {
         let fd = unsafe { syscall(SYS_eventfd2, 0, EFD_CLOEXEC) as i32 };

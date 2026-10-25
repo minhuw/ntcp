@@ -116,8 +116,13 @@ impl Owner {
             self.rollback_connection(cid);
             return Err(e);
         }
-        self.connection_options
-            .push((cid, options.tos, options.discover, Some(options.zerocopy)));
+        self.connection_options.push((
+            cid,
+            options.tos,
+            options.discover,
+            Some(options.zerocopy),
+            options.mark,
+        ));
         let s = self.sockets.get_mut(&id).unwrap();
         s.handle = Handle::Connection(cid);
         s.connect_pending = true;

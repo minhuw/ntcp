@@ -199,6 +199,23 @@ pub trait PacketIo {
         None
     }
 
+    // Host-local output policy metadata, never encoded into packet bytes.
+    // Owners serialize this setting with submission and must restore zero for
+    // unmarked flows. Unsupported backends reject nonzero marks explicitly.
+    fn packet_mark_supported(&self) -> bool {
+        false
+    }
+    fn set_packet_mark(&mut self, mark: u32) -> io::Result<()> {
+        if mark == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "packet marks unsupported",
+            ))
+        }
+    }
+
     fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>>;
     // Synchronous TX EMSGSIZE rejects this packet before submission, including
     // timestamp/scheduled TX. Other errors do NOT imply non-submission; async
@@ -415,6 +432,12 @@ mod tests {
         );
         assert_eq!(
             io.poll_tx_scheduling_error().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert!(!io.packet_mark_supported());
+        io.set_packet_mark(0).unwrap();
+        assert_eq!(
+            io.set_packet_mark(1).unwrap_err().kind(),
             io::ErrorKind::Unsupported
         );
         assert_eq!(mock.transmitted, 0);

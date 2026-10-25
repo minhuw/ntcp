@@ -213,6 +213,37 @@ impl Owner {
             None => Ok(None),
         }
     }
+    pub(super) fn packet_mark_supported(&self) -> bool {
+        #[cfg(feature = "packet-test")]
+        if let Some(packets) = &self.packets {
+            return packets.packet_mark_supported();
+        }
+        self.ethernet
+            .as_ref()
+            .is_some_and(|b| b.io.packet_mark_supported())
+    }
+    pub(super) fn set_backend_mark(&mut self, mark: u32) -> std::io::Result<()> {
+        #[cfg(feature = "packet-test")]
+        if let Some(packets) = &mut self.packets {
+            return packets.set_packet_mark(mark);
+        }
+        if let Some(backend) = &mut self.ethernet {
+            return backend.io.set_packet_mark(mark);
+        }
+        if let Some(tun) = &mut self.tun {
+            return tun.set_packet_mark(mark);
+        }
+        if mark == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        }
+    }
+    pub(super) fn output_mark(&self, owner: Option<ConnectionId>) -> u32 {
+        owner
+            .and_then(|cid| self.connection_options.iter().find(|p| p.0 == cid))
+            .map_or(0, |p| p.4)
+    }
     pub(super) fn transmit_ip_backend(&mut self, bytes: &[u8]) -> std::io::Result<TxOutcome> {
         #[cfg(feature = "packet-test")]
         if let Some(packets) = &mut self.packets {

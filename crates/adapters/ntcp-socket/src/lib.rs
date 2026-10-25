@@ -1606,7 +1606,7 @@ fn socket_option_feature(level: i32, name: i32) -> Result<()> {
                 | TCP_KEEPCNT | TCP_FASTOPEN | TCP_FASTOPEN_CONNECT | TCP_FASTOPEN_KEY
                 | TCP_SYNCNT)
                 // SO_TIMESTAMPING_OLD / SO_TIMESTAMPING_NEW.
-                | (SOL_SOCKET, SO_ZEROCOPY | SO_DOMAIN | SO_PROTOCOL | 37 | 65)
+                | (SOL_SOCKET, SO_ZEROCOPY | SO_MARK | SO_DOMAIN | SO_PROTOCOL | 37 | 65)
                 | (IPPROTO_IP, IP_FREEBIND | IP_MTU_DISCOVER | IP_MTU)
         )
     {
@@ -1711,6 +1711,14 @@ pub unsafe extern "C" fn ntcp_managed_setsockopt(
             }
             load(p.cast::<i32>())?
         };
+        if (level, name) == (SOL_SOCKET, SO_MARK) {
+            let mut header = [0x20080522u32, 0]; // Linux capability ABI v3, current thread.
+            let mut data = [0u32; 6];
+            raw(unsafe { syscall(SYS_capget, header.as_mut_ptr(), data.as_mut_ptr()) })?;
+            if data[0] & ((1 << 12) | (1 << 13)) == 0 {
+                return Err(EPERM);
+            }
+        }
         call(id, Op::Set(level, name, value))?;
         Ok(0)
     }) as i32

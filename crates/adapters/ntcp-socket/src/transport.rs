@@ -60,6 +60,7 @@ pub(crate) fn transport_option_prefix(
     put(72, info.rttvar_us);
     put(76, (info.ssthresh / info.mss) as u64);
     put(80, (info.cwnd / info.mss) as u64);
+    put(84, u64::from(info.advertised_mss));
     put(88, info.reordering as u64);
     for (offset, value) in [
         (168, info.busy_time_us),
@@ -383,6 +384,7 @@ mod tests {
             cwnd: 10000,
             ssthresh: 8000,
             mss: 1000,
+            advertised_mss: 1200,
             max_send_window: 32000,
             rtt_us: Some(12000),
             min_rtt_us: Some(10000),
@@ -453,6 +455,7 @@ mod tests {
             (52, 789),
             (68, 12000),
             (80, 10),
+            (84, 1200),
             (144, 4000),
             (148, 10000),
             (192, 0x12345678),
@@ -476,7 +479,7 @@ mod tests {
             16..20,
             24..40,
             52..56,
-            68..84,
+            68..88,
             88..92,
             144..152,
             168..196,
