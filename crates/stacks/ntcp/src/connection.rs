@@ -644,6 +644,8 @@ pub(crate) struct Connection {
     scaling: bool,
     timestamps: bool,
     timestamp_offset: u32,
+    // Inclusive wire TSval bounds from accepted active-open SYNs, not selection.
+    syn_timestamp_range: Option<(u32, u32)>,
     timestamp_tick: u64,
     timestamp_bytes: u32,
     invalid_scale_reported: bool,
@@ -956,6 +958,7 @@ impl Connection {
             scaling: false,
             timestamps: false,
             timestamp_offset: 0,
+            syn_timestamp_range: None,
             timestamp_tick,
             timestamp_bytes: 0,
             invalid_scale_reported: false,
@@ -2229,7 +2232,13 @@ impl Connection {
         }
     }
 
-    fn record_syn_departure(&mut self) {
+    fn record_syn_departure(&mut self, timestamp: Option<u32>) {
+        if !self.passive_open
+            && let Some(value) = timestamp
+        {
+            let first = self.syn_timestamp_range.map_or(value, |(first, _)| first);
+            self.syn_timestamp_range = Some((first, value));
+        }
         if self.syn_committed {
             self.committed_syn_retransmissions =
                 self.committed_syn_retransmissions.saturating_add(1);
@@ -2611,7 +2620,7 @@ impl Connection {
         if d.syn {
             if finished {
                 self.fast_open_attempt |= d.fast_open && !self.syn_committed;
-                self.record_syn_departure();
+                self.record_syn_departure(d.syn_timestamp);
             }
             self.syn_payload_sent = self.syn_payload_sent.max(count);
             self.rack.record_syn_payload(
@@ -4511,6 +4520,23 @@ impl Connection {
                 return Ok(());
             }
             if h.flags & SYN == 0 {
+                return Ok(());
+            }
+            // Active-open hardening: a nonzero echo must lie within the
+            // timestamps we actually sent in SYNs. Reject before learning any
+            // peer options or data, while leaving this handshake alive. This
+            // supplements ACK validation; it is not the negotiated PAWS test.
+            if self.config.timestamps
+                && valid_ack
+                && let Some((_, echo)) = segment.options.timestamps
+                && echo != 0
+                && self
+                    .syn_timestamp_range
+                    .is_none_or(|(first, last)| echo.wrapping_sub(first) > last.wrapping_sub(first))
+            {
+                self.pending_rst = Some((ack, false));
+                self.reset_echo = None;
+                self.reset_reply = true;
                 return Ok(());
             }
             self.accepted_metadata = true;
@@ -8437,6 +8463,7 @@ impl Connection {
             payload: count,
             stream: count != 0 && !keepalive,
             syn,
+            syn_timestamp: timestamp.map(|(value, _)| value),
             fast_open: fast_open_option.is_some() && !self.passive_open,
             fin: flags & FIN != 0,
             rto: !keepalive
@@ -8732,7 +8759,7 @@ impl Connection {
         if syn && !reserve {
             self.fast_open_attempt |=
                 fast_open_option.is_some() && !self.passive_open && !self.syn_committed;
-            self.record_syn_departure();
+            self.record_syn_departure(timestamp.map(|(value, _)| value));
             self.syn_payload_sent = self.syn_payload_sent.max(count);
             self.rack
                 .record_syn_payload(seq.wrapping_add(1), seq.wrapping_add(1 + count as u32));
@@ -10426,6 +10453,10 @@ mod tests {
 
     mod handshake_limit {
         include!("connection_handshake_limit_tests.rs");
+    }
+
+    mod syn_echo {
+        include!("connection_syn_echo_tests.rs");
     }
 
     mod syn_deferral {

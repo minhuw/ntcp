@@ -15,6 +15,7 @@ pub(crate) struct Departure {
     pub payload: usize,
     pub stream: bool,
     pub syn: bool,
+    pub syn_timestamp: Option<u32>,
     pub fast_open: bool,
     pub passive_syn_data_acked: bool,
     pub fin: bool,

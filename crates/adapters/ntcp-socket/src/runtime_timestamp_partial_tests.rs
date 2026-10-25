@@ -34,6 +34,7 @@ fn fixture_with_window(window: u16) -> Fixture {
         .unwrap();
     let syn = wire::parse(tx.ip, &bytes[..tx.len]).unwrap();
     let iss = syn.header.sequence;
+    let syn_timestamp = syn.options.timestamps.unwrap().0;
     let incoming = wire::Header {
         source_port: 8080,
         destination_port: syn.header.source_port,
@@ -47,9 +48,10 @@ fn fixture_with_window(window: u16) -> Fixture {
         source: tx.ip.destination,
         destination: tx.ip.source,
     };
-    let options = [
-        2, 4, 3, 232, 4, 2, 8, 10, 0, 0, 2, 188, 0, 0, 0, 100, 1, 3, 3, 7,
+    let mut options = [
+        2, 4, 3, 232, 4, 2, 8, 10, 0, 0, 2, 188, 0, 0, 0, 0, 1, 3, 3, 7,
     ];
+    options[12..16].copy_from_slice(&syn_timestamp.to_be_bytes());
     let n = wire::encode(ip, incoming, &options, &[], &mut bytes).unwrap();
     a.test_now = Some(10000);
     a.input(10000, ip, 0, &bytes[..n]).unwrap();

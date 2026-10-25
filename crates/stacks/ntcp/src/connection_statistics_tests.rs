@@ -94,6 +94,21 @@ fn statistics_syn_rtt_options_and_packet_delivery_matrix() {
                         let echo = a.timestamp_value(selected).wrapping_add(u32::from(stale));
                         synack(&mut a, 30_000, acked, timestamps.then_some(echo));
                         let info = a.transport_info();
+                        if timestamps && stale {
+                            // An echo outside the submitted SYN range is now
+                            // rejected before negotiation or delivery accounting.
+                            assert_eq!(info.state, State::SynSent);
+                            assert_eq!(info.rtt_us, None);
+                            assert_eq!(a.rtt.updates, 0);
+                            assert_eq!(info.delivered_segments, 0);
+                            assert!(!info.timestamps_negotiated);
+                            assert!(!info.sack_negotiated && !info.window_scaling_negotiated);
+                            assert!(!info.ecn_negotiated);
+                            synack(&mut a, 30_001, acked, Some(echo));
+                            assert_eq!(a.transport_info().delivered_segments, 0);
+                            assert!(!a.handshake_complete());
+                            continue;
+                        }
                         assert_eq!(info.state, State::Established);
                         assert_eq!(info.rtt_us, (!timestamps || !stale).then_some(20_000));
                         assert_eq!(a.rtt.updates, usize::from(!timestamps || !stale));

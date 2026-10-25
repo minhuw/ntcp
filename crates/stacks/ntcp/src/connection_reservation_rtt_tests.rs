@@ -250,6 +250,18 @@ fn reserved_control_echo_validation_karn_and_syn_backoff() {
                         timestamps.then_some((3000, echo)),
                         b"",
                     );
+                    if !passive && timestamps && !retry && !valid_echo {
+                        // A forged SYNACK echo no longer reaches RTT sampling.
+                        // Passive final ACKs still exercise invalid-echo/Karn
+                        // accounting without changing their acceptance policy.
+                        assert_eq!(c.state(), State::SynSent);
+                        assert!(!c.syn_delivered);
+                        assert_eq!(c.rtt.srtt(), None);
+                        assert_eq!(c.rtt.updates, 0);
+                        assert_eq!(c.rto(), 1_000_000);
+                        assert_eq!(c.rto_deadline, Some(3_000_000));
+                        continue;
+                    }
                     assert_eq!(c.state(), State::Established);
                     let eligible = !retry && (!timestamps || valid_echo);
                     assert_eq!(
