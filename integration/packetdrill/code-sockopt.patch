@@ -773,7 +773,7 @@
  
  void run_command_event(
  	struct state *state, struct event *event, struct command_spec *command)
-@@ -43,6 +45,27 @@
+@@ -43,6 +45,28 @@
  	wait_for_event(state);
  
  	char *error = NULL;
@@ -782,7 +782,8 @@
 +		if (strcmp(command->command_line, "ntcp-local-resource-reject-on") &&
 +		    strcmp(command->command_line, "ntcp-local-resource-reject-off") &&
 +		    strcmp(command->command_line, "ntcp-local-timestamps-on") &&
-+		    strcmp(command->command_line, "ntcp-local-timestamps-off")) {
++		    strcmp(command->command_line, "ntcp-local-timestamps-off") &&
++		    strcmp(command->command_line, "ntcp-local-timestamps-on-clear-tfo-cache")) {
 +			asprintf(&error, "shared-object shell commands are unsupported");
 +			goto error_out;
 +		}

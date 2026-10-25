@@ -1818,6 +1818,7 @@ fn timestamp_control_abi_changes_only_future_connection_defaults() {
         for command in [
             c"ntcp-local-timestamps-maybe",
             c"ntcp-local-timestamps-off; true",
+            c"ntcp-local-timestamps-on-clear-tfo-cache; true",
         ] {
             assert_eq!(ntcp_packetdrill_control(USERDATA, command.as_ptr()), -1);
             assert_eq!(errno(), EOPNOTSUPP);
@@ -1826,7 +1827,7 @@ fn timestamp_control_abi_changes_only_future_connection_defaults() {
     for (index, enabled) in [true, false, true].into_iter().enumerate() {
         if index != 0 {
             let command = if enabled {
-                c"ntcp-local-timestamps-on"
+                c"ntcp-local-timestamps-on-clear-tfo-cache"
             } else {
                 c"ntcp-local-timestamps-off"
             };

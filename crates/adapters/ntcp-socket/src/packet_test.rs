@@ -91,6 +91,11 @@ pub fn timestamp_default(enabled: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn clear_fast_open_client_cache() -> Result<()> {
+    runtime()?.call(0, Op::ClearFastOpenClientCache)?;
+    Ok(())
+}
+
 // Called only by the patched runner's exact, audited command capability.
 pub fn local_resource_rejection(enabled: bool) -> Result<()> {
     runtime()?.call(0, Op::LocalResourceReject(enabled))?;

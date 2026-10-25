@@ -8681,29 +8681,27 @@
       "command_line": "`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n",
       "command_sha256": "0912d315bbb2e31cf6e169eeb8a745141ee7a0d345416062b720b4b62a4c767b",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n",
-      "adapter_flags": "upstream,local=192.168.0.1",
+      "adapter_flags": "upstream,local=192.168.0.1,budget224m,no-timestamps",
       "embedded_tcp_info": true,
       "inventory_audit": {
         "source_family": "fastopen",
-        "blocked_capabilities": [
-          "dynamic"
-        ]
+        "blocked_capabilities": []
       },
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`",
           "sha256": "5cb0e8a62ef4087e6344a5d7ef9cbd8721bdcec466c0c5cbb789a793a8d87dbc",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "semantic_mapping": "Initial no-timestamps common profile; Linux setup is not executed."
         },
         {
           "command": "`sysctl -q net.ipv4.tcp_timestamps=1\n       sysctl -q net.ipv4.tcp_fastopen_cookies=0 net.ipv4.tcp_fastopen_cookies=10 &> /dev/null ||\\\n       ip tcp_metrics flush all &> /dev/null`",
           "sha256": "19edaa3dafd5d88c351a719e308a34175e7a259c7b0378312e79cd15649e6aed",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "semantic_mapping": "Exact timed callback enables timestamps for future connections and explicitly clears learned client TFO cookie/MSS and per-service failure entries. Existing connections, listener policies and keys survive."
         },
         {
           "command": "`/tmp/sysctl_restore_${PPID}.sh`",
           "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "semantic_mapping": "Process-local runtime teardown; no host configuration to restore."
         }
       ],
       "mapping": {
@@ -8719,9 +8717,12 @@
           "capture_clock": "realtime epoch microseconds at backend submission",
           "hardware_tso": false,
           "gro": false,
-          "options": [],
+          "options": [
+            "budget224m",
+            "no-timestamps"
+          ],
           "sack": true,
-          "timestamps": true,
+          "timestamps": false,
           "initial_window": "Iw10",
           "fast_open_early_response": false,
           "rack": true,
@@ -8734,7 +8735,7 @@
           "mss": 1460,
           "receive_capacity": 8388608,
           "window_scale": 8,
-          "endpoint_max_buffer_bytes": 33554432,
+          "endpoint_max_buffer_bytes": 234881024,
           "congestion_control": "Cubic",
           "cubic_hystart": true,
           "cubic_fast_convergence": true,
@@ -8755,12 +8756,15 @@
         },
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
-        "claim": "Capability audit only; source is retained and not executed.",
+        "claim": "Original assertions retained with exact initial timestamp setting and process-local timed client-cache management; Linux defaults are not reproduced.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "Explicit client-cache management clears learned credentials/MSS/service failure entries only; original Nagle policy is retained."
         ],
-        "option_reasons": {}
+        "option_reasons": {
+          "no-timestamps": "Original setup disables timestamps until the exact timed event enables future negotiation.",
+          "budget224m": "Seven sequential client connections retain charged warmup/TIME-WAIT and active storage across an explicit client-cache flush; the existing bounded budget preserves native per-socket accounting."
+        }
       },
       "additional_setup_files": [
         {
@@ -8768,9 +8772,11 @@
           "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
         }
       ],
-      "blocked_reasons": [
-        "The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
-      ]
+      "cache_flush_control": true,
+      "cache_flush_event_sha256": "4638a8032a8a4ef63963872f8aff83f3b4e1fa02845fb0b36435ac0014ac3405",
+      "restore_line": "`/tmp/sysctl_restore_${PPID}.sh`\n",
+      "restore_sha256": "60a62f306d37841760269f429facc4f42420d9a0f3331bcb8ac55a14f7e84b48",
+      "restore_replacement_line": "// ntcp profile is process-local; no host sysctls to restore.\n"
     },
     "fastopen/client/syn-data-icmp-unreach-frag-needed-with-seq-ipv6.pkt": {
       "source_sha256": "ed444c172ba6320b6339d3fe9537f510708d8e6bc66537084d4740d92f8defc5",

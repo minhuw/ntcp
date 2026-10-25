@@ -1254,6 +1254,17 @@ impl Endpoint {
         Ok(())
     }
 
+    // Explicit administration after server/path maintenance, not an automatic
+    // retry heuristic. Clear learned client credentials, peer MSS and per-service
+    // failure records, retaining allocated storage. Existing connections keep
+    // their snapshots; their later handshakes can learn fresh entries again.
+    // Server cookie keys/policies, listeners and output reservations are untouched.
+    pub fn clear_fast_open_client_cache(&mut self) {
+        if let Some(cache) = &mut self.fast_open {
+            cache.clear_client_cache();
+        }
+    }
+
     fn fast_open_lifetime(&self) -> u64 {
         self.config
             .connection

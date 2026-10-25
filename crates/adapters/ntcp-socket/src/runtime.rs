@@ -88,6 +88,8 @@ pub enum Op {
     LocalResourceReject(bool),
     #[cfg(feature = "packet-test")]
     TimestampDefault(bool),
+    #[cfg(feature = "packet-test")]
+    ClearFastOpenClientCache,
     Close,
     Shutdown(i32),
     Flags(i32, i32),
@@ -783,6 +785,7 @@ impl Owner {
                     | Op::Capture(_)
                     | Op::LocalResourceReject(_)
                     | Op::TimestampDefault(_)
+                    | Op::ClearFastOpenClientCache
             )
         {
             return true;
@@ -1544,6 +1547,11 @@ impl Owner {
             Op::TimestampDefault(enabled) => {
                 self.packets.as_ref().ok_or(EOPNOTSUPP)?;
                 self.endpoint.packet_test_timestamp_default(*enabled);
+                return Ok(out);
+            }
+            Op::ClearFastOpenClientCache => {
+                self.packets.as_ref().ok_or(EOPNOTSUPP)?;
+                self.endpoint.clear_fast_open_client_cache();
                 return Ok(out);
             }
             Op::LocalResourceReject(enabled) => {
@@ -2482,7 +2490,8 @@ impl Owner {
             Op::Inject(_)
             | Op::Capture(_)
             | Op::LocalResourceReject(_)
-            | Op::TimestampDefault(_) => unreachable!(),
+            | Op::TimestampDefault(_)
+            | Op::ClearFastOpenClientCache => unreachable!(),
         }
         Ok(out)
     }
@@ -2592,6 +2601,10 @@ mod tests {
                 Some(EOPNOTSUPP)
             );
         }
+        assert_eq!(
+            owner.execute(0, Op::ClearFastOpenClientCache).err(),
+            Some(EOPNOTSUPP)
+        );
     }
 
     #[test]

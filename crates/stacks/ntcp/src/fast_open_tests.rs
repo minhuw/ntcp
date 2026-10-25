@@ -1845,3 +1845,120 @@ mod active_open_options {
 mod empty_syn {
     include!("fast_open_empty_syn_tests.rs");
 }
+
+#[test]
+fn clear_client_cache_preserves_reserved_open_server_keys_and_live_connection() {
+    for v6 in [false, true] {
+        let (mut a, mut b, listener) = warm(v6);
+        a.enable_output_reservations().unwrap();
+        let (local, remote) = addresses(v6, 40001);
+        let (client, n) = a.connect_fast_open(100, local, remote, b"held").unwrap();
+        assert_eq!(n, 4);
+        let mut bytes = [0; 2048];
+        let (output, attempt) = a.poll_reserved_transmit(100, &mut bytes, 64).unwrap();
+        let tx = output.packet.unwrap();
+        let syn = (tx.ip, bytes[..tx.len].to_vec());
+        let selected = wire::parse(syn.0, &syn.1).unwrap();
+        assert_eq!(selected.payload, b"held");
+        assert!(!selected.options.fast_open.unwrap().as_bytes().is_empty());
+        let budget = a.buffer_bytes();
+        crate::allocation_tests::fail_after(0, || a.clear_fast_open_client_cache());
+        assert_eq!(a.buffer_bytes(), budget);
+        assert!(
+            !a.has_fast_open_cookie(100, local.ip(), remote.ip())
+                .unwrap()
+        );
+        assert!(a.is_output_reserved(client));
+        assert_eq!(a.state(client).unwrap(), State::SynSent);
+        assert!(a.accept_transmit(110, attempt.unwrap()).unwrap());
+        // Clearing a server's client cache must not revoke its issued cookie,
+        // disable this listener or change its pending-child authorization.
+        b.clear_fast_open_client_cache();
+        deliver(&mut b, 120, &syn);
+        let child = b.accept(listener).unwrap();
+        assert_eq!(b.state(child).unwrap(), State::SynReceived);
+        assert_eq!(b.readable_bytes(child).unwrap(), 4);
+        deliver(&mut a, 140, &packet(&mut b, 130));
+        assert_eq!(a.state(client).unwrap(), State::Established);
+        assert!(
+            a.has_fast_open_cookie(140, local.ip(), remote.ip())
+                .unwrap()
+        );
+        // Completing an already-active handshake may repopulate the cache.
+        let ack = {
+            let (out, attempt) = a.poll_reserved_transmit(140, &mut bytes, 64).unwrap();
+            let tx = out.packet.unwrap();
+            let p = (tx.ip, bytes[..tx.len].to_vec());
+            a.accept_transmit(150, attempt.unwrap()).unwrap();
+            p
+        };
+        deliver(&mut b, 160, &ack);
+        let info = a.transport_info(client).unwrap();
+        a.clear_fast_open_client_cache();
+        b.clear_fast_open_client_cache();
+        assert_eq!(a.state(client).unwrap(), info.state);
+        assert_eq!(a.acknowledged(client).unwrap(), 4);
+        assert_eq!(b.read(child, &mut bytes).unwrap(), 4);
+        assert_eq!(&bytes[..4], b"held");
+        assert_eq!(b.write(child, b"reply").unwrap(), 5);
+        deliver(&mut a, 180, &packet(&mut b, 170));
+        assert_eq!(a.read(client, &mut bytes).unwrap(), 5);
+        assert_eq!(&bytes[..5], b"reply");
+        // Same server, new tuple: no cached credential survives the flush.
+        let (next_local, _) = addresses(v6, 40002);
+        let (_, n) = a
+            .connect_fast_open(190, next_local, remote, b"new")
+            .unwrap();
+        assert_eq!(n, 0);
+        // The preceding data ACK may be queued ahead of this new SYN.
+        let mut found = false;
+        for _ in 0..4 {
+            let (out, attempt) = a.poll_reserved_transmit(190, &mut bytes, 64).unwrap();
+            let tx = out.packet.unwrap();
+            let p = wire::parse(tx.ip, &bytes[..tx.len]).unwrap();
+            if p.header.flags & wire::SYN != 0 {
+                assert_eq!(p.options.fast_open, Some(wire::FastOpenCookie::request()));
+                assert!(p.payload.is_empty());
+                found = true;
+                break;
+            }
+            a.accept_transmit(190, attempt.unwrap()).unwrap();
+        }
+        assert!(found);
+    }
+}
+
+#[test]
+fn clear_client_cache_explicitly_discards_service_failure_and_does_not_enable_service() {
+    for v6 in [false, true] {
+        let mut cold = endpoint(1, v6);
+        let bytes = cold.buffer_bytes();
+        crate::allocation_tests::fail_after(0, || cold.clear_fast_open_client_cache());
+        assert_eq!(cold.buffer_bytes(), bytes);
+        let (mut a, _, _) = warm(v6);
+        let (local, remote) = addresses(v6, 40001);
+        a.connect_fast_open(100, local, remote, b"probe").unwrap();
+        let syn = packet(&mut a, 100);
+        let seq = wire::parse(syn.0, &syn.1).unwrap().header.sequence;
+        assert!(
+            a.network_error(
+                110,
+                Tuple { local, remote },
+                seq,
+                NetworkError::SoftUnreachable
+            )
+            .unwrap()
+        );
+        assert!(!a.can_defer_fast_open(110, local.ip(), remote).unwrap());
+        a.clear_fast_open_client_cache();
+        assert!(
+            !a.has_fast_open_cookie(110, local.ip(), remote.ip())
+                .unwrap()
+        );
+        // The live attempt retains its transport state and can learn a new
+        // credential; explicit invalidation, not successful ACK processing,
+        // is what removed the previously cached service failure.
+        deliver(&mut a, 120, &cache_reply(&syn, 940, Some(&[9; 8])));
+        assert!(a.can_defer_fast_open(120, local.ip(), remote).unwrap());
+    }
+}

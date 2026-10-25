@@ -268,6 +268,10 @@ UPSTREAM_OPTION_AUDIT['fastopen/client/syn-data-mss.pkt'] = {
 UPSTREAM_OPTION_AUDIT['zerocopy/fastopen-client.pkt'] = {
     'budget128m': 'Two client connections retain charged receive/send/scoreboard/RACK storage across warmup and TIME-WAIT; the existing bounded budget accommodates both without changing per-socket accounting.',
 }
+UPSTREAM_OPTION_AUDIT['fastopen/client/nonblocking-sendto.pkt'] = {
+    'no-timestamps': 'Original setup disables timestamps until the exact timed event enables future negotiation.',
+    'budget224m': 'Seven sequential client connections retain charged warmup/TIME-WAIT and active storage across an explicit client-cache flush; the existing bounded budget preserves native per-socket accounting.',
+}
 UPSTREAM_OPTION_AUDIT['zerocopy/maxfrags.pkt'] = {
     'budget224m': 'Original SO_SNDBUF=2000000 needs the existing bounded budget for native doubled/clamped capacity and resize staging. Linux page-fragment accounting is not emulated.',
 }
@@ -351,6 +355,15 @@ TIMESTAMP_SOURCES = {
     'zerocopy/fastopen-client.pkt': 'e0fa374f4ba5713f7a131e94e808f2bd59e7b2884305af4502debc9d80eb7680',
 }
 
+CACHE_FLUSH_SCRIPT = 'fastopen/client/nonblocking-sendto.pkt'
+CACHE_FLUSH_SOURCE_SHA256 = 'd72c1847f685d9ea14a7518c508c8b61c427d661c71c48bc506e9bbc81e29f36'
+CACHE_FLUSH_SETUP = b'`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n'
+CACHE_FLUSH_EVENT = b'+.001 `sysctl -q net.ipv4.tcp_timestamps=1\n       sysctl -q net.ipv4.tcp_fastopen_cookies=0 net.ipv4.tcp_fastopen_cookies=10 &> /dev/null ||\\\n       ip tcp_metrics flush all &> /dev/null`\n'
+CACHE_FLUSH_CONTROL = b'+.001 `ntcp-local-timestamps-on-clear-tfo-cache`\n// Clear learned client cache in this process.\n// Existing connections and server policy remain in place.\n'
+CACHE_FLUSH_RESTORE = b'`/tmp/sysctl_restore_${PPID}.sh`\n'
+CACHE_FLUSH_RESTORED = b'// ntcp profile is process-local; no host sysctls to restore.\n'
+
+
 
 TCP_INFO_FIELDS = {'tcpi_state', 'tcpi_ca_state', 'tcpi_probes', 'tcpi_backoff', 'tcpi_unacked', 'tcpi_sacked',
                    'tcpi_lost', 'tcpi_retrans', 'tcpi_reordering',
@@ -430,7 +443,7 @@ def runner_provenance(runner):
     return provenance
 
 
-def preflight(text, embedded_tcp_info=False, resource_control=False, timestamp_control=False):
+def preflight(text, embedded_tcp_info=False, resource_control=False, timestamp_control=False, cache_flush_control=False):
     # Conservative safety/capability screening, NOT a second packetdrill parser.
     # Upstream --dry_run remains the authority for script syntax.
     # Inspect raw text conservatively, including comments: do not accidentally
@@ -441,6 +454,8 @@ def preflight(text, embedded_tcp_info=False, resource_control=False, timestamp_c
         shell_text = text.replace(RESOURCE_CONTROL.decode(), '', 1)
     if timestamp_control and text.count(TIMESTAMP_CONTROL.decode()) == 1:
         shell_text = shell_text.replace(TIMESTAMP_CONTROL.decode(), '', 1)
+    if cache_flush_control and text.count(CACHE_FLUSH_CONTROL.decode()) == 1:
+        shell_text = shell_text.replace(CACHE_FLUSH_CONTROL.decode(), '', 1)
     if '`' in shell_text:
         reasons.append('shell setup/assertions target Linux, not the ntcp backend')
     if '%{' in text or '}%' in text:
@@ -489,6 +504,32 @@ def adapt_source(directory, relative, manifest, so_flags):
         data = (directory / extra['path']).read_bytes()
         if hashlib.sha256(data).hexdigest() != extra['sha256']:
             raise ValueError(f"setup {extra['path']} hash differs from audited adaptation")
+    if relative == CACHE_FLUSH_SCRIPT and not entry.get('blocked_reasons'):
+        expected_commands = [CACHE_FLUSH_SETUP.rstrip(b'\n'),
+                             CACHE_FLUSH_EVENT[CACHE_FLUSH_EVENT.index(b'`'):].rstrip(b'\n'),
+                             CACHE_FLUSH_RESTORE.rstrip(b'\n')]
+        if (hashlib.sha256(source).hexdigest() != CACHE_FLUSH_SOURCE_SHA256
+                or entry['command_line'].encode() != CACHE_FLUSH_SETUP
+                or entry['replacement_line'].encode() != b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n'
+                or entry.get('command_sha256') != hashlib.sha256(CACHE_FLUSH_SETUP).hexdigest()
+                or entry.get('expected_command_count') != 3
+                or re.findall(rb'`[^`]*`', source) != expected_commands
+                or [(c['command'], c['sha256']) for c in entry.get('audited_shell_commands', [])]
+                    != [(c.decode(), hashlib.sha256(c).hexdigest()) for c in expected_commands]
+                or entry.get('cache_flush_control') is not True
+                or entry.get('cache_flush_event_sha256') != hashlib.sha256(CACHE_FLUSH_EVENT).hexdigest()
+                or entry.get('restore_line', '').encode() != CACHE_FLUSH_RESTORE
+                or entry.get('restore_sha256') != hashlib.sha256(CACHE_FLUSH_RESTORE).hexdigest()
+                or entry.get('restore_replacement_line', '').encode() != CACHE_FLUSH_RESTORED
+                or entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
+                or metadata['timestamps']
+                or source.count(CACHE_FLUSH_EVENT) != 1):
+            raise ValueError('expected exact audited cache-flush setup and timed command')
+        generated = source.replace(CACHE_FLUSH_SETUP, entry['replacement_line'].encode(), 1).replace(CACHE_FLUSH_EVENT, CACHE_FLUSH_CONTROL, 1).replace(CACHE_FLUSH_RESTORE, CACHE_FLUSH_RESTORED, 1)
+        reasons = preflight(generated.decode(), True, cache_flush_control=True)
+        if reasons:
+            raise ValueError('; '.join(reasons))
+        return generated, {**entry, 'generated_sha256': hashlib.sha256(generated).hexdigest()}
     if relative in TIMESTAMP_SOURCES and not entry.get('blocked_reasons'):
         expected_commands = [TIMESTAMP_SETUP.rstrip(b'\n'),
                              TIMESTAMP_EVENT[TIMESTAMP_EVENT.index(b'`'):].rstrip(b'\n')]
@@ -1003,7 +1044,8 @@ def main():
                                          row['adaptation'].get('embedded_tcp_info') is True)
                     reasons = preflight(text, embedded_tcp_info,
                                         resource_control=(row['adapted'] and row['adaptation'].get('resource_control') is True),
-                                        timestamp_control=(row['adapted'] and row['adaptation'].get('timestamp_control') is True))
+                                        timestamp_control=(row['adapted'] and row['adaptation'].get('timestamp_control') is True),
+                                        cache_flush_control=(row['adapted'] and row['adaptation'].get('cache_flush_control') is True))
                     if variant not in ('native-ipv4', 'ipv4'):
                         reasons.append('the adapter implements IPv4 only')
                     if reasons:

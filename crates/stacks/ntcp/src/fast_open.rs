@@ -151,6 +151,13 @@ impl FastOpen {
         })
     }
 
+    pub fn clear_client_cache(&mut self) {
+        self.entries.clear();
+        self.next = 0;
+        self.negative.clear();
+        self.negative_next = 0;
+    }
+
     pub fn suppressed(
         &self,
         now: Instant,
@@ -426,5 +433,44 @@ mod negative_tests {
             assert_eq!(cache.entries[0].learned, 11);
             assert_eq!(cache.entries[0].mss, 940);
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_management_tests {
+    use super::*;
+
+    #[test]
+    fn clear_client_cache_reuses_full_storage_and_resets_eviction_cursors() {
+        let local = IpAddr::from([192, 0, 2, 1]);
+        let cookie = FastOpenCookie::new(&[7; 8]).unwrap();
+        let mut cache = FastOpen::new().unwrap();
+        for n in 1..=65 {
+            let remote = IpAddr::from([198, 51, 100, n]);
+            cache.learn(0, local, remote, cookie, 536);
+            cache.fail(0, local, SocketAddr::new(remote, 80));
+        }
+        let capacities = (cache.entries.capacity(), cache.negative.capacity());
+        assert_eq!((cache.next, cache.negative_next), (1, 1));
+        crate::allocation_tests::fail_after(0, || {
+            cache.clear_client_cache();
+            cache.clear_client_cache();
+            assert!(cache.entries.is_empty() && cache.negative.is_empty());
+            assert_eq!((cache.next, cache.negative_next), (0, 0));
+            assert_eq!(
+                (cache.entries.capacity(), cache.negative.capacity()),
+                capacities
+            );
+            let remote = IpAddr::from([203, 0, 113, 1]);
+            cache.learn(10, local, remote, cookie, 940);
+            cache.fail(10, local, SocketAddr::new(remote, 80));
+            assert_eq!(cache.get(10, 100, local, remote).unwrap().mss, 940);
+            assert!(cache.suppressed(10, 100, local, SocketAddr::new(remote, 80)));
+            assert!(
+                cache
+                    .get(10, 100, local, IpAddr::from([198, 51, 100, 65]))
+                    .is_none()
+            );
+        });
     }
 }

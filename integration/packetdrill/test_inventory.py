@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 from expectations import PORTED_SCRIPTS
-from run import (HERE, PIN, SYN_DATA_ACK_SCRIPTS, TIMESTAMP_CONTROL, TIMESTAMP_EVENT, adapt_source, preflight,
+from run import (CACHE_FLUSH_CONTROL, CACHE_FLUSH_EVENT, HERE, PIN, SYN_DATA_ACK_SCRIPTS, TIMESTAMP_CONTROL, TIMESTAMP_EVENT, adapt_source, preflight,
                  select_cases)
 
 
@@ -44,6 +44,8 @@ class CompleteInventory(unittest.TestCase):
                     expected = original.replace(entry['command_line'].encode(), entry['replacement_line'].encode(), 1)
                     if entry.get('restore_line'):
                         expected = expected.replace(entry['restore_line'].encode(), entry['restore_replacement_line'].encode(), 1)
+                    if entry.get('cache_flush_control'):
+                        expected = expected.replace(CACHE_FLUSH_EVENT, CACHE_FLUSH_CONTROL, 1)
                     if entry.get('timestamp_control'):
                         expected = expected.replace(TIMESTAMP_EVENT, TIMESTAMP_CONTROL, 1)
                     # Existing resource-control mapping is independently covered.
@@ -51,7 +53,8 @@ class CompleteInventory(unittest.TestCase):
                         self.assertEqual(generated, expected)
                     self.assertEqual(preflight(generated.decode(), entry.get('embedded_tcp_info') is True,
                                                resource_control=entry.get('resource_control') is True,
-                                               timestamp_control=entry.get('timestamp_control') is True), [])
+                                               timestamp_control=entry.get('timestamp_control') is True,
+                                               cache_flush_control=entry.get('cache_flush_control') is True), [])
 
     def test_syn_data_setup_cannot_rehash_an_alternate_policy_into_execution(self):
         directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
