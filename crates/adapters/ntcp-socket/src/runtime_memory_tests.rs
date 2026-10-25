@@ -722,3 +722,7 @@ mod fast_open_mss {
 mod accept_reset {
     include!("runtime_accept_reset_tests.rs");
 }
+
+mod tfo_copied_completion {
+    include!("runtime_tfo_copied_completion_tests.rs");
+}

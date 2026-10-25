@@ -128,6 +128,8 @@ pub(super) struct LogicalSend {
     end: u64,
     cookie: Option<u64>,
     zc: Option<u32>,
+    // Owns one notification slot, without an ID, during provisional TFO copy.
+    zc_pending: bool,
     zerocopy: bool,
     destination: Option<SocketAddr>,
     fast_open_started: bool,
@@ -170,6 +172,7 @@ impl LogicalSend {
             end: 0,
             cookie: None,
             zc: None,
+            zc_pending: false,
             zerocopy: socket.zerocopy && flags & MSG_ZEROCOPY != 0,
             destination,
             fast_open_started: false,
@@ -245,9 +248,9 @@ impl Owner {
             if remote.port() == 0 {
                 return Err(EINVAL);
             }
-            // No completion/timestamp range may be fabricated for bytes queued
-            // by core's initial-copy API. Reject before consuming or connecting.
-            if send.flags & MSG_ZEROCOPY != 0 || send.bits & crate::timestamping::TX_RECORD != 0 {
+            // Native TX timestamps need a real initial-copy range and events.
+            // Copied notifications instead rely on ownership of admitted bytes.
+            if send.bits & crate::timestamping::TX_RECORD != 0 {
                 return Err(EOPNOTSUPP);
             }
             let lowat =
@@ -258,11 +261,26 @@ impl Owner {
             }
             // Crucially precedes local-port allocation, core connection, and
             // clearing the deferred peer. EFAULT leaves the socket retryable.
+            let completion =
+                self.reserve_send_completion(id, count != 0, send.zerocopy, 0, true)?;
             let bytes = send.copy_chunk(count)?;
             let local = self.connect_local(id)?;
             let n = self.start_connection(id, local, remote, Some(&bytes))?;
             send.fast_open_started = true;
             send.advance(n);
+            if n != 0 && completion {
+                let socket = self.sockets.get_mut(&id).unwrap();
+                // A blocking implicit open owns only provisional SYN bytes.
+                // Hold notification capacity until the handshake makes the
+                // positive return irrevocable; failed calls consume no ID.
+                if blocking {
+                    send.zc_pending = true;
+                } else {
+                    send.zc = Some(socket.zc_next);
+                    socket.zc_next = socket.zc_next.wrapping_add(1);
+                }
+                socket.zc_reserved += 1;
+            }
             send.wait_handshake = blocking;
             if blocking {
                 let Handle::Connection(cid) = self.sockets[&id].handle else {
@@ -286,6 +304,11 @@ impl Owner {
             }
             self.complete_connect(id)?;
             send.wait_handshake = false;
+            if core::mem::take(&mut send.zc_pending) {
+                let socket = self.sockets.get_mut(&id).unwrap();
+                send.zc = Some(socket.zc_next);
+                socket.zc_next = socket.zc_next.wrapping_add(1);
+            }
         }
         // Ordinary stream sends validate state before accessing payload or
         // reserving completions. Fast Open's implicit connect is handled above.
@@ -350,6 +373,11 @@ impl Owner {
         send: &mut LogicalSend,
         result: Result<()>,
     ) -> Result<Reply> {
+        if core::mem::take(&mut send.zc_pending)
+            && let Some(socket) = self.sockets.get_mut(&id)
+        {
+            socket.zc_reserved -= 1;
+        }
         if let Some(cid) = send.pending_fast_open.take() {
             let _ = self.endpoint.set_fast_open_write_pending(cid, false);
         }

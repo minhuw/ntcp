@@ -383,18 +383,13 @@ fn fast_open_blocking_hit_and_miss_wait_handshake_and_complete_iovecs() {
 }
 
 #[test]
-fn fast_open_rejects_unsafe_completions_and_deferred_close_sends_nothing() {
+fn fast_open_rejects_native_timestamps_and_deferred_close_sends_nothing() {
     let (mut a, _b, _) = tfo_setup(true);
     let client = new(&mut a, SOCK_NONBLOCK);
     a.execute(client, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
         .unwrap();
     a.execute(client, Op::Connect("192.0.2.2:8080".parse().unwrap()))
         .unwrap();
-    assert_eq!(
-        a.execute(client, tfo_send(b"hello", MSG_ZEROCOPY))
-            .unwrap_err(),
-        EOPNOTSUPP
-    );
     a.execute(
         client,
         Op::Set(

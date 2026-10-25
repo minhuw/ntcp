@@ -11,16 +11,18 @@ from run import (HERE, PIN, TIMESTAMP_SCRIPT, TIMESTAMP_SETUP, TIMESTAMP_EVENT,
 
 
 class TimestampMappingChecks(unittest.TestCase):
+    script = TIMESTAMP_SCRIPT
+
     def setUp(self):
         self.directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
         if not self.directory.is_dir():
             self.skipTest('pinned checkout unavailable')
         self.manifest = json.loads((HERE / 'adaptations.json').read_text())
-        self.entry = self.manifest['scripts'][TIMESTAMP_SCRIPT]
-        self.source = (self.directory / TIMESTAMP_SCRIPT).read_bytes()
+        self.entry = self.manifest['scripts'][self.script]
+        self.source = (self.directory / self.script).read_bytes()
 
     def test_exact_timed_translation_preserves_every_nonconfiguration_byte(self):
-        generated, audit = adapt_source(self.directory, TIMESTAMP_SCRIPT, self.manifest, self.entry['adapter_flags'])
+        generated, audit = adapt_source(self.directory, self.script, self.manifest, self.entry['adapter_flags'])
         expected = self.source.replace(TIMESTAMP_SETUP, self.entry['replacement_line'].encode(), 1).replace(TIMESTAMP_EVENT, TIMESTAMP_CONTROL, 1)
         self.assertEqual(generated, expected)
         self.assertEqual(generated.count(b'\n'), self.source.count(b'\n'))
@@ -38,23 +40,23 @@ class TimestampMappingChecks(unittest.TestCase):
                            ('command_sha256', 'bad'), ('replacement_line', '// changed\n'),
                            ('variant', 'ipv6')]:
             bad = copy.deepcopy(self.manifest)
-            bad['scripts'][TIMESTAMP_SCRIPT][key] = value
+            bad['scripts'][self.script][key] = value
             with self.subTest(key=key), self.assertRaises(ValueError):
-                adapt_source(self.directory, TIMESTAMP_SCRIPT, bad, self.entry['adapter_flags'])
+                adapt_source(self.directory, self.script, bad, self.entry['adapter_flags'])
         for altered in (self.source.replace(b' +.07 `', b' +.08 `'),
                         self.source.replace(b'tcp_timestamps=0', b'tcp_timestamps=1'),
                         self.source + b'+0 `true`\n'):
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                for name, data in [(TIMESTAMP_SCRIPT, altered), (self.entry['setup_path'], (self.directory / self.entry['setup_path']).read_bytes())]:
+                for name, data in [(self.script, altered), (self.entry['setup_path'], (self.directory / self.entry['setup_path']).read_bytes())]:
                     target = root / name
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(data)
                 bad = copy.deepcopy(self.manifest)
                 # Even a rehashed altered source cannot extend the capability.
-                bad['scripts'][TIMESTAMP_SCRIPT]['source_sha256'] = hashlib.sha256(altered).hexdigest()
+                bad['scripts'][self.script]['source_sha256'] = hashlib.sha256(altered).hexdigest()
                 with self.assertRaisesRegex(ValueError, 'exact audited timestamp'):
-                    adapt_source(root, TIMESTAMP_SCRIPT, bad, self.entry['adapter_flags'])
+                    adapt_source(root, self.script, bad, self.entry['adapter_flags'])
 
     def test_preflight_accepts_only_one_exact_enabled_control(self):
         text = TIMESTAMP_CONTROL.decode()
@@ -64,3 +66,7 @@ class TimestampMappingChecks(unittest.TestCase):
                         text + '+0 `true`\n', text.replace('-off`', '-off; true`')):
             with self.subTest(text=changed):
                 self.assertTrue(preflight(changed, timestamp_control=True))
+
+
+class ZerocopyTimestampMappingChecks(TimestampMappingChecks):
+    script = 'zerocopy/fastopen-client.pkt'

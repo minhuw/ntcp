@@ -265,6 +265,9 @@ for _name in SYN_DATA_ACK_SCRIPTS:
 UPSTREAM_OPTION_AUDIT['fastopen/client/syn-data-mss.pkt'] = {
     'budget224m': 'Five client connections retain receive/send/scoreboard/RACK storage across the timed MSS and timestamp-default changes; use the existing bounded seven-connection budget without changing per-socket accounting.',
 }
+UPSTREAM_OPTION_AUDIT['zerocopy/fastopen-client.pkt'] = {
+    'budget128m': 'Two client connections retain charged receive/send/scoreboard/RACK storage across warmup and TIME-WAIT; the existing bounded budget accommodates both without changing per-socket accounting.',
+}
 UPSTREAM_OPTION_AUDIT['zerocopy/maxfrags.pkt'] = {
     'budget224m': 'Original SO_SNDBUF=2000000 needs the existing bounded budget for native doubled/clamped capacity and resize staging. Linux page-fragment accounting is not emulated.',
 }
@@ -343,6 +346,10 @@ TIMESTAMP_SETUP = b'`../../common/defaults.sh`\n'
 TIMESTAMP_EVENT = b' +.07 `sysctl -q net.ipv4.tcp_timestamps=0`\n'
 TIMESTAMP_CONTROL = b' +.07 `ntcp-local-timestamps-off`\n'
 TIMESTAMP_SOURCE_SHA256 = '4f7824b6627baed6f812a60882a31d5a273ac3070359348d3280e12541279fbb'
+TIMESTAMP_SOURCES = {
+    TIMESTAMP_SCRIPT: TIMESTAMP_SOURCE_SHA256,
+    'zerocopy/fastopen-client.pkt': 'e0fa374f4ba5713f7a131e94e808f2bd59e7b2884305af4502debc9d80eb7680',
+}
 
 
 TCP_INFO_FIELDS = {'tcpi_state', 'tcpi_ca_state', 'tcpi_probes', 'tcpi_backoff', 'tcpi_unacked', 'tcpi_sacked',
@@ -482,11 +489,11 @@ def adapt_source(directory, relative, manifest, so_flags):
         data = (directory / extra['path']).read_bytes()
         if hashlib.sha256(data).hexdigest() != extra['sha256']:
             raise ValueError(f"setup {extra['path']} hash differs from audited adaptation")
-    if relative == TIMESTAMP_SCRIPT and not entry.get('blocked_reasons'):
+    if relative in TIMESTAMP_SOURCES and not entry.get('blocked_reasons'):
         expected_commands = [TIMESTAMP_SETUP.rstrip(b'\n'),
                              TIMESTAMP_EVENT[TIMESTAMP_EVENT.index(b'`'):].rstrip(b'\n')]
         expected_audit = [(c.decode(), hashlib.sha256(c).hexdigest()) for c in expected_commands]
-        if (hashlib.sha256(source).hexdigest() != TIMESTAMP_SOURCE_SHA256
+        if (hashlib.sha256(source).hexdigest() != TIMESTAMP_SOURCES[relative]
                 or entry['command_line'].encode() != TIMESTAMP_SETUP
                 or entry['replacement_line'].encode() != b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n'
                 or entry.get('command_sha256') != hashlib.sha256(TIMESTAMP_SETUP).hexdigest()

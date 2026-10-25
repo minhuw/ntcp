@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from expectations import PORTED_SCRIPTS
 
-from run import (SYN_DATA_ACK_SCRIPTS, TIMESTAMP_SCRIPT, RESOURCE_SCRIPT, RESOURCE_EVENT, RESOURCE_CONTROL, SLOW_START_ACK_SCRIPTS, FASTOPEN_CLIENT_SCRIPTS, NON_TFO_SETUP_COMMANDS, ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
+from run import (SYN_DATA_ACK_SCRIPTS, TIMESTAMP_SOURCES, RESOURCE_SCRIPT, RESOURCE_EVENT, RESOURCE_CONTROL, SLOW_START_ACK_SCRIPTS, FASTOPEN_CLIENT_SCRIPTS, NON_TFO_SETUP_COMMANDS, ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
                  fixture_command, HERE, PIN, adapt_source, check_plugin_hash, invoke, main, outcome,
                  preflight, profile_metadata, select_cases, variants, verify_backend)
 
@@ -506,7 +506,8 @@ class AdaptationChecks(unittest.TestCase):
         # Timed resource commands require the exact real source/hash and have
         # separate capability tests; generic synthetic sources cannot enable it.
         self.manifest['scripts'].pop(RESOURCE_SCRIPT)
-        self.manifest['scripts'].pop(TIMESTAMP_SCRIPT)
+        for name in TIMESTAMP_SOURCES:
+            self.manifest['scripts'].pop(name)
         # Synthetic generic sources have no IPv6-only filename constraints.
         for name in list(self.manifest['scripts']):
             if name.endswith('v6.pkt'):
@@ -865,11 +866,13 @@ class AdaptationChecks(unittest.TestCase):
     def test_explicit_resource_reasons_do_not_enable_blocked_setup(self):
         manifest = json.loads((HERE / 'adaptations.json').read_text())
         self.assertNotIn('no SO_SNDBUF mapping', json.dumps(manifest))
-        reasons = [entry['mapping']['option_reasons']['budget128m']
-                   for entry in manifest['scripts'].values()
-                   if 'budget128m' in entry['mapping']['option_reasons']]
+        reasons = {name: entry['mapping']['option_reasons']['budget128m']
+                   for name, entry in manifest['scripts'].items()
+                   if 'budget128m' in entry['mapping']['option_reasons']}
+        retained = reasons.pop('zerocopy/fastopen-client.pkt')
+        self.assertIn('Two client connections retain', retained)
         self.assertEqual(len(reasons), 6)
-        self.assertTrue(all('SO_SNDBUF=200000' in reason and 'staged' in reason for reason in reasons))
+        self.assertTrue(all('SO_SNDBUF=200000' in reason and 'staged' in reason for reason in reasons.values()))
         for entry in manifest['scripts'].values():
             if entry.get('blocked_reasons'):
                 self.assertTrue(any('Unavailable:' in command['semantic_mapping']
