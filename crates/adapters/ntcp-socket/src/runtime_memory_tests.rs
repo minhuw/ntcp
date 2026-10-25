@@ -718,3 +718,7 @@ include!("runtime_icmp_tests.rs");
 mod fast_open_mss {
     include!("runtime_fast_open_mss_tests.rs");
 }
+
+mod accept_reset {
+    include!("runtime_accept_reset_tests.rs");
+}

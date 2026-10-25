@@ -5523,3 +5523,6 @@ fn pmtud_endpoint_opt_in_tuple_dispatch_path_query_and_link_update() {
 mod handshake_limit {
     include!("endpoint_handshake_limit_tests.rs");
 }
+
+#[path = "endpoint_accept_reset_tests.rs"]
+mod accept_reset;
