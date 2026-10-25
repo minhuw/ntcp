@@ -581,6 +581,9 @@ fn due(deadline: Option<Instant>, now: Instant) -> bool {
 struct IwEpoch {
     start: Seq,
     end: Seq,
+    // Probe ACKs cannot validate the ordinary restart flight. Its first byte
+    // is recorded separately from the complete (possibly probe-led) range.
+    fresh_start: Option<Seq>,
     bytes: u32,
     open: bool,
     lost: bool,
@@ -6142,7 +6145,12 @@ impl Connection {
             self.limited_end = Some(end);
             self.limited_sent = bytes;
         }
-        if !syn_ack && let Some(epoch) = &mut self.iw_epoch {
+        if !syn_ack
+            && let Some(epoch) = &mut self.iw_epoch
+            && epoch.fresh_start.is_some_and(|start| after(ack, start))
+        {
+            // Only cumulative progress into ordinary fresh data validates
+            // this burst; a probe-only ACK leaves its accounting open.
             epoch.open = false;
         }
         let bytes = ack
@@ -8320,10 +8328,14 @@ impl Connection {
             && !probe
             && !keepalive
             && count != 0;
-        let idle_reduction = fresh_data
+        // Persist can be the first data-bearing output after an idle period.
+        // Share the actual restart decision with feedback and burst tracking;
+        // probe packets themselves remain ineligible for ECT/CWR.
+        let idle_restart = !keepalive
+            && count != 0
             && self.flight() == 0
-            && now.saturating_sub(self.last_sent) >= self.rto()
-            && self.congestion.cwnd() > self.restart_window();
+            && now.saturating_sub(self.last_sent) >= self.rto();
+        let idle_reduction = idle_restart && self.congestion.cwnd() > self.restart_window();
         //= https://www.rfc-editor.org/rfc/rfc3168#section-5.2
         //= reason=Shared fresh-data output predicate excludes setup, pure ACK, reset, FIN-only, keepalive, persist and retransmitted packets. Fresh FIFO bytes (including Limited Transmit, recovery new data, data/FIN and original TLP) advance tracked sequence space and remain subject to loss recovery. Assertions cover special ECT/Not-ECT outputs, original TLP loss RTO and corrupted CE loss congestion response; no router marking claim.
         //# To ensure the reliable delivery of the congestion indication
@@ -8705,12 +8717,14 @@ impl Connection {
                 self.congestion.limit_restart(self.mss as u32);
             }
         }
-        if fresh_data && self.config.initial_window == InitialWindow::Iw10 {
-            let idle = self.flight() == 0 && now.saturating_sub(self.last_sent) >= self.rto();
-            if !self.iw_started || idle {
+        if self.config.initial_window == InitialWindow::Iw10
+            && (fresh_data || probe && idle_restart)
+        {
+            if !self.iw_started || idle_restart {
                 self.iw_epoch = Some(IwEpoch {
                     start: seq,
                     end: seq,
+                    fresh_start: None,
                     bytes: 0,
                     open: true,
                     lost: false,
@@ -8721,7 +8735,13 @@ impl Connection {
                 && epoch.open
             {
                 epoch.end = seq.wrapping_add(count as u32);
+                // Include the initiating probe's real byte once; retransmitted
+                // probes do not enter this block. Its ACK alone cannot close
+                // the ordinary data flight that will follow it.
                 epoch.bytes = epoch.bytes.saturating_add(count as u32);
+                if fresh_data {
+                    epoch.fresh_start.get_or_insert(seq);
+                }
                 if epoch.lost && epoch.bytes > 4_096 {
                     self.iw_fallback = true;
                 }
@@ -8761,6 +8781,11 @@ impl Connection {
             self.sack_receive |= sack_offer;
             self.ecn_sent_setup |= setup;
             self.ecn_sent_plain |= !setup;
+        }
+        if idle_reduction {
+            // A probe cannot carry CWR. Retain this successful reduction for
+            // the next eligible new-data packet, even if the probe is ACKed.
+            self.ecn_cwr_pending |= self.ecn_feedback();
         }
         if fresh_data && flags & CWR != 0 {
             self.ecn_cwr_pending = false;
@@ -8863,11 +8888,7 @@ impl Connection {
         //= https://www.rfc-editor.org/rfc/rfc5681#section-4.1
         //# Therefore, a TCP SHOULD set cwnd to no more than RW before beginning transmission
         //# if the TCP has not sent data in an interval exceeding the retransmission timeout.
-        if !keepalive
-            && self.flight() == 0
-            && now.saturating_sub(self.last_sent) >= self.rto()
-            && count != 0
-        {
+        if idle_restart {
             self.congestion.restart_after_idle();
             self.congestion.limit_restart(self.restart_window());
         }
@@ -10591,6 +10612,10 @@ mod tests {
         assert!(a.take_events().connected);
         assert!(b.take_events().connected);
         (a, b)
+    }
+
+    mod persist_idle_restart {
+        include!("connection_persist_idle_restart_tests.rs");
     }
 
     mod sender_metadata {
