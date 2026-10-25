@@ -859,7 +859,7 @@ impl Congestion {
     //= reason=Actual bounded flight output followed one RTT later by delayed or one-byte divided ACKs: exact cumulative byte ledger and at most one SMSS increase for each of three flights, including wrap.
     //# Note that during congestion avoidance, cwnd MUST NOT be
     //= https://www.rfc-editor.org/rfc/rfc5681#section-4.3
-    //= reason=NewReno/SACK/RACK/RACK+PRR actual entries and covering ACK exits give cwnd2000 below ssthresh4000; first next MSS ACK leaves cwnd unchanged, second grows by one MSS; RTO restores slow start. No global PRR/half-flight claim.
+    //= reason=NewReno/SACK/RACK entries without PRR and covering ACK exits give cwnd2000 below ssthresh4000; first next MSS ACK leaves cwnd unchanged, second grows by one MSS; RTO restores slow start. No global PRR/half-flight claim.
     //# has been successfully retransmitted, cwnd MUST be set to no more than ssthresh and congestion
     //# avoidance MUST be used to further increase cwnd.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-3.1
@@ -872,7 +872,7 @@ impl Congestion {
     //# both allows TCPs to increase cwnd by one segment per RTT in the face of delayed ACKs and
     //# provides robustness against ACK Division attacks.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-4.3
-    //= reason=NewReno/SACK/RACK/RACK+PRR actual entries and covering ACK exits give cwnd2000 below ssthresh4000; first next MSS ACK leaves cwnd unchanged, second grows by one MSS; RTO restores slow start. No global PRR/half-flight claim.
+    //= reason=NewReno/SACK/RACK entries without PRR and covering ACK exits give cwnd2000 below ssthresh4000; first next MSS ACK leaves cwnd unchanged, second grows by one MSS; RTO restores slow start. No global PRR/half-flight claim.
     //# Finally, after all loss in the given window of segments has been successfully retransmitted,
     //# cwnd MUST be set to no more than ssthresh and congestion avoidance MUST be used to further
     //# increase cwnd.
@@ -1743,14 +1743,10 @@ impl Congestion {
 pub enum PrrAlgorithm {
     #[default]
     Rfc9937,
-    // Historical unconditional entry MSS, deferred ACK replay and persist bypass.
-    // Compatibility policy, not a claim of RFC 6937 or RFC 9937 conformance.
-    LegacyInitialCredit,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Prr {
-    algorithm: PrrAlgorithm,
     recover_fs: u32,
     mss: u32,
     dupack_bytes: u32,
@@ -1764,23 +1760,14 @@ impl Prr {
     //# At the beginning of a congestion control response episode initiated
     //# by the congestion control algorithm, a data sender using PRR MUST
     //# initialize the PRR state.
-    pub(crate) fn new(flight: u32, mss: u32, algorithm: PrrAlgorithm) -> Self {
+    pub(crate) fn new(flight: u32, mss: u32, _algorithm: PrrAlgorithm) -> Self {
         Self {
-            algorithm,
-            recover_fs: if algorithm == PrrAlgorithm::LegacyInitialCredit {
-                flight.max(1)
-            } else {
-                flight
-            },
+            recover_fs: flight,
             mss,
             dupack_bytes: 0,
             delivered: 0,
             out: 0,
-            credit: if algorithm == PrrAlgorithm::LegacyInitialCredit {
-                mss
-            } else {
-                0
-            },
+            credit: 0,
         }
     }
 
@@ -1845,20 +1832,20 @@ impl Prr {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
-    //= reason=Rfc9937 accounts current delivery, inflight and SafeACK against a fixed episode target; LegacyInitialCredit is compatibility-only.
+    //= reason=Rfc9937 accounts current delivery, inflight and SafeACK against a fixed episode target.
     //# The Proportional Rate
     //# Reduction (PRR) algorithm [RFC6937] is RECOMMENDED for the specific
     //# congestion control actions taken upon the losses detected by RACK-
     //# TLP.
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-    //= reason=Rfc9937 only; LegacyInitialCredit deliberately retains historical equations.
+    //= reason=Zero delivery preserves the episode counters and credit.
     //# if (DeliveredData is 0)
     //#    Return
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
     //= reason=Byte counters accumulate current ACK only; independent per-ACK oracle and wire traces cover signed SACK trimming and no-SACK capped delivery.
     //# prr_delivered += DeliveredData
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-    //= reason=Widened byte multiplication with ceil division; threshold equality selects reduction branch. Large integer overflow vector in rfc9937_safe_unsafe_zero_delivery_and_forced_first_transmit and independent wire oracle supplement the vectors; legacy equation tests are not used.
+    //= reason=Widened byte multiplication with ceil division; threshold equality selects reduction branch. Large integer overflow vector in rfc9937_safe_unsafe_zero_delivery_and_forced_first_transmit and independent wire oracle supplement the vectors; independent modern equation tests are used.
     //# if (inflight > ssthresh) {
     //#    // Proportional Rate Reduction
     //#    // This uses integer division, rounding up:
@@ -1896,8 +1883,7 @@ impl Prr {
         threshold: u32,
         safe_ack: bool,
     ) {
-        let modern = self.algorithm == PrrAlgorithm::Rfc9937;
-        if modern && delivered == 0 {
+        if delivered == 0 {
             return;
         }
         self.delivered = self.delivered.saturating_add(u64::from(delivered));
@@ -1906,35 +1892,23 @@ impl Prr {
                 .div_ceil(u128::from(self.recover_fs.max(1)))
                 .min(u128::from(u64::MAX));
             (allowed as u64).saturating_sub(self.out)
-        } else if modern {
+        } else {
             self.delivered
                 .saturating_sub(self.out)
                 .max(u64::from(delivered))
                 .saturating_add(if safe_ack { u64::from(self.mss) } else { 0 })
                 .min(u64::from(threshold - pipe))
-        } else {
-            self.delivered
-                .saturating_sub(self.out)
-                .min(u64::from(threshold - pipe))
         };
         self.credit = credit.min(u64::from(u32::MAX)) as u32;
-        if modern && self.out == 0 && self.credit == 0 {
+        if self.out == 0 && self.credit == 0 {
             self.credit = self.mss;
-        }
-    }
-
-    // Entry policy, not an RFC 6937 CRB equation: this may permit out > delivered.
-    // Strict mode never applies this compatibility override.
-    pub(crate) fn guarantee_initial(&mut self, mss: u32) {
-        if self.algorithm == PrrAlgorithm::LegacyInitialCredit {
-            self.credit = self.credit.max(mss);
         }
     }
 
     // RFC 6675 section 5 first repair, composed with RFC 8985 timer entry;
     // not DeliveredData or the RFC 9937 per-ACK floor. Caller owns fresh entry.
     pub(crate) fn admit_timer_repair(&mut self, pipe: u32, cwnd: u32) {
-        if self.algorithm == PrrAlgorithm::Rfc9937 && self.delivered == 0 && self.out == 0 {
+        if self.delivered == 0 && self.out == 0 {
             self.credit = self.mss.min(cwnd.saturating_sub(pipe));
         }
     }
@@ -1942,7 +1916,7 @@ impl Prr {
     // Only timer entry grants strict credit without delivery; reserved output
     // holds the owner against ingress until its admitted fragments finish.
     pub(crate) fn timer_repair(&self) -> bool {
-        self.algorithm == PrrAlgorithm::Rfc9937 && self.delivered == 0 && self.credit != 0
+        self.delivered == 0 && self.credit != 0
     }
 
     pub(crate) fn finish_timer_repair(&mut self) {
@@ -1966,9 +1940,7 @@ impl Prr {
     //#
     //#    prr_out += (data sent)
     pub(crate) fn sent(&mut self, bytes: u32) {
-        if self.algorithm == PrrAlgorithm::Rfc9937 {
-            debug_assert!(bytes <= self.credit);
-        }
+        debug_assert!(bytes <= self.credit);
         self.out = self.out.saturating_add(u64::from(bytes));
         self.credit = self.credit.saturating_sub(bytes);
     }
@@ -2230,7 +2202,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.1
     //= type=test
-    //= reason=Connection selects the congestion target; constructor zeros byte counters. Entry wire traces separately assert the actual target; compatibility policy excluded.
+    //= reason=Connection selects the congestion target; constructor zeros byte counters. Entry wire traces separately assert the actual target.
     //# ssthresh = CongCtrlAlg()      // Target flight size in recovery
     //# prr_delivered = 0             // Total bytes delivered in recovery
     //# prr_out = 0                   // Total bytes sent in recovery
@@ -2240,7 +2212,7 @@ mod tests {
     //# prr_delivered += DeliveredData
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
     //= type=test
-    //= reason=Widened byte multiplication with ceil division; threshold equality selects reduction branch. Large integer overflow vector in rfc9937_safe_unsafe_zero_delivery_and_forced_first_transmit and independent wire oracle supplement the vectors; legacy equation tests are not used.
+    //= reason=Widened byte multiplication with ceil division; threshold equality selects reduction branch. Large integer overflow vector in rfc9937_safe_unsafe_zero_delivery_and_forced_first_transmit and independent wire oracle supplement the vectors; independent modern equation tests are used.
     //# if (inflight > ssthresh) {
     //#    // Proportional Rate Reduction
     //#    // This uses integer division, rounding up:
@@ -2259,7 +2231,6 @@ mod tests {
             let mut p = Prr::new(10_000, 1000, PrrAlgorithm::Rfc9937);
             assert_eq!(p.counters(), (10_000, 0, 0));
             assert_eq!(p.credit(), 0);
-            p.guarantee_initial(1000);
             assert_eq!(p.credit(), 0);
             for i in 0..100 {
                 // Exercise headroom discontinuities, small ACKs, duplicate ACKs,
@@ -2307,20 +2278,6 @@ mod tests {
         assert_eq!(prr.credit(), 0);
         prr.acknowledge(1000, 1000, 5000, false);
         assert_eq!(prr.credit(), 2000);
-        let mut timer_entry = Prr::new(10_000, 1000, PrrAlgorithm::LegacyInitialCredit);
-        timer_entry.sent(1000);
-        timer_entry.acknowledge(1000, 3000, 5000, false);
-        // Initial retransmission consumes actual output even without an entry ACK.
-        assert_eq!(timer_entry.credit(), 0);
-        let mut timer_entry = Prr::new(10_000, 1000, PrrAlgorithm::LegacyInitialCredit);
-        timer_entry.acknowledge(1000, 3000, 5000, false); // Real deferred causative SACK.
-        timer_entry.guarantee_initial(1000);
-        timer_entry.sent(1000);
-        timer_entry.acknowledge(1000, 3000, 5000, false);
-        assert_eq!(timer_entry.credit(), 1000);
-        timer_entry.sent(1000);
-        timer_entry.acknowledge(0, 3000, 5000, false);
-        assert_eq!(timer_entry.credit(), 0);
     }
 
     #[test]
@@ -2344,49 +2301,6 @@ mod tests {
             assert_eq!(prr.delivered, 3000);
             assert_eq!(prr.out, 1000);
         }
-    }
-
-    #[test]
-    fn prr_crb_equation_vectors_in_bytes() {
-        // Non-half thresholds, CEIL rounding, branch equality, banked delivery,
-        // partial-byte ACKs, overconsumption saturation and widened multiplication.
-        for (flight, threshold, pipe, delivered, out, expected) in [
-            (10_000, 7000, 8000, 1001, 0, 701),
-            (10_000, 7000, 8000, 1001, 700, 1),
-            (10_000, 7000, 7000, 1001, 0, 0),
-            (10_000, 7000, 6999, 1001, 0, 1),
-            (10_000, 7000, 3000, 3000, 1000, 2000),
-            (10_000, 7000, 6998, 3000, 1000, 2),
-            (10_000, 7000, 8000, 1, 0, 1),
-            (10_000, 7000, 8000, 1, 2, 0),
-            (10_000, 7000, 1000, 1, 2, 0),
-            (10_000, 7000, 8000, 10_000, 0, 7000),
-            (u32::MAX, u32::MAX - 1, u32::MAX, u32::MAX, 0, u32::MAX - 1),
-        ] {
-            let mut prr = Prr::new(flight, 1000, PrrAlgorithm::LegacyInitialCredit);
-            prr.sent(out);
-            prr.acknowledge(delivered, pipe, threshold, false);
-            assert_eq!(prr.credit(), expected);
-            assert_eq!(prr.delivered, u64::from(delivered));
-            assert_eq!(prr.out, u64::from(out));
-            prr.sent(expected);
-            assert_eq!(prr.credit(), 0);
-            assert_eq!(prr.out, u64::from(out) + u64::from(expected));
-        }
-    }
-
-    #[test]
-    fn legacy_prr_initial_state_and_guarantee_are_not_delivery() {
-        let mut prr = Prr::new(10_000, 1000, PrrAlgorithm::LegacyInitialCredit);
-        assert_eq!((prr.recover_fs, prr.delivered, prr.out), (10_000, 0, 0));
-        assert_eq!(prr.credit(), 1000); // Characterize policy, not a CRB waiver.
-        prr.acknowledge(0, 3000, 5000, false);
-        assert_eq!(prr.credit(), 0);
-        prr.guarantee_initial(1000);
-        assert_eq!((prr.delivered, prr.out, prr.credit()), (0, 0, 1000));
-        prr.sent(1000);
-        assert_eq!((prr.delivered, prr.out, prr.credit()), (0, 1000, 0));
-        assert!(prr.out > prr.delivered); // Strict conservation is not established.
     }
 
     #[test]

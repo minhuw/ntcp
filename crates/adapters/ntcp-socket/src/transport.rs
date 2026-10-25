@@ -74,7 +74,7 @@ pub(crate) fn transport_option_prefix(
         | (u8::from(info.sack_negotiated) << 1)
         | (u8::from(info.window_scaling_negotiated) << 2)
         | (u8::from(info.ecn_negotiated) << 3)
-        | (u8::from(info.syn_data_acked) << 5);
+        | (u8::from(info.syn_data_fully_acked) << 5);
     if info.window_scaling_negotiated {
         bytes[6] = info.send_window_scale | (info.receive_window_scale << 4);
     }
@@ -369,6 +369,7 @@ mod tests {
             receive_window_scale: 14,
             ecn_negotiated: true,
             syn_data_acked: true,
+            syn_data_fully_acked: true,
             delivered_segments: 0x12345678,
             delivered_segments_valid: true,
             unacked: 3,
@@ -524,6 +525,7 @@ mod tests {
         sample.window_scaling_negotiated = false;
         sample.ecn_negotiated = false;
         sample.syn_data_acked = false;
+        sample.syn_data_fully_acked = false;
         assert_eq!(&transport_option(sample, 1).unwrap()[5..7], &[0, 0]);
         for bit in [1, 2, 4, 8, 32] {
             let single = ntcp::TransportInfo {
@@ -532,6 +534,7 @@ mod tests {
                 window_scaling_negotiated: bit == 4,
                 ecn_negotiated: bit == 8,
                 syn_data_acked: bit == 32,
+                syn_data_fully_acked: bit == 32,
                 ..sample
             };
             assert_eq!(transport_option(single, 1).unwrap()[5], bit);

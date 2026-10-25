@@ -8,13 +8,14 @@
  #include <signal.h>
  #include <stdio.h>
  #include <stdlib.h>
-@@ -140,11 +141,107 @@
+@@ -140,11 +141,108 @@
  
  #ifdef linux
  
 +/* This opt-in collector matches run.py's audited assertion fields. Keep the
 + * field's end offset, not sizeof(tcp_info): kernels may return older layouts. */
 +#define TCP_INFO_PREFIX_FIELDS(X) \
++	X(tcpi_state) \
 +	X(tcpi_ca_state) \
 +	X(tcpi_probes) \
 +	X(tcpi_backoff) \
@@ -116,7 +117,7 @@
  	assert(len >= sizeof(struct _tcp_info));
  
  	write_symbols(code);
-@@ -559,6 +656,11 @@
+@@ -559,6 +657,11 @@
  	if (strcmp(config->code_sockopt, "") == 0) {
  		code->data_type = DATA_NONE;		/* auto-detect */
  #if HAVE_TCP_INFO
@@ -128,7 +129,7 @@
  	} else if (strcmp(config->code_sockopt, "TCP_INFO") == 0) {
  		code->data_type = DATA_TCP_INFO;
  #endif
-@@ -710,7 +812,8 @@
+@@ -710,7 +813,8 @@
  #if HAVE_TCP_INFO
  	case DATA_TCP_INFO:
  		opt_name = TCP_INFO;
@@ -138,7 +139,7 @@
  		level = SOL_TCP;
  		break;
  #endif  /* HAVE_TCP_INFO */
-@@ -740,6 +843,16 @@
+@@ -740,6 +844,16 @@
  		free(data);
  		return NULL;
  	}
@@ -155,7 +156,7 @@
  	*len = opt_len;
  	return data;
  }
-@@ -760,44 +873,28 @@
+@@ -760,44 +874,28 @@
  	}
  	int fd = state->socket_under_test->fd.live_fd;
  	struct code_state *code = state->code;

@@ -69,6 +69,7 @@ fn syn_data_ack_bounds_wrap_partial_retry_and_flush() {
             );
             assert_eq!(a.state(), State::Established);
             assert_eq!(a.fast_open_negative, acked == 0);
+            assert_eq!(a.transport_info().syn_data_fully_acked, acked == 12);
             assert_eq!(a.acknowledged, acked as u64);
             assert_eq!(a.send.len(), 12 - acked as usize);
             assert_eq!(a.data_flight(), 12 - acked);
@@ -87,6 +88,7 @@ fn syn_data_ack_bounds_wrap_partial_retry_and_flush() {
                     })
                 );
                 assert!(a.sample.is_none());
+                assert!(!a.transport_info().syn_data_fully_acked);
             }
         }
         let mut a = client(iss, 12);
@@ -1398,6 +1400,102 @@ fn fast_open_synack_classification_shared_across_handshake_roles() {
                     }
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn inventory_tfo_partial_synack_resegmentation_counts_original_identity() {
+    extern crate std;
+    fn emit(a: &mut Connection, now: u64, reserved: bool) -> Vec<u8> {
+        let mut bytes = vec![0; 4096];
+        let n = a
+            .transmit_selected(now, &mut bytes, reserved)
+            .unwrap()
+            .unwrap();
+        if reserved {
+            let mut d = a.last_departure.unwrap();
+            let count = d.payload;
+            a.accept_reserved_output(now, &mut d, 0, count, true)
+                .unwrap();
+        }
+        bytes.truncate(n);
+        bytes
+    }
+    for iss in [100, u32::MAX - 500] {
+        for reserved in [false, true] {
+            let mut c = config(16384, 1460);
+            c.timestamps = false;
+            c.sack = true;
+            c.rack = true;
+            let mut a = Connection::active(tuple(), c, iss, 0).unwrap();
+            let mut cache = crate::fast_open::FastOpen::new().unwrap();
+            cache.learn(
+                0,
+                tuple().local.ip(),
+                tuple().remote.ip(),
+                wire::FastOpenCookie::new(&[7; 8]).unwrap(),
+                1460,
+            );
+            let cached = cache.get(0, 100, tuple().local.ip(), tuple().remote.ip());
+            assert_eq!(a.prepare_fast_open(cached, &[42; 1420]).unwrap(), 1420);
+            emit(&mut a, 0, reserved);
+            let response = Segment {
+                header: Header {
+                    source_port: tuple().remote.port(),
+                    destination_port: tuple().local.port(),
+                    sequence: 999,
+                    acknowledgment: iss.wrapping_add(101),
+                    flags: SYN | ACK,
+                    window: 65535,
+                    urgent_pointer: 0,
+                },
+                options: wire::Options {
+                    mss: Some(1000),
+                    sack_permitted: true,
+                    ..Default::default()
+                },
+                raw_options: &[],
+                payload: &[],
+            };
+            a.input(10_000, &response).unwrap();
+            assert_eq!(a.acknowledged, 100);
+            assert_eq!(a.send.len(), 1320);
+            let mut total = 0;
+            for length in [1000, 320] {
+                let bytes = emit(&mut a, 10_000, reserved);
+                let retry = wire::parse(ip(tuple()), &bytes).unwrap();
+                assert_eq!(retry.header.sequence, iss.wrapping_add(101 + total));
+                assert_eq!(retry.payload.len(), length);
+                total += length as u32;
+            }
+            assert_eq!(a.data_flight(), 1320);
+            let info = a.transport_info();
+            assert_eq!(info.unacked, 2);
+            assert_eq!(info.retransmitted, 2);
+            assert!(info.ledger_valid);
+            assert_eq!(a.transmit(10_000, &mut [0; 4096]), Ok(None));
+            inject(
+                &mut a,
+                20_000,
+                Seq(1000),
+                Seq(iss.wrapping_add(1421)),
+                ACK,
+                65535,
+                &[],
+            );
+            let final_info = a.transport_info();
+            assert_eq!(a.acknowledged, 1420);
+            assert_eq!(a.send.len(), 0);
+            assert_eq!(final_info.unacked, 0);
+            assert_eq!(final_info.retransmitted, 0);
+            std::eprintln!(
+                "TFO_INVENTORY {{\"probe\":\"partial_resegmentation\",\"iss\":{iss},\"reserved\":{reserved},\"syn_bytes\":1420,\"syn_data_acked\":100,\"new_mss\":1000,\"repair_lengths\":[1000,320],\"unacked\":{},\"retransmitted\":{},\"final_unacked\":{},\"final_delivered_segments\":{}}}",
+                info.unacked,
+                info.retransmitted,
+                final_info.unacked,
+                final_info.delivered_segments
+            );
         }
     }
 }

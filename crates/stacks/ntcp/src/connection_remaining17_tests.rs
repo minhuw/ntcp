@@ -4,7 +4,7 @@ extern crate std;
 use super::*;
 use alloc::{format, string::String};
 
-fn profile(push_batch: u16) -> ConnectionConfig {
+fn profile() -> ConnectionConfig {
     ConnectionConfig {
         receive_capacity: 8 * 1024 * 1024,
         receive_ip_payload_limit: 65515,
@@ -27,14 +27,12 @@ fn profile(push_batch: u16) -> ConnectionConfig {
         adaptive_ack: true,
         delayed_ack_us: 200000,
         coalesce_read_window_updates: true,
-        output_push_batch_segments: push_batch,
-        output_push_batch_retransmissions: false,
         ..ConnectionConfig::default()
     }
 }
 
-fn setup(mss: u16, sack: bool, syn_at: u64, ack_at: u64, push_batch: u16) -> Connection {
-    setup_config(mss, sack, syn_at, ack_at, profile(push_batch))
+fn setup(mss: u16, sack: bool, syn_at: u64, ack_at: u64) -> Connection {
+    setup_config(mss, sack, syn_at, ack_at, profile())
 }
 
 fn setup_config(
@@ -175,132 +173,9 @@ fn save(name: &str, rows: &[String]) {
     }
 }
 
-struct PushCaseTrace {
-    packets: Vec<(u32, usize, bool)>,
-    state: (u32, u32, u32, u32),
-    rows: Vec<String>,
-}
-
-fn push_case(name: &str, push_batch: u16) -> PushCaseTrace {
-    let limited = name.starts_with("limited");
-    let sack = name != "limited-no-sack";
-    let mut a = setup(
-        1000,
-        sack,
-        if limited { 100000 } else { 0 },
-        if limited { 200000 } else { 10000 },
-        push_batch,
-    );
-    let mut rows = Vec::new();
-    a.write(&vec![
-        0x55;
-        if limited {
-            15000
-        } else if name == "prr-multi" {
-            20000
-        } else {
-            10000
-        }
-    ])
-    .unwrap();
-    let first = drain(&mut a, if limited { 200000 } else { 10000 }, &mut rows);
-    assert_eq!(first.iter().map(|p| p.1).sum::<usize>(), 10000);
-    let last;
-    if limited {
-        ack(
-            &mut a,
-            310000,
-            1,
-            if sack { &[(1001, 2001)] } else { &[] },
-            &mut rows,
-        );
-        ack(
-            &mut a,
-            320000,
-            1,
-            if sack { &[(1001, 3001)] } else { &[] },
-            &mut rows,
-        );
-        last = ack(&mut a, 330000, 3001, &[], &mut rows);
-    } else if name == "prr-multi" {
-        for (i, hi) in (5001..=12001).step_by(1000).enumerate() {
-            ack(&mut a, 20000 + i as u64 * 2000, 1, &[(4001, hi)], &mut rows);
-        }
-        last = ack(&mut a, 44000, 1001, &[(4001, 12001)], &mut rows);
-    } else {
-        for (i, hi) in (5001..=10001).step_by(1000).enumerate() {
-            ack(
-                &mut a,
-                if i == 0 { 20000 } else { 22000 },
-                1,
-                &[(4001, hi)],
-                &mut rows,
-            );
-        }
-        for next in [1001, 2001, 3001] {
-            ack(&mut a, 32000, next, &[(4001, 10001)], &mut rows);
-        }
-        ack(&mut a, 32000, 10001, &[], &mut rows);
-        a.write(&vec![0x66; 10000]).unwrap();
-        last = drain(&mut a, 42000, &mut rows);
-    }
-    let proof = (
-        a.snd_una.0,
-        a.snd_nxt.0,
-        a.congestion.cwnd(),
-        a.prr.map_or(0, |p| p.credit()),
-    );
-    PushCaseTrace {
-        packets: last,
-        state: proof,
-        rows,
-    }
-}
-
-#[test]
-fn remaining17_push_boundaries_change_flags_without_changing_send_admission() {
-    for (name, seq, len, expected_last) in [
-        ("limited-no-sack", 12001, 2000, true),
-        ("limited-sack", 12001, 2000, true),
-        ("prr-multi", 14001, 2000, true),
-        ("prr-new-write", 10001, 7000, false),
-    ] {
-        let PushCaseTrace {
-            packets: baseline,
-            state: base_state,
-            rows: base_rows,
-        } = push_case(name, 0);
-        let PushCaseTrace {
-            packets: batched,
-            state: batch_state,
-            rows: batch_rows,
-        } = push_case(name, 2);
-        save(&format!("core-{name}-push0"), &base_rows);
-        save(&format!("core-{name}-push2"), &batch_rows);
-        assert_eq!(
-            baseline.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>(),
-            batched.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>()
-        );
-        assert_eq!(base_state, batch_state);
-        assert_eq!(baseline.first().unwrap().0, seq);
-        assert_eq!(baseline.iter().map(|p| p.1).sum::<usize>(), len);
-        let checked = baseline.len() - 1;
-        let expected_default = if name.starts_with("limited") {
-            expected_last
-        } else {
-            !expected_last
-        };
-        assert_eq!(
-            baseline[checked].2, expected_default,
-            "{name}: {baseline:?}"
-        );
-        assert_eq!(batched[checked].2, expected_last, "{name}: {batched:?}");
-    }
-}
-
 #[test]
 fn no_sack_cubic_first_repair_keeps_byte_prr() {
-    let mut a = setup(1460, false, 100000, 200000, 0);
+    let mut a = setup(1460, false, 100000, 200000);
     let mut rows = Vec::new();
     a.write(&vec![0x55; 5840]).unwrap();
     drain(&mut a, 200000, &mut rows);
@@ -325,7 +200,7 @@ fn limited_transmit_growth_separates_retirement_and_fresh_credit() {
         for hystart in [false, true] {
             for queued in [10000, 15000] {
                 for duplicates in 0..=2u32 {
-                    let mut config = profile(0);
+                    let mut config = profile();
                     config.cubic_hystart = hystart;
                     let mut a = setup_config(1000, sack, 100000, 200000, config);
                     let mut rows = Vec::new();
@@ -389,7 +264,7 @@ fn limited_transmit_growth_separates_retirement_and_fresh_credit() {
 
 #[test]
 fn limited_transmit_repeated_sack_grants_no_extra_output_or_growth() {
-    let mut a = setup(1000, true, 100000, 200000, 0);
+    let mut a = setup(1000, true, 100000, 200000);
     let mut rows = Vec::new();
     a.write(&vec![0x55; 15000]).unwrap();
     assert_eq!(drain(&mut a, 200000, &mut rows).len(), 10);
@@ -414,7 +289,7 @@ fn limited_transmit_repeated_sack_grants_no_extra_output_or_growth() {
 fn limited_transmit_fresh_growth_exact_wire_and_sequence_wrap() {
     for sack in [false, true] {
         for iss in [0, u32::MAX - 499] {
-            let mut a = setup_sequence(1000, sack, 100000, 200000, profile(0), iss);
+            let mut a = setup_sequence(1000, sack, 100000, 200000, profile(), iss);
             let base = a.snd_una;
             let mut rows = Vec::new();
             a.write(&vec![0x55; 15000]).unwrap();
@@ -461,7 +336,7 @@ fn limited_transmit_fresh_growth_exact_wire_and_sequence_wrap() {
 #[test]
 fn limited_transmit_growth_estimate_consumes_bytes_under_ack_division() {
     for divided in [false, true] {
-        let mut a = setup(1000, false, 100000, 200000, 0);
+        let mut a = setup(1000, false, 100000, 200000);
         let mut rows = Vec::new();
         a.write(&vec![0x55; 10000]).unwrap();
         assert_eq!(drain(&mut a, 200000, &mut rows).len(), 10);
@@ -482,7 +357,7 @@ fn limited_transmit_growth_estimate_consumes_bytes_under_ack_division() {
 
 #[test]
 fn limited_transmit_sacked_tail_cannot_discount_historical_eligible_prefix() {
-    let mut config = profile(0);
+    let mut config = profile();
     config.rack = false;
     config.prr = false;
     config.tlp = false;
@@ -504,7 +379,7 @@ fn limited_transmit_sacked_tail_cannot_discount_historical_eligible_prefix() {
 
 #[test]
 fn limited_transmit_delivery_estimates_ignore_window_and_payload_acks() {
-    let mut a = setup(1000, false, 100000, 200000, 0);
+    let mut a = setup(1000, false, 100000, 200000);
     let mut rows = Vec::new();
     a.write(&vec![0x55; 10000]).unwrap();
     drain(&mut a, 200000, &mut rows);
@@ -522,7 +397,7 @@ fn limited_transmit_delivery_estimates_ignore_window_and_payload_acks() {
 #[test]
 fn limited_transmit_growth_estimates_end_on_rto_recovery_and_terminal() {
     for end in 0..3 {
-        let mut a = setup(1000, false, 100000, 200000, 0);
+        let mut a = setup(1000, false, 100000, 200000);
         let mut rows = Vec::new();
         a.write(&vec![0x55; 15000]).unwrap();
         drain(&mut a, 200000, &mut rows);
@@ -553,7 +428,7 @@ fn limited_transmit_growth_estimates_end_on_rto_recovery_and_terminal() {
 
 #[test]
 fn no_sack_cubic_cwnd_basis_repair_and_recovery_completion() {
-    let mut a = setup(1460, false, 100000, 200000, 2);
+    let mut a = setup(1460, false, 100000, 200000);
     let mut rows = Vec::new();
     a.write(&vec![0x55; 5840]).unwrap();
     assert_eq!(drain(&mut a, 200000, &mut rows).len(), 4);

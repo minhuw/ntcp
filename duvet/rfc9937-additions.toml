@@ -1,6 +1,6 @@
 # RFC9937 operative prose/pseudocode omitted by keyword extraction.
 # Exact official text, whitespace only; no invented BCP14 levels.
-# Evidence profile: prr=true, Rfc9937, valid payload ledger; LegacyInitialCredit excluded.
+# Evidence profile: prr=true, Rfc9937, valid payload ledger.
 
 # entry-equations
 [[spec]]

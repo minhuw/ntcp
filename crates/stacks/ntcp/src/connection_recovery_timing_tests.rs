@@ -101,7 +101,8 @@ fn retransmit_delay_characterization() {
         "sack-shift-sacked-7-3-4-8-9-fack",
         "sack-shift-sacked-7-5-6-8-9-fack",
     ] {
-        for algorithm in [PrrAlgorithm::Rfc9937, PrrAlgorithm::LegacyInitialCredit] {
+        {
+            let algorithm = crate::PrrAlgorithm::Rfc9937;
             for continue_peer_script in [false, true] {
                 if continue_peer_script && !case.starts_with("sack-shift") {
                     continue;
@@ -479,7 +480,8 @@ fn timer_repair_respects_pipe_and_pacing_and_cannot_repeat_on_active_timer() {
 #[test]
 fn no_sack_first_flight_heuristic_and_reno_policy_control() {
     for iss in [0u32, u32::MAX] {
-        for algorithm in [PrrAlgorithm::Rfc9937, PrrAlgorithm::LegacyInitialCredit] {
+        {
+            let algorithm = crate::PrrAlgorithm::Rfc9937;
             for policy in [RecoveryAlgorithm::NewReno, RecoveryAlgorithm::Reno] {
                 let mut cfg = profile(algorithm);
                 cfg.recovery_algorithm = policy; // Separate control; profile() remains unchanged.
@@ -539,7 +541,7 @@ fn no_sack_first_flight_heuristic_and_reno_policy_control() {
                     assert_eq!(p.credit(), 1460);
                     assert_eq!(a.rack.counts().lost, 1);
                 } else {
-                    assert!(a.prr.is_none()); // Legacy no-SACK uses classic recovery, not PRR.
+                    assert!(a.prr.is_none()); // No-SACK delivery is accounted by PRR.
                 }
                 state(
                     &a,
@@ -552,9 +554,7 @@ fn no_sack_first_flight_heuristic_and_reno_policy_control() {
                 assert_eq!(first.0, 300_000);
                 assert_eq!(first.1, base.0);
                 assert_eq!(first.2, 1460);
-                if algorithm == PrrAlgorithm::LegacyInitialCredit {
-                    assert_eq!(first.2, 1460);
-                }
+
                 if algorithm == PrrAlgorithm::Rfc9937 {
                     assert_eq!(a.prr.unwrap().counters().2, first.2 as u64);
                     assert_eq!(a.prr.unwrap().credit(), 0);
@@ -751,7 +751,8 @@ fn stale_ack_state(a: &Connection, now: u64, label: &str, rows: &mut Vec<String>
 
 #[test]
 fn stale_ack_prr_prefix_and_counterfactual_delivery() {
-    for algorithm in [PrrAlgorithm::Rfc9937, PrrAlgorithm::LegacyInitialCredit] {
+    {
+        let algorithm = crate::PrrAlgorithm::Rfc9937;
         for continuation in ["prefix-only", "with-old-ack", "without-old-ack"] {
             let metadata = ip(reverse(tuple()));
             let mut bytes = [0; 60];
@@ -951,6 +952,71 @@ fn stale_ack_prr_prefix_and_counterfactual_delivery() {
                 )
                 .unwrap();
             }
+        }
+    }
+}
+
+#[test]
+fn unsupported_bulk_prefix_enters_rfc9406_css_before_legacy_hystart_exit() {
+    for paced in [false, true] {
+        let mut cfg = profile(PrrAlgorithm::Rfc9937);
+        cfg.send_capacity = 100_000; // Enough queued data for the entire30KB ACK prefix.
+        cfg.coalesce_read_window_updates = true;
+        cfg.output_group_flush = true;
+        cfg.tlp = false; // Original script explicitly disables TLP.
+        cfg.pacing = paced.then(PacingConfig::default);
+        let metadata = ip(reverse(tuple()));
+        let mut bytes = [0; 64];
+        let n = wire::encode(
+            metadata,
+            Header {
+                source_port: tuple().remote.port(),
+                destination_port: tuple().local.port(),
+                sequence: 0,
+                acknowledgment: 0,
+                flags: SYN,
+                window: 32792,
+                urgent_pointer: 0,
+            },
+            &[2, 4, 3, 232, 4, 2, 1, 1, 1, 3, 3, 10],
+            &[],
+            &mut bytes,
+        )
+        .unwrap();
+        let syn = wire::parse(metadata, &bytes[..n]).unwrap();
+        let mut a = Connection::passive(tuple(), cfg, 0, 0, &syn).unwrap();
+        let mut rows = Vec::new();
+        output(&mut a, 0, &mut rows);
+        inject(&mut a, 100_000, Seq(1), Seq(1), ACK, 514, &[]);
+        a.write(&vec![7; 100_000]).unwrap();
+        output(&mut a, 100_000, &mut rows);
+        for step in 1..=15 {
+            let now = 100_000 + step * 100_000;
+            advance(&mut a, now - 1, &mut rows);
+            let ack = Seq(1 + step as u32 * 2000);
+            assert!(!after(ack, a.snd_nxt));
+            inject(&mut a, now, Seq(1), ack, ACK, 514, &[]);
+            let startup = a.congestion.startup_state().unwrap();
+            rows.push(format!("{{\"event\":\"startup_observation\",\"at_us\":{now},\"ack\":{},\"cwnd\":{},\"samples\":{},\"css_baseline\":{},\"css_rounds\":{},\"paced\":{paced}}}",
+                ack.0, a.congestion.cwnd(), startup.0, startup.1.map_or("null".into(), |v|format!("{v}")), startup.2));
+            assert!(a.prr.is_none() && !a.congestion.in_recovery());
+            if step == 13 {
+                assert_eq!(a.congestion.cwnd(), 36_000);
+                assert!(startup.1.is_some());
+            }
+            if step >= 14 {
+                assert_eq!(a.congestion.cwnd(), 36_000 + (step as u32 - 13) * 500);
+            }
+            output(&mut a, now, &mut rows);
+        }
+        assert_eq!(a.congestion.cwnd(), 37_000);
+        if let Ok(directory) = std::env::var("NTCP_UNSUPPORTED13_STUDY_DIR") {
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                format!("{directory}/bulk-css-paced-{paced}.json"),
+                format!("[\n{}\n]\n", rows.join(",\n")),
+            )
+            .unwrap();
         }
     }
 }

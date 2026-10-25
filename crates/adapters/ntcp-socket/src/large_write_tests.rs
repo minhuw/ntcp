@@ -528,7 +528,7 @@ fn logical_zero_progress_backpressure_counts_byte_capacity_not_lowat() {
 #[cfg(feature = "packet-test")]
 #[test]
 fn logical_sndbuf_reno_control_ack_timeline() {
-    sndbuf_ack_timeline(upstream_large_write_tests("reno,legacy-prr"));
+    sndbuf_ack_timeline(upstream_large_write_tests("reno"));
 }
 
 #[cfg(feature = "packet-test")]

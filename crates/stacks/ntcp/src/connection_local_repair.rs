@@ -28,7 +28,6 @@ pub(super) struct RepairUndo {
     timestamp_bytes: u32,
     last_timestamp_sent_at: Option<Instant>,
     retransmit_burst: Option<(Seq, u32)>,
-    output_push_batch: Option<(Seq, bool, u16)>,
     sws_deadline: Option<Instant>,
     sws_override: bool,
     retx_pending: bool,
@@ -128,7 +127,6 @@ impl RepairUndo {
             timestamp_bytes: a.timestamp_bytes,
             last_timestamp_sent_at: a.last_timestamp_sent_at,
             retransmit_burst: a.retransmit_burst,
-            output_push_batch: a.output_push_batch,
             sws_deadline: a.sws_deadline,
             sws_override: a.sws_override,
             retx_pending: a.retx_pending,
@@ -223,7 +221,6 @@ impl Connection {
         self.timestamp_bytes = undo.timestamp_bytes;
         self.last_timestamp_sent_at = undo.last_timestamp_sent_at;
         self.retransmit_burst = undo.retransmit_burst;
-        self.output_push_batch = undo.output_push_batch;
         self.sws_deadline = undo.sws_deadline;
         self.sws_override = undo.sws_override;
         self.retx_pending = undo.retx_pending;

@@ -714,6 +714,9 @@ impl Owner {
         owner
             .endpoint
             .set_fast_open_cookie_policy(crate::packet_profile::cookie_policy(profile));
+        if matches!(profile, crate::packet_profile::Profile::Upstream(o) if o.tfo_listen) {
+            owner.endpoint.enable_fast_open().map_err(engine)?;
+        }
         owner.defaults = crate::packet_profile::config(profile);
         owner.socket_policy.notsent_lowat = crate::packet_profile::notsent_lowat(profile);
         owner.packets = Some(PacketBackend::new(profile, options.queue_capacity)?);
@@ -734,6 +737,10 @@ impl Owner {
             let config = crate::packet_profile::config(packets.profile);
             socket.receive_capacity = config.connection.receive_capacity;
             socket.send_capacity = config.connection.send_capacity;
+            if matches!(packets.profile, crate::packet_profile::Profile::Upstream(o) if o.tfo_listen)
+            {
+                socket.fast_open_limit = config.max_connections as i32;
+            }
             return socket;
         }
         let mut socket = Socket::new(flags);

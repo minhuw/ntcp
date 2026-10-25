@@ -62,6 +62,8 @@ const SYN_PAYLOAD: u8 = 1 << 2;
 // Independent delivery-unit boundary: latest RACK transmissions can overlap
 // only part of a queued packet. Byte/SACK splits preserve this endpoint.
 const DELIVERY_END: u8 = 1 << 3;
+const DIAGNOSTIC_RETRY: u8 = 1 << 4;
+const DIAGNOSTIC_LOST: u8 = 1 << 5;
 
 impl Interval {
     fn stats_flag(&self, bit: u8) -> bool {
@@ -598,6 +600,8 @@ impl Rack {
                 if selection.retransmit {
                     r.set_stats_flag(SYN_PAYLOAD, false);
                 }
+                r.set_stats_flag(DIAGNOSTIC_RETRY, selection.retransmit);
+                r.set_stats_flag(DIAGNOSTIC_LOST, false);
                 if !r.stats_flag(PACKET_DELIVERED) {
                     r.set_stats_flag(PACKET_INCLUDES_FIN, false);
                 }
@@ -1073,6 +1077,7 @@ impl Rack {
                 retransmission_lost |= r.retransmitted && r.loss_response_pending;
                 r.original_lost = true;
                 r.needs_retransmit = true;
+                r.set_stats_flag(DIAGNOSTIC_LOST, true);
             } else {
                 self.deadline = Some(self.deadline.map_or(deadline, |old| old.max(deadline)));
             }
@@ -1105,6 +1110,7 @@ impl Rack {
             if r.start == ack || now >= r.sent.saturating_add(self.rtt).saturating_add(window) {
                 r.original_lost = true;
                 r.needs_retransmit = true;
+                r.set_stats_flag(DIAGNOSTIC_LOST, true);
             }
         }
     }
@@ -1121,6 +1127,7 @@ impl Rack {
                 if !r.sacked {
                     r.original_lost = true;
                     r.needs_retransmit = true;
+                    r.set_stats_flag(DIAGNOSTIC_LOST, true);
                 }
             }
         }
@@ -1133,6 +1140,7 @@ impl Rack {
                 newly_lost |= !r.needs_retransmit;
                 r.original_lost = true;
                 r.needs_retransmit = true;
+                r.set_stats_flag(DIAGNOSTIC_LOST, true);
             }
         }
         newly_lost
@@ -1225,21 +1233,39 @@ impl Rack {
     }
 
     pub(crate) fn counts(&self) -> Counts {
-        self.count_by_original(false, false)
+        self.count_by_original(false)
     }
 
     // Packet-unit consumers must distinguish the original wire segments of a
     // single logical admission. ACK/SACK splits preserve these boundaries;
     // later retry repacketization must not create extra original packets.
+    // Linux-style queued packetization statistics are independent of the
+    // original-wire identities consumed by RACK/TLP. Commit, not selection,
+    // supplies boundaries and retry status; ACK/SACK splits retain them.
+    pub(crate) fn diagnostic_packet_counts(&self) -> Counts {
+        let mut counts = Counts::default();
+        let mut start = 0;
+        for end in 0..self.intervals.len() {
+            if !self.intervals[end].stats_flag(DELIVERY_END) {
+                continue;
+            }
+            let packet = &self.intervals[start..=end];
+            counts.unacked += 1;
+            counts.sacked += u32::from(packet.iter().all(|r| r.sacked));
+            counts.lost += u32::from(packet.iter().any(|r| r.original_lost && !r.sacked));
+            counts.retransmitted += u32::from(packet.iter().any(|r| {
+                r.stats_flag(DIAGNOSTIC_RETRY) && !r.stats_flag(DIAGNOSTIC_LOST) && !r.sacked
+            }));
+            start = end + 1;
+        }
+        counts
+    }
+
     pub(crate) fn packet_counts(&self) -> Counts {
-        self.count_by_original(true, false)
+        self.count_by_original(true)
     }
 
-    pub(crate) fn committed_packet_counts(&self) -> Counts {
-        self.count_by_original(true, true)
-    }
-
-    fn count_by_original(&self, physical: bool, committed_only: bool) -> Counts {
+    fn count_by_original(&self, physical: bool) -> Counts {
         let mut counts = Counts::default();
         for segment in self.intervals.chunk_by(|a, b| {
             if physical {
@@ -1249,13 +1275,6 @@ impl Rack {
                 a.original_end == b.original_end
             }
         }) {
-            if committed_only
-                && !segment
-                    .iter()
-                    .any(|r| r.departure_committed || r.retransmitted)
-            {
-                continue;
-            }
             counts.unacked += 1;
             counts.sacked += u32::from(segment.iter().all(|r| r.sacked));
             counts.lost += u32::from(segment.iter().any(|r| r.original_lost && !r.sacked));
@@ -1529,6 +1548,7 @@ mod tests {
             r.delivered = true;
             r.sacked = true;
             r.needs_retransmit = true;
+            r.set_stats_flag(DIAGNOSTIC_LOST, true);
             let before = *r;
             let counts = rack.counts();
             let pipe = rack.pipe();
@@ -1543,7 +1563,8 @@ mod tests {
                 transmission_start: seq(8),
                 transmission_end: seq(16),
                 departure_committed: true,
-                stats_flags: before.stats_flags | DELIVERY_END,
+                stats_flags: (before.stats_flags | DELIVERY_END | DIAGNOSTIC_RETRY)
+                    & !DIAGNOSTIC_LOST,
                 ..before
             };
             assert_eq!(*accepted, expected);
@@ -2965,5 +2986,32 @@ mod tests {
             rack.recovery_exit(false);
         }
         assert_eq!(rack.reo_window(false, Some(100)), 25);
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_packetization_tests {
+    use super::*;
+    #[test]
+    fn committed_resegmentation_preserves_recovery_identity_and_rejection_snapshot() {
+        let mut r = Rack::with_capacity(16).unwrap();
+        r.transmit(Seq(100), Seq(1420), 0, false);
+        let original = r.departure_selection().unwrap();
+        assert!(r.commit_departure(original, Seq(100), Seq(1420), 0));
+        assert_eq!(r.diagnostic_packet_counts().unacked, 1);
+        r.mark_head_lost();
+        r.transmit(Seq(100), Seq(1420), 1, true);
+        let retry = r.departure_selection().unwrap();
+        assert_eq!(r.diagnostic_packet_counts().unacked, 1);
+        assert_eq!(r.diagnostic_packet_counts().retransmitted, 0);
+        assert!(r.commit_departure(retry, Seq(100), Seq(1100), 2));
+        assert_eq!(r.diagnostic_packet_counts().unacked, 2);
+        assert_eq!(r.diagnostic_packet_counts().retransmitted, 1);
+        assert_eq!(r.packet_counts().unacked, 1);
+        assert!(r.commit_departure(retry, Seq(1100), Seq(1420), 3));
+        assert_eq!(r.diagnostic_packet_counts().unacked, 2);
+        assert_eq!(r.diagnostic_packet_counts().retransmitted, 2);
+        assert_eq!(r.packet_counts().unacked, 1);
+        assert_eq!(r.pipe(), 1320);
     }
 }

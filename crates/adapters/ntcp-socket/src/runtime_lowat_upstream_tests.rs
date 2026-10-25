@@ -27,6 +27,22 @@ fn established_with_window(
     wire::Header,
     u32,
 ) {
+    established_with_timing(global, syn_window, ack_window, 10_000)
+}
+
+fn established_with_timing(
+    global: bool,
+    syn_window: u16,
+    ack_window: u16,
+    handshake_us: u64,
+) -> (
+    Owner,
+    u64,
+    ntcp::ConnectionId,
+    ntcp::IpMetadata,
+    wire::Header,
+    u32,
+) {
     let settings = crate::packet_profile::profile("upstream,local=192.168.0.1").unwrap();
     let mut a = Owner::packet(settings).unwrap();
     a.test_now = Some(0);
@@ -74,8 +90,8 @@ fn established_with_window(
     incoming.flags = ACK;
     incoming.window = ack_window;
     let n = wire::encode(ip, incoming, &[], &[], &mut bytes).unwrap();
-    a.test_now = Some(10000);
-    a.input(10000, ip, 0, &bytes[..n]).unwrap();
+    a.test_now = Some(handshake_us);
+    a.input(handshake_us, ip, 0, &bytes[..n]).unwrap();
     a.events();
     let child = a
         .execute(listener, Op::Accept(SOCK_NONBLOCK))
@@ -403,10 +419,136 @@ fn lowat_nonblocking_held_output_returns_prefix_then_finalizes_boundary() {
     // A real software group retains the reservation through every accepted
     // physical segment. A SEND boundary may finalize only after its suffix.
     while a.endpoint.is_output_reserved(cid) {
-        let (poll, token) = a.endpoint.poll_reserved_transmit(10000, &mut output, BUDGET).unwrap();
+        let (poll, token) = a
+            .endpoint
+            .poll_reserved_transmit(10000, &mut output, BUDGET)
+            .unwrap();
         assert!(poll.packet.is_some());
         assert!(a.endpoint.accept_transmit(10000, token.unwrap()).unwrap());
     }
     a.events();
     assert!(a.sockets[&child].send_finish.is_none());
+}
+
+#[test]
+fn unsupported_buffer_native_capacity_and_writable_edge_controls() {
+    let mut rows = Vec::new();
+    for capacity in [50_000usize, 65_536] {
+        for lowat in [0u32, u32::MAX, 32_000] {
+            let (mut a, child, cid, ip, mut incoming, iss) = established(false);
+            a.execute(child, Op::Set(SOL_SOCKET, SO_SNDBUF, (capacity / 2) as i32))
+                .unwrap();
+            a.execute(child, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, lowat as i32))
+                .unwrap();
+            assert_ne!(a.execute(child, Op::Ready).unwrap().value & EPOLLOUT, 0);
+            let data = vec![7; capacity + 10_000];
+            let (mut request, rx) = nonblocking_request(
+                child,
+                Op::Send(vec![(data.as_ptr() as usize, data.len())], 0),
+            );
+            let mut wire_end = 1;
+            let mut completed = false;
+            for _ in 0..BUDGET + 4 {
+                completed = a.service(&mut request);
+                for (seq, len, _) in drain(&mut a, 10_000, iss) {
+                    assert_eq!(seq, wire_end);
+                    wire_end += len as u32;
+                }
+                if completed {
+                    break;
+                }
+            }
+            assert!(completed);
+            let accepted = rx.recv().unwrap().unwrap().value as usize;
+            assert!(accepted > 0 && accepted < data.len());
+            assert_eq!(a.execute(child, Op::Write(vec![1])).unwrap_err(), EAGAIN);
+            let blocked = a.execute(child, Op::Ready).unwrap();
+            assert_eq!(blocked.value & EPOLLOUT, 0);
+            let info = a.endpoint.transport_info(cid).unwrap();
+            rows.push(format!("{{\"event\":\"blocked\",\"capacity\":{capacity},\"lowat\":{lowat},\"accepted\":{accepted},\"wire_end\":{wire_end},\"notsent\":{}}}", info.notsent_bytes));
+            let mut writable = false;
+            for ack_bytes in (1000..=accepted as u32).step_by(1000) {
+                assert!(ack_bytes < wire_end);
+                let now = 20_000 + u64::from(ack_bytes);
+                incoming.acknowledgment = iss.wrapping_add(1 + ack_bytes);
+                let mut bytes = [0; 64];
+                let n = wire::encode(ip, incoming, &[], &[], &mut bytes).unwrap();
+                a.test_now = Some(now);
+                a.input(now, ip, 0, &bytes[..n]).unwrap();
+                a.events();
+                for (seq, len, _) in drain(&mut a, now, iss) {
+                    assert_eq!(seq, wire_end);
+                    wire_end += len as u32;
+                }
+                let ready = a.execute(child, Op::Ready).unwrap();
+                if ready.value & EPOLLOUT != 0 {
+                    assert!(socket_options::edge_changed(
+                        EPOLLOUT as u32,
+                        Some(blocked.readiness_generations),
+                        ready.readiness_generations
+                    ));
+                    let repeated = a.execute(child, Op::Ready).unwrap();
+                    assert!(!socket_options::edge_changed(
+                        EPOLLOUT as u32,
+                        Some(ready.readiness_generations),
+                        repeated.readiness_generations
+                    ));
+                    assert_eq!(a.execute(child, Op::Write(vec![3; 17])).unwrap().value, 17);
+                    rows.push(format!("{{\"event\":\"writable\",\"capacity\":{capacity},\"lowat\":{lowat},\"ack_bytes\":{ack_bytes},\"wire_end\":{wire_end},\"accepted\":{accepted}}}"));
+                    writable = true;
+                    break;
+                }
+            }
+            assert!(writable);
+        }
+    }
+    save("unsupported-buffer-native-controls", &rows);
+}
+
+#[test]
+fn unsupported_zero_rtt_tail_probe_changes_lowat_admission_by_one_mss() {
+    let mut rows = Vec::new();
+    for (handshake_us, service_timers, expected) in
+        [(1, false, 42000), (1, true, 43000), (10000, true, 42000)]
+    {
+        let (mut a, child, cid, _, _, iss) =
+            established_with_timing(false, 32792, 257, handshake_us);
+        a.execute(child, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, 32000))
+            .unwrap();
+        let data = vec![7; 59000];
+        let (mut request, rx) = nonblocking_request(
+            child,
+            Op::Send(vec![(data.as_ptr() as usize, data.len())], 0),
+        );
+        let mut wire_end = 1;
+        let mut completed = false;
+        for turn in 0..BUDGET + 4 {
+            let now = handshake_us + turn as u64 * 50;
+            a.test_now = Some(now);
+            if service_timers && a.endpoint.next_deadline().is_some_and(|d| d <= now) {
+                a.endpoint.on_timeout(now, BUDGET).unwrap();
+                for (seq, len, _) in drain(&mut a, now, iss) {
+                    assert_eq!(seq, wire_end);
+                    wire_end += len as u32;
+                }
+            }
+            completed = a.service(&mut request);
+            for (seq, len, _) in drain(&mut a, now, iss) {
+                assert_eq!(seq, wire_end);
+                wire_end += len as u32;
+            }
+            if completed {
+                break;
+            }
+        }
+        assert!(completed);
+        let accepted = rx.recv().unwrap().unwrap().value;
+        assert_eq!(accepted, expected);
+        let info = a.endpoint.transport_info(cid).unwrap();
+        assert_eq!(info.cwnd, 10000);
+        assert_eq!(info.notsent_bytes, 32000);
+        assert_eq!(wire_end, if expected == 43000 { 11001 } else { 10001 });
+        rows.push(format!("{{\"handshake_us\":{handshake_us},\"service_timers\":{service_timers},\"accepted\":{accepted},\"wire_end\":{wire_end},\"cwnd\":{},\"notsent\":{}}}",info.cwnd,info.notsent_bytes));
+    }
+    save("zero-rtt-lowat-probe-controls", &rows);
 }

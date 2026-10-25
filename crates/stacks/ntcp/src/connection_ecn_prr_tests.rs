@@ -671,7 +671,8 @@ fn packetdrill_passive_ecn_cwr_prr_characterization() {
     extern crate std;
     use alloc::{format, string::String};
     let mut rows: Vec<String> = Vec::new();
-    for algorithm in [PrrAlgorithm::Rfc9937, PrrAlgorithm::LegacyInitialCredit] {
+    {
+        let algorithm = crate::PrrAlgorithm::Rfc9937;
         // Audited upstream,ecn baseline; no congestion/flight state fabrication.
         let cfg = ConnectionConfig {
             receive_capacity: 8 * 1024 * 1024,
@@ -801,12 +802,7 @@ fn packetdrill_passive_ecn_cwr_prr_characterization() {
         assert!(a.ecn_cwr_pending && a.transport_info_at(305_000).ecn_response);
         assert!(a.next_deadline().unwrap() > 305_000);
         snapshot(&a, "after_ece", 305_000, &mut rows);
-        if algorithm == PrrAlgorithm::LegacyInitialCredit {
-            // This control omits modern ECN PRR; it is not RFC6937 CWR emulation.
-            assert!(a.prr.is_none());
-            assert_eq!(a.congestion.cwnd(), 7000);
-            continue;
-        }
+
         assert_eq!(a.congestion.ecn_prr_end(), Some(Seq(4001)));
         assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 0));
         assert_eq!(a.prr.unwrap().credit(), 2000);
@@ -850,8 +846,4 @@ fn packetdrill_passive_ecn_cwr_prr_characterization() {
 
 mod remaining17_study {
     include!("connection_remaining17_tests.rs");
-
-    mod push_boundary {
-        include!("connection_push_boundary_tests.rs");
-    }
 }

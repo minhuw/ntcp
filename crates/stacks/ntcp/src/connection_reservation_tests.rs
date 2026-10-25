@@ -630,7 +630,7 @@ fn gso_full_range_credit_bounds_and_scalar_nagle_cork_tail() {
 
 #[test]
 fn gso_conservative_fallbacks_keep_scalar_paths() {
-    for case in 0..12 {
+    for case in (0..12).filter(|&case| case != 8) {
         let cfg = ConnectionConfig {
             initial_window: InitialWindow::Iw10,
             congestion_algorithm: if case == 11 {
@@ -654,7 +654,6 @@ fn gso_conservative_fallbacks_keep_scalar_paths() {
                 a.config.prr = true;
                 a.config.prr_pacing = true;
             }
-            8 => a.config.output_push_batch_segments = 2,
             9 => a.consecutive_timeouts = 1,
             10 => {
                 a.tx_timestamps.resize(1, usize::MAX).unwrap();
@@ -835,24 +834,42 @@ fn group_preflight_and_same_submit_time_keep_rack_spans_and_first_timer_across_w
 
 #[test]
 fn actual_group_flush_follows_admission_not_a_fixed_segment_count() {
-    for (queued, storage, window) in [(2500, 8000, 16000), (4500, 8000, 16000), (7500, 2500, 16000), (7500, 8000, 2500)] {
-        let (mut a, _) = pair(ConnectionConfig {
-            initial_window: InitialWindow::Iw10,
-            output_group_flush: true,
-            ..config(16384, 1000)
-        }, u32::MAX - 1500);
+    for (queued, storage, window) in [
+        (2500, 8000, 16000),
+        (4500, 8000, 16000),
+        (7500, 2500, 16000),
+        (7500, 8000, 2500),
+    ] {
+        let (mut a, _) = pair(
+            ConnectionConfig {
+                initial_window: InitialWindow::Iw10,
+                output_group_flush: true,
+                ..config(16384, 1000)
+            },
+            u32::MAX - 1500,
+        );
         a.snd_wnd = window;
         a.write(&vec![7; queued]).unwrap();
         let mut payload = vec![0; storage];
         let mut bytes = [0; 2048];
-        let expected = (queued / 1000).min(storage / 1000).min(window as usize / 1000)
-            .min(4).min((a.congestion.cwnd() as usize / 1000 / 2).max(1)) * 1000;
-        let n = crate::allocation_tests::fail_after(0, || gso_select(&mut a, 40, &mut payload, &mut bytes)).unwrap();
+        let expected = (queued / 1000)
+            .min(storage / 1000)
+            .min(window as usize / 1000)
+            .min(4)
+            .min((a.congestion.cwnd() as usize / 1000 / 2).max(1))
+            * 1000;
+        let n = crate::allocation_tests::fail_after(0, || {
+            gso_select(&mut a, 40, &mut payload, &mut bytes)
+        })
+        .unwrap();
         let d = a.last_departure.unwrap();
         let segmentation = d.segmentation.unwrap();
         assert_eq!(segmentation.payload_len, expected);
         assert_ne!(segmentation.terminal_flags & PSH, 0);
-        assert_eq!(wire::parse(ip(tuple()), &bytes[..n]).unwrap().header.flags & PSH, 0);
+        assert_eq!(
+            wire::parse(ip(tuple()), &bytes[..n]).unwrap().header.flags & PSH,
+            0
+        );
         // Optional group flush never becomes an application mark retained by
         // retries. Only the original SEND terminal byte carries that intent.
         assert!(!a.send.pushed(0, queued - 1));
@@ -864,11 +881,14 @@ fn actual_group_flush_follows_admission_not_a_fixed_segment_count() {
 #[test]
 fn actual_group_flush_preserves_no_push_and_application_terminal() {
     for push in [false, true] {
-        let (mut a, _) = pair(ConnectionConfig {
-            initial_window: InitialWindow::Iw10,
-            output_group_flush: true,
-            ..config(16384, 1000)
-        }, 0);
+        let (mut a, _) = pair(
+            ConnectionConfig {
+                initial_window: InitialWindow::Iw10,
+                output_group_flush: true,
+                ..config(16384, 1000)
+            },
+            0,
+        );
         a.write_with_push(&[3; 4000], push).unwrap();
         let mut payload = [0; 8000];
         gso_select(&mut a, 40, &mut payload, &mut [0; 2048]).unwrap();
@@ -882,19 +902,32 @@ fn actual_group_flush_preserves_no_push_and_application_terminal() {
 
 #[test]
 fn actual_group_flush_failed_encoding_cannot_create_an_application_mark() {
-    let (mut a, _) = pair(ConnectionConfig {
-        initial_window: InitialWindow::Iw10,
-        output_group_flush: true,
-        ..config(16384, 1000)
-    }, 0);
+    let (mut a, _) = pair(
+        ConnectionConfig {
+            initial_window: InitialWindow::Iw10,
+            output_group_flush: true,
+            ..config(16384, 1000)
+        },
+        0,
+    );
     a.write(&[5; 7000]).unwrap();
     let before = (a.snd_nxt, a.flight(), a.rack.counts().unacked);
     let mut payload = [0; 8000];
-    assert_eq!(a.transmit_selected_with_gso(40, &mut [], true,
-        Some(crate::output_reservation::GsoBuffer {
-            limits: crate::GsoLimits { max_bytes: 8000, max_segments: 8 },
-            payload: &mut payload,
-        })), Err(Error::OutputTooSmall));
+    assert_eq!(
+        a.transmit_selected_with_gso(
+            40,
+            &mut [],
+            true,
+            Some(crate::output_reservation::GsoBuffer {
+                limits: crate::GsoLimits {
+                    max_bytes: 8000,
+                    max_segments: 8
+                },
+                payload: &mut payload,
+            })
+        ),
+        Err(Error::OutputTooSmall)
+    );
     assert_eq!((a.snd_nxt, a.flight(), a.rack.counts().unacked), before);
     assert!(!a.send.pushed(0, 6999));
     assert!(a.send.pushed(6999, 1));
@@ -902,11 +935,14 @@ fn actual_group_flush_failed_encoding_cannot_create_an_application_mark() {
 
 #[test]
 fn actual_group_flush_tracks_final_accepted_fragment_through_mtu_shrink() {
-    let (mut a, _) = pair(ConnectionConfig {
-        initial_window: InitialWindow::Iw10,
-        output_group_flush: true,
-        ..config(16384, 1000)
-    }, u32::MAX - 1500);
+    let (mut a, _) = pair(
+        ConnectionConfig {
+            initial_window: InitialWindow::Iw10,
+            output_group_flush: true,
+            ..config(16384, 1000)
+        },
+        u32::MAX - 1500,
+    );
     a.write(&[9; 7000]).unwrap();
     let mut reservation = crate::output_reservation::OutputReservation::new();
     reservation.bytes.resize(2048, 0);
@@ -917,21 +953,43 @@ fn actual_group_flush_tracks_final_accepted_fragment_through_mtu_shrink() {
     let total = departure.segmentation.unwrap().payload_len;
     assert_eq!(total, 4000);
     let token = reservation.token(None).unwrap();
-    reservation.capture(crate::Transmit {
-        connection: None, tx_timestamp: None, ipv4_options: Default::default(),
-        ecn: 0, ip: ip(tuple()), len: n, hop_limit: 64, dscp: 0,
-    }, &bytes, token);
+    reservation.capture(
+        crate::Transmit {
+            connection: None,
+            tx_timestamp: None,
+            ipv4_options: Default::default(),
+            ecn: 0,
+            ip: ip(tuple()),
+            len: n,
+            hop_limit: 64,
+            dscp: 0,
+        },
+        &bytes,
+        token,
+    );
     reservation.current.as_mut().unwrap().departure = Some(departure);
     let mut accepted = 0;
     crate::allocation_tests::fail_after(0, || {
         while accepted < total {
-            let p = reservation.fragment(if accepted < 2000 { 1020 } else { 520 }, &mut bytes).unwrap();
+            let p = reservation
+                .fragment(if accepted < 2000 { 1020 } else { 520 }, &mut bytes)
+                .unwrap();
             let segment = wire::parse(p.ip, &bytes[..p.len]).unwrap();
             let count = segment.payload.len();
-            assert_eq!(segment.header.sequence, departure.start.wrapping_add(accepted as u32));
+            assert_eq!(
+                segment.header.sequence,
+                departure.start.wrapping_add(accepted as u32)
+            );
             assert_eq!(segment.header.flags & PSH != 0, accepted + count == total);
             let r = reservation.current.as_mut().unwrap();
-            a.accept_reserved_output(50 + accepted as u64, &mut departure, r.offset, r.emitted_bytes, r.finished).unwrap();
+            a.accept_reserved_output(
+                50 + accepted as u64,
+                &mut departure,
+                r.offset,
+                r.emitted_bytes,
+                r.finished,
+            )
+            .unwrap();
             accepted += count;
             r.offset += r.emitted_bytes;
         }
@@ -946,7 +1004,9 @@ fn actual_group_flush_tracks_final_accepted_fragment_through_mtu_shrink() {
 fn actual_group_flush_prr_new_data_charges_existing_credit_once() {
     for iss in [0, u32::MAX - 4999] {
         let cfg = ConnectionConfig {
-            sack: true, rack: true, prr: true,
+            sack: true,
+            rack: true,
+            prr: true,
             prr_algorithm: PrrAlgorithm::Rfc9937,
             congestion_algorithm: CongestionAlgorithm::Cubic,
             cubic_hystart: true,
@@ -961,15 +1021,29 @@ fn actual_group_flush_prr_new_data_charges_existing_credit_once() {
         deliver(&mut peer, &mut a, 100_000);
         deliver(&mut a, &mut peer, 100_000);
         a.write(&[0x55; 10000]).unwrap();
-        for _ in 0..10 { packet(&mut a, 100_000); }
+        for _ in 0..10 {
+            packet(&mut a, 100_000);
+        }
         a.write(&[7; 10000]).unwrap();
         rack_sack(&mut a, 190_000, 0, &[]);
-        for (now, end) in [(200_000, 5000), (202_000, 6000), (204_000, 7000),
-            (206_000, 8000), (208_000, 9000), (210_000, 10000),
-            (212_000, 11000), (214_000, 12000)] {
+        for (now, end) in [
+            (200_000, 5000),
+            (202_000, 6000),
+            (204_000, 7000),
+            (206_000, 8000),
+            (208_000, 9000),
+            (210_000, 10000),
+            (212_000, 11000),
+            (214_000, 12000),
+        ] {
             strict_ack(&mut a, now, 0, &[(4000, end)]);
             let n = a.transmit(now, &mut [0; 2048]).unwrap();
-            assert!(n.is_some(), "no output at {now}, PRR={:?}, duplicate ACKs={}", a.prr, a.duplicate_acks);
+            assert!(
+                n.is_some(),
+                "no output at {now}, PRR={:?}, duplicate ACKs={}",
+                a.prr,
+                a.duplicate_acks
+            );
         }
         strict_ack(&mut a, 224_000, 1000, &[(4000, 12000)]);
         let before = a.prr.unwrap();
@@ -987,16 +1061,28 @@ fn actual_group_flush_prr_new_data_charges_existing_credit_once() {
         let selected = a.prr.unwrap();
         assert_eq!(selected.counters().0, before.counters().0);
         assert_eq!(selected.counters().1, before.counters().1);
-        assert_eq!(selected.counters().2, before.counters().2 + s.payload_len as u64);
+        assert_eq!(
+            selected.counters().2,
+            before.counters().2 + s.payload_len as u64
+        );
         assert_eq!(selected.credit(), before.credit() - s.payload_len as u32);
         let counters = selected.counters();
         for offset in (0..s.payload_len).step_by(s.segment_payload_len) {
-            a.accept_reserved_output(224_100 + offset as u64, &mut d, offset,
-                s.segment_payload_len, offset + s.segment_payload_len == s.payload_len).unwrap();
+            a.accept_reserved_output(
+                224_100 + offset as u64,
+                &mut d,
+                offset,
+                s.segment_payload_len,
+                offset + s.segment_payload_len == s.payload_len,
+            )
+            .unwrap();
             assert_eq!(a.prr.unwrap().counters(), counters);
         }
         // This is a new-data group, not repair coalescing or delivery credit.
-        assert!(!a.send.pushed(next.distance_from(a.send_base) as usize, s.payload_len));
+        assert!(
+            !a.send
+                .pushed(next.distance_from(a.send_base) as usize, s.payload_len)
+        );
         assert_eq!(a.snd_nxt, next.wrapping_add(s.payload_len as u32));
     }
     let mut a = strict_flight(0);
@@ -1011,12 +1097,15 @@ fn actual_group_flush_prr_new_data_charges_existing_credit_once() {
 #[test]
 fn actual_group_flush_singleton_distinguishes_startup_and_reduced_window() {
     for reduced in [false, true] {
-        let (mut a, _) = pair(ConnectionConfig {
-            initial_window: InitialWindow::Iw10,
-            congestion_algorithm: CongestionAlgorithm::Cubic,
-            output_group_flush: true,
-            ..config(16384, 1000)
-        }, 0);
+        let (mut a, _) = pair(
+            ConnectionConfig {
+                initial_window: InitialWindow::Iw10,
+                congestion_algorithm: CongestionAlgorithm::Cubic,
+                output_group_flush: true,
+                ..config(16384, 1000)
+            },
+            0,
+        );
         if reduced {
             // Model the completed CC response to a ten-MSS flight; byte
             // transmission/credit behavior is tested by the full PRR trace.
@@ -1038,10 +1127,14 @@ fn actual_group_flush_singleton_distinguishes_startup_and_reduced_window() {
                 assert_ne!(d.segmentation.unwrap().terminal_flags & PSH, 0);
             } else {
                 assert!(d.segmentation.is_none());
-                assert_eq!(wire::parse(ip(tuple()), &bytes[..n]).unwrap().header.flags & PSH != 0, !reduced);
+                assert_eq!(
+                    wire::parse(ip(tuple()), &bytes[..n]).unwrap().header.flags & PSH != 0,
+                    !reduced
+                );
             }
             for offset in (0..expected).step_by(1000) {
-                a.accept_reserved_output(50, &mut d, offset, 1000, offset + 1000 == expected).unwrap();
+                a.accept_reserved_output(50, &mut d, offset, 1000, offset + 1000 == expected)
+                    .unwrap();
             }
         }
         assert_eq!(a.flight(), 7000);
@@ -1062,18 +1155,24 @@ fn actual_group_flush_adapts_to_rtt_without_enabling_pacing() {
                 units_per_second: 1_000_000 * scale,
                 ..CallerTimebase::default()
             };
-            let (mut a, _) = pair(ConnectionConfig {
-                initial_window: InitialWindow::Iw10,
-                output_group_flush: true,
-                timebase,
-                ..config(16384, 1000)
-            }, 0);
+            let (mut a, _) = pair(
+                ConnectionConfig {
+                    initial_window: InitialWindow::Iw10,
+                    output_group_flush: true,
+                    timebase,
+                    ..config(16384, 1000)
+                },
+                0,
+            );
             a.rtt = RttEstimator::with_timebase(a.config.rto_min_us, timebase);
             a.rtt.sample(timebase.ticks_from_us(rtt_us));
             assert!(!a.pacing_enabled());
             a.write(&[7; 7000]).unwrap();
             gso_select(&mut a, 40, &mut [0; 8000], &mut [0; 2048]).unwrap();
-            assert_eq!(a.last_departure.unwrap().segmentation.unwrap().payload_len, expected_group);
+            assert_eq!(
+                a.last_departure.unwrap().segmentation.unwrap().payload_len,
+                expected_group
+            );
             assert!(!a.pacing_enabled());
             assert!(!a.send.pushed(0, 6999));
             assert!(a.send.pushed(6999, 1));
@@ -1154,7 +1253,9 @@ fn late_fresh_rejection_cannot_restart_an_expired_application_deadline() {
     let (mut a, _) = pair(config(4096, 100), 0);
     a.set_application_timeout(Some(100)).unwrap();
     a.write(&[7; 250]).unwrap();
-    a.transmit_selected(40, &mut [0; 2048], true).unwrap().unwrap();
+    a.transmit_selected(40, &mut [0; 2048], true)
+        .unwrap()
+        .unwrap();
     assert!(a.cancel_reserved_resource(200).unwrap());
     assert_eq!(a.state, State::Closed);
     assert_eq!(a.reason, Some(CloseReason::TimedOut));

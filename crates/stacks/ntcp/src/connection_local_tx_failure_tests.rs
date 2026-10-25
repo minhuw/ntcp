@@ -20,9 +20,7 @@ fn local_sender_with_algorithm(rows: &mut Vec<String>, algorithm: PrrAlgorithm) 
     // Remaining common upstream options, audited against packet_profile::config.
     cfg.coalesce_read_window_updates = true;
     cfg.abort_with_ack = true;
-    cfg.output_push_batch_segments = 0;
     cfg.output_group_flush = true;
-    cfg.output_push_batch_retransmissions = false;
     let incoming = ip(reverse(tuple()));
     let mut bytes = [0; 64];
     let n = wire::encode(
@@ -381,15 +379,6 @@ fn rack_timer_prr_window_survives_rejection_and_zero_delivery() {
         )
         .unwrap();
     }
-}
-
-#[test]
-fn rack_timer_prr_window_keeps_legacy_entry_policy() {
-    let mut rows = Vec::new();
-    let a = local_sender_with_algorithm(&mut rows, PrrAlgorithm::LegacyInitialCredit);
-    assert_eq!(a.congestion.cwnd(), 2000);
-    assert_eq!(a.congestion.recovery_target(), 2000);
-    assert_eq!(a.prr.unwrap().credit(), 1000);
 }
 
 #[test]

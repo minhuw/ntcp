@@ -1744,3 +1744,90 @@ fn fast_open_negative_local_deadline_does_not_suppress_when_serviced_late() {
         }
     }
 }
+
+#[test]
+fn inventory_tfo_syn_only_rejection_keeps_cookie_but_suppresses_after_data_ack() {
+    for v6 in [false, true] {
+        let config = EndpointConfig {
+            max_connections: 16,
+            connection: ConnectionConfig {
+                mss: 1460,
+                timestamps: false,
+                send_capacity: 8192,
+                receive_capacity: 8192,
+                ..ConnectionConfig::default()
+            },
+            ..EndpointConfig::default()
+        };
+        let mut a = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
+        a.enable_fast_open().unwrap();
+        let (local, remote) = addresses(v6, 40000);
+        a.connect_fast_open(0, local, remote, &[]).unwrap();
+        let syn = packet(&mut a, 0);
+        deliver(&mut a, 10_000, &cache_reply(&syn, 1460, Some(&[7; 8])));
+        packet(&mut a, 10_000);
+        let (local, _) = addresses(v6, 40001);
+        let (id, accepted) = a
+            .connect_fast_open(20_000, local, remote, &[42; 700])
+            .unwrap();
+        assert_eq!(accepted, 700);
+        let syn = packet(&mut a, 20_000);
+        let iss = wire::parse(syn.0, &syn.1).unwrap().header.sequence;
+        let mut response = cache_reply(&syn, 1040, Some(&[8; 8]));
+        response.1[8..12].copy_from_slice(&iss.wrapping_add(1).to_be_bytes());
+        repair_cache_checksum(response.0, &mut response.1);
+        deliver(&mut a, 40_000, &response);
+        let retry = packet(&mut a, 40_000);
+        let parsed = wire::parse(retry.0, &retry.1).unwrap();
+        assert_eq!(parsed.header.sequence, iss.wrapping_add(1));
+        assert_eq!(parsed.payload.len(), 700);
+        let ip = IpMetadata {
+            source: remote.ip(),
+            destination: local.ip(),
+        };
+        let mut ack = [0; 64];
+        let length = wire::encode(
+            ip,
+            wire::Header {
+                source_port: remote.port(),
+                destination_port: local.port(),
+                sequence: 124,
+                acknowledgment: iss.wrapping_add(701),
+                flags: wire::ACK,
+                window: 8192,
+                urgent_pointer: 0,
+            },
+            &[],
+            &[],
+            &mut ack,
+        )
+        .unwrap();
+        deliver(&mut a, 41_000, &(ip, ack[..length].to_vec()));
+        assert_eq!(a.acknowledged(id).unwrap(), 700);
+        assert!(
+            a.has_fast_open_cookie(41_000, local.ip(), remote.ip())
+                .unwrap()
+        );
+        assert!(!a.can_defer_fast_open(41_000, local.ip(), remote).unwrap());
+        let (next, _) = addresses(v6, 40002);
+        let (_, same_accepted) = a
+            .connect_fast_open(42_000, next, remote, &[42; 5000])
+            .unwrap();
+        assert_eq!(same_accepted, 0);
+        assert!(!a.can_defer_fast_open(42_000, local.ip(), remote).unwrap());
+        let mut other = remote;
+        other.set_port(remote.port() + 1);
+        let (next, _) = addresses(v6, 40003);
+        let (_, other_accepted) = a
+            .connect_fast_open(43_000, next, other, &[42; 5000])
+            .unwrap();
+        assert_eq!(other_accepted, 1000);
+        assert!(
+            a.can_defer_fast_open(60_040_001, local.ip(), remote)
+                .unwrap()
+        );
+        std::eprintln!(
+            "TFO_INVENTORY {{\"probe\":\"syn_only_cache\",\"v6\":{v6},\"original_bytes\":700,\"repaired_bytes\":700,\"ordinary_data_acked\":700,\"cookie_retained\":true,\"next_same_service_accepted\":{same_accepted},\"other_service_accepted\":{other_accepted},\"eligible_after_60s\":true}}"
+        );
+    }
+}

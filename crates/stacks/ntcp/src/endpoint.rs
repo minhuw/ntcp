@@ -4451,10 +4451,8 @@ mod recovery_observation_tests {
 
     #[test]
     fn rack_deadline_budget_ready_queue_and_stable_owner() {
-        for algorithm in [
-            crate::PrrAlgorithm::Rfc9937,
-            crate::PrrAlgorithm::LegacyInitialCredit,
-        ] {
+        {
+            let algorithm = crate::PrrAlgorithm::Rfc9937;
             let config = EndpointConfig {
                 max_connections: 4,
                 max_listeners: 1,

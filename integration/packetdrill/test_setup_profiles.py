@@ -7,13 +7,16 @@ from run import HERE, PIN, SLOW_START_ACK_SCRIPTS, adapt_source, profile_metadat
 
 
 class SetupProfiles(unittest.TestCase):
+    def test_removed_legacy_prr_has_no_usable_metadata(self):
+        metadata = profile_metadata('upstream,local=192.0.2.1,legacy-prr')
+        self.assertIsNone(metadata['software_gso'])
+        self.assertNotIn('prr', metadata)
+
     def test_common_abort_ack_policy_and_native_defaults(self):
         for flags in ('upstream,local=192.0.2.1',
                       'upstream,local=192.0.2.1,abort-with-ack',
                       'upstream,local=192.0.2.1,no-timestamps'):
             self.assertIs(profile_metadata(flags)['abort_with_ack'], True)
-            self.assertEqual(profile_metadata(flags)['output_push_batch_segments'], 0)
-            self.assertIs(profile_metadata(flags)['output_push_batch_retransmissions'], False)
         self.assertNotIn('abort_with_ack', profile_metadata('baseline,local=192.0.2.1'))
 
     def test_exact_setup_only_and_fail_closed(self):
@@ -50,7 +53,7 @@ class SetupProfiles(unittest.TestCase):
                 with self.subTest(name=name, key=key), self.assertRaises(ValueError):
                     adapt_source(directory, name, changed, changed['scripts'][name]['adapter_flags'])
             if name.startswith('nagle/'):
-                policy_keys = ('timestamps', 'sack', 'output_push_batch_segments')
+                policy_keys = ('timestamps', 'sack', 'output_group_flush')
             elif name in SLOW_START_ACK_SCRIPTS:
                 self.assertEqual(source.count(b'\n'), generated.count(b'\n'))
                 policy_keys = ('endpoint_max_buffer_bytes', 'congestion_control', 'cubic_hystart')
@@ -106,7 +109,7 @@ class SetupProfiles(unittest.TestCase):
 
     def test_linux_cookie_explicit_listener_setup_and_capability_metadata(self):
         from run import (LINUX_COOKIE_OPTION, LINUX_COOKIE_SCRIPTS,
-                         LINUX_COOKIE_SETTINGS, preflight, tcp_info_only)
+                         LINUX_COOKIE_SETTINGS, IMPLICIT_TFO_LISTENER_SCRIPTS, preflight, tcp_info_only)
         directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
         if not directory.is_dir():
             self.skipTest('pinned checkout unavailable')
@@ -118,17 +121,21 @@ class SetupProfiles(unittest.TestCase):
             entry = manifest['scripts'][name]
             source = (directory / name).read_bytes()
             generated, audit = adapt_source(directory, name, manifest, entry['adapter_flags'])
-            expected = source.replace(b'`../../../common/defaults.sh`\n',
+            expected = source.replace(entry['command_line'].encode(),
                                       entry['replacement_line'].encode(), 1)
             self.assertEqual(generated, expected)
             self.assertEqual(source, (directory / name).read_bytes())
             self.assertNotIn(b'`', generated)
-            self.assertIn(b'TCP_FASTOPEN, [', generated)
-            self.assertIn(b'FO 3021b9d889017eeb', generated)
+            if name not in IMPLICIT_TFO_LISTENER_SCRIPTS:
+                self.assertIn(b'TCP_FASTOPEN, [', generated)
+            self.assertTrue(b'FO 3021b9d889017eeb' in generated or b'FO TFO_COOKIE' in generated)
             self.assertEqual(audit['generated_sha256'], hashlib.sha256(expected).hexdigest())
             self.assertEqual(preflight(generated.decode(), entry['embedded_tcp_info']), [])
             metadata = profile_metadata(entry['adapter_flags'])
-            for key, value in LINUX_COOKIE_SETTINGS.items():
+            expected_settings = dict(LINUX_COOKIE_SETTINGS)
+            if name in IMPLICIT_TFO_LISTENER_SCRIPTS:
+                expected_settings.update(fast_open_listener_default=True, implicit_listener_enablement=True)
+            for key, value in expected_settings.items():
                 self.assertEqual(metadata[key], value)
                 changed = copy.deepcopy(manifest)
                 changed['scripts'][name]['mapping']['ntcp_settings'][key] = 'incorrect'
@@ -202,7 +209,7 @@ class SetupProfiles(unittest.TestCase):
     def test_adaptive_ack_exact_three_setup_only_mappings(self):
         from run import ADAPTIVE_ACK_OPTION, ADAPTIVE_ACK_SCRIPTS, ADAPTIVE_ACK_SETTINGS, preflight
         manifest = json.loads((HERE / 'adaptations.json').read_text())
-        self.assertEqual(len(manifest['scripts']), 105)
+        self.assertEqual(len(manifest['scripts']), 162)
         self.assertEqual({name for name, entry in manifest['scripts'].items()
                           if ADAPTIVE_ACK_OPTION in entry['adapter_flags'].split(',')},
                          ADAPTIVE_ACK_SCRIPTS)

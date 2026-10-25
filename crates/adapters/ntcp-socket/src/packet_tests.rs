@@ -1751,9 +1751,9 @@ fn cubic_real_loss_snapshot_and_upstream_reno_independence() {
         (upstream_packet_tests(""), Some(true), 7),
         (upstream_packet_tests(""), Some(false), 7),
         (upstream_packet_tests(""), None, 7),
-        (upstream_packet_tests("reno,legacy-prr"), Some(true), 5),
-        (upstream_packet_tests("reno,legacy-prr"), Some(false), 5),
-        (upstream_packet_tests("reno,legacy-prr"), None, 5),
+        (upstream_packet_tests("reno"), Some(true), 5),
+        (upstream_packet_tests("reno"), Some(false), 5),
+        (upstream_packet_tests("reno"), None, 5),
     ] {
         let mut owner = match pacing {
             Some(pacing) => Owner::new_with_prr_pacing((local(), profile), pacing),
@@ -1810,14 +1810,7 @@ fn cubic_real_loss_snapshot_and_upstream_reno_independence() {
                 .payload
                 .len();
         }
-        assert_eq!(
-            emitted,
-            if profile == upstream_packet_tests("") && pacing {
-                1000
-            } else {
-                10_000
-            }
-        );
+        assert_eq!(emitted, if pacing { 1000 } else { 10_000 });
         for tick in 11..=19 {
             owner
                 .endpoint
@@ -1869,14 +1862,8 @@ fn cubic_real_loss_snapshot_and_upstream_reno_independence() {
             .input(now + 50_000, ip, &tcp[..n])
             .unwrap();
         let info = owner.inner.endpoint.transport_info(id).unwrap();
-        assert_eq!(
-            info.cwnd,
-            if profile == upstream_packet_tests("") {
-                7000
-            } else {
-                2000
-            }
-        );
+        // Both CCs leave RFC9937 at their fixed reduction target.
+        assert_eq!(info.cwnd, threshold * 1000);
         let (mut query, _) = request(18, fd, 1, vec![], TCP_INFO_SIZE);
         let bytes = owner.execute(&mut query).unwrap().unwrap().bytes;
         for (offset, value) in [(76, info.ssthresh), (80, info.cwnd)] {

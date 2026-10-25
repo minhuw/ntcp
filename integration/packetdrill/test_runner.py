@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from expectations import PORTED_SCRIPTS
 
-from run import (RESOURCE_SCRIPT, RESOURCE_EVENT, RESOURCE_CONTROL, SLOW_START_ACK_SCRIPTS, FASTOPEN_CLIENT_SCRIPTS, NON_TFO_SETUP_COMMANDS, ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
+from run import (SYN_DATA_ACK_SCRIPTS, RESOURCE_SCRIPT, RESOURCE_EVENT, RESOURCE_CONTROL, SLOW_START_ACK_SCRIPTS, FASTOPEN_CLIENT_SCRIPTS, NON_TFO_SETUP_COMMANDS, ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
                  fixture_command, HERE, PIN, adapt_source, check_plugin_hash, invoke, main, outcome,
                  preflight, profile_metadata, select_cases, variants, verify_backend)
 
@@ -506,6 +506,10 @@ class AdaptationChecks(unittest.TestCase):
         # Timed resource commands require the exact real source/hash and have
         # separate capability tests; generic synthetic sources cannot enable it.
         self.manifest['scripts'].pop(RESOURCE_SCRIPT)
+        # Synthetic generic sources have no IPv6-only filename constraints.
+        for name in list(self.manifest['scripts']):
+            if name.endswith('v6.pkt'):
+                self.manifest['scripts'].pop(name)
         self.source = (b'// assertions must survive exactly\n`../common/defaults.sh`\n'
                        b'0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3\n'
                        b'+0 > S 0:0(0) <...>\n+0 close(3) = 0\n')
@@ -516,7 +520,7 @@ class AdaptationChecks(unittest.TestCase):
             if name in ('nagle/https_client.pkt', 'notsent_lowat/notsent-lowat-sysctl.pkt',
                         'syscall_bad_arg/fastopen-invalid-buf-ptr.pkt') or name in (
                             LINUX_COOKIE_SCRIPTS | FASTOPEN_PMTUD_SCRIPTS | ADAPTIVE_ACK_SCRIPTS
-                            | FASTOPEN_CLIENT_SCRIPTS | NON_TFO_SETUP_COMMANDS.keys() | SLOW_START_ACK_SCRIPTS):
+                            | FASTOPEN_CLIENT_SCRIPTS | NON_TFO_SETUP_COMMANDS.keys() | SLOW_START_ACK_SCRIPTS | SYN_DATA_ACK_SCRIPTS):
                 path = self.directory / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 source = self.source.replace(b'`../common/defaults.sh`\n', entry['command_line'].encode())
@@ -797,7 +801,7 @@ class AdaptationChecks(unittest.TestCase):
 
     def test_consistent_manifest_cannot_smuggle_unaudited_options(self):
         name = 'tcp_info/tcp-info-sndbuf-limited.pkt'
-        for token in ('reno', 'paced', 'legacy-prr', 'linux-cookie', 'pmtud1500', 'adaptive-ack'):
+        for token in ('reno', 'paced', 'linux-cookie', 'pmtud1500', 'adaptive-ack'):
             manifest = copy.deepcopy(self.manifest)
             entry = manifest['scripts'][name]
             entry['adapter_flags'] += ',' + token
@@ -818,7 +822,7 @@ class AdaptationChecks(unittest.TestCase):
                              (128 if 'budget128m' in settings['options'] else
                               224 if 'budget224m' in settings['options'] else 32) * 1024 * 1024)
             self.assertEqual(settings['preallocate_connections'],
-                             3 if 'prealloc3' in settings['options'] else 1)
+                             4 if 'prealloc4' in settings['options'] else 3 if 'prealloc3' in settings['options'] else 1)
 
     def test_congestion_basic_selection_and_diagnostic_profiles(self):
         manifest = json.loads((HERE / 'adaptations.json').read_text())
@@ -897,7 +901,7 @@ class AdaptationChecks(unittest.TestCase):
         report = checkout / 'report.json'
         calls = []
         tracked = '\0'.join(str(Path(PIN['tcp_tests']) / name)
-                            for name in [*self.manifest['scripts'], 'unselected.pkt'])
+                            for name in self.manifest['scripts'])
 
         def execute(argv, cwd, timeout):
             generated = Path(argv[-1])
@@ -919,9 +923,9 @@ class AdaptationChecks(unittest.TestCase):
         inventory_count = len(self.manifest['scripts'])
         count = inventory_count - len(PORTED_SCRIPTS & self.manifest['scripts'].keys())
         self.assertEqual(data['coverage'], {'selected_script_files': count,
-                                          'upstream_script_files': inventory_count + 1,
+                                          'upstream_script_files': inventory_count,
                                           'selection': 'adaptation_allowlist'})
-        self.assertEqual(data['counts'], {'failed': count - 1, 'passed': 1, 'unsupported': 2 * count})
+        self.assertEqual(data['counts'], {'failed': count - 1, 'passed': 1, 'unsupported': 2 * count - 1})
         self.assertFalse(data['all_passed'])
         self.assertEqual(len(calls), 2 * count)
         for row in data['results']:
@@ -982,10 +986,10 @@ class AdaptationChecks(unittest.TestCase):
             data = json.loads(report.read_text())
             self.assertEqual(data['counts'], expected_counts)
             self.assertEqual(data['all_passed'], expected_counts == {'passed': 1})
-            self.assertEqual(data['eligible_total'], 3 * inventory_count)
+            self.assertEqual(data['eligible_total'], 3 * inventory_count - 1)
             self.assertEqual(data['eligible_script_files'], inventory_count)
             self.assertEqual(data['selected_total'], sum(expected_counts.values()))
-            self.assertEqual(data['excluded_total'], 3 * inventory_count - data['selected_total'])
+            self.assertEqual(data['excluded_total'], 3 * inventory_count - 1 - data['selected_total'])
             self.assertEqual(len(calls), expected_calls)
             self.assertEqual(data['adaptation_manifest_sha256'],
                              hashlib.sha256((manifest_dir / 'adaptations.json').read_bytes()).hexdigest())
@@ -997,6 +1001,14 @@ class AdaptationChecks(unittest.TestCase):
                 self.assertEqual(row['adaptation']['source_sha256'],
                                  self.manifest['scripts'][row['script']]['source_sha256'])
                 self.assertEqual(row['effective_flags']['packetdrill'], PIN['variants'][row['variant']])
+        # A newly tracked source cannot disappear behind the old allowlist.
+        with patch('run.HERE', manifest_dir), patch('run.check_checkout', return_value=PIN['revision']), \
+                patch('run.subprocess.check_output', return_value=tracked + '\0' + PIN['tcp_tests'] + '/unselected.pkt'), \
+                patch('run.invoke') as execute, patch.object(sys, 'argv', argv):
+            with self.assertRaises(SystemExit) as error:
+                main()
+            self.assertEqual(error.exception.code, 2)
+            execute.assert_not_called()
         # An override cannot execute with settings different from the audit claim.
         with patch('run.HERE', manifest_dir), patch('run.check_checkout', return_value=PIN['revision']), \
                 patch('run.subprocess.check_output', return_value=tracked), \
@@ -1005,7 +1017,7 @@ class AdaptationChecks(unittest.TestCase):
                      '--suite', 'upstream', '--report', str(report), '--so-flags', 'baseline']):
             self.assertEqual(main(), 1)
             execute.assert_not_called()
-        self.assertEqual(json.loads(report.read_text())['counts'], {'adaptation_rejected': 3 * count})
+        self.assertEqual(json.loads(report.read_text())['counts'], {'adaptation_rejected': 3 * count - 1})
 
 
 class FileFixtureChecks(unittest.TestCase):

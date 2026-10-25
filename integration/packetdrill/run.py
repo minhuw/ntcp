@@ -22,9 +22,15 @@ PIN = json.loads((HERE / 'upstream.json').read_text())
 
 
 LINUX_COOKIE_OPTION = 'linux-cookie'
+IMPLICIT_TFO_LISTENER_SCRIPTS = {
+    'fastopen/server/opt34/' + name + '.pkt'
+    for name in ('basic-rw', 'basic-zero-payload', 'listener-closed-trigger-rst',
+                 'reset-close-with-unread-data', 'reset-non-tfo-socket',
+                 'unread-data-closed-trigger-rst')}
 LINUX_COOKIE_SCRIPTS = {
     'fastopen/server/opt34/' + name + '.pkt'
-    for name in ('fin-close-socket', 'reset-after-accept', 'reset-before-accept')}
+    for name in ('fin-close-socket', 'reset-after-accept', 'reset-before-accept')} | IMPLICIT_TFO_LISTENER_SCRIPTS | {
+    'fastopen/server/client-ack-dropped-then-recovery-ms-timestamps.pkt'}
 LINUX_COOKIE_SETTINGS = {
     'fast_open_client_default': False, 'fast_open_listener_default': False,
     'fast_open_cache': 'fresh runtime', 'fast_open_cookie_policy': 'linux-siphash24',
@@ -83,6 +89,14 @@ SLOW_START_ACK_SCRIPTS = {
 }
 SLOW_START_ACK_SETUP = (b'`../common/defaults.sh\n'
                         b'sysctl -q net.ipv4.tcp_tso_win_divisor=100`\n')
+
+
+SYN_DATA_ACK_SCRIPTS = {
+    'fastopen/client/' + name + '.pkt'
+    for name in ('syn-data-only-syn-acked', 'syn-data-partial-or-over-ack')}
+SYN_DATA_ACK_SETUP = (b'`../../common/defaults.sh\n'
+                      b' ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0 \\\n'
+                      b'                             /proc/sys/net/ipv4/tcp_min_tso_segs=2`\n')
 
 
 # Exact per-case option audit: setup-only adaptation never interprets shell/sysctl text.
@@ -234,6 +248,34 @@ UPSTREAM_OPTION_AUDIT = {
     },
 }
 
+for _name in IMPLICIT_TFO_LISTENER_SCRIPTS:
+    UPSTREAM_OPTION_AUDIT[_name] = {
+        'linux-cookie': 'Original defaults key and kind34 cookie require the existing feature-gated Linux SipHash policy.',
+        'tfo-listen': 'defaults.sh tcp_fastopen=0x70403 enables listeners without TCP_FASTOPEN; enable the existing bounded TFO listener machinery for newly created sockets.',
+    }
+UPSTREAM_OPTION_AUDIT['fastopen/server/client-ack-dropped-then-recovery-ms-timestamps.pkt'] = {
+    'linux-cookie': 'Original kind34 cookie and explicit TCP_FASTOPEN listener use the defaults key and existing Linux SipHash policy.',
+}
+for _name in SYN_DATA_ACK_SCRIPTS:
+    UPSTREAM_OPTION_AUDIT[_name] = {
+        'budget224m': 'Multi-connection trace retains socket storage; use the existing bounded seven-connection budget without changing buffer accounting.',
+        'prealloc3': 'Reserve three charged connection pools before timed events, as for the existing multi-connection TFO cases.',
+        'no-timestamps': 'Exact setup disables timestamps; tcp_min_tso_segs=2 uses the existing common minimum software group size. Packet and PRR expectations remain unchanged.',
+    }
+UPSTREAM_OPTION_AUDIT['zerocopy/maxfrags.pkt'] = {
+    'budget224m': 'Original SO_SNDBUF=2000000 needs the existing bounded budget for native doubled/clamped capacity and resize staging. Linux page-fragment accounting is not emulated.',
+}
+
+
+for _name in ('fastopen/server/opt34/basic-rw.pkt',
+              'fastopen/server/client-ack-dropped-then-recovery-ms-timestamps.pkt'):
+    UPSTREAM_OPTION_AUDIT[_name]['early-response'] = 'Original authenticated TFO trace writes response data before final handshake ACK. Enable existing core early response under the configured IW policy; validation, quotas and all window limits still apply.'
+
+
+UPSTREAM_OPTION_AUDIT['fastopen/client/syn-data-only-syn-acked.pkt'].pop('prealloc3')
+UPSTREAM_OPTION_AUDIT['fastopen/client/syn-data-only-syn-acked.pkt']['prealloc4'] = 'The unchanged source creates four distinct client connections including retained warmup/TIME_WAIT storage; pre-touch four charged pools within budget224m before timed events.'
+
+
 def upstream_flags(relative):
     return "upstream,local=192.168.0.1" + "".join("," + token for token in sorted(UPSTREAM_OPTION_AUDIT.get(relative, {})))
 
@@ -293,7 +335,7 @@ RESOURCE_CONTROL = b'   +0 `ntcp-local-resource-reject-on`\n'
 RESOURCE_SOURCE_SHA256 = 'fbbf50f3e1d2facf9835267513fe709665db245d1f2234f98dd448d8be59d564'
 
 
-TCP_INFO_FIELDS = {'tcpi_ca_state', 'tcpi_probes', 'tcpi_backoff', 'tcpi_unacked', 'tcpi_sacked',
+TCP_INFO_FIELDS = {'tcpi_state', 'tcpi_ca_state', 'tcpi_probes', 'tcpi_backoff', 'tcpi_unacked', 'tcpi_sacked',
                    'tcpi_lost', 'tcpi_retrans', 'tcpi_reordering',
                    'tcpi_snd_cwnd', 'tcpi_snd_ssthresh', 'tcpi_rtt', 'tcpi_min_rtt', 'tcpi_reord_seen',
                    'tcpi_notsent_bytes', 'tcpi_last_data_recv', 'tcpi_busy_time',
@@ -307,7 +349,8 @@ TCP_INFO_OPTION_BITS = {'TCPI_OPT_TIMESTAMPS': 1, 'TCPI_OPT_SACK': 2,
 
 
 TCP_INFO_SYMBOLS = {'TCP_CA_Open', 'TCP_CA_Disorder', 'TCP_CA_CWR',
-                    'TCP_CA_Recovery', 'TCP_CA_Loss'} | TCP_INFO_OPTION_BITS.keys()
+                    'TCP_CA_Recovery', 'TCP_CA_Loss', 'TCP_ESTABLISHED',
+                    'TCP_CLOSE', 'TCP_CLOSE_WAIT'} | TCP_INFO_OPTION_BITS.keys()
 
 
 def tcp_info_option_mask(node):
@@ -464,13 +507,16 @@ def adapt_source(directory, relative, manifest, so_flags):
             b'`../../common/defaults.sh\nsysctl -q net.ipv4.tcp_notsent_lowat=4000`\n'),
         **NON_TFO_SETUP_COMMANDS,
         **{name: SLOW_START_ACK_SETUP for name in SLOW_START_ACK_SCRIPTS},
+        **{name: SYN_DATA_ACK_SETUP for name in SYN_DATA_ACK_SCRIPTS},
     }
     for name in FASTOPEN_CLIENT_SCRIPTS | ADAPTIVE_ACK_SCRIPTS | FASTOPEN_PMTUD_SCRIPTS:
         setup_commands[name] = (
             b'`../../common/defaults.sh\n'
             b' ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n')
     for name in LINUX_COOKIE_SCRIPTS:
-        setup_commands[name] = b'`../../../common/defaults.sh`\n'
+        setup_commands[name] = (b'`../../../common/defaults.sh`\n'
+                                if name.startswith('fastopen/server/opt34/')
+                                else b'`../../common/defaults.sh`\n')
     if LINUX_COOKIE_OPTION in so_flags.split(',') and relative not in LINUX_COOKIE_SCRIPTS:
         raise ValueError('Linux cookie setup is limited to audited explicit listeners')
     if FASTOPEN_PMTUD_OPTION in so_flags.split(',') and relative not in FASTOPEN_PMTUD_SCRIPTS:
@@ -481,7 +527,7 @@ def adapt_source(directory, relative, manifest, so_flags):
         expected = setup_commands[relative]
         commands = [command.rstrip(b'\n')]
         replacements = [(command, replacement)]
-        if (relative in FASTOPEN_CLIENT_SCRIPTS | ADAPTIVE_ACK_SCRIPTS | FASTOPEN_PMTUD_SCRIPTS
+        if (relative in FASTOPEN_CLIENT_SCRIPTS | ADAPTIVE_ACK_SCRIPTS | FASTOPEN_PMTUD_SCRIPTS | SYN_DATA_ACK_SCRIPTS
                 or relative in {'syscall_bad_arg/fastopen-invalid-buf-ptr.pkt', 'nagle/https_client.pkt',
                                 'fastopen/server/basic-non-tfo-listener.pkt',
                                 'fastopen/server/icmp-baseline.pkt'}):
@@ -499,6 +545,8 @@ def adapt_source(directory, relative, manifest, so_flags):
         if (relative in FASTOPEN_PMTUD_SCRIPTS | ADAPTIVE_ACK_SCRIPTS | FASTOPEN_CLIENT_SCRIPTS | SLOW_START_ACK_SCRIPTS
                 or relative in NON_TFO_SETUP_COMMANDS and expected.count(b'\n') == 2):
             expected_replacement += b'\n'  # Keep the audited two-line setup's line numbers.
+        if relative in SYN_DATA_ACK_SCRIPTS:
+            expected_replacement += b'\n' * (expected.count(b'\n') - 1)
         if (command != expected or so_flags != upstream_flags(relative)
                 or entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
                 or replacement != expected_replacement
@@ -683,9 +731,9 @@ UPSTREAM_BASELINE_REASON = 'Common upstream baseline: actual CUBIC with HyStart+
 
 UPSTREAM_OPTIONS = {
     'no-timestamps', 'ecn', 'adaptive-ack', 'lowat4000', 'linux-cookie', 'pmtud1500',
-    'budget128m', 'budget224m', 'prealloc3', 'immediate-ack', 'peer-ack-delay200ms',
-    'abort-with-ack', 'coalesce-read-window', 'legacy-prr',
-    'reno', 'paced', 'receive64k',
+    'budget128m', 'budget224m', 'prealloc3', 'prealloc4', 'immediate-ack', 'peer-ack-delay200ms',
+    'abort-with-ack', 'coalesce-read-window',
+    'reno', 'paced', 'receive64k', 'tfo-listen', 'early-response',
 }
 
 
@@ -705,7 +753,8 @@ def profile_metadata(so_flags):
     known = (valid_local and profile is not None and len(tokens) == len(set(tokens))
              and (not options or profile == 'upstream' and options <= UPSTREAM_OPTIONS)
              and not {'budget128m', 'budget224m'} <= options
-             and not {'immediate-ack', 'adaptive-ack'} <= options)
+             and not {'immediate-ack', 'adaptive-ack'} <= options
+             and not {'prealloc3', 'prealloc4'} <= options)
     upstream = profile == 'upstream'
     # Configuration/capture boundary only, never a claim of Linux fq/TSO timing equivalence.
     metadata = {
@@ -725,8 +774,8 @@ def profile_metadata(so_flags):
     if upstream:
         metadata.update(
             options=sorted(options), sack=True, timestamps='no-timestamps' not in options,
-            initial_window='Iw10', rack=True, prr='LegacyInitialCredit' if 'legacy-prr' in options else 'Rfc9937',
-            tlp=True, rto_min_us=200000, preallocate_connections=3 if 'prealloc3' in options else 1,
+            initial_window='Iw10', fast_open_early_response='early-response' in options, rack=True, prr='Rfc9937',
+            tlp=True, rto_min_us=200000, preallocate_connections=4 if 'prealloc4' in options else 3 if 'prealloc3' in options else 1,
             ecn='ecn' in options, mss=1460,
             receive_capacity=65535 if 'receive64k' in options else 8388608,
             window_scale=0 if 'receive64k' in options else 8,
@@ -739,15 +788,17 @@ def profile_metadata(so_flags):
             abort_with_ack=True,
             coalesce_read_window_updates=True,
             peer_max_ack_delay_us=200000 if 'peer-ack-delay200ms' in options else 499999,
-            output_push_batch_segments=0,
             output_group_flush=True,
-            output_push_batch_retransmissions=False,
             global_notsent_lowat=4000 if 'lowat4000' in options else 4294967295,
             socket_notsent_lowat=0, fast_open_client_default=False, fast_open_listener_default=False,
             fast_open_cache='fresh runtime', fast_open_cookie_policy='hmac-sha256',
             pacing_config={'rate_gain_percent': 125, 'max_bytes_per_second': None, 'max_burst_segments': 2} if 'paced' in options else None)
         if 'linux-cookie' in options:
             metadata.update(LINUX_COOKIE_SETTINGS)
+        if 'tfo-listen' in options:
+            metadata.update(fast_open_listener_default=True,
+                            implicit_listener_enablement=True,
+                            fast_open_listener_limit=128)
         if 'pmtud1500' in options:
             metadata.update(FASTOPEN_PMTUD_SETTINGS)
         if 'adaptive-ack' in options:
@@ -837,6 +888,9 @@ def main():
                    if manifest is not None else upstream_scripts)
         if any(script not in upstream_scripts for script in scripts):
             parser.error('adaptation allowlist contains an untracked upstream script')
+        if (args.suite == 'upstream'
+                and set(directory / path for path in manifest['scripts']) != set(upstream_scripts)):
+            parser.error('adaptation inventory must cover every tracked upstream TCP script')
     else:
         scripts = sorted(directory.rglob('*.pkt'))
     if not scripts:

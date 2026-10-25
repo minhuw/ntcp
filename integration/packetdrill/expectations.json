@@ -289,6 +289,15 @@
       ],
       "disposition": "ntcp-accounting-expectation",
       "owner_suite": "ntcp-ported"
+    },
+    {
+      "script": "zerocopy/maxfrags.pkt",
+      "source_sha256": "b30ef6786bad996ed0fc4f6d3640bf677cc4bb6de9d329d0acd0e1d52fc7196b",
+      "symbols": [
+        "SO_SNDBUF"
+      ],
+      "disposition": "unchanged-original-expectations",
+      "owner_suite": "upstream"
     }
   ]
 }

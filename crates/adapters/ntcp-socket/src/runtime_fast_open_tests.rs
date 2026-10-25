@@ -1811,3 +1811,64 @@ fn fast_open_reset_cookie_reuse_and_independent_suppression_blocking_send() {
         );
     }
 }
+
+#[test]
+fn upstream_implicit_fast_open_listener_and_explicit_disable() {
+    for disabled in [false, true] {
+        let (_, profile) = crate::packet_profile::profile(
+            "upstream,local=192.0.2.2,tfo-listen,budget224m,prealloc3",
+        )
+        .unwrap();
+        let mut b = owner(2, profile, 32);
+        let mut a = owner(1, Profile::Pipeline, 32);
+        let listener = new(&mut b, SOCK_NONBLOCK);
+        assert_eq!(
+            b.execute(listener, Op::Get(IPPROTO_TCP, TCP_FASTOPEN))
+                .unwrap()
+                .value,
+            128
+        );
+        if disabled {
+            b.execute(listener, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 0))
+                .unwrap();
+        }
+        b.execute(listener, Op::Bind("192.0.2.2:8080".parse().unwrap()))
+            .unwrap();
+        b.execute(listener, Op::Listen(4)).unwrap();
+        // Warm the actual client cookie cache through an ordinary handshake.
+        let warmup = new(&mut a, SOCK_NONBLOCK);
+        a.execute(warmup, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1))
+            .unwrap();
+        assert_eq!(
+            a.execute(warmup, Op::Connect("192.0.2.2:8080".parse().unwrap()))
+                .unwrap_err(),
+            EINPROGRESS
+        );
+        exchange(&mut a, &mut b);
+        let child = b
+            .execute(listener, Op::Accept(SOCK_NONBLOCK))
+            .unwrap()
+            .value as u64;
+        a.execute(warmup, Op::Close).unwrap();
+        b.execute(child, Op::Close).unwrap();
+        exchange(&mut a, &mut b);
+        let client = new(&mut a, SOCK_NONBLOCK);
+        let data = [42; 10];
+        let result = a.execute(client, tfo_send(&data, MSG_FASTOPEN));
+        if disabled {
+            assert_eq!(result.unwrap_err(), EINPROGRESS);
+        } else {
+            assert_eq!(result.unwrap().value, 10);
+        }
+        let syn = tfo_capture(&mut a);
+        assert_eq!(segment(&syn).payload.len(), if disabled { 0 } else { 10 });
+        tfo_deliver(&mut b, syn);
+        let result = b.execute(listener, Op::Accept(SOCK_NONBLOCK));
+        if disabled {
+            assert_eq!(result.unwrap_err(), EAGAIN);
+        } else {
+            let child = result.unwrap().value as u64;
+            assert_eq!(b.execute(child, Op::Read(10)).unwrap().bytes, data);
+        }
+    }
+}

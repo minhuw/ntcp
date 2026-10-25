@@ -21,17 +21,19 @@ pub struct UpstreamOptions {
     pub adaptive_ack: bool,
     pub lowat4000: bool,
     pub linux_cookie: bool,
+    pub tfo_listen: bool,
+    pub early_response: bool,
     pub pmtud1500: bool,
     pub budget128m: bool,
     pub budget224m: bool,
     pub prealloc3: bool,
+    pub prealloc4: bool,
     pub immediate_ack: bool,
     pub peer_ack_delay200ms: bool,
     // Records an explicit, idempotent request; upstream already enables this by default.
     pub abort_with_ack: bool,
     // Records an explicit, idempotent request; upstream already enables this by default.
     pub coalesce_read_window: bool,
-    pub legacy_prr: bool,
     pub reno: bool,
     pub paced: bool,
     pub receive64k: bool,
@@ -63,15 +65,17 @@ impl Profile {
                     (options.adaptive_ack, "adaptive-ack"),
                     (options.lowat4000, "lowat4000"),
                     (options.linux_cookie, "linux-cookie"),
+                    (options.tfo_listen, "tfo-listen"),
+                    (options.early_response, "early-response"),
                     (options.pmtud1500, "pmtud1500"),
                     (options.budget128m, "budget128m"),
                     (options.budget224m, "budget224m"),
                     (options.prealloc3, "prealloc3"),
+                    (options.prealloc4, "prealloc4"),
                     (options.immediate_ack, "immediate-ack"),
                     (options.peer_ack_delay200ms, "peer-ack-delay200ms"),
                     (options.abort_with_ack, "abort-with-ack"),
                     (options.coalesce_read_window, "coalesce-read-window"),
-                    (options.legacy_prr, "legacy-prr"),
                     (options.reno, "reno"),
                     (options.paced, "paced"),
                     (options.receive64k, "receive64k"),
@@ -123,15 +127,17 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
                 "adaptive-ack" => &mut options.adaptive_ack,
                 "lowat4000" => &mut options.lowat4000,
                 "linux-cookie" => &mut options.linux_cookie,
+                "tfo-listen" => &mut options.tfo_listen,
+                "early-response" => &mut options.early_response,
                 "pmtud1500" => &mut options.pmtud1500,
                 "budget128m" => &mut options.budget128m,
                 "budget224m" => &mut options.budget224m,
                 "prealloc3" => &mut options.prealloc3,
+                "prealloc4" => &mut options.prealloc4,
                 "immediate-ack" => &mut options.immediate_ack,
                 "peer-ack-delay200ms" => &mut options.peer_ack_delay200ms,
                 "abort-with-ack" => &mut options.abort_with_ack,
                 "coalesce-read-window" => &mut options.coalesce_read_window,
-                "legacy-prr" => &mut options.legacy_prr,
                 "reno" => &mut options.reno,
                 "paced" => &mut options.paced,
                 "receive64k" => &mut options.receive64k,
@@ -147,7 +153,9 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
     let mut selected =
         selected.ok_or_else(|| unsupported("so_flags requires exactly one profile"))?;
     if matches!(selected, Profile::Upstream(_)) {
-        if options.budget128m && options.budget224m || options.adaptive_ack && options.immediate_ack
+        if options.budget128m && options.budget224m
+            || options.adaptive_ack && options.immediate_ack
+            || options.prealloc3 && options.prealloc4
         {
             return Err(unsupported("conflicting upstream options"));
         }
@@ -194,7 +202,13 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
         } * 1024
             * 1024;
         // First-touch storage before timed events, still charged to the bounded budget.
-        config.preallocate_connections = if o.prealloc3 { 3 } else { 1 };
+        config.preallocate_connections = if o.prealloc4 {
+            4
+        } else if o.prealloc3 {
+            3
+        } else {
+            1
+        };
         c.receive_capacity = if o.receive64k { 65535 } else { 8 * 1024 * 1024 };
         c.initial_window = ntcp::InitialWindow::Iw10;
         c.congestion_algorithm = if o.reno {
@@ -203,6 +217,7 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
             ntcp::CongestionAlgorithm::Cubic
         };
         c.pacing = o.paced.then(ntcp::PacingConfig::default);
+        c.fast_open_early_response = o.early_response;
         c.cubic_hystart = true;
         c.cubic_fast_convergence = true;
         c.timestamps = !o.no_timestamps;
@@ -210,20 +225,14 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
         c.rack = true;
         c.tlp = true;
         c.prr = true;
-        c.prr_algorithm = if o.legacy_prr {
-            ntcp::PrrAlgorithm::LegacyInitialCredit
-        } else {
-            ntcp::PrrAlgorithm::Rfc9937
-        };
+        c.prr_algorithm = ntcp::PrrAlgorithm::Rfc9937;
         c.prr_pacing = o.paced;
         c.rto_min_us = 200_000;
         c.ecn = o.ecn;
         c.abort_with_ack = true;
         c.coalesce_read_window_updates =
             ntcp::ConnectionConfig::default().coalesce_read_window_updates;
-        c.output_push_batch_segments = 0;
         c.output_group_flush = true;
-        c.output_push_batch_retransmissions = false;
         if o.peer_ack_delay200ms {
             c.peer_max_ack_delay_us = 200_000;
         }
@@ -328,6 +337,11 @@ mod setup_profile_tests {
             .1
     }
     #[test]
+    fn removed_legacy_prr_option_is_rejected() {
+        assert!(profile("upstream,local=192.0.2.1,legacy-prr").is_err());
+    }
+
+    #[test]
     fn common_baseline_and_independent_options() {
         let base = config(selected(""));
         let c = &base.connection;
@@ -336,15 +350,14 @@ mod setup_profile_tests {
         assert_eq!(c.prr_algorithm, ntcp::PrrAlgorithm::Rfc9937);
         assert!(!c.prr_pacing);
         assert!(c.timestamps && c.sack && c.rack && c.tlp);
+        assert!(!c.fast_open_early_response);
         assert_eq!(c.initial_window, ntcp::InitialWindow::Iw10);
         assert_eq!(c.receive_capacity, 8 * 1024 * 1024);
         assert_eq!(c.rto_min_us, 200_000);
         assert!(c.adaptive_ack);
         assert!(c.coalesce_read_window_updates);
         assert!(c.abort_with_ack);
-        assert_eq!(c.output_push_batch_segments, 0);
         assert!(c.output_group_flush);
-        assert!(!c.output_push_batch_retransmissions);
         assert_eq!(c.delayed_ack_us, 200_000);
         assert_eq!(base.max_buffer_bytes, 32 * 1024 * 1024);
         assert_eq!(base.preallocate_connections, 1);
@@ -354,6 +367,7 @@ mod setup_profile_tests {
             ("immediate-ack", 2),
             ("budget128m", 3),
             ("prealloc3", 4),
+            ("early-response", 5),
         ] {
             let p = selected(&format!(",{token}"));
             assert_eq!(
@@ -372,6 +386,7 @@ mod setup_profile_tests {
                 }
                 3 => changed.max_buffer_bytes = base.max_buffer_bytes,
                 4 => changed.preallocate_connections = 1,
+                5 => changed.connection.fast_open_early_response = false,
                 _ => unreachable!(),
             }
             assert_eq!(format!("{changed:?}"), format!("{base:?}"), "{token}");
@@ -413,7 +428,6 @@ mod setup_profile_tests {
             "peer-ack-delay200ms",
             "abort-with-ack",
             "coalesce-read-window",
-            "legacy-prr",
             "reno",
             "paced",
             "receive64k",
@@ -468,10 +482,6 @@ mod setup_profile_tests {
                 }
                 "abort-with-ack" => assert!(c.abort_with_ack),
                 "coalesce-read-window" => assert!(c.coalesce_read_window_updates),
-                "legacy-prr" => {
-                    assert_eq!(c.prr_algorithm, ntcp::PrrAlgorithm::LegacyInitialCredit);
-                    c.prr_algorithm = ntcp::PrrAlgorithm::Rfc9937;
-                }
                 "reno" => {
                     assert_eq!(c.congestion_algorithm, ntcp::CongestionAlgorithm::Reno);
                     c.congestion_algorithm = ntcp::CongestionAlgorithm::Cubic;
@@ -728,5 +738,26 @@ mod setup_profile_tests {
             );
             assert_eq!(endpoint.buffer_bytes(), initial);
         }
+    }
+}
+
+#[cfg(test)]
+mod early_response_pool_tests {
+    use super::*;
+    #[test]
+    fn four_charged_pools_and_early_response_are_independent_options() {
+        let (_, selected) =
+            profile("upstream,local=192.0.2.1,budget224m,prealloc4,early-response").unwrap();
+        let config = config(selected);
+        assert_eq!(config.preallocate_connections, 4);
+        assert_eq!(config.max_buffer_bytes, 224 * 1024 * 1024);
+        assert!(config.connection.fast_open_early_response);
+        assert_eq!(
+            profile(&format!("{},local=192.0.2.1", selected.flags()))
+                .unwrap()
+                .1,
+            selected
+        );
+        assert!(profile("upstream,local=192.0.2.1,prealloc3,prealloc4").is_err());
     }
 }

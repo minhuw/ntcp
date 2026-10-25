@@ -61,8 +61,6 @@ fn local_failure_endpoint() -> (Endpoint, ConnectionId, u32) {
                 delayed_ack_us: 200_000,
                 coalesce_read_window_updates: true,
                 abort_with_ack: true,
-                output_push_batch_segments: 2,
-                output_push_batch_retransmissions: false,
                 ..ConnectionConfig::default()
             },
             ..EndpointConfig::default()

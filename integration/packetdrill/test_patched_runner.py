@@ -170,7 +170,7 @@ class CompiledSnapshotChecks(unittest.TestCase):
                          ['requested TCP_INFO 196', 'requested TCP_INFO 6'])
 
     def test_prefix_field_layout_matches_audited_fields(self):
-        ends = {'tcpi_ca_state': 2, 'tcpi_probes': 4, 'tcpi_backoff': 5, 'tcpi_options': 6, 'tcpi_snd_wscale': 7,
+        ends = {'tcpi_state': 1, 'tcpi_ca_state': 2, 'tcpi_probes': 4, 'tcpi_backoff': 5, 'tcpi_options': 6, 'tcpi_snd_wscale': 7,
                 'tcpi_rcv_wscale': 7, 'tcpi_unacked': 28, 'tcpi_sacked': 32,
                 'tcpi_lost': 36, 'tcpi_retrans': 40, 'tcpi_last_data_recv': 56,
                 'tcpi_rtt': 72, 'tcpi_snd_ssthresh': 80, 'tcpi_snd_cwnd': 84,
