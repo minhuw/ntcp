@@ -2802,6 +2802,29 @@ impl Connection {
         Ok(())
     }
 
+    pub(crate) fn validate_route_mtu(&self, now: Instant, mtu: Option<u32>) -> Result<(), Error> {
+        self.check_time(now)?;
+        let range = if self.tuple.local.is_ipv4() {
+            68..=65535
+        } else {
+            1280..=65575
+        };
+        if self.pmtud.is_none() || mtu.is_some_and(|mtu| !range.contains(&mtu)) {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_route_mtu(&mut self, now: Instant, mtu: Option<u32>) -> Result<(), Error> {
+        self.validate_route_mtu(now, mtu)?;
+        self.update_time(now)?;
+        self.pmtud.as_mut().unwrap().set_route_mtu(mtu);
+        self.config.pmtud.as_mut().unwrap().route_mtu = mtu;
+        self.refresh_path_mss();
+        self.arm_work();
+        Ok(())
+    }
+
     pub(crate) fn validate_first_hop_mtu(&self, now: Instant, mtu: u32) -> Result<(), Error> {
         self.check_time(now)?;
         let range = if self.tuple.local.is_ipv4() {
@@ -29134,6 +29157,10 @@ mod tests {
     }
     mod advertised_mss {
         include!("connection_advertised_mss_tests.rs");
+    }
+
+    mod route_mtu {
+        include!("connection_route_mtu_tests.rs");
     }
 
     mod pmtud_config {

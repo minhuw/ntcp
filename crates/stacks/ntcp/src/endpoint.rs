@@ -2862,6 +2862,27 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Change one connection's administrative MTU ceiling on the same path.
+    /// None removes this ceiling, still respecting interface/peer/allocation
+    /// limits and network-discovered evidence. Does not signal a new path,
+    /// change the endpoint template, or raise effective MTU without an ACK.
+    /// Prepared scalar and grouped output must be resolved by the caller first.
+    pub fn set_route_mtu(
+        &mut self,
+        now: Instant,
+        id: ConnectionId,
+        mtu: Option<u32>,
+    ) -> Result<(), EndpointError> {
+        if self.is_output_reserved(id) {
+            return Err(EndpointError::OutputReserved);
+        }
+        self.slot(id)?.connection.validate_route_mtu(now, mtu)?;
+        self.clock(now)?;
+        self.slot_mut(id)?.connection.set_route_mtu(now, mtu)?;
+        self.refresh(id.slot);
+        Ok(())
+    }
+
     pub fn set_first_hop_mtu(
         &mut self,
         now: Instant,
@@ -4169,7 +4190,10 @@ impl Endpoint {
                         }
                         _ => 40,
                     };
-                    let budget = policy.first_hop_mtu.saturating_sub(ip_len);
+                    let mtu = policy
+                        .first_hop_mtu
+                        .min(policy.route_mtu.unwrap_or(u32::MAX));
+                    let budget = mtu.saturating_sub(ip_len);
                     if budget < 20 {
                         // Stateless replies cannot fragment or drop a required source route.
                         self.control.pop_front();
@@ -5572,6 +5596,64 @@ mod endpoint_mtu_update_tests {
             Err(Error::InvalidArgument.into())
         );
         assert_eq!(disabled.now, 0);
+    }
+
+    #[test]
+    fn default_route_ceiling_bounds_stateless_reply_and_optional_timestamp() {
+        for route in [None, Some(68), Some(80)] {
+            let mut policy = crate::PmtudConfig::new(1500);
+            policy.route_mtu = route;
+            let mut e = Endpoint::new(
+                EndpointConfig {
+                    connection: ConnectionConfig {
+                        pmtud: Some(policy),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                [1; 32],
+                0,
+                |_| true,
+            )
+            .unwrap();
+            e.control.push_back((
+                IpMetadata {
+                    source: "192.0.2.1".parse().unwrap(),
+                    destination: "192.0.2.2".parse().unwrap(),
+                },
+                Header {
+                    source_port: 1,
+                    destination_port: 2,
+                    sequence: 0,
+                    acknowledgment: 0,
+                    flags: RST,
+                    window: 0,
+                    urgent_pointer: 0,
+                },
+                OutgoingIpv4Options {
+                    record_route_slots: Some(9),
+                    ..Default::default()
+                },
+                Some(100),
+            ));
+            let mut bytes = [0; 256];
+            let output = e.poll_transmit(1, &mut bytes, 16).unwrap().packet;
+            if route == Some(68) {
+                assert!(output.is_none());
+            } else {
+                let output = output.unwrap();
+                assert_eq!(output.len, if route.is_some() { 20 } else { 32 });
+                assert!(60 + output.len <= route.unwrap_or(1500) as usize);
+                assert_eq!(
+                    wire::parse(output.ip, &bytes[..output.len])
+                        .unwrap()
+                        .header
+                        .flags,
+                    RST
+                );
+            }
+            assert!(e.control.is_empty());
+        }
     }
 
     #[test]

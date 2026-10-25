@@ -3,6 +3,7 @@ use crate::{Instant, Ipv4Plateaus, PmtudConfig, PmtudPolicy, seq::Seq};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PathMtuInfo {
     pub first_hop_mtu: u32,
+    pub route_mtu: Option<u32>,
     pub current_mtu: u32,
     pub search_low: u32,
     pub search_high: u32,
@@ -48,6 +49,8 @@ pub(crate) struct Pmtud {
     aging: Option<u64>,
     periodic_deadline: Option<Instant>,
     high_limit: Option<u32>,
+    // Negative network evidence survives temporary administrative clipping.
+    discovered_high: Option<u32>,
     low_limit: Option<u32>,
     plateaus: Ipv4Plateaus,
     // PTB hold / failed-probe suppression; Infinity never disables this timer.
@@ -119,6 +122,7 @@ impl Pmtud {
         Self {
             info: PathMtuInfo {
                 first_hop_mtu: config.first_hop_mtu,
+                route_mtu: config.route_mtu,
                 current_mtu: mtu,
                 search_low: low,
                 search_high: high,
@@ -134,6 +138,7 @@ impl Pmtud {
                 .expect("validated PMTUD aging"),
             periodic_deadline: None,
             high_limit: config.initial_search_high,
+            discovered_high: None,
             low_limit: config.initial_search_low,
             plateaus: config.policy.ipv4_plateaus,
             deadline: None,
@@ -153,11 +158,17 @@ impl Pmtud {
 
     pub fn constrain(&mut self, bound: u32) {
         self.bound = bound;
+        let bound = self.route_bound();
         self.initial_low =
             bound.min(
                 self.low_limit
                     .unwrap_or(if self.floor == 68 { 1024 } else { 1280 }),
             );
+        if self.info.current_mtu > bound {
+            // A local limit decrease is not failure of the previously verified
+            // larger size; its loss ratio cannot classify this smaller MTU.
+            self.verification = None;
+        }
         self.info.current_mtu = self.info.current_mtu.min(bound);
         self.info.search_low = self.info.search_low.min(bound);
         self.info.search_high = self.info.search_high.min(self.search_ceiling());
@@ -172,6 +183,29 @@ impl Pmtud {
         // A local link increase is a new search bound, not proof about the path.
         if self.info.search_high < self.search_ceiling() {
             self.schedule_aging(now);
+        }
+    }
+
+    // Same path only: this is permission to probe, never delivery evidence.
+    pub fn set_route_mtu(&mut self, mtu: Option<u32>) {
+        if mtu == self.info.route_mtu {
+            return;
+        }
+        let old_ceiling = self.search_ceiling();
+        self.info.route_mtu = mtu;
+        self.constrain(self.bound);
+        if self.search_ceiling() > old_ceiling {
+            let high = self
+                .search_ceiling()
+                .min(self.discovered_high.unwrap_or(u32::MAX));
+            if high > self.info.search_high {
+                self.info.search_high = high;
+                if self.info.search_low < high {
+                    // New admissible space, not a periodic reset of negative
+                    // evidence. PTB/probe/RTO cooldown stays in `deadline`.
+                    self.periodic_deadline = None;
+                }
+            }
         }
     }
 
@@ -197,6 +231,7 @@ impl Pmtud {
         if self.deadline.is_some_and(|d| d <= now) {
             self.deadline = None;
             if self.reset_search {
+                self.discovered_high = None;
                 self.info.search_high = self.search_ceiling();
             }
             self.reset_search = false;
@@ -206,6 +241,7 @@ impl Pmtud {
         }
         if self.periodic_deadline.is_some_and(|d| d <= now) {
             self.periodic_deadline = None;
+            self.discovered_high = None;
             self.info.search_high = self.search_ceiling();
         }
     }
@@ -680,7 +716,7 @@ impl Pmtud {
     fn apply_ptb(&mut self, mtu: u32, now: Instant) {
         self.icmp_since_progress = true;
         self.info.current_mtu = mtu.min(self.info.current_mtu);
-        self.info.search_high = self.info.search_high.min(mtu);
+        self.record_upper_limit(mtu);
         self.info.search_low = self.info.search_low.min(mtu);
         // Cancel classification, not the outstanding data's repair boundary.
         self.probe = None;
@@ -849,7 +885,7 @@ impl Pmtud {
                     //= reason=Wait for cumulative delivery of the trailing window and exclude every observed nearby retransmission. This bound update is independent of the one-shot congestion outcome.
                     //# In the absence of other indications, set search_high to the probe
                     //# size minus one.
-                    self.info.search_high = self.info.search_high.min(p.size - 1);
+                    self.record_upper_limit(p.size - 1);
                     self.info.search_low = self.info.search_low.min(self.info.search_high);
                     if self.info.current_mtu >= p.size {
                         self.info.current_mtu = self.info.search_low;
@@ -873,8 +909,8 @@ impl Pmtud {
             && sent != 0
         {
             if lost.saturating_mul(10) > sent {
-                self.info.search_high = self.info.search_high.min(self.info.current_mtu - 1);
-                self.info.current_mtu = previous.min(self.bound);
+                self.record_upper_limit(self.info.current_mtu - 1);
+                self.info.current_mtu = previous.min(self.route_bound());
                 self.info.search_low = self.info.search_low.min(self.info.current_mtu);
                 self.probe = None;
                 self.delay(now, cooldown);
@@ -891,8 +927,18 @@ impl Pmtud {
         }
     }
 
+    fn record_upper_limit(&mut self, mtu: u32) {
+        self.discovered_high = Some(self.discovered_high.map_or(mtu, |old| old.min(mtu)));
+        self.info.search_high = self.info.search_high.min(mtu);
+    }
+
+    fn route_bound(&self) -> u32 {
+        self.bound.min(self.info.route_mtu.unwrap_or(self.bound))
+    }
+
     fn search_ceiling(&self) -> u32 {
-        self.bound.min(self.high_limit.unwrap_or(self.bound))
+        self.route_bound()
+            .min(self.high_limit.unwrap_or(self.bound))
     }
 
     fn schedule_aging(&mut self, now: Instant) {
@@ -1309,4 +1355,9 @@ mod tests {
         p.ack(Seq(1711), 600_000_200, 1000, 1000);
         assert_eq!(p.info.current_mtu, 1750);
     }
+}
+
+#[cfg(test)]
+mod route_tests {
+    include!("pmtud_route_tests.rs");
 }

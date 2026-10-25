@@ -83,6 +83,9 @@ impl Default for PmtudPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PmtudConfig {
     pub first_hop_mtu: u32,
+    // Same-path administrative ceiling, independent of interface MTU and
+    // network-discovered limits. None imposes no additional route ceiling.
+    pub route_mtu: Option<u32>,
     pub initial_mtu: Option<u32>,
     pub initial_search_low: Option<u32>,
     pub initial_search_high: Option<u32>,
@@ -93,6 +96,7 @@ impl PmtudConfig {
     pub const fn new(first_hop_mtu: u32) -> Self {
         Self {
             first_hop_mtu,
+            route_mtu: None,
             initial_mtu: None,
             initial_search_low: None,
             initial_search_high: None,
@@ -110,7 +114,11 @@ impl PmtudConfig {
     pub(crate) fn initial_values(self, bound: u32, ipv4: bool) -> Result<(u32, u32, u32), Error> {
         let floor = if ipv4 { 68 } else { 1280 };
         let max = if ipv4 { 65535 } else { 65575 };
+        let bound = bound.min(self.route_mtu.unwrap_or(bound));
         if !(floor..=max).contains(&self.first_hop_mtu)
+            || self
+                .route_mtu
+                .is_some_and(|mtu| !(floor..=max).contains(&mtu))
             || [
                 self.initial_mtu,
                 self.initial_search_low,
