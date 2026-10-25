@@ -3116,4 +3116,7 @@ mod cookie_policy_tests;
 mod linux_option_abi_tests;
 
 #[cfg(all(test, feature = "linux"))]
+mod send_state_abi_tests;
+
+#[cfg(all(test, feature = "linux"))]
 mod syncnt_abi_tests;

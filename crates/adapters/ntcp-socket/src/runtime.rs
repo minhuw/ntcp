@@ -1357,7 +1357,7 @@ impl Owner {
     fn send_state(&mut self, id: u64) -> Result<ConnectionId> {
         let s = self.sockets.get_mut(&id).ok_or(EBADF)?;
         let Handle::Connection(cid) = s.handle else {
-            return Err(ENOTCONN);
+            return Err(EPIPE);
         };
         if s.error != 0 {
             let e = s.error;

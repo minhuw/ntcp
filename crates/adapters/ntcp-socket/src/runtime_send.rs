@@ -287,43 +287,28 @@ impl Owner {
             self.complete_connect(id)?;
             send.wait_handshake = false;
         }
-        let connected = matches!(
-            self.sockets.get(&id).ok_or(EBADF)?.handle,
-            Handle::Connection(_)
-        );
-        let cid = if connected {
-            Some(self.send_state(id)?)
-        } else {
-            None
-        };
+        // Ordinary stream sends validate state before accessing payload or
+        // reserving completions. Fast Open's implicit connect is handled above.
+        let cid = self.send_state(id)?;
         let remaining = send.total - send.accepted;
         if remaining == 0 {
-            self.send_state(id)?;
             return Ok(());
         }
-        let room = if let Some(cid) = cid {
-            self.socket_send_room(id, cid)?
-        } else {
-            BYTES
-        };
+        let room = self.socket_send_room(id, cid)?;
         if room == 0 {
             self.endpoint
-                .record_send_backpressure(cid.unwrap())
+                .record_send_backpressure(cid)
                 .map_err(engine)?;
             return Err(EAGAIN);
         }
         let deferred = blocking || self.batched_send(id);
-        let completion = if cid.is_some() {
-            self.reserve_send_completion(
-                id,
-                true,
-                send.zerocopy && send.zc.is_none(),
-                send.bits,
-                deferred,
-            )?
-        } else {
-            false
-        };
+        let completion = self.reserve_send_completion(
+            id,
+            true,
+            send.zerocopy && send.zc.is_none(),
+            send.bits,
+            deferred,
+        )?;
         let mut observed = Vec::new();
         if deferred && send.bits & crate::timestamping::TX_RECORD != 0 {
             observed.try_reserve_exact(4).map_err(|_| ENOBUFS)?;
@@ -331,7 +316,6 @@ impl Owner {
         let count = remaining.min(BYTES).min(room);
         let bytes = send.copy_chunk(count)?;
         let copied = bytes.len();
-        let cid = cid.ok_or(ENOTCONN)?;
         let flags = if deferred && copied < remaining {
             (send.flags | MSG_MORE) & !MSG_EOR
         } else {

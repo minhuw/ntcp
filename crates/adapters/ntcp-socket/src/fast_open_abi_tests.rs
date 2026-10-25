@@ -321,8 +321,10 @@ mod packets {
                     -1
                 );
                 assert_eq!(errno(), EFAULT);
+                // The failed handshake left no connected stream; ordinary
+                // write reports EPIPE before looking at its payload pointer.
                 assert_eq!(write(alias, ptr::null(), 2), -1);
-                assert_eq!(errno(), EFAULT);
+                assert_eq!(errno(), EPIPE);
                 assert_eq!(
                     sendto(
                         alias,
