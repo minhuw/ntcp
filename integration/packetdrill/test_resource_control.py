@@ -73,11 +73,15 @@ class ResourceCommandChecks(unittest.TestCase):
                         str(source), str(runner.parent / 'run_command.c'), '-ldl', '-o', str(cls.binary)], check=True)
 
     def test_exact_controls_and_all_error_paths_cannot_reach_shell(self):
-        for command in ('ntcp-local-resource-reject-on', 'ntcp-local-resource-reject-off'):
+        for command in ('ntcp-local-resource-reject-on', 'ntcp-local-resource-reject-off',
+                        'ntcp-local-timestamps-on', 'ntcp-local-timestamps-off'):
             subprocess.run([str(self.binary), command, 'normal'], check=True)
         for command, mode in [('true', 'normal'), ('ntcp-local-resource-reject-on; true', 'normal'),
                               ('ntcp-local-resource-reject-on', 'missing'),
-                              ('ntcp-local-resource-reject-on', 'no-so')]:
+                              ('ntcp-local-resource-reject-on', 'no-so'),
+                              ('ntcp-local-timestamps-off; true', 'normal'),
+                              ('ntcp-local-timestamps-off', 'missing'),
+                              ('ntcp-local-timestamps-off', 'no-so')]:
             result = subprocess.run([str(self.binary), command, mode], capture_output=True)
             self.assertEqual(result.returncode, 42, (command, mode, result.stderr))
             self.assertNotIn(b'UNEXPECTED_SHELL', result.stderr)
@@ -103,7 +107,9 @@ int safe_system(const char *command, char **error) {
 int ntcp_packetdrill_control(void *userdata, const char *command) {
     assert(userdata == (void *)123);
     assert(!strcmp(command, "ntcp-local-resource-reject-on") ||
-           !strcmp(command, "ntcp-local-resource-reject-off"));
+           !strcmp(command, "ntcp-local-resource-reject-off") ||
+           !strcmp(command, "ntcp-local-timestamps-on") ||
+           !strcmp(command, "ntcp-local-timestamps-off"));
     controls++; return 0;
 }
 int main(int argc, char **argv) {

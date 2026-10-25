@@ -85,6 +85,12 @@ pub fn capture(capacity: usize) -> Result<(Vec<u8>, i64)> {
     }
 }
 
+// Changes future negotiation only; existing connection state and caches survive.
+pub fn timestamp_default(enabled: bool) -> Result<()> {
+    runtime()?.call(0, Op::TimestampDefault(enabled))?;
+    Ok(())
+}
+
 // Called only by the patched runner's exact, audited command capability.
 pub fn local_resource_rejection(enabled: bool) -> Result<()> {
     runtime()?.call(0, Op::LocalResourceReject(enabled))?;

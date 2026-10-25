@@ -145,3 +145,130 @@ fn fast_open_active_options_retain_owned_tail_after_later_mtu_reduction() {
         assert_eq!(endpoint.transport_info(id).unwrap().notsent_bytes, 0);
     }
 }
+
+#[cfg(feature = "packet-test-controls")]
+#[test]
+fn packet_test_timestamp_default_preserves_established_state_and_cached_mss() {
+    for v6 in [false, true] {
+        let (mut endpoint, _) = sender(true, None);
+        let (local, remote) = addresses(v6, 49200);
+        let (old, _) = endpoint.connect_fast_open(0, local, remote, b"").unwrap();
+        let syn = packet(&mut endpoint, 0);
+        let sent = wire::parse(syn.0, &syn.1).unwrap();
+        assert!(sent.options.timestamps.is_some());
+        let mut reply = cache_reply(&syn, 940, Some(&[0xab, 0xcd, 0x12, 0x34]));
+        let mut bytes = reply.1[..30].to_vec();
+        let mut ts = vec![1, 1, 8, 10];
+        ts.extend_from_slice(&2000u32.to_be_bytes());
+        ts.extend_from_slice(&sent.options.timestamps.unwrap().0.to_be_bytes());
+        bytes.extend_from_slice(&ts);
+        bytes.extend_from_slice(&[1, 1]);
+        bytes[12] = ((bytes.len() / 4) as u8) << 4;
+        repair_cache_checksum(reply.0, &mut bytes);
+        reply.1 = bytes;
+        deliver(&mut endpoint, 1000, &reply);
+        let ack = packet(&mut endpoint, 1000);
+        assert!(wire::parse(ack.0, &ack.1).unwrap().options.timestamps.is_some());
+        endpoint.packet_test_timestamp_default(false);
+        endpoint.write(old, b"old").unwrap();
+        let old_data = packet(&mut endpoint, 1001);
+        assert!(wire::parse(old_data.0, &old_data.1).unwrap().options.timestamps.is_some());
+        let (local2, _) = addresses(v6, 49201);
+        let (_, accepted) = endpoint.connect_fast_open(1002, local2, remote, &[7; 2000]).unwrap();
+        assert_eq!(accepted, 900);
+        let syn = packet(&mut endpoint, 1002);
+        let syn = wire::parse(syn.0, &syn.1).unwrap();
+        assert!(syn.options.timestamps.is_none());
+        assert_eq!(syn.payload.len(), 900);
+        assert_eq!(syn.options.fast_open.unwrap().as_bytes(), &[0xab, 0xcd, 0x12, 0x34]);
+        endpoint.packet_test_timestamp_default(true);
+        let (local3, _) = addresses(v6, 49202);
+        endpoint.connect(1003, local3, remote).unwrap();
+        let syn = packet(&mut endpoint, 1003);
+        assert!(wire::parse(syn.0, &syn.1).unwrap().options.timestamps.is_some());
+    }
+}
+
+#[cfg(feature = "packet-test-controls")]
+#[test]
+fn packet_test_timestamp_default_applies_to_new_passive_connections() {
+    for v6 in [false, true] {
+        let (mut client, _) = sender(true, None);
+        let (mut server, _) = sender(true, None);
+        let (local, remote) = addresses(v6, 49300);
+        let listener = server.listen(remote, 8).unwrap();
+        server.packet_test_timestamp_default(false);
+        client.connect(0, local, remote).unwrap();
+        let syn = packet(&mut client, 0);
+        assert!(wire::parse(syn.0, &syn.1).unwrap().options.timestamps.is_some());
+        deliver(&mut server, 1, &syn);
+        let reply = packet(&mut server, 1);
+        assert!(wire::parse(reply.0, &reply.1).unwrap().options.timestamps.is_none());
+        deliver(&mut client, 2, &reply);
+        deliver(&mut server, 3, &packet(&mut client, 2));
+        let first = server.accept(listener).unwrap();
+        server.packet_test_timestamp_default(true);
+        server.write(first, b"first").unwrap();
+        let data = packet(&mut server, 4);
+        assert!(wire::parse(data.0, &data.1).unwrap().options.timestamps.is_none());
+        let (local2, _) = addresses(v6, 49301);
+        client.connect(5, local2, remote).unwrap();
+        let syn = packet(&mut client, 5);
+        deliver(&mut server, 6, &syn);
+        let reply = packet(&mut server, 6);
+        assert!(wire::parse(reply.0, &reply.1).unwrap().options.timestamps.is_some());
+    }
+}
+
+#[cfg(feature = "packet-test-controls")]
+#[test]
+fn packet_test_timestamp_default_controls_time_wait_reuse_without_changing_old_state() {
+    for v6 in [false, true] {
+        let (mut client, config) = sender(true, None);
+        let mut config = config;
+        config.reuse_time_wait = true;
+        let mut server = Endpoint::new(config, [4; 32], 0, |_| true).unwrap();
+        let (local, remote) = addresses(v6, 49400);
+        let listener = server.listen(remote, 8).unwrap();
+        let client_id = client.connect(0, local, remote).unwrap();
+        let first_syn = packet(&mut client, 0);
+        let first = wire::parse(first_syn.0, &first_syn.1).unwrap();
+        let original_sequence = first.header.sequence;
+        let newer_timestamp = first.options.timestamps.unwrap().0.wrapping_add(1000);
+        deliver(&mut server, 10, &first_syn);
+        deliver(&mut client, 20, &packet(&mut server, 10));
+        deliver(&mut server, 30, &packet(&mut client, 20));
+        let child = server.accept(listener).unwrap();
+        server.shutdown(child).unwrap();
+        deliver(&mut client, 100, &packet(&mut server, 100));
+        deliver(&mut server, 110, &packet(&mut client, 100));
+        client.shutdown(client_id).unwrap();
+        deliver(&mut server, 200, &packet(&mut client, 200));
+        deliver(&mut client, 210, &packet(&mut server, 200));
+        assert_eq!(server.state(child), Ok(State::TimeWait));
+        server.release(child).unwrap();
+        let old_expiry = server.next_deadline();
+        let tuple = Tuple { local: remote, remote: local };
+        let mut options = vec![1, 1, 8, 10];
+        options.extend_from_slice(&newer_timestamp.to_be_bytes());
+        options.extend_from_slice(&0u32.to_be_bytes());
+        let mut syn = vec![0; 64];
+        let n = wire::encode(first_syn.0, wire::Header {
+            source_port: local.port(), destination_port: remote.port(),
+            sequence: original_sequence, acknowledgment: 0,
+            flags: wire::SYN, window: 8192, urgent_pointer: 0,
+        }, &options, &[], &mut syn).unwrap();
+        syn.truncate(n);
+        server.packet_test_timestamp_default(false);
+        assert_eq!(server.input(300, first_syn.0, &syn), Ok(InputDisposition::Dropped));
+        assert_eq!(server.connection_id(tuple), Some(child));
+        assert_eq!(server.next_deadline(), old_expiry);
+        server.packet_test_timestamp_default(true);
+        assert_eq!(server.input(301, first_syn.0, &syn), Ok(InputDisposition::Processed));
+        assert_ne!(server.connection_id(tuple), Some(child));
+        let reply = packet(&mut server, 301);
+        let reply = wire::parse(reply.0, &reply.1).unwrap();
+        assert_eq!(reply.header.flags & (wire::SYN | wire::ACK), wire::SYN | wire::ACK);
+        assert!(reply.options.timestamps.is_some());
+    }
+}

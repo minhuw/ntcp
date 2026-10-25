@@ -86,6 +86,8 @@ pub enum Op {
     Capture(usize),
     #[cfg(feature = "packet-test")]
     LocalResourceReject(bool),
+    #[cfg(feature = "packet-test")]
+    TimestampDefault(bool),
     Close,
     Shutdown(i32),
     Flags(i32, i32),
@@ -777,7 +779,10 @@ impl Owner {
         if self.packet_backend()
             && matches!(
                 op,
-                Op::Inject(_) | Op::Capture(_) | Op::LocalResourceReject(_)
+                Op::Inject(_)
+                    | Op::Capture(_)
+                    | Op::LocalResourceReject(_)
+                    | Op::TimestampDefault(_)
             )
         {
             return true;
@@ -1534,6 +1539,11 @@ impl Owner {
                     unreachable!()
                 };
                 self.packets.as_mut().unwrap().inject(bytes)?;
+                return Ok(out);
+            }
+            Op::TimestampDefault(enabled) => {
+                self.packets.as_ref().ok_or(EOPNOTSUPP)?;
+                self.endpoint.packet_test_timestamp_default(*enabled);
                 return Ok(out);
             }
             Op::LocalResourceReject(enabled) => {
@@ -2469,7 +2479,10 @@ impl Owner {
             Op::Wait(_, _) => unreachable!(),
             Op::New(_) => unreachable!(),
             #[cfg(feature = "packet-test")]
-            Op::Inject(_) | Op::Capture(_) | Op::LocalResourceReject(_) => unreachable!(),
+            Op::Inject(_)
+            | Op::Capture(_)
+            | Op::LocalResourceReject(_)
+            | Op::TimestampDefault(_) => unreachable!(),
         }
         Ok(out)
     }
@@ -2568,6 +2581,19 @@ mod tests {
         let server = b.execute(listen, Op::Accept(SOCK_NONBLOCK)).unwrap().value as u64;
         (a, b, client, server, listen)
     }
+    #[cfg(feature = "packet-test")]
+    #[test]
+    fn timestamp_default_control_rejects_non_packet_backend() {
+        let mut owner = owner(2);
+        assert!(owner.packets.is_none());
+        for enabled in [false, true] {
+            assert_eq!(
+                owner.execute(0, Op::TimestampDefault(enabled)).err(),
+                Some(EOPNOTSUPP)
+            );
+        }
+    }
+
     #[test]
     fn tcp_info_prefix_survives_ambiguous_data_fin_delivery() {
         use ntcp::wire::{self, ACK, FIN, SYN};

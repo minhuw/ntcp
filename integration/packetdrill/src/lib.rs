@@ -24,12 +24,13 @@ unsafe extern "C" fn ntcp_packetdrill_control(
         if ntcp_plugin_active(userdata) == 0 || command.is_null() {
             return Err(EINVAL);
         }
-        let enabled = match unsafe { CStr::from_ptr(command) }.to_bytes() {
-            b"ntcp-local-resource-reject-on" => true,
-            b"ntcp-local-resource-reject-off" => false,
+        match unsafe { CStr::from_ptr(command) }.to_bytes() {
+            b"ntcp-local-resource-reject-on" => packet_test::local_resource_rejection(true)?,
+            b"ntcp-local-resource-reject-off" => packet_test::local_resource_rejection(false)?,
+            b"ntcp-local-timestamps-on" => packet_test::timestamp_default(true)?,
+            b"ntcp-local-timestamps-off" => packet_test::timestamp_default(false)?,
             _ => return Err(EOPNOTSUPP),
         };
-        packet_test::local_resource_rejection(enabled)?;
         Ok(0)
     }) as i32
 }

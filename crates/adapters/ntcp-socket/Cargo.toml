@@ -10,7 +10,7 @@ crate-type = ["rlib", "cdylib"]
 [features]
 default = ["linux"]
 linux = []
-packet-test = []
+packet-test = ["ntcp/packet-test-controls"]
 tfo-linux-cookie = ["ntcp/tfo-linux-cookie"]
 
 [dependencies]

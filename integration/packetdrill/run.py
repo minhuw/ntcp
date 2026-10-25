@@ -262,6 +262,9 @@ for _name in SYN_DATA_ACK_SCRIPTS:
         'prealloc3': 'Reserve three charged connection pools before timed events, as for the existing multi-connection TFO cases.',
         'no-timestamps': 'Exact setup disables timestamps; tcp_min_tso_segs=2 uses the existing common minimum software group size. Packet and PRR expectations remain unchanged.',
     }
+UPSTREAM_OPTION_AUDIT['fastopen/client/syn-data-mss.pkt'] = {
+    'budget224m': 'Five client connections retain receive/send/scoreboard/RACK storage across the timed MSS and timestamp-default changes; use the existing bounded seven-connection budget without changing per-socket accounting.',
+}
 UPSTREAM_OPTION_AUDIT['zerocopy/maxfrags.pkt'] = {
     'budget224m': 'Original SO_SNDBUF=2000000 needs the existing bounded budget for native doubled/clamped capacity and resize staging. Linux page-fragment accounting is not emulated.',
 }
@@ -333,6 +336,12 @@ RESOURCE_SETUP = b'`../../common/defaults.sh`\n'
 RESOURCE_EVENT = b'   +0 `tc qdisc delete dev tun0 root 2>/dev/null ; tc qdisc add dev tun0 root pfifo limit 0`\n'
 RESOURCE_CONTROL = b'   +0 `ntcp-local-resource-reject-on`\n'
 RESOURCE_SOURCE_SHA256 = 'fbbf50f3e1d2facf9835267513fe709665db245d1f2234f98dd448d8be59d564'
+
+TIMESTAMP_SCRIPT = 'fastopen/client/syn-data-mss.pkt'
+TIMESTAMP_SETUP = b'`../../common/defaults.sh`\n'
+TIMESTAMP_EVENT = b' +.07 `sysctl -q net.ipv4.tcp_timestamps=0`\n'
+TIMESTAMP_CONTROL = b' +.07 `ntcp-local-timestamps-off`\n'
+TIMESTAMP_SOURCE_SHA256 = '4f7824b6627baed6f812a60882a31d5a273ac3070359348d3280e12541279fbb'
 
 
 TCP_INFO_FIELDS = {'tcpi_state', 'tcpi_ca_state', 'tcpi_probes', 'tcpi_backoff', 'tcpi_unacked', 'tcpi_sacked',
@@ -413,7 +422,7 @@ def runner_provenance(runner):
     return provenance
 
 
-def preflight(text, embedded_tcp_info=False, resource_control=False):
+def preflight(text, embedded_tcp_info=False, resource_control=False, timestamp_control=False):
     # Conservative safety/capability screening, NOT a second packetdrill parser.
     # Upstream --dry_run remains the authority for script syntax.
     # Inspect raw text conservatively, including comments: do not accidentally
@@ -422,6 +431,8 @@ def preflight(text, embedded_tcp_info=False, resource_control=False):
     shell_text = text
     if resource_control and text.count(RESOURCE_CONTROL.decode()) == 1:
         shell_text = text.replace(RESOURCE_CONTROL.decode(), '', 1)
+    if timestamp_control and text.count(TIMESTAMP_CONTROL.decode()) == 1:
+        shell_text = shell_text.replace(TIMESTAMP_CONTROL.decode(), '', 1)
     if '`' in shell_text:
         reasons.append('shell setup/assertions target Linux, not the ntcp backend')
     if '%{' in text or '}%' in text:
@@ -470,6 +481,28 @@ def adapt_source(directory, relative, manifest, so_flags):
         data = (directory / extra['path']).read_bytes()
         if hashlib.sha256(data).hexdigest() != extra['sha256']:
             raise ValueError(f"setup {extra['path']} hash differs from audited adaptation")
+    if relative == TIMESTAMP_SCRIPT and not entry.get('blocked_reasons'):
+        expected_commands = [TIMESTAMP_SETUP.rstrip(b'\n'),
+                             TIMESTAMP_EVENT[TIMESTAMP_EVENT.index(b'`'):].rstrip(b'\n')]
+        expected_audit = [(c.decode(), hashlib.sha256(c).hexdigest()) for c in expected_commands]
+        if (hashlib.sha256(source).hexdigest() != TIMESTAMP_SOURCE_SHA256
+                or entry['command_line'].encode() != TIMESTAMP_SETUP
+                or entry['replacement_line'].encode() != b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n'
+                or entry.get('command_sha256') != hashlib.sha256(TIMESTAMP_SETUP).hexdigest()
+                or entry.get('expected_command_count') != 2
+                or re.findall(rb'`[^`]*`', source) != expected_commands
+                or [(c['command'], c['sha256']) for c in entry.get('audited_shell_commands', [])] != expected_audit
+                or entry.get('timestamp_control') is not True
+                or entry.get('timestamp_event_sha256') != hashlib.sha256(TIMESTAMP_EVENT).hexdigest()
+                or entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
+                or not metadata['timestamps']
+                or source.count(TIMESTAMP_EVENT) != 1):
+            raise ValueError('expected exact audited timestamp setup and timed command')
+        generated = source.replace(TIMESTAMP_SETUP, entry['replacement_line'].encode(), 1).replace(TIMESTAMP_EVENT, TIMESTAMP_CONTROL, 1)
+        reasons = preflight(generated.decode(), timestamp_control=True)
+        if reasons:
+            raise ValueError('; '.join(reasons))
+        return generated, {**entry, 'generated_sha256': hashlib.sha256(generated).hexdigest()}
     if relative == RESOURCE_SCRIPT and not entry.get('blocked_reasons'):
         expected_commands = [RESOURCE_SETUP.rstrip(b'\n'),
                              RESOURCE_EVENT[RESOURCE_EVENT.index(b'`'):].rstrip(b'\n')]
@@ -960,7 +993,9 @@ def main():
                     row['stage'] = 'preflight'
                     embedded_tcp_info = (row['adapted'] and
                                          row['adaptation'].get('embedded_tcp_info') is True)
-                    reasons = preflight(text, embedded_tcp_info, resource_control=(row['adapted'] and row['adaptation'].get('resource_control') is True))
+                    reasons = preflight(text, embedded_tcp_info,
+                                        resource_control=(row['adapted'] and row['adaptation'].get('resource_control') is True),
+                                        timestamp_control=(row['adapted'] and row['adaptation'].get('timestamp_control') is True))
                     if variant not in ('native-ipv4', 'ipv4'):
                         reasons.append('the adapter implements IPv4 only')
                     if reasons:

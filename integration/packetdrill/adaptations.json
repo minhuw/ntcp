@@ -8876,25 +8876,22 @@
       "command_line": "`../../common/defaults.sh`\n",
       "command_sha256": "6c75c757b0ac9311ba3458f38b676a7841890410981ecdacfcb03ef7315546bf",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream,local=192.168.0.1",
+      "adapter_flags": "upstream,local=192.168.0.1,budget224m",
       "embedded_tcp_info": false,
       "inventory_audit": {
         "source_family": "fastopen",
-        "blocked_capabilities": [
-          "dynamic",
-          "mss"
-        ]
+        "blocked_capabilities": []
       },
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh`",
           "sha256": "db987cbec339a8140034dc0a76556fcd8346c3b83c75c17b92ce643980e7c17b",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully. The socket adapter does not implement TCP_MAXSEG get/set. This original socket-option requirement is a missing API, not a packet timing failure."
+          "semantic_mapping": "Common upstream configuration with timestamps initially enabled; no Linux defaults shell is executed."
         },
         {
           "command": "`sysctl -q net.ipv4.tcp_timestamps=0`",
           "sha256": "5abe6d35f1a9d0ea560265ed88cb79f8d2be5ca08c3277bf301055c2bbc8eb06",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully. The socket adapter does not implement TCP_MAXSEG get/set. This original socket-option requirement is a missing API, not a packet timing failure."
+          "semantic_mapping": "At the original +.07 event, the exact local test control disables timestamp negotiation for subsequent connections while retaining existing connections and TFO cache."
         }
       ],
       "mapping": {
@@ -8910,7 +8907,9 @@
           "capture_clock": "realtime epoch microseconds at backend submission",
           "hardware_tso": false,
           "gro": false,
-          "options": [],
+          "options": [
+            "budget224m"
+          ],
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
@@ -8925,7 +8924,7 @@
           "mss": 1460,
           "receive_capacity": 8388608,
           "window_scale": 8,
-          "endpoint_max_buffer_bytes": 33554432,
+          "endpoint_max_buffer_bytes": 234881024,
           "congestion_control": "Cubic",
           "cubic_hystart": true,
           "cubic_fast_convergence": true,
@@ -8946,18 +8945,18 @@
         },
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
-        "claim": "Capability audit only; source is retained and not executed.",
+        "claim": "Exact timed process-local timestamp-default mapping; every packet, syscall, assertion and event time is preserved.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully.",
-          "The socket adapter does not implement TCP_MAXSEG get/set. This original socket-option requirement is a missing API, not a packet timing failure."
+          "The timed tcp_timestamps=0 command changes only future connection negotiation in this test endpoint. Existing negotiated timestamp state and TFO cookie/raw-MSS cache remain intact. No host shell or sysctl command is executed.",
+          "Five client connections retain receive/send/scoreboard/RACK storage across the timed MSS and timestamp-default changes; use the existing bounded seven-connection budget without changing per-socket accounting."
         ],
-        "option_reasons": {}
+        "option_reasons": {
+          "budget224m": "Five client connections retain receive/send/scoreboard/RACK storage across the timed MSS and timestamp-default changes; use the existing bounded seven-connection budget without changing per-socket accounting."
+        }
       },
-      "blocked_reasons": [
-        "The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully.",
-        "The socket adapter does not implement TCP_MAXSEG get/set. This original socket-option requirement is a missing API, not a packet timing failure."
-      ]
+      "timestamp_control": true,
+      "timestamp_event_sha256": "09049dda5e717f74aade790df31d7163d00b46bd12cf724931461172815262d9"
     },
     "fastopen/client/syn-data-only-syn-acked.pkt": {
       "source_sha256": "8ad2d87d8cfd343439654ae2b5030f53c2c9695941ef9e275eba08f4ad43536f",

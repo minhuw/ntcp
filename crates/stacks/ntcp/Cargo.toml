@@ -11,6 +11,7 @@ categories = ["network-programming"]
 include = ["/src/**", "/examples/**", "/tests/**", "/Cargo.toml", "/README.md", "/LICENSE"]
 
 [features]
+packet-test-controls = []
 tfo-linux-cookie = ["dep:siphasher", "dep:subtle"]
 
 [dependencies]

@@ -1798,3 +1798,67 @@ fn icmp_network_errors_cross_shared_abi_without_soft_stream_failure() {
     assert_eq!(info.len(), 280);
     assert_eq!(info[0], 7); // TCP closed; application descriptor still valid.
 }
+
+#[test]
+fn timestamp_control_abi_changes_only_future_connection_defaults() {
+    if isolated("tests::timestamp_control_abi_changes_only_future_connection_defaults") {
+        return;
+    }
+    unsafe {
+        assert_eq!(
+            ntcp_packetdrill_control(USERDATA, c"ntcp-local-timestamps-off".as_ptr()),
+            -1
+        );
+        assert_eq!(errno(), EINVAL);
+    }
+    let adapter = Adapter::start((local(), upstream_tests("budget224m"))).unwrap();
+    unsafe {
+        assert_eq!(ntcp_packetdrill_control(USERDATA, ptr::null()), -1);
+        assert_eq!(errno(), EINVAL);
+        for command in [
+            c"ntcp-local-timestamps-maybe",
+            c"ntcp-local-timestamps-off; true",
+        ] {
+            assert_eq!(ntcp_packetdrill_control(USERDATA, command.as_ptr()), -1);
+            assert_eq!(errno(), EOPNOTSUPP);
+        }
+    }
+    for (index, enabled) in [true, false, true].into_iter().enumerate() {
+        if index != 0 {
+            let command = if enabled {
+                c"ntcp-local-timestamps-on"
+            } else {
+                c"ntcp-local-timestamps-off"
+            };
+            assert_eq!(
+                unsafe { ntcp_packetdrill_control(USERDATA, command.as_ptr()) },
+                0
+            );
+        }
+        let fd = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+            .unwrap()
+            .value as i32;
+        assert_eq!(
+            call(
+                &adapter,
+                5,
+                fd,
+                0,
+                encode_addr("192.0.2.2:8080".parse().unwrap()),
+                0
+            )
+            .err(),
+            Some(EINPROGRESS)
+        );
+        let syn = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+        let (ip, tcp) = parse_frame(&syn).unwrap();
+        assert_eq!(
+            ntcp::wire::parse(ip, tcp)
+                .unwrap()
+                .options
+                .timestamps
+                .is_some(),
+            enabled
+        );
+    }
+}

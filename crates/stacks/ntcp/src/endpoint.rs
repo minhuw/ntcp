@@ -364,6 +364,8 @@ impl Listener {
 // Ambiguous overlapping ingress domains need separate endpoints, not implicit
 // context guessing from addresses.
 pub struct Endpoint {
+    #[cfg(feature = "packet-test-controls")]
+    test_timestamp_default: Option<bool>,
     fast_open_cookie_policy: FastOpenCookiePolicy,
     fast_open: Option<crate::fast_open::FastOpen>,
     reservations: Vec<crate::output_reservation::OutputReservation>,
@@ -472,6 +474,8 @@ impl Endpoint {
             .try_reserve_exact(count)
             .map_err(|_| Error::NoMemory)?;
         Ok(Self {
+            #[cfg(feature = "packet-test-controls")]
+            test_timestamp_default: None,
             fast_open: None,
             fast_open_cookie_policy: FastOpenCookiePolicy::default(),
             reservations: Vec::new(),
@@ -515,12 +519,36 @@ impl Endpoint {
             })
     }
 
+    // Test-only per-network-context configuration control.
+    // Existing connections own their configuration and are never changed here.
+    #[cfg(feature = "packet-test-controls")]
+    pub fn packet_test_timestamp_default(&mut self, enabled: bool) {
+        self.test_timestamp_default = Some(enabled);
+    }
+
+    fn new_connection_timestamps(&self) -> bool {
+        #[cfg(feature = "packet-test-controls")]
+        if let Some(enabled) = self.test_timestamp_default {
+            return enabled;
+        }
+        self.config.connection.timestamps
+    }
+
+    fn timestamp_clock_required(&self) -> bool {
+        #[cfg(feature = "packet-test-controls")]
+        if self.test_timestamp_default.is_some() {
+            // Never weaken ambiguity checks for any previously created connection.
+            return true;
+        }
+        self.config.connection.timestamps
+    }
+
     fn check_clock(&self, now: Instant) -> Result<(), EndpointError> {
         if now < self.now {
             return Err(Error::TimeWentBackwards.into());
         }
         let granularity = self.config.connection.timestamp_granularity;
-        if self.config.connection.timestamps
+        if self.timestamp_clock_required()
             && granularity.tick_in(now, self.config.connection.timebase)
                 - granularity.tick_in(self.now, self.config.connection.timebase)
                 >= 1 << 31
@@ -940,6 +968,7 @@ impl Endpoint {
         rx_timestamps.resize(rx_ranges, available - charge)?;
         let mut receive = pool_index.map(|index| self.receive_pool.swap_remove(index));
         let mut connection_config = self.config.connection.clone();
+        connection_config.timestamps = self.new_connection_timestamps();
         connection_config.send_capacity = capacities.0;
         connection_config.receive_capacity = capacities.1;
         connection_config.user_mss = options.user_mss;
@@ -2250,7 +2279,7 @@ impl Endpoint {
             || !self.slots[index].as_ref().unwrap().connection.reuse_syn(
                 self.now,
                 syn,
-                self.config.connection.timestamps,
+                self.new_connection_timestamps(),
             )
         {
             return Ok(InputDisposition::Dropped);
@@ -5579,4 +5608,27 @@ mod output_reservation_tests {
 #[cfg(test)]
 mod reset_defense_tests {
     include!("endpoint_reset_defense_tests.rs");
+}
+
+#[cfg(all(test, feature = "packet-test-controls"))]
+mod timestamp_default_control_tests {
+    use super::*;
+
+    #[test]
+    fn changing_future_default_never_weakens_timestamp_clock_guard() {
+        for originally_enabled in [false, true] {
+            for future_enabled in [false, true] {
+                let mut config = EndpointConfig::default();
+                config.connection.timestamps = originally_enabled;
+                let mut endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
+                endpoint.packet_test_timestamp_default(future_enabled);
+                assert_eq!(endpoint.new_connection_timestamps(), future_enabled);
+                assert!(endpoint.check_clock(1000).is_ok());
+                assert_eq!(
+                    endpoint.check_clock((1u64 << 31) * 1000),
+                    Err(Error::AmbiguousTimeJump.into())
+                );
+            }
+        }
+    }
 }
