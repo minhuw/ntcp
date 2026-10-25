@@ -271,6 +271,7 @@ UPSTREAM_OPTION_AUDIT['zerocopy/maxfrags.pkt'] = {
 
 
 for _name in ('fastopen/server/opt34/basic-rw.pkt',
+              'fastopen/server/opt34/basic-zero-payload.pkt',
               'fastopen/server/client-ack-dropped-then-recovery-ms-timestamps.pkt'):
     UPSTREAM_OPTION_AUDIT[_name]['early-response'] = 'Original authenticated TFO trace writes response data before final handshake ACK. Enable existing core early response under the configured IW policy; validation, quotas and all window limits still apply.'
 

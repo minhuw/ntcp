@@ -10075,7 +10075,7 @@
       "command_line": "`../../../common/defaults.sh`\n",
       "command_sha256": "43540040bb5213e3f94b916314167629484f7326159c993604ef18c48bc434eb",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n",
-      "adapter_flags": "upstream,local=192.168.0.1,linux-cookie,tfo-listen",
+      "adapter_flags": "upstream,local=192.168.0.1,early-response,linux-cookie,tfo-listen",
       "embedded_tcp_info": true,
       "inventory_audit": {
         "source_family": "fastopen",
@@ -10102,13 +10102,14 @@
           "hardware_tso": false,
           "gro": false,
           "options": [
+            "early-response",
             "linux-cookie",
             "tfo-listen"
           ],
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
-          "fast_open_early_response": false,
+          "fast_open_early_response": true,
           "rack": true,
           "prr": "Rfc9937",
           "tlp": true,
@@ -10153,11 +10154,13 @@
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
           "Original defaults key and kind34 cookie require the existing feature-gated Linux SipHash policy.",
-          "defaults.sh tcp_fastopen=0x70403 enables listeners without TCP_FASTOPEN; enable the existing bounded TFO listener machinery for newly created sockets."
+          "defaults.sh tcp_fastopen=0x70403 enables listeners without TCP_FASTOPEN; enable the existing bounded TFO listener machinery for newly created sockets.",
+          "Original authenticated TFO trace writes response data before final handshake ACK. Enable existing core early response under the configured IW policy; validation, quotas and all window limits still apply."
         ],
         "option_reasons": {
           "linux-cookie": "Original defaults key and kind34 cookie require the existing feature-gated Linux SipHash policy.",
-          "tfo-listen": "defaults.sh tcp_fastopen=0x70403 enables listeners without TCP_FASTOPEN; enable the existing bounded TFO listener machinery for newly created sockets."
+          "tfo-listen": "defaults.sh tcp_fastopen=0x70403 enables listeners without TCP_FASTOPEN; enable the existing bounded TFO listener machinery for newly created sockets.",
+          "early-response": "Original authenticated TFO trace writes response data before final handshake ACK. Enable existing core early response under the configured IW policy; validation, quotas and all window limits still apply."
         }
       }
     },

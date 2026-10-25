@@ -1040,7 +1040,8 @@ impl Endpoint {
                 )
             });
             accept_syn_data = valid && pending.saturating_add(reset_debt) < limit;
-            early = accept_syn_data && !syn.payload.is_empty();
+            // Pending quota also covers authenticated, data-less early children.
+            early = accept_syn_data;
             // RFC 7413 §4.2.2 permits omission; Linux does not refresh valid cookies.
             // This decision is independent of payload admission and pending quota.
             if syn.options.fast_open.is_some() && (!valid || policy.refresh_valid_cookie()) {

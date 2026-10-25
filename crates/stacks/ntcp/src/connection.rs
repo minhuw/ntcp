@@ -1139,7 +1139,9 @@ impl Connection {
         connection.rx_timestamps = rx_timestamps;
         connection.input_timestamps = timestamps;
         connection.passive_open = true;
-        connection.fast_open_early = authenticated_syn && !syn.payload.is_empty();
+        // Authentication authorizes an early child even for a server-first
+        // exchange. Payload presence separately controls readable data.
+        connection.fast_open_early = authenticated_syn;
         connection.learn_syn(syn, authenticated_syn);
         connection.input_timestamps = RxPacketTimestamps::default();
         connection.state = State::SynReceived;

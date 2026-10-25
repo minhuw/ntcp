@@ -1872,3 +1872,32 @@ fn upstream_implicit_fast_open_listener_and_explicit_disable() {
         }
     }
 }
+
+#[test]
+fn fast_open_authenticated_empty_syn_accepts_without_false_readability() {
+    let (mut a, mut b, listener) = tfo_setup(true);
+    let client = new(&mut a, SOCK_NONBLOCK);
+    assert_eq!(a.execute(client, tfo_send(&[], MSG_FASTOPEN)).unwrap_err(), EINPROGRESS);
+    let syn = tfo_capture(&mut a);
+    assert!(segment(&syn).payload.is_empty());
+    assert!(!segment(&syn).options.fast_open.unwrap().as_bytes().is_empty());
+    tfo_deliver(&mut b, syn);
+    let server = b.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap().value as u64;
+    assert_eq!(b.endpoint.state(cid(&b, server)).unwrap(), State::SynReceived);
+    let ready = b.execute(server, Op::Ready).unwrap().value;
+    assert_eq!(ready & EPOLLIN, 0);
+    assert_ne!(ready & EPOLLOUT, 0);
+    assert_eq!(b.execute(server, Op::Read(32)).unwrap_err(), EAGAIN);
+    let synack = tfo_capture(&mut b);
+    assert_eq!(b.execute(server, Op::Write(vec![9; 100])).unwrap().value, 100);
+    tfo_no_output(&mut b); // The ordinary Pipeline policy holds early responses.
+    tfo_deliver(&mut a, synack);
+    tfo_deliver(&mut b, tfo_capture(&mut a));
+    exchange(&mut a, &mut b);
+    assert_eq!(a.execute(client, Op::Read(100)).unwrap().bytes, [9; 100]);
+    a.execute(client, Op::Write(b"request".to_vec())).unwrap();
+    exchange(&mut a, &mut b);
+    assert_ne!(b.execute(server, Op::Ready).unwrap().value & EPOLLIN, 0);
+    assert_eq!(b.execute(server, Op::Read(32)).unwrap().bytes, b"request");
+    assert!(!b.endpoint.transport_info(cid(&b, server)).unwrap().syn_data_fully_acked);
+}

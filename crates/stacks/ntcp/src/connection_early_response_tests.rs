@@ -135,7 +135,7 @@ fn early_response_actual_gate_and_committed_synack() {
                         assert_eq!(synack.header.flags & (SYN | ACK), SYN | ACK);
                         assert!(synack.payload.is_empty());
                     }
-                    let allowed = enabled && auth && !request.is_empty();
+                    let allowed = enabled && auth;
                     assert_eq!(a.early_response_eligible(), allowed);
                     let anchor = a.rto_deadline;
                     assert_eq!(anchor, Some(1_020_000));
@@ -672,6 +672,11 @@ fn early_response_public_auth_fallbacks_and_reset_debt_do_not_transmit() {
             // Invalid authentication with structurally valid cookie.
             let position = options.windows(2).position(|b| b == [34, 10]).unwrap();
             options[position + 2] ^= 1;
+        }
+        if mode == 1 {
+            // A data-less ordinary SYN has no authenticated early capability.
+            let position = options.windows(2).position(|b| b == [34, 10]).unwrap();
+            options[position..position + 10].fill(1);
         }
         if mode == 2 {
             b.set_listener_fast_open(listener, 0).unwrap();

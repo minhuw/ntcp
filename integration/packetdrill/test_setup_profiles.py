@@ -7,6 +7,26 @@ from run import HERE, PIN, SLOW_START_ACK_SCRIPTS, adapt_source, profile_metadat
 
 
 class SetupProfiles(unittest.TestCase):
+    def test_empty_tfo_syn_server_first_uses_existing_explicit_policy(self):
+        from run import upstream_flags
+        name = 'fastopen/server/opt34/basic-zero-payload.pkt'
+        directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
+        if not directory.is_dir():
+            self.skipTest('pinned checkout unavailable')
+        manifest = json.loads((HERE / 'adaptations.json').read_text())
+        entry = manifest['scripts'][name]
+        source = (directory / name).read_bytes()
+        generated, audit = adapt_source(directory, name, manifest, entry['adapter_flags'])
+        self.assertEqual(generated, source.replace(entry['command_line'].encode(), entry['replacement_line'].encode(), 1))
+        self.assertEqual(entry['adapter_flags'], upstream_flags(name))
+        self.assertIn('early-response', entry['adapter_flags'].split(','))
+        self.assertTrue(audit['mapping']['ntcp_settings']['fast_open_early_response'])
+        self.assertFalse(profile_metadata('upstream,local=192.168.0.1')['fast_open_early_response'])
+        changed = copy.deepcopy(manifest)
+        changed['scripts'][name]['adapter_flags'] = entry['adapter_flags'].replace(',early-response', '')
+        with self.assertRaises(ValueError):
+            adapt_source(directory, name, changed, changed['scripts'][name]['adapter_flags'])
+
     def test_removed_legacy_prr_has_no_usable_metadata(self):
         metadata = profile_metadata('upstream,local=192.0.2.1,legacy-prr')
         self.assertIsNone(metadata['software_gso'])

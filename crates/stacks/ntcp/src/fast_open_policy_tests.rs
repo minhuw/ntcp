@@ -199,10 +199,11 @@ fn response_cookie_does_not_change_authentication_or_quota() {
                         send_syn(&mut endpoint, local, remote, incoming, payload);
                         let (child, cookie, ack) = response(&mut endpoint);
                         let valid = incoming == Some(issued);
-                        let early = valid && !full && !payload.is_empty();
+                        let early = valid && !full;
+                        let syn_data = early && !payload.is_empty();
                         assert_eq!(
                             endpoint.transport_info(child).unwrap().syn_data_acked,
-                            early
+                            syn_data
                         );
                         let expected = if incoming.is_some() && (!valid || refresh_valid) {
                             Some(issued)
@@ -210,16 +211,23 @@ fn response_cookie_does_not_change_authentication_or_quota() {
                             None
                         };
                         assert_eq!(cookie, expected);
-                        assert_eq!(ack, if early { 106 } else { 101 });
+                        assert_eq!(ack, if syn_data { 106 } else { 101 });
                         assert_eq!(
                             endpoint.readable_bytes(child).unwrap(),
-                            if early { 5 } else { 0 }
+                            if syn_data { 5 } else { 0 }
                         );
                         if early {
                             assert_eq!(endpoint.accept(listener).unwrap(), child);
                             let mut data = [0; 5];
-                            assert_eq!(endpoint.read(child, &mut data).unwrap(), 5);
-                            assert_eq!(&data, b"early");
+                            if syn_data {
+                                assert_eq!(endpoint.read(child, &mut data).unwrap(), 5);
+                                assert_eq!(&data, b"early");
+                            } else {
+                                assert_eq!(
+                                    endpoint.read(child, &mut data),
+                                    Err(Error::WouldBlock.into())
+                                );
+                            }
                         } else {
                             assert!(endpoint.accept(listener).is_err());
                         }
