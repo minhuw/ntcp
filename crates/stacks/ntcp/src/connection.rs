@@ -130,6 +130,9 @@ pub struct ConnectionConfig {
     pub mss: u16,
     // Application maximum segment size; independent of path MTU and storage ceiling.
     pub user_mss: Option<u16>,
+    // Receive-only MSS offer cap. Does not constrain outgoing data/probes or
+    // reduce actual receive/storage capacity. None retains the normal offer.
+    pub advertised_mss: Option<u16>,
     pub pmtud: Option<crate::PmtudConfig>,
     // Maximum TCP segment bytes after IP headers/extensions are subtracted from
     // the reassembly bound; use the smallest bound if it varies.
@@ -272,6 +275,7 @@ impl ConnectionConfig {
             || self.receive_ip_payload_limit < 21
             || self.send_ip_payload_limit < self.minimum_send_budget()
             || self.user_mss == Some(0)
+            || self.advertised_mss == Some(0)
             || self.mss == 0
             || self.mss > if ipv4 { 65495 } else { 65515 }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.3
@@ -295,6 +299,13 @@ impl ConnectionConfig {
             return Err(Error::InvalidArgument);
         }
         Ok(())
+    }
+
+    fn receive_mss_offer(&self) -> u16 {
+        self.mss
+            .min(self.user_mss.unwrap_or(u16::MAX))
+            .min(self.advertised_mss.unwrap_or(u16::MAX))
+            .min(self.receive_ip_payload_limit - 20)
     }
 
     fn initial_path_bound(&self, mtu: u32, ipv4: bool) -> u32 {
@@ -337,6 +348,7 @@ impl Default for ConnectionConfig {
             receive_capacity: 65536,
             mss: 1460,
             user_mss: None,
+            advertised_mss: None,
             pmtud: None,
             receive_ip_payload_limit: u16::MAX,
             send_ip_payload_limit: u16::MAX,
@@ -911,10 +923,7 @@ impl Connection {
         Ok(Self {
             tuple,
             peer_mss: config.mss,
-            receive_mss_offer: config
-                .mss
-                .min(config.user_mss.unwrap_or(u16::MAX))
-                .min(config.receive_ip_payload_limit - 20),
+            receive_mss_offer: config.receive_mss_offer(),
             send_mss_limit: config.mss,
             ip_header_len,
             pmtud,
@@ -2996,11 +3005,7 @@ impl Connection {
         // An application can limit future sends after establishment, but cannot
         // retroactively change the receive capability advertised in its SYN.
         if !self.syn_committed {
-            self.receive_mss_offer = self
-                .config
-                .mss
-                .min(mss.unwrap_or(u16::MAX))
-                .min(self.config.receive_ip_payload_limit - 20);
+            self.receive_mss_offer = self.config.receive_mss_offer();
         }
         if self.pmtud.is_some() {
             self.refresh_path_mss();
@@ -29127,6 +29132,10 @@ mod tests {
     mod pmtud_lifecycle {
         include!("pmtud_lifecycle_tests.rs");
     }
+    mod advertised_mss {
+        include!("connection_advertised_mss_tests.rs");
+    }
+
     mod pmtud_config {
         include!("pmtud_config_tests.rs");
     }

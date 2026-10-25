@@ -100,6 +100,7 @@ pub struct EndpointConfig {
 impl EndpointConfig {
     pub fn validate(&self) -> Result<(), EndpointError> {
         if !(1..=1_024).contains(&self.max_setup_cache_entries)
+            || self.connection.advertised_mss == Some(0)
             || self.connection.pmtud.is_some_and(|p| p.first_hop_mtu < 68)
             || !self.connection.valid_timestamp_timebase()
             || !self.connection.valid_pacing()

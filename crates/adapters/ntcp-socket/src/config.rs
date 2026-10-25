@@ -214,6 +214,7 @@ impl SocketConfig {
                     }
                     config.io.next_hop_mac = Some(mac);
                 }
+                "tcp.advertised_mss" => config.tcp.connection.advertised_mss = Some(number(value)?),
                 "tcp.pacing" => {
                     pacing_enabled = match value {
                         "true" => true,

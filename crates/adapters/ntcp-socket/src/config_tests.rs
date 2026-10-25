@@ -637,3 +637,29 @@ fn client_tfo_permission_configuration_is_strict_and_defaults_to_allowed() {
         );
     }
 }
+
+#[test]
+fn advertised_receive_mss_config_is_independent_of_send_and_receive_capacity() {
+    let baseline = SocketConfig::parse(BASE).unwrap();
+    assert_eq!(baseline.tcp.connection.advertised_mss, None);
+    for value in [1, 600, 1460, u16::MAX] {
+        let mut changed =
+            SocketConfig::parse(&format!("{BASE}tcp.advertised_mss={value}\n")).unwrap();
+        assert_eq!(changed.tcp.connection.advertised_mss, Some(value));
+        changed.tcp.connection.advertised_mss = None;
+        assert_eq!(format!("{changed:?}"), format!("{baseline:?}"));
+    }
+    for value in [
+        "0",
+        "65536",
+        "-1",
+        "+600",
+        "none",
+        "600\ntcp.advertised_mss=700",
+    ] {
+        assert!(SocketConfig::parse(&format!("{BASE}tcp.advertised_mss={value}\n")).is_err());
+    }
+    let mut invalid = baseline;
+    invalid.tcp.connection.advertised_mss = Some(0);
+    assert!(invalid.validate().is_err());
+}
