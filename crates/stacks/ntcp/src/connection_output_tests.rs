@@ -283,7 +283,7 @@ fn selected_recovery_output_policy_matrix() {
 //# NOT send data if inflight (see below) matches or exceeds cwnd.
 fn probe_and_shrink_output_policy_matrix() {
     for iss in [100, u32::MAX - 1999] {
-        let (mut a, _) = tlp_pair(iss);
+        let (mut a, _) = tlp_baseline_pair(iss);
         let base = a.snd_una;
         a.write(&[1; 6000]).unwrap();
         assert_eq!(
@@ -304,7 +304,7 @@ fn probe_and_shrink_output_policy_matrix() {
         assert!(!a.tlp_pending);
         assert_eq!(a.loss_timer.unwrap().0, LossTimer::Rto);
         assert_eq!(outputs(&mut a, pto + 1, base), vec![]);
-        let (mut a, _) = tlp_pair(iss);
+        let (mut a, _) = tlp_baseline_pair(iss);
         let base = a.snd_una;
         let next = a.receive.next();
         a.write(&[1; 6000]).unwrap();
@@ -786,7 +786,7 @@ fn pacing_selection_gates_protocol_probes_and_widened_rate() {
     assert!(!a.retx_pending);
 
     for probe in [false, true] {
-        let (mut a, _) = tlp_pair(0);
+        let (mut a, _) = tlp_baseline_pair(0);
         a.config.prr_algorithm = PrrAlgorithm::Rfc9937;
         a.config.prr_pacing = true;
         a.write(&[0x55; 2000]).unwrap();
@@ -2235,7 +2235,7 @@ fn eor_cork_flush_does_not_bypass_cwnd_or_prr_credit_and_tlp_respects_boundary()
     assert!(ranges.iter().map(|&(_, n)| n).sum::<usize>() <= credit as usize);
     assert_eq!(a.transmit(200_000, &mut [0; 1500]), Ok(None));
 
-    let (mut a, _) = tlp_pair(u32::MAX - 999);
+    let (mut a, _) = tlp_baseline_pair(u32::MAX - 999);
     a.write(&[1; 1000]).unwrap();
     packet(&mut a, 100_000);
     a.set_cork(true);

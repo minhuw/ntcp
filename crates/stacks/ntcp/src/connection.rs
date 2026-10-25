@@ -194,6 +194,11 @@ pub struct ConnectionConfig {
     // Opt-in RFC 8985 tail loss probes; requires rack and sack configuration
     // and negotiated SACK. At most one probe per outstanding flight.
     pub tlp: bool,
+    // Extra scheduling/granularity allowance for sampled multi-packet PTOs.
+    // Default 2ms reduces spurious probes on very low-RTT paths; 0 selects
+    // the RFC8985 section7.2 baseline. Always capped by the existing RTO.
+    // Single-packet peer ACK budgets and the no-SRTT fallback are independent.
+    pub tlp_timer_margin_us: u64,
     // Peer delayed-ACK budget, independent of our receive ACK policy. Default
     // covers RFC 9293's <500ms bound; tune only with knowledge of the peer.
     pub peer_max_ack_delay_us: u64,
@@ -352,6 +357,7 @@ impl Default for ConnectionConfig {
             prr_pacing: true,
             pacing: None,
             tlp: false,
+            tlp_timer_margin_us: 2_000,
             peer_max_ack_delay_us: 499_999,
             rto_min_us: 1_000_000,
             retransmit_beyond_window: false,
@@ -1623,11 +1629,11 @@ impl Connection {
     //# PTO by TLP.max_ack_delay to accommodate a potentially delayed
     //# acknowledgment and reduce the risk of spurious retransmissions.
     //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
-    //= reason=One second without SRTT; otherwise 2*SRTT plus peer ACK budget for one packet. Short-packet flights also wait at least SRTT+peer budget for stretched ACKs, capped by unarmed RTO reference.
+    //= reason=One second without SRTT; sampled single-packet flight adds the peer ACK budget, multi-packet flight adds the configurable scheduling margin (default2ms). This is a documented conservative SHOULD departure to reduce low-RTT spurious probes; bounded by the original RTO. pto_margin_ack_loss_and_rto_cap_wire tests default/zero/nonzero margins and real wire feedback.
     //# Summarizing these considerations in pseudocode form, a sender SHOULD
     //# use the following logic to select the duration of a PTO:
     //= https://www.rfc-editor.org/rfc/rfc8985#section-7.2
-    //= reason=Implements one-second fallback, single-packet peer-delay inflation and RTO-reference cap. Larger flights containing short wire packets floor PTO at SRTT+peer delay per section9.4; full-sized flights use 2*SRTT.
+    //= reason=RTO cap, no-SRTT fallback and peer ACK budget are retained. The configurable multi-packet scheduling margin is scoped to the 2*SRTT line by duvet/rfc8985-additions.toml; it does not waive expiry gating, probe bounds or accounting. Short-packet flights retain their section9.4 peer-delay floor.
     //# TLP_calc_PTO():
     //# If SRTT is available:
     //# PTO = 2 * SRTT
@@ -1646,9 +1652,9 @@ impl Connection {
     //# any delayed ACKs that it is withholding.
     fn schedule_tlp(&mut self) {
         if self.tlp_arm_eligible() {
-            // Short packets may not reach the receiver's ACK-every-two-MSS
-            // threshold. Preserve their delay budget without postponing a
-            // full-sized flight's section7.2 PTO merely because SACK split it.
+            // Preserve a short flight's peer ACK budget without imposing that
+            // delay on full-sized flights. A separate scheduling margin covers
+            // local timing variance for sampled multi-packet flights.
             let pto =
                 self.rtt
                     .srtt()
@@ -1657,10 +1663,17 @@ impl Connection {
                             at_or_after(fin, self.snd_una)
                                 && (self.fin_standalone || fin == self.snd_una)
                         }));
-                        let delay = if self.rack.packet_counts().unacked + fin_packet == 1 {
+                        let packets = self.rack.packet_counts().unacked + fin_packet;
+                        let delay = if packets == 1 {
                             self.config
                                 .timebase
                                 .ticks_from_us(self.config.peer_max_ack_delay_us)
+                        } else if packets > 1 {
+                            // Conservative scheduling allowance, not delivery or
+                            // congestion credit. Preserve RTO as the outer cap.
+                            self.config
+                                .timebase
+                                .ticks_from_us(self.config.tlp_timer_margin_us)
                         } else {
                             0
                         };
@@ -9322,7 +9335,7 @@ mod tests {
     //# When arming a RACK reordering timer or TLP
     //# PTO timer, the sender SHOULD cancel any other pending timers.
     fn selected_loss_timer_transition_matrix_and_independent_ack() {
-        let (mut a, _) = tlp_pair(0);
+        let (mut a, _) = tlp_baseline_pair(0);
         assert_eq!(a.loss_timer, None);
         a.write(&[1; 4000]).unwrap();
         for _ in 0..4 {
@@ -9405,7 +9418,7 @@ mod tests {
     //# timer, if the FlightSize is not zero.
     fn pto_arming_is_independent_of_expiry_gates_and_restores_rto() {
         for gate in 0..4 {
-            let (mut a, _) = tlp_pair(0);
+            let (mut a, _) = tlp_baseline_pair(0);
             if gate == 0 {
                 a.rtt = RttEstimator::new(1_000_000);
                 a.tlp_fresh_rtt = false;
@@ -9436,7 +9449,7 @@ mod tests {
         }
         // Scheduling also occurs with an old probe still tracked, and uses
         // the reference cap without arming that reference as a second timer.
-        let (mut a, _) = tlp_pair(0);
+        let (mut a, _) = tlp_baseline_pair(0);
         a.tlp_end = Some((a.snd_una, a.snd_una.wrapping_add(1), true));
         a.write(&[1; 1000]).unwrap();
         packet(&mut a, 100_000);
@@ -9457,7 +9470,7 @@ mod tests {
     //# any delayed ACKs that it is withholding.
     fn pto_peer_ack_budget_covers_delayed_and_stretched_short_packets() {
         for stretched in [false, true] {
-            let (mut a, _) = tlp_pair(0);
+            let (mut a, _) = tlp_baseline_pair(0);
             a.config.peer_max_ack_delay_us = 499_999;
             a.config.rto_min_us = 1_000_000;
             a.rtt = RttEstimator::new(1_000_000);
@@ -9485,7 +9498,7 @@ mod tests {
     fn full_mss_flight_partial_sack_preserves_two_srtt_pto_and_rto_fallback() {
         for iss in [0, u32::MAX - 1999] {
             for acknowledged in [0, 1] {
-                let (mut a, _) = tlp_pair(iss);
+                let (mut a, _) = tlp_baseline_pair(iss);
                 a.config.peer_max_ack_delay_us = 499_999;
                 let base = a.snd_una;
                 a.write(&[0x55; 4000]).unwrap();
@@ -9758,7 +9771,7 @@ mod tests {
     #[test]
     fn pto_new_data_fin_and_closing_ack_keep_loss_timer() {
         for close_wait in [false, true] {
-            let (mut a, _) = tlp_pair(0);
+            let (mut a, _) = tlp_baseline_pair(0);
             if close_wait {
                 a.state = State::CloseWait;
             }
@@ -10208,7 +10221,7 @@ mod tests {
     #[test]
     fn scaled_tlp_tail_retry_commits_but_zero_window_persist_does_not() {
         for iss in [100, u32::MAX - 1999] {
-            let (mut a, _) = tlp_pair(iss);
+            let (mut a, _) = tlp_baseline_pair(iss);
             a.write(&[0x55; 4000]).unwrap();
             for _ in 0..4 {
                 packet(&mut a, 100_000);
@@ -10307,6 +10320,10 @@ mod tests {
         assert!(a.take_events().connected);
         assert!(b.take_events().connected);
         (a, b)
+    }
+
+    mod pto_margin {
+        include!("connection_pto_margin_tests.rs");
     }
 
     mod adaptive_ack_tests {
@@ -14982,13 +14999,17 @@ mod tests {
         }
     }
 
-    fn tlp_pair(iss: u32) -> (Connection, Connection) {
+    fn tlp_baseline_pair(iss: u32) -> (Connection, Connection) {
         let cfg = ConnectionConfig {
             sack: true,
             rack: true,
             prr: true,
             prr_algorithm: PrrAlgorithm::Rfc9937,
             tlp: true,
+            // This helper fixes the RFC8985 baseline for recovery/ECT/PRR
+            // equation traces. Default-margin behavior has independent real
+            // wire tests in pto_margin, plus socket/packetdrill regressions.
+            tlp_timer_margin_us: 0,
             peer_max_ack_delay_us: 0,
             rto_min_us: 200_000,
             ..config(65_536, 1000)
@@ -15013,7 +15034,7 @@ mod tests {
     //# control deems this appropriate.
     fn tlp_partial_sack_then_full_tail_delivery_cannot_inflate_prr_credit() {
         for iss in [0, u32::MAX - 1999] {
-            let (mut a, _) = tlp_pair(iss);
+            let (mut a, _) = tlp_baseline_pair(iss);
             let base = a.send_base;
             a.write(&[0x55; 4000]).unwrap();
             for _ in 0..4 {
@@ -15083,25 +15104,27 @@ mod tests {
             for _ in 0..4 {
                 packet(&mut a, 100_000);
             }
-            a.timeout(300_000).unwrap();
-            packet(&mut a, 300_000); // Retransmitted tail ends at offset 4000.
+            let pto = a.tlp_deadline.unwrap();
+            assert_eq!(pto, 302_000);
+            a.timeout(pto).unwrap();
+            packet(&mut a, pto); // Retransmitted tail ends at offset 4000.
             a.write(&[0x66; 6000]).unwrap();
             for _ in 0..6 {
-                packet(&mut a, 300_001);
+                packet(&mut a, pto + 1);
             }
             assert_eq!(a.snd_nxt, base.wrapping_add(10_000));
-            rack_sack(&mut a, 400_001, 5000, &[]);
+            rack_sack(&mut a, pto + 100_001, 5000, &[]);
             assert_eq!(a.tlp_end, None);
             assert_eq!((a.congestion.cwnd(), a.congestion.ssthresh()), (5000, 5000));
             assert!(!a.congestion.in_recovery());
             assert!(a.sack_recovery.is_none());
             // Later SACKs prove the original segment at offset 5000 was lost
             // in the already-reduced flight. Recovery must retransmit it now.
-            rack_sack(&mut a, 500_001, 5000, &[(6000, 10_000)]);
+            rack_sack(&mut a, pto + 200_001, 5000, &[(6000, 10_000)]);
             assert_eq!(a.rack.counts().lost, 1);
             assert!(a.sack_recovery.is_some());
             assert_eq!(a.congestion.ssthresh(), 5000); // No second original-flight reduction.
-            let bytes = packet(&mut a, 500_001);
+            let bytes = packet(&mut a, pto + 200_001);
             let p = wire::parse(ip(tuple()), &bytes).unwrap();
             assert_eq!(p.header.sequence, base.wrapping_add(5000).0);
             assert_eq!(p.payload, &[0x66; 1000]);
@@ -15117,7 +15140,7 @@ mod tests {
     //# was later.
     fn tlp_options_clipped_suffix_full_sack_cannot_grant_fresh_rtt() {
         for iss in [0, u32::MAX - 1999] {
-            let (mut a, _) = tlp_pair(iss);
+            let (mut a, _) = tlp_baseline_pair(iss);
             a.config.send_ip_payload_limit = 1020;
             let base = a.send_base;
             a.write(&[0x55; 4000]).unwrap();
@@ -15176,7 +15199,7 @@ mod tests {
     //# fast recovery, or RTO recovery.
     fn tlp_four_packets_partial_byte_sack_output_retry_and_rto_sequence() {
         for iss in [0, u32::MAX - 1999] {
-            let (mut a, _) = tlp_pair(iss);
+            let (mut a, _) = tlp_baseline_pair(iss);
             let base = a.send_base;
             a.write(&[0x55; 4000]).unwrap();
             for i in 0..4 {
@@ -15307,7 +15330,7 @@ mod tests {
     //# control will erase the overcommit upon the next ACK.
     fn tlp_prefers_new_data_beyond_cwnd_and_ack_is_not_loss() {
         for iss in [0, u32::MAX - 1999] {
-            let (mut a, _) = tlp_pair(iss);
+            let (mut a, _) = tlp_baseline_pair(iss);
             let base = a.send_base;
             a.write(&[0x55; 6000]).unwrap();
             for _ in 0..4 {
@@ -15379,7 +15402,7 @@ mod tests {
             // 0: ACK beyond probe = loss; 1: matching DSACK; 2: bare DupACK;
             // 3: unrelated DSACK must not suppress the later loss response.
             for case in 0..4 {
-                let (mut a, _) = tlp_pair(iss);
+                let (mut a, _) = tlp_baseline_pair(iss);
                 a.write(&[0x55; 4000]).unwrap();
                 for _ in 0..4 {
                     packet(&mut a, 100_000);
@@ -15459,7 +15482,7 @@ mod tests {
     //# recovery to recover those losses.
     fn tlp_packet_feedback_detects_earlier_losses_and_enters_rack_recovery() {
         for iss in [0, u32::MAX - 1999] {
-            let (mut a, mut b) = tlp_pair(iss);
+            let (mut a, mut b) = tlp_baseline_pair(iss);
             let base = a.send_base;
             a.write(&[0x55; 4000]).unwrap();
             for _ in 0..4 {
@@ -15500,7 +15523,7 @@ mod tests {
     //# zero).
     fn tlp_zero_window_complete_sack_and_recovery_cancel_probe() {
         for mode in 0..4 {
-            let (mut a, _) = tlp_pair(0);
+            let (mut a, _) = tlp_baseline_pair(0);
             a.write(&[0x55; 4000]).unwrap();
             for _ in 0..4 {
                 packet(&mut a, 100_000);
@@ -15605,7 +15628,7 @@ mod tests {
     //# probe was sent, the sender MUST re-arm the RTO timer, not the PTO
     //# timer, if the FlightSize is not zero.
     fn tlp_failed_output_falls_back_to_rto_without_consuming_a_probe() {
-        let (mut a, _) = tlp_pair(0);
+        let (mut a, _) = tlp_baseline_pair(0);
         a.write(&[0x55; 5000]).unwrap();
         for _ in 0..4 {
             packet(&mut a, 100_000);
@@ -15638,7 +15661,7 @@ mod tests {
         for iss in [0, u32::MAX - 500] {
             for mode in 0..4 {
                 for acknowledge in [false, true] {
-                    let (mut a, _) = tlp_pair(iss);
+                    let (mut a, _) = tlp_baseline_pair(iss);
                     let base = a.send_base;
                     // Empty, combined, standalone after full cwnd, or combined
                     // with all payload cumulatively acknowledged before PTO.
@@ -15764,7 +15787,7 @@ mod tests {
 
     #[test]
     fn tlp_fin_failed_probe_restores_rto_and_charges_timestamp_sequence_space() {
-        let (mut a, _) = tlp_pair(u32::MAX);
+        let (mut a, _) = tlp_baseline_pair(u32::MAX);
         a.timestamps = true;
         a.config.timestamp_bytes_per_tick = 1;
         a.shutdown().unwrap();
@@ -15817,7 +15840,7 @@ mod tests {
     #[test]
     fn tlp_fin_gates_and_application_timeout_origin() {
         for gate in ["freshness", "zero-window", "fin-outside-window"] {
-            let (mut a, _) = tlp_pair(0);
+            let (mut a, _) = tlp_baseline_pair(0);
             if gate == "fin-outside-window" {
                 a.write(&[0x55; 4000]).unwrap();
                 for _ in 0..4 {
@@ -15842,7 +15865,7 @@ mod tests {
             assert_eq!(a.tlp_end, None);
             assert!(a.tlp_fresh_rtt || gate == "freshness");
         }
-        let (mut a, _) = tlp_pair(0);
+        let (mut a, _) = tlp_baseline_pair(0);
         a.config.peer_max_ack_delay_us = 200_000;
         a.timeout(2_100_000).unwrap();
         a.set_application_timeout(Some(3_000_000)).unwrap();
@@ -15913,7 +15936,7 @@ mod tests {
                 Err(Error::InvalidArgument)
             ));
         }
-        let (mut a, _) = tlp_pair(0);
+        let (mut a, _) = tlp_baseline_pair(0);
         a.tlp_fresh_rtt = false;
         a.write(&[0x55; 1000]).unwrap();
         packet(&mut a, 100_000);
@@ -16633,7 +16656,7 @@ mod tests {
     //# control deems this appropriate.
     fn rack_mixed_immediate_deferred_loss_timer_cannot_mint_prr_entry_credit() {
         for iss in [0, u32::MAX - 1999] {
-            let (mut a, _) = tlp_pair(iss);
+            let (mut a, _) = tlp_baseline_pair(iss);
             a.config.tlp = false;
             a.write(&[0x55; 4000]).unwrap();
             for now in [100_000, 200_000, 300_000, 300_000] {
@@ -16659,7 +16682,7 @@ mod tests {
     #[test]
     fn rack_ack_splits_preserve_active_prr_beyond_old_ledger_limit() {
         for iss in [0, u32::MAX - 99] {
-            let (mut a, _) = tlp_pair(iss);
+            let (mut a, _) = tlp_baseline_pair(iss);
             a.set_nagle(false);
             let base = a.send_base;
             a.write(&[0x55; 2]).unwrap();
@@ -23184,7 +23207,7 @@ mod tests {
         for control in [RST, SYN] {
             for work in ["rto", "tlp", "persist", "new"] {
                 let (mut a, _) = if work == "tlp" {
-                    tlp_pair(u32::MAX - 500)
+                    tlp_baseline_pair(u32::MAX - 500)
                 } else {
                     pair(config(4096, 1000), u32::MAX - 500)
                 };
@@ -24206,7 +24229,7 @@ mod tests {
             0
         );
 
-        let (mut a, _) = tlp_pair(u32::MAX - 1999);
+        let (mut a, _) = tlp_baseline_pair(u32::MAX - 1999);
         a.write(&[1; 6000]).unwrap();
         for _ in 0..4 {
             packet(&mut a, 100_000);

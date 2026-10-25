@@ -726,7 +726,7 @@ def select_cases(scripts, directory, suite, selected_variants=None, selected_scr
     return selected, excluded
 
 
-UPSTREAM_BASELINE_REASON = 'Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.'
+UPSTREAM_BASELINE_REASON = 'Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.'
 
 
 UPSTREAM_OPTIONS = {
@@ -775,7 +775,7 @@ def profile_metadata(so_flags):
         metadata.update(
             options=sorted(options), sack=True, timestamps='no-timestamps' not in options,
             initial_window='Iw10', fast_open_early_response='early-response' in options, rack=True, prr='Rfc9937',
-            tlp=True, rto_min_us=200000, preallocate_connections=4 if 'prealloc4' in options else 3 if 'prealloc3' in options else 1,
+            tlp=True, tlp_timer_margin_us=2000, rto_min_us=200000, preallocate_connections=4 if 'prealloc4' in options else 3 if 'prealloc3' in options else 1,
             ecn='ecn' in options, mss=1460,
             receive_capacity=65535 if 'receive64k' in options else 8388608,
             window_scale=0 if 'receive64k' in options else 8,

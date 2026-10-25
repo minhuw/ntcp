@@ -164,13 +164,13 @@ fn script_last_byte_sack_timer() {
         }
         rack_sack(&mut b, 300_000, 0, &[(3999, 4000)]);
         let (at, bytes) = first_loss_output(&mut b, reserved);
-        assert_eq!(at, 400_000, "SACK reserved={reserved}");
+        assert_eq!(at, 402_000, "SACK reserved={reserved}");
         let tail = wire::parse(ip(b.tuple()), &bytes).unwrap();
         assert_eq!(tail.header.sequence, 3001);
         assert_eq!(tail.payload.len(), 1000);
         assert_ne!(tail.header.flags & PSH, 0);
         let (at, bytes) = first_loss_output(&mut b, reserved);
-        assert_eq!(at, 700_000);
+        assert_eq!(at, 702_000);
         let head = wire::parse(ip(b.tuple()), &bytes).unwrap();
         assert_eq!(head.header.sequence, 1);
         assert_eq!(head.payload.len(), 1000);
@@ -189,7 +189,7 @@ fn script_shutdown_outstanding_data_probes_fin_not_head() {
         output(&mut b, 30_000, 30_000, reserved);
         let (at, bytes) = first_loss_output(&mut b, reserved);
         let payload_len = wire::parse(ip(b.tuple()), &bytes).unwrap().payload.len();
-        assert_eq!((at, payload_len), (50_000, 0), "reserved={reserved}");
+        assert_eq!((at, payload_len), (52_000, 0), "reserved={reserved}");
         let fin = wire::parse(ip(b.tuple()), &bytes).unwrap();
         assert_eq!(fin.header.sequence, 10_001);
         assert_eq!(fin.header.flags & FIN, FIN);

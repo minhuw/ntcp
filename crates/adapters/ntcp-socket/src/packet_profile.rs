@@ -354,6 +354,7 @@ mod setup_profile_tests {
         assert_eq!(c.initial_window, ntcp::InitialWindow::Iw10);
         assert_eq!(c.receive_capacity, 8 * 1024 * 1024);
         assert_eq!(c.rto_min_us, 200_000);
+        assert_eq!(c.tlp_timer_margin_us, 2000);
         assert!(c.adaptive_ack);
         assert!(c.coalesce_read_window_updates);
         assert!(c.abort_with_ack);

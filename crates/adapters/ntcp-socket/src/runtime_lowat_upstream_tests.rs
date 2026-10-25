@@ -506,10 +506,10 @@ fn unsupported_buffer_native_capacity_and_writable_edge_controls() {
 }
 
 #[test]
-fn unsupported_zero_rtt_tail_probe_changes_lowat_admission_by_one_mss() {
+fn short_rtt_send_admission_is_stable_with_timer_service() {
     let mut rows = Vec::new();
     for (handshake_us, service_timers, expected) in
-        [(1, false, 42000), (1, true, 43000), (10000, true, 42000)]
+        [(1, false, 42000), (1, true, 42000), (10000, true, 42000)]
     {
         let (mut a, child, cid, _, _, iss) =
             established_with_timing(false, 32792, 257, handshake_us);
@@ -551,4 +551,150 @@ fn unsupported_zero_rtt_tail_probe_changes_lowat_admission_by_one_mss() {
         rows.push(format!("{{\"handshake_us\":{handshake_us},\"service_timers\":{service_timers},\"accepted\":{accepted},\"wire_end\":{wire_end},\"cwnd\":{},\"notsent\":{}}}",info.cwnd,info.notsent_bytes));
     }
     save("zero-rtt-lowat-probe-controls", &rows);
+}
+
+#[test]
+fn short_rtt_ack_precedes_margin_probe_and_preserves_completion_ids() {
+    let mut rows = Vec::new();
+    for (handshake_us, timers) in [(1, true), (1, false), (10_000, true)] {
+        let (mut a, child, cid, ip, mut incoming, iss) =
+            established_with_timing(false, 32792, 257, handshake_us);
+        a.execute(child, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, -1))
+            .unwrap();
+        a.execute(child, Op::Set(SOL_SOCKET, SO_ZEROCOPY, 1))
+            .unwrap();
+        let now = handshake_us + 100;
+        a.test_now = Some(now);
+        let data = [42; 4000];
+        assert_eq!(
+            a.execute(
+                child,
+                Op::Send(vec![(data.as_ptr() as usize, data.len())], MSG_ZEROCOPY)
+            )
+            .unwrap()
+            .value,
+            4000
+        );
+        let initial = drain(&mut a, now, iss);
+        assert_eq!(initial.iter().map(|p| p.1).sum::<usize>(), 4000);
+        let deadline = a.endpoint.next_deadline().unwrap();
+        let feedback_at = now + 100;
+        let mut probes = Vec::new();
+        if timers && deadline < feedback_at {
+            a.test_now = Some(deadline);
+            a.endpoint.on_timeout(deadline, BUDGET).unwrap();
+            probes = drain(&mut a, deadline, iss);
+        }
+        assert!(probes.is_empty());
+        assert!(deadline > feedback_at);
+        incoming.acknowledgment = iss.wrapping_add(4001);
+        let mut packet = [0; 64];
+        let n = wire::encode(ip, incoming, &[], &[], &mut packet).unwrap();
+        a.test_now = Some(feedback_at);
+        a.input(feedback_at, ip, 0, &packet[..n]).unwrap();
+        a.events();
+        assert_eq!(a.endpoint.transport_info(cid).unwrap().unacked, 0);
+        let next_at = feedback_at + 10;
+        a.test_now = Some(next_at);
+        assert_eq!(
+            a.execute(
+                child,
+                Op::Send(vec![(data.as_ptr() as usize, data.len())], MSG_ZEROCOPY)
+            )
+            .unwrap()
+            .value,
+            4000
+        );
+        let next = drain(&mut a, next_at, iss);
+        assert_eq!(
+            next.iter().map(|p| (p.0, p.1)).collect::<Vec<_>>(),
+            vec![(4001, 1000), (5001, 1000), (6001, 1000), (7001, 1000)]
+        );
+        assert_eq!(a.sockets[&child].zc_next, 2);
+        assert_eq!(a.sockets[&child].completions.len(), 1);
+        assert!(matches!(
+            a.sockets[&child].completions.front(),
+            Some(Completion::ZeroCopy(0, 1))
+        ));
+        let packets = |items: &[(u32, usize, bool)]| {
+            format!(
+                "[{}]",
+                items
+                    .iter()
+                    .map(|p| format!("[{},{},{}]", p.0, p.1, p.2))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
+        rows.push(format!("{{\"handshake_us\":{handshake_us},\"timers\":{timers},\"first_send_at\":{now},\"probe_deadline\":{deadline},\"ack_at\":{feedback_at},\"initial\":{},\"probes\":{},\"next\":{},\"zc_next\":2}}", packets(&initial), packets(&probes), packets(&next)));
+    }
+    save("remaining-five-probe-order", &rows);
+}
+
+#[test]
+fn remaining_five_passive_large_send_allocation_timing() {
+    let mut rows = Vec::new();
+    for request in [0, 2_000_000] {
+        let settings =
+            crate::packet_profile::profile("upstream,local=192.168.0.1,budget224m").unwrap();
+        let mut a = Owner::packet(settings).unwrap();
+        a.test_now = Some(0);
+        let listener = new(&mut a, SOCK_NONBLOCK);
+        let clock = std::time::Instant::now();
+        if request != 0 {
+            a.execute(listener, Op::Set(SOL_SOCKET, SO_SNDBUF, request))
+                .unwrap();
+        }
+        let set_us = clock.elapsed().as_micros();
+        a.execute(listener, Op::Bind("192.168.0.1:8080".parse().unwrap()))
+            .unwrap();
+        let clock = std::time::Instant::now();
+        a.execute(listener, Op::Listen(1)).unwrap();
+        let listen_us = clock.elapsed().as_micros();
+        let ip = ntcp::IpMetadata {
+            source: "192.0.2.1".parse().unwrap(),
+            destination: "192.168.0.1".parse().unwrap(),
+        };
+        let header = wire::Header {
+            source_port: 40000,
+            destination_port: 8080,
+            sequence: 0,
+            acknowledgment: 0,
+            flags: SYN,
+            window: 32792,
+            urgent_pointer: 0,
+        };
+        let mut bytes = [0; 2048];
+        let n = wire::encode(
+            ip,
+            header,
+            &[2, 4, 3, 232, 4, 2, 1, 1, 1, 3, 3, 7],
+            &[],
+            &mut bytes,
+        )
+        .unwrap();
+        let clock = std::time::Instant::now();
+        a.input(0, ip, 0, &bytes[..n]).unwrap();
+        let input_us = clock.elapsed().as_micros();
+        let clock = std::time::Instant::now();
+        let tx = a
+            .endpoint
+            .poll_transmit(0, &mut bytes, BUDGET)
+            .unwrap()
+            .packet
+            .unwrap();
+        let output_us = clock.elapsed().as_micros();
+        assert_eq!(
+            wire::parse(tx.ip, &bytes[..tx.len]).unwrap().header.flags & (SYN | ACK),
+            SYN | ACK
+        );
+        let incoming = ntcp::Tuple {
+            local: "192.168.0.1:8080".parse().unwrap(),
+            remote: "192.0.2.1:40000".parse().unwrap(),
+        };
+        let cid = a.endpoint.connection_id(incoming).unwrap();
+        let info = a.endpoint.transport_info(cid).unwrap();
+        rows.push(format!("{{\"sndbuf_request\":{request},\"send_capacity\":{},\"retained_bytes\":{},\"setsockopt_us\":{set_us},\"listen_us\":{listen_us},\"syn_input_us\":{input_us},\"first_output_us\":{output_us}}}",info.send_capacity,a.endpoint.buffer_bytes()));
+    }
+    save("remaining-five-passive-cost", &rows);
 }

@@ -2,11 +2,16 @@
 
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.2"
-reason = "The optional single-segment delayed-ACK inflation is not selected: schedule_tlp uses 2*SRTT capped by RTO. RFC 8985 explicitly permits this choice with MAY. The separate absent-SRTT scheduling and section 9.4 delayed-ACK mitigation gaps remain tracked."
+reason = "Scoped conservative SHOULD adjustment: sampled multi-packet flights add ConnectionConfig.tlp_timer_margin_us (default2000us) to 2*SRTT to reduce spurious probes caused by host scheduling and processing variance on very small RTTs. Zero selects the baseline. Genuine loss probing may be later by that bounded allowance, always capped by the existing RTO; no-SRTT fallback, single-packet peer ACK delay, short-packet ACK floor, fresh-RTT/one-probe expiry gates and congestion accounting remain governed separately. pto_margin_ack_loss_and_rto_cap_wire and pto_margin_preserves_single_short_and_unsampled_budgets cover those boundaries. 2ms is an implementation choice, not an RFC requirement."
 quote = '''
-Third, when the FlightSize is one segment, the sender MAY inflate the
-PTO by TLP.max_ack_delay to accommodate a potentially delayed
-acknowledgment and reduce the risk of spurious retransmissions.
+PTO = 2 * SRTT
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc8985#section-7.2"
+reason = "Same scoped scheduling/granularity adjustment as the PTO pseudocode equation: sampled multi-packet flights use a caller-configurable conservative margin, default2ms, under the unchanged RTO cap. It trades a bounded extra early-loss-probe delay for reduced spurious probes on lossless low-RTT paths; not a claim that RFC8985 prescribes a2ms constant."
+quote = '''
+First, the default PTO interval is 2*SRTT.
 '''
 
 [[spec]]

@@ -62,7 +62,7 @@ class SetupProfiles(unittest.TestCase):
                                'fast_open_listener_default', 'fast_open_cache')
             else:
                 policy_keys = ('global_notsent_lowat', 'socket_notsent_lowat')
-            for key in ('general_pacing', 'software_gso', 'hardware_tso', *policy_keys):
+            for key in ('general_pacing', 'software_gso', 'hardware_tso', 'tlp_timer_margin_us', *policy_keys):
                 changed = copy.deepcopy(manifest)
                 changed['scripts'][name]['mapping']['ntcp_settings'][key] = 'incorrect'
                 with self.assertRaises(ValueError):
