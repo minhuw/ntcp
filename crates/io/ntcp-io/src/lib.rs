@@ -1,4 +1,26 @@
+pub use ntcp_buffer::{Payload, StablePayloadStorage};
 use std::io;
+
+/// Header bytes owned by the sender, followed by immutable shared payload ranges.
+/// Only the header may be copied by a zero-copy backend. Payload leases must be
+/// retained until the device/driver has finished reading the original storage.
+#[derive(Debug, Default)]
+pub struct OwnedPacket {
+    pub header: Vec<u8>,
+    pub payload: Vec<Payload>,
+}
+impl OwnedPacket {
+    pub fn checked_len(&self) -> Option<usize> {
+        self.payload
+            .iter()
+            .try_fold(self.header.len(), |n, p| n.checked_add(p.len()))
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ZeroCopyCapabilities {
+    pub max_payload_segments: usize,
+    pub max_packet_len: usize,
+}
 
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
@@ -161,12 +183,37 @@ pub struct TimestampCapabilities {
 
 // Packet operations do bounded, nonblocking work on one complete packet. The caller
 // owns its buffers: receive copies into out, transmit retains no borrow.
-// Submitted transfers a copy to the backend; it implies neither wire delivery
-// nor a TCP acknowledgement. Backend DMA buffers are reclaimed internally.
+// Ordinary transmit transfers a copy; explicit transmit_zero_copy instead
+// retains owning immutable leases until reclamation. Submitted implies neither
+// wire delivery nor a TCP acknowledgement. DMA buffers are reclaimed internally.
 // None/WouldBlock leaves the caller free to retry. Errors never report a
 // truncated packet as valid. Drivers, threads and scheduling belong to callers.
 pub trait PacketIo {
     fn layer(&self) -> PacketLayer;
+
+    fn zero_copy_capabilities(&self) -> Option<ZeroCopyCapabilities> {
+        None
+    }
+    // Request reclamation of at most budget completed transmissions. This is
+    // service work, not proof of wire delivery or a TCP acknowledgement. An
+    // asynchronous shared backend must also make progress when TX is idle.
+    fn reclaim_transmit(&mut self, _budget: usize) -> io::Result<usize> {
+        Ok(0)
+    }
+    // Storage registration/mapping is backend-specific. A positive result must
+    // remain valid while the borrowed backend configuration is unchanged.
+    fn zero_copy_payload_supported(&self, _payload: &Payload) -> bool {
+        false
+    }
+    // Submitted retains shared leases until actual TX reclamation. WouldBlock
+    // retains nothing. Unsupported/InvalidInput certify no submission; all other
+    // errors must be treated as uncertain, just as ordinary transmit errors.
+    fn transmit_zero_copy(&mut self, _packet: &OwnedPacket) -> io::Result<TxOutcome> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "shared TX unsupported",
+        ))
+    }
 
     // Current interface IP MTU, including IP header, excluding L2/FCS.
     // Read-only control-plane query; unknown is distinct from a failed query.
@@ -362,6 +409,8 @@ mod tests {
             received: false,
         };
         let io: &mut dyn PacketIo = &mut mock;
+        assert_eq!(io.reclaim_transmit(0).unwrap(), 0);
+        assert_eq!(io.reclaim_transmit(1).unwrap(), 0);
         assert_eq!(io.local_ip_mtu().unwrap(), None);
         assert_eq!(io.max_packet_len(), None);
         assert_eq!(io.tcp_segmentation_capabilities(), None);

@@ -9,6 +9,8 @@
 
 extern crate alloc;
 
+pub use ntcp_buffer::Payload;
+
 #[cfg(test)]
 mod allocation_tests;
 mod buffer;

@@ -412,6 +412,51 @@ pub fn encode(
     Ok(len)
 }
 
+/// Encode a TCP header while checksumming immutable payload slices in place.
+/// Returns header length only; no payload bytes are copied into `out`.
+pub fn encode_shared(
+    ip: IpMetadata,
+    header: Header,
+    options: &[u8],
+    payload: &[crate::Payload],
+    out: &mut [u8],
+) -> Result<usize, WireError> {
+    let payload_len = payload.iter().try_fold(0usize, |n, p| {
+        n.checked_add(p.len()).ok_or(WireError::TooLong)
+    })?;
+    let header_len = 20 + options.len().div_ceil(4) * 4;
+    let total = header_len
+        .checked_add(payload_len)
+        .ok_or(WireError::TooLong)?;
+    let len = checked_length(ip, total)?;
+    let n = encode(ip, header, options, &[], out)?;
+    out[16..18].fill(0);
+    let mut sum = match (ip.source, ip.destination) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => add_words(add_words(0, &src.octets()), &dst.octets()),
+        (IpAddr::V6(src), IpAddr::V6(dst)) => add_words(add_words(0, &src.octets()), &dst.octets()),
+        _ => return Err(WireError::AddressFamily),
+    };
+    sum = add_words(add_words(sum, &len.to_be_bytes()), &[0, 6]);
+    let mut odd = None;
+    for bytes in core::iter::once(&out[..n]).chain(payload.iter().map(|p| p.as_slice())) {
+        for &byte in bytes {
+            if let Some(high) = odd.take() {
+                sum += u32::from(u16::from_be_bytes([high, byte]));
+                sum = (sum & 0xffff) + (sum >> 16);
+            } else {
+                odd = Some(byte);
+            }
+        }
+    }
+    if let Some(high) = odd {
+        sum += u32::from(high) << 8;
+    }
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    out[16..18].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -431,6 +476,36 @@ mod tests {
                 destination: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).into(),
             },
         ]
+    }
+
+    #[test]
+    fn shared_checksum_matches_contiguous_for_odd_ranges_and_options() {
+        use crate::Payload;
+        use alloc::{vec, vec::Vec};
+        for ip in ips() {
+            for len in 1..70 {
+                let data: Vec<u8> = (0..len).map(|n| (n * 17) as u8).collect();
+                let base = Payload::from_vec(data.clone());
+                for chunk in [1, 3, 7, 16] {
+                    let parts: Vec<_> = (0..len)
+                        .step_by(chunk)
+                        .map(|n| base.slice(n..(n + chunk).min(len)).unwrap())
+                        .collect();
+                    for options in [&[][..], &[1, 1, 8, 10, 0, 0, 0, 7, 0, 0, 0, 9][..]] {
+                        let mut ordinary = vec![0; 20 + options.len() + len];
+                        encode(ip, header(), options, &data, &mut ordinary).unwrap();
+                        let mut shared = vec![0xa5; ordinary.len()];
+                        let n = encode_shared(ip, header(), options, &parts, &mut shared).unwrap();
+                        assert_eq!(&shared[..n], &ordinary[..n]);
+                        assert!(shared[n..].iter().all(|&v| v == 0xa5));
+                        shared.truncate(n);
+                        shared.extend_from_slice(&data);
+                        assert_eq!(shared, ordinary);
+                        parse(ip, &shared).unwrap();
+                    }
+                }
+            }
+        }
     }
 
     fn header() -> Header {

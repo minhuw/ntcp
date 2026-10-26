@@ -66,3 +66,36 @@ fn checked_headers_and_wrong_family() {
     );
     assert_eq!(bytes, before);
 }
+
+#[test]
+fn shared_headers_preserve_ip_options_and_full_wire_lengths_without_payload_copy() {
+    for tcp_header in [20, 32, 60] {
+        for payload_len in [1, 17, 1460] {
+            for options in [
+                ntcp::OutgoingIpv4Options::default(),
+                ntcp::OutgoingIpv4Options {
+                    record_route_slots: Some(2),
+                    timestamp: Some(ntcp::TimestampRequest::Times(2)),
+                    ..Default::default()
+                },
+            ] {
+                let mut transmit = tx(false, tcp_header + payload_len);
+                transmit.ipv4_options = options;
+                let mut full = vec![0xa5; 60 + transmit.len];
+                let total = encode(&mut full, transmit, 123).unwrap();
+                let mut shared = vec![0xa5; 60 + tcp_header];
+                let stored =
+                    ntcp_ip::encode_shared_header(&mut shared, transmit, 123, tcp_header).unwrap();
+                assert_eq!(&shared[..stored], &full[..stored]);
+                assert_eq!(ntcp_ip::ipv4_bounds(&shared[..stored]).unwrap().1, total);
+                assert!(shared[stored..].iter().all(|&b| b == 0xa5));
+                assert_eq!(stored + payload_len, total);
+            }
+        }
+    }
+    let mut bytes = [0xa5; 80];
+    for bad in [0, 19, 21, 61, usize::MAX] {
+        assert!(ntcp_ip::encode_shared_header(&mut bytes, tx(false, 80), 0, bad).is_err());
+        assert_eq!(bytes, [0xa5; 80]);
+    }
+}

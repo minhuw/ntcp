@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/stacks/*", "crates/io/*", "crates/adapters/*", "integration/packetdrill", "crates/net/ntcp-egress", "crates/net/ntcp-tx"]
+members = ["crates/stacks/*", "crates/io/*", "crates/adapters/*", "integration/packetdrill", "crates/net/ntcp-egress", "crates/net/ntcp-tx", "crates/net/ntcp-buffer"]
 resolver = "3"

@@ -60,14 +60,39 @@ pub fn ipv6_bounds(b: &[u8]) -> Result<usize, Error> {
 }
 
 pub fn encode(packet: &mut [u8], transmit: ntcp::Transmit) -> Result<usize, Error> {
+    encode_present(packet, transmit, transmit.len)
+}
+
+// Encode only the resident header. Payload ranges remain owned by PacketIo.
+pub fn encode_shared_header(
+    packet: &mut [u8],
+    transmit: ntcp::Transmit,
+    present_tcp_len: usize,
+) -> Result<usize, Error> {
+    if !(20..=60).contains(&present_tcp_len)
+        || !present_tcp_len.is_multiple_of(4)
+        || present_tcp_len > transmit.len
+    {
+        return Err(Error::Length);
+    }
+    encode_present(packet, transmit, present_tcp_len)
+}
+fn encode_present(
+    packet: &mut [u8],
+    transmit: ntcp::Transmit,
+    present_tcp_len: usize,
+) -> Result<usize, Error> {
     let (IpAddr::V6(source), IpAddr::V6(destination)) =
         (transmit.ip.source, transmit.ip.destination)
     else {
         return Err(Error::Version);
     };
-    let total = transmit.len.checked_add(IPV6_HEADER).ok_or(Error::Length)?;
+    transmit.len.checked_add(IPV6_HEADER).ok_or(Error::Length)?;
     if transmit.len > usize::from(u16::MAX)
-        || total > packet.len()
+        || present_tcp_len > transmit.len
+        || present_tcp_len
+            .checked_add(IPV6_HEADER)
+            .is_none_or(|n| n > packet.len())
         || transmit.len == 0
         || transmit.hop_limit == 0
         || transmit.dscp > 63
@@ -86,7 +111,7 @@ pub fn encode(packet: &mut [u8], transmit: ntcp::Transmit) -> Result<usize, Erro
     header[7] = transmit.hop_limit;
     header[8..24].copy_from_slice(&source.octets());
     header[24..40].copy_from_slice(&destination.octets());
-    Ok(total)
+    Ok(IPV6_HEADER + present_tcp_len)
 }
 
 // Checked quoted header: returns metadata, header length, original packet

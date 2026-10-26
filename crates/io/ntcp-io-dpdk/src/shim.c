@@ -269,3 +269,129 @@ int ntcp_dpdk_tso_transmit(uint16_t port, uint16_t queue, void *pool,
     rte_pktmbuf_free(head);
     return 0;
 }
+
+#include <stdlib.h>
+#include <rte_malloc.h>
+#include <rte_memory.h>
+
+void *ntcp_dpdk_payload_alloc(size_t length, uint64_t *iova) {
+    if (!length || length > NTCP_DPDK_MAX_PACKET_LEN) return NULL;
+    void *p = rte_zmalloc(NULL, length, RTE_CACHE_LINE_SIZE);
+    if (!p) return NULL;
+    rte_iova_t base = rte_mem_virt2iova(p);
+    // The external mbuf describes one contiguous IOVA span. Refuse fragmented
+    // mappings rather than assuming that virtually contiguous implies DMA-safe.
+    if (base == RTE_BAD_IOVA) { rte_free(p); return NULL; }
+    for (size_t offset = 0; offset < length;) {
+        const char *at = (const char *)p + offset;
+        const struct rte_memseg *ms = rte_mem_virt2memseg(at, NULL);
+        if (!ms || rte_mem_virt2iova(at) != base + offset) {
+            rte_free(p); return NULL;
+        }
+        size_t left = (uintptr_t)ms->addr + ms->len - (uintptr_t)at;
+        if (!left) { rte_free(p); return NULL; }
+        offset += RTE_MIN(left, length - offset);
+    }
+    *iova = base;
+    return p;
+}
+void ntcp_dpdk_payload_free(void *address) { rte_free(address); }
+
+int ntcp_dpdk_reclaim(uint16_t port, uint16_t queue, uint32_t budget) {
+    if (!budget) return 0; // DPDK zero means unbounded: never forward it.
+    return rte_eth_tx_done_cleanup(port, queue, budget);
+}
+int ntcp_dpdk_shared_check(uint16_t port, uint16_t queue, void *pool, uint16_t *limit) {
+    struct rte_eth_dev_info info;
+    int result = rte_eth_dev_info_get(port, &info);
+    if (result < 0) return result;
+    if (queue >= info.nb_tx_queues) return -EINVAL;
+    struct rte_eth_conf conf;
+    result = rte_eth_dev_conf_get(port, &conf);
+    if (result < 0) return result;
+    struct rte_eth_txq_info qinfo;
+    result = rte_eth_tx_queue_info_get(port, queue, &qinfo);
+    if (result < 0) return result;
+    if (!(info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) ||
+        !((conf.txmode.offloads | qinfo.conf.offloads) & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) ||
+        !info.tx_desc_lim.nb_seg_max || !info.tx_desc_lim.nb_mtu_seg_max || !qinfo.nb_desc ||
+        ((conf.txmode.offloads | qinfo.conf.offloads) & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) ||
+        rte_pktmbuf_data_room_size(pool) < RTE_PKTMBUF_HEADROOM + 134)
+        return -ENOTSUP;
+    *limit = RTE_MIN(RTE_MIN(info.tx_desc_lim.nb_seg_max,
+                          info.tx_desc_lim.nb_mtu_seg_max), qinfo.nb_desc);
+    if (*limit < 3) return -ENOTSUP;
+    // Idle TX must progress without waiting for another packet to be sent.
+    // This may reclaim a completed packet but never changes port settings.
+    result = ntcp_dpdk_reclaim(port, queue, 1);
+    return result < 0 ? result : 0;
+}
+
+struct ntcp_external {
+    struct rte_mbuf_ext_shared_info shared;
+    void *lease;
+    ntcp_release_fn release;
+};
+static void external_free(void *address, void *opaque) {
+    (void)address;
+    struct ntcp_external *e = opaque;
+    e->release(e->lease);
+    free(e);
+}
+int ntcp_dpdk_shared_transmit(uint16_t port, uint16_t queue, void *pool,
+    const uint8_t *header, uint16_t header_length,
+    const struct ntcp_shared_segment *segments, uint16_t count,
+    ntcp_release_fn release) {
+    struct rte_mbuf *head = NULL;
+    uint16_t consumed = 0;
+    int result = -EINVAL;
+    size_t total = header_length;
+    if (!header_length || !count) goto done;
+    for (uint16_t i = 0; i < count; ++i) {
+        if (!segments[i].length || !segments[i].address ||
+            segments[i].iova == RTE_BAD_IOVA) goto done;
+        total += segments[i].length;
+    }
+    if (total > NTCP_DPDK_MAX_PACKET_LEN) { result = -EMSGSIZE; goto done; }
+    result = 0;
+    head = rte_pktmbuf_alloc(pool);
+    if (!head) goto done;
+    void *dst = rte_pktmbuf_append(head, header_length);
+    if (!dst) { result = -EINVAL; goto done; }
+    memcpy(dst, header, header_length);
+    for (; consumed < count;) {
+        struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
+        struct ntcp_external *e = calloc(1, sizeof(*e));
+        if (!m || !e) { rte_pktmbuf_free(m); free(e); goto done; }
+        const struct ntcp_shared_segment *s = &segments[consumed];
+        e->lease = s->lease;
+        e->release = release;
+        e->shared.free_cb = external_free;
+        e->shared.fcb_opaque = e;
+        rte_mbuf_ext_refcnt_set(&e->shared, 1);
+        rte_pktmbuf_attach_extbuf(m, (void *)s->address, s->iova, s->length, &e->shared);
+        m->data_off = 0;
+        m->data_len = s->length;
+        m->pkt_len = s->length;
+        consumed++;
+        if (rte_pktmbuf_chain(head, m)) { rte_pktmbuf_free(m); result = -EINVAL; goto done; }
+    }
+    // Ethernet padding follows the payload. It must not alter referenced bytes
+    // or the IP/TCP lengths/checksums encoded by the caller.
+    if (total < 60) {
+        struct rte_mbuf *pad = rte_pktmbuf_alloc(pool);
+        if (!pad) goto done;
+        dst = rte_pktmbuf_append(pad, (uint16_t)(60 - total));
+        if (!dst) { rte_pktmbuf_free(pad); result = -EINVAL; goto done; }
+        memset(dst, 0, 60 - total);
+        if (rte_pktmbuf_chain(head, pad)) { rte_pktmbuf_free(pad); result = -EINVAL; goto done; }
+    }
+    if (rte_eth_tx_burst(port, queue, &head, 1) == 1) {
+        head = NULL;
+        result = 1;
+    }
+done:
+    rte_pktmbuf_free(head);
+    for (; consumed < count; ++consumed) release(segments[consumed].lease);
+    return result;
+}

@@ -220,3 +220,31 @@ void ntcp_test_check_tso(unsigned l3, unsigned mss, unsigned length) {
     assert(bytes == length && segments == m->nb_segs);
     rte_pktmbuf_free(m);
 }
+
+// Inspect the original external payload addresses, then perform actual mbuf
+// reclamation. This is ownership/pointer evidence, not physical NIC evidence.
+void ntcp_test_check_shared(const void *first, unsigned first_len,
+                            const void *second, unsigned second_len,
+                            unsigned header_length, unsigned total_length) {
+    struct rte_mbuf *m;
+    assert(rte_ring_dequeue(tx, (void **)&m) == 0);
+    assert(m->pkt_len == (total_length < 60 ? 60 : total_length));
+    assert(m->data_len == header_length);
+    struct rte_mbuf *s = m->next;
+    assert(s && (s->ol_flags & RTE_MBUF_F_EXTERNAL));
+    assert(rte_pktmbuf_mtod(s, const void *) == first && s->data_len == first_len);
+    if (second_len) {
+        s = s->next;
+        assert(s && (s->ol_flags & RTE_MBUF_F_EXTERNAL));
+        assert(rte_pktmbuf_mtod(s, const void *) == second && s->data_len == second_len);
+    }
+    s = s->next;
+    if (total_length < 60) {
+        assert(s && s->data_len == 60 - total_length);
+        const uint8_t *pad = rte_pktmbuf_mtod(s, const uint8_t *);
+        for (unsigned i = 0; i < s->data_len; ++i) assert(pad[i] == 0);
+        s = s->next;
+    }
+    assert(!s);
+    rte_pktmbuf_free(m);
+}

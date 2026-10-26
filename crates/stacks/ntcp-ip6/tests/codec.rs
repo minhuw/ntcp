@@ -62,3 +62,25 @@ fn checked_headers_and_wrong_family() {
     );
     assert_eq!(bytes, before);
 }
+
+#[test]
+fn shared_header_describes_external_payload_without_copying_it() {
+    for tcp_header in [20, 32, 60] {
+        for data in [1, 17, 1460, 65000] {
+            let t = tx(true, tcp_header + data);
+            let mut full = vec![0xa5; 40 + t.len];
+            let total = encode(&mut full, t).unwrap();
+            let mut resident = vec![0xa5; 40 + tcp_header];
+            let stored = ntcp_ip6::encode_shared_header(&mut resident, t, tcp_header).unwrap();
+            assert_eq!(stored, resident.len());
+            assert_eq!(resident, full[..stored]);
+            assert_eq!(ntcp_ip6::ipv6_bounds(&resident).unwrap(), total);
+            assert_eq!(stored + data, total);
+        }
+    }
+    for bad in [0, 19, 21, 61, usize::MAX] {
+        let mut bytes = [0xa5; 100];
+        assert!(ntcp_ip6::encode_shared_header(&mut bytes, tx(true, 100), bad).is_err());
+        assert_eq!(bytes, [0xa5; 100]);
+    }
+}

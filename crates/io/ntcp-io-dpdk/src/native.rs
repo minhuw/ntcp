@@ -11,6 +11,9 @@ pub const MAX_PACKET_LEN: usize = 65_535;
 
 #[path = "segmentation.rs"]
 mod segmentation;
+#[path = "shared.rs"]
+mod shared;
+pub use shared::DpdkBuffer;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -82,7 +85,8 @@ struct TimestampConfig {
 }
 
 /// Borrows an already started Ethernet port and its queues. Owns no EAL,
-/// devices, pools, or threads. Each operation copies at most one frame.
+/// devices, pools, or threads. Each operation submits at most one frame;
+/// explicit zero-copy submission retains external payload leases until reclaim.
 /// Not Send/Sync: the host must enforce DPDK lcore and queue scheduling rules.
 pub struct Dpdk {
     port: u16,
@@ -90,6 +94,7 @@ pub struct Dpdk {
     tx_queue: u16,
     pool: NonNull<c_void>,
     tso: Option<TsoConfig>,
+    shared_limit: Option<u16>,
     rx_timestamp: Option<TimestampConfig>,
     tx_scheduling: Option<TimestampConfig>,
     _local: PhantomData<Rc<()>>,
@@ -135,6 +140,7 @@ impl Dpdk {
             tx_queue,
             pool,
             tso: None,
+            shared_limit: None,
             rx_timestamp: None,
             tx_scheduling: None,
             _local: PhantomData,
@@ -264,6 +270,19 @@ impl Dpdk {
 // Keep the default Unsupported TX timestamp methods: SEND_ON_TIMESTAMP is
 // launch scheduling, and timesync TX targets PTP, not ordinary TCP completion.
 impl PacketIo for Dpdk {
+    fn reclaim_transmit(&mut self, budget: usize) -> io::Result<usize> {
+        self.reclaim_shared(budget)
+    }
+    fn zero_copy_capabilities(&self) -> Option<ntcp_io::ZeroCopyCapabilities> {
+        self.shared_capabilities()
+    }
+    fn zero_copy_payload_supported(&self, payload: &ntcp_io::Payload) -> bool {
+        self.supports_shared(payload)
+    }
+    fn transmit_zero_copy(&mut self, packet: &ntcp_io::OwnedPacket) -> io::Result<TxOutcome> {
+        self.submit_shared(packet)
+    }
+
     fn tcp_segmentation_capabilities(&self) -> Option<TcpSegmentationCapabilities> {
         self.tso.map(|c| TcpSegmentationCapabilities {
             max_aggregate_len: MAX_PACKET_LEN

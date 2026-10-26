@@ -83,6 +83,31 @@ pub fn ipv4_bounds(b: &[u8]) -> Result<(usize, usize), Error> {
 //# changes and the new PMTU is lower, it will be discovered.
 
 pub fn encode(packet: &mut [u8], transmit: ntcp::Transmit, timestamp: u32) -> Result<usize, Error> {
+    encode_present(packet, transmit, timestamp, transmit.len)
+}
+
+/// Encode IP around an already checksummed TCP header. The remaining TCP bytes
+/// reside in immutable external payload ranges; only present header bytes move.
+pub fn encode_shared_header(
+    packet: &mut [u8],
+    transmit: ntcp::Transmit,
+    timestamp: u32,
+    tcp_header_len: usize,
+) -> Result<usize, Error> {
+    if !(20..=60).contains(&tcp_header_len)
+        || !tcp_header_len.is_multiple_of(4)
+        || tcp_header_len > transmit.len
+    {
+        return Err(Error::Length);
+    }
+    encode_present(packet, transmit, timestamp, tcp_header_len)
+}
+fn encode_present(
+    packet: &mut [u8],
+    transmit: ntcp::Transmit,
+    timestamp: u32,
+    present: usize,
+) -> Result<usize, Error> {
     let ntcp::Transmit {
         ip,
         len: tcp_len,
@@ -101,13 +126,14 @@ pub fn encode(packet: &mut [u8], transmit: ntcp::Transmit, timestamp: u32) -> Re
         .map_err(|_| Error::Options)?;
     let header_len = IP_HEADER + option_len;
     let total_len = tcp_len.checked_add(header_len).ok_or(Error::Length)?;
-    if total_len > usize::from(u16::MAX) || total_len > packet.len() {
+    let stored_len = header_len.checked_add(present).ok_or(Error::Length)?;
+    if total_len > usize::from(u16::MAX) || stored_len > packet.len() {
         return Err(Error::Length);
     }
     if hop_limit == 0 || dscp > 63 || ecn > 3 {
         return Err(Error::Invalid);
     }
-    packet.copy_within(IP_HEADER..IP_HEADER + tcp_len, header_len);
+    packet.copy_within(IP_HEADER..IP_HEADER + present, header_len);
     let header = &mut packet[..header_len];
     header.fill(0);
     header[0] = 0x40 | (header_len / 4) as u8;
@@ -140,7 +166,7 @@ pub fn encode(packet: &mut [u8], transmit: ntcp::Transmit, timestamp: u32) -> Re
     header[16..20].copy_from_slice(&destination.octets());
     let sum = checksum(header);
     header[10..12].copy_from_slice(&sum.to_be_bytes());
-    Ok(total_len)
+    Ok(stored_len)
 }
 
 // Checked quoted header: returns metadata, header length, original packet

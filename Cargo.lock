@@ -94,6 +94,7 @@ version = "0.0.1"
 dependencies = [
  "hmac",
  "libc",
+ "ntcp-buffer",
  "ntcp-icmp",
  "ntcp-io",
  "ntcp-io-tun",
@@ -104,6 +105,10 @@ dependencies = [
  "siphasher",
  "subtle",
 ]
+
+[[package]]
+name = "ntcp-buffer"
+version = "0.0.1"
 
 [[package]]
 name = "ntcp-egress"
@@ -134,6 +139,7 @@ name = "ntcp-io"
 version = "0.0.1"
 dependencies = [
  "libc",
+ "ntcp-buffer",
 ]
 
 [[package]]

@@ -28,6 +28,7 @@ fn scheduled_mbuf_encoding_and_rejection_not_live_launch() {
         }
         let _host = Host;
         let mut io = Dpdk::from_borrowed(port as u16, 0, 0, ntcp_test_pool()).unwrap();
+        shared::ring_test(&mut io);
         ntcp_test_tso_gate();
         assert_eq!(io.tcp_segmentation_capabilities(), None);
         let request = TcpSegmentationRequest {
