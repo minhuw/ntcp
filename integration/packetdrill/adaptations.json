@@ -24,6 +24,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -94,6 +96,8 @@
           "options": [
             "immediate-ack"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -167,6 +171,8 @@
           "options": [
             "immediate-ack"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -242,6 +248,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -311,6 +319,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -384,6 +394,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -453,6 +465,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -522,6 +536,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -592,6 +608,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -662,6 +680,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -732,6 +752,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -801,6 +823,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -870,6 +894,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -939,6 +965,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -1008,6 +1036,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -1077,6 +1107,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -1148,6 +1180,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -1242,6 +1276,8 @@
           "options": [
             "ecn"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -1314,6 +1350,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -1383,6 +1421,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -1452,6 +1492,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -1521,6 +1563,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -1590,6 +1634,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -1659,6 +1705,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -1728,6 +1776,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -1797,6 +1847,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -1866,6 +1918,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -1935,6 +1989,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -2004,6 +2060,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -2073,6 +2131,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -2143,6 +2203,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -2228,6 +2290,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -2298,6 +2362,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -2368,6 +2434,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -2438,6 +2506,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -2508,6 +2578,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -2573,6 +2645,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -2659,6 +2733,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -2745,6 +2821,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -2829,6 +2907,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -2913,6 +2993,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -3002,6 +3084,8 @@
           "options": [
             "budget128m"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -3075,6 +3159,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -3147,6 +3233,8 @@
           "options": [
             "ecn"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -3231,6 +3319,8 @@
           "options": [
             "budget128m"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -3313,6 +3403,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -3383,6 +3475,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -3455,6 +3549,8 @@
           "options": [
             "budget128m"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -3539,6 +3635,8 @@
           "options": [
             "budget128m"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -3621,6 +3719,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -3716,6 +3816,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -3813,6 +3915,8 @@
           "options": [
             "budget128m"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -3888,6 +3992,8 @@
           "options": [
             "budget128m"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -3961,6 +4067,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -4051,6 +4159,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -4149,6 +4259,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -4224,6 +4336,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -4293,6 +4407,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -4362,6 +4478,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -4431,6 +4549,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -4500,6 +4620,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -4570,6 +4692,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -4656,6 +4780,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -4742,6 +4868,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -4827,6 +4955,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -4896,6 +5026,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -4968,6 +5100,8 @@
           "options": [
             "no-timestamps"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -5061,6 +5195,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -5130,6 +5266,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -5200,6 +5338,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -5290,6 +5430,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -5362,6 +5504,8 @@
           "options": [
             "lowat4000"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -5443,6 +5587,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -5519,6 +5665,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -5589,6 +5737,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -5660,6 +5810,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -5732,6 +5884,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -5802,6 +5956,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -5872,6 +6028,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -5942,6 +6100,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -6006,6 +6166,8 @@
           "options": [
             "linux-cookie"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -6097,6 +6259,8 @@
           "options": [
             "linux-cookie"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -6188,6 +6352,8 @@
           "options": [
             "linux-cookie"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -6286,6 +6452,8 @@
             "pmtud1500",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -6393,6 +6561,8 @@
             "pmtud1500",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -6500,6 +6670,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -6606,6 +6778,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -6712,6 +6886,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -6817,6 +6993,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -6920,6 +7098,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -7023,6 +7203,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -7126,6 +7308,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -7229,6 +7413,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -7332,6 +7518,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -7435,6 +7623,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -7538,6 +7728,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -7641,6 +7833,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -7740,6 +7934,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -7822,6 +8018,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -7925,6 +8123,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -8028,6 +8228,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -8131,6 +8333,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -8230,6 +8434,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -8322,6 +8528,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -8415,6 +8623,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -8475,30 +8685,27 @@
       "command_line": "`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0 \\\n                             /proc/sys/net/ipv4/tcp_fastopen=5`\n",
       "command_sha256": "d72485b6d2f39a9555c9d78058a6811a69dcc9fe55cc5d1381293b7f819842fd",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n\n",
-      "adapter_flags": "upstream,local=192.168.0.1",
+      "adapter_flags": "upstream,local=192.168.0.1,application-protected-tfo-client,budget224m,no-timestamps",
       "embedded_tcp_info": true,
       "inventory_audit": {
         "source_family": "fastopen",
-        "blocked_capabilities": [
-          "cookieless",
-          "dynamic"
-        ]
+        "blocked_capabilities": []
       },
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0 \\\n                             /proc/sys/net/ipv4/tcp_fastopen=5`",
           "sha256": "2d444c8a0010c10896dec4051a4fc6924e95367b6ed9ced115857d624eab7002",
-          "semantic_mapping": "Unavailable: source is retained and never executed: Setup requires accepting or sending early data without a validated cookie (tcp_fastopen cookie-not-required bits); no packet-backend configuration maps this policy. Original early-data authorization assertions are retained. The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "semantic_mapping": "Process-local explicit client policy and exact timed return to required-cookie default; original data, syscalls and assertions remain. Existing connections and negative evidence survive. No host sysctl or shell execution."
         },
         {
           "command": "`sysctl -q net.ipv4.tcp_fastopen=1`",
           "sha256": "f755bb2b76f19c1b35a1cc77a0e5e2fc30e10de23f56c2955d6890517b09f7e0",
-          "semantic_mapping": "Unavailable: source is retained and never executed: Setup requires accepting or sending early data without a validated cookie (tcp_fastopen cookie-not-required bits); no packet-backend configuration maps this policy. Original early-data authorization assertions are retained. The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "semantic_mapping": "Process-local explicit client policy and exact timed return to required-cookie default; original data, syscalls and assertions remain. Existing connections and negative evidence survive. No host sysctl or shell execution."
         },
         {
           "command": "`/tmp/sysctl_restore_${PPID}.sh`",
           "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
-          "semantic_mapping": "Unavailable: source is retained and never executed: Setup requires accepting or sending early data without a validated cookie (tcp_fastopen cookie-not-required bits); no packet-backend configuration maps this policy. Original early-data authorization assertions are retained. The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "semantic_mapping": "Process-local explicit client policy and exact timed return to required-cookie default; original data, syscalls and assertions remain. Existing connections and negative evidence survive. No host sysctl or shell execution."
         }
       ],
       "mapping": {
@@ -8515,10 +8722,16 @@
           "hardware_tso": false,
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
-          "options": [],
+          "options": [
+            "application-protected-tfo-client",
+            "budget224m",
+            "no-timestamps"
+          ],
+          "fast_open_client_policy": "ApplicationProtected",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
-          "timestamps": true,
+          "timestamps": false,
           "initial_window": "Iw10",
           "fast_open_early_response": false,
           "rack": true,
@@ -8531,7 +8744,7 @@
           "mss": 1460,
           "receive_capacity": 8388608,
           "window_scale": 8,
-          "endpoint_max_buffer_bytes": 33554432,
+          "endpoint_max_buffer_bytes": 234881024,
           "congestion_control": "Cubic",
           "cubic_hystart": true,
           "cubic_fast_convergence": true,
@@ -8552,13 +8765,18 @@
         },
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
-        "claim": "Capability audit only; source is retained and not executed.",
+        "claim": "Setup-only mapping; behavioral differences remain failures.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "Setup requires accepting or sending early data without a validated cookie (tcp_fastopen cookie-not-required bits); no packet-backend configuration maps this policy. Original early-data authorization assertions are retained.",
-          "The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "Exact tcp_fastopen=5 explicitly selects option-omitted active-open data for protected services; retain conservative cold peer MSS, actual SYN accounting and negative-response evidence.",
+          "Exact initial setup disables timestamps throughout the source.",
+          "Five sequential connections retain charged active and closing pools; use the existing bounded seven-connection budget without changing per-socket accounting."
         ],
-        "option_reasons": {}
+        "option_reasons": {
+          "application-protected-tfo-client": "Exact tcp_fastopen=5 explicitly selects option-omitted active-open data for protected services; retain conservative cold peer MSS, actual SYN accounting and negative-response evidence.",
+          "no-timestamps": "Exact initial setup disables timestamps throughout the source.",
+          "budget224m": "Five sequential connections retain charged active and closing pools; use the existing bounded seven-connection budget without changing per-socket accounting."
+        }
       },
       "additional_setup_files": [
         {
@@ -8566,10 +8784,11 @@
           "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
         }
       ],
-      "blocked_reasons": [
-        "Setup requires accepting or sending early data without a validated cookie (tcp_fastopen cookie-not-required bits); no packet-backend configuration maps this policy. Original early-data authorization assertions are retained.",
-        "The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
-      ]
+      "cookieless_client_control": true,
+      "cookieless_client_event_sha256": "f23c0e851dbe6889c8b38aa4924c783376330025fa4c4170c18ce74114dab3d6",
+      "restore_line": "`/tmp/sysctl_restore_${PPID}.sh`\n",
+      "restore_sha256": "60a62f306d37841760269f429facc4f42420d9a0f3331bcb8ac55a14f7e84b48",
+      "restore_replacement_line": "// ntcp profile is process-local; no host sysctls to restore.\n"
     },
     "fastopen/client/fallback-exp-opt.pkt": {
       "source_sha256": "413bf23175b354b0fa21f864675507e402573ee7ba4553b14f4a782c536898b5",
@@ -8621,6 +8840,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -8731,6 +8952,8 @@
             "budget224m",
             "no-timestamps"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -8847,6 +9070,8 @@
             "budget224m",
             "no-timestamps"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -8958,6 +9183,8 @@
             "budget224m",
             "no-timestamps"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -9030,19 +9257,19 @@
       "inventory_audit": {
         "source_family": "fastopen",
         "blocked_capabilities": [
-          "ipv6"
+          "ipv6-setup"
         ]
       },
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`",
           "sha256": "5cb0e8a62ef4087e6344a5d7ef9cbd8721bdcec466c0c5cbb789a793a8d87dbc",
-          "semantic_mapping": "Unavailable: source is retained and never executed: This source requires IPv6 TCP/ICMPv6 packet injection; the packetdrill socket backend and capture interface implement IPv4 only."
+          "semantic_mapping": "Unavailable: source is retained and never executed: IPv6 socket/wire support is available, but this IPv6-only source still has no audited mapping for its no-timestamps setup and 1440-byte advertised MSS assumption under the pinned 1520-byte IPv6 variant. Original MSS and ICMPv6 quote assertions remain unchanged."
         },
         {
           "command": "`/tmp/sysctl_restore_${PPID}.sh`",
           "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
-          "semantic_mapping": "Unavailable: source is retained and never executed: This source requires IPv6 TCP/ICMPv6 packet injection; the packetdrill socket backend and capture interface implement IPv4 only."
+          "semantic_mapping": "Unavailable: source is retained and never executed: IPv6 socket/wire support is available, but this IPv6-only source still has no audited mapping for its no-timestamps setup and 1440-byte advertised MSS assumption under the pinned 1520-byte IPv6 variant. Original MSS and ICMPv6 quote assertions remain unchanged."
         }
       ],
       "mapping": {
@@ -9060,6 +9287,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -9099,7 +9328,7 @@
         "claim": "Capability audit only; source is retained and not executed.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "This source requires IPv6 TCP/ICMPv6 packet injection; the packetdrill socket backend and capture interface implement IPv4 only."
+          "IPv6 socket/wire support is available, but this IPv6-only source still has no audited mapping for its no-timestamps setup and 1440-byte advertised MSS assumption under the pinned 1520-byte IPv6 variant. Original MSS and ICMPv6 quote assertions remain unchanged."
         ],
         "option_reasons": {}
       },
@@ -9110,7 +9339,7 @@
         }
       ],
       "blocked_reasons": [
-        "This source requires IPv6 TCP/ICMPv6 packet injection; the packetdrill socket backend and capture interface implement IPv4 only."
+        "IPv6 socket/wire support is available, but this IPv6-only source still has no audited mapping for its no-timestamps setup and 1440-byte advertised MSS assumption under the pinned 1520-byte IPv6 variant. Original MSS and ICMPv6 quote assertions remain unchanged."
       ]
     },
     "fastopen/client/syn-data-mss.pkt": {
@@ -9157,6 +9386,8 @@
           "options": [
             "budget224m"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -9252,6 +9483,8 @@
             "no-timestamps",
             "prealloc4"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -9357,6 +9590,8 @@
             "no-timestamps",
             "prealloc3"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": false,
@@ -9425,29 +9660,27 @@
       "command_line": "`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n",
       "command_sha256": "0912d315bbb2e31cf6e169eeb8a745141ee7a0d345416062b720b4b62a4c767b",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n",
-      "adapter_flags": "upstream,local=192.168.0.1",
+      "adapter_flags": "upstream,local=192.168.0.1,budget224m,no-timestamps",
       "embedded_tcp_info": true,
       "inventory_audit": {
         "source_family": "fastopen",
-        "blocked_capabilities": [
-          "dynamic"
-        ]
+        "blocked_capabilities": []
       },
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`",
           "sha256": "5cb0e8a62ef4087e6344a5d7ef9cbd8721bdcec466c0c5cbb789a793a8d87dbc",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "semantic_mapping": "Exact setup maps to process-local timestamp defaults; the timed event enables future timestamp negotiation without clearing TFO state or modifying established connections. Restore is process teardown; no host shell or sysctl executes."
         },
         {
           "command": "`sysctl -q net.ipv4.tcp_timestamps=1`",
           "sha256": "012690230414e515e23a3301b2e82eb6c37ac74ddec34f3eb30f63c38a4a32b8",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "semantic_mapping": "Exact setup maps to process-local timestamp defaults; the timed event enables future timestamp negotiation without clearing TFO state or modifying established connections. Restore is process teardown; no host shell or sysctl executes."
         },
         {
           "command": "`/tmp/sysctl_restore_${PPID}.sh`",
           "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
-          "semantic_mapping": "Unavailable: source is retained and never executed: The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "semantic_mapping": "Exact setup maps to process-local timestamp defaults; the timed event enables future timestamp negotiation without clearing TFO state or modifying established connections. Restore is process teardown; no host shell or sysctl executes."
         }
       ],
       "mapping": {
@@ -9464,10 +9697,15 @@
           "hardware_tso": false,
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
-          "options": [],
+          "options": [
+            "budget224m",
+            "no-timestamps"
+          ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
-          "timestamps": true,
+          "timestamps": false,
           "initial_window": "Iw10",
           "fast_open_early_response": false,
           "rack": true,
@@ -9480,7 +9718,7 @@
           "mss": 1460,
           "receive_capacity": 8388608,
           "window_scale": 8,
-          "endpoint_max_buffer_bytes": 33554432,
+          "endpoint_max_buffer_bytes": 234881024,
           "congestion_control": "Cubic",
           "cubic_hystart": true,
           "cubic_fast_convergence": true,
@@ -9501,12 +9739,17 @@
         },
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
-        "claim": "Capability audit only; source is retained and not executed.",
+        "claim": "Setup-only mapping; all original behavioral assertions remain unchanged and mismatches remain failures.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
+          "Original setup disables timestamps until the exact timed event enables negotiation for future connections; existing connections and TFO cache remain unchanged.",
+          "Six sequential client connections retain charged active and closing storage across the original trace; use the existing bounded seven-connection budget without changing per-socket accounting.",
+          "Only the three exact hash-audited configuration commands are translated; no TFO cache flush or negative-response policy override."
         ],
-        "option_reasons": {}
+        "option_reasons": {
+          "no-timestamps": "Original setup disables timestamps until the exact timed event enables negotiation for future connections; existing connections and TFO cache remain unchanged.",
+          "budget224m": "Six sequential client connections retain charged active and closing storage across the original trace; use the existing bounded seven-connection budget without changing per-socket accounting."
+        }
       },
       "additional_setup_files": [
         {
@@ -9514,9 +9757,11 @@
           "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
         }
       ],
-      "blocked_reasons": [
-        "The script changes process-global TCP settings or clears the Fast Open cache during timed events; there is no audited process-local control mapping for these events. A static profile cannot replace them faithfully."
-      ]
+      "timestamp_on_control": true,
+      "timestamp_event_sha256": "36e51e51236bccc89efd15ea04ab07a7409b3f411c092d835b6e94a9ead243e8",
+      "restore_line": "`/tmp/sysctl_restore_${PPID}.sh`\n",
+      "restore_sha256": "60a62f306d37841760269f429facc4f42420d9a0f3331bcb8ac55a14f7e84b48",
+      "restore_replacement_line": "// ntcp profile is process-local; no host sysctls to restore.\n"
     },
     "fastopen/server/basic-cookie-not-reqd.pkt": {
       "source_sha256": "2039dc9526b6f58746892cc5bed1a5561aa221deb60b4f98c94c29d5ee7e8fb4",
@@ -9527,24 +9772,22 @@
       "command_line": "`../../common/defaults.sh\n ../../common/set_sysctls.py  /proc/sys/net/ipv4/tcp_fastopen=0x202`\n",
       "command_sha256": "b850ed1e07c6595ec839f91ba1d54c37fd19e52a3b242cf889232f5c6b8e9594",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n",
-      "adapter_flags": "upstream,local=192.168.0.1",
+      "adapter_flags": "upstream,local=192.168.0.1,application-protected-tfo",
       "embedded_tcp_info": true,
       "inventory_audit": {
         "source_family": "fastopen",
-        "blocked_capabilities": [
-          "cookieless"
-        ]
+        "blocked_capabilities": []
       },
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh\n ../../common/set_sysctls.py  /proc/sys/net/ipv4/tcp_fastopen=0x202`",
           "sha256": "584b13e4a653acbefcae3c4be2cdd7d91f5f893483545ee665d5f7d14c6e823a",
-          "semantic_mapping": "Unavailable: source is retained and never executed: Setup requires accepting or sending early data without a validated cookie (tcp_fastopen cookie-not-required bits); no packet-backend configuration maps this policy. Original early-data authorization assertions are retained."
+          "semantic_mapping": "Exact setup/restore translation to process-local server admission; no host sysctl or shell executes. The source explicitly opts in with TCP_FASTOPEN. Other Linux mask bits are unexercised here and do not enable client cookie bypass."
         },
         {
           "command": "`/tmp/sysctl_restore_${PPID}.sh`",
           "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
-          "semantic_mapping": "Unavailable: source is retained and never executed: Setup requires accepting or sending early data without a validated cookie (tcp_fastopen cookie-not-required bits); no packet-backend configuration maps this policy. Original early-data authorization assertions are retained."
+          "semantic_mapping": "Exact setup/restore translation to process-local server admission; no host sysctl or shell executes. The source explicitly opts in with TCP_FASTOPEN. Other Linux mask bits are unexercised here and do not enable client cookie bypass."
         }
       ],
       "mapping": {
@@ -9561,7 +9804,11 @@
           "hardware_tso": false,
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
-          "options": [],
+          "options": [
+            "application-protected-tfo"
+          ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "ApplicationProtected",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -9598,12 +9845,17 @@
         },
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
-        "claim": "Capability audit only; source is retained and not executed.",
+        "claim": "Linux-compatible explicit server admission, not client cookie bypass or host sysctl emulation.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "Setup requires accepting or sending early data without a validated cookie (tcp_fastopen cookie-not-required bits); no packet-backend configuration maps this policy. Original early-data authorization assertions are retained."
+          "Explicit listener application-protected policy supplies server bit0x200; pending quotas, TCP option parsing and normal listener TFO enablement remain active.",
+          "Endpoint and client default policies remain unchanged; source TCP_FASTOPEN calls enable their own listener.",
+          "Exact server bit0x200 selects explicit listener application-protected admission; skip cookie MAC verification/generation, retain endpoint/listener enablement, pending/reset-debt quota and TCP validation. Client no-cookie policy remains off."
         ],
-        "option_reasons": {}
+        "option_reasons": {
+          "application-protected-tfo": "Exact server bit0x200 selects explicit listener application-protected admission; skip cookie MAC verification/generation, retain endpoint/listener enablement, pending/reset-debt quota and TCP validation. Client no-cookie policy remains off."
+        },
+        "scope": "fastopen/server/basic-cookie-not-reqd.pkt; all packet/syscall/assertion/timing bytes preserved; setup-only application-protected server policy"
       },
       "additional_setup_files": [
         {
@@ -9611,9 +9863,9 @@
           "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
         }
       ],
-      "blocked_reasons": [
-        "Setup requires accepting or sending early data without a validated cookie (tcp_fastopen cookie-not-required bits); no packet-backend configuration maps this policy. Original early-data authorization assertions are retained."
-      ]
+      "restore_line": "`/tmp/sysctl_restore_${PPID}.sh`\n",
+      "restore_sha256": "60a62f306d37841760269f429facc4f42420d9a0f3331bcb8ac55a14f7e84b48",
+      "restore_replacement_line": "// ntcp profile is process-local; no host sysctls to restore.\n"
     },
     "fastopen/server/basic-rw.pkt": {
       "source_sha256": "b34f2c15ae328f443f564de91577bc7772816e5997388aa3198881932ac5a896",
@@ -9654,6 +9906,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -9740,6 +9994,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -9827,6 +10083,8 @@
             "early-response",
             "linux-cookie"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -9921,6 +10179,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -10018,6 +10278,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -10106,6 +10368,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -10162,19 +10426,17 @@
       "command_line": "`../../../common/defaults.sh\n sysctl -q net.ipv4.tcp_fastopen=0x202`\n",
       "command_sha256": "696067240667d197a1da4056e767080570379cc34e3484737cf81b1a0aba06d9",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n",
-      "adapter_flags": "upstream,local=192.168.0.1",
+      "adapter_flags": "upstream,local=192.168.0.1,application-protected-tfo",
       "embedded_tcp_info": true,
       "inventory_audit": {
         "source_family": "fastopen",
-        "blocked_capabilities": [
-          "cookieless"
-        ]
+        "blocked_capabilities": []
       },
       "audited_shell_commands": [
         {
           "command": "`../../../common/defaults.sh\n sysctl -q net.ipv4.tcp_fastopen=0x202`",
           "sha256": "40f9e22c0246c224189191c7a6846e5ca40f17236f5e079ffe02443f1cf2cb1a",
-          "semantic_mapping": "Unavailable: source is retained and never executed: Setup requires accepting or sending early data without a validated cookie (tcp_fastopen cookie-not-required bits); no packet-backend configuration maps this policy. Original early-data authorization assertions are retained."
+          "semantic_mapping": "Exact setup/restore translation to process-local server admission; no host sysctl or shell executes. The source explicitly opts in with TCP_FASTOPEN. Other Linux mask bits are unexercised here and do not enable client cookie bypass."
         }
       ],
       "mapping": {
@@ -10191,7 +10453,11 @@
           "hardware_tso": false,
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
-          "options": [],
+          "options": [
+            "application-protected-tfo"
+          ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "ApplicationProtected",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -10228,16 +10494,18 @@
         },
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
-        "claim": "Capability audit only; source is retained and not executed.",
+        "claim": "Linux-compatible explicit server admission, not client cookie bypass or host sysctl emulation.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "Setup requires accepting or sending early data without a validated cookie (tcp_fastopen cookie-not-required bits); no packet-backend configuration maps this policy. Original early-data authorization assertions are retained."
+          "Explicit listener application-protected policy supplies server bit0x200; pending quotas, TCP option parsing and normal listener TFO enablement remain active.",
+          "Endpoint and client default policies remain unchanged; source TCP_FASTOPEN calls enable their own listener.",
+          "Exact server bit0x200 selects explicit listener application-protected admission; skip cookie MAC verification/generation, retain endpoint/listener enablement, pending/reset-debt quota and TCP validation. Client no-cookie policy remains off."
         ],
-        "option_reasons": {}
-      },
-      "blocked_reasons": [
-        "Setup requires accepting or sending early data without a validated cookie (tcp_fastopen cookie-not-required bits); no packet-backend configuration maps this policy. Original early-data authorization assertions are retained."
-      ]
+        "option_reasons": {
+          "application-protected-tfo": "Exact server bit0x200 selects explicit listener application-protected admission; skip cookie MAC verification/generation, retain endpoint/listener enablement, pending/reset-debt quota and TCP validation. Client no-cookie policy remains off."
+        },
+        "scope": "fastopen/server/opt34/basic-cookie-not-reqd.pkt; all packet/syscall/assertion/timing bytes preserved; setup-only application-protected server policy"
+      }
     },
     "fastopen/server/opt34/basic-rw.pkt": {
       "source_sha256": "b3f88cbd6d3e747ee444cb183cc126ece73ffb7abd54f52fb6fcb21860a2ce44",
@@ -10280,6 +10548,8 @@
             "linux-cookie",
             "tfo-listen"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -10379,6 +10649,8 @@
             "linux-cookie",
             "tfo-listen"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -10487,6 +10759,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -10574,6 +10848,8 @@
             "linux-cookie",
             "tfo-listen"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -10685,6 +10961,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -10772,6 +11050,8 @@
             "linux-cookie",
             "tfo-listen"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -10869,6 +11149,8 @@
             "linux-cookie",
             "tfo-listen"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -10969,6 +11251,8 @@
             "tfo-key=f763bfa0813d80ed301d64cd904abcce",
             "tfo-listen"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -11079,6 +11363,8 @@
             "tfo-key=f763bfa0813d80ed301d64cd904abcce",
             "tfo-listen"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -11190,6 +11476,8 @@
             "tfo-key=f763bfa0813d80ed301d64cd904abcce",
             "tfo-listen"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -11299,6 +11587,8 @@
             "linux-cookie",
             "tfo-listen"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -11415,6 +11705,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -11507,6 +11799,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -11593,6 +11887,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -11679,6 +11975,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -11765,6 +12063,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -11857,6 +12157,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -11957,6 +12259,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -12057,6 +12361,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -12156,6 +12462,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -12248,6 +12556,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -12332,6 +12642,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -12418,6 +12730,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -12502,6 +12816,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -12584,6 +12900,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -12666,6 +12984,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -12760,6 +13080,8 @@
             "no-gso",
             "pmtud1500"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -12839,31 +13161,28 @@
       "expected_command_count": 3,
       "command_line": "`../common/defaults.sh\n ../common/set_sysctls.py \\\n\t/proc/sys/net/ipv4/tcp_mtu_probing=2 \\\n\t/proc/sys/net/ipv4/tcp_base_mss=512\n ip -6 route change 2001:DB8::1 via fd3d:fa7b:d17d:8888::0 dev tun0 advmss 600 mtu lock 660 initcwnd 11\n ethtool -K tun0 gso off tso off\n`\n",
       "command_sha256": "c28a32713dff3ecffb05c9b10b1bf6e4f0e5279ac4880ec155fe52d69f246f6d",
-      "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n\n\n\n\n\n",
-      "adapter_flags": "upstream,local=192.168.0.1",
+      "replacement_line": "0 `ntcp-local-route-set 2001:db8::1 660 600 572`\n\n\n\n\n\n\n",
+      "adapter_flags": "upstream,local=fd::1,link-mtu=1520,no-gso",
       "embedded_tcp_info": false,
       "inventory_audit": {
         "source_family": "mtu_probe",
-        "blocked_capabilities": [
-          "ipv6",
-          "mtu"
-        ]
+        "blocked_capabilities": []
       },
       "audited_shell_commands": [
         {
           "command": "`../common/defaults.sh\n ../common/set_sysctls.py \\\n\t/proc/sys/net/ipv4/tcp_mtu_probing=2 \\\n\t/proc/sys/net/ipv4/tcp_base_mss=512\n ip -6 route change 2001:DB8::1 via fd3d:fa7b:d17d:8888::0 dev tun0 advmss 600 mtu lock 660 initcwnd 11\n ethtool -K tun0 gso off tso off\n`",
           "sha256": "73363180f91f4e5841ace8d50abbbb30a2ffa93abce5cf5ab9dff5ae0566625d",
-          "semantic_mapping": "Unavailable: source is retained and never executed: This source requires IPv6 TCP/ICMPv6 packet injection; the packetdrill socket backend and capture interface implement IPv4 only. No audited control maps tcp_mtu_probing=2, tcp_base_mss=512, per-route advmss/locked MTU/initcwnd11, GSO disablement, and the timed route-MTU increase to this backend. ICMP PMTUD alone does not reproduce this PLPMTUD setup."
+          "semantic_mapping": "Exact command maps only to the process-local destination packetization API; original timing retained. No host route, qdisc, sysctl or interface is changed. IW10 and validated ICMP policy retained; no Linux route locking equivalence."
         },
         {
           "command": "`ip -6 route change 2001:DB8::1 via fd3d:fa7b:d17d:8888::0 dev tun0 advmss 1480 mtu lock 1520`",
           "sha256": "2f1d35139f8c6e814e40dceff59b9878e4fcb2b40681a43acabb8eb4de35ca6d",
-          "semantic_mapping": "Unavailable: source is retained and never executed: This source requires IPv6 TCP/ICMPv6 packet injection; the packetdrill socket backend and capture interface implement IPv4 only. No audited control maps tcp_mtu_probing=2, tcp_base_mss=512, per-route advmss/locked MTU/initcwnd11, GSO disablement, and the timed route-MTU increase to this backend. ICMP PMTUD alone does not reproduce this PLPMTUD setup."
+          "semantic_mapping": "Exact command maps only to the process-local destination packetization API; original timing retained. No host route, qdisc, sysctl or interface is changed. IW10 and validated ICMP policy retained; no Linux route locking equivalence."
         },
         {
           "command": "`/tmp/sysctl_restore_${PPID}.sh`",
           "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
-          "semantic_mapping": "Unavailable: source is retained and never executed: This source requires IPv6 TCP/ICMPv6 packet injection; the packetdrill socket backend and capture interface implement IPv4 only. No audited control maps tcp_mtu_probing=2, tcp_base_mss=512, per-route advmss/locked MTU/initcwnd11, GSO disablement, and the timed route-MTU increase to this backend. ICMP PMTUD alone does not reproduce this PLPMTUD setup."
+          "semantic_mapping": "Exact command maps only to the process-local destination packetization API; original timing retained. No host route, qdisc, sysctl or interface is changed. IW10 and validated ICMP policy retained; no Linux route locking equivalence."
         }
       ],
       "mapping": {
@@ -12874,13 +13193,18 @@
           "transmit_batch_clock": "monotonic sample per selection/accept",
           "egress_pipeline": "shared production scheduler",
           "general_pacing": false,
-          "software_gso": true,
-          "capture_boundary": "individual raw IPv4 TCP wire segments",
+          "software_gso": false,
+          "capture_boundary": "individual raw IPv6 TCP wire segments",
           "capture_clock": "realtime epoch microseconds at backend submission",
           "hardware_tso": false,
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
-          "options": [],
+          "options": [
+            "link-mtu=1520",
+            "no-gso"
+          ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -12913,17 +13237,33 @@
           "fast_open_listener_default": false,
           "fast_open_cache": "fresh runtime",
           "fast_open_cookie_policy": "hmac-sha256",
-          "pacing_config": null
+          "pacing_config": null,
+          "pmtud_first_hop_mtu": 1520
         },
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
-        "claim": "Capability audit only; source is retained and not executed.",
+        "claim": "Exact source setup mapped to native IPv6 destination packetization policies; physical link and received PTB minimums retained. Common IW10 and validated ICMP policy retained independently of Linux route locking. Original assertions unchanged.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "This source requires IPv6 TCP/ICMPv6 packet injection; the packetdrill socket backend and capture interface implement IPv4 only.",
-          "No audited control maps tcp_mtu_probing=2, tcp_base_mss=512, per-route advmss/locked MTU/initcwnd11, GSO disablement, and the timed route-MTU increase to this backend. ICMP PMTUD alone does not reproduce this PLPMTUD setup."
+          "Pinned synthetic IPv6 link MTU1520; physical minimum retained independently of administrative route660 and initial search572.",
+          "Original strict segment checking disables GSO/TSO; disable software aggregation without changing TCP packet assertions."
         ],
-        "option_reasons": {}
+        "option_reasons": {
+          "link-mtu=1520": "Pinned synthetic IPv6 link MTU1520; physical minimum retained independently of administrative route660 and initial search572.",
+          "no-gso": "Original strict segment checking disables GSO/TSO; disable software aggregation without changing TCP packet assertions."
+        },
+        "destination_route": {
+          "destination": "2001:db8::1",
+          "initial_mtu_cap": 660,
+          "initial_advertised_mss": 600,
+          "initial_search_low": 572,
+          "updated_mtu_cap": 1520,
+          "future_advertised_mss": 1480,
+          "initial_window": "Common RFC6928 IW10; byte/window/queued-tail admission already permits this probe, without Linux-specific cwnd>=11 gate.",
+          "scope": "Runtime-owned destination transport policy; synthetic packet context does not configure host gateway/device. Strict scalar capture, no offload.",
+          "locked_route": "Administrative MTU ceiling; ordinary validated ICMP and DF policy retained. No claim of Linux route locking/discovery-disable equivalence.",
+          "ipv6_minimum": "Physical link>=1280 and received PTB<1280 rejection retained; explicit route and search values are transport packetization settings."
+        }
       },
       "additional_setup_files": [
         {
@@ -12931,10 +13271,11 @@
           "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
         }
       ],
-      "blocked_reasons": [
-        "This source requires IPv6 TCP/ICMPv6 packet injection; the packetdrill socket backend and capture interface implement IPv4 only.",
-        "No audited control maps tcp_mtu_probing=2, tcp_base_mss=512, per-route advmss/locked MTU/initcwnd11, GSO disablement, and the timed route-MTU increase to this backend. ICMP PMTUD alone does not reproduce this PLPMTUD setup."
-      ]
+      "route_control": true,
+      "route_event_sha256": "dfa41dd8c75646ab7b53f64128e7054d59105fd4d7382aa63502afc79dd7bf0b",
+      "restore_line": "`/tmp/sysctl_restore_${PPID}.sh`\n",
+      "restore_sha256": "60a62f306d37841760269f429facc4f42420d9a0f3331bcb8ac55a14f7e84b48",
+      "restore_replacement_line": "// ntcp destination routes are local to this runtime.\n"
     },
     "zerocopy/basic.pkt": {
       "source_sha256": "53328c4fbce52cb6f90c15315fa55888bcb5e41c88df7883fc63f3f6738c58b5",
@@ -12973,6 +13314,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -13054,6 +13397,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -13135,6 +13480,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -13215,6 +13562,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -13295,6 +13644,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -13376,6 +13727,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -13457,6 +13810,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -13544,6 +13899,8 @@
           "options": [
             "budget128m"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -13602,24 +13959,22 @@
       "command_line": "`../../common/defaults.sh\n ../common/set_sysctls.py /proc/sys/net/ipv4/tcp_fastopen=0x207`\n",
       "command_sha256": "a3a18d64e368d7c4b44d252d954604c2c1f7e556c889ba0792df16a2f5f1c817",
       "replacement_line": "// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n",
-      "adapter_flags": "upstream,local=192.168.0.1",
+      "adapter_flags": "upstream,local=192.168.0.1,application-protected-tfo,early-response",
       "embedded_tcp_info": false,
       "inventory_audit": {
         "source_family": "zerocopy",
-        "blocked_capabilities": [
-          "cookieless"
-        ]
+        "blocked_capabilities": []
       },
       "audited_shell_commands": [
         {
           "command": "`../../common/defaults.sh\n ../common/set_sysctls.py /proc/sys/net/ipv4/tcp_fastopen=0x207`",
           "sha256": "c039dd939a7700a46a9eec0bdad278be038f766332af21127405e21a7ffd22f2",
-          "semantic_mapping": "Unavailable: source is retained and never executed: Setup requires accepting or sending early data without a validated cookie (tcp_fastopen cookie-not-required bits); no packet-backend configuration maps this policy. Original early-data authorization assertions are retained."
+          "semantic_mapping": "Exact setup/restore translation to process-local server admission; no host sysctl or shell executes. The source explicitly opts in with TCP_FASTOPEN. Other Linux mask bits are unexercised here and do not enable client cookie bypass."
         },
         {
           "command": "`/tmp/sysctl_restore_${PPID}.sh`",
           "sha256": "36f3e8473828e29db183e78214cf9b3f29d99f737a137630b79b22d69c52a265",
-          "semantic_mapping": "Unavailable: source is retained and never executed: Setup requires accepting or sending early data without a validated cookie (tcp_fastopen cookie-not-required bits); no packet-backend configuration maps this policy. Original early-data authorization assertions are retained."
+          "semantic_mapping": "Exact setup/restore translation to process-local server admission; no host sysctl or shell executes. The source explicitly opts in with TCP_FASTOPEN. Other Linux mask bits are unexercised here and do not enable client cookie bypass."
         }
       ],
       "mapping": {
@@ -13636,12 +13991,17 @@
           "hardware_tso": false,
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
-          "options": [],
+          "options": [
+            "application-protected-tfo",
+            "early-response"
+          ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "ApplicationProtected",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
           "initial_window": "Iw10",
-          "fast_open_early_response": false,
+          "fast_open_early_response": true,
           "rack": true,
           "prr": "Rfc9937",
           "tlp": true,
@@ -13673,12 +14033,18 @@
         },
         "linux_defaults_reproduced": false,
         "assertions_preserved": true,
-        "claim": "Capability audit only; source is retained and not executed.",
+        "claim": "Linux-compatible explicit server admission, not client cookie bypass or host sysctl emulation.",
         "reasons": [
           "Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.",
-          "Setup requires accepting or sending early data without a validated cookie (tcp_fastopen cookie-not-required bits); no packet-backend configuration maps this policy. Original early-data authorization assertions are retained."
+          "Explicit listener application-protected policy supplies server bit0x200; pending quotas, TCP option parsing and normal listener TFO enablement remain active.",
+          "Endpoint and client default policies remain unchanged; source TCP_FASTOPEN calls enable their own listener.",
+          "Exact server bit0x200 selects explicit listener application-protected admission; skip cookie MAC verification/generation, retain endpoint/listener enablement, pending/reset-debt quota and TCP validation. Client no-cookie policy remains off."
         ],
-        "option_reasons": {}
+        "option_reasons": {
+          "application-protected-tfo": "Exact server bit0x200 selects explicit listener application-protected admission; skip cookie MAC verification/generation, retain endpoint/listener enablement, pending/reset-debt quota and TCP validation. Client no-cookie policy remains off.",
+          "early-response": "The original server sends1000 response bytes before final handshake ACK; enable existing bounded early response. The ordinary unregistered payload retains explicit COPIED completion."
+        },
+        "scope": "zerocopy/fastopen-server.pkt; all packet/syscall/assertion/timing bytes preserved; setup-only application-protected server policy"
       },
       "additional_setup_files": [
         {
@@ -13686,9 +14052,9 @@
           "sha256": "6cd15bf74429a4c3f2c4e7fb93d1a6aff0476840c1b0869ac244cecda0eb4060"
         }
       ],
-      "blocked_reasons": [
-        "Setup requires accepting or sending early data without a validated cookie (tcp_fastopen cookie-not-required bits); no packet-backend configuration maps this policy. Original early-data authorization assertions are retained."
-      ]
+      "restore_line": "`/tmp/sysctl_restore_${PPID}.sh`\n",
+      "restore_sha256": "60a62f306d37841760269f429facc4f42420d9a0f3331bcb8ac55a14f7e84b48",
+      "restore_replacement_line": "// ntcp profile is process-local; no host sysctls to restore.\n"
     },
     "zerocopy/maxfrags.pkt": {
       "source_sha256": "b30ef6786bad996ed0fc4f6d3640bf677cc4bb6de9d329d0acd0e1d52fc7196b",
@@ -13729,6 +14095,8 @@
           "options": [
             "budget224m"
           ],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,
@@ -13812,6 +14180,8 @@
           "gro": false,
           "receive_tcp_segmentation_metadata": true,
           "options": [],
+          "fast_open_client_policy": "RequireCookie",
+          "fast_open_early_data_policy": "RequireCookie",
           "fast_open_client_enabled": true,
           "sack": true,
           "timestamps": true,

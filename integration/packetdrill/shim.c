@@ -31,7 +31,7 @@ static int unsupported(const char *why) {
 extern int ntcp_c_packet_socket(int domain, int type, int protocol);
 static int sock(void *u, int domain, int type, int protocol) {
     if (!NTCP_RUST_CALL(int, ntcp_plugin_active(u))) return -1;
-    if (domain != AF_INET || (type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) != SOCK_STREAM || (protocol && protocol != IPPROTO_TCP)) return unsupported("socket: only IPv4 TCP");
+    if ((domain != AF_INET && domain != AF_INET6) || (type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) != SOCK_STREAM || (protocol && protocol != IPPROTO_TCP)) return unsupported("socket: only IP TCP");
     return ntcp_c_packet_socket(domain,type,protocol);
 }
 extern int ntcp_c_bind(int fd, const struct sockaddr *p, socklen_t n);
@@ -187,7 +187,7 @@ void ntcp_abi_check(void *u) {
     assert(p.fcntl && p.ioctl && p.close && p.shutdown && p.getsockopt && p.setsockopt && p.poll);
     assert(p.netdev_send && p.netdev_receive && p.usleep && p.gettimeofday);
     assert(p.epoll_create && p.epoll_ctl && p.epoll_wait && p.pipe && p.splice);
-    assert(p.socket(u, AF_INET6, SOCK_STREAM, 0) == -1 && errno == ENOSYS);
+    assert(p.socket(u, AF_UNIX, SOCK_STREAM, 0) == -1 && errno == ENOSYS);
     assert(p.ioctl(u, -1, 0) == -1 && errno == ENOSYS);
     assert(p.getsockopt(u, -1, IPPROTO_TCP, TCP_INFO, NULL, NULL) == -1 && errno == EBADF);
     int epfd = p.epoll_create(u, 1); assert(epfd >= 0);

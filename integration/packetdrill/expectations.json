@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "upstream_revision": "83f72d3f9085d0e26eb4d206fe4d7cfab5b6d872",
-  "scope": "The ntcp-ported suite exclusively owns these source-derived accounting tests. The upstream suite excludes these source identities from execution and result counts; the two suites use the same common transport profile.",
+  "scope": "The ntcp-ported suite exclusively owns these source-derived tests with native accounting or transport-policy expectations. The upstream suite excludes these source identities from execution and result counts; the two suites use the same common transport profile.",
   "scripts": {
     "timestamping/partial.pkt": {
       "source_sha256": "5a119eceac60170a8d3cc160c06ee272da119d63286ba1e1a9a87b992490038c",
@@ -46,14 +46,14 @@
       "source_sha256": "b210842cadfbc6d0ce1fee19afb3790dc9b9fe8c1fe02673288a646e3239e644",
       "input_generated_sha256": "0943bca391bead0d64d7d806c196afb51c50300dde35e503342d7501ad77fc92",
       "fixture": "ntcp-expectations/tcp_info/tcp-info-sndbuf-limited.pkt",
-      "fixture_sha256": "8e8e4288eb7bdf6756352be6e7324179758c75fa123b79601003f6ac16d58c88",
-      "rationale": "ntcp SO_SNDBUF10000 is20000 payload bytes. Unpaced HyStart++ and this hard capacity send10k,18k,then20k flights; the Linux source ACK30001/70001/95001 runs ahead. Use a60000-byte blocking workload and valid ACKs while retaining a genuine20ms buffer-starvation interval.",
+      "fixture_sha256": "2c60a568e0df030a524d0f1a5a508c60692aa8949fba57f20203ef2d61d1fb32",
+      "rationale": "ntcp SO_SNDBUF10000 is20000 payload bytes. Unpaced HyStart++ and this hard capacity send10k,20k,then20k flights; the Linux source ACK30001/70001/95001 runs ahead. Use a60000-byte blocking workload and valid ACKs while retaining a genuine20ms buffer-starvation interval.",
       "changes": [
         {
           "field": "blocking write workload",
           "upstream": 150000,
           "ntcp": 60000,
-          "derivation": "48k queued by120ms; final12k becomes admissible on the140ms ACK. The write still blocks until buffer space is freed."
+          "derivation": "50k queued by120ms; final10k becomes admissible on the140ms ACK. The write still blocks until buffer space is freed."
         },
         {
           "field": "write return-time range",
@@ -64,8 +64,8 @@
         {
           "field": "cumulative ACK timeline",
           "upstream": "110ms:10001,120ms:30001,130ms:70001,150ms:95001,170ms:150001",
-          "ntcp": "110ms:10001,120ms:28001,140ms:48001,170ms:60001",
-          "derivation": "Actual transmitted frontiers under20k capacity and10->18->26 MSS growth. Counter snapshots remain150ms and170ms."
+          "ntcp": "110ms:10001,120ms:30001,140ms:50001,170ms:60001",
+          "derivation": "Actual transmitted frontiers under20k capacity and tuned non-paced L16:10->20->36 MSS growth. Counter snapshots remain150ms and170ms; the real20ms buffer-starved interval is unchanged."
         },
         {
           "field": "positive realtime sndbuf-limited bounds",
@@ -87,6 +87,552 @@
         "All ACKs cover transmitted data; positive counter persists after the final ACK.",
         "No runtime, congestion-control, counter or profile changes."
       ]
+    },
+    "epoll/epoll_out_edge.pkt": {
+      "source_sha256": "9b19fb287c49efbeecf90f5a2a75eedbb1bc3ce3b91772b0c7c4b684bdbdcd24",
+      "input_generated_sha256": "9b19fb287c49efbeecf90f5a2a75eedbb1bc3ce3b91772b0c7c4b684bdbdcd24",
+      "fixture": "ntcp-expectations/epoll/epoll_out_edge.pkt",
+      "fixture_sha256": "743b1cf78dfa1352039b510ea03d88394a6c35a1bd54826631496aecde0c2647",
+      "native_setup": {
+        "kind": "explicit-native-socket-options",
+        "linux_setup_reproduced": false,
+        "adapter_flags": "upstream,local=192.168.0.1",
+        "source_command_sha256": "09826d9fab8d8baffb09a4cf2d6117deb60b4a3561f7d907bca04cc99ebfb347",
+        "source_blocked_reasons": [
+          "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are implemented; Linux memory/wakeup equivalence is not claimed."
+        ],
+        "rationale": "Replace the unsupported Linux tcp_wmem default with an explicit native SO_SNDBUF payload limit through the ordinary socket API. Keep the common transport profile.",
+        "socket_options": [
+          {
+            "option": "SO_SNDBUF",
+            "request": 4000,
+            "effective_payload_bytes": 8000
+          },
+          {
+            "option": "TCP_NOTSENT_LOWAT",
+            "raw_value": 4294967295,
+            "effective_value": 4294967295
+          }
+        ]
+      },
+      "rationale": "Exercise native payload-space and LOWAT readiness through real EPOLLET after positive partial writes. Linux skb allocation overshoot and write-space hysteresis are separate host policies.",
+      "changes": [
+        {
+          "field": "Linux tcp_wmem setup",
+          "upstream": "4096 50000 4194304 default/automatic memory accounting",
+          "ntcp": "explicit SO_SNDBUF4000 ->8000 payload bytes; get verifies actual limit",
+          "derivation": "max(2*4000,4608)=8000; each original request59000/180000 remains partial."
+        },
+        {
+          "field": "peer window setup",
+          "upstream": "peer scale7 and open initial window",
+          "ntcp": "peer scale0, initial window0, then2000-byte windows",
+          "derivation": "Exact two-MSS send windows separate buffer-space and notsent transitions without Linux TSO or congestion-growth assumptions."
+        },
+        {
+          "field": "partial write returns",
+          "upstream": "Linux skb-dependent58000/128000/112000 (or finite-LOWAT42000/48000/48000)",
+          "ntcp": "8000 on each of three original59000/180000/180000 write requests",
+          "derivation": "Hard native payload capacity; no positive payload credit returned until cumulative ACK frees actual bytes."
+        },
+        {
+          "field": "LOWAT configuration",
+          "upstream": "raw 0xffffffff",
+          "ntcp": "raw 0xffffffff",
+          "derivation": "Finite4000 tests strict2000-byte half-threshold; raw0 still inherits the common unlimited default and UINT_MAX explicitly disables the gate."
+        },
+        {
+          "field": "writable wakeup timeline",
+          "upstream": "Linux skb memory-wakeup threshold",
+          "ntcp": "first2000-byte cumulative progress",
+          "derivation": "Native OUT requires payload room and2*notsent<effectiveLOWAT."
+        },
+        {
+          "field": "third-cycle polling",
+          "upstream": "intermediate epoll queries",
+          "ntcp": "query only after all data is ACKed",
+          "derivation": "The readiness transition must be retained even when the application did not observe the blocked level."
+        },
+        {
+          "field": "handshake ACK delay",
+          "upstream": 0,
+          "ntcp": "100ms",
+          "derivation": "Give staged10ms cumulative ACKs a realistic RTT budget instead of triggering a sub-millisecond-handshake TLP; common probe/recovery configuration and timing tolerances remain unchanged."
+        }
+      ],
+      "invariants": [
+        "Original source and setup bytes remain hash-audited and unexecuted; Linux setup remains unsupported outside this independently audited port.",
+        "All three writes return a positive prefix smaller than their original request; no application-visible EAGAIN is required.",
+        "Initial writable edge, blocked buffer, one new edge per readiness episode and no duplicate ET delivery remain asserted.",
+        "First two cycles check intermediate thresholds; the third proves a blocked-to-ready transition survives without an intervening poll.",
+        "Every cumulative ACK follows an explicitly asserted contiguous transmitted2000-byte range; no ACK acknowledges unsent data.",
+        "Native socket policy, TCP congestion/recovery, pacing, buffer accounting and packetdrill tolerances are unchanged."
+      ]
+    },
+    "epoll/epoll_out_edge_default_notsent_lowat.pkt": {
+      "source_sha256": "dfef6226aa011c2ddc8676d8a448ff3ff6f7668e06edde4f6469011ff0fca15b",
+      "input_generated_sha256": "dfef6226aa011c2ddc8676d8a448ff3ff6f7668e06edde4f6469011ff0fca15b",
+      "fixture": "ntcp-expectations/epoll/epoll_out_edge_default_notsent_lowat.pkt",
+      "fixture_sha256": "88e8ab215c52f2950977ea6ee340ddfea1baf7f29168d1eef71f90e335fc71d3",
+      "native_setup": {
+        "kind": "explicit-native-socket-options",
+        "linux_setup_reproduced": false,
+        "adapter_flags": "upstream,local=192.168.0.1",
+        "source_command_sha256": "09826d9fab8d8baffb09a4cf2d6117deb60b4a3561f7d907bca04cc99ebfb347",
+        "source_blocked_reasons": [
+          "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are implemented; Linux memory/wakeup equivalence is not claimed."
+        ],
+        "rationale": "Replace the unsupported Linux tcp_wmem default with an explicit native SO_SNDBUF payload limit through the ordinary socket API. Keep the common transport profile.",
+        "socket_options": [
+          {
+            "option": "SO_SNDBUF",
+            "request": 4000,
+            "effective_payload_bytes": 8000
+          },
+          {
+            "option": "TCP_NOTSENT_LOWAT",
+            "raw_value": 0,
+            "effective_value": 4294967295
+          }
+        ]
+      },
+      "rationale": "Exercise native payload-space and LOWAT readiness through real EPOLLET after positive partial writes. Linux skb allocation overshoot and write-space hysteresis are separate host policies.",
+      "changes": [
+        {
+          "field": "Linux tcp_wmem setup",
+          "upstream": "4096 50000 4194304 default/automatic memory accounting",
+          "ntcp": "explicit SO_SNDBUF4000 ->8000 payload bytes; get verifies actual limit",
+          "derivation": "max(2*4000,4608)=8000; each original request59000/180000 remains partial."
+        },
+        {
+          "field": "peer window setup",
+          "upstream": "peer scale7 and open initial window",
+          "ntcp": "peer scale0, initial window0, then2000-byte windows",
+          "derivation": "Exact two-MSS send windows separate buffer-space and notsent transitions without Linux TSO or congestion-growth assumptions."
+        },
+        {
+          "field": "partial write returns",
+          "upstream": "Linux skb-dependent58000/128000/112000 (or finite-LOWAT42000/48000/48000)",
+          "ntcp": "8000 on each of three original59000/180000/180000 write requests",
+          "derivation": "Hard native payload capacity; no positive payload credit returned until cumulative ACK frees actual bytes."
+        },
+        {
+          "field": "LOWAT configuration",
+          "upstream": "raw 0",
+          "ntcp": "raw 0",
+          "derivation": "Finite4000 tests strict2000-byte half-threshold; raw0 still inherits the common unlimited default and UINT_MAX explicitly disables the gate."
+        },
+        {
+          "field": "writable wakeup timeline",
+          "upstream": "Linux skb memory-wakeup threshold",
+          "ntcp": "first2000-byte cumulative progress",
+          "derivation": "Native OUT requires payload room and2*notsent<effectiveLOWAT."
+        },
+        {
+          "field": "third-cycle polling",
+          "upstream": "intermediate epoll queries",
+          "ntcp": "query only after all data is ACKed",
+          "derivation": "The readiness transition must be retained even when the application did not observe the blocked level."
+        },
+        {
+          "field": "handshake ACK delay",
+          "upstream": 0,
+          "ntcp": "100ms",
+          "derivation": "Give staged10ms cumulative ACKs a realistic RTT budget instead of triggering a sub-millisecond-handshake TLP; common probe/recovery configuration and timing tolerances remain unchanged."
+        }
+      ],
+      "invariants": [
+        "Original source and setup bytes remain hash-audited and unexecuted; Linux setup remains unsupported outside this independently audited port.",
+        "All three writes return a positive prefix smaller than their original request; no application-visible EAGAIN is required.",
+        "Initial writable edge, blocked buffer, one new edge per readiness episode and no duplicate ET delivery remain asserted.",
+        "First two cycles check intermediate thresholds; the third proves a blocked-to-ready transition survives without an intervening poll.",
+        "Every cumulative ACK follows an explicitly asserted contiguous transmitted2000-byte range; no ACK acknowledges unsent data.",
+        "Native socket policy, TCP congestion/recovery, pacing, buffer accounting and packetdrill tolerances are unchanged."
+      ]
+    },
+    "epoll/epoll_out_edge_notsent_lowat.pkt": {
+      "source_sha256": "1c92e45e15289838e41e562c41c214071b1c9a196e4e2df9015893578d776ba2",
+      "input_generated_sha256": "1c92e45e15289838e41e562c41c214071b1c9a196e4e2df9015893578d776ba2",
+      "fixture": "ntcp-expectations/epoll/epoll_out_edge_notsent_lowat.pkt",
+      "fixture_sha256": "f752a2216ae6eb504d9052038f1efe15ca5bfb5dd8f36d4812586c2b459ca48d",
+      "native_setup": {
+        "kind": "explicit-native-socket-options",
+        "linux_setup_reproduced": false,
+        "adapter_flags": "upstream,local=192.168.0.1",
+        "source_command_sha256": "09826d9fab8d8baffb09a4cf2d6117deb60b4a3561f7d907bca04cc99ebfb347",
+        "source_blocked_reasons": [
+          "Linux tcp_wmem=\"4096 50000 4194304\" and skb send-buffer wakeup accounting have no audited adapter-profile equivalent; set_sysctls.py remains unexecuted. TCP_NOTSENT_LOWAT and EPOLLET are implemented; Linux memory/wakeup equivalence is not claimed."
+        ],
+        "rationale": "Replace the unsupported Linux tcp_wmem default with an explicit native SO_SNDBUF payload limit through the ordinary socket API. Keep the common transport profile.",
+        "socket_options": [
+          {
+            "option": "SO_SNDBUF",
+            "request": 4000,
+            "effective_payload_bytes": 8000
+          },
+          {
+            "option": "TCP_NOTSENT_LOWAT",
+            "raw_value": 4000,
+            "effective_value": 4000
+          }
+        ]
+      },
+      "rationale": "Exercise native payload-space and LOWAT readiness through real EPOLLET after positive partial writes. Linux skb allocation overshoot and write-space hysteresis are separate host policies.",
+      "changes": [
+        {
+          "field": "Linux tcp_wmem setup",
+          "upstream": "4096 50000 4194304 default/automatic memory accounting",
+          "ntcp": "explicit SO_SNDBUF4000 ->8000 payload bytes; get verifies actual limit",
+          "derivation": "max(2*4000,4608)=8000; each original request59000/180000 remains partial."
+        },
+        {
+          "field": "peer window setup",
+          "upstream": "peer scale7 and open initial window",
+          "ntcp": "peer scale0, initial window0, then2000-byte windows",
+          "derivation": "Exact two-MSS send windows separate buffer-space and notsent transitions without Linux TSO or congestion-growth assumptions."
+        },
+        {
+          "field": "partial write returns",
+          "upstream": "Linux skb-dependent58000/128000/112000 (or finite-LOWAT42000/48000/48000)",
+          "ntcp": "8000 on each of three original59000/180000/180000 write requests",
+          "derivation": "Hard native payload capacity; no positive payload credit returned until cumulative ACK frees actual bytes."
+        },
+        {
+          "field": "LOWAT configuration",
+          "upstream": "raw 32000",
+          "ntcp": "raw 4000",
+          "derivation": "Finite4000 tests strict2000-byte half-threshold; raw0 still inherits the common unlimited default and UINT_MAX explicitly disables the gate."
+        },
+        {
+          "field": "writable wakeup timeline",
+          "upstream": "Linux skb memory-wakeup threshold",
+          "ntcp": "third2000-byte cumulative progress after unsent reaches0; exactly2000 stays blocked",
+          "derivation": "Native OUT requires payload room and2*notsent<effectiveLOWAT."
+        },
+        {
+          "field": "third-cycle polling",
+          "upstream": "intermediate epoll queries",
+          "ntcp": "query only after all data is ACKed",
+          "derivation": "The readiness transition must be retained even when the application did not observe the blocked level."
+        },
+        {
+          "field": "handshake ACK delay",
+          "upstream": 0,
+          "ntcp": "100ms",
+          "derivation": "Give staged10ms cumulative ACKs a realistic RTT budget instead of triggering a sub-millisecond-handshake TLP; common probe/recovery configuration and timing tolerances remain unchanged."
+        }
+      ],
+      "invariants": [
+        "Original source and setup bytes remain hash-audited and unexecuted; Linux setup remains unsupported outside this independently audited port.",
+        "All three writes return a positive prefix smaller than their original request; no application-visible EAGAIN is required.",
+        "Initial writable edge, blocked buffer, one new edge per readiness episode and no duplicate ET delivery remain asserted.",
+        "First two cycles check intermediate thresholds; the third proves a blocked-to-ready transition survives without an intervening poll.",
+        "Every cumulative ACK follows an explicitly asserted contiguous transmitted2000-byte range; no ACK acknowledges unsent data.",
+        "Native socket policy, TCP congestion/recovery, pacing, buffer accounting and packetdrill tolerances are unchanged."
+      ]
+    },
+    "notsent_lowat/notsent-lowat-default.pkt": {
+      "source_sha256": "b96dc3e7a6bc4d4f7369895120c77503cb94c18f18bccc4e9e8b5ee15903ac87",
+      "input_generated_sha256": "b96dc3e7a6bc4d4f7369895120c77503cb94c18f18bccc4e9e8b5ee15903ac87",
+      "fixture": "ntcp-expectations/notsent_lowat/notsent-lowat-default.pkt",
+      "fixture_sha256": "d8f40a70274ae89abb94cb738bae4d7fd6381ca04b79ce58961230167b81b9e8",
+      "native_setup": {
+        "kind": "explicit-native-socket-options",
+        "linux_setup_reproduced": false,
+        "adapter_flags": "upstream,local=192.168.0.1",
+        "source_command_sha256": "d7b2e415aa09240601a95594511488188f6e49828e13a5fc2f34016d6cecaf26",
+        "source_blocked_reasons": [
+          "Linux tcp_wmem=\"4096 50000 4194304\", tcp_min_tso_segs=10 and skb write-wakeup accounting have no audited adapter-profile equivalent; setup and restore remain unexecuted. Per-socket TCP_NOTSENT_LOWAT is implemented; Linux memory/wakeup equivalence is not claimed."
+        ],
+        "rationale": "Use the ordinary SO_SNDBUF API to select a native payload capacity; leave TCP_NOTSENT_LOWAT unset to verify raw0 inherits the common unlimited default. Linux tcp_wmem/TSO setup remains unsupported and unexecuted.",
+        "socket_options": [
+          {
+            "option": "SO_SNDBUF",
+            "request": 4000,
+            "effective_payload_bytes": 8000
+          },
+          {
+            "option": "TCP_NOTSENT_LOWAT",
+            "set": false,
+            "raw_value": 0,
+            "effective_value": 4294967295
+          }
+        ]
+      },
+      "rationale": "Exercise a real blocking poll after a positive partial write, with native payload-space readiness and default LOWAT inheritance. Linux skb allocation overshoot and write-space hysteresis do not define native admission or notification thresholds.",
+      "changes": [
+        {
+          "field": "Linux default buffer and TSO setup",
+          "upstream": "tcp_wmem=4096 50000 4194304; tcp_min_tso_segs=10",
+          "ntcp": "SO_SNDBUF4000 ->8000 payload bytes, verified by getsockopt; common transport profile",
+          "derivation": "max(2*4000,4608)=8000. No Linux allocation/TSO policy is simulated."
+        },
+        {
+          "field": "peer window and handshake",
+          "upstream": "peer scale7; final handshake ACK after20ms with raw window257",
+          "ntcp": "peer scale0; final handshake ACK after100ms with window0; reopen2000 bytes after10ms",
+          "derivation": "Two-MSS physical windows separate output from payload-space reclamation; handshake RTT separates staged feedback from loss-probe deadlines."
+        },
+        {
+          "field": "initial partial write",
+          "upstream": "write59000 returns58000",
+          "ntcp": "same59000-byte request returns8000",
+          "derivation": "The native payload ring is full at8000 bytes; every positive return is still smaller than its request."
+        },
+        {
+          "field": "blocking poll completion and ACKs",
+          "upstream": "Linux poll becomes writable after cumulativeACK17001",
+          "ntcp": "first poll finishes20ms after invocation onACK2001; duplicateACK at5ms and reopen at10ms do not complete it",
+          "derivation": "Only real cumulative progress frees payload space. Each ACK follows a checked contiguous transmitted2000-byte range; original poll timeout1000ms and ordinary timing tolerance remain."
+        },
+        {
+          "field": "level readiness and second fill/drain cycle",
+          "upstream": "one blocking poll",
+          "ntcp": "repeated ready polls; second59000-byte request returns2000, second blocked poll completes10ms later onACK4001; full data drain toACK10001",
+          "derivation": "Refill exactly the reclaimed room. Verify poll reports persistent current level and can block again after refill, independent of epoll edge generations."
+        }
+      ],
+      "invariants": [
+        "Original source/setup hashes and blocked reasons remain intact; shell commands are never executed.",
+        "TCP_NOTSENT_LOWAT is never set; getsockopt must report raw0 inherited from the common default.",
+        "Both writes return a positive prefix smaller than59000, without any application-visible EAGAIN call.",
+        "Blocked poll cannot return on a duplicateACK or a window-only update; cumulative data ACK restores writable capacity.",
+        "Repeated ready queries remain ready, and a refilled buffer removes POLLOUT until new cumulative progress.",
+        "Every ACK covers explicitly checked transmitted data; all10000 accepted bytes are transmitted and acknowledged.",
+        "Production buffer policy, LOWAT/readiness code, congestion/recovery, pacing and packetdrill tolerances stay unchanged."
+      ]
+    },
+    "blocking/blocking-write.pkt": {
+      "source_sha256": "92051dff53277fa0b39accb4e6b10289be21b6b1ce535b4e0cf67cf6c90643cd",
+      "input_generated_sha256": "92051dff53277fa0b39accb4e6b10289be21b6b1ce535b4e0cf67cf6c90643cd",
+      "fixture": "ntcp-expectations/blocking/blocking-write.pkt",
+      "fixture_sha256": "7aa4d1a17601eecae45968789179a5048b58ba90201e006a39513fee18025b13",
+      "native_setup": {
+        "kind": "explicit-native-socket-options",
+        "linux_setup_reproduced": false,
+        "adapter_flags": "upstream,local=192.168.0.1",
+        "source_command_sha256": "08a6b9f76d07f42bc1a65a7b266f18b3952d8ab843a28db1ed5d90de916711c8",
+        "source_blocked_reasons": [
+          "Linux tcp_min_tso_segs=10 has no adapter profile mapping; ntcp does not implement Linux TSO accumulation or sk_sndbuf write-wakeup accounting. The 21000->42000 SO_SNDBUF assertion and 61000-byte blocking write must remain unchanged.",
+          "The set_sysctls.py invocation and generated sysctl restore command cannot run against the ntcp backend; both remain untouched and unexecuted."
+        ],
+        "rationale": "Retain the original ordinary SO_SNDBUF21000/42000 API assertion; use its actual native payload capacity without Linux TSO accumulation or skb wakeup accounting. Common transport profile only.",
+        "socket_options": [
+          {
+            "option": "SO_SNDBUF",
+            "request": 21000,
+            "effective_payload_bytes": 42000
+          }
+        ]
+      },
+      "rationale": "Verify a real61000-byte blocking write spanning a42000-byte native payload buffer. Keep its logical cursor pending when actual cumulative ACK reclamation is one byte short, then complete once the final byte permits all payload to be admitted.",
+      "changes": [
+        {
+          "field": "Linux TSO setup",
+          "upstream": "tcp_min_tso_segs=10 plus Linux skb write-wakeup model",
+          "ntcp": "explicit original SO_SNDBUF21000 ->42000 payload bytes; common upstream profile",
+          "derivation": "Socket request/return assertions are unchanged; no TSO/skb policy is emulated or host shell executed."
+        },
+        {
+          "field": "peer advertised window",
+          "upstream": "50000 bytes",
+          "ntcp": "2000 bytes; peer MSS1000 and scale0 unchanged",
+          "derivation": "Two-MSS windows let every cumulative ACK follow a checked contiguous transmitted range without depending on Linux congestion-window growth or TSO aggregation."
+        },
+        {
+          "field": "cumulative ACK feedback",
+          "upstream": "10001 at100ms,30001 at200ms,36001 at300ms after write starts",
+          "ntcp": "2000-byte cumulative steps through18001 at90ms;19000 at100ms;19001 at130ms",
+          "derivation": "61000-42000=19000 actual payload bytes must be reclaimed. ACK19000 confirms18999; ACK19001 confirms19000. No ACK covers unsent data."
+        },
+        {
+          "field": "blocking write completion",
+          "upstream": "300ms after invocation",
+          "ntcp": "130ms after invocation",
+          "derivation": "The final actual acknowledgment byte makes room for the complete logical write. A30ms gap from the one-byte-short event exceeds the unchanged original10ms tolerance."
+        },
+        {
+          "field": "outbound and teardown checks",
+          "upstream": "no explicit data-output assertions or finalRST",
+          "ntcp": "assert output through21001, then inject valid peerRST after successful write completion",
+          "derivation": "Prove ACK validity and distinguish write admission from full network delivery; remaining buffered/inflight payload need not be acknowledged before a successful write returns."
+        }
+      ],
+      "invariants": [
+        "Original source/setup bytes, command hashes and blocked reasons remain intact; no Linux shell command is executed.",
+        "Original SO_SNDBUF21000->42000 and61000-byte blocking write/result remain unchanged; no nonblocking mode or per-call DONTWAIT is introduced.",
+        "Original10ms timing tolerance, SYN/handshake delays and peer MSS1000/window scale0 are retained.",
+        "ACK19000 leaves capacity arithmetic one byte short; checked return waits for ACK19001, separated by30ms.",
+        "Every cumulative ACK follows explicitly asserted actual transmitted bytes, with no acknowledgment beyond the emitted frontier.",
+        "The full logical write completes while most data remains queued or outstanding; write success is admission, not full delivery.",
+        "Production send capacity, pending-send progress, ACK validation, congestion/recovery, pacing and common profile stay unchanged."
+      ]
+    },
+    "fastopen/server/client-ack-dropped-then-recovery-ms-timestamps.pkt": {
+      "source_sha256": "3f04931e584c9493577c19ddca3856c1fd1eb95ac8df021b5eb3072ee3fb9062",
+      "input_generated_sha256": "94358951a8efa4825db771902b162af150ec7ed67a62244214868aed18014b29",
+      "fixture": "ntcp-expectations/fastopen/server/client-ack-dropped-then-recovery-ms-timestamps.pkt",
+      "fixture_sha256": "3d67fb4aacc9baf0ec8cb3ea914479dce8c9a934593baa8413e43686771b8cf3",
+      "expectation_kind": "ntcp-transport-policy",
+      "rationale": "Check passive Fast Open transition into SACK recovery when the final handshake ACK and the first two response segments are lost. Use native admitted software-group flush boundaries, scalar repair PUSH semantics and the actual common receive capacity; retain the original recovery state/window, timestamp and timing assertions.",
+      "changes": [
+        {
+          "field": "initial 10000-byte output",
+          "upstream": "Two 5000-byte GSO aggregates with PSH at5000 and10000.",
+          "ntcp": "Ten1000-byte physical segments, with group-terminal PSH at2000,4000,6000,8000,10000.",
+          "derivation": "No SRTT exists before completion of the passive TFO handshake. The existing window/RTT work target uses its RTO fallback, selecting the minimum useful two-segment aggregation under the real backend/window limits."
+        },
+        {
+          "field": "2000-byte loss repair",
+          "upstream": "One2000-byte aggregate with terminalPSH.",
+          "ntcp": "Two1000-byte scalar repairs without PSH.",
+          "derivation": "Only the original application terminal byte10000 retains PUSH. Temporary aggregation flush hints do not create persistent application marks for retransmission."
+        },
+        {
+          "field": "outbound receive-window field",
+          "upstream": 256,
+          "ntcp": 32764,
+          "derivation": "Common receive capacity8388608 minus1000 unread SYN bytes, encoded at scale8: floor((8388608-1000)/256)=32764. Exact native window is checked on all data and repair segments."
+        }
+      ],
+      "invariants": [
+        "Original source and common setup remain hash-audited; setup uses the original audited early-response/linux-cookie options without host shell execution.",
+        "The final handshake ACK stays absent until original timestamp/SACK feedback; the10000-byte write and peer MSS1012 (1000 data bytes with timestamps) stay unchanged.",
+        "All incoming packet sequence numbers, cumulative ACKs, SACK ranges, timestamp values and echo values are unchanged.",
+        "Initial cwnd10, both TCP_CA_Recovery assertions and both cwnd7 assertions remain verbatim; the missing first2000 bytes are repaired immediately.",
+        "Initial output still covers1:10001 and repair covers1:2001; only segmentation, PSH and window expectations change. Original timestamp tick1000us, outgoing timestamp options and time tolerance remain unchanged.",
+        "Every initial physical segment and both scalar repairs have explicit PSH and native receive-window checks. Final application PUSH remains present.",
+        "No TCP core, socket, plugin, congestion/recovery, timer, grouping or common-profile changes."
+      ]
+    },
+    "fastopen/server/opt34/simple3.pkt": {
+      "source_sha256": "56c755f8291fe24914faa31fbf1187bfbef16257bb51a418a108c0f8c4fb226f",
+      "input_generated_sha256": "3fa43651d2e404c626f63de14d702c91a6f7e6876f0bd0790b1c96e3d3bf8da2",
+      "fixture": "ntcp-expectations/fastopen/server/opt34/simple3.pkt",
+      "fixture_sha256": "1bddc2c6fd31bc996043355912e14bfde3476b26d65c1ab59944dae21eec0f3c",
+      "expectation_kind": "ntcp-transport-policy",
+      "rationale": "Verify the original address-bound server cookie under the configured master key, authenticate it after listener restart and send10000 response bytes before the final handshake ACK. Native sequence-space admission retains the unacknowledged SYN, so add one slot to the second SYN window; explicitly check the read-triggered receive-window expansion and actual physical-segment PUSH boundaries.",
+      "changes": [
+        {
+          "field": "second connection initial SYN window",
+          "upstream": 10000,
+          "ntcp": 10001,
+          "derivation": "SND.UNA stays atISS until the final handshake ACK, so one sequence position remains occupied by SYN.10001 leaves exactly10000 payload positions; selectedIW/cwnd remains10MSS and no production window credit changes."
+        },
+        {
+          "field": "window update after reading1000 SYN bytes",
+          "upstream": "No standalone ACK expected before the application write.",
+          "ntcp": "Explicit ACK1001 with raw window32768 and original timestamp echo10.",
+          "derivation": "SYNACK unscaled window64535 expands to8388608 bytes after the read; encoded window8388608/256=32768. Credit8324073 exceeds the shared remaining-window coalescing threshold64535."
+        },
+        {
+          "field": "10000-byte early response output",
+          "upstream": "Two5000-byte aggregates with PSH at5000 and10000.",
+          "ntcp": "Ten1000-byte physical segments with PSH at2000,4000,6000,8000,10000 and raw window32768.",
+          "derivation": "No data RTT sample before handshake completion; the existing group-work estimate chooses two-segment aggregation. All10000 original payload bytes still precede the unchanged final handshake ACK."
+        },
+        {
+          "field": "fixture comments",
+          "upstream": "Historical AES64 and Linux five-MSS TSO description.",
+          "ntcp": "Address-bound cookie validation and native SYN-window/group boundary explanation.",
+          "derivation": "Keep fixture comments consistent with the existing audited Linux-cookie policy and the actual native assertions."
+        }
+      ],
+      "invariants": [
+        "The original local192.168.0.3 and remote10.248.0.3 addresses, configured master key, exact76d2c1c530f51f79 cookie and cookie validation across close/relisten remain unchanged.",
+        "Original setup remains hash-audited; the same early-response, linux-cookie, tfo-key, implicit listener opt-in, budget and preallocation options apply without executing host shell commands.",
+        "The original1000-byte SYN request,1000-byte read and15000-byte successful write remain unchanged.",
+        "All10000 checked response bytes are sent before the original final handshake ACK; the added window slot does not increase the initial payload target or move ACK feedback earlier.",
+        "Every original incoming sequence number, ACK number, timestamp and echo remains unchanged; the second SYN receive window is the only incoming packet field adjusted.",
+        "All original outgoing cookie, sequence and timestamp checks remain; data aggregates are expanded into exact physical-segment PSH/window expectations and the extra read ACK is explicitly checked.",
+        "Original relative delays and timing tolerance remain unchanged. No TCP core, socket, plugin, congestion/recovery, window policy or common profile changes."
+      ]
+    },
+    "zerocopy/maxfrags.pkt": {
+      "source_sha256": "b30ef6786bad996ed0fc4f6d3640bf677cc4bb6de9d329d0acd0e1d52fc7196b",
+      "input_generated_sha256": "197007ea45f25f8a49cb9445398142bd1ee5fc4377613b832fc88fbeed0967b6",
+      "fixture": "ntcp-expectations/zerocopy/maxfrags.pkt",
+      "fixture_sha256": "fb7162a47cdc49595a1dac75896d750202c5375ddea9404bba2e219ea451ff1c",
+      "expectation_kind": "ntcp-transport-policy",
+      "rationale": "Verify ordinary multi-iovec sending and copied MSG_ZEROCOPY fallback with the original error-queue completion contract. The native adapter copies iovecs into an owned byte stream and has no Linux skb page-fragment budget; use normal18/64-byte packetization while preserving all syscall and notification assertions.",
+      "changes": [
+        {
+          "field": "18-byte MSG_ZEROCOPY output and feedback",
+          "upstream": "17+1 bytes with intermediateACK36 and finalACK37",
+          "ntcp": "One18-byte segment19:37 with terminalPSH; retainACK37",
+          "derivation": "All18 copied payload bytes fit within negotiatedMSS1000. There are no retained per-page fragments to force a split."
+        },
+        {
+          "field": "64-byte MSG_ZEROCOPY output and feedback",
+          "upstream": "17+17+17+13 bytes withACK54/71/88/101",
+          "ntcp": "One64-byte segment37:101 with terminalPSH; retainACK101",
+          "derivation": "All64 copied bytes fit withinMSS1000. Removed intermediateACKs correspond only to the removed fragment-budget boundaries."
+        },
+        {
+          "field": "fixture comments",
+          "upstream": "Linux skb fragment exhaustion and per-page truesize",
+          "ntcp": "Native copied-fallback multi-iovec sends and completion IDs",
+          "derivation": "Describe the tested native buffer/ownership contract without claiming a17-fragment limit or physical zero-copy."
+        }
+      ],
+      "invariants": [
+        "The original ordinary18-byte writev-style sendmsg, its18-byte packet andACK19 remain unchanged.",
+        "Both MSG_ZEROCOPY sends retain all18/64 one-byte iovec declarations, flag values and exact18/64-byte return values.",
+        "Original SO_ZEROCOPY enablement and SO_SNDBUF2000000 remain unchanged; common profile/budget and source setup audit retained without host shell execution.",
+        "Both recvmsg(MSG_ERRQUEUE) checks retain all cmsg fields, SO_EE_CODE_ZEROCOPY_COPIED and exact ID ranges0..0 then1..1.",
+        "Original handshake, MSS1000, peer window, relative delays and SYNACK timing tolerance remain unchanged.",
+        "Every actual transmitted packet retains PSH checking and each ACK follows a checked contiguous byte range; total transmitted100 bytes and finalACK101 are unchanged.",
+        "No socket/core/backend/zerocopy completion, iovec limit, send-buffer or production packetization changes."
+      ]
+    },
+    "mtu_probe/basic-v4.pkt": {
+      "source_sha256": "0a1d1b8575030cd7db5ad33e0eac66d46863a448f251472ffac38243edc431d0",
+      "input_generated_sha256": "7c1e4330917a78f6ced8a96b995e50fa2ad791266357fb80c6255e36d05a85a8",
+      "fixture": "ntcp-expectations/mtu_probe/basic-v4.pkt",
+      "fixture_sha256": "c608c57869a3dc92584aa347a1ca4943176cf590cb69a5f3fd7a441d45465041",
+      "expectation_kind": "ntcp-transport-policy",
+      "rationale": "Exercise actual packetization-layer MTU probing independently of Nagle tail holding and Linux scalar PUSH hints. Enable TCP_NODELAY explicitly while retaining every original packet boundary, byte count, probe size, incoming ACK, relative time and MSS-growth observation. A nonterminal scalar segment has no native PUSH mark.",
+      "local_controls": {
+        "capability": "route_control",
+        "lines": [
+          {
+            "line": "0 `ntcp-local-route-set 192.0.2.1 640 600 552`\n",
+            "sha256": "a6855423579cc861d9f0fbc63e06c7f1a9642764f56466d4bd4895769628fa1f"
+          },
+          {
+            "line": "   +0 `ntcp-local-route-set 192.0.2.1 1500 1460 552`\n",
+            "sha256": "2bb747a4b370af44fad11bdbbc93749d58b7c05e719984b017f988d9afe02ad4"
+          }
+        ]
+      },
+      "changes": [
+        {
+          "field": "accepted socket TCP_NODELAY",
+          "upstream": "Nagle remains enabled by defaults",
+          "ntcp": "Explicit TCP_NODELAY=1 immediately after accept",
+          "derivation": "The test provides ACKs only after each complete write. Removing Nagle withholding makes both short terminal tails observable without changing ACK feedback or the independent PMTU algorithm."
+        },
+        {
+          "field": "3387:3987(600) PSH flag",
+          "upstream": "PSH=1",
+          "ntcp": "PSH=0",
+          "derivation": "This segment is not the end of queued application data. Native scalar packetization keeps the actual terminal PUSH at sequence4000; it does not create a Linux intermediate batching flush hint."
+        },
+        {
+          "field": "fixture comments",
+          "upstream": "Linux kernel probe description",
+          "ntcp": "Native PLPMTUD and explicit NODELAY scope",
+          "derivation": "Describe the exact transport policy exercised by this derived fixture."
+        }
+      ],
+      "invariants": [
+        "Both process-local route events and their original event positions remain byte-for-byte identical to the hash-audited setup-only adaptation. No host command is executed.",
+        "The 4000-byte first write retains probe1:987(986), five600-byte segments, final14-byte tail, and originalACK4001.",
+        "After cumulativeACK4001 validates the larger probe, the second2000-byte write retains986+986+28-byte segmentation and originalACK6001.",
+        "Original MSS600 handshake, receive-window scaling, strict physical-segment checks, relative delays and timing tolerance remain unchanged.",
+        "Every sequence interval and all packet fields apart from the single intermediate PSH bit remain unchanged. Terminal segments retain PSH.",
+        "No TCP core, socket, plugin, common profile, congestion, receive-window or MTU-discovery behavior is modified."
+      ]
     }
   },
   "inventory": [
@@ -96,8 +642,8 @@
       "symbols": [
         "SO_SNDBUF"
       ],
-      "disposition": "unsupported-setup-or-backend",
-      "owner_suite": "upstream"
+      "disposition": "ntcp-accounting-expectation",
+      "owner_suite": "ntcp-ported"
     },
     {
       "script": "cubic/cubic-bulk-166k-idle-restart.pkt",
@@ -150,8 +696,8 @@
       "symbols": [
         "TCP_NOTSENT_LOWAT"
       ],
-      "disposition": "unsupported-setup-or-backend",
-      "owner_suite": "upstream"
+      "disposition": "ntcp-accounting-expectation",
+      "owner_suite": "ntcp-ported"
     },
     {
       "script": "epoll/epoll_out_edge_default_notsent_lowat.pkt",
@@ -159,8 +705,8 @@
       "symbols": [
         "TCP_NOTSENT_LOWAT"
       ],
-      "disposition": "unsupported-setup-or-backend",
-      "owner_suite": "upstream"
+      "disposition": "ntcp-accounting-expectation",
+      "owner_suite": "ntcp-ported"
     },
     {
       "script": "epoll/epoll_out_edge_notsent_lowat.pkt",
@@ -168,8 +714,8 @@
       "symbols": [
         "TCP_NOTSENT_LOWAT"
       ],
-      "disposition": "unsupported-setup-or-backend",
-      "owner_suite": "upstream"
+      "disposition": "ntcp-accounting-expectation",
+      "owner_suite": "ntcp-ported"
     },
     {
       "script": "notsent_lowat/notsent-lowat-default.pkt",
@@ -177,8 +723,8 @@
       "symbols": [
         "TCP_NOTSENT_LOWAT"
       ],
-      "disposition": "unsupported-setup-or-backend",
-      "owner_suite": "upstream"
+      "disposition": "ntcp-accounting-expectation",
+      "owner_suite": "ntcp-ported"
     },
     {
       "script": "notsent_lowat/notsent-lowat-setsockopt.pkt",
@@ -296,8 +842,8 @@
       "symbols": [
         "SO_SNDBUF"
       ],
-      "disposition": "unchanged-original-expectations",
-      "owner_suite": "upstream"
+      "disposition": "ntcp-transport-policy-expectation",
+      "owner_suite": "ntcp-ported"
     }
   ]
 }

@@ -10,7 +10,7 @@ setup. Linux setup commands are translated through
 | Suite | Purpose |
 |---|---|
 | `upstream` | Pinned upstream scripts with audited setup adaptations and original assertions. |
-| `ntcp-ported` | Source-derived tests with expectations adapted to ntcp's buffer accounting. |
+| `ntcp-ported` | Source-derived tests with expectations adapted to ntcp's accounting or transport policies. |
 | `upstream-raw` | Full pinned upstream inventory without setup adaptations. |
 | `smoke`, `sack` | Native ntcp fixtures. |
 
@@ -32,6 +32,30 @@ slow-start heuristic can grow the window toward twice the peak flight size.
 
 Scripts: `slow_start/slow-start-ack-per-2pkt-send-6pkt.pkt`,
 `slow_start/slow-start-app-limited-9-packets-out.pkt`.
+
+### HyStart++ and classic Linux HyStart
+
+ntcp's CUBIC startup uses
+[HyStart++ (RFC 9406)](https://www.rfc-editor.org/rfc/rfc9406#section-4.2).
+These scripts select classic Linux HyStart through `hystart_detect=3`, which has
+no ntcp setup mapping; they remain unsupported.
+
+For non-paced output, ntcp selects a limit of sixteen MSS per ACK, using the
+tuning permission in [RFC 9406 §4.3](https://www.rfc-editor.org/rfc/rfc9406#section-4.3).
+This favors window growth under coalesced ACKs over the recommended eight-MSS
+limit, with a larger burst allowance and possible additional loss. An ACK covering
+ten MSS can grow a window from ten to twenty MSS. Actually paced output retains
+the uncapped limit; startup bursts and protocol probes do not qualify as paced.
+
+When delay increases, HyStart++ enters Conservative Slow Start (CSS), with
+one-quarter of ordinary slow-start growth. A qualifying RTT decrease can return
+the connection to ordinary slow start. Persistent delay leads to congestion
+avoidance after five CSS rounds, including the partial entry round. Classic
+HyStart can enter congestion avoidance directly on delay detection, so its
+window and exit assertions describe a different startup algorithm.
+
+Scripts: `cubic/cubic-hystart-delay-min-rtt-jumps-downward.pkt`,
+`cubic/cubic-hystart-delay-rtt-jumps-upward.pkt`.
 
 ### Slow-start growth under reordering
 
@@ -72,6 +96,27 @@ discusses Minshall's modification.
 
 Script: `fastopen/client/nonblocking-sendto-over-mss.pkt`.
 
+### Fast Open negative-response caching
+
+When a validated SYN-ACK acknowledges the SYN but none of its data, ntcp caches
+that negative response and temporarily disables Fast Open for the service.
+[RFC 7413 §4.1.3.1](https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1)
+explicitly includes unacknowledged SYN data among the negative responses clients
+MUST cache and recommends temporarily disabling Fast Open after such responses.
+
+ntcp retains the cookie and learned peer MSS, but applies a 60-second cooldown
+keyed by local IP, remote IP, and remote service port, across local ephemeral
+ports. The duration and cache scope are local policy. Successfully retransmitting
+the data after the handshake does not clear this evidence: ordinary TCP delivery
+does not establish that the server or path accepts SYN data. Fast Open becomes
+eligible again when the cooldown expires.
+
+The script expects the next connection to reuse Fast Open immediately. ntcp
+instead sends an ordinary SYN; the nonblocking `MSG_FASTOPEN` call returns
+`EINPROGRESS` without accepting initial data.
+
+Script: `fastopen/client/syn-data-only-syn-acked.pkt`.
+
 ### Soft ICMP errors during a passive handshake
 
 ntcp reports IPv4 host-unreachable as a soft error and retains the pending
@@ -81,7 +126,17 @@ Linux may discard the pending request, causing the later handshake ACK to elicit
 a reset. [RFC 5461 §4.1](https://www.rfc-editor.org/rfc/rfc5461#section-4.1)
 describes early connection aborts as a departure from standard soft-error handling.
 
-Script: `fastopen/server/icmp-baseline.pkt`.
+The same policy applies to cookie-authenticated Fast Open requests. Buffered SYN
+data remains readable through the accepted child, and the pending handshake can
+still complete. Before accept, the soft error is available through the listener's
+`SO_ERROR`; draining the early data does not turn it into a fatal read error.
+
+The option-34 script also checks Linux's `TcpExtOutOfWindowIcmps` through `nstat`.
+That counter has no audited native query mapping, so the script remains
+unsupported independently of the soft-error policy.
+
+Scripts: `fastopen/server/icmp-baseline.pkt`,
+`fastopen/server/opt34/icmp-before-accept.pkt`.
 
 ### Missing negotiated timestamps
 
@@ -164,3 +219,32 @@ These fixtures retain checks for timestamp phases, error-queue notifications,
 positive buffer-limited time, and receive-window accounting. The
 [adapter replay](../../crates/adapters/ntcp-socket/src/runtime_accounting_expectations_tests.rs)
 checks the same accounting with a deterministic clock.
+
+## Transport-policy expectations
+
+The [Fast Open recovery fixture](ntcp-expectations/fastopen/server/client-ack-dropped-then-recovery-ms-timestamps.pkt)
+checks recovery after a lost final handshake ACK and missing response data. It
+retains the upstream timestamp, SACK, recovery-state and congestion-window checks,
+while checking ntcp's actual software-group PSH boundaries, scalar repair flags
+and receive-window advertisement. Group flush hints do not become application
+PUSH marks retained for retransmission.
+
+The [server-cookie fixture](ntcp-expectations/fastopen/server/opt34/simple3.pkt)
+checks the configured key and address-bound cookie across a listener restart,
+then verifies a full 10 KB response before the final handshake ACK. Its second
+SYN advertises 10001 bytes: ntcp retains the unacknowledged SYN in sequence-space
+window accounting, leaving 10000 payload positions. The fixture also checks the
+read-triggered receive-window expansion and actual software-group PSH boundaries.
+
+The [multi-iovec copied-fallback fixture](ntcp-expectations/zerocopy/maxfrags.pkt)
+checks ordinary and `MSG_ZEROCOPY` sends with the original iovec arrays and copied
+completion IDs. ntcp gathers copied data into its byte buffer, so the small
+18-byte and 64-byte sends each fit in one TCP segment. Linux skb page-fragment
+limits do not define native segment boundaries. For the unregistered iovecs in
+this fixture, `MSG_ZEROCOPY` reports `SO_EE_CODE_ZEROCOPY_COPIED`; its notification
+releases the application's buffer ownership obligation rather than reporting
+network delivery.
+
+Like accounting ports, these fixtures belong exclusively to `ntcp-ported`;
+`upstream` excludes their source identities. Their changes and source hashes are
+recorded in [expectations.json](expectations.json).

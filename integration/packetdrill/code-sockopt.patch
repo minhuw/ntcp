@@ -1032,7 +1032,7 @@
  
  void run_command_event(
  	struct state *state, struct event *event, struct command_spec *command)
-@@ -43,6 +45,36 @@
+@@ -43,6 +45,38 @@
  	wait_for_event(state);
  
  	char *error = NULL;
@@ -1044,6 +1044,8 @@
 +		    strcmp(command->command_line, "ntcp-local-timestamps-off") &&
 +		    strcmp(command->command_line, "ntcp-local-tfo-client-on") &&
 +		    strcmp(command->command_line, "ntcp-local-tfo-client-off") &&
++		    strcmp(command->command_line, "ntcp-local-tfo-client-protected") &&
++		    strcmp(command->command_line, "ntcp-local-tfo-client-require-cookie") &&
 +		    strcmp(command->command_line, "ntcp-local-timestamps-on-clear-tfo-cache") &&
 +		    strncmp(command->command_line, "ntcp-local-assert-listener ",
 +		            sizeof("ntcp-local-assert-listener ") - 1) &&

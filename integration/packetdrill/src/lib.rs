@@ -33,6 +33,16 @@ unsafe extern "C" fn ntcp_packetdrill_control(
                 .map_err(|e| e.raw_os_error().unwrap_or(EIO))?,
             b"ntcp-local-tfo-client-off" => ntcp_socket::set_fast_open_client_enabled(false)
                 .map_err(|e| e.raw_os_error().unwrap_or(EIO))?,
+            b"ntcp-local-tfo-client-protected" => ntcp_socket::set_fast_open_client_default_policy(
+                ntcp_socket::FastOpenClientPolicy::ApplicationProtected,
+            )
+            .map_err(|e| e.raw_os_error().unwrap_or(EIO))?,
+            b"ntcp-local-tfo-client-require-cookie" => {
+                ntcp_socket::set_fast_open_client_default_policy(
+                    ntcp_socket::FastOpenClientPolicy::RequireCookie,
+                )
+                .map_err(|e| e.raw_os_error().unwrap_or(EIO))?
+            }
             b"ntcp-local-timestamps-on-clear-tfo-cache" => {
                 packet_test::timestamp_default(true)?;
                 packet_test::clear_fast_open_client_cache()?;
@@ -55,7 +65,7 @@ unsafe extern "C" fn ntcp_packetdrill_control(
 }
 fn route_command(
     command: &[u8],
-) -> Result<(std::net::Ipv4Addr, Option<ntcp_socket::RoutePolicy>), i32> {
+) -> Result<(std::net::IpAddr, Option<ntcp_socket::RoutePolicy>), i32> {
     if command.len() > 96 {
         return Err(EOPNOTSUPP);
     }
@@ -64,7 +74,7 @@ fn route_command(
     if fields.len() < 2 {
         return Err(EOPNOTSUPP);
     }
-    let destination: std::net::Ipv4Addr = fields[1].parse().map_err(|_| EOPNOTSUPP)?;
+    let destination: std::net::IpAddr = fields[1].parse().map_err(|_| EOPNOTSUPP)?;
     if destination.to_string() != fields[1] {
         return Err(EOPNOTSUPP);
     }

@@ -1,0 +1,98 @@
+// Copied MSG_ZEROCOPY with multi-iovec sends.
+// Source: zerocopy/maxfrags.pkt; native expectations in expectations.json.
+// Check ordinary and copied-fallback sends plus completion IDs.
+
+// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.
+
+    0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
+   +0 setsockopt(3, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
+   +0 setsockopt(3, SOL_SOCKET, SO_ZEROCOPY, [1], 4) = 0
+
+   // Retain the source buffer-size request; ntcp accounts payload bytes.
+   +0 setsockopt(3, SOL_SOCKET, SO_SNDBUF, [2000000], 4) = 0
+
+   +0 bind(3, ..., ...) = 0
+   +0 listen(3, 1) = 0
+
+   +0 < S 0:0(0) win 32792 <mss 1000,sackOK,nop,nop,nop,wscale 7>
+   +0 > S. 0:0(0) ack 1 <mss 1460,nop,nop,sackOK,nop,wscale 8>
+   +0 < . 1:1(0) ack 1 win 257
+
+   +0 accept(3, ..., ...) = 4
+
+   // Ordinary send: gather all 18 one-byte iovecs into the byte stream.
+   +0 sendmsg(4, {msg_name(...)=...,
+		  msg_iov(18)=[{..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}],
+		  msg_flags=0}, 0) = 18
+
+   +0 > P. 1:19(18) ack 1
+   +0 < . 1:1(0) ack 19 win 257
+
+   // send a zerocopy iov of 18 elements:
+   +1 sendmsg(4, {msg_name(...)=...,
+		  msg_iov(18)=[{..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}],
+		  msg_flags=0}, MSG_ZEROCOPY) = 18
+
+   // Copied fallback: all 18 bytes fit in one segment with terminal PUSH.
+   +0 > P. 19:37(18) ack 1
+   +0 < . 1:1(0) ack 37 win 257
+
+   +1 recvmsg(4, {msg_name(...)=...,
+                  msg_iov(1)=[{...,0}],
+                  msg_flags=MSG_ERRQUEUE,
+                  msg_control=[
+                        {cmsg_level=CMSG_LEVEL_IP,
+                         cmsg_type=CMSG_TYPE_RECVERR,
+                         cmsg_data={ee_errno=0,
+                                    ee_origin=SO_EE_ORIGIN_ZEROCOPY,
+                                    ee_type=0,
+                                    ee_code=SO_EE_CODE_ZEROCOPY_COPIED,
+                                    ee_info=0,
+                                    ee_data=0}}
+                   ]}, MSG_ERRQUEUE) = 0
+
+   // send a zerocopy iov of 64 elements:
+   +0 sendmsg(4, {msg_name(...)=...,
+                  msg_iov(64)=[{..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1},
+			       {..., 1}, {..., 1}, {..., 1}, {..., 1}],
+                  msg_flags=0}, MSG_ZEROCOPY) = 64
+
+   // Copied fallback: all 64 bytes fit in one segment with terminal PUSH.
+   +0 > P. 37:101(64) ack 1
+   +0 < . 1:1(0) ack 101 win 257
+
+   +1 recvmsg(4, {msg_name(...)=...,
+                  msg_iov(1)=[{...,0}],
+                  msg_flags=MSG_ERRQUEUE,
+                  msg_control=[
+                        {cmsg_level=CMSG_LEVEL_IP,
+                         cmsg_type=CMSG_TYPE_RECVERR,
+                         cmsg_data={ee_errno=0,
+                                    ee_origin=SO_EE_ORIGIN_ZEROCOPY,
+                                    ee_type=0,
+                                    ee_code=SO_EE_CODE_ZEROCOPY_COPIED,
+                                    ee_info=1,
+                                    ee_data=1}}
+                   ]}, MSG_ERRQUEUE) = 0

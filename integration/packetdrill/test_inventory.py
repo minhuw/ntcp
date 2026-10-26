@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 from expectations import PORTED_SCRIPTS
-from run import (ROUTE_EVENT, ROUTE_CONTROL, LISTENER_ASSERT_EVENT, LISTENER_ASSERT_CONTROL, TFO_PERMISSION_EVENTS, CACHE_FLUSH_CONTROL, CACHE_FLUSH_EVENT, HERE, PIN, SYN_DATA_ACK_SCRIPTS, TIMESTAMP_CONTROL, TIMESTAMP_EVENT, adapt_source, preflight,
+from run import (COOKIELESS_CLIENT_EVENT, COOKIELESS_CLIENT_CONTROL, ROUTE_CASES, SYNACK_DATA_EVENT, SYNACK_DATA_CONTROL, ROUTE_EVENT, ROUTE_CONTROL, LISTENER_ASSERT_EVENT, LISTENER_ASSERT_CONTROL, TFO_PERMISSION_EVENTS, CACHE_FLUSH_CONTROL, CACHE_FLUSH_EVENT, HERE, PIN, SYN_DATA_ACK_SCRIPTS, TIMESTAMP_CONTROL, TIMESTAMP_EVENT, adapt_source, preflight,
                  select_cases)
 
 
@@ -28,7 +28,8 @@ class CompleteInventory(unittest.TestCase):
         selected, excluded = select_cases([directory / n for n in sorted(names)], directory, 'upstream')
         self.assertEqual({str(p.relative_to(directory)) for p, _, _ in selected}, names - PORTED_SCRIPTS)
         self.assertEqual({r['script'] for r in excluded}, PORTED_SCRIPTS)
-        self.assertEqual(len({str(p.relative_to(directory)) for p, v, _ in selected if v == 'ipv4'}), 158)
+        self.assertEqual({str(p.relative_to(directory)) for p, v, _ in selected if v == 'ipv4'},
+                         {n for n in names - PORTED_SCRIPTS if manifest['scripts'][n]['variant'] == 'ipv4'})
         for name, entry in manifest['scripts'].items():
             with self.subTest(name=name):
                 original = (directory / name).read_bytes()
@@ -45,7 +46,8 @@ class CompleteInventory(unittest.TestCase):
                     if entry.get('restore_line'):
                         expected = expected.replace(entry['restore_line'].encode(), entry['restore_replacement_line'].encode(), 1)
                     if entry.get('route_control'):
-                        expected = expected.replace(ROUTE_EVENT, ROUTE_CONTROL, 1)
+                        _, _, event, control, _, _, _ = ROUTE_CASES[name]
+                        expected = expected.replace(event, control, 1)
                     if entry.get('listener_assertion_control'):
                         expected = expected.replace(LISTENER_ASSERT_EVENT, LISTENER_ASSERT_CONTROL, 1)
                     if entry.get('tfo_permission_control'):
@@ -53,6 +55,10 @@ class CompleteInventory(unittest.TestCase):
                             expected = expected.replace(event, control, 1)
                     if entry.get('cache_flush_control'):
                         expected = expected.replace(CACHE_FLUSH_EVENT, CACHE_FLUSH_CONTROL, 1)
+                    if entry.get('cookieless_client_control'):
+                        expected = expected.replace(COOKIELESS_CLIENT_EVENT, COOKIELESS_CLIENT_CONTROL, 1)
+                    if entry.get('timestamp_on_control'):
+                        expected = expected.replace(SYNACK_DATA_EVENT, SYNACK_DATA_CONTROL, 1)
                     if entry.get('timestamp_control'):
                         expected = expected.replace(TIMESTAMP_EVENT, TIMESTAMP_CONTROL, 1)
                     # Existing resource-control mapping is independently covered.
@@ -60,9 +66,11 @@ class CompleteInventory(unittest.TestCase):
                         self.assertEqual(generated, expected)
                     self.assertEqual(preflight(generated.decode(), entry.get('embedded_tcp_info') is True,
                                                resource_control=entry.get('resource_control') is True,
+                                               timestamp_on_control=entry.get('timestamp_on_control') is True,
                                                timestamp_control=entry.get('timestamp_control') is True,
                                                cache_flush_control=entry.get('cache_flush_control') is True,
                                                tfo_permission_control=entry.get('tfo_permission_control') is True,
+                                               cookieless_client_control=entry.get('cookieless_client_control') is True,
                                                listener_assertion_control=entry.get('listener_assertion_control') is True,
                                                route_control=entry.get('route_control') is True), [])
 

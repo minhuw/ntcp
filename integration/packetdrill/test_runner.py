@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from expectations import PORTED_SCRIPTS
 
-from run import (ROUTE_SCRIPT, LISTENER_ASSERT_SCRIPT, TFO_PERMISSION_SOURCES, CACHE_FLUSH_SCRIPT, SYN_DATA_ACK_SCRIPTS, TIMESTAMP_SOURCES, RESOURCE_SCRIPT, RESOURCE_EVENT, RESOURCE_CONTROL, SLOW_START_ACK_SCRIPTS, FASTOPEN_CLIENT_SCRIPTS, NON_TFO_SETUP_COMMANDS, ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
+from run import (COOKIELESS_CLIENT_SCRIPT, SYNACK_DATA_SCRIPT, ROUTE_SCRIPT, LISTENER_ASSERT_SCRIPT, TFO_PERMISSION_SOURCES, CACHE_FLUSH_SCRIPT, SYN_DATA_ACK_SCRIPTS, TIMESTAMP_SOURCES, RESOURCE_SCRIPT, RESOURCE_EVENT, RESOURCE_CONTROL, SLOW_START_ACK_SCRIPTS, FASTOPEN_CLIENT_SCRIPTS, NON_TFO_SETUP_COMMANDS, ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
                  fixture_command, HERE, PIN, adapt_source, check_plugin_hash, invoke, main, outcome,
                  preflight, profile_metadata, select_cases, variants, verify_backend)
 
@@ -507,10 +507,12 @@ class AdaptationChecks(unittest.TestCase):
         # separate capability tests; generic synthetic sources cannot enable it.
         self.manifest['scripts'].pop(ROUTE_SCRIPT)
         self.manifest['scripts'].pop(RESOURCE_SCRIPT)
+        self.manifest['scripts'].pop(SYNACK_DATA_SCRIPT)
+        self.manifest['scripts'].pop(COOKIELESS_CLIENT_SCRIPT)  # Exact dynamic source has its own audit tests.
         self.manifest['scripts'].pop(CACHE_FLUSH_SCRIPT)
         self.manifest['scripts'].pop(LISTENER_ASSERT_SCRIPT)
-        from run import CUSTOM_TFO_SOURCES
-        for name in CUSTOM_TFO_SOURCES:
+        from run import COOKIELESS_SERVER_SETUP, CUSTOM_TFO_SOURCES
+        for name in CUSTOM_TFO_SOURCES.keys() | COOKIELESS_SERVER_SETUP.keys():
             self.manifest['scripts'].pop(name)
         for name in TFO_PERMISSION_SOURCES:
             self.manifest['scripts'].pop(name)
@@ -931,7 +933,7 @@ class AdaptationChecks(unittest.TestCase):
                 '--suite', 'upstream', '--report', str(report)]
         with patch('run.HERE', manifest_dir), patch('run.check_checkout', return_value=PIN['revision']), \
                 patch('run.subprocess.check_output', return_value=tracked), \
-                patch('run.invoke', side_effect=execute), patch.object(sys, 'argv', argv):
+                patch('run.invoke', side_effect=execute), patch.object(sys, 'argv', argv + ['--variant', 'ipv4']):
             self.assertEqual(main(), 1)
         data = json.loads(report.read_text())
         self.assertEqual(data['suite'], 'upstream')
@@ -940,7 +942,7 @@ class AdaptationChecks(unittest.TestCase):
         self.assertEqual(data['coverage'], {'selected_script_files': count,
                                           'upstream_script_files': inventory_count,
                                           'selection': 'adaptation_allowlist'})
-        self.assertEqual(data['counts'], {'failed': count - 1, 'passed': 1, 'unsupported': 2 * count})
+        self.assertEqual(data['counts'], {'failed': count - 1, 'passed': 1})
         self.assertFalse(data['all_passed'])
         self.assertEqual(len(calls), 2 * count)
         for row in data['results']:
@@ -985,9 +987,9 @@ class AdaptationChecks(unittest.TestCase):
         for filters, expected_counts, expected_calls in (
             (['--variant', 'ipv4', '--script', self.name], {'passed': 1}, 2),
             (['--variant', 'ipv4'], {'passed': 1, 'failed': count - 1}, 2 * count),
-            (['--variant', 'ipv6', '--script', self.name], {'unsupported': 1}, 0),
+            (['--variant', 'ipv6', '--script', self.name], {'passed': 1}, 2),
             (['--variant', 'ipv4', '--variant', 'ipv6', '--script', self.name],
-             {'passed': 1, 'unsupported': 1}, 2),
+             {'passed': 2}, 4),
             (['--variant', 'ipv4', '--script', self.name,
               '--script', 'blocking/blocking-read.pkt'], {'passed': 1, 'failed': 1}, 4),
         ):
@@ -997,10 +999,10 @@ class AdaptationChecks(unittest.TestCase):
                     patch('run.subprocess.check_output', return_value=tracked), \
                     patch('run.invoke', side_effect=execute), \
                     patch.object(sys, 'argv', argv + filters):
-                self.assertEqual(main(), 0 if expected_counts == {'passed': 1} else 1)
+                self.assertEqual(main(), 0 if set(expected_counts) == {'passed'} else 1)
             data = json.loads(report.read_text())
             self.assertEqual(data['counts'], expected_counts)
-            self.assertEqual(data['all_passed'], expected_counts == {'passed': 1})
+            self.assertEqual(data['all_passed'], set(expected_counts) == {'passed'})
             self.assertEqual(data['eligible_total'], 3 * inventory_count)
             self.assertEqual(data['eligible_script_files'], inventory_count)
             self.assertEqual(data['selected_total'], sum(expected_counts.values()))
@@ -1019,7 +1021,7 @@ class AdaptationChecks(unittest.TestCase):
         # A newly tracked source cannot disappear behind the old allowlist.
         with patch('run.HERE', manifest_dir), patch('run.check_checkout', return_value=PIN['revision']), \
                 patch('run.subprocess.check_output', return_value=tracked + '\0' + PIN['tcp_tests'] + '/unselected.pkt'), \
-                patch('run.invoke') as execute, patch.object(sys, 'argv', argv):
+                patch('run.invoke') as execute, patch.object(sys, 'argv', argv + ['--variant', 'ipv4']):
             with self.assertRaises(SystemExit) as error:
                 main()
             self.assertEqual(error.exception.code, 2)
@@ -1402,7 +1404,11 @@ class PublishedSelectionChecks(unittest.TestCase):
             sendfile_enabled = not self.manifest['scripts']['sendfile/sendfile-simple.pkt'].get('blocked_reasons')
             for selection, source_eligible in ((SOCKET43, 37 + int(sendfile_enabled)), (SOCKET_FEATURE19, 15)):
                 ported = set(selection) & PORTED_SCRIPTS
-                eligible = source_eligible - len(ported)
+                eligible = sum(not self.manifest['scripts'][n].get('blocked_reasons')
+                               for n in selection if n not in ported)
+                blocked = sum(bool(self.manifest['scripts'][n].get('blocked_reasons'))
+                              for n in selection if n not in ported)
+                self.assertEqual(source_eligible, sum(not self.manifest['scripts'][n].get('blocked_reasons') for n in selection))
                 executed = []
 
                 def execute(argv, cwd, timeout):
@@ -1428,7 +1434,7 @@ class PublishedSelectionChecks(unittest.TestCase):
                         patch.object(sys, 'argv', argv):
                     self.assertEqual(main(), 1)
                 data = json.loads(report.read_text())
-                self.assertEqual(data['counts'], {'failed': eligible, 'unsupported': len(selection) - source_eligible})
+                self.assertEqual(data['counts'], {k: n for k, n in {'failed': eligible, 'unsupported': blocked}.items() if n})
                 self.assertFalse(set(executed) & PORTED_SCRIPTS)
                 self.assertEqual({r['script'] for r in data['ported_exclusions']}, ported)
                 self.assertEqual(invoke_mock.call_count, 2 * eligible)
@@ -1486,9 +1492,13 @@ class PublishedSelectionChecks(unittest.TestCase):
                     patch('run.invoke', side_effect=execute), patch.object(sys, 'argv', argv):
                 self.assertEqual(main(), 1)
             data = json.loads(report.read_text())
-            self.assertEqual(data['selected_total'], 35)
-            self.assertEqual(data['script_files'], 35)
-            self.assertEqual({row['script'] for row in data['results']}, set(selection))
+            upstream_owned = set(selection) - PORTED_SCRIPTS
+            self.assertEqual(data['selected_total'], len(upstream_owned))
+            self.assertEqual(data['script_files'], len(upstream_owned))
+            self.assertEqual({row['script'] for row in data['results']}, upstream_owned)
+            self.assertEqual({row['script'] for row in data['ported_exclusions']},
+                             set(selection) & PORTED_SCRIPTS)
+            self.assertFalse(set(executed) & PORTED_SCRIPTS)
             self.assertFalse(data['all_passed'])
             self.assertEqual(len(executed), 26)
             self.assertIn('syscall_bad_arg/sendmsg-empty-iov.pkt', executed)
@@ -1562,7 +1572,8 @@ class PipelineProfileTests(unittest.TestCase):
         self.assertTrue(paced['general_pacing'])
         self.assertTrue(paced['prr_pacing'])
         self.assertEqual(paced['pacing_config'], {
-            'rate_gain_percent': 125, 'max_bytes_per_second': None, 'max_burst_segments': 2})
+            'rate_gain_percent': 125, 'max_bytes_per_second': None, 'max_burst_segments': 2,
+            'initial_window_burst': True})
         paced.update(options=[], general_pacing=False, prr_pacing=False, pacing_config=None)
         self.assertEqual(paced, base)
 

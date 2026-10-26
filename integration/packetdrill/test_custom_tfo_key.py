@@ -7,9 +7,10 @@ import re
 import tempfile
 import unittest
 
+from expectations import PORTED_EXCLUSION, PORTED_SCRIPTS
 from run import (HERE, PIN, CUSTOM_TFO_SOURCES, CUSTOM_TFO_SETUP,
                  CUSTOM_TFO_KEY_OPTION, linux_key_words, adapt_source,
-                 profile_metadata, select_cases)
+                 profile_metadata, select_cases, variant_setup)
 
 
 class CustomTfoKeyMapping(unittest.TestCase):
@@ -44,9 +45,16 @@ class CustomTfoKeyMapping(unittest.TestCase):
             self.assertTrue(metadata['fast_open_listener_default'])
             self.assertEqual(metadata['fast_open_early_response'], name.endswith('simple3.pkt'))
             self.assertEqual(metadata['preallocate_connections'], 3)
-            selected, _ = select_cases([self.directory / name], self.directory, 'upstream', ['ipv4'])
+            owner = 'ntcp-ported' if name in PORTED_SCRIPTS else 'upstream'
+            selected, _ = select_cases([self.directory / name], self.directory, owner, ['ipv4'])
+            self.assertEqual(len(selected), 1)
             self.assertIn(f'--local_ip={local}', selected[0][2])
             self.assertIn(f'--remote_ip={remote}', selected[0][2])
+            if owner == 'ntcp-ported':
+                upstream, excluded = select_cases([self.directory / name], self.directory,
+                                                  'upstream', ['ipv4'])
+                self.assertEqual(upstream, [])
+                self.assertEqual(excluded[0]['reasons'], [PORTED_EXCLUSION])
             self.assertEqual(PIN['variants']['ipv4'][1], '--local_ip=192.168.0.1')
 
     def test_rehashed_key_address_or_policy_changes_are_rejected(self):
@@ -82,3 +90,23 @@ class CustomTfoKeyMapping(unittest.TestCase):
                         valid.replace('f763', 'F763'), valid.replace('upstream,', 'baseline,')]:
             with self.subTest(flags=invalid):
                 self.assertIsNone(profile_metadata(invalid)['software_gso'])
+
+    def test_mapped_address_selection_and_audit_use_the_same_canonical_ipv4_setup(self):
+        for name, (_, local, remote) in CUSTOM_TFO_SOURCES.items():
+            if name in PORTED_SCRIPTS:
+                continue
+            entry = self.manifest['scripts'][name]
+            generated, _ = adapt_source(self.directory, name, self.manifest, entry['adapter_flags'])
+            selected, _ = select_cases([self.directory / name], self.directory, 'upstream', ['ipv4-mapped-v6'])
+            self.assertEqual(len(selected), 1)
+            flags = selected[0][2]
+            self.assertIn('--ip_version=ipv4-mapped-ipv6', flags)
+            self.assertIn(f'--local_ip={local}', flags)
+            self.assertIn(f'--remote_ip={remote}', flags)
+            resolved, audit, reasons = variant_setup(name, generated, entry['adapter_flags'], 'ipv4-mapped-v6')
+            self.assertEqual(reasons, [])
+            self.assertEqual(resolved, entry['adapter_flags'])
+            self.assertEqual(audit['packetdrill_flags'], flags)
+            self.assertEqual(audit['generated_sha256'], hashlib.sha256(generated).hexdigest())
+            self.assertFalse(audit['body_rewritten'])
+        self.assertEqual(PIN['variants']['ipv4-mapped-v6'][1], '--local_ip=192.168.0.1')

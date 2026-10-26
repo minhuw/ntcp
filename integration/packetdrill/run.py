@@ -287,6 +287,10 @@ UPSTREAM_OPTION_AUDIT['fastopen/client/syn-data-mss.pkt'] = {
 UPSTREAM_OPTION_AUDIT['zerocopy/fastopen-client.pkt'] = {
     'budget128m': 'Two client connections retain charged receive/send/scoreboard/RACK storage across warmup and TIME-WAIT; the existing bounded budget accommodates both without changing per-socket accounting.',
 }
+UPSTREAM_OPTION_AUDIT['fastopen/client/synack-data.pkt'] = {
+    'no-timestamps': 'Original setup disables timestamps until the exact timed event enables negotiation for future connections; existing connections and TFO cache remain unchanged.',
+    'budget224m': 'Six sequential client connections retain charged active and closing storage across the original trace; use the existing bounded seven-connection budget without changing per-socket accounting.',
+}
 UPSTREAM_OPTION_AUDIT['fastopen/client/nonblocking-sendto.pkt'] = {
     'no-timestamps': 'Original setup disables timestamps until the exact timed event enables future negotiation.',
     'budget224m': 'Seven sequential client connections retain charged warmup/TIME-WAIT and active storage across an explicit client-cache flush; the existing bounded budget preserves native per-socket accounting.',
@@ -325,14 +329,101 @@ for _name in CUSTOM_TFO_SOURCES:
 UPSTREAM_OPTION_AUDIT['fastopen/server/opt34/simple3.pkt']['early-response'] = 'Original script writes15000 bytes before the final handshake ACK; enable existing authenticated early response without changing window or grouping policy.'
 
 
+UPSTREAM_OPTION_AUDIT['mtu_probe/basic-v6.pkt'] = {
+    'link-mtu=1520': 'Pinned synthetic IPv6 link MTU1520; physical minimum retained independently of administrative route660 and initial search572.',
+    'no-gso': 'Original strict segment checking disables GSO/TSO; disable software aggregation without changing TCP packet assertions.',
+}
+
 UPSTREAM_OPTION_AUDIT['mtu_probe/basic-v4.pkt'] = {
     'pmtud1500': 'Actual1500-byte local interface bound; destination route cap and search-low are independently configured through the shared owner API.',
     'no-gso': 'Original disables GSO/TSO and uses strict segment checking; disable software aggregation, retaining individual wire packets.',
 }
 
 
+UPSTREAM_OPTION_AUDIT['fastopen/client/cookie-less-sendto.pkt'] = {
+    'application-protected-tfo-client': 'Exact tcp_fastopen=5 explicitly selects option-omitted active-open data for protected services; retain conservative cold peer MSS, actual SYN accounting and negative-response evidence.',
+    'no-timestamps': 'Exact initial setup disables timestamps throughout the source.',
+    'budget224m': 'Five sequential connections retain charged active and closing pools; use the existing bounded seven-connection budget without changing per-socket accounting.',
+}
+
+
+COOKIELESS_SERVER_SETUP = {'fastopen/server/basic-cookie-not-reqd.pkt': ('2039dc9526b6f58746892cc5bed1a5561aa221deb60b4f98c94c29d5ee7e8fb4', b'`../../common/defaults.sh\n ../../common/set_sysctls.py  /proc/sys/net/ipv4/tcp_fastopen=0x202`\n', True), 'fastopen/server/opt34/basic-cookie-not-reqd.pkt': ('18b465a3233d63fe44a93bac33f79dc611cebe648fde137f0aa18fcda423ec5b', b'`../../../common/defaults.sh\n sysctl -q net.ipv4.tcp_fastopen=0x202`\n', False), 'zerocopy/fastopen-server.pkt': ('7c0780243e6adf4d2be3a577480ef93665b6ba4157204aa12a7408df058d4dfb', b'`../../common/defaults.sh\n ../common/set_sysctls.py /proc/sys/net/ipv4/tcp_fastopen=0x207`\n', True)}
+for _name in COOKIELESS_SERVER_SETUP:
+    UPSTREAM_OPTION_AUDIT[_name] = {
+        'application-protected-tfo': 'Exact server bit0x200 selects explicit listener application-protected admission; skip cookie MAC verification/generation, retain endpoint/listener enablement, pending/reset-debt quota and TCP validation. Client no-cookie policy remains off.',
+    }
+UPSTREAM_OPTION_AUDIT['zerocopy/fastopen-server.pkt']['early-response'] = 'The original server sends1000 response bytes before final handshake ACK; enable existing bounded early response. The ordinary unregistered payload retains explicit COPIED completion.'
+
+def variant_setup(relative, generated, so_flags, variant):
+    """Map only the pinned runner's family parameters; body bytes stay exact."""
+    if relative == ROUTE_V6_SCRIPT:
+        if variant != 'ipv6' or so_flags != upstream_flags(relative):
+            return so_flags, None, ['IPv6-only route source requires exact audited addressing']
+        return so_flags, {'variant': variant, 'mapping': 'Original IPv6 local and route destination addresses',
+                          'canonical_adapter_flags': so_flags, 'adapter_flags': so_flags,
+                          'packetdrill_flags': execution_variant_flags(relative, variant),
+                          'generated_sha256': hashlib.sha256(generated).hexdigest(),
+                          'body_rewritten': False}, []
+    if variant == 'ipv4':
+        return so_flags, None, []
+    if variant == 'ipv4-mapped-v6':
+        if so_flags != upstream_flags(relative):
+            return so_flags, None, ['mapped setup differs from exact audited mapping']
+        return so_flags, {'variant': variant,
+                          'mapping': 'IPv6 socket API with configured IPv4 transport',
+                          'canonical_adapter_flags': so_flags, 'adapter_flags': so_flags,
+                          'packetdrill_flags': execution_variant_flags(relative, variant),
+                          'generated_sha256': hashlib.sha256(generated).hexdigest(),
+                          'body_rewritten': False}, []
+    if variant != 'ipv6':
+        return so_flags, None, ['unknown IP execution variant']
+    if so_flags != upstream_flags(relative) or 'local=192.168.0.1' not in so_flags.split(','):
+        return so_flags, None, ['IPv6 mapping requires audited common local addressing']
+    # Literal AF_INET addresses, route commands and IP-level socket controls
+    # require a separate family audit; never rewrite those upstream assertions.
+    body = re.sub(rb'//[^\n]*', b'', generated)
+    # Recognize supported cross-family option aliases only in option argument
+    # positions. This inspection view never replaces the executable script.
+    shared_aliases = set()
+    def shared_option(match):
+        shared_aliases.add(match[2].decode() + '/IP_FREEBIND')
+        return match[1] + b'FAMILY_SHARED_OPTION' + match[3] + b'FREEBIND' + match[4]
+    inspected = re.sub(
+        rb'(\b(?:set|get)sockopt\s*\(\s*[^,\n()]+,\s*)(SOL_IP|IPPROTO_IP)(\s*,\s*)IP_FREEBIND(\s*,)',
+        shared_option, body)
+    if re.search(rb'\b(?:IPPROTO_IP|SOL_IP|IP_TOS|IP_MTU_DISCOVER|IP_MTU|IP_FREEBIND|sockaddr_in)\b|\b(?:\d{1,3}\.){3}\d{1,3}\b', inspected):
+        return so_flags, None, ['IPv6 mapping requires audit of explicit IPv4 address or socket control']
+    if re.search(rb'\bicmp\b[^\n]*(?:\bfrag_needed\b|\bCODE\b)', body):
+        return so_flags, None, ['pinned IPv6 runner cannot parse the original IPv4 ICMP error code']
+    local = next(flag.split('=', 1)[1] for flag in PIN['variants']['ipv6']
+                 if flag.startswith('--local_ip='))
+    resolved = so_flags.replace(',local=192.168.0.1', ',local=' + local, 1)
+    audit = {'variant': 'ipv6', 'mapping': 'pinned pure IPv6 runner parameters',
+             'canonical_adapter_flags': so_flags, 'adapter_flags': resolved,
+             'packetdrill_flags': PIN['variants']['ipv6'],
+             'generated_sha256': hashlib.sha256(generated).hexdigest(),
+             'body_rewritten': False}
+    if shared_aliases:
+        audit['shared_socket_option_aliases'] = sorted(shared_aliases)
+    return resolved, audit, []
+
+
+def execution_variant_flags(relative, variant):
+    flags = list(PIN['variants'][variant])
+    if variant in ('ipv4', 'ipv4-mapped-v6') and relative in CUSTOM_TFO_SOURCES:
+        _, local, remote = CUSTOM_TFO_SOURCES[relative]
+        flags = [f'--local_ip={local}' if token.startswith('--local_ip=')
+                 else f'--remote_ip={remote}' if token.startswith('--remote_ip=')
+                 else token for token in flags]
+    if relative == ROUTE_V6_SCRIPT and variant == 'ipv6':
+        flags = [f'--local_ip=fd::1' if token.startswith('--local_ip=')
+                 else f'--remote_ip=2001:db8::1' if token.startswith('--remote_ip=')
+                 else token for token in flags]
+    return flags
+
+
 def upstream_flags(relative):
-    local = CUSTOM_TFO_SOURCES[relative][1] if relative in CUSTOM_TFO_SOURCES else '192.168.0.1'
+    local = 'fd::1' if relative == ROUTE_V6_SCRIPT else CUSTOM_TFO_SOURCES[relative][1] if relative in CUSTOM_TFO_SOURCES else '192.168.0.1'
     return "upstream,local=" + local + "".join("," + token for token in sorted(UPSTREAM_OPTION_AUDIT.get(relative, {})))
 
 
@@ -400,6 +491,18 @@ TIMESTAMP_SOURCES = {
     'zerocopy/fastopen-client.pkt': 'e0fa374f4ba5713f7a131e94e808f2bd59e7b2884305af4502debc9d80eb7680',
 }
 
+SYNACK_DATA_SCRIPT = 'fastopen/client/synack-data.pkt'
+SYNACK_DATA_SOURCE_SHA256 = '04060050a00a3f31eff9308ce67a9c232efc6bf402f921dfc40410ed69697c26'
+SYNACK_DATA_SETUP = b'`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n'
+SYNACK_DATA_EVENT = b'   +0 `sysctl -q net.ipv4.tcp_timestamps=1`\n'
+SYNACK_DATA_CONTROL = b'   +0 `ntcp-local-timestamps-on`\n'
+
+COOKIELESS_CLIENT_SCRIPT = 'fastopen/client/cookie-less-sendto.pkt'
+COOKIELESS_CLIENT_SHA256 = 'b2e6010d739c872f4effb5ebd65290c7808421bad2cffba13cf3317c425dec19'
+COOKIELESS_CLIENT_SETUP = b'`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0 \\\n                             /proc/sys/net/ipv4/tcp_fastopen=5`\n'
+COOKIELESS_CLIENT_EVENT = b' +.03 `sysctl -q net.ipv4.tcp_fastopen=1`\n'
+COOKIELESS_CLIENT_CONTROL = b' +.03 `ntcp-local-tfo-client-require-cookie`\n'
+
 CACHE_FLUSH_SCRIPT = 'fastopen/client/nonblocking-sendto.pkt'
 CACHE_FLUSH_SOURCE_SHA256 = 'd72c1847f685d9ea14a7518c508c8b61c427d661c71c48bc506e9bbc81e29f36'
 CACHE_FLUSH_SETUP = b'`../../common/defaults.sh\n ../../common/set_sysctls.py /proc/sys/net/ipv4/tcp_timestamps=0`\n'
@@ -446,6 +549,22 @@ ROUTE_MAPPING = {
     'initial_window': 'Common RFC6928 IW10; byte/window/queued-tail admission already permits this probe, without Linux-specific cwnd>=11 gate.',
     'scope': 'Runtime-owned destination transport policy; synthetic packet context does not configure host gateway/device. Strict scalar capture, no offload.',
     'locked_route': 'Administrative MTU ceiling; ordinary validated ICMP and DF policy retained. No claim of Linux route locking/discovery-disable equivalence.',
+}
+
+
+ROUTE_V6_SCRIPT = 'mtu_probe/basic-v6.pkt'
+ROUTE_V6_SOURCE_SHA256 = 'd7061284181020bb8b6f6d3e979a14b753e4f1281605031471b0eca08314bb5c'
+ROUTE_V6_SETUP = ROUTE_SETUP.replace(b'ip route change 192.0.2.1 via 192.168.0.2', b'ip -6 route change 2001:DB8::1 via fd3d:fa7b:d17d:8888::0').replace(b'mtu lock 640', b'mtu lock 660')
+ROUTE_V6_INITIAL = ROUTE_INITIAL.replace(b'192.0.2.1 640 600 552', b'2001:db8::1 660 600 572')
+ROUTE_V6_EVENT = b'   +0 `ip -6 route change 2001:DB8::1 via fd3d:fa7b:d17d:8888::0 dev tun0 advmss 1480 mtu lock 1520`\n'
+ROUTE_V6_CONTROL = b'   +0 `ntcp-local-route-set 2001:db8::1 1520 1480 572`\n'
+ROUTE_V6_MAPPING = {**ROUTE_MAPPING, 'destination': '2001:db8::1',
+                    'initial_mtu_cap': 660, 'initial_search_low': 572,
+                    'updated_mtu_cap': 1520, 'future_advertised_mss': 1480,
+                    'ipv6_minimum': 'Physical link>=1280 and received PTB<1280 rejection retained; explicit route and search values are transport packetization settings.'}
+ROUTE_CASES = {
+    ROUTE_SCRIPT: (ROUTE_SETUP, ROUTE_INITIAL, ROUTE_EVENT, ROUTE_CONTROL, ROUTE_SOURCE_SHA256, ROUTE_MAPPING, 'ipv4'),
+    ROUTE_V6_SCRIPT: (ROUTE_V6_SETUP, ROUTE_V6_INITIAL, ROUTE_V6_EVENT, ROUTE_V6_CONTROL, ROUTE_V6_SOURCE_SHA256, ROUTE_V6_MAPPING, 'ipv6'),
 }
 
 
@@ -527,7 +646,7 @@ def runner_provenance(runner):
     return provenance
 
 
-def preflight(text, embedded_tcp_info=False, resource_control=False, timestamp_control=False, cache_flush_control=False, tfo_permission_control=False, listener_assertion_control=False, route_control=False):
+def preflight(text, embedded_tcp_info=False, resource_control=False, timestamp_control=False, cache_flush_control=False, tfo_permission_control=False, listener_assertion_control=False, route_control=False, timestamp_on_control=False, cookieless_client_control=False):
     # Conservative safety/capability screening, NOT a second packetdrill parser.
     # Upstream --dry_run remains the authority for script syntax.
     # Inspect raw text conservatively, including comments: do not accidentally
@@ -538,6 +657,8 @@ def preflight(text, embedded_tcp_info=False, resource_control=False, timestamp_c
         shell_text = text.replace(RESOURCE_CONTROL.decode(), '', 1)
     if timestamp_control and text.count(TIMESTAMP_CONTROL.decode()) == 1:
         shell_text = shell_text.replace(TIMESTAMP_CONTROL.decode(), '', 1)
+    if timestamp_on_control and text.count(SYNACK_DATA_CONTROL.decode()) == 1:
+        shell_text = shell_text.replace(SYNACK_DATA_CONTROL.decode(), '', 1)
     if cache_flush_control and text.count(CACHE_FLUSH_CONTROL.decode()) == 1:
         shell_text = shell_text.replace(CACHE_FLUSH_CONTROL.decode(), '', 1)
     if tfo_permission_control:
@@ -548,9 +669,14 @@ def preflight(text, embedded_tcp_info=False, resource_control=False, timestamp_c
                 break
     if listener_assertion_control and text.count(LISTENER_ASSERT_CONTROL.decode()) == 1:
         shell_text = shell_text.replace(LISTENER_ASSERT_CONTROL.decode(), '', 1)
-    if route_control and all(shell_text.count(c.decode()) == 1 for c in (ROUTE_INITIAL, ROUTE_CONTROL)):
-        for command in (ROUTE_INITIAL, ROUTE_CONTROL):
-            shell_text = shell_text.replace(command.decode(), '', 1)
+    if route_control:
+        for _, initial, _, control, _, _, _ in ROUTE_CASES.values():
+            if all(shell_text.count(c.decode()) == 1 for c in (initial, control)):
+                for command in (initial, control):
+                    shell_text = shell_text.replace(command.decode(), '', 1)
+                break
+    if cookieless_client_control and text.count(COOKIELESS_CLIENT_CONTROL.decode()) == 1:
+        shell_text = shell_text.replace(COOKIELESS_CLIENT_CONTROL.decode(), '', 1)
     if '`' in shell_text:
         reasons.append('shell setup/assertions target Linux, not the ntcp backend')
     if '%{' in text or '}%' in text:
@@ -599,27 +725,28 @@ def adapt_source(directory, relative, manifest, so_flags):
         data = (directory / extra['path']).read_bytes()
         if hashlib.sha256(data).hexdigest() != extra['sha256']:
             raise ValueError(f"setup {extra['path']} hash differs from audited adaptation")
-    if relative == ROUTE_SCRIPT and not entry.get('blocked_reasons'):
-        commands = [ROUTE_SETUP.rstrip(b'\n'), ROUTE_EVENT[ROUTE_EVENT.index(b'`'):].rstrip(b'\n'), ROUTE_RESTORE.rstrip(b'\n')]
-        if (hashlib.sha256(source).hexdigest() != ROUTE_SOURCE_SHA256
-                or entry['command_line'].encode() != ROUTE_SETUP
-                or entry['replacement_line'].encode() != ROUTE_INITIAL
-                or entry.get('command_sha256') != hashlib.sha256(ROUTE_SETUP).hexdigest()
+    if relative in ROUTE_CASES and not entry.get('blocked_reasons'):
+        setup, initial, event, control, digest, mapping, family = ROUTE_CASES[relative]
+        commands = [setup.rstrip(b'\n'), event[event.index(b'`'):].rstrip(b'\n'), ROUTE_RESTORE.rstrip(b'\n')]
+        if (hashlib.sha256(source).hexdigest() != digest
+                or entry['command_line'].encode() != setup
+                or entry['replacement_line'].encode() != initial
+                or entry.get('command_sha256') != hashlib.sha256(setup).hexdigest()
                 or entry.get('expected_command_count') != 3
                 or re.findall(rb'`[^`]*`', source) != commands
                 or [(c['command'], c['sha256']) for c in entry.get('audited_shell_commands', [])]
                     != [(c.decode(), hashlib.sha256(c).hexdigest()) for c in commands]
                 or entry.get('route_control') is not True
-                or entry.get('route_event_sha256') != hashlib.sha256(ROUTE_EVENT).hexdigest()
-                or entry['mapping'].get('destination_route') != ROUTE_MAPPING
+                or entry.get('route_event_sha256') != hashlib.sha256(event).hexdigest()
+                or entry['mapping'].get('destination_route') != mapping
                 or entry.get('restore_line', '').encode() != ROUTE_RESTORE
                 or entry.get('restore_sha256') != hashlib.sha256(ROUTE_RESTORE).hexdigest()
                 or entry.get('restore_replacement_line', '').encode() != ROUTE_RESTORED
-                or entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
+                or entry['variant'] != family or entry['setup_path'] != 'common/defaults.sh'
                 or not any(extra['path'] == 'common/set_sysctls.py' for extra in entry.get('additional_setup_files', []))
-                or source.count(ROUTE_EVENT) != 1):
+                or source.count(event) != 1):
             raise ValueError('expected exact audited route setup and timed command')
-        generated = source.replace(ROUTE_SETUP, ROUTE_INITIAL, 1).replace(ROUTE_EVENT, ROUTE_CONTROL, 1).replace(ROUTE_RESTORE, ROUTE_RESTORED, 1)
+        generated = source.replace(setup, initial, 1).replace(event, control, 1).replace(ROUTE_RESTORE, ROUTE_RESTORED, 1)
         reasons = preflight(generated.decode(), route_control=True)
         if reasons:
             raise ValueError('; '.join(reasons))
@@ -672,6 +799,59 @@ def adapt_source(directory, relative, manifest, so_flags):
         for event, control in events:
             generated = generated.replace(event, control, 1)
         reasons = preflight(generated.decode(), True, tfo_permission_control=True)
+        if reasons:
+            raise ValueError('; '.join(reasons))
+        return generated, {**entry, 'generated_sha256': hashlib.sha256(generated).hexdigest()}
+    if relative == COOKIELESS_CLIENT_SCRIPT and not entry.get('blocked_reasons'):
+        commands = [COOKIELESS_CLIENT_SETUP.rstrip(b'\n'), COOKIELESS_CLIENT_EVENT[COOKIELESS_CLIENT_EVENT.index(b'`'):].rstrip(b'\n'), CACHE_FLUSH_RESTORE.rstrip(b'\n')]
+        replacement = b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n' + b'\n' * (COOKIELESS_CLIENT_SETUP.count(b'\n') - 1)
+        if (hashlib.sha256(source).hexdigest() != COOKIELESS_CLIENT_SHA256
+                or entry['command_line'].encode() != COOKIELESS_CLIENT_SETUP
+                or entry['replacement_line'].encode() != replacement
+                or entry.get('command_sha256') != hashlib.sha256(COOKIELESS_CLIENT_SETUP).hexdigest()
+                or entry.get('expected_command_count') != 3
+                or re.findall(rb'`[^`]*`', source) != commands
+                or [(c['command'], c['sha256']) for c in entry.get('audited_shell_commands', [])]
+                    != [(c.decode(), hashlib.sha256(c).hexdigest()) for c in commands]
+                or entry.get('cookieless_client_control') is not True
+                or entry.get('cookieless_client_event_sha256') != hashlib.sha256(COOKIELESS_CLIENT_EVENT).hexdigest()
+                or entry.get('restore_line', '').encode() != CACHE_FLUSH_RESTORE
+                or entry.get('restore_sha256') != hashlib.sha256(CACHE_FLUSH_RESTORE).hexdigest()
+                or entry.get('restore_replacement_line', '').encode() != CACHE_FLUSH_RESTORED
+                or entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
+                or not any(extra['path'] == 'common/set_sysctls.py' for extra in entry.get('additional_setup_files', []))
+                or metadata['timestamps'] or metadata['fast_open_client_policy'] != 'ApplicationProtected'
+                or source.count(COOKIELESS_CLIENT_EVENT) != 1):
+            raise ValueError('expected exact audited cookie-less client setup and timed command')
+        generated = source.replace(COOKIELESS_CLIENT_SETUP, replacement, 1).replace(COOKIELESS_CLIENT_EVENT, COOKIELESS_CLIENT_CONTROL, 1).replace(CACHE_FLUSH_RESTORE, CACHE_FLUSH_RESTORED, 1)
+        reasons = preflight(generated.decode(), True, cookieless_client_control=True)
+        if reasons:
+            raise ValueError('; '.join(reasons))
+        return generated, {**entry, 'generated_sha256': hashlib.sha256(generated).hexdigest()}
+    if relative == SYNACK_DATA_SCRIPT and not entry.get('blocked_reasons'):
+        commands = [SYNACK_DATA_SETUP.rstrip(b'\n'),
+                    SYNACK_DATA_EVENT[SYNACK_DATA_EVENT.index(b'`'):].rstrip(b'\n'),
+                    CACHE_FLUSH_RESTORE.rstrip(b'\n')]
+        if (hashlib.sha256(source).hexdigest() != SYNACK_DATA_SOURCE_SHA256
+                or entry['command_line'].encode() != SYNACK_DATA_SETUP
+                or entry['replacement_line'].encode() != b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n\n'
+                or entry.get('command_sha256') != hashlib.sha256(SYNACK_DATA_SETUP).hexdigest()
+                or entry.get('expected_command_count') != 3
+                or re.findall(rb'`[^`]*`', source) != commands
+                or [(c['command'], c['sha256']) for c in entry.get('audited_shell_commands', [])]
+                    != [(c.decode(), hashlib.sha256(c).hexdigest()) for c in commands]
+                or entry.get('timestamp_on_control') is not True
+                or entry.get('timestamp_event_sha256') != hashlib.sha256(SYNACK_DATA_EVENT).hexdigest()
+                or entry.get('restore_line', '').encode() != CACHE_FLUSH_RESTORE
+                or entry.get('restore_sha256') != hashlib.sha256(CACHE_FLUSH_RESTORE).hexdigest()
+                or entry.get('restore_replacement_line', '').encode() != CACHE_FLUSH_RESTORED
+                or entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
+                or not any(extra['path'] == 'common/set_sysctls.py' for extra in entry.get('additional_setup_files', []))
+                or metadata['timestamps']
+                or source.count(SYNACK_DATA_EVENT) != 1):
+            raise ValueError('expected exact audited SYNACK timestamp setup and timed command')
+        generated = source.replace(SYNACK_DATA_SETUP, entry['replacement_line'].encode(), 1).replace(SYNACK_DATA_EVENT, SYNACK_DATA_CONTROL, 1).replace(CACHE_FLUSH_RESTORE, CACHE_FLUSH_RESTORED, 1)
+        reasons = preflight(generated.decode(), True, timestamp_on_control=True)
         if reasons:
             raise ValueError('; '.join(reasons))
         return generated, {**entry, 'generated_sha256': hashlib.sha256(generated).hexdigest()}
@@ -740,6 +920,37 @@ def adapt_source(directory, relative, manifest, so_flags):
             raise ValueError('expected exact audited resource setup and timed command')
         generated = source.replace(RESOURCE_SETUP, entry['replacement_line'].encode(), 1).replace(RESOURCE_EVENT, RESOURCE_CONTROL, 1)
         reasons = preflight(generated.decode(), True, resource_control=True)
+        if reasons:
+            raise ValueError('; '.join(reasons))
+        return generated, {**entry, 'generated_sha256': hashlib.sha256(generated).hexdigest()}
+    if relative in COOKIELESS_SERVER_SETUP:
+        digest, expected, has_restore = COOKIELESS_SERVER_SETUP[relative]
+        restore = b'`/tmp/sysctl_restore_${PPID}.sh`\n'
+        restored = b'// ntcp profile is process-local; no host sysctls to restore.\n'
+        commands = [expected.rstrip(b'\n')] + ([restore.rstrip(b'\n')] if has_restore else [])
+        replacement = b'// ntcp setup mapped by adaptations.json; Linux defaults not reproduced.\n' + b'\n' * (expected.count(b'\n') - 1)
+        if (hashlib.sha256(source).hexdigest() != digest
+                or entry.get('blocked_reasons')
+                or entry['command_line'].encode() != expected
+                or entry.get('command_sha256') != hashlib.sha256(expected).hexdigest()
+                or entry['replacement_line'].encode() != replacement
+                or entry.get('expected_command_count') != len(commands)
+                or re.findall(rb'`[^`]*`', source) != commands
+                or [(c['command'].encode(), c['sha256']) for c in entry.get('audited_shell_commands', [])]
+                    != [(c, hashlib.sha256(c).hexdigest()) for c in commands]
+                or entry['variant'] != 'ipv4' or entry['setup_path'] != 'common/defaults.sh'
+                or metadata.get('fast_open_early_data_policy') != 'ApplicationProtected'
+                or metadata.get('fast_open_client_default') is not False
+                or metadata.get('fast_open_listener_default') is not False
+                or (has_restore and (entry.get('restore_line', '').encode() != restore
+                    or entry.get('restore_sha256') != hashlib.sha256(restore).hexdigest()
+                    or entry.get('restore_replacement_line', '').encode() != restored
+                    or not any(extra['path'] == 'common/set_sysctls.py' for extra in entry.get('additional_setup_files', []))))):
+            raise ValueError('expected exact audited cookieless server setup')
+        generated = source.replace(expected, replacement, 1)
+        if has_restore:
+            generated = generated.replace(restore, restored, 1)
+        reasons = preflight(generated.decode(), entry.get('embedded_tcp_info') is True)
         if reasons:
             raise ValueError('; '.join(reasons))
         return generated, {**entry, 'generated_sha256': hashlib.sha256(generated).hexdigest()}
@@ -982,11 +1193,8 @@ def select_cases(scripts, directory, suite, selected_variants=None, selected_scr
                     exclusion['ported_to'] = 'ntcp-ported'
                 excluded.append(exclusion)
             else:
-                if suite == 'upstream' and variant == 'ipv4' and relative in CUSTOM_TFO_SOURCES:
-                    _, local, remote = CUSTOM_TFO_SOURCES[relative]
-                    flags = [f'--local_ip={local}' if token.startswith('--local_ip=')
-                             else f'--remote_ip={remote}' if token.startswith('--remote_ip=')
-                             else token for token in flags]
+                if suite in ('upstream', 'ntcp-ported'):
+                    flags = execution_variant_flags(relative, variant)
                 selected.append((script, variant, flags))
     if not selected and not any(PORTED_EXCLUSION in row['reasons'] for row in excluded):
         raise ValueError('selection matches no eligible packetdrill cases')
@@ -996,7 +1204,7 @@ def select_cases(scripts, directory, suite, selected_variants=None, selected_scr
 UPSTREAM_BASELINE_REASON = 'Common upstream baseline: actual CUBIC with HyStart++ and fast convergence, no enforced pacing (PacingConfig=None and prr_pacing=false), IW10, 8 MiB receive storage, timestamps/SACK, RACK/TLP with the core default2ms sampled multi-packet PTO scheduling margin, RFC9937 PRR without pacing, read-window update coalescing (core default, including prompt zero/subscale reopening), synchronized local abort RST|ACK (the core bare-RST default remains separately scoped), actual admitted software-segmentation group terminal flush hints (bounded by backend capacity, queued data and half the effective cwnd), with original retry hints and no fixed packet-count batches, adaptive ACK (40ms initial timeout, 200ms maximum; audited immediate-ack overrides to fixed0), 200ms RTO floor, one preallocated connection and a bounded32MiB budget. No Linux autotuning, skb accounting, qdisc or full defaults equivalence.'
 
 
-UPSTREAM_OPTIONS = {
+UPSTREAM_OPTIONS = {'application-protected-tfo', 'application-protected-tfo-client',
     'no-timestamps', 'ecn', 'adaptive-ack', 'lowat4000', 'linux-cookie', 'pmtud1500',
     'budget128m', 'budget224m', 'prealloc3', 'prealloc4', 'immediate-ack', 'peer-ack-delay200ms',
     'abort-with-ack', 'coalesce-read-window',
@@ -1014,15 +1222,21 @@ def profile_metadata(so_flags):
     options = set(policies) - profiles
     import ipaddress
     try:
-        valid_local = len(local) == 1 and isinstance(ipaddress.ip_address(local[0]), ipaddress.IPv4Address)
+        address = ipaddress.ip_address(local[0]) if len(local) == 1 else None
+        valid_local = address is not None and not (address.is_loopback or address.is_multicast or address.is_unspecified or (address.version == 6 and (address.ipv4_mapped is not None or address.is_link_local)))
     except ValueError:
         valid_local = False
     keys = [token[8:] for token in policies if token.startswith('tfo-key=')]
     key_tokens = {token for token in options if token.startswith('tfo-key=')}
     valid_key = (not keys or len(keys) == 1 and re.fullmatch(r'[0-9a-f]{32}', keys[0]) is not None
                  and 'linux-cookie' in options)
-    known = (valid_local and valid_key and profile is not None and len(tokens) == len(set(tokens))
-             and (not options or profile == 'upstream' and options - key_tokens <= UPSTREAM_OPTIONS)
+    mtu_tokens = {token for token in options if token.startswith('link-mtu=')}
+    mtu_text = next(iter(mtu_tokens)).split('=', 1)[1] if len(mtu_tokens) == 1 else None
+    valid_mtu = (not mtu_tokens or mtu_text is not None and re.fullmatch(r'[1-9][0-9]*', mtu_text) is not None
+                 and (1280 if valid_local and address.version == 6 else 68) <= int(mtu_text) <= 65535
+                 and 'pmtud1500' not in options)
+    known = (valid_local and valid_key and valid_mtu and profile is not None and len(tokens) == len(set(tokens))
+             and (not options or profile == 'upstream' and options - key_tokens - mtu_tokens <= UPSTREAM_OPTIONS)
              and not {'budget128m', 'budget224m'} <= options
              and not {'immediate-ack', 'adaptive-ack'} <= options
              and not {'prealloc3', 'prealloc4'} <= options)
@@ -1036,7 +1250,7 @@ def profile_metadata(so_flags):
         'egress_pipeline': 'shared production scheduler',
         'general_pacing': ('paced' in options if upstream else profile in {'pipeline-paced', 'pipeline-paced-gso'}),
         'software_gso': (upstream and 'no-gso' not in options) or profile in {'pipeline-gso', 'pipeline-paced-gso'},
-        'capture_boundary': 'individual raw IPv4 TCP wire segments',
+        'capture_boundary': 'individual raw IPv6 TCP wire segments' if valid_local and address.version == 6 else 'individual raw IPv4 TCP wire segments',
         'capture_clock': 'realtime epoch microseconds at backend submission',
         'hardware_tso': False, 'gro': False, 'receive_tcp_segmentation_metadata': True,
     }
@@ -1044,7 +1258,7 @@ def profile_metadata(so_flags):
         return {key: value if key == 'profile' else None for key, value in metadata.items()}
     if upstream:
         metadata.update(
-            options=sorted(options), fast_open_client_enabled=True, sack=True, timestamps='no-timestamps' not in options,
+            options=sorted(options), fast_open_client_policy='ApplicationProtected' if 'application-protected-tfo-client' in options else 'RequireCookie', fast_open_early_data_policy='ApplicationProtected' if 'application-protected-tfo' in options else 'RequireCookie', fast_open_client_enabled=True, sack=True, timestamps='no-timestamps' not in options,
             initial_window='Iw10', fast_open_early_response='early-response' in options, rack=True, prr='Rfc9937',
             tlp=True, tlp_timer_margin_us=2000, rto_min_us=200000, preallocate_connections=4 if 'prealloc4' in options else 3 if 'prealloc3' in options else 1,
             ecn='ecn' in options, mss=1460,
@@ -1063,7 +1277,7 @@ def profile_metadata(so_flags):
             global_notsent_lowat=4000 if 'lowat4000' in options else 4294967295,
             socket_notsent_lowat=0, fast_open_client_default=False, fast_open_listener_default=False,
             fast_open_cache='fresh runtime', fast_open_cookie_policy='hmac-sha256',
-            pacing_config={'rate_gain_percent': 125, 'max_bytes_per_second': None, 'max_burst_segments': 2} if 'paced' in options else None)
+            pacing_config={'rate_gain_percent': 125, 'max_bytes_per_second': None, 'max_burst_segments': 2, 'initial_window_burst': True} if 'paced' in options else None)
         if 'linux-cookie' in options:
             metadata.update(LINUX_COOKIE_SETTINGS)
             if keys:
@@ -1072,6 +1286,8 @@ def profile_metadata(so_flags):
             metadata.update(fast_open_listener_default=True,
                             implicit_listener_enablement=True,
                             fast_open_listener_limit=128)
+        if mtu_tokens:
+            metadata['pmtud_first_hop_mtu'] = int(mtu_text)
         if 'pmtud1500' in options:
             metadata.update(FASTOPEN_PMTUD_SETTINGS)
         if 'adaptive-ack' in options:
@@ -1203,20 +1419,28 @@ def main():
                         generated, audit = apply_expectations(
                             HERE, row['script'], generated, audit, expectation_manifest)
                     if 'expectation_adjustment' in audit:
-                        row['expectation_kind'] = 'ntcp-accounting'
-                        reasons = preflight(generated.decode(), audit.get('embedded_tcp_info') is True)
+                        row['expectation_kind'] = audit['expectation_adjustment'].get(
+                            'expectation_kind', 'ntcp-accounting')
+                        reasons = preflight(generated.decode(), audit.get('embedded_tcp_info') is True,
+                                            route_control=audit.get('route_control') is True)
                         if reasons:
                             raise ValueError('accounting fixture preflight: ' + '; '.join(reasons))
                     row['adaptation'] = audit
                     if audit.get('blocked_reasons'):
                         row.update(status='unsupported', reasons=audit['blocked_reasons'])
-                    elif variant != 'ipv4':
-                        row.update(status='unsupported', reasons=['adaptation supports IPv4 only'])
                     else:
-                        execution_script = Path(temporary) / script.name
-                        execution_script.write_bytes(generated)
-                        text = generated.decode()
-                        row['adapted'] = True
+                        so_flags, variant_audit, reasons = variant_setup(row['script'], generated, so_flags, variant)
+                        if reasons:
+                            row.update(status='unsupported', reasons=reasons)
+                        else:
+                            if variant_audit is not None:
+                                row['adaptation']['variant_setup'] = variant_audit
+                            row['effective_flags']['adapter'] = so_flags
+                            row['effective_flags'].update(profile_metadata(so_flags))
+                            execution_script = Path(temporary) / script.name
+                            execution_script.write_bytes(generated)
+                            text = generated.decode()
+                            row['adapted'] = True
                 except (ValueError, OSError) as error:
                     row.update(status='adaptation_rejected', reasons=[str(error)])
             if 'status' not in row:
@@ -1236,12 +1460,14 @@ def main():
                     reasons = preflight(text, embedded_tcp_info,
                                         resource_control=(row['adapted'] and row['adaptation'].get('resource_control') is True),
                                         timestamp_control=(row['adapted'] and row['adaptation'].get('timestamp_control') is True),
+                                        timestamp_on_control=(row['adapted'] and row['adaptation'].get('timestamp_on_control') is True),
                                         cache_flush_control=(row['adapted'] and row['adaptation'].get('cache_flush_control') is True),
+                                        cookieless_client_control=(row['adapted'] and row['adaptation'].get('cookieless_client_control') is True),
                                         tfo_permission_control=(row['adapted'] and row['adaptation'].get('tfo_permission_control') is True),
                                         listener_assertion_control=(row['adapted'] and row['adaptation'].get('listener_assertion_control') is True),
                                         route_control=(row['adapted'] and row['adaptation'].get('route_control') is True))
-                    if variant not in ('native-ipv4', 'ipv4'):
-                        reasons.append('the adapter implements IPv4 only')
+                    if variant in ('ipv6', 'ipv4-mapped-v6') and not row['adapted']:
+                        reasons.append('IPv6 socket execution requires audited family setup')
                     if reasons:
                         row.update(status='unsupported', reasons=reasons)
                     else:
@@ -1287,8 +1513,8 @@ def main():
                                    stage='environment' if status == 'environment_error' or fixture_unavailable else 'behavior',
                                    behavior_executed=status != 'environment_error' and not fixture_unavailable, log=log)
             results.append(row)
-            expectation_label = (', ntcp-accounting'
-                                 if row['expectation_kind'] == 'ntcp-accounting' else '')
+            expectation_label = (', ' + row['expectation_kind']
+                                 if args.suite == 'ntcp-ported' else '')
             print(f'{row["status"]}: {row["script"]} ({variant}, {args.suite}{expectation_label})', flush=True)
     try:
         check_plugin_hash(plugin, plugin_sha256)

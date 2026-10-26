@@ -19,16 +19,16 @@
 
  +.01 < . 1:1(0) ack 10001 win 10000
 
- +.01 < . 1:1(0) ack 28001 win 10000
+ +.01 < . 1:1(0) ack 30001 win 10000
 
-// ntcp keeps 20000 payload bytes, and unpaced HyStart++ grows 10->18->26 MSS.
-// ACK 28001 permits a full 20000-byte flight with cwnd 26000 and a blocked writer.
+// ntcp keeps 20000 payload bytes, and unpaced HyStart++ grows 10->20->36 MSS.
+// ACK 30001 permits a full 20000-byte flight with cwnd 36000 and a blocked writer.
 // Hold that genuinely buffer-starved state from 120ms until 140ms.
 // The realtime bound uses the existing 4ms packet-event tolerance; deterministic
 // replay checks exactly 20000us. Positive duration remains mandatory.
- +.02 < . 1:1(0) ack 48001 win 10000
+ +.02 < . 1:1(0) ack 50001 win 10000
 
-// The final 12000 bytes fit and complete the 60000-byte blocking write.
+// The final 10000 bytes fit and complete the 60000-byte blocking write.
 // At 150ms data is still outstanding, but the socket is no longer buffer-limited.
  +.01 %{ assert 16000 <= tcpi_sndbuf_limited <= 24000, tcpi_sndbuf_limited; \
      assert 49000 <= tcpi_busy_time <= 52000, tcpi_busy_time; \

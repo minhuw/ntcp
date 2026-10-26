@@ -1,0 +1,42 @@
+// Source-derived default-LOWAT POLLOUT coverage using native payload capacity.
+// Raw default zero inherits the common unlimited LOWAT; no override is set.
+// A100ms handshake RTT separates staged10ms feedback from initial loss probes.
+    0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
+   +0 setsockopt(3, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
+   +0 bind(3, ..., ...) = 0
+   +0 listen(3, 1) = 0
+   +0 < S 0:0(0) win 32792 <mss 1000,sackOK,nop,nop,nop,wscale 0>
+   +0 > S. 0:0(0) ack 1 <mss 1460,nop,nop,sackOK,nop,wscale 8>
+  +.1 < . 1:1(0) ack 1 win 0
+   +0 accept(3, ..., ...) = 4
+   +0 setsockopt(4, SOL_SOCKET, SO_SNDBUF, [4000], 4) = 0
+   +0 getsockopt(4, SOL_SOCKET, SO_SNDBUF, [8000], [4]) = 0
+   +0 getsockopt(4, SOL_TCP, TCP_NOTSENT_LOWAT, [0], [4]) = 0
+   +0 fcntl(4, F_SETFL, O_RDWR|O_NONBLOCK) = 0
+   +0 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 0) = 1
+   +0 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 0) = 1
+// Fill the8000-byte payload buffer with a positive partial write.
+   +0 write(4, ..., 59000) = 8000
+   +0 poll([{fd=4, events=POLLOUT, revents=0}], 1, 0) = 0
+// DuplicateACK and window reopen free no payload space. Only data ACK wakes poll.
+   +0...0.020 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 1000) = 1
+ +.005 < . 1:1(0) ack 1 win 0
+ +.005 < . 1:1(0) ack 1 win 2000
+   +0 > P. 1:2001(2000) ack 1
+ +.010 < . 1:1(0) ack 2001 win 2000
+   +0 > P. 2001:4001(2000) ack 1
+   +0 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 0) = 1
+   +0 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 0) = 1
+// Refill the real2000-byte room and require a second blocked-to-writable cycle.
+   +0 write(4, ..., 59000) = 2000
+   +0 poll([{fd=4, events=POLLOUT, revents=0}], 1, 0) = 0
+   +0...0.010 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 1000) = 1
+ +.010 < . 1:1(0) ack 4001 win 2000
+   +0 > P. 4001:6001(2000) ack 1
+   +0 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 0) = 1
+ +.010 < . 1:1(0) ack 6001 win 2000
+   +0 > P. 6001:8001(2000) ack 1
+ +.010 < . 1:1(0) ack 8001 win 2000
+   +0 > P. 8001:10001(2000) ack 1
+ +.010 < . 1:1(0) ack 10001 win 2000
+   +0 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 0) = 1

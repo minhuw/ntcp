@@ -1,0 +1,43 @@
+// Source-derived blocking write with native payload capacity.
+// Preserve42000-byte capacity,61000-byte request and original10ms tolerance.
+// ACK19000 leaves one byte of admission outstanding; ACK19001 completes it.
+--tolerance_usecs=10000
+    0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
+   +0 setsockopt(3, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
+   +0 bind(3, ..., ...) = 0
+   +0 listen(3, 1) = 0
+  +.1 < S 0:0(0) win 2000 <mss 1000,nop,wscale 0>
+   +0 > S. 0:0(0) ack 1 <mss 1460,nop,wscale 8>
+  +.1 < . 1:1(0) ack 1 win 2000
+   +0 accept(3, ..., ...) = 4
+   +0 setsockopt(4, SOL_SOCKET, SO_SNDBUF, [21000], 4) = 0
+   +0 getsockopt(4, SOL_SOCKET, SO_SNDBUF, [42000], [4]) = 0
+   +0...0.130 write(4, ..., 61000) = 61000
+   +0 > . 1:2001(2000) ack 1
+ +.010 < . 1:1(0) ack 2001 win 2000
+   +0 > . 2001:4001(2000) ack 1
+ +.010 < . 1:1(0) ack 4001 win 2000
+   +0 > . 4001:6001(2000) ack 1
+ +.010 < . 1:1(0) ack 6001 win 2000
+   +0 > . 6001:8001(2000) ack 1
+ +.010 < . 1:1(0) ack 8001 win 2000
+   +0 > . 8001:10001(2000) ack 1
+ +.010 < . 1:1(0) ack 10001 win 2000
+   +0 > . 10001:12001(2000) ack 1
+ +.010 < . 1:1(0) ack 12001 win 2000
+   +0 > . 12001:14001(2000) ack 1
+ +.010 < . 1:1(0) ack 14001 win 2000
+   +0 > . 14001:16001(2000) ack 1
+ +.010 < . 1:1(0) ack 16001 win 2000
+   +0 > . 16001:18001(2000) ack 1
+ +.010 < . 1:1(0) ack 18001 win 2000
+   +0 > . 18001:20001(2000) ack 1
+// One byte below the total-capacity threshold: still pending.
+ +.010 < . 1:1(0) ack 19000 win 2000
+// Keep this final byte30ms apart so the original10ms timing tolerance
+// cannot hide an early return. Completion admits the full write; most bytes
+// are still outstanding or queued, not yet acknowledged.
+ +.030 < . 1:1(0) ack 19001 win 2000
+   +0 > . 20001:21001(1000) ack 1
+// Terminate after the checked successful write; full delivery is not required.
+ +.010 < R. 1:1(0) ack 21001 win 2000

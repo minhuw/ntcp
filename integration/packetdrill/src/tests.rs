@@ -2048,7 +2048,10 @@ fn listener_assertion_control_uses_real_membership_at_requested_port() {
 fn destination_route_command_is_canonical_and_bounded() {
     let (destination, policy) =
         route_command(b"ntcp-local-route-set 192.0.2.1 640 600 552").unwrap();
-    assert_eq!(destination, "192.0.2.1".parse::<Ipv4Addr>().unwrap());
+    assert_eq!(destination, "192.0.2.1".parse::<IpAddr>().unwrap());
+    let (v6, route) = route_command(b"ntcp-local-route-set 2001:db8::1 660 600 572").unwrap();
+    assert_eq!(v6, "2001:db8::1".parse::<IpAddr>().unwrap());
+    assert_eq!(route.unwrap().initial_search_low, Some(572));
     assert_eq!(policy.unwrap().mtu, Some(640));
     assert_eq!(
         route_command(b"ntcp-local-route-remove 192.0.2.1")
@@ -2071,7 +2074,8 @@ fn destination_route_command_is_canonical_and_bounded() {
         "ntcp-local-route-set 192.0.2.1  640 600 552",
         "ntcp-local-route-remove 192.0.2.1\n",
         "ntcp-local-route-remove 192.0.2.1 trailing",
-        "ntcp-local-route-set ::1 640 600 552",
+        "ntcp-local-route-set 2001:DB8::1 660 600 572",
+        "ntcp-local-route-set fe80::1%2 660 600 572",
     ] {
         assert_eq!(route_command(bad.as_bytes()), Err(EOPNOTSUPP), "{bad}");
     }
@@ -2224,4 +2228,92 @@ fn segmented_receive_abi_preserves_observed_size_and_rejects_invalid_metadata() 
         -1
     );
     assert_eq!(errno(), EIO);
+}
+
+#[test]
+fn client_policy_control_and_native_peer_override_preserve_deferred_open() {
+    if isolated("tests::client_policy_control_and_native_peer_override_preserve_deferred_open") {
+        return;
+    }
+    let adapter = Adapter::start((local(), upstream_tests("no-timestamps,budget224m"))).unwrap();
+    let remote = "192.0.2.2:8080".parse().unwrap();
+    let set_option = |fd: i32| unsafe {
+        let value = 1i32;
+        ntcp_socket::setsockopt(
+            fd,
+            IPPROTO_TCP,
+            TCP_FASTOPEN_CONNECT,
+            (&value as *const i32).cast(),
+            4,
+        )
+    };
+    assert_eq!(
+        unsafe { ntcp_packetdrill_control(USERDATA, c"ntcp-local-tfo-client-protected".as_ptr()) },
+        0
+    );
+    let first = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+        .unwrap()
+        .value as i32;
+    assert_eq!(set_option(first), 0);
+    assert_eq!(
+        call(&adapter, 5, first, 0, encode_addr(remote), 0)
+            .unwrap()
+            .value,
+        0
+    );
+    assert_eq!(
+        unsafe {
+            ntcp_packetdrill_control(USERDATA, c"ntcp-local-tfo-client-require-cookie".as_ptr())
+        },
+        0
+    );
+    let data = [7u8; 1000];
+    assert_eq!(
+        unsafe { ntcp_socket::write(first, data.as_ptr().cast(), data.len()) },
+        496
+    );
+    let bytes = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+    let (ip, tcp) = parse_frame(&bytes).unwrap();
+    let syn = ntcp::wire::parse(ip, tcp).unwrap();
+    assert_eq!(syn.payload.len(), 496);
+    assert!(syn.options.fast_open.is_none());
+    let next = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+        .unwrap()
+        .value as i32;
+    assert_eq!(set_option(next), 0);
+    assert_eq!(
+        unsafe {
+            ntcp_packetdrill_control(USERDATA, c"ntcp-local-tfo-client-protected; true".as_ptr())
+        },
+        -1
+    );
+    assert_eq!(errno(), EOPNOTSUPP);
+    assert_eq!(
+        call(&adapter, 5, next, 0, encode_addr(remote), 0).err(),
+        Some(EINPROGRESS)
+    );
+    let bytes = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
+    let (ip, tcp) = parse_frame(&bytes).unwrap();
+    assert_eq!(
+        ntcp::wire::parse(ip, tcp).unwrap().options.fast_open,
+        Some(ntcp::wire::FastOpenCookie::request())
+    );
+    let scoped = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
+        .unwrap()
+        .value as i32;
+    ntcp_socket::set_fast_open_client_policy(
+        scoped,
+        Some((
+            remote,
+            ntcp_socket::FastOpenClientPolicy::ApplicationProtected,
+        )),
+    )
+    .unwrap();
+    assert_eq!(set_option(scoped), 0);
+    assert_eq!(
+        call(&adapter, 5, scoped, 0, encode_addr(remote), 0)
+            .unwrap()
+            .value,
+        0
+    );
 }

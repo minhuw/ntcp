@@ -1,0 +1,74 @@
+// Source-derived EPOLLET/EPOLLOUT accounting coverage.
+// A 100ms handshake RTT separates staged ACKs from initial loss-probe timing.
+// Common upstream profile; explicit native payload capacity = 2*4000.
+// Peer scale zero makes each 2000-byte window exactly two 1000-byte MSS.
+// The native wakeup checks payload space and, for LOWAT4000, notsent<2000.
+    0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
+   +0 setsockopt(3, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
+   +0 bind(3, ..., ...) = 0
+   +0 listen(3, 1) = 0
+   +0 < S 0:0(0) win 32792 <mss 1000,sackOK,nop,nop,nop,wscale 0>
+   +0 > S. 0:0(0) ack 1 <mss 1460,nop,nop,sackOK,nop,wscale 8>
+  +.1 < . 1:1(0) ack 1 win 0
+   +0 accept(3, ..., ...) = 4
+   +0 setsockopt(4, SOL_SOCKET, SO_SNDBUF, [4000], 4) = 0
+   +0 getsockopt(4, SOL_SOCKET, SO_SNDBUF, [8000], [4]) = 0
+   +0 setsockopt(4, SOL_TCP, TCP_NOTSENT_LOWAT, [4000], 4) = 0
+   +0 getsockopt(4, SOL_TCP, TCP_NOTSENT_LOWAT, [4000], [4]) = 0
+   +0 fcntl(4, F_SETFL, O_RDWR|O_NONBLOCK) = 0
+   +0 epoll_create(1) = 5
+   +0 epoll_ctl(5, EPOLL_CTL_ADD, 4, {events=EPOLLOUT|EPOLLIN|EPOLLET, fd=4}) = 0
+   +0 epoll_wait(5, {events=EPOLLOUT, fd=4}, 1, 0) = 1
+   +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
+
+// Partial-write cycle 1; no application EAGAIN call.
+   +0 write(4, ..., 59000) = 8000
+   +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
+   +0 < . 1:1(0) ack 1 win 0
+   +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
+ +.01 < . 1:1(0) ack 1 win 2000
+   +0 > P. 1:2001(2000) ack 1
+   +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
+ +.01 < . 1:1(0) ack 2001 win 2000
+   +0 > P. 2001:4001(2000) ack 1
+   +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
+ +.01 < . 1:1(0) ack 4001 win 2000
+   +0 > P. 4001:6001(2000) ack 1
+   +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
+ +.01 < . 1:1(0) ack 6001 win 2000
+   +0 > P. 6001:8001(2000) ack 1
+   +0 epoll_wait(5, {events=EPOLLOUT, fd=4}, 1, 0) = 1
+   +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
+ +.01 < . 1:1(0) ack 8001 win 2000
+   +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
+
+// Partial-write cycle 2; no application EAGAIN call.
+   +0 write(4, ..., 180000) = 8000
+   +0 > P. 8001:10001(2000) ack 1
+   +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
+ +.01 < . 1:1(0) ack 10001 win 2000
+   +0 > P. 10001:12001(2000) ack 1
+   +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
+ +.01 < . 1:1(0) ack 12001 win 2000
+   +0 > P. 12001:14001(2000) ack 1
+   +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
+ +.01 < . 1:1(0) ack 14001 win 2000
+   +0 > P. 14001:16001(2000) ack 1
+   +0 epoll_wait(5, {events=EPOLLOUT, fd=4}, 1, 0) = 1
+   +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
+ +.01 < . 1:1(0) ack 16001 win 2000
+   +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
+
+// Partial-write cycle 3; no application EAGAIN call.
+   +0 write(4, ..., 180000) = 8000
+   +0 > P. 16001:18001(2000) ack 1
+// Defer epoll queries until after all feedback: the blocked level is unobserved.
+ +.01 < . 1:1(0) ack 18001 win 2000
+   +0 > P. 18001:20001(2000) ack 1
+ +.01 < . 1:1(0) ack 20001 win 2000
+   +0 > P. 20001:22001(2000) ack 1
+ +.01 < . 1:1(0) ack 22001 win 2000
+   +0 > P. 22001:24001(2000) ack 1
+ +.01 < . 1:1(0) ack 24001 win 2000
+   +0 epoll_wait(5, {events=EPOLLOUT, fd=4}, 1, 0) = 1
+   +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
