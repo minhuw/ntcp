@@ -11,10 +11,7 @@ fn close_full_listener(
                 let mut owner = start();
                 let listener = owner.execute(0, Op::New(0)).unwrap().value as u64;
                 owner
-                    .execute(
-                        listener,
-                        Op::Bind(SocketAddr::new(owner.local.into(), 8080)),
-                    )
+                    .execute(listener, Op::Bind(SocketAddr::new(owner.local, 8080)))
                     .unwrap();
                 owner.execute(listener, Op::Listen(1)).unwrap();
                 let mut waiters = Vec::new();

@@ -11,7 +11,7 @@ use std::{
 };
 
 pub(super) struct EthernetBackend {
-    pub(super) io: Box<dyn PacketIo + Send>,
+    pub(super) io: Box<dyn PacketIo>,
     pub(super) local: [u8; 6],
     pub(super) next_hop: [u8; 6],
     next_cookie: u64,
@@ -55,15 +55,22 @@ pub(super) fn core_stamps(stamps: PacketTimestamps) -> ntcp::RxPacketTimestamps 
     }
 }
 // Startup only: local_ip_mtu may block on the backend's control plane.
-pub(super) fn backend_config(
+#[cfg(test)]
+pub(super) fn backend_config(config: EndpointConfig, io: &dyn PacketIo) -> Result<EndpointConfig> {
+    backend_config_family(config, io, Ipv4Addr::UNSPECIFIED.into())
+}
+pub(super) fn backend_config_family(
     mut config: EndpointConfig,
     io: &dyn PacketIo,
+    local: IpAddr,
 ) -> Result<EndpointConfig> {
+    let header = crate::ip::header_len(local);
+    let minimum = if local.is_ipv4() { 68 } else { 1280 };
     let mtu = io
         .local_ip_mtu()
         .map_err(|e| e.raw_os_error().unwrap_or(EIO))?
         .ok_or(EOPNOTSUPP)?;
-    if mtu < 68 {
+    if mtu < minimum {
         return Err(EINVAL);
     }
     let overhead = if io.layer() == ntcp_io::PacketLayer::Ethernet {
@@ -71,19 +78,21 @@ pub(super) fn backend_config(
     } else {
         0
     };
-    let ip_capacity = io
-        .max_packet_len()
-        .unwrap_or(65535 + overhead)
+    let packet_capacity = io.max_packet_len().unwrap_or(65535 + overhead);
+    let packet_capacity = io.zero_copy_capabilities().map_or(packet_capacity, |caps| {
+        packet_capacity.min(caps.max_packet_len)
+    });
+    let ip_capacity = packet_capacity
         .checked_sub(overhead)
         .ok_or(EINVAL)?
         .min(65535);
-    if ip_capacity < 68 {
+    if ip_capacity < minimum as usize {
         return Err(EINVAL);
     }
     config.connection.send_ip_payload_limit = config
         .connection
         .send_ip_payload_limit
-        .min((ip_capacity - 20) as u16);
+        .min((ip_capacity - header) as u16);
     let mut policy = config
         .connection
         .pmtud
@@ -95,6 +104,67 @@ pub(super) fn backend_config(
 }
 
 impl Owner {
+    pub(super) fn external_backend(
+        config: &SocketConfig,
+        backend: crate::EthernetPacketIo,
+    ) -> Result<Self> {
+        if backend.io.layer() != ntcp_io::PacketLayer::Ethernet {
+            return Err(EINVAL);
+        }
+        // A userspace-owned port need not have a kernel interface/address.
+        // The embedding host explicitly assigns its address and subnet instead
+        // of consulting getifaddrs (used by borrowed TUN/AF_PACKET interfaces).
+        let local = config.io.address;
+        let prefix = config.io.prefix.ok_or(EINVAL)?;
+        let network = crate::ip::network(local, prefix).ok_or(EINVAL)?;
+        if !unicast(local) {
+            return Err(EADDRNOTAVAIL);
+        }
+        if let (IpAddr::V4(local), IpAddr::V4(network)) = (local, network) {
+            let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+            if prefix <= 30 && (local == network || u32::from(local) == u32::from(network) | !mask)
+            {
+                return Err(EADDRNOTAVAIL);
+            }
+        }
+        let tcp = backend_config_family(config.tcp.clone(), &*backend.io, local)?;
+        let mut secret = [0; 32];
+        let mut offset = 0;
+        while offset < secret.len() {
+            let n = unsafe {
+                syscall(
+                    SYS_getrandom,
+                    secret[offset..].as_mut_ptr(),
+                    secret.len() - offset,
+                    0,
+                )
+            };
+            if n < 0 {
+                if errno() == EINTR {
+                    continue;
+                }
+                return Err(errno());
+            }
+            if n == 0 {
+                return Err(EIO);
+            }
+            offset += n as usize;
+        }
+        let mut owner = Self::with_config(config.io.address, (network, prefix), secret, None, tcp)?;
+        owner.apply_socket_config(config)?;
+        owner.ethernet = Some(EthernetBackend {
+            io: backend.io,
+            local: backend.local_mac,
+            next_hop: backend.next_hop_mac,
+            next_cookie: 1,
+            pending: Vec::with_capacity(timestamps::PHASES),
+        });
+        owner.enable_egress(config.io.egress_capacity, config.io.gso)?;
+        owner.reservations = true;
+        owner.reservation_timeout_us = u64::from(config.io.output_reservation_timeout_ms) * 1000;
+        Ok(owner)
+    }
+
     pub(super) fn af_packet(config: &SocketConfig) -> Result<Self> {
         let name = &config.io.interface;
         let local = config.io.address;
@@ -105,7 +175,7 @@ impl Owner {
             return Err(errno());
         }
         let next_hop = config.io.next_hop_mac.ok_or(EINVAL)?;
-        let mut io = AfPacket::bind(index, ntcp_ethernet::ETHERTYPE_IPV4)
+        let mut io = AfPacket::bind(index, crate::ip::ether_type(local))
             .map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
         if config.io.receive_aggregation {
             io.enable_receive_aggregation()
@@ -172,7 +242,7 @@ impl Owner {
             subnet,
             secret,
             None,
-            backend_config(config.tcp.clone(), &io)?,
+            backend_config_family(config.tcp.clone(), &io, local)?,
         )?;
         owner.apply_socket_config(config)?;
         owner.ethernet = Some(EthernetBackend {
@@ -315,10 +385,10 @@ impl Owner {
         stamps: ntcp::RxPacketTimestamps,
         segment_size: Option<core::num::NonZeroU16>,
     ) {
-        let Ok(p) = ntcp_ip::parse(bytes, false) else {
+        let Ok(p) = crate::ip::parse(bytes) else {
             return;
         };
-        if p.ip.destination != IpAddr::V4(self.local) {
+        if p.ip.destination != self.local {
             return;
         }
         if p.protocol == 6 {
@@ -357,7 +427,10 @@ impl Owner {
                     q.ip_header_len,
                     feedback.candidate_mtu.unwrap_or(0),
                 );
-            } else if let Some(error) = feedback.ipv4_network_error() {
+            } else if let Some(error) = feedback
+                .ipv4_network_error()
+                .or_else(|| feedback.ipv6_network_error())
+            {
                 let _ = self
                     .endpoint
                     .network_error(self.now(), tuple, q.sequence, error);
@@ -479,7 +552,11 @@ impl EthernetBackend {
             &mut frame,
             self.local,
             self.next_hop,
-            ntcp_ethernet::ETHERTYPE_IPV4,
+            if packet.first().is_some_and(|b| b >> 4 == 6) {
+                ntcp_ethernet::ETHERTYPE_IPV6
+            } else {
+                ntcp_ethernet::ETHERTYPE_IPV4
+            },
             packet,
         )
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
@@ -551,3 +628,7 @@ mod tests;
 #[cfg(test)]
 #[path = "runtime_accept_tests.rs"]
 mod accept_tests;
+
+#[cfg(test)]
+#[path = "runtime_shared_tests.rs"]
+mod shared_tests;

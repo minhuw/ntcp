@@ -30,10 +30,12 @@ macro_rules! boundary_entry {
 }
 
 mod config;
+mod ip;
 pub use config::{Backend, IoConfig, SocketConfig, SocketPolicy};
 #[cfg(feature = "tfo-linux-cookie")]
 pub use ntcp::LinuxSipHash24Key;
-pub use ntcp::{FastOpenCookiePolicy, RoutePolicy};
+pub use ntcp::wire::FastOpenCookie;
+pub use ntcp::{FastOpenClientPolicy, FastOpenCookiePolicy, FastOpenEarlyDataPolicy, RoutePolicy};
 mod file_transfer;
 #[cfg(feature = "packet-test")]
 pub mod packet_profile;
@@ -41,6 +43,9 @@ pub mod packet_profile;
 pub mod packet_test;
 mod readiness;
 mod runtime;
+mod zerocopy;
+pub use ntcp_io::Payload;
+pub use zerocopy::RegisteredPayload;
 mod socket_options;
 mod stdio;
 mod timestamping;
@@ -219,6 +224,36 @@ static CONFIG: OnceLock<Result<Option<SocketConfig>>> = OnceLock::new();
 
 // Also used for file selection: failures are immutable, never native fallback.
 fn select_config(explicit: Option<SocketConfig>) -> Result<&'static Option<SocketConfig>> {
+    select_config_backend(explicit, None)
+}
+
+/// An owner-thread constructed Ethernet backend. It need not be Send: DPDK
+/// queues and their adapter remain confined to the thread that invokes factory.
+pub struct EthernetPacketIo {
+    pub io: Box<dyn ntcp_io::PacketIo>,
+    pub local_mac: [u8; 6],
+    pub next_hop_mac: [u8; 6],
+}
+type PacketIoFactory = Box<dyn FnOnce() -> std::io::Result<EthernetPacketIo> + Send>;
+static PACKET_IO_FACTORY: Mutex<Option<PacketIoFactory>> = Mutex::new(None);
+
+/// Assign an explicitly owned address/subnet (`config.io.prefix` is required).
+/// The factory runs on the socket owner thread after lazy runtime startup.
+pub fn configure_with_packet_io(
+    config: SocketConfig,
+    factory: impl FnOnce() -> std::io::Result<EthernetPacketIo> + Send + 'static,
+) -> std::io::Result<()> {
+    if DEPTH.with(Cell::get) != 0 {
+        return Err(std::io::Error::from_raw_os_error(EDEADLK));
+    }
+    select_config_backend(Some(config), Some(Box::new(factory)))
+        .map(|_| ())
+        .map_err(std::io::Error::from_raw_os_error)
+}
+fn select_config_backend(
+    explicit: Option<SocketConfig>,
+    factory: Option<PacketIoFactory>,
+) -> Result<&'static Option<SocketConfig>> {
     if explicit.is_none() && matches!(CONFIG.get(), Some(Ok(None))) {
         return Ok(CONFIG.get().unwrap().as_ref().unwrap());
     }
@@ -237,9 +272,10 @@ fn select_config(explicit: Option<SocketConfig>) -> Result<&'static Option<Socke
     let old = set_internal(true);
     let result = CONFIG.get_or_init(|| {
         selected = true;
-        catch_unwind(|| {
+        catch_unwind(AssertUnwindSafe(|| {
             if let Some(config) = explicit {
                 config.validate().map_err(|_| EINVAL)?;
+                *PACKET_IO_FACTORY.lock().map_err(|_| EIO)? = factory;
                 Ok(Some(config))
             } else {
                 // Preserve non-UTF8 filesystem paths; only file contents are UTF8.
@@ -248,7 +284,7 @@ fn select_config(explicit: Option<SocketConfig>) -> Result<&'static Option<Socke
                     .transpose()
                     .map_err(|e| e.raw_os_error().unwrap_or(EINVAL))
             }
-        })
+        }))
         .unwrap_or(Err(EIO))
     });
     set_internal(old);
@@ -287,11 +323,83 @@ pub fn set_fast_open_client_enabled(enabled: bool) -> std::io::Result<()> {
     apply().map_err(std::io::Error::from_raw_os_error)
 }
 
+/// Set the policy for future active opens in this runtime. ApplicationProtected
+/// asserts agreement with the services the application will contact. Existing
+/// connections and already-deferred opens retain their admission; caches survive.
+pub fn set_fast_open_client_default_policy(policy: FastOpenClientPolicy) -> std::io::Result<()> {
+    let apply = || -> Result<()> {
+        mutation_context()?;
+        if RUNTIME.get().is_none() {
+            match CONFIG.get() {
+                Some(Ok(Some(_))) => (),
+                Some(Err(error)) => return Err(*error),
+                _ => return Err(EINVAL),
+            }
+        }
+        runtime()?.call(0, Op::SetFastOpenClientDefaultPolicy(policy))?;
+        Ok(())
+    };
+    apply().map_err(std::io::Error::from_raw_os_error)
+}
+
+/// Override one fresh socket's client policy for an exact target IP and port.
+/// None removes the override. A supplied server cookie remains an explicit
+/// credential exchange; this setting does not enable TFO or erase failures.
+pub fn set_fast_open_client_policy(
+    fd: i32,
+    policy: Option<(SocketAddr, FastOpenClientPolicy)>,
+) -> std::io::Result<()> {
+    let apply = || -> Result<()> {
+        mutation_context()?;
+        let id = owned(fd)?.ok_or(EOPNOTSUPP)?;
+        call(id, Op::SetFastOpenClientPolicy(policy))?;
+        Ok(())
+    };
+    apply().map_err(std::io::Error::from_raw_os_error)
+}
+
+/// Stage a cookie obtained from this target server for the local address on a fresh managed socket.
+/// None removes the staged credential. A zero-length cookie is valid only when
+/// the protected server explicitly supplied/agreed it (RFC7413 section7.3).
+/// No server agreement is inferred from an empty option or a local listener.
+/// Only the exact remote IP/port uses it. The Fast Open option remains on wire;
+/// cold peer MSS defaults still apply.
+/// This neither enables TFO calls nor clears independent failure evidence.
+pub fn set_fast_open_server_cookie(
+    fd: i32,
+    credential: Option<(SocketAddr, FastOpenCookie)>,
+) -> std::io::Result<()> {
+    let apply = || -> Result<()> {
+        mutation_context()?;
+        let id = owned(fd)?.ok_or(EOPNOTSUPP)?;
+        call(id, Op::SetFastOpenServerCookie(credential))?;
+        Ok(())
+    };
+    apply().map_err(std::io::Error::from_raw_os_error)
+}
+
+/// Change future early admissions on one managed listening socket. TFO service
+/// and listener enablement remain separate. ApplicationProtected is appropriate
+/// only for applications with independent resource/amplification protection and
+/// normal Fast Open replay tolerance. Existing children keep their policy.
+pub fn set_listener_fast_open_early_data_policy(
+    fd: i32,
+    policy: FastOpenEarlyDataPolicy,
+) -> std::io::Result<()> {
+    let apply = || -> Result<()> {
+        mutation_context()?;
+        let id = owned(fd)?.ok_or(EOPNOTSUPP)?;
+        call(id, Op::SetListenerFastOpenEarlyDataPolicy(policy))?;
+        Ok(())
+    };
+    apply().map_err(std::io::Error::from_raw_os_error)
+}
+
 // Per-destination same-path transport policy, serialized with the owner. None
 // removes the override. MTU changes cover existing connections; creation hints
 // affect future connections only. A held affected output returns WouldBlock.
 pub fn set_destination_route(
-    destination: Ipv4Addr,
+    destination: impl Into<IpAddr>,
     policy: Option<RoutePolicy>,
 ) -> std::io::Result<()> {
     let apply = || -> Result<()> {
@@ -303,7 +411,7 @@ pub fn set_destination_route(
                 _ => return Err(EINVAL),
             }
         }
-        runtime()?.call(0, Op::SetDestinationRoute(destination, policy))?;
+        runtime()?.call(0, Op::SetDestinationRoute(destination.into(), policy))?;
         Ok(())
     };
     apply().map_err(std::io::Error::from_raw_os_error)
@@ -803,21 +911,38 @@ unsafe fn address(p: *const sockaddr, len: socklen_t) -> Result<SocketAddr> {
     if p.is_null() {
         return Err(EFAULT);
     }
-    if len < std::mem::size_of::<sockaddr_in>() as u32 {
+    if len < 2 {
         return Err(EINVAL);
     }
-    let p = load(p.cast::<sockaddr_in>())?;
-    if p.sin_family as i32 != AF_INET {
-        return Err(if io_limit() < runtime::BYTES {
-            runtime::unsupported_option("address family")
-        } else {
-            EAFNOSUPPORT
-        });
+    match load(p.cast::<u16>())? as i32 {
+        AF_INET => {
+            if (len as usize) < std::mem::size_of::<sockaddr_in>() {
+                return Err(EINVAL);
+            }
+            let p = load(p.cast::<sockaddr_in>())?;
+            Ok(SocketAddr::new(
+                Ipv4Addr::from(p.sin_addr.s_addr.to_ne_bytes()).into(),
+                u16::from_be(p.sin_port),
+            ))
+        }
+        AF_INET6 => {
+            if (len as usize) < std::mem::size_of::<sockaddr_in6>() {
+                return Err(EINVAL);
+            }
+            let p = load(p.cast::<sockaddr_in6>())?;
+            let addr = std::net::SocketAddrV6::new(
+                p.sin6_addr.s6_addr.into(),
+                u16::from_be(p.sin6_port),
+                u32::from_be(p.sin6_flowinfo),
+                p.sin6_scope_id,
+            );
+            if addr.scope_id() != 0 || addr.flowinfo() != 0 || addr.ip().is_unicast_link_local() {
+                return Err(EOPNOTSUPP);
+            }
+            Ok(addr.into())
+        }
+        _ => Err(EAFNOSUPPORT),
     }
-    Ok(SocketAddr::new(
-        Ipv4Addr::from(p.sin_addr.s_addr.to_ne_bytes()).into(),
-        u16::from_be(p.sin_port),
-    ))
 }
 // Linux rejects AF_UNSPEC for an implicit Fast Open connect (not a disconnect).
 unsafe fn send_address(p: *const sockaddr, len: socklen_t, flags: i32) -> Result<SocketAddr> {
@@ -833,25 +958,47 @@ unsafe fn output_addr(addr: SocketAddr, p: *mut sockaddr, len: *mut socklen_t) -
     if len.is_null() {
         return Err(EFAULT);
     }
-    let IpAddr::V4(ip) = addr.ip() else {
-        return Err(EAFNOSUPPORT);
+    let (mut storage, size) = match addr {
+        SocketAddr::V4(addr) => {
+            let a = sockaddr_in {
+                sin_family: AF_INET as u16,
+                sin_port: addr.port().to_be(),
+                sin_addr: in_addr {
+                    s_addr: u32::from_ne_bytes(addr.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            let mut storage = [0u8; std::mem::size_of::<sockaddr_in6>()];
+            storage[..std::mem::size_of::<sockaddr_in>()].copy_from_slice(unsafe {
+                std::slice::from_raw_parts(
+                    (&a as *const sockaddr_in).cast(),
+                    std::mem::size_of::<sockaddr_in>(),
+                )
+            });
+            (storage, std::mem::size_of::<sockaddr_in>())
+        }
+        SocketAddr::V6(addr) => {
+            let a = sockaddr_in6 {
+                sin6_family: AF_INET6 as u16,
+                sin6_port: addr.port().to_be(),
+                sin6_flowinfo: addr.flowinfo().to_be(),
+                sin6_addr: in6_addr {
+                    s6_addr: addr.ip().octets(),
+                },
+                sin6_scope_id: addr.scope_id(),
+            };
+            let mut storage = [0u8; std::mem::size_of::<sockaddr_in6>()];
+            storage.copy_from_slice(unsafe {
+                std::slice::from_raw_parts(
+                    (&a as *const sockaddr_in6).cast(),
+                    std::mem::size_of::<sockaddr_in6>(),
+                )
+            });
+            (storage, std::mem::size_of::<sockaddr_in6>())
+        }
     };
-    let addr = sockaddr_in {
-        sin_family: AF_INET as u16,
-        sin_port: addr.port().to_be(),
-        sin_addr: in_addr {
-            s_addr: u32::from_ne_bytes(ip.octets()),
-        },
-        sin_zero: [0; 8],
-    };
-    let size = std::mem::size_of::<sockaddr_in>();
     let n = (load(len)? as usize).min(size);
-    memory(
-        (&addr as *const sockaddr_in).cast_mut().cast(),
-        p.cast(),
-        n,
-        true,
-    )?;
+    memory(storage.as_mut_ptr(), p.cast(), n, true)?;
     store(len, &(size as u32))?;
     Ok(())
 }
@@ -873,11 +1020,18 @@ pub unsafe extern "C" fn ntcp_managed_socket(domain: i32, kind: i32, protocol: i
             return Err(EPROTONOSUPPORT);
         }
         let rt = runtime()?;
-        if domain != rt.family {
+        if domain == AF_INET && rt.family != AF_INET {
             return Err(EAFNOSUPPORT);
         }
         let (fd, t) = token(kind)?;
-        match rt.call(0, Op::New(kind)) {
+        match rt.call(
+            0,
+            if domain == rt.family {
+                Op::New(kind)
+            } else {
+                Op::NewDomain(domain, kind)
+            },
+        ) {
             Ok(reply) => install(fd, t, reply.value as u64),
             Err(e) => {
                 unsafe {
@@ -1261,7 +1415,12 @@ fn copy_timestamp_completion(
     stamp: Option<&[u8; 48]>,
     error: &[u8; 32],
     payload: &[u8],
+    family: i32,
 ) -> Result<usize> {
+    let mut error = error.to_vec();
+    if family == AF_INET6 {
+        error.resize(44, 0);
+    }
     let vectors = load_array(m.msg_iov, m.msg_iovlen, 1024)?;
     let mut copied = 0;
     for v in vectors {
@@ -1277,7 +1436,15 @@ fn copy_timestamp_completion(
     for (level, kind, data) in stamp
         .map(|stamp| (SOL_SOCKET, kind, stamp.as_slice()))
         .into_iter()
-        .chain(std::iter::once((SOL_IP, IP_RECVERR, error.as_slice())))
+        .chain(std::iter::once((
+            if family == AF_INET6 { SOL_IPV6 } else { SOL_IP },
+            if family == AF_INET6 {
+                IPV6_RECVERR
+            } else {
+                IP_RECVERR
+            },
+            error.as_slice(),
+        )))
     {
         let (control, n, truncated) = socket_options::cmsg_control(
             m.msg_controllen - used,
@@ -1298,17 +1465,27 @@ fn copy_timestamp_completion(
     Ok(copied)
 }
 // SPDX-License-Identifier: GPL-2.0-or-later
-fn copy_completion(p: *mut msghdr, mut m: msghdr, (lo, hi): (u32, u32)) -> Result<()> {
-    let mut extended = [0u8; 32]; // sock_extended_err + sockaddr_in offender
+fn copy_completion_family(
+    p: *mut msghdr,
+    mut m: msghdr,
+    (lo, hi): (u32, u32),
+    copied: bool,
+    family: i32,
+) -> Result<()> {
+    let mut extended = vec![0u8; if family == AF_INET6 { 44 } else { 32 }]; // sock_extended_err + zero offender
     extended[4] = 5; // SO_EE_ORIGIN_ZEROCOPY
-    extended[6] = 1; // SO_EE_CODE_ZEROCOPY_COPIED
+    extended[6] = u8::from(copied); // SO_EE_CODE_ZEROCOPY_COPIED
     extended[8..12].copy_from_slice(&lo.to_ne_bytes());
     extended[12..16].copy_from_slice(&hi.to_ne_bytes());
     let (control, used, truncated) = socket_options::cmsg_control(
         m.msg_controllen,
         !m.msg_control.is_null(),
-        SOL_IP,
-        IP_RECVERR,
+        if family == AF_INET6 { SOL_IPV6 } else { SOL_IP },
+        if family == AF_INET6 {
+            IPV6_RECVERR
+        } else {
+            IP_RECVERR
+        },
         &extended,
     );
     m.msg_flags = MSG_ERRQUEUE | if truncated { MSG_CTRUNC } else { 0 };
@@ -1650,6 +1827,7 @@ fn socket_option_feature(level: i32, name: i32) -> Result<()> {
                 // SO_TIMESTAMPING_OLD / SO_TIMESTAMPING_NEW.
                 | (SOL_SOCKET, SO_ZEROCOPY | SO_MARK | SO_DOMAIN | SO_PROTOCOL | 37 | 65)
                 | (IPPROTO_IP, IP_FREEBIND | IP_MTU_DISCOVER | IP_MTU)
+                | (IPPROTO_IPV6, IPV6_FREEBIND)
         )
     {
         return Err(ENOPROTOOPT);

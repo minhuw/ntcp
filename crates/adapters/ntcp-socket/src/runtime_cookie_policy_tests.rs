@@ -11,7 +11,7 @@ fn set(owner: &mut Owner, id: u64, byte: u8) -> Result<Reply> {
 fn syn(owner: &mut Owner, port: u16, remote_port: u16) {
     let ip = ntcp::IpMetadata {
         source: "192.0.2.1".parse().unwrap(),
-        destination: owner.local.into(),
+        destination: owner.local,
     };
     let mut bytes = [0; 128];
     let n = wire::encode(
@@ -48,14 +48,14 @@ fn response(owner: &mut Owner) -> Option<FastOpenCookie> {
 fn listener(owner: &mut Owner, port: u16) -> u64 {
     let id = owner.execute(0, Op::New(SOCK_NONBLOCK)).unwrap().value as u64;
     owner
-        .execute(id, Op::Bind(SocketAddr::new(owner.local.into(), port)))
+        .execute(id, Op::Bind(SocketAddr::new(owner.local, port)))
         .unwrap();
     id
 }
 
 #[test]
 fn typed_default_staging_rotation_isolation_and_failed_handles() {
-    let local = "192.168.0.1".parse().unwrap();
+    let local: IpAddr = "192.168.0.1".parse().unwrap();
     let mut config = SocketConfig::new("test", local);
     config.fast_open_cookie_policy = policy(1);
     let mut owner =
@@ -129,7 +129,7 @@ fn typed_default_staging_rotation_isolation_and_failed_handles() {
 
 #[test]
 fn socket_rotation_keeps_held_synack_and_budget_unchanged() {
-    let local = "192.168.0.1".parse().unwrap();
+    let local: IpAddr = "192.168.0.1".parse().unwrap();
     let mut owner = Owner::with_config(
         local,
         (local, 32),

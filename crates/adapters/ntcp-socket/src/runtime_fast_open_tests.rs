@@ -41,7 +41,7 @@ fn tfo_setup(warm: bool) -> (Owner, Owner, u64) {
         assert!(!a.sockets.contains_key(&client));
         assert!(
             a.endpoint
-                .has_fast_open_cookie(a.now(), a.local.into(), b.local.into())
+                .has_fast_open_cookie(a.now(), a.local, b.local)
                 .unwrap()
         );
     }
@@ -1409,7 +1409,7 @@ fn fast_open_failed_implicit_completion_rolls_back_for_retry() {
             let remote = "192.0.2.2:8080".parse().unwrap();
             assert_eq!(
                 a.endpoint
-                    .can_defer_fast_open(a.now(), a.local.into(), remote)
+                    .can_defer_fast_open(a.now(), a.local, remote)
                     .unwrap(),
                 warm
             );
@@ -1695,12 +1695,12 @@ fn fast_open_reset_cookie_reuse_and_independent_suppression_blocking_send() {
         let remote: SocketAddr = "192.0.2.2:8080".parse().unwrap();
         assert!(
             a.endpoint
-                .has_fast_open_cookie(a.now(), a.local.into(), remote.ip())
+                .has_fast_open_cookie(a.now(), a.local, remote.ip())
                 .unwrap()
         );
         assert_eq!(
             a.endpoint
-                .can_defer_fast_open(a.now(), a.local.into(), remote)
+                .can_defer_fast_open(a.now(), a.local, remote)
                 .unwrap(),
             !suppress
         );
@@ -1800,7 +1800,7 @@ fn fast_open_reset_cookie_reuse_and_independent_suppression_blocking_send() {
         }
         assert_eq!(
             a.endpoint
-                .can_defer_fast_open(a.now(), a.local.into(), remote)
+                .can_defer_fast_open(a.now(), a.local, remote)
                 .unwrap(),
             !timeout && !suppress
         );
@@ -1895,4 +1895,44 @@ fn fast_open_authenticated_empty_syn_accepts_without_false_readability() {
     assert_ne!(b.execute(server, Op::Ready).unwrap().value & EPOLLIN, 0);
     assert_eq!(b.execute(server, Op::Read(32)).unwrap().bytes, b"request");
     assert!(!b.endpoint.transport_info(cid(&b, server)).unwrap().syn_data_fully_acked);
+}
+
+#[test]
+fn server_cookie_blocking_iov_and_deferred_calls_retain_tail_until_handshake() {
+    for deferred in [false, true] {
+        let (mut a, mut b, listener) = tfo_setup(false);
+        let remote = "192.0.2.2:8080".parse().unwrap();
+        b.execute(listener, Op::SetListenerFastOpenEarlyDataPolicy(FastOpenEarlyDataPolicy::ApplicationProtected)).unwrap();
+        let client = new(&mut a, 0);
+        a.execute(client, Op::Set(IPPROTO_TCP, TCP_NODELAY, 1)).unwrap();
+        a.execute(client, Op::SetFastOpenServerCookie(Some((remote, FastOpenCookie::request())))).unwrap();
+        if deferred {
+            a.execute(client, Op::Set(IPPROTO_TCP, TCP_FASTOPEN_CONNECT, 1)).unwrap();
+            a.execute(client, Op::Connect(remote)).unwrap();
+            tfo_no_output(&mut a);
+            assert_eq!(a.execute(client, Op::SetFastOpenServerCookie(None)).unwrap_err(), EINVAL);
+        }
+        let first = vec![1; 1000];
+        let second = vec![2; 1000];
+        let (reply, rx) = mpsc::sync_channel(1);
+        let mut request = Request {
+            id: client,
+            op: Op::Wait(Box::new(Op::SendTo(vec![(first.as_ptr() as usize, first.len()), (second.as_ptr() as usize, second.len())],
+                if deferred {0} else {MSG_FASTOPEN}, Some(remote), None)), None),
+            reply, deadline: None, send: None, closing: None,
+        };
+        assert!(!a.service(&mut request));
+        let syn = tfo_capture(&mut a);
+        assert_eq!(segment(&syn).payload, &first[..496]);
+        assert_eq!(segment(&syn).options.fast_open, Some(FastOpenCookie::request()));
+        assert!(rx.try_recv().is_err());
+        tfo_deliver(&mut b, syn);
+        let server = b.execute(listener, Op::Accept(SOCK_NONBLOCK)).unwrap().value as u64;
+        assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap().bytes, first[..496]);
+        exchange(&mut a, &mut b);
+        assert!(a.service(&mut request));
+        assert_eq!(rx.recv().unwrap().unwrap().value, 2000);
+        exchange(&mut a, &mut b);
+        assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap().bytes, [first[496..].to_vec(), second].concat());
+    }
 }

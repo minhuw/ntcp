@@ -48,6 +48,7 @@ fn disabled_linux_options_preserve_native_and_posix_abi() {
                 &[SO_ZEROCOPY, SO_DOMAIN, SO_PROTOCOL, 37, 65][..],
             ),
             (IPPROTO_IP, &[IP_FREEBIND, IP_MTU_DISCOVER, IP_MTU][..]),
+            (IPPROTO_IPV6, &[IPV6_FREEBIND][..]),
         ] {
             for &name in names {
                 let mut bytes = [0xa5u8; 32];

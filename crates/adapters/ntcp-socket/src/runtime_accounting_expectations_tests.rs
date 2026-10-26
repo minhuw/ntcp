@@ -89,9 +89,9 @@ fn sndbuf_accounting_fixture_has_exact_positive_interval_and_valid_acks() {
     incoming.sequence = 1;
     incoming.flags = ACK;
     for (now, ack, expected_end, expected_cwnd, done) in [
-        (110000, 10001, 28001, 18000, false),
-        (120000, 28001, 48001, 26000, false),
-        (140000, 48001, 60001, 26000, true),
+        (110000, 10001, 30001, 20000, false),
+        (120000, 30001, 50001, 36000, false),
+        (140000, 50001, 60001, 36000, true),
     ] {
         assert!(ack <= frontier, "ACK must not acknowledge unsent bytes");
         incoming.acknowledgment = iss.wrapping_add(ack);

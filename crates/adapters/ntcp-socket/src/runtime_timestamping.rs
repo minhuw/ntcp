@@ -33,6 +33,7 @@ impl std::ops::Deref for PacketPayload {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Completion {
     ZeroCopy(u32, u32),
+    SharedZeroCopy(u32, u32, bool),
     Timestamp {
         stamp: [u8; 48],
         error: [u8; 32],
@@ -48,7 +49,7 @@ impl Completion {
     }
     pub(super) fn charge(&self) -> usize {
         match self {
-            Self::ZeroCopy(..) => 0,
+            Self::ZeroCopy(..) | Self::SharedZeroCopy(..) => 0,
             Self::Timestamp { payload, .. } => RECORD + payload.charge(),
         }
     }
@@ -117,6 +118,8 @@ impl TimestampState {
 impl Socket {
     fn timestamp_charge(&self) -> usize {
         self.timestamps.charge()
+            + self.zc_leases.capacity() * std::mem::size_of::<crate::zerocopy::Pending>()
+            + self.zc_leases.len() * std::mem::size_of::<crate::zerocopy::LeaseState>()
             + self.completions.capacity() * std::mem::size_of::<Completion>()
             + self
                 .completions

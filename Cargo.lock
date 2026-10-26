@@ -226,6 +226,7 @@ dependencies = [
  "ntcp-io-tun",
  "ntcp-ip",
  "ntcp-ip-common",
+ "ntcp-ip6",
 ]
 
 [[package]]

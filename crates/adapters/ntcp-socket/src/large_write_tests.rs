@@ -604,6 +604,7 @@ fn sndbuf_ack_timeline(profile: crate::packet_profile::Profile) {
     if profile == upstream_large_write_tests("paced") {
         let mut now = 10000;
         let mut flight_times = Vec::new();
+        let mut paced_times = Vec::new();
         let mut finished = false;
         for (ack_time, ack) in [
             (110000, 10001),
@@ -634,6 +635,8 @@ fn sndbuf_ack_timeline(profile: crate::packet_profile::Profile) {
                         );
                         if ack == 10001 {
                             flight_times.push(now);
+                        } else if ack == 30001 {
+                            paced_times.push(now);
                         }
                         eprintln!("PACED output t={now} high={high}");
                     }
@@ -699,11 +702,13 @@ fn sndbuf_ack_timeline(profile: crate::packet_profile::Profile) {
             if ack == 10001 {
                 assert_eq!(high, 10001);
                 assert_eq!(flight_times.len(), 10);
-                assert!(flight_times.last().unwrap() > flight_times.first().unwrap());
-                assert!(flight_times.windows(3).all(|t| t[0] < t[2]));
-                assert_eq!(info.cwnd, 20000);
+                assert!(flight_times.iter().all(|t| *t == flight_times[0]));
+                assert_eq!(info.cwnd, 20000); // Initial bypass uses finite L16.
             } else if ack == 30001 {
                 assert_eq!(high, 30001);
+                assert_eq!(paced_times.len(), 20);
+                assert!(paced_times.last().unwrap() > paced_times.first().unwrap());
+                assert!(paced_times.windows(3).all(|t| t[0] < t[2]));
                 assert_eq!(info.cwnd, 40000);
                 assert_eq!(info.sndbuf_limited_us, 0);
             }

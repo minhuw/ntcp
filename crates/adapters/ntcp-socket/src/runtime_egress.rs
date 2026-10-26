@@ -16,6 +16,7 @@ struct Entry {
 struct TxSlot {
     bytes: Vec<u8>,
     entry: Option<Entry>,
+    shared: ntcp_io::OwnedPacket,
 }
 struct RxSlot {
     bytes: Vec<u8>,
@@ -31,6 +32,7 @@ pub(super) struct Egress {
     candidates: Vec<ConnectionId>,
     packet_capacity: usize,
     cursor: usize,
+    shared_segments: usize,
     #[cfg(test)]
     pub(super) selected_ranges: usize,
 }
@@ -40,6 +42,9 @@ fn buffer(size: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 impl Egress {
+    pub(super) fn shared_enabled(&self) -> bool {
+        self.shared_segments != 0
+    }
     fn new(capacity: usize, packet_capacity: usize, connections: usize) -> Result<Self> {
         let retained = capacity.checked_mul(packet_capacity).ok_or(EINVAL)?;
         let scheduler = Scheduler::new(
@@ -68,6 +73,7 @@ impl Egress {
             tx.push(TxSlot {
                 bytes: buffer(packet_capacity)?,
                 entry: None,
+                shared: ntcp_io::OwnedPacket::default(),
             });
             rx.push(RxSlot {
                 bytes: buffer(packet_capacity)?,
@@ -84,6 +90,7 @@ impl Egress {
             candidates,
             packet_capacity,
             cursor: 0,
+            shared_segments: 0,
             #[cfg(test)]
             selected_ranges: 0,
         })
@@ -118,6 +125,8 @@ impl Egress {
         }
         self.scheduler.disable_flow(entry.flow).map_err(|_| EIO)?;
         slot.bytes.clear();
+        slot.shared.header.clear();
+        slot.shared.payload.clear();
         Ok(())
     }
     pub(super) fn wait(&self, now: u64, core: Option<u64>) -> std::time::Duration {
@@ -139,7 +148,7 @@ impl Owner {
         capacity: usize,
         gso: Option<ntcp::GsoLimits>,
     ) -> Result<()> {
-        let packet_capacity = if let Some(backend) = &self.ethernet {
+        let mut packet_capacity = if let Some(backend) = &self.ethernet {
             backend.io.max_packet_len().unwrap_or(65535 + 14)
         } else {
             self.tun
@@ -147,6 +156,13 @@ impl Owner {
                 .and_then(|io| io.max_packet_len())
                 .unwrap_or(65535)
         };
+        if let Some(caps) = self
+            .ethernet
+            .as_ref()
+            .and_then(|b| b.io.zero_copy_capabilities())
+        {
+            packet_capacity = packet_capacity.min(caps.max_packet_len);
+        }
         // Core charges aggregate storage separately from these scalar wire buffers.
         match gso {
             Some(limits) => self
@@ -157,16 +173,44 @@ impl Owner {
                 .enable_output_reservations_with_capacity(capacity),
         }
         .map_err(engine)?;
-        self.egress = Some(Egress::new(
-            capacity,
-            packet_capacity,
-            self.defaults.max_connections,
-        )?);
+        let mut egress = Egress::new(capacity, packet_capacity, self.defaults.max_connections)?;
+        if let Some(caps) = self
+            .ethernet
+            .as_ref()
+            .and_then(|b| b.io.zero_copy_capabilities())
+        {
+            let segments = caps
+                .max_payload_segments
+                .min(self.defaults.connection.send_capacity);
+            if segments == 0 || caps.max_packet_len < 60 {
+                return Err(EINVAL);
+            }
+            for slot in &mut egress.tx {
+                slot.shared
+                    .payload
+                    .try_reserve_exact(segments)
+                    .map_err(|_| ENOMEM)?;
+                slot.shared
+                    .header
+                    .try_reserve_exact(134)
+                    .map_err(|_| ENOMEM)?;
+            }
+            self.endpoint
+                .enable_shared_output(segments)
+                .map_err(engine)?;
+            egress.shared_segments = segments;
+        }
+        self.egress = Some(egress);
         Ok(())
     }
     pub(super) fn command_held(&self, id: u64, op: &Op) -> bool {
         // This policy-only command cannot rewrite a held packet or its owner.
-        if matches!(op, Op::SetFastOpenClientEnabled(_)) {
+        if matches!(
+            op,
+            Op::SetFastOpenClientEnabled(_)
+                | Op::SetListenerFastOpenEarlyDataPolicy(_)
+                | Op::SetFastOpenServerCookie(_)
+        ) {
             return false;
         }
         #[cfg(feature = "packet-test")]
@@ -260,23 +304,36 @@ impl Owner {
         }
         let ethernet = self.ethernet.is_some();
         let offset = if ethernet { 14 } else { 0 };
+        let header = crate::ip::header_len(self.local);
         let length = self
             .output_packet_len()
             .min(egress.packet_capacity.saturating_sub(offset));
-        if length < 40 {
+        if length < header + 20 {
             return Err(EINVAL);
         }
-        let bytes = &mut egress.tx[index].bytes;
+        let slot = &mut egress.tx[index];
+        let bytes = &mut slot.bytes;
         bytes.resize(length + offset, 0);
         let now = self.now();
         let output = match owner {
-            Some(id) => {
-                self.endpoint
-                    .poll_reserved_transmit_for(now, id, &mut bytes[offset + 20..], BUDGET)
+            Some(id) if egress.shared_segments != 0 => {
+                self.endpoint.poll_reserved_transmit_shared_for(
+                    now,
+                    id,
+                    &mut bytes[offset + header..],
+                    &mut slot.shared.payload,
+                    BUDGET,
+                )
             }
+            Some(id) => self.endpoint.poll_reserved_transmit_for(
+                now,
+                id,
+                &mut bytes[offset + header..],
+                BUDGET,
+            ),
             None => self.endpoint.poll_reserved_stateless_transmit(
                 now,
-                &mut bytes[offset + 20..],
+                &mut bytes[offset + header..],
                 BUDGET,
             ),
         };
@@ -303,11 +360,18 @@ impl Owner {
             return Ok(());
         };
         let attempt = attempt.ok_or(EIO)?;
-        let ip_len =
-            ntcp_ip::encode(&mut bytes[offset..], tx, (now / 1000) as u32).map_err(|_| EIO)?;
-        if owner
-            .and_then(|cid| self.connection_options.iter().find(|p| p.0 == cid))
-            .is_some_and(|p| p.2 == IP_PMTUDISC_DONT)
+        let shared_len: usize = slot.shared.payload.iter().map(ntcp_io::Payload::len).sum();
+        let ip_len = crate::ip::encode(
+            &mut bytes[offset..],
+            tx,
+            (now / 1000) as u32,
+            tx.len - shared_len,
+        )
+        .map_err(|_| EIO)?;
+        if self.local.is_ipv4()
+            && owner
+                .and_then(|cid| self.connection_options.iter().find(|p| p.0 == cid))
+                .is_some_and(|p| p.2 == IP_PMTUDISC_DONT)
         {
             let ip = &mut bytes[offset..];
             ip[6] = 0;
@@ -315,14 +379,23 @@ impl Owner {
             let checksum = ntcp_ip_common::checksum(&ip[..20]);
             ip[10..12].copy_from_slice(&checksum.to_be_bytes());
         }
-        self.timestamp_packet(tx.tx_timestamp, &bytes[offset..offset + ip_len]);
+        if shared_len == 0 {
+            self.timestamp_packet(tx.tx_timestamp, &bytes[offset..offset + ip_len]);
+        }
         bytes.truncate(offset + ip_len);
         if let Some(backend) = &self.ethernet {
             bytes[..6].copy_from_slice(&backend.next_hop);
             bytes[6..12].copy_from_slice(&backend.local);
-            bytes[12..14].copy_from_slice(&ntcp_ethernet::ETHERTYPE_IPV4.to_be_bytes());
-            bytes.resize(bytes.len().max(60), 0);
+            bytes[12..14].copy_from_slice(&crate::ip::ether_type(self.local).to_be_bytes());
+            if shared_len == 0 {
+                bytes.resize(bytes.len().max(60), 0);
+            }
         }
+        slot.shared.header.clear();
+        if shared_len != 0 {
+            slot.shared.header.extend_from_slice(bytes);
+        }
+        let wire_bytes = (bytes.len() + shared_len).max(if ethernet { 60 } else { 0 });
         self.drain_timestamps(ClockPair::sample(self));
         if existing.is_none() {
             #[cfg(test)]
@@ -353,7 +426,7 @@ impl Owner {
                 .enqueue(
                     entry.flow,
                     Metadata {
-                        wire_bytes: slot.bytes.len() as u64,
+                        wire_bytes: wire_bytes as u64,
                         retained_bytes: egress.packet_capacity,
                         not_before: now,
                     },
@@ -423,7 +496,16 @@ impl Owner {
                     .unwrap_or_default();
                 self.set_backend_mark(entry.mark)
                     .map_err(|e| e.raw_os_error().unwrap_or(EIO))?;
-                let submitted = if let Some(backend) = &mut self.ethernet {
+                let submitted = if !slot.shared.payload.is_empty() {
+                    if sources != (false, false) {
+                        return Err(EOPNOTSUPP);
+                    }
+                    self.ethernet
+                        .as_mut()
+                        .ok_or(EIO)?
+                        .io
+                        .transmit_zero_copy(&slot.shared)
+                } else if let Some(backend) = &mut self.ethernet {
                     backend.transmit_frame(
                         &mut self.endpoint,
                         entry.timestamp,
@@ -533,8 +615,8 @@ impl Owner {
         result
     }
     fn ingress_owner(&self, bytes: &[u8]) -> Option<ConnectionId> {
-        let packet = ntcp_ip::parse(bytes, false).ok()?;
-        if packet.ip.destination != IpAddr::V4(self.local) {
+        let packet = crate::ip::parse(bytes).ok()?;
+        if packet.ip.destination != self.local {
             return None;
         }
         let tuple = if packet.protocol == 6 {

@@ -32,6 +32,24 @@ pub struct Feedback {
 }
 
 impl Feedback {
+    // RFC9293 3.9.2.2: IPv6 unreachable0/3 and time/parameter errors
+    // are soft. Other recognized policy/reachability failures remain soft
+    // unless the protocol explicitly identifies a hard unreachable2/4.
+    pub fn ipv6_network_error(self) -> Option<ntcp::NetworkError> {
+        if !self.outer.source.is_ipv6() {
+            return None;
+        }
+        Some(match self.kind {
+            FeedbackKind::DestinationUnreachable => match self.code {
+                2 | 4 => ntcp::NetworkError::HardUnreachable,
+                0 | 1 | 3 | 5..=7 => ntcp::NetworkError::SoftUnreachable,
+                _ => return None,
+            },
+            FeedbackKind::TimeExceeded => ntcp::NetworkError::TimeExceeded,
+            FeedbackKind::ParameterProblem => ntcp::NetworkError::ParameterProblem,
+            _ => return None,
+        })
+    }
     // Classify validated IPv4 errors, not their connection-specific effect.
     // PTB remains on the PMTU path. IPv6 consumers need their own mapping.
     // Unlisted IPv4 unreachable codes stay nonterminal rather than becoming

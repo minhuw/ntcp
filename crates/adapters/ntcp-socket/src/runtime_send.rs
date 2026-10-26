@@ -128,6 +128,7 @@ pub(super) struct LogicalSend {
     end: u64,
     cookie: Option<u64>,
     zc: Option<u32>,
+    lease: Option<std::sync::Arc<crate::zerocopy::LeaseState>>,
     // Owns one notification slot, without an ID, during provisional TFO copy.
     zc_pending: bool,
     zerocopy: bool,
@@ -172,6 +173,7 @@ impl LogicalSend {
             end: 0,
             cookie: None,
             zc: None,
+            lease: None,
             zc_pending: false,
             zerocopy: socket.zerocopy && flags & MSG_ZEROCOPY != 0,
             destination,
@@ -233,6 +235,31 @@ impl LogicalSend {
     }
 }
 impl Owner {
+    pub(super) fn collect_zero_copy(&mut self) {
+        for socket in self.sockets.values_mut() {
+            let mut index = 0;
+            while index < socket.zc_leases.len() {
+                let Some(copied) = socket.zc_leases[index].state.complete() else {
+                    index += 1;
+                    continue;
+                };
+                let pending = socket.zc_leases.remove(index).unwrap();
+                socket.zc_reserved -= 1;
+                if let Some(Completion::SharedZeroCopy(lo, hi, old_copied)) =
+                    socket.completions.back_mut()
+                    && *old_copied == copied
+                    && extends_completion((*lo, *hi), pending.id)
+                {
+                    *hi = pending.id;
+                } else {
+                    socket
+                        .completions
+                        .push_back(Completion::SharedZeroCopy(pending.id, pending.id, copied));
+                }
+                socket.readiness_generations[2] = socket.readiness_generations[2].wrapping_add(1);
+            }
+        }
+    }
     // One bounded copy/admission per service turn. No foreign data survives a
     // turn except bytes already owned by TCP; the cursor advances only on write.
     fn send_step(&mut self, id: u64, send: &mut LogicalSend, blocking: bool) -> Result<()> {
@@ -252,7 +279,11 @@ impl Owner {
         }
         if !send.fast_open_started && (send.flags & MSG_FASTOPEN != 0 || deferred) {
             let socket = &self.sockets[&id];
-            let remote = socket.deferred_peer.or(send.destination).ok_or(EINVAL)?;
+            let remote = if let Some(remote) = socket.deferred_peer {
+                remote
+            } else {
+                socket.normalize_address(send.destination.ok_or(EINVAL)?, self.local, false)?
+            };
             if remote.port() == 0 {
                 return Err(EINVAL);
             }
@@ -345,16 +376,88 @@ impl Owner {
             observed.try_reserve_exact(4).map_err(|_| ENOBUFS)?;
         }
         let count = remaining.min(BYTES).min(room);
-        let bytes = send.copy_chunk(count)?;
-        let copied = bytes.len();
-        let flags = if deferred && copied < remaining {
+        // Registered immutable input is eligible only when the selected backend
+        // explicitly accepts its storage. Arbitrary pointers stay on fault-safe
+        // copied admission; timestamp packet capture is also a copied contract.
+        let shared = if send.zerocopy
+            && send.bits & crate::timestamping::TX_RECORD == 0
+            && self.egress.as_ref().is_some_and(|e| e.shared_enabled())
+        {
+            let mut index = send.index;
+            let mut offset = send.offset;
+            while index < send.sources.len() && send.sources[index].1 == offset {
+                index += 1;
+                offset = 0;
+            }
+            let (address, len) = send.sources[index];
+            let address = address.checked_add(offset).ok_or(EFAULT)?;
+            crate::zerocopy::lookup(address, count.min(len - offset))?.filter(|p| {
+                self.ethernet
+                    .as_ref()
+                    .is_some_and(|b| b.io.zero_copy_payload_supported(p))
+            })
+        } else {
+            None
+        };
+        let admitted = shared.as_ref().map_or(count, ntcp_io::Payload::len);
+        let flags = if deferred && admitted < remaining {
             (send.flags | MSG_MORE) & !MSG_EOR
         } else {
             send.flags
         };
         let cookie = self.timestamp_cookie;
-        let n = self.timestamp_write_bits(id, cid, &bytes[..copied], flags, send.bits)?;
-        debug_assert_eq!(n, copied); // Exclusive owner: admission cannot change during copy.
+        let n = if let Some(payload) = shared {
+            let socket = self.sockets.get_mut(&id).unwrap();
+            let pending = socket.zc_reserved + usize::from(send.zc.is_none());
+            socket
+                .zc_leases
+                .try_reserve_exact(pending.saturating_sub(socket.zc_leases.len()))
+                .map_err(|_| ENOBUFS)?;
+            let state = send.lease.get_or_insert_with(|| {
+                let state = crate::zerocopy::LeaseState::new();
+                if send.accepted != 0 {
+                    state.copied();
+                }
+                state
+            });
+            let progress = self.endpoint.send_progress(cid).map_err(engine)?;
+            let goal = batch_goal(&self.endpoint.transport_info(cid).map_err(engine)?);
+            let (_, batch_start) = self.send_batch_admission(id, cid)?;
+            let n = self
+                .endpoint
+                .write_shared(
+                    cid,
+                    state.borrow(payload),
+                    flags & MSG_MORE != 0,
+                    flags & MSG_EOR != 0,
+                    None,
+                )
+                .map_err(engine)?;
+            if n != 0 {
+                let end = progress.queued_end + n as u64;
+                self.sockets.get_mut(&id).unwrap().send_batch = if flags & MSG_EOR == 0 && goal != 0
+                {
+                    Some(SendBatch {
+                        connection: cid,
+                        start: batch_start + ((end - batch_start - 1) / goal as u64) * goal as u64,
+                        end,
+                    })
+                } else {
+                    None
+                };
+            }
+            n
+        } else {
+            let bytes = send.copy_chunk(count)?;
+            let n = self.timestamp_write_bits(id, cid, &bytes, flags, send.bits)?;
+            if n != 0
+                && let Some(state) = &send.lease
+            {
+                state.copied();
+            }
+            debug_assert_eq!(n, bytes.len());
+            n
+        };
         send.advance(n);
         send.cid = Some(cid);
         send.end = self.endpoint.send_progress(cid).map_err(engine)?.queued_end;
@@ -418,19 +521,31 @@ impl Owner {
         if let Some(cookie) = send.cookie.take() {
             self.finish_timestamp(id, cookie);
         }
+        let lease = send.lease.take();
+        if let Some(state) = &lease {
+            state.finish();
+        }
         if let Some(next) = send.zc.take()
             && let Some(s) = self.sockets.get_mut(&id)
         {
-            s.zc_reserved -= 1;
-            if let Some(Completion::ZeroCopy(lo, hi)) = s.completions.back_mut()
-                && extends_completion((*lo, *hi), next)
-            {
-                *hi = next;
+            if let Some(state) = lease {
+                // Reservation transfers to a release observation, not immediate
+                // submission completion. TCP, held plans and backend all count.
+                s.zc_leases
+                    .push_back(crate::zerocopy::Pending { id: next, state });
             } else {
-                s.completions.push_back(Completion::ZeroCopy(next, next));
+                s.zc_reserved -= 1;
+                if let Some(Completion::ZeroCopy(lo, hi)) = s.completions.back_mut()
+                    && extends_completion((*lo, *hi), next)
+                {
+                    *hi = next;
+                } else {
+                    s.completions.push_back(Completion::ZeroCopy(next, next));
+                }
+                s.readiness_generations[2] = s.readiness_generations[2].wrapping_add(1);
             }
-            s.readiness_generations[2] = s.readiness_generations[2].wrapping_add(1);
         }
+        self.collect_zero_copy();
         // A blocking implicit connect has only provisionally copied SYN data.
         // Its failure is not an ordinary post-handshake partial send success.
         if send.accepted == 0 || send.wait_handshake {
@@ -461,7 +576,7 @@ impl Owner {
             && send.cid.is_some()
             && !send.wait_handshake
             && result.is_ok()
-            && self.batched_send(request.id)
+            && (self.batched_send(request.id) || send.lease.is_some())
             && send.batch_turns < BUDGET;
         if (blocking || continuing)
             && !expired

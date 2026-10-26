@@ -694,3 +694,116 @@ mod packets {
         packet_test::stop();
     }
 }
+
+#[cfg(feature = "linux")]
+#[test]
+fn server_early_policy_native_api_fd_aliases_and_rejection() {
+    if !child(
+        "fast_open_abi_tests::server_early_policy_native_api_fd_aliases_and_rejection",
+        "NTCP_SERVER_EARLY_POLICY_CHILD",
+    ) {
+        return;
+    }
+    let protected = FastOpenEarlyDataPolicy::ApplicationProtected;
+    let required = FastOpenEarlyDataPolicy::RequireCookie;
+    assert_eq!(
+        set_listener_fast_open_early_data_policy(-1, protected)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(EOPNOTSUPP)
+    );
+    assert!(CONFIG.get().is_none() && RUNTIME.get().is_none());
+    assert!(RUNTIME.set(Ok(Runtime::in_memory_test())).is_ok());
+    let id = call(0, Op::New(SOCK_NONBLOCK)).unwrap().value as u64;
+    let (fd, token) = token(SOCK_CLOEXEC).unwrap();
+    install(fd, token, id).unwrap();
+    assert_eq!(
+        set_listener_fast_open_early_data_policy(fd, protected)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(EOPNOTSUPP)
+    );
+    call(id, Op::Listen(2)).unwrap();
+    let alias = unsafe { dup(fd) };
+    assert!(alias >= 0);
+    set_listener_fast_open_early_data_policy(alias, protected).unwrap();
+    assert_eq!(
+        call(id, Op::Get(IPPROTO_TCP, TCP_FASTOPEN)).unwrap().value,
+        0
+    );
+    call(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 1)).unwrap();
+    unsafe {
+        assert_eq!(close(fd), 0);
+    }
+    set_listener_fast_open_early_data_policy(alias, required).unwrap();
+    unsafe {
+        assert_eq!(close(alias), 0);
+    }
+    assert_eq!(
+        set_listener_fast_open_early_data_policy(alias, protected)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(EOPNOTSUPP)
+    );
+}
+
+#[cfg(feature = "linux")]
+#[test]
+fn server_cookie_native_api_alias_scope_and_invalid_handles() {
+    if !child(
+        "fast_open_abi_tests::server_cookie_native_api_alias_scope_and_invalid_handles",
+        "NTCP_CLIENT_SERVER_COOKIE_CHILD",
+    ) {
+        return;
+    }
+    let credential = Some(("192.0.2.2:8080".parse().unwrap(), FastOpenCookie::request()));
+    assert_eq!(
+        set_fast_open_server_cookie(-1, credential)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(EOPNOTSUPP)
+    );
+    assert!(CONFIG.get().is_none() && RUNTIME.get().is_none());
+    assert!(RUNTIME.set(Ok(Runtime::in_memory_test())).is_ok());
+    let id = call(0, Op::New(SOCK_NONBLOCK)).unwrap().value as u64;
+    let (fd, token) = token(SOCK_CLOEXEC).unwrap();
+    install(fd, token, id).unwrap();
+    assert_eq!(
+        set_fast_open_server_cookie(
+            fd,
+            Some(("192.0.2.2:0".parse().unwrap(), FastOpenCookie::request()))
+        )
+        .unwrap_err()
+        .raw_os_error(),
+        Some(EINVAL)
+    );
+    set_fast_open_server_cookie(fd, credential).unwrap();
+    assert_eq!(
+        call(id, Op::Get(IPPROTO_TCP, TCP_FASTOPEN_CONNECT))
+            .unwrap()
+            .value,
+        0
+    );
+    let alias = unsafe { dup(fd) };
+    assert!(alias >= 0);
+    unsafe {
+        assert_eq!(close(fd), 0);
+    }
+    set_fast_open_server_cookie(alias, None).unwrap();
+    call(id, Op::Listen(2)).unwrap();
+    assert_eq!(
+        set_fast_open_server_cookie(alias, credential)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(EINVAL)
+    );
+    unsafe {
+        assert_eq!(close(alias), 0);
+    }
+    assert_eq!(
+        set_fast_open_server_cookie(alias, credential)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(EOPNOTSUPP)
+    );
+}

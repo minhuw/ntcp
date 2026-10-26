@@ -24,6 +24,8 @@ impl std::fmt::Debug for CookieKey {
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UpstreamOptions {
+    pub application_protected_tfo: bool,
+    pub application_protected_tfo_client: bool,
     pub no_timestamps: bool,
     pub ecn: bool,
     pub adaptive_ack: bool,
@@ -33,6 +35,7 @@ pub struct UpstreamOptions {
     pub tfo_listen: bool,
     pub early_response: bool,
     pub pmtud1500: bool,
+    pub link_mtu: Option<u32>,
     pub budget128m: bool,
     pub budget224m: bool,
     pub prealloc3: bool,
@@ -69,6 +72,9 @@ impl Profile {
             Self::Sack => "sack".into(),
             Self::Upstream(options) => {
                 let mut flags = String::from("upstream");
+                if let Some(mtu) = options.link_mtu {
+                    flags.push_str(&format!(",link-mtu={mtu}"));
+                }
                 for (enabled, token) in [
                     (options.no_timestamps, "no-timestamps"),
                     (options.ecn, "ecn"),
@@ -76,6 +82,14 @@ impl Profile {
                     (options.lowat4000, "lowat4000"),
                     (options.linux_cookie, "linux-cookie"),
                     (options.tfo_listen, "tfo-listen"),
+                    (
+                        options.application_protected_tfo,
+                        "application-protected-tfo",
+                    ),
+                    (
+                        options.application_protected_tfo_client,
+                        "application-protected-tfo-client",
+                    ),
                     (options.early_response, "early-response"),
                     (options.pmtud1500, "pmtud1500"),
                     (options.budget128m, "budget128m"),
@@ -108,7 +122,7 @@ impl Profile {
         }
     }
 }
-pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
+pub fn profile(flags: &str) -> Result<(IpAddr, Profile)> {
     let mut local = None;
     let mut selected = None;
     let mut options = UpstreamOptions::default();
@@ -120,8 +134,19 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
             }
             local = Some(
                 ip.parse()
-                    .map_err(|_| unsupported("invalid local IPv4 in so_flags"))?,
+                    .map_err(|_| unsupported("invalid local IP in so_flags"))?,
             );
+            continue;
+        }
+        if let Some(text) = flag.strip_prefix("link-mtu=") {
+            let mtu: u32 = text.parse().map_err(|_| unsupported("invalid link MTU"))?;
+            if options.link_mtu.replace(mtu).is_some()
+                || text != mtu.to_string()
+                || !(68..=65535).contains(&mtu)
+            {
+                return Err(unsupported("invalid or duplicate link MTU"));
+            }
+            has_options = true;
             continue;
         }
         if let Some(hex) = flag.strip_prefix("tfo-key=") {
@@ -163,6 +188,8 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
                 "lowat4000" => &mut options.lowat4000,
                 "linux-cookie" => &mut options.linux_cookie,
                 "tfo-listen" => &mut options.tfo_listen,
+                "application-protected-tfo" => &mut options.application_protected_tfo,
+                "application-protected-tfo-client" => &mut options.application_protected_tfo_client,
                 "early-response" => &mut options.early_response,
                 "pmtud1500" => &mut options.pmtud1500,
                 "budget128m" => &mut options.budget128m,
@@ -192,6 +219,7 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
         if options.budget128m && options.budget224m
             || options.adaptive_ack && options.immediate_ack
             || options.prealloc3 && options.prealloc4
+            || options.pmtud1500 && options.link_mtu.is_some()
             || options.cookie_key.is_some() && !options.linux_cookie
         {
             return Err(unsupported("conflicting upstream options"));
@@ -204,10 +232,13 @@ pub fn profile(flags: &str) -> Result<(Ipv4Addr, Profile)> {
     } else if has_options {
         return Err(unsupported("options require upstream baseline"));
     }
-    Ok((
-        local.ok_or_else(|| unsupported("so_flags requires local=<IPv4>"))?,
-        selected,
-    ))
+    let local = local.ok_or_else(|| unsupported("so_flags requires local=<IP>"))?;
+    if !crate::ip::unicast(local)
+        || local.is_ipv6() && options.link_mtu.is_some_and(|mtu| mtu < 1280)
+    {
+        return Err(unsupported("invalid local unicast IP"));
+    }
+    Ok((local, selected))
 }
 pub(crate) fn config(profile: Profile) -> EndpointConfig {
     let mut config = EndpointConfig {
@@ -275,7 +306,9 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
         }
         c.adaptive_ack = !o.immediate_ack;
         c.delayed_ack_us = if o.immediate_ack { 0 } else { 200_000 };
-        if o.pmtud1500 {
+        if let Some(mtu) = o.link_mtu {
+            c.pmtud = Some(ntcp::PmtudConfig::new(mtu));
+        } else if o.pmtud1500 {
             c.pmtud = Some(ntcp::PmtudConfig::new(1500));
         }
     }
@@ -317,10 +350,16 @@ pub(crate) fn gso(profile: Profile) -> Option<ntcp::GsoLimits> {
 // Injection admits only the ICMP feedback understood by production input_ip.
 // Keep parse_frame TCP-only: its callers consume the payload as TCP.
 pub(crate) fn validate_injection(bytes: &[u8]) -> Result<()> {
-    if bytes.get(9) != Some(&1) {
+    if bytes.first().is_some_and(|b| b >> 4 == 4) {
+        parse_ipv4(bytes)?;
+    }
+    let p = crate::ip::parse(bytes).map_err(|_| EINVAL)?;
+    if p.protocol == 6 {
         return parse_frame(bytes).map(|_| ());
     }
-    parse_ipv4(bytes)?;
+    if p.protocol != if p.ip.source.is_ipv4() { 1 } else { 58 } {
+        return Err(unsupported("packet: unsupported IP protocol"));
+    }
     ntcp_icmp::decode_icmp(bytes).map_err(|error| match error {
         ntcp_icmp::Error::ProtocolUnsupported => {
             unsupported("packet: unsupported ICMP error type/code")
@@ -329,16 +368,19 @@ pub(crate) fn validate_injection(bytes: &[u8]) -> Result<()> {
     })?;
     Ok(())
 }
-pub(crate) fn parse_frame(bytes: &[u8]) -> Result<ntcp_ip::Packet<'_>> {
-    if bytes.len() < 20 {
-        return Err(EINVAL);
+pub(crate) fn parse_frame(bytes: &[u8]) -> Result<crate::ip::Packet<'_>> {
+    if bytes.first().is_some_and(|b| b >> 4 == 4) {
+        parse_ipv4(bytes)?;
     }
-    if bytes[0] >> 4 != 4 || bytes[9] != 6 {
-        return Err(unsupported("packet: only IPv4 TCP"));
+    let p = crate::ip::parse(bytes).map_err(|_| EINVAL)?;
+    if p.ip.source.is_ipv4() {
+        parse_ipv4(bytes)?;
     }
-    let packet = parse_ipv4(bytes)?;
-    ntcp::wire::parse(packet.ip, packet.payload).map_err(|_| EINVAL)?;
-    Ok(packet)
+    if p.protocol != 6 {
+        return Err(unsupported("packet: only TCP"));
+    }
+    ntcp::wire::parse(p.ip, p.payload).map_err(|_| EINVAL)?;
+    Ok(p)
 }
 fn parse_ipv4(bytes: &[u8]) -> Result<ntcp_ip::Packet<'_>> {
     if bytes.len() < 20 {
@@ -563,8 +605,11 @@ mod setup_profile_tests {
     #[test]
     fn common_and_paced_startup_output_and_hystart_ack_growth() {
         use ntcp::wire::{self, ACK, SYN};
-        for paced in [false, true] {
-            let config = config(selected(if paced { ",paced" } else { "" }));
+        for (paced, initial_burst) in [(false, false), (true, false), (true, true)] {
+            let mut config = config(selected(if paced { ",paced" } else { "" }));
+            if let Some(p) = &mut config.connection.pacing {
+                p.initial_window_burst = initial_burst;
+            }
             assert_eq!(config.connection.prr_pacing, paced);
             assert_eq!(config.connection.pacing.is_some(), paced);
             let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
@@ -611,7 +656,14 @@ mod setup_profile_tests {
                     }
                 }
                 if now == 10_000 {
-                    assert_eq!(sent, if paced { 2000 } else { 10_000 });
+                    assert_eq!(
+                        sent,
+                        if paced && !initial_burst {
+                            2000
+                        } else {
+                            10_000
+                        }
+                    );
                 }
                 if sent == 10_000 {
                     break;
@@ -635,11 +687,9 @@ mod setup_profile_tests {
             ack.acknowledgment = syn.sequence.wrapping_add(10_001);
             let n = wire::encode(ip, ack, &[], &[], &mut bytes).unwrap();
             endpoint.input(110_000, ip, &bytes[..n]).unwrap();
-            // An actually unpaced flight must not acquire the paced infinity tag.
-            assert_eq!(
-                endpoint.transport_info(id).unwrap().cwnd,
-                if paced { 20_000 } else { 18_000 }
-            );
+            // Ten delivered MSS fit both the finite tuned L16 and paced
+            // infinity; the measured departure times above distinguish pacing.
+            assert_eq!(endpoint.transport_info(id).unwrap().cwnd, 20_000);
         }
     }
 
@@ -927,5 +977,35 @@ mod no_gso_tests {
                 .1,
             scalar
         );
+    }
+}
+
+#[cfg(test)]
+mod link_mtu_tests {
+    use super::*;
+    #[test]
+    fn explicit_synthetic_link_mtu_is_bounded_and_keeps_family_minimum() {
+        for (local, mtu) in [("192.0.2.1", 9000), ("2001:db8::1", 1520)] {
+            let (address, p) = profile(&format!("upstream,local={local},link-mtu={mtu}")).unwrap();
+            let c = config(p);
+            assert_eq!(c.connection.pmtud.unwrap().first_hop_mtu, mtu);
+            assert_eq!(
+                profile(&format!("{},local={address}", p.flags()))
+                    .unwrap()
+                    .1,
+                p
+            );
+        }
+        for flags in [
+            "upstream,local=2001:db8::1,link-mtu=660",
+            "upstream,local=192.0.2.1,link-mtu=67",
+            "upstream,local=192.0.2.1,link-mtu=65536",
+            "upstream,local=192.0.2.1,link-mtu=01520",
+            "upstream,local=192.0.2.1,link-mtu=1520,link-mtu=1520",
+            "upstream,local=192.0.2.1,link-mtu=1520,pmtud1500",
+            "baseline,local=192.0.2.1,link-mtu=1520",
+        ] {
+            assert!(profile(flags).is_err(), "{flags}");
+        }
     }
 }

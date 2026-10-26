@@ -5,7 +5,7 @@ const BASE: &str = "io.interface=ntcp0\nio.address=10.73.0.2\n";
 
 #[test]
 fn parser_and_typed_validation() {
-    let default = SocketConfig::new("ntcp0", "10.73.0.2".parse().unwrap());
+    let default = SocketConfig::new("ntcp0", "10.73.0.2".parse::<std::net::IpAddr>().unwrap());
     assert_eq!(
         format!("{:?}", SocketConfig::parse(BASE).unwrap()),
         format!("{default:?}")
@@ -35,6 +35,8 @@ fn parser_and_typed_validation() {
         "io.prefix=-1",
         "io.prefix=+1",
         "tcp.pacing=1",
+        "tcp.pacing_initial_window_burst=false",
+        "tcp.pacing=true\ntcp.pacing_initial_window_burst=1",
         "tcp.pacing=true # inline",
         "[section]",
         "io.backend=native",
@@ -370,7 +372,7 @@ fn packet_profile_ignores_production_configuration() {
         return;
     }
     crate::packet_test::start((
-        "192.0.2.1".parse().unwrap(),
+        "192.0.2.1".parse::<std::net::IpAddr>().unwrap(),
         crate::packet_profile::Profile::Baseline,
     ))
     .unwrap();
@@ -672,7 +674,7 @@ fn destination_route_parser_and_typed_bounds() {
     assert_eq!(
         config.routes[0],
         (
-            "192.0.2.1".parse().unwrap(),
+            "192.0.2.1".parse::<std::net::IpAddr>().unwrap(),
             ntcp::RoutePolicy {
                 mtu: Some(640),
                 advertised_mss: Some(600),
@@ -726,7 +728,7 @@ fn destination_route_api_before_config_does_not_select_runtime() {
         return;
     }
     assert_eq!(
-        crate::set_destination_route("192.0.2.1".parse().unwrap(), None)
+        crate::set_destination_route("192.0.2.1".parse::<std::net::IpAddr>().unwrap(), None)
             .unwrap_err()
             .raw_os_error(),
         Some(libc::EINVAL)
@@ -748,4 +750,45 @@ fn receive_aggregation_is_explicit_native_socket_capability() {
         assert!(SocketConfig::parse(&format!("{BASE}io.receive_aggregation={value}\n")).is_err());
     }
     assert!(SocketConfig::parse(&format!("{BASE}io.receive_aggregation=false\n")).is_ok());
+}
+
+#[test]
+fn parser_initial_window_burst_opt_out_and_default() {
+    for (setting, expected) in [
+        ("", true),
+        ("\ntcp.pacing_initial_window_burst=false", false),
+        ("\ntcp.pacing_initial_window_burst=true", true),
+    ] {
+        let c = SocketConfig::parse(&format!("{BASE}tcp.pacing=true{setting}")).unwrap();
+        assert_eq!(
+            c.tcp.connection.pacing.unwrap().initial_window_burst,
+            expected
+        );
+    }
+}
+
+#[test]
+fn explicit_client_early_policy_parser_keeps_authenticated_default() {
+    assert_eq!(
+        SocketConfig::parse(BASE)
+            .unwrap()
+            .socket
+            .fast_open_client_policy,
+        ntcp::FastOpenClientPolicy::RequireCookie
+    );
+    assert_eq!(
+        SocketConfig::parse(&format!(
+            "{BASE}socket.fast_open_client_policy=application-protected\n"
+        ))
+        .unwrap()
+        .socket
+        .fast_open_client_policy,
+        ntcp::FastOpenClientPolicy::ApplicationProtected
+    );
+    for value in ["true", "cookie-less", "unknown", ""] {
+        assert!(
+            SocketConfig::parse(&format!("{BASE}socket.fast_open_client_policy={value}\n"))
+                .is_err()
+        );
+    }
 }

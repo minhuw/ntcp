@@ -3,7 +3,7 @@ use std::{
     collections::BTreeSet,
     fs::OpenOptions,
     io::{self, Read},
-    net::Ipv4Addr,
+    net::{IpAddr, Ipv4Addr},
     os::unix::fs::OpenOptionsExt,
     path::Path,
 };
@@ -24,13 +24,14 @@ pub struct SocketConfig {
     pub socket: SocketPolicy,
     pub fast_open_cookie_policy: ntcp::FastOpenCookiePolicy,
     pub io: IoConfig,
-    pub routes: Vec<(Ipv4Addr, ntcp::RoutePolicy)>,
+    pub routes: Vec<(IpAddr, ntcp::RoutePolicy)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SocketPolicy {
     pub notsent_lowat: u32,
     pub fast_open_client_enabled: bool,
+    pub fast_open_client_policy: ntcp::FastOpenClientPolicy,
 }
 
 impl Default for SocketPolicy {
@@ -38,6 +39,7 @@ impl Default for SocketPolicy {
         Self {
             notsent_lowat: u32::MAX,
             fast_open_client_enabled: true,
+            fast_open_client_policy: ntcp::FastOpenClientPolicy::RequireCookie,
         }
     }
 }
@@ -46,7 +48,7 @@ impl Default for SocketPolicy {
 pub struct IoConfig {
     pub backend: Backend,
     pub interface: String,
-    pub address: Ipv4Addr,
+    pub address: IpAddr,
     pub prefix: Option<u8>,
     pub next_hop_mac: Option<[u8; 6]>,
     pub output_reservation_timeout_ms: u32,
@@ -60,7 +62,8 @@ fn invalid() -> io::Error {
 }
 
 impl SocketConfig {
-    pub fn new(interface: impl Into<String>, address: Ipv4Addr) -> Self {
+    pub fn new(interface: impl Into<String>, address: impl Into<IpAddr>) -> Self {
+        let address = address.into();
         let mut tcp = ntcp::EndpointConfig {
             max_connections: crate::runtime::LIMIT,
             max_listeners: crate::runtime::LIMIT,
@@ -71,7 +74,7 @@ impl SocketConfig {
         tcp.connection.receive_capacity = crate::runtime::BYTES;
         tcp.connection.send_capacity = crate::runtime::BYTES;
         tcp.connection.mss = MSS;
-        tcp.connection.send_ip_payload_limit = 1480;
+        tcp.connection.send_ip_payload_limit = if address.is_ipv4() { 1480 } else { 1460 };
         tcp.connection.receive_ip_payload_limit = 65515;
         Self {
             tcp,
@@ -123,10 +126,11 @@ impl SocketConfig {
                     || b == b'\\'
             })
             || matches!(self.io.interface.as_str(), "." | "..")
-            || self.io.address.octets()[0] == 0
-            || self.io.address.octets()[0] >= 224
-            || self.io.address.is_loopback()
-            || self.io.prefix.is_some_and(|p| p > 32)
+            || !crate::ip::unicast(self.io.address)
+            || self
+                .io
+                .prefix
+                .is_some_and(|p| crate::ip::network(self.io.address, p).is_none())
         {
             return Err(invalid());
         }
@@ -138,7 +142,9 @@ impl SocketConfig {
         // Before IO opens, validate against configured allocation ceilings.
         // Backend startup repeats policy validation with the actual interface MTU.
         let mut route_defaults = self.tcp.connection.clone();
-        let bound = (u32::from(route_defaults.send_ip_payload_limit) + 20).min(65535);
+        let bound = (u32::from(route_defaults.send_ip_payload_limit)
+            + crate::ip::header_len(self.io.address) as u32)
+            .min(65535);
         route_defaults
             .pmtud
             .get_or_insert(ntcp::PmtudConfig::new(bound));
@@ -146,9 +152,8 @@ impl SocketConfig {
             return Err(invalid());
         }
         for (i, (destination, policy)) in self.routes.iter().enumerate() {
-            if destination.is_loopback()
-                || destination.octets()[0] == 0
-                || destination.octets()[0] >= 224
+            if !crate::ip::unicast(*destination)
+                || destination.is_ipv4() != self.io.address.is_ipv4()
                 || self.routes[..i]
                     .iter()
                     .any(|(other, _)| other == destination)
@@ -156,12 +161,13 @@ impl SocketConfig {
                 return Err(invalid());
             }
             policy
-                .validate(&route_defaults, true)
+                .validate(&route_defaults, self.io.address.is_ipv4())
                 .map_err(|_| invalid())?;
         }
         self.tcp.validate().map_err(|_| invalid())?;
         let c = &self.tcp.connection;
-        c.validate(true).map_err(|_| invalid())?;
+        c.validate(self.io.address.is_ipv4())
+            .map_err(|_| invalid())?;
         // The owner clock, IPv4 packet size and descriptor registry are adapter constraints.
         if self.tcp.ipv4_options_enabled // Native input strips/rejects IPv4 options.
             || c.timebase.units_per_second != 1_000_000
@@ -206,7 +212,7 @@ impl SocketConfig {
             }
             if let Some(route) = key.strip_prefix("route.") {
                 let (address, field) = route.rsplit_once('.').ok_or_else(invalid)?;
-                let address: Ipv4Addr = address.parse().map_err(|_| invalid())?;
+                let address: IpAddr = address.parse().map_err(|_| invalid())?;
                 let index = match config.routes.iter().position(|(ip, _)| *ip == address) {
                     Some(index) => index,
                     None => {
@@ -233,6 +239,13 @@ impl SocketConfig {
                     config.socket.fast_open_client_enabled = match value {
                         "true" => true,
                         "false" => false,
+                        _ => return Err(invalid()),
+                    };
+                }
+                "socket.fast_open_client_policy" => {
+                    config.socket.fast_open_client_policy = match value {
+                        "require-cookie" => ntcp::FastOpenClientPolicy::RequireCookie,
+                        "application-protected" => ntcp::FastOpenClientPolicy::ApplicationProtected,
                         _ => return Err(invalid()),
                     };
                 }
@@ -290,6 +303,14 @@ impl SocketConfig {
                 }
                 "tcp.pacing_max_bytes_per_second" => {
                     pacing.max_bytes_per_second = Some(number(value)?);
+                    tuned = true;
+                }
+                "tcp.pacing_initial_window_burst" => {
+                    pacing.initial_window_burst = match value {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err(invalid()),
+                    };
                     tuned = true;
                 }
                 "tcp.pacing_burst_segments" => {

@@ -61,10 +61,10 @@ impl Owner {
         }
         let mut local = match self.sockets[&id].local {
             Some(local) => local,
-            None => SocketAddr::new(self.local.into(), self.port()?),
+            None => SocketAddr::new(self.local, self.port()?),
         };
         if local.ip().is_unspecified() {
-            local.set_ip(self.local.into());
+            local.set_ip(self.local);
         }
         Ok(local)
     }
@@ -78,6 +78,7 @@ impl Owner {
         remote: SocketAddr,
         initial: Option<&[u8]>,
     ) -> Result<usize> {
+        self.check_address(remote)?;
         if remote.port() == 0 {
             return Err(EINVAL);
         }
@@ -89,9 +90,26 @@ impl Owner {
         };
         let (cid, accepted) = if let Some(initial) = initial {
             self.endpoint.enable_fast_open().map_err(engine)?;
-            self.endpoint
-                .connect_fast_open_with_options(self.now(), local, remote, initial, open)
-                .map_err(engine)?
+            if let Some(cookie) = options.server_cookie_for(remote) {
+                self.endpoint.connect_fast_open_with_server_cookie(
+                    self.now(),
+                    local,
+                    remote,
+                    initial,
+                    open,
+                    Some(cookie),
+                )
+            } else {
+                self.endpoint.connect_fast_open_with_policy(
+                    self.now(),
+                    local,
+                    remote,
+                    initial,
+                    open,
+                    options.client_policy_for(remote, self.socket_policy.fast_open_client_policy),
+                )
+            }
+            .map_err(engine)?
         } else {
             (
                 self.endpoint
@@ -110,8 +128,8 @@ impl Owner {
         }
         self.connection_options.push((
             cid,
-            options.tos,
-            options.discover,
+            options.wire_tos(self.local),
+            options.wire_discover(self.local),
             Some(options.zerocopy),
             options.mark,
         ));
@@ -120,6 +138,7 @@ impl Owner {
         s.connect_pending = true;
         s.local = Some(local);
         s.deferred_peer = None;
+        s.deferred_client_policy = None;
         Ok(accepted)
     }
 }

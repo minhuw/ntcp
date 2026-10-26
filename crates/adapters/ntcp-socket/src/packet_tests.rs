@@ -141,7 +141,7 @@ impl Submission {
     }
 }
 impl Adapter {
-    fn start(settings: (Ipv4Addr, Profile)) -> Result<Self> {
+    fn start(settings: (impl Into<IpAddr>, Profile)) -> Result<Self> {
         let runtime = std::sync::Arc::new(Runtime::packet(settings)?);
         Ok(Self {
             tx: Submission(runtime.clone()),
@@ -199,7 +199,7 @@ impl Owner {
             }
         }
     }
-    fn new(settings: (Ipv4Addr, Profile)) -> Result<Self> {
+    fn new(settings: (impl Into<IpAddr>, Profile)) -> Result<Self> {
         Ok(Self {
             inner: SocketOwner::packet(settings)?,
         })
@@ -571,20 +571,20 @@ fn ipv4_validation_and_address_roundtrip() {
     malformed[0] = 0x46;
     assert_eq!(parse_frame(&malformed).unwrap_err(), ENOSYS);
     malformed[0] = 0x60;
-    assert_eq!(parse_frame(&malformed).unwrap_err(), ENOSYS);
+    assert_eq!(parse_frame(&malformed).unwrap_err(), EINVAL);
     let address = SocketAddr::new(local().into(), 8080);
     assert_eq!(decode_addr(&encode_addr(address)).unwrap(), address);
     assert!(profile("").is_err());
     assert_eq!(
         profile("baseline,local=192.0.2.1").unwrap(),
-        (local(), Profile::Baseline)
+        (IpAddr::from(local()), Profile::Baseline)
     );
     assert!(profile("baseline,local=192.0.2.1,sack").is_err());
 }
 
 #[test]
 fn reuseaddr_allows_rebinding_connected_socket_but_not_listener() {
-    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
     let address = SocketAddr::new(local().into(), 40000);
     let id = owner
         .inner
@@ -615,7 +615,7 @@ fn reuseaddr_allows_rebinding_connected_socket_but_not_listener() {
 
 #[test]
 fn socket_sends_wait_for_handshake_without_core_buffering() {
-    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
     let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
     let remote = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080);
     let (mut connect, _) = request(5, fd, 0, encode_addr(remote), 0);
@@ -695,15 +695,15 @@ fn socket_sends_wait_for_handshake_without_core_buffering() {
 fn profiles_require_one_selection_and_one_ipv4_address() {
     assert_eq!(
         profile("local=192.0.2.1,upstream").unwrap(),
-        (local(), upstream_packet_tests(""))
+        (IpAddr::from(local()), upstream_packet_tests(""))
     );
     assert_eq!(
         profile("sack,local=192.0.2.1").unwrap(),
-        (local(), Profile::Sack)
+        (IpAddr::from(local()), Profile::Sack)
     );
     assert_eq!(
         profile("upstream,ecn,local=192.0.2.1").unwrap(),
-        (local(), upstream_packet_tests("ecn"))
+        (IpAddr::from(local()), upstream_packet_tests("ecn"))
     );
     for flags in [
         "upstream",
@@ -1052,7 +1052,7 @@ fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
 
 #[test]
 fn user_timeout_preconnect_updates_reset_and_deadlines() {
-    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
     let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
     assert_eq!(execute_value(&mut owner, 12, fd, 5, 0), Ok(0));
     assert_eq!(execute_value(&mut owner, 11, fd, 5, -1), Err(EINVAL));
@@ -1133,7 +1133,7 @@ fn user_timeout_preconnect_updates_reset_and_deadlines() {
 
 #[test]
 fn listener_timeout_inheritance_and_queued_payload_gap_urgent_fin() {
-    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
     let listener = owner.alloc(Socket::new(0)).unwrap();
     execute_value(&mut owner, 11, listener, 5, 1234).unwrap();
     let (mut bind, _) = request(
@@ -1238,7 +1238,7 @@ fn listener_timeout_inheritance_and_queued_payload_gap_urgent_fin() {
 
 #[test]
 fn logical_ephemeral_ports_do_not_follow_reused_os_descriptors() {
-    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
     let remote = encode_addr(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080));
     for port in 40000..40004 {
         let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
@@ -1369,7 +1369,7 @@ fn upstream_profiles_use_iw10() {
 
 #[test]
 fn ip_options_pending_connect_updates_and_engine_owned_ecn() {
-    let mut owner = Owner::new((local(), Profile::Sack)).unwrap();
+    let mut owner = Owner::new((IpAddr::from(local()), Profile::Sack)).unwrap();
     let fd = owner.alloc(Socket::new(0)).unwrap();
     assert_eq!(execute_value(&mut owner, 12, fd, 6, 0), Ok(0));
     assert_eq!(
@@ -1476,7 +1476,7 @@ fn ip_options_pending_connect_updates_and_engine_owned_ecn() {
 #[test]
 fn passive_ack_fin_snapshots_zerocopy_before_accept_and_returns_eof() {
     for enabled in [0, 1] {
-        let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+        let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
         let listener = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
         execute_value(&mut owner, 11, listener, 8, enabled).unwrap();
         let (mut bind, _) = request(
@@ -1508,7 +1508,7 @@ fn passive_ack_fin_snapshots_zerocopy_before_accept_and_returns_eof() {
 
 #[test]
 fn ip_options_changes_preserve_sack_holes_and_data_ack() {
-    let mut owner = Owner::new((local(), Profile::Sack)).unwrap();
+    let mut owner = Owner::new((IpAddr::from(local()), Profile::Sack)).unwrap();
     let (fd, id, handshake_tx, _) = active_ip_connection(&mut owner, 0, IP_PMTUDISC_DONT);
     let data: Vec<u8> = (0..4380).map(|i| (i % 251) as u8).collect();
     let (mut write, _) = request(7, fd, 0, data.clone(), 0);
@@ -1564,7 +1564,7 @@ fn ip_options_changes_preserve_sack_holes_and_data_ack() {
 
 #[test]
 fn transport_encoding_counts_recovery_and_invalid_ledger() {
-    let mut owner = Owner::new((local(), upstream_packet_tests(""))).unwrap();
+    let mut owner = Owner::new((IpAddr::from(local()), upstream_packet_tests(""))).unwrap();
     let fd = owner.alloc(Socket::new(SOCK_NONBLOCK)).unwrap();
     let (mut req, _) = request(
         5,
@@ -1626,7 +1626,7 @@ fn transport_encoding_counts_recovery_and_invalid_ledger() {
 #[test]
 fn shutdown_modes_drain_queue_repeat_and_preserve_single_fin() {
     for how in [SHUT_RD, SHUT_WR, SHUT_RDWR] {
-        let mut owner = Owner::new((local(), Profile::Sack)).unwrap();
+        let mut owner = Owner::new((IpAddr::from(local()), Profile::Sack)).unwrap();
         let (fd, id, tx, syn) = active_ip_connection(&mut owner, 0, IP_PMTUDISC_WANT);
         for invalid in [-1, 3, i32::MAX] {
             assert_eq!(execute_value(&mut owner, 9, fd, invalid, 0), Err(EINVAL));
@@ -1680,7 +1680,7 @@ fn shutdown_modes_drain_queue_repeat_and_preserve_single_fin() {
         );
         assert_eq!(owner.inner.endpoint.state(id), Ok(State::FinWait1));
     }
-    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
     assert_eq!(
         execute_value(&mut owner, 9, u64::MAX, SHUT_RD, 0),
         Err(EBADF)
@@ -1692,7 +1692,7 @@ fn shutdown_modes_drain_queue_repeat_and_preserve_single_fin() {
 #[test]
 fn shutdown_close_resets_unread_data_in_all_modes() {
     for how in [SHUT_RD, SHUT_WR, SHUT_RDWR] {
-        let mut owner = Owner::new((local(), Profile::Sack)).unwrap();
+        let mut owner = Owner::new((IpAddr::from(local()), Profile::Sack)).unwrap();
         let (fd, id, tx, syn) = active_ip_connection(&mut owner, 0, IP_PMTUDISC_WANT);
         shutdown_data(&mut owner, tx, syn, 101);
         execute_value(&mut owner, 9, fd, how, 0).unwrap();
@@ -1877,7 +1877,7 @@ fn cubic_real_loss_snapshot_and_upstream_reno_independence() {
 
 #[test]
 fn copied_completions_wrap_coalesce_and_reserve_before_accepting_bytes() {
-    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
     let (fd, id, _, _) = active_ip_connection(&mut owner, 0, IP_PMTUDISC_WANT);
     execute_value(&mut owner, 11, fd, 8, 1).unwrap();
     owner.sockets.get_mut(&fd).unwrap().zc_next = u32::MAX - 1;
@@ -1999,7 +1999,7 @@ fn copied_completions_wrap_coalesce_and_reserve_before_accepting_bytes() {
 
 #[test]
 fn owner_constructs_endpoint_and_preserves_output_under_backpressure() {
-    let adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
+    let adapter = Adapter::start((IpAddr::from(local()), Profile::Baseline)).unwrap();
     for i in 0..LIMIT + 4 {
         // Respect Endpoint's separate 128-control-replies/second rate limit.
         if i == LIMIT {
@@ -2300,7 +2300,7 @@ fn upstream_sack_profile_negotiates_combined_options_and_peer_fallback() {
         (true, false, &[2, 4, 5, 180, 1, 1, 4, 2, 1, 3, 3, 7][..]),
         (false, false, &[2, 4, 5, 180, 1, 3, 3, 7][..]),
     ] {
-        let adapter = Adapter::start((local(), upstream_packet_tests(""))).unwrap();
+        let adapter = Adapter::start((IpAddr::from(local()), upstream_packet_tests(""))).unwrap();
         let fd = call(&adapter, 1, 0, SOCK_STREAM, vec![], 0).unwrap().value as u64;
         call(
             &adapter,
@@ -2422,7 +2422,7 @@ fn owner_loop_profiles_preserve_terminal_push_without_frozen_batch_clock() {
 
 #[test]
 fn ip_options_passive_expiry_gc_final_reset_and_unmatched_control() {
-    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
     let listener = owner.alloc(Socket::new(0)).unwrap();
     execute_value(&mut owner, 11, listener, 6, 40).unwrap();
     execute_value(&mut owner, 11, listener, 7, IP_PMTUDISC_DONT).unwrap();
@@ -2528,7 +2528,7 @@ fn ip_options_passive_expiry_gc_final_reset_and_unmatched_control() {
 
 #[test]
 fn ip_metadata_limit_is_reserved_before_connect_and_reused_after_gc() {
-    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
     // Small real buffers let this test reach all 128 slots, not the profile's
     // separate aggregate byte cap. Production profile settings remain untouched.
     let mut config = EndpointConfig {
@@ -2568,7 +2568,7 @@ fn ip_metadata_limit_is_reserved_before_connect_and_reused_after_gc() {
 
 #[test]
 fn receive_retry_fault_preserves_stream_and_short_copyout() {
-    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
     let (fd, id, tx, sent) = active_ip_connection(&mut owner, 0, IP_PMTUDISC_WANT);
     execute_value(&mut owner, 10, fd, F_SETFL, O_RDWR).unwrap();
     let (mut r, rx) = request(6, fd, 0, vec![], 6);
@@ -2615,7 +2615,7 @@ fn send_payload_faults_follow_owner_errors_and_shutdown() {
         vec![(0, 0), (1, 3), (1, 3)],
         vec![(0, 0), (0, 3), (0, 3)],
     ] {
-        let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+        let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
         let (fd, id, tx, syn) = active_ip_connection(&mut owner, 0, IP_PMTUDISC_WANT);
         let (mut send, _) = request(7, fd, 0, vec![], 0);
         send.destinations = sources.clone();
@@ -2673,7 +2673,7 @@ fn send_payload_faults_follow_owner_errors_and_shutdown() {
 
 #[test]
 fn ip_options_listener_snapshot_accept_detached_fin_and_fd_reuse() {
-    let mut owner = Owner::new((local(), Profile::Sack)).unwrap();
+    let mut owner = Owner::new((IpAddr::from(local()), Profile::Sack)).unwrap();
     let reservation_bytes = owner.inner.endpoint.buffer_bytes();
     let listener = owner.alloc(Socket::new(0)).unwrap();
     execute_value(&mut owner, 11, listener, 8, 1).unwrap();
@@ -2773,7 +2773,7 @@ fn ip_options_listener_snapshot_accept_detached_fin_and_fd_reuse() {
 
 #[test]
 fn saturated_options_preserve_time_wait_ack_and_listener_reset() {
-    let mut owner = Owner::new((local(), Profile::Baseline)).unwrap();
+    let mut owner = Owner::new((IpAddr::from(local()), Profile::Baseline)).unwrap();
     let mut config = crate::packet_profile::config(Profile::Baseline);
     config.max_connections = LIMIT + 1; // Core still has room when metadata fills.
     config.connection.receive_capacity = 128;
@@ -2878,7 +2878,7 @@ fn saturated_options_preserve_time_wait_ack_and_listener_reset() {
 
 #[test]
 fn pending_accept_does_not_block_packets_and_stop_joins() {
-    let adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
+    let adapter = Adapter::start((IpAddr::from(local()), Profile::Baseline)).unwrap();
     let fd = call(&adapter, 1, 0, 0, vec![], 0).unwrap().value as u64;
     call(
         &adapter,
@@ -2910,7 +2910,7 @@ fn pending_accept_does_not_block_packets_and_stop_joins() {
 
 #[test]
 fn explicit_close_cancels_pending_accept_before_descriptor_reuse() {
-    let adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
+    let adapter = Adapter::start((IpAddr::from(local()), Profile::Baseline)).unwrap();
     let fd = call(&adapter, 1, 0, 0, vec![], 0).unwrap().value as u64;
     call(
         &adapter,
@@ -2937,7 +2937,7 @@ fn explicit_close_cancels_pending_accept_before_descriptor_reuse() {
 
 #[test]
 fn descriptor_and_request_limits_fail_without_hanging() {
-    let adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
+    let adapter = Adapter::start((IpAddr::from(local()), Profile::Baseline)).unwrap();
     let fds: Vec<_> = (0..LIMIT)
         .map(|_| call(&adapter, 1, 0, 0, vec![], 0).unwrap().value as u64)
         .collect();
@@ -2972,7 +2972,7 @@ fn descriptor_and_request_limits_fail_without_hanging() {
 
 #[test]
 fn pending_limit_and_poll_timeout() {
-    let adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
+    let adapter = Adapter::start((IpAddr::from(local()), Profile::Baseline)).unwrap();
     let mut replies = Vec::new();
     for _ in 0..LIMIT {
         let (r, rx) = request(15, 0, 0, vec![], BYTES);
@@ -2992,7 +2992,7 @@ fn pending_limit_and_poll_timeout() {
 
 #[test]
 fn owner_loop_preserves_pending_send_read_fifo_on_refused_handshake() {
-    let adapter = Adapter::start((local(), Profile::Baseline)).unwrap();
+    let adapter = Adapter::start((IpAddr::from(local()), Profile::Baseline)).unwrap();
     let fd = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
         .unwrap()
         .value as u64;

@@ -2,7 +2,7 @@ use super::*;
 
 fn listen_at(owner: &mut Owner, port: u16) -> u64 {
     let fd = new(owner, SOCK_NONBLOCK);
-    owner.execute(fd, Op::Bind(SocketAddr::new(owner.local.into(), port))).unwrap();
+    owner.execute(fd, Op::Bind(SocketAddr::new(owner.local, port))).unwrap();
     owner.execute(fd, Op::Listen(4)).unwrap();
     fd
 }

@@ -48,10 +48,15 @@ fn socket_buffer_value(name: i32, value: i32) -> usize {
 #[derive(Clone)]
 pub enum Op {
     New(i32),
+    NewDomain(i32, i32),
     Wait(Box<Op>, Option<std::time::Duration>),
     FinishConnect,
     SetFastOpenClientEnabled(bool),
-    SetDestinationRoute(Ipv4Addr, Option<ntcp::RoutePolicy>),
+    SetFastOpenClientDefaultPolicy(FastOpenClientPolicy),
+    SetFastOpenClientPolicy(Option<(SocketAddr, FastOpenClientPolicy)>),
+    SetFastOpenServerCookie(Option<(SocketAddr, FastOpenCookie)>),
+    SetListenerFastOpenEarlyDataPolicy(ntcp::FastOpenEarlyDataPolicy),
+    SetDestinationRoute(IpAddr, Option<ntcp::RoutePolicy>),
     #[cfg(all(test, feature = "packet-test"))]
     BlockingConnect(SocketAddr),
     Bind(SocketAddr),
@@ -170,23 +175,34 @@ impl Runtime {
 
     pub fn start(config: SocketConfig) -> Result<Self> {
         config.validate().map_err(|_| EINVAL)?;
+        let factory = crate::PACKET_IO_FACTORY.lock().map_err(|_| EIO)?.take();
         Self::spawn(
-            move || match config.io.backend {
-                Backend::Tun => Owner::new(&config),
-                Backend::AfPacket => Owner::af_packet(&config),
-            },
+            std::panic::AssertUnwindSafe(move || {
+                if let Some(factory) = factory {
+                    Owner::external_backend(
+                        &config,
+                        factory().map_err(|e| e.raw_os_error().unwrap_or(EIO))?,
+                    )
+                } else {
+                    match config.io.backend {
+                        Backend::Tun => Owner::new(&config),
+                        Backend::AfPacket => Owner::af_packet(&config),
+                    }
+                }
+            }),
             false,
         )
     }
     #[cfg(all(test, feature = "packet-test"))]
-    pub fn packet(settings: (Ipv4Addr, crate::packet_profile::Profile)) -> Result<Self> {
+    pub fn packet(settings: (impl Into<IpAddr>, crate::packet_profile::Profile)) -> Result<Self> {
         Self::packet_with_options(settings, crate::packet_test::Options::default())
     }
     #[cfg(feature = "packet-test")]
     pub fn packet_with_options(
-        settings: (Ipv4Addr, crate::packet_profile::Profile),
+        settings: (impl Into<IpAddr>, crate::packet_profile::Profile),
         options: crate::packet_test::Options,
     ) -> Result<Self> {
+        let settings = (settings.0.into(), settings.1);
         Self::spawn(move || Owner::packet_with_options(settings, options), true)
     }
     fn spawn(
@@ -207,7 +223,7 @@ impl Runtime {
                 set_internal(true);
                 let result = std::panic::catch_unwind(|| match start() {
                     Ok(mut owner) => {
-                        let _ = ready_tx.send(Ok(()));
+                        let _ = ready_tx.send(Ok(crate::ip::family(owner.local)));
                         owner.run(rx, wake, &stopping);
                     }
                     Err(e) => {
@@ -232,14 +248,17 @@ impl Runtime {
                 return Err(EAGAIN);
             }
         };
-        if let Err(e) = ready_rx.recv().unwrap_or(Err(EIO)) {
-            close_failed_startup(worker, wake);
-            return Err(e);
-        }
+        let family = match ready_rx.recv().unwrap_or(Err(EIO)) {
+            Ok(family) => family,
+            Err(e) => {
+                close_failed_startup(worker, wake);
+                return Err(e);
+            }
+        };
         Ok(Self {
             tx,
             wake,
-            family: AF_INET,
+            family,
             io_limit: if packet { 65535 } else { BYTES },
             stop,
             worker: Mutex::new(Some(worker)),
@@ -338,6 +357,11 @@ enum Handle {
 }
 #[derive(Clone)]
 struct Socket {
+    domain: i32,
+    v6only: bool,
+    bound_addr: Option<SocketAddr>,
+    ipv6_tclass: u8,
+    ipv6_discover: i32,
     send_capacity: usize,
     receive_capacity: usize,
     handle: Handle,
@@ -361,6 +385,9 @@ struct Socket {
     fast_open_limit: i32,
     fast_open_cookie_policy: Option<FastOpenCookiePolicy>,
     fast_open_connect: bool,
+    server_cookie: Option<(SocketAddr, FastOpenCookie)>,
+    client_policy: Option<(SocketAddr, FastOpenClientPolicy)>,
+    deferred_client_policy: Option<FastOpenClientPolicy>,
     deferred_peer: Option<SocketAddr>,
     readiness: i32,
     readiness_generations: [u64; 5],
@@ -390,12 +417,36 @@ struct Socket {
     zerocopy: bool,
     zc_next: u32,
     zc_reserved: usize,
+    zc_leases: VecDeque<crate::zerocopy::Pending>,
     completions: VecDeque<Completion>,
     timestamps: TimestampState,
 }
 impl Socket {
+    fn server_cookie_for(&self, remote: SocketAddr) -> Option<FastOpenCookie> {
+        self.server_cookie
+            .and_then(|(peer, cookie)| (peer == remote).then_some(cookie))
+    }
+
+    fn client_policy_for(
+        &self,
+        remote: SocketAddr,
+        default: FastOpenClientPolicy,
+    ) -> FastOpenClientPolicy {
+        self.deferred_client_policy
+            .or_else(|| {
+                self.client_policy
+                    .and_then(|(peer, policy)| (peer == remote).then_some(policy))
+            })
+            .unwrap_or(default)
+    }
+
     fn new(flags: i32) -> Self {
         Self {
+            domain: AF_INET,
+            v6only: false,
+            bound_addr: None,
+            ipv6_tclass: 0,
+            ipv6_discover: IP_PMTUDISC_WANT,
             send_capacity: BYTES,
             receive_capacity: BYTES,
             handle: Handle::Fresh,
@@ -415,6 +466,9 @@ impl Socket {
             fast_open_limit: 0,
             fast_open_cookie_policy: None,
             fast_open_connect: false,
+            server_cookie: None,
+            client_policy: None,
+            deferred_client_policy: None,
             deferred_peer: None,
             readiness: 0,
             readiness_generations: [0; 5],
@@ -439,6 +493,7 @@ impl Socket {
             zerocopy: false,
             zc_next: 0,
             zc_reserved: 0,
+            zc_leases: VecDeque::new(),
             completions: VecDeque::new(),
             timestamps: TimestampState::default(),
         }
@@ -500,7 +555,13 @@ pub(crate) fn unsupported_option(reason: &str) -> i32 {
         EOPNOTSUPP
     }
 }
-type ChildOptionsSnapshot = (ConnectionId, u64, u64, u64, (bool, bool, bool, u32, bool));
+type ChildOptionsSnapshot = (
+    ConnectionId,
+    u64,
+    u64,
+    u64,
+    (bool, bool, bool, u32, bool, u8, i32),
+);
 
 struct Owner {
     endpoint: Endpoint,
@@ -509,7 +570,7 @@ struct Owner {
     tun: Option<Tun>,
     ethernet: Option<backend::EthernetBackend>,
     sockets: BTreeMap<u64, Socket>,
-    local: Ipv4Addr,
+    local: IpAddr,
     epoch: Instant,
     #[cfg(test)]
     test_now: Option<u64>,
@@ -535,11 +596,10 @@ struct Owner {
     #[cfg(feature = "packet-test")]
     packets: Option<PacketBackend>,
 }
-fn unicast(ip: Ipv4Addr) -> bool {
-    ip.octets()[0] != 0 && ip.octets()[0] < 224 && !ip.is_loopback()
+fn unicast(ip: impl Into<IpAddr>) -> bool {
+    crate::ip::unicast(ip.into())
 }
-fn context(io: &crate::IoConfig) -> Result<(Ipv4Addr, u8)> {
-    let (name, local, requested) = (&io.interface, io.address, io.prefix);
+fn context(io: &crate::IoConfig) -> Result<(IpAddr, u8)> {
     let mut list = ptr::null_mut();
     if unsafe { libc::getifaddrs(&mut list) } < 0 {
         return Err(errno());
@@ -549,26 +609,60 @@ fn context(io: &crate::IoConfig) -> Result<(Ipv4Addr, u8)> {
     let mut duplicate = false;
     unsafe {
         while let Some(entry) = cursor.as_ref() {
-            if !entry.ifa_addr.is_null() && (*entry.ifa_addr).sa_family as i32 == AF_INET {
-                let addr = &*entry.ifa_addr.cast::<sockaddr_in>();
-                let ip = Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes());
-                duplicate |= ip == local;
-                if CStr::from_ptr(entry.ifa_name).to_bytes() == name.as_bytes()
-                    && !entry.ifa_netmask.is_null()
-                    && (*entry.ifa_netmask).sa_family as i32 == AF_INET
-                {
-                    let mask = u32::from_be_bytes(
+            if !entry.ifa_addr.is_null() {
+                let family = (*entry.ifa_addr).sa_family as i32;
+                let pair = if family == AF_INET {
+                    let addr = &*entry.ifa_addr.cast::<sockaddr_in>();
+                    let mask = (!entry.ifa_netmask.is_null()).then(|| {
                         (*entry.ifa_netmask.cast::<sockaddr_in>())
                             .sin_addr
                             .s_addr
-                            .to_ne_bytes(),
-                    );
-                    let prefix = mask.leading_ones() as u8;
-                    if mask == u32::MAX.checked_shl(32 - prefix as u32).unwrap_or(0)
-                        && requested.is_none_or(|p| p == prefix)
-                        && u32::from(ip) & mask == u32::from(local) & mask
+                            .to_ne_bytes()
+                    });
+                    mask.map(|m| {
+                        (
+                            IpAddr::V4(Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes())),
+                            IpAddr::V4(m.into()),
+                        )
+                    })
+                } else if family == AF_INET6 {
+                    let addr = &*entry.ifa_addr.cast::<sockaddr_in6>();
+                    let mask = (!entry.ifa_netmask.is_null()).then(|| {
+                        (*entry.ifa_netmask.cast::<sockaddr_in6>())
+                            .sin6_addr
+                            .s6_addr
+                    });
+                    mask.map(|m| {
+                        (
+                            IpAddr::V6(addr.sin6_addr.s6_addr.into()),
+                            IpAddr::V6(m.into()),
+                        )
+                    })
+                } else {
+                    None
+                };
+                if let Some((addr, mask)) = pair {
+                    duplicate |= addr == io.address;
+                    let (bits, ones) = match mask {
+                        IpAddr::V4(v) => (32, u32::from(v).leading_ones()),
+                        IpAddr::V6(v) => (128, u128::from(v).leading_ones()),
+                    };
+                    let valid_mask = match mask {
+                        IpAddr::V4(v) => {
+                            u32::from(v) == u32::MAX.checked_shl(bits - ones).unwrap_or(0)
+                        }
+                        IpAddr::V6(v) => {
+                            u128::from(v) == u128::MAX.checked_shl(bits - ones).unwrap_or(0)
+                        }
+                    };
+                    if valid_mask
+                        && CStr::from_ptr(entry.ifa_name).to_bytes() == io.interface.as_bytes()
+                        && io.prefix.is_none_or(|p| u32::from(p) == ones)
+                        && addr.is_ipv4() == io.address.is_ipv4()
+                        && crate::ip::network(addr, ones as u8)
+                            == crate::ip::network(io.address, ones as u8)
                     {
-                        found = Some((ip, prefix));
+                        found = Some((addr, ones as u8));
                     }
                 }
             }
@@ -576,17 +670,18 @@ fn context(io: &crate::IoConfig) -> Result<(Ipv4Addr, u8)> {
         }
         libc::freeifaddrs(list);
     }
-    if duplicate || !unicast(local) {
+    if duplicate || !unicast(io.address) {
         return Err(EADDRNOTAVAIL);
     }
-    let (ip, prefix) = found.ok_or(EADDRNOTAVAIL)?;
-    if prefix <= 30 {
-        let mask = u32::MAX.checked_shl(32 - prefix as u32).unwrap_or(0);
-        if u32::from(local) == u32::from(ip) & mask || u32::from(local) == u32::from(ip) | !mask {
+    let pair = found.ok_or(EADDRNOTAVAIL)?;
+    if let IpAddr::V4(local) = io.address {
+        let mask = u32::MAX.checked_shl(32 - u32::from(pair.1)).unwrap_or(0);
+        let network = u32::from(local) & mask;
+        if pair.1 <= 30 && (u32::from(local) == network || u32::from(local) == network | !mask) {
             return Err(EADDRNOTAVAIL);
         }
     }
-    Ok((ip, prefix))
+    Ok(pair)
 }
 impl Owner {
     fn new(config: &SocketConfig) -> Result<Self> {
@@ -621,7 +716,7 @@ impl Owner {
             }
             offset += n as usize;
         }
-        let tcp = backend::backend_config(config.tcp.clone(), &tun)?;
+        let tcp = backend::backend_config_family(config.tcp.clone(), &tun, local)?;
         let mut owner = Self::with_config(local, subnet, secret, Some(tun), tcp)?;
         owner.apply_socket_config(config)?;
         owner.enable_reservations(&config.io, index)?;
@@ -634,37 +729,49 @@ impl Owner {
         let now = self.now();
         for &(destination, policy) in &config.routes {
             self.endpoint
-                .set_destination_route(now, destination.into(), Some(policy))
+                .set_destination_route(now, destination, Some(policy))
                 .map_err(engine)?;
         }
         Ok(())
     }
     fn with_config(
-        local: Ipv4Addr,
-        (address, prefix): (Ipv4Addr, u8),
+        local: impl Into<IpAddr>,
+        (address, prefix): (impl Into<IpAddr>, u8),
         secret: [u8; 32],
         tun: Option<Tun>,
         config: EndpointConfig,
     ) -> Result<Self> {
+        let local = local.into();
+        let address = address.into();
         let defaults = config.clone();
         let valid = move |ip: IpAddr| {
-            matches!(ip, IpAddr::V4(ip) if unicast(ip)
-            && (prefix > 30 || u32::from(ip) != u32::from(address) | (u32::MAX.checked_shr(prefix as u32).unwrap_or(0))))
+            if ip.is_ipv4() != local.is_ipv4() || !unicast(ip) {
+                return false;
+            }
+            match (ip, address) {
+                (IpAddr::V4(ip), IpAddr::V4(address)) => {
+                    prefix > 30
+                        || u32::from(ip)
+                            != u32::from(address) | u32::MAX.checked_shr(prefix as u32).unwrap_or(0)
+                }
+                (IpAddr::V6(_), IpAddr::V6(_)) => true,
+                _ => false,
+            }
         };
         let endpoint = Endpoint::new(config, secret, 0, move |r| match r {
             AddressValidation::Bind { local: bind } => {
                 // Per-socket local-address permission is checked by Op::Bind.
                 // FREEBIND does not relax Open, Incoming, or Route policy.
-                bind.is_unspecified() || valid(bind)
+                bind.is_unspecified() || unicast(bind)
             }
             AddressValidation::Open {
                 local: source,
                 remote,
-            } => source == IpAddr::V4(local) && valid(remote),
+            } => source == local && valid(remote),
             AddressValidation::Incoming {
                 source,
                 destination,
-            } => destination == IpAddr::V4(local) && valid(source),
+            } => destination == local && valid(source),
             AddressValidation::Route { .. } => false,
         })
         .map_err(engine)?;
@@ -702,20 +809,21 @@ impl Owner {
         })
     }
     #[cfg(all(test, feature = "packet-test"))]
-    fn packet(settings: (Ipv4Addr, crate::packet_profile::Profile)) -> Result<Self> {
+    fn packet(settings: (impl Into<IpAddr>, crate::packet_profile::Profile)) -> Result<Self> {
         Self::packet_with_options(settings, crate::packet_test::Options::default())
     }
     #[cfg(feature = "packet-test")]
     fn packet_with_options(
-        (local, profile): (Ipv4Addr, crate::packet_profile::Profile),
+        (local, profile): (impl Into<IpAddr>, crate::packet_profile::Profile),
         options: crate::packet_test::Options,
     ) -> Result<Self> {
+        let local = local.into();
         options.validate()?;
         // Deterministic key and synthetic address policy are explicit test-only
         // settings, never a production entropy source or TUN routing policy.
         let mut owner = Self::with_config(
             local,
-            (local, 32),
+            (local, if local.is_ipv4() { 32 } else { 128 }),
             [42; 32],
             None,
             SocketConfig::new("test", local).tcp,
@@ -725,11 +833,9 @@ impl Owner {
             [42; 32],
             0,
             move |r| match r {
-                AddressValidation::Bind { local: addr } => {
-                    addr.is_unspecified() || matches!(addr, IpAddr::V4(ip) if unicast(ip))
-                }
-                AddressValidation::Open { local: addr, .. } => addr == IpAddr::V4(local),
-                AddressValidation::Incoming { destination, .. } => destination == IpAddr::V4(local),
+                AddressValidation::Bind { local: addr } => addr.is_unspecified() || unicast(addr),
+                AddressValidation::Open { local: addr, .. } => addr == local,
+                AddressValidation::Incoming { destination, .. } => destination == local,
                 AddressValidation::Route { .. } => false,
             },
         )
@@ -742,9 +848,28 @@ impl Owner {
         }
         owner.defaults = crate::packet_profile::config(profile);
         owner.socket_policy.notsent_lowat = crate::packet_profile::notsent_lowat(profile);
+        if matches!(profile, crate::packet_profile::Profile::Upstream(o) if o.application_protected_tfo_client)
+        {
+            owner.socket_policy.fast_open_client_policy =
+                FastOpenClientPolicy::ApplicationProtected;
+        }
         owner.packets = Some(PacketBackend::new(profile, options.queue_capacity)?);
         owner.enable_egress(options.egress_capacity, crate::packet_profile::gso(profile))?;
         Ok(owner)
+    }
+    fn check_address(&self, addr: SocketAddr) -> Result<()> {
+        if addr.is_ipv4() != self.local.is_ipv4() {
+            return Err(EAFNOSUPPORT);
+        }
+        if let SocketAddr::V6(v) = addr
+            && (v.scope_id() != 0
+                || v.flowinfo() != 0
+                || v.ip().to_ipv4_mapped().is_some()
+                || v.ip().is_unicast_link_local())
+        {
+            return Err(EOPNOTSUPP);
+        }
+        Ok(())
     }
     fn socket_limit(&self) -> usize {
         #[cfg(feature = "packet-test")]
@@ -757,6 +882,8 @@ impl Owner {
         #[cfg(feature = "packet-test")]
         if let Some(packets) = &self.packets {
             let mut socket = Socket::new(flags);
+            socket.domain = crate::ip::family(self.local);
+            socket.v6only = self.local.is_ipv6();
             let config = crate::packet_profile::config(packets.profile);
             socket.receive_capacity = config.connection.receive_capacity;
             socket.send_capacity = config.connection.send_capacity;
@@ -768,12 +895,15 @@ impl Owner {
             return socket;
         }
         let mut socket = Socket::new(flags);
+        socket.domain = crate::ip::family(self.local);
+        socket.v6only = self.local.is_ipv6();
         let c = &self.defaults.connection;
         socket.send_capacity = c.send_capacity;
         socket.receive_capacity = c.receive_capacity;
         socket.user_mss = c.user_mss;
         socket.nodelay = !c.nagle;
         socket.tos = self.defaults.dscp << 2;
+        socket.ipv6_tclass = socket.tos;
         if let Some(k) = c.keepalive {
             socket.keepalive = true;
             socket.idle = (k.idle_us / 1_000_000) as i32;
@@ -792,7 +922,9 @@ impl Owner {
     fn admission_command(&self, op: &Op) -> bool {
         if matches!(
             op,
-            Op::SetFastOpenClientEnabled(_) | Op::SetDestinationRoute(..)
+            Op::SetFastOpenClientEnabled(_)
+                | Op::SetFastOpenClientDefaultPolicy(_)
+                | Op::SetDestinationRoute(..)
         ) {
             return true;
         }
@@ -829,14 +961,17 @@ impl Owner {
             >= self.socket_limit()
     }
     fn frame(&self, tx: ntcp::Transmit, tcp: &[u8]) -> Result<Vec<u8>> {
-        let mut packet = vec![0; 20 + tcp.len()];
-        packet[20..].copy_from_slice(tcp);
-        let n = ntcp_ip::encode(&mut packet, tx, (self.now() / 1000) as u32).map_err(|_| EIO)?;
+        let header = crate::ip::header_len(tx.ip.source);
+        let mut packet = vec![0; header + tcp.len()];
+        packet[header..].copy_from_slice(tcp);
+        let n = crate::ip::encode(&mut packet, tx, (self.now() / 1000) as u32, tx.len)
+            .map_err(|_| EIO)?;
         packet.truncate(n);
-        if tx
-            .connection
-            .and_then(|cid| self.connection_options.iter().find(|p| p.0 == cid))
-            .is_some_and(|p| p.2 == IP_PMTUDISC_DONT)
+        if tx.ip.source.is_ipv4()
+            && tx
+                .connection
+                .and_then(|cid| self.connection_options.iter().find(|p| p.0 == cid))
+                .is_some_and(|p| p.2 == IP_PMTUDISC_DONT)
         {
             packet[6] = 0;
             packet[10..12].fill(0);
@@ -954,9 +1089,10 @@ impl Owner {
             return 65535;
         }
         // Include the largest TCP option header, not just the data MSS.
-        20 + usize::from(self.defaults.connection.send_ip_payload_limit)
-            .min(usize::from(self.defaults.connection.mss) + 60)
-            .min(65515)
+        crate::ip::header_len(self.local)
+            + usize::from(self.defaults.connection.send_ip_payload_limit)
+                .min(usize::from(self.defaults.connection.mss) + 60)
+                .min(65515)
     }
     // Select at current time, never at a future pacing deadline. Reserved departure
     // commits only at backend acceptance; retain the same bytes through WouldBlock.
@@ -967,13 +1103,14 @@ impl Owner {
         if self.waiting_mtu {
             return Ok(false);
         }
+        let header = crate::ip::header_len(self.local);
         let mut packet = vec![0; self.output_packet_len()];
         let pair = ClockPair::sample(self);
         let now = transmit_now.unwrap_or_else(|| self.now());
         let tx = if self.reservations {
             match self
                 .endpoint
-                .poll_reserved_transmit(now, &mut packet[20..], BUDGET)
+                .poll_reserved_transmit(now, &mut packet[header..], BUDGET)
             {
                 Ok((output, attempt)) => {
                     if let Some(attempt) = attempt {
@@ -989,7 +1126,7 @@ impl Owner {
             }
         } else {
             self.endpoint
-                .poll_transmit(now, &mut packet[20..], BUDGET)
+                .poll_transmit(now, &mut packet[header..], BUDGET)
                 .map_err(engine)?
                 .packet
         };
@@ -999,7 +1136,7 @@ impl Owner {
         if self.reservations {
             self.reservation_owner = tx.connection;
         }
-        packet = self.frame(tx, &packet[20..20 + tx.len])?;
+        packet = self.frame(tx, &packet[header..header + tx.len])?;
         self.timestamp_packet(tx.tx_timestamp, &packet);
         self.drain_timestamps(pair);
         self.pending_token = tx.tx_timestamp;
@@ -1038,7 +1175,15 @@ impl Owner {
             if self.receive_batch(&mut input).is_err() || self.poll_backend_timestamps().is_err() {
                 break 'run;
             }
+            if self
+                .ethernet
+                .as_mut()
+                .is_some_and(|b| b.io.reclaim_transmit(BUDGET).is_err())
+            {
+                break 'run;
+            }
             self.events();
+            self.collect_zero_copy();
             self.service_before_output(&mut after_output);
             if self.egress.is_some() {
                 if self.service_egress().is_err() {
@@ -1062,6 +1207,7 @@ impl Owner {
                 }
             }
             self.events();
+            self.collect_zero_copy();
             for (mut request, retried) in after_output.drain(..) {
                 if retried || !self.service(&mut request) {
                     self.pending.push_back(request);
@@ -1192,12 +1338,17 @@ impl Owner {
                 .values()
                 .find(|s| {
                     matches!(s.handle, Handle::Listener(_))
-                        && s.local.is_some_and(|local| {
-                            local.port() == tuple.local.port()
-                                && (local.ip().is_unspecified() || local == tuple.local)
-                        })
+                        && s.local
+                            .is_some_and(|local| binding_overlap(local, tuple.local))
                 })
-                .map(|s| (s.tos, s.discover, s.zerocopy, s.mark))
+                .map(|s| {
+                    (
+                        s.wire_tos(self.local),
+                        s.wire_discover(self.local),
+                        s.zerocopy,
+                        s.mark,
+                    )
+                })
         });
         // Reserve only for checked passive SYNs: LISTEN ACKs need stateless
         // resets, and existing TIME-WAIT traffic still needs core processing.
@@ -1239,10 +1390,8 @@ impl Owner {
             && Some(cid) != before
             && let Some((&listener, s)) = self.sockets.iter().find(|(_, s)| {
                 matches!(s.handle, Handle::Listener(_))
-                    && s.local.is_some_and(|local| {
-                        local.port() == tuple.local.port()
-                            && (local.ip().is_unspecified() || local == tuple.local)
-                    })
+                    && s.local
+                        .is_some_and(|local| binding_overlap(local, tuple.local))
             })
         {
             // Runtime bind policy admits only one listener per port. Input can
@@ -1255,7 +1404,15 @@ impl Owner {
                 listener,
                 s.receive_timeout_us,
                 s.send_timeout_us,
-                (s.nodelay, s.cork, s.inq, s.notsent_lowat, s.freebind),
+                (
+                    s.nodelay,
+                    s.cork,
+                    s.inq,
+                    s.notsent_lowat,
+                    s.freebind,
+                    s.other_ip_policy(self.local).0,
+                    s.other_ip_policy(self.local).1,
+                ),
             ));
         }
         if let Some(tuple) = tuple
@@ -1392,7 +1549,9 @@ impl Owner {
         self.endpoint
             .set_user_mss(cid, s.user_mss)
             .map_err(engine)?;
-        self.endpoint.set_dscp(cid, s.tos >> 2).map_err(engine)?;
+        self.endpoint
+            .set_dscp(cid, s.wire_tos(self.local) >> 2)
+            .map_err(engine)?;
         self.endpoint.set_nagle(cid, !s.nodelay).map_err(engine)?;
         self.endpoint.set_cork(cid, s.cork).map_err(engine)?;
         if s.timestamps.options.flags != 0 {
@@ -1553,11 +1712,11 @@ impl Owner {
     }
     fn execute(&mut self, id: u64, op: Op) -> Result<Reply> {
         if let Op::SetDestinationRoute(destination, policy) = op {
-            if !unicast(destination) {
+            if !unicast(destination) || destination.is_ipv4() != self.local.is_ipv4() {
                 return Err(EINVAL);
             }
             self.endpoint
-                .set_destination_route(self.now(), destination.into(), policy)
+                .set_destination_route(self.now(), destination, policy)
                 .map_err(|error| {
                     if error == EndpointError::OutputReserved {
                         EAGAIN
@@ -1592,6 +1751,10 @@ impl Owner {
         }
         if let Op::SetFastOpenClientEnabled(enabled) = op {
             self.socket_policy.fast_open_client_enabled = enabled;
+            return Ok(out);
+        }
+        if let Op::SetFastOpenClientDefaultPolicy(policy) = op {
+            self.socket_policy.fast_open_client_policy = policy;
             return Ok(out);
         }
         #[cfg(feature = "packet-test")]
@@ -1652,12 +1815,61 @@ impl Owner {
             _ => (),
         }
         self.events();
-        if let Op::New(flags) = op {
-            out.value = self.alloc(self.fresh_socket(flags))?;
+        if let Op::New(flags) | Op::NewDomain(_, flags) = op {
+            let domain = if let Op::NewDomain(domain, _) = op {
+                domain
+            } else {
+                crate::ip::family(self.local)
+            };
+            if ![AF_INET, AF_INET6].contains(&domain) || domain == AF_INET && self.local.is_ipv6() {
+                return Err(EAFNOSUPPORT);
+            }
+            let mut socket = self.fresh_socket(flags);
+            socket.domain = domain;
+            socket.v6only = domain == AF_INET6 && self.local.is_ipv6();
+            out.value = self.alloc(socket)?;
             return Ok(out);
         }
         let s = self.sockets.get(&id).ok_or(EBADF)?;
         match op {
+            Op::SetFastOpenClientPolicy(policy) => {
+                if !matches!(s.handle, Handle::Fresh) || s.deferred_peer.is_some() {
+                    return Err(EINVAL);
+                }
+                let policy = policy
+                    .map(|(peer, policy)| {
+                        s.normalize_address(peer, self.local, false)
+                            .map(|peer| (peer, policy))
+                    })
+                    .transpose()?;
+                if policy.is_some_and(|(peer, _)| peer.port() == 0 || !unicast(peer.ip())) {
+                    return Err(EINVAL);
+                }
+                self.sockets.get_mut(&id).unwrap().client_policy = policy;
+            }
+            Op::SetFastOpenServerCookie(credential) => {
+                if !matches!(s.handle, Handle::Fresh) || s.deferred_peer.is_some() {
+                    return Err(EINVAL);
+                }
+                let credential = credential
+                    .map(|(peer, cookie)| {
+                        s.normalize_address(peer, self.local, false)
+                            .map(|peer| (peer, cookie))
+                    })
+                    .transpose()?;
+                if credential.is_some_and(|(peer, _)| peer.port() == 0 || !unicast(peer.ip())) {
+                    return Err(EINVAL);
+                }
+                self.sockets.get_mut(&id).unwrap().server_cookie = credential;
+            }
+            Op::SetListenerFastOpenEarlyDataPolicy(policy) => {
+                let Handle::Listener(listener) = s.handle else {
+                    return Err(EOPNOTSUPP);
+                };
+                self.endpoint
+                    .set_listener_fast_open_early_data_policy(listener, policy)
+                    .map_err(engine)?;
+            }
             #[cfg(feature = "tfo-linux-cookie")]
             Op::SetFastOpenKey(key) => {
                 if s.deferred_peer.is_some()
@@ -1674,28 +1886,32 @@ impl Owner {
                 self.sockets.get_mut(&id).unwrap().fast_open_cookie_policy = Some(policy);
             }
             Op::Bind(mut addr) => {
+                let mut local = s.normalize_address(addr, self.local, true)?;
                 if !matches!(s.handle, Handle::Fresh)
                     || s.local.is_some()
                     || s.deferred_peer.is_some()
                 {
                     return Err(EINVAL);
                 }
-                if !s.freebind && addr.ip() != IpAddr::V4(self.local) && !addr.ip().is_unspecified()
-                {
+                if !s.freebind && local.ip() != self.local && !local.ip().is_unspecified() {
                     return Err(EADDRNOTAVAIL);
                 }
                 let reuse = s.reuse;
+                let new_v6only = s.v6only;
                 if addr.port() == 0 {
                     addr.set_port(self.port()?);
+                    local.set_port(addr.port());
                 }
                 if self.sockets.iter().any(|(&other, s)| {
                     other != id
                         && !(reuse && s.reuse && matches!(s.handle, Handle::Connection(_)))
-                        && s.local.is_some_and(|a| a.port() == addr.port())
+                        && s.conflicts_binding(addr, local, new_v6only)
                 }) {
                     return Err(EADDRINUSE);
                 }
-                self.sockets.get_mut(&id).unwrap().local = Some(addr);
+                let socket = self.sockets.get_mut(&id).unwrap();
+                socket.local = Some(local);
+                socket.bound_addr = Some(addr);
             }
             Op::Listen(backlog) => {
                 if !matches!(s.handle, Handle::Fresh) || s.deferred_peer.is_some() {
@@ -1709,7 +1925,19 @@ impl Owner {
                 let user_mss = s.user_mss;
                 let local = match s.local {
                     Some(a) => a,
-                    None => SocketAddr::new(self.local.into(), self.port()?),
+                    None => {
+                        let api = SocketAddr::new(
+                            if s.domain == AF_INET6 {
+                                std::net::Ipv6Addr::UNSPECIFIED.into()
+                            } else {
+                                self.local
+                            },
+                            0,
+                        );
+                        let mut local = s.normalize_address(api, self.local, true)?;
+                        local.set_port(self.port()?);
+                        local
+                    }
                 };
                 let listener = self
                     .endpoint
@@ -1763,8 +1991,23 @@ impl Owner {
                     let _ = self.endpoint.close_listener(listener);
                     return Err(engine(e));
                 }
+                #[cfg(feature = "packet-test")]
+                if self.packets.as_ref().is_some_and(|p| {
+                    matches!(p.profile,
+                    crate::packet_profile::Profile::Upstream(o) if o.application_protected_tfo)
+                }) {
+                    self.endpoint
+                        .set_listener_fast_open_early_data_policy(
+                            listener,
+                            ntcp::FastOpenEarlyDataPolicy::ApplicationProtected,
+                        )
+                        .map_err(engine)?;
+                }
                 let s = self.sockets.get_mut(&id).unwrap();
                 s.local = Some(local);
+                if s.domain == AF_INET6 && s.bound_addr.is_none() {
+                    s.bound_addr = Some(SocketAddr::new(s.api_unspecified(), local.port()));
+                }
                 s.handle = Handle::Listener(listener);
             }
             Op::Accept(flags) => {
@@ -1775,6 +2018,13 @@ impl Owner {
                     return Err(EINVAL);
                 };
                 let mut child = self.fresh_socket(flags);
+                child.domain = s.domain;
+                child.v6only = s.v6only;
+                child.set_other_ip_policy(
+                    self.local,
+                    s.other_ip_policy(self.local).0,
+                    s.other_ip_policy(self.local).1,
+                );
                 child.reuse = s.reuse;
                 child.freebind = s.freebind;
                 child.nodelay = s.nodelay;
@@ -1806,8 +2056,13 @@ impl Owner {
                     .iter()
                     .position(|(other, _, _, _, _)| *other == cid)
                 {
-                    let (_, _, receive, send, (nodelay, cork, inq, lowat, freebind)) =
-                        self.child_timeouts.swap_remove(index);
+                    let (
+                        _,
+                        _,
+                        receive,
+                        send,
+                        (nodelay, cork, inq, lowat, freebind, other_tos, other_discover),
+                    ) = self.child_timeouts.swap_remove(index);
                     child.receive_timeout_us = receive;
                     child.send_timeout_us = send;
                     child.nodelay = nodelay;
@@ -1815,6 +2070,7 @@ impl Owner {
                     child.inq = inq;
                     child.notsent_lowat = lowat;
                     child.freebind = freebind;
+                    child.set_other_ip_policy(self.local, other_tos, other_discover);
                 }
                 let tuple = match self.endpoint.tuple(cid).map_err(engine) {
                     Ok(tuple) => tuple,
@@ -1834,14 +2090,14 @@ impl Owner {
                     .map_err(engine)?
                     .map_or(0, |us| (us / 1000) as i32);
                 if let Some(p) = self.connection_options.iter().find(|p| p.0 == cid) {
-                    child.tos = p.1;
-                    child.discover = p.2;
+                    child.set_wire_ip_policy(self.local, p.1, p.2);
                     child.zerocopy = p.3.unwrap_or(false);
                     child.mark = p.4;
                 }
                 if let Some(index) = self.child_timestamps.iter().position(|p| p.0 == cid) {
                     child.timestamps.options = self.child_timestamps.swap_remove(index).1;
                 }
+                let peer = child.api_address(tuple.remote);
                 child.handle = Handle::Connection(cid);
                 child.local = Some(tuple.local);
                 child.connected = true;
@@ -1860,10 +2116,12 @@ impl Owner {
                         return Err(e);
                     }
                 };
-                out.addr = Some(tuple.remote);
+                out.addr = Some(peer);
                 // Core emits Acceptable on empty->nonempty; stay readable until accept returns EAGAIN.
             }
             Op::Connect(remote) => {
+                let remote = s.normalize_address(remote, self.local, false)?;
+                self.check_address(remote)?;
                 if !self.check_connect(id)? {
                     return Ok(out);
                 }
@@ -1877,14 +2135,30 @@ impl Owner {
                     && self.socket_policy.fast_open_client_enabled
                 {
                     self.endpoint.enable_fast_open().map_err(engine)?;
-                    if self
-                        .endpoint
-                        .can_defer_fast_open(self.now(), local.ip(), remote)
-                        .map_err(engine)?
-                    {
+                    let socket = &self.sockets[&id];
+                    let policy = socket
+                        .client_policy_for(remote, self.socket_policy.fast_open_client_policy);
+                    let allowed = if let Some(cookie) = socket.server_cookie_for(remote) {
+                        self.endpoint.can_defer_fast_open_with_server_cookie(
+                            self.now(),
+                            local.ip(),
+                            remote,
+                            Some(cookie),
+                        )
+                    } else {
+                        self.endpoint.can_defer_fast_open_with_policy(
+                            self.now(),
+                            local.ip(),
+                            remote,
+                            policy,
+                        )
+                    }
+                    .map_err(engine)?;
+                    if allowed {
                         let s = self.sockets.get_mut(&id).unwrap();
                         s.local = Some(local);
                         s.deferred_peer = Some(remote);
+                        s.deferred_client_policy = Some(policy);
                         return Ok(out);
                     }
                     self.start_connection(id, local, remote, Some(&[]))?;
@@ -2054,7 +2328,11 @@ impl Owner {
                 let p = address as *mut msghdr;
                 out.value = match completion {
                     Completion::ZeroCopy(lo, hi) => {
-                        copy_completion(p, load(p)?, (*lo, *hi))?;
+                        copy_completion_family(p, load(p)?, (*lo, *hi), true, s.domain)?;
+                        0
+                    }
+                    Completion::SharedZeroCopy(lo, hi, copied) => {
+                        copy_completion_family(p, load(p)?, (*lo, *hi), *copied, s.domain)?;
                         0
                     }
                     Completion::Timestamp {
@@ -2079,6 +2357,7 @@ impl Owner {
                             reported.iter().any(|&b| b != 0).then_some(&reported),
                             error,
                             payload,
+                            s.domain,
                         )? as i32
                     }
                 };
@@ -2217,7 +2496,29 @@ impl Owner {
             Op::Set(SOL_SOCKET, name @ (37 | 65), value) => {
                 self.timestamp_options(id, name, value as u32)?;
             }
+            Op::Set(IPPROTO_IPV6, IPV6_V6ONLY, value) if s.domain == AF_INET6 => {
+                if !matches!(s.handle, Handle::Fresh) || s.local.is_some() {
+                    return Err(EINVAL);
+                }
+                self.sockets.get_mut(&id).unwrap().v6only = value != 0;
+            }
+            // Linux IPv6 stream sockets expose the same FREEBIND flag through
+            // both option levels; binding permission is independent of wire family.
+            Op::Set(IPPROTO_IP, name, _) if self.local.is_ipv6() && name != IP_FREEBIND => {
+                return Err(ENOPROTOOPT);
+            }
+            Op::Set(IPPROTO_IPV6, _, _) if s.domain != AF_INET6 => return Err(ENOPROTOOPT),
             Op::Set(level, name, value) => {
+                // RFC3542 section6.5: -1 clears the sticky IPv6 class to0;
+                // validate before cloning options or touching live TCP policy.
+                let value = if (level, name) == (IPPROTO_IPV6, IPV6_TCLASS) {
+                    if !(-1..=255).contains(&value) {
+                        return Err(EINVAL);
+                    }
+                    value.max(0)
+                } else {
+                    value
+                };
                 // Reject an unauthorized request before option cloning or any
                 // completion/staging capacity is required for a transaction.
                 if level == IPPROTO_TCP && name == TCP_FASTOPEN_CONNECT {
@@ -2241,6 +2542,18 @@ impl Owner {
                 }
                 let mut candidate = s.clone();
                 candidate.timestamps.restore_reservations()?;
+                // Clone preserves pending observations but not spare queue slots.
+                // Active logical sends already own those slots too.
+                if s.zc_leases.capacity() != 0 {
+                    candidate
+                        .zc_leases
+                        .try_reserve_exact(
+                            candidate
+                                .zc_reserved
+                                .saturating_sub(candidate.zc_leases.len()),
+                        )
+                        .map_err(|_| ENOBUFS)?;
+                }
                 candidate
                     .completions
                     .try_reserve_exact(candidate.timestamps.reserved() + candidate.zc_reserved)
@@ -2268,9 +2581,12 @@ impl Owner {
                         }
                         s.zerocopy = value != 0;
                     }
-                    (IPPROTO_IP, IP_FREEBIND) => s.freebind = value != 0,
+                    (IPPROTO_IP, IP_FREEBIND) | (IPPROTO_IPV6, IPV6_FREEBIND) => {
+                        s.freebind = value != 0
+                    }
                     (IPPROTO_IP, IP_TOS) => s.tos = value as u8 & !3,
-                    (IPPROTO_IP, IP_MTU_DISCOVER) => {
+                    (IPPROTO_IPV6, IPV6_TCLASS) => s.ipv6_tclass = value as u8 & !3,
+                    (IPPROTO_IP, IP_MTU_DISCOVER) | (IPPROTO_IPV6, IPV6_MTU_DISCOVER) => {
                         match value {
                             IP_PMTUDISC_DONT | IP_PMTUDISC_WANT | IP_PMTUDISC_DO => (),
                             3..=5 => {
@@ -2280,7 +2596,11 @@ impl Owner {
                             }
                             _ => return Err(EINVAL),
                         }
-                        s.discover = value;
+                        if level == IPPROTO_IP {
+                            s.discover = value;
+                        } else {
+                            s.ipv6_discover = value;
+                        }
                     }
                     (IPPROTO_TCP, TCP_MAXSEG) => {
                         // Linux TCP_MIN_MSS=88, MAX_TCP_WINDOW=32767; zero clears the override.
@@ -2388,17 +2708,18 @@ impl Owner {
                             .endpoint
                             .set_application_timeout(cid, user_timeout_us(s.user_timeout_ms)?)
                             .map_err(engine)?,
-                        (IPPROTO_IP, IP_TOS) => {
-                            self.endpoint.set_dscp(cid, s.tos >> 2).map_err(engine)?
-                        }
+                        (IPPROTO_IP, IP_TOS) | (IPPROTO_IPV6, IPV6_TCLASS) => self
+                            .endpoint
+                            .set_dscp(cid, s.wire_tos(self.local) >> 2)
+                            .map_err(engine)?,
                         _ => (),
                     }
                 }
                 if let Handle::Connection(cid) = s.handle
                     && let Some(p) = self.connection_options.iter_mut().find(|p| p.0 == cid)
                 {
-                    p.1 = s.tos;
-                    p.2 = s.discover;
+                    p.1 = s.wire_tos(self.local);
+                    p.2 = s.wire_discover(self.local);
                     p.4 = s.mark;
                 }
                 if let Handle::Listener(listener) = s.handle {
@@ -2443,11 +2764,16 @@ impl Owner {
                 out.bytes = s.timestamps.options.get(name)?.to_vec();
                 out.value = i32::from_ne_bytes(out.bytes[..4].try_into().unwrap());
             }
+            Op::Get(IPPROTO_IP, name) if self.local.is_ipv6() && name != IP_FREEBIND => {
+                return Err(ENOPROTOOPT);
+            }
+            Op::Get(IPPROTO_IPV6, _) if s.domain != AF_INET6 => return Err(ENOPROTOOPT),
             Op::Get(level, name) => {
                 let s = self.sockets.get_mut(&id).unwrap();
                 out.value = match (level, name) {
                     (SOL_SOCKET, SO_TYPE) => SOCK_STREAM,
-                    (SOL_SOCKET, SO_DOMAIN) => AF_INET,
+                    (SOL_SOCKET, SO_DOMAIN) => s.domain,
+                    (IPPROTO_IPV6, IPV6_V6ONLY) if s.domain == AF_INET6 => i32::from(s.v6only),
                     (SOL_SOCKET, SO_PROTOCOL) => IPPROTO_TCP,
                     (SOL_SOCKET, SO_ERROR) => {
                         if s.error != 0 {
@@ -2487,10 +2813,12 @@ impl Owner {
                     // Zero reports no application override, not Linux's default count.
                     (IPPROTO_TCP, TCP_SYNCNT) => s.syn_retries.map_or(0, |n| i32::from(n.get())),
                     (IPPROTO_TCP, TCP_USER_TIMEOUT) => s.user_timeout_ms,
-                    (IPPROTO_IP, IP_FREEBIND) => s.freebind as i32,
+                    (IPPROTO_IP, IP_FREEBIND) | (IPPROTO_IPV6, IPV6_FREEBIND) => s.freebind as i32,
                     (IPPROTO_IP, IP_TOS) => s.tos as i32,
+                    (IPPROTO_IPV6, IPV6_TCLASS) => s.ipv6_tclass as i32,
                     (IPPROTO_IP, IP_MTU_DISCOVER) => s.discover,
-                    (IPPROTO_IP, IP_MTU) => {
+                    (IPPROTO_IPV6, IPV6_MTU_DISCOVER) => s.ipv6_discover,
+                    (IPPROTO_IP, IP_MTU) | (IPPROTO_IPV6, IPV6_MTU) => {
                         let Handle::Connection(cid) = s.handle else {
                             return Err(ENOTCONN);
                         };
@@ -2516,7 +2844,7 @@ impl Owner {
             Op::Name(peer) => {
                 out.addr = Some(if peer {
                     if let Some(peer) = s.deferred_peer {
-                        out.addr = Some(peer);
+                        out.addr = Some(s.api_address(peer));
                         return Ok(out);
                     }
                     let Handle::Connection(cid) = s.handle else {
@@ -2525,10 +2853,13 @@ impl Owner {
                     if !s.connected {
                         return Err(ENOTCONN);
                     }
-                    self.endpoint.tuple(cid).map_err(engine)?.remote
+                    s.api_address(self.endpoint.tuple(cid).map_err(engine)?.remote)
+                } else if !matches!(s.handle, Handle::Connection(_)) && s.bound_addr.is_some() {
+                    s.bound_addr.unwrap()
                 } else {
                     s.local
-                        .unwrap_or(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0))
+                        .map(|local| s.api_address(local))
+                        .unwrap_or_else(|| SocketAddr::new(s.api_unspecified(), 0))
                 });
             }
             Op::Available => {
@@ -2579,7 +2910,11 @@ impl Owner {
             }
             Op::FinishConnect => self.complete_connect(id)?,
             Op::Wait(_, _) => unreachable!(),
-            Op::New(_) | Op::SetFastOpenClientEnabled(_) | Op::SetDestinationRoute(..) => {
+            Op::New(_)
+            | Op::NewDomain(..)
+            | Op::SetFastOpenClientEnabled(_)
+            | Op::SetFastOpenClientDefaultPolicy(_)
+            | Op::SetDestinationRoute(..) => {
                 unreachable!()
             }
             #[cfg(feature = "packet-test")]
@@ -3816,3 +4151,15 @@ mod admission_tests;
 #[cfg(all(test, feature = "tfo-linux-cookie"))]
 #[path = "runtime_cookie_policy_tests.rs"]
 mod cookie_policy_tests;
+
+#[cfg(test)]
+#[path = "runtime_early_data_policy_tests.rs"]
+mod early_data_policy_tests;
+
+#[cfg(test)]
+#[path = "runtime_ipv6_tests.rs"]
+mod ipv6_tests;
+
+#[path = "runtime_address.rs"]
+mod address_policy;
+use address_policy::binding_overlap;

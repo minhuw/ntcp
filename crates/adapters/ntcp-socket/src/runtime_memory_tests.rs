@@ -207,7 +207,20 @@ fn software_segments_match_scalar_and_share_a_bounded_service_turn() {
 
 #[test]
 fn deterministic_pacing_never_submits_before_core_deadline() {
-    let (mut a, _, clients, _) = pair(Profile::PipelinePacedGso, 128);
+    let (mut a, mut b, clients, servers) = pair(Profile::PipelinePacedGso, 128);
+    // Retire a real initial write before testing ordinary pacing deadlines.
+    a.execute(clients[0], Op::Write(vec![8; 1460])).unwrap();
+    exchange(&mut a, &mut b);
+    let now = a.now() + 200000;
+    a.test_now = Some(now);
+    b.test_now = Some(now);
+    a.endpoint.on_timeout(now, BUDGET).unwrap();
+    b.endpoint.on_timeout(now, BUDGET).unwrap();
+    exchange(&mut a, &mut b);
+    assert_eq!(
+        b.execute(servers[0], Op::Read(1460)).unwrap().bytes.len(),
+        1460
+    );
     a.execute(clients[0], Op::Write(vec![9; 4380])).unwrap();
     a.service_egress().unwrap();
     let first = a.packets.as_ref().unwrap().output.len();
@@ -389,7 +402,7 @@ fn packet_ptb_validation_precedes_bounded_queue_admission() {
         (7, 1, true, ENOSYS),               // Fragment offset.
         (34, 0x20, true, EINVAL),           // Fragmented quote, even with valid checksum.
         (2, 1, true, EINVAL),               // Outer length exceeds supplied bytes.
-        (0, 0x65, true, ENOSYS),            // IPv6 is not admitted.
+        (0, 0x65, true, EINVAL),            // IPv4 bytes are not a valid IPv6 frame.
         (0, 0x46, true, ENOSYS),            // Outer options remain unsupported.
         (9, 17, true, ENOSYS),              // UDP is not admitted.
         (20, 8, true, ENOSYS),              // Echo is not admitted.

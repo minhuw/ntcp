@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn owner_native_route_configuration_and_management_affect_real_connection_policies() {
-    let mut config = SocketConfig::new("test", "10.73.0.2".parse().unwrap());
+    let mut config = SocketConfig::new("test", "10.73.0.2".parse::<std::net::IpAddr>().unwrap());
     config.tcp.connection.pmtud = Some(ntcp::PmtudConfig::new(1500));
     let remote = "10.73.0.3".parse().unwrap();
     let policy = ntcp::RoutePolicy {
@@ -81,7 +81,7 @@ fn owner_native_route_configuration_and_management_affect_real_connection_polici
     let before = (
         a.endpoint.path_mtu_info(id).unwrap(),
         a.endpoint.path_mtu_info(next).unwrap(),
-        a.endpoint.destination_route(remote.into()),
+        a.endpoint.destination_route(remote),
     );
     a.test_now = Some(2000);
     assert_eq!(
@@ -93,7 +93,7 @@ fn owner_native_route_configuration_and_management_affect_real_connection_polici
         (
             a.endpoint.path_mtu_info(id).unwrap(),
             a.endpoint.path_mtu_info(next).unwrap(),
-            a.endpoint.destination_route(remote.into())
+            a.endpoint.destination_route(remote)
         ),
         before
     );

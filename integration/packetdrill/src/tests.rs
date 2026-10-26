@@ -2130,7 +2130,7 @@ fn destination_route_control_and_native_api_share_actual_future_syn_policy() {
     );
     assert_eq!(errno(), EOPNOTSUPP);
     ntcp_socket::set_destination_route(
-        "192.0.2.2".parse().unwrap(),
+        "192.0.2.2".parse::<IpAddr>().unwrap(),
         Some(ntcp_socket::RoutePolicy {
             mtu: Some(1500),
             advertised_mss: Some(1460),

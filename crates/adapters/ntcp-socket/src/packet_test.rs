@@ -28,10 +28,11 @@ impl Options {
     }
 }
 
-pub fn start(settings: (Ipv4Addr, Profile)) -> Result<()> {
+pub fn start(settings: (impl Into<IpAddr>, Profile)) -> Result<()> {
     start_with_options(settings, Options::default())
 }
-pub fn start_with_options(settings: (Ipv4Addr, Profile), options: Options) -> Result<()> {
+pub fn start_with_options(settings: (impl Into<IpAddr>, Profile), options: Options) -> Result<()> {
+    let settings = (settings.0.into(), settings.1);
     if RUNTIME.get().is_some() {
         return Err(EBUSY);
     }

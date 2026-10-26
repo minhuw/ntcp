@@ -17,7 +17,7 @@ fn client_tfo_permission_fresh_denial_precedes_copy_port_and_completion() {
     assert_eq!(s.local, None);
     assert_eq!((s.zc_next, s.zc_reserved, s.completions.len()), (0, 0, 0));
     assert_eq!(a.endpoint.buffer_bytes(), budget);
-    assert!(a.endpoint.has_fast_open_cookie(a.now(), a.local.into(), "192.0.2.2".parse().unwrap()).unwrap());
+    assert!(a.endpoint.has_fast_open_cookie(a.now(), a.local, "192.0.2.2".parse().unwrap()).unwrap());
     tfo_no_output(&mut a);
 }
 
