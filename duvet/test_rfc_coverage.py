@@ -36,13 +36,19 @@ class CoverageGate(unittest.TestCase):
     def test_config_extracts_all_requested_rfcs_and_all_extension_sections(self):
         config = tomllib.loads((Path(__file__).parent / "duvet.toml").read_text())
         self.assertEqual(set(RFCS), {9293, 2018, 6675, 8985, 9937, 6298,
-                                     5681, 6582, 6928, 7323, 2883, 3168, 5961, 3042, 9406, 9438, 1191, 8201, 4821, 5927})
+                                     5681, 6582, 6928, 7323, 2883, 3168, 5961, 3042, 9406, 9438, 1191, 8201, 4821, 5927, 7413})
         self.assertEqual({s["source"] for s in config["specification"]},
                          {f"{PREFIX}{rfc}" for rfc in RFCS})
         patterns = {r["pattern"] for r in config["requirement"]}
-        for rfc in RFCS:
+        for rfc in set(RFCS) - {7413}:
             sections = "section-3*" if rfc == 9293 else "*"
             self.assertIn(f"workbench/duvet/requirements/**/rfc{rfc}/{sections}.toml", patterns)
+        # TFO has a scoped manual inventory, not full-document extraction.
+        self.assertFalse(any("rfc7413/" in pattern for pattern in patterns))
+        inventory = tomllib.loads((Path(__file__).parent / "rfc7413-additions.toml").read_text())
+        self.assertTrue(inventory["spec"])
+        self.assertTrue(all(s["target"].startswith(f"{PREFIX}7413#section-")
+                            for s in inventory["spec"]))
         self.assertIn("duvet/rfc*-additions.toml", patterns)
         self.assertIn("duvet/rfc*-todos.toml", patterns)
 

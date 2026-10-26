@@ -1,0 +1,56 @@
+# Scoped inventory for server admission and explicit client credential/MSS boundaries.
+# RFC7413 is Experimental. This is not an inventory of all its requirements.
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-2"
+quote = '''
+TCP implementations MUST NOT use TFO by default, but only use TFO if requested explicitly by the application on a per-service-port basis.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.2"
+quote = '''
+FastOpenEnabled: default is off. It MUST be turned on explicitly by the application. When this flag is off, the server does not perform any TFO-related operations and MUST ignore all cookie options.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.2"
+quote = '''
+If this variable goes over a preset system limit, the server MUST disable TFO for all new connection requests until PendingFastOpenRequests drops below the system limit.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-7.3"
+quote = '''
+cookies are not necessary if the server has application-level protection or is immune to these attacks.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2"
+quote = '''
+To open a TFO connection, the client MUST have obtained a cookie from the server:
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3"
+quote = '''
+Without a cached server MSS, the amount of data in the SYN packet is limited to the default MSS of 536 bytes for IPv4 [RFC1122] and 1220 bytes for IPv6 [RFC2460].
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2"
+quote = '''
+Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2"
+quote = '''
+To deal with network or servers dropping SYN packets with payload or unknown options, when the SYN timer fires, the client SHOULD retransmit a SYN packet without data and Fast Open options.
+'''
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-7.3"
+quote = '''
+For such applications the server may choose to generate a trivial or even a zero-length cookie to improve performance by avoiding the cookie generation and verification.
+'''

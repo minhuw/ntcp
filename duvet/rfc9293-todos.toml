@@ -1,11 +1,10 @@
-# BASE-056 implementation recommendation is now evidenced in core and native IPv4 tests.
-# Exact PMTUD/PLPMTUD clause gaps remain in RFC1191/8201/4821 inventories; no full compliance claim.
+# Exact PMTUD/PLPMTUD clause gaps remain in RFC1191/8201/4821 inventories.
 
-# Approved SHOULD departure: bounded Nagle variant for persist-only flight.
 [[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.7.4"
-reason = "User-approved persist-reopen policy: retain original Nagle for ordinary application data, but permit one fresh short segment after a validated positive window update when the sole outstanding data is a physically committed fresh one-octet zero-window probe. The reason is to avoid a probe-induced RTO wait despite an open receive window; this is a deliberate departure from strict original Nagle, not an RFC-prescribed exception or general permission to ignore SHOULD. Connection::persist_reopen_nagle_exception requires exact probe provenance, one-byte flight, no RTO/retransmission or loss recovery, and no active PRR. First accepted non-persist sequence output consumes provenance; actual ACK of the byte, ordinary RTO and terminal teardown also clear it. Reservation selection and zero-payload acceptance do not grant or consume it. Keep per-connection disable (MUST-17), normal cwnd/rwnd/PRR and pacing admission, SWS avoidance, CORK, sequence/ACK validation, and original/retransmit/RTT accounting unchanged. Evidence: modern_persist_reopen_committed_vs_pending_probe; modern_persist_probe_ack_releases_tail_without_disabling_nagle; persist_reopen_failed_output_and_one_shot_window_updates; persist_reopen_reservations_record_and_consume_only_on_departure; persist_reopen_ordinary_short_flight_still_obeys_nagle; persist_reopen_window_cork_and_timeout_guards. These tests cover event order, real probe ACK, ordinary short writes and old-data probes, wrap, caller units, failed encoding, repeated window updates, receive-window/CORK limits, RTO/terminal cleanup, deferred departure and partial backend acceptance. This scoped exception does not waive unrelated SHLD-7 implementation or test obligations."
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1"
+reason = "Explicit user-selected Linux-style empty-flight window discovery: when rwnd=0 with queued data and no stream bytes in flight, send an ACK at SND.UNA-1 with no payload. The receiver's ordinary unacceptable-sequence reply reports RCV.NXT and current window; first-probe RTO, exponential backoff, responsiveness and user-resource bounds remain. This differs from the quoted data-octet description and is recorded as a scoped probe-format policy, not claimed as literal satisfaction. Already-outstanding bytes still use the existing data-octet probe/retransmission path with true ACK bounds and ordinary loss/RTO rules. Real IPv4/IPv6/SACK/ECN peer, lost-update, shared ownership, wrap, caller-clock and deferred-acceptance tests cover the selected policy. No generic early-data-retransmission exemption is granted."
 quote = '''
-A TCP implementation SHOULD implement the Nagle algorithm to coalesce
-short segments (SHLD-7).
+The sending TCP peer must regularly transmit at least one octet of
+new data (if available), or retransmit to the receiving TCP peer even
+if the send window is zero, in order to "probe" the window.
 '''

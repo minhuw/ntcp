@@ -599,3 +599,14 @@ Instead, implementation of Path MTU Discovery (PMTUD) and Packetization Layer
 Path MTU Discovery (PLPMTUD) is strongly recommended in order for TCP to
 improve segmentation decisions.
 '''
+
+# Empty-flight probe payload policy is explicit even though the source prose
+# has no uppercase BCP14 keyword and is not extracted automatically.
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1"
+level = "MUST"
+quote = '''
+The sending TCP peer must regularly transmit at least one octet of
+new data (if available), or retransmit to the receiving TCP peer even
+if the send window is zero, in order to "probe" the window.
+'''

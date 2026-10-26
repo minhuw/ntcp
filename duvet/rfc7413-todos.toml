@@ -1,0 +1,15 @@
+# Ordinary authenticated client flow remains covered. Protected-service
+# authorization is a separately requested section7.3 alternative.
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2"
+reason = "Scope exception only for explicit FastOpenClientPolicy::ApplicationProtected with independent target-service agreement under section7.3. This user-selected Linux-compatible alternative sends SYN data with no FO option; it does not claim acquisition of a cookie. RequireCookie remains the default and existing supplied/learned credential APIs retain ordinary exchange. Cold536/1220 peer MSS, actual SYN departure/ACK validation, memory limits, retries and negative-response suppression remain authoritative. Native paired-endpoint, mode/default/peer-scoped socket and reserved-departure tests cover the alternative."
+quote = '''
+To open a TFO connection, the client MUST have obtained a cookie from the server:
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2"
+reason = "The ordinary required-cookie path still serializes the credential/request. Explicit protected-service client authorization selects omitted-option SYN data under the section7.3 deployment model as a Linux-compatible wire choice, not literal satisfaction of this ordinary-exchange clause. Actual emitted-option provenance gates cookie learning; unsolicited cookies cannot create/replace credentials in the omitted-option mode. Peer MSS learning remains independent and conservative cold limits are unchanged."
+quote = '''
+Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.
+'''

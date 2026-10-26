@@ -1,13 +1,26 @@
 # Unresolved behavior/integration or evidence gaps are TODOs, not waivers.
 # Optional/actor exceptions are explicit; no QUIC, deployment results or undo claimed.
 
-# 9406-generated-section-4.3-2
+# Non-paced L tuning selected by explicit transport policy.
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.3"
-reason = "Optional tuning permission is not selected: HyStart uses published fixed constants. No runtime tuning API is required by this MAY; fixed-value and minimum-divisor obligations remain inventoried. Reviewed candidate code/tests: crates/stacks/ntcp/src/hystart.rs::HyStart::ack; crates/stacks/ntcp/src/recovery.rs::Congestion::on_ack_with_ecn; crates/stacks/ntcp/src/connection.rs::Connection::input."
+reason = "Deliberate recommendation departure: non-paced L=16 accepts more coalesced-ACK credit with a finite bound, under the same section's tuning permission. Published L=8 is not claimed. Larger bursts and loss are the explicit tradeoff; no performance improvement is asserted from packetdrill. RTT/CSS constants and genuine paced infinity are retained. Boundary/CSS/provenance and two-flight wire tests cover the selected policy."
 quote = '''
-An implementation MAY tune them for different
-network characteristics.
+It is RECOMMENDED that a HyStart++ implementation use the following
+constants:
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9406#section-4.3"
+reason = "Only non-paced L is tuned from the recommended8 to16. This is a bounded startup policy, not a claim to use the unchanged published constants; tuning is explicitly permitted in section4.3. All listed RTT/CSS constants and paced infinity remain implemented."
+quote = '''
+MIN_RTT_THRESH = 4 msec
+   MAX_RTT_THRESH = 16 msec
+   MIN_RTT_DIVISOR = 8
+   N_RTT_SAMPLE = 8
+   CSS_GROWTH_DIVISOR = 4
+   CSS_ROUNDS = 5
+   L = infinity if paced, L = 8 if non-paced
 '''
 
 # 9406-generated-section-4.3-7
