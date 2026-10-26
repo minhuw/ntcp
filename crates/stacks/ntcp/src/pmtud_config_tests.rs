@@ -34,7 +34,7 @@ fn family_tuple(ipv4: bool) -> Tuple {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc4821#section-7.2
 //= type=test
-//= reason=Reviewed 0030a96: independent creation-only initial_search_low is validated with initial_mtu/initial_search_high, family and allocation bounds. Defaults remain conservative IPv4 min(mtu,1024) and IPv6 min(mtu,1280); dual-family tests assert defaults, independent overrides, rejection rather than silent clamping, and subsequent peer caps. Destination policy configuration is independently covered at071/119.
+//= reason=Reviewed 0030a96: independent creation-only initial_search_low is validated with initial_mtu/initial_search_high, family and allocation bounds. Defaults remain conservative IPv4 min(mtu,1024) and IPv6 min(mtu,1280); explicit transport bounds use packet/header limits independently of physical IPv6 link and PTB minimums. Tests assert defaults, independent overrides, rejection rather than silent clamping, and subsequent peer caps. Destination policy configuration is independently covered at071/119.
 //# It is RECOMMENDED that search_low be initially set to an MTU size that is likely
 //# to work over a very wide range of environments. Given today's technologies, a
 //# value of 1024 bytes is probably safe enough. The initial value for search_low
@@ -87,7 +87,7 @@ fn pmtud_config_initial_bounds_defaults_and_independent_overrides() {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc4821#section-7.2
 //= type=test
-//= reason=Reviewed 0030a96: independent creation-only initial_search_low is validated with initial_mtu/initial_search_high, family and allocation bounds. Defaults remain conservative IPv4 min(mtu,1024) and IPv6 min(mtu,1280); dual-family tests assert defaults, independent overrides, rejection rather than silent clamping, and subsequent peer caps. Destination policy configuration is independently covered at071/119.
+//= reason=Reviewed 0030a96: independent creation-only initial_search_low is validated with initial_mtu/initial_search_high, family and allocation bounds. Defaults remain conservative IPv4 min(mtu,1024) and IPv6 min(mtu,1280); explicit transport bounds use packet/header limits independently of physical IPv6 link and PTB minimums. Tests assert defaults, independent overrides, rejection rather than silent clamping, and subsequent peer caps. Destination policy configuration is independently covered at071/119.
 //# It is RECOMMENDED that search_low be initially set to an MTU size that is likely
 //# to work over a very wide range of environments. Given today's technologies, a
 //# value of 1024 bytes is probably safe enough. The initial value for search_low
@@ -95,7 +95,7 @@ fn pmtud_config_initial_bounds_defaults_and_independent_overrides() {
 
 fn pmtud_config_invalid_explicit_values_are_not_silently_clamped() {
     for ipv4 in [true, false] {
-        let floor = if ipv4 { 68 } else { 1280 };
+        let floor = settings().packetization_mtu_floor(ipv4);
         for field in 0..3 {
             for invalid in [0, floor - 1, 1501, u32::MAX] {
                 let mut cfg = settings();

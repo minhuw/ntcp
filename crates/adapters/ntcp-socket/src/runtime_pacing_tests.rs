@@ -2,7 +2,11 @@
 fn paced_owner(last: u8) -> Owner {
     let local = Ipv4Addr::new(10, 73, 0, last);
     let mut config = SocketConfig::new("test", local);
-    config.tcp.connection.pacing = Some(ntcp::PacingConfig::default());
+    // These rate/deadline tests explicitly select the ordinary bucket.
+    // Default startup bursts are covered by the common-profile wire test.
+    config.tcp.connection.pacing = Some(ntcp::PacingConfig {
+        initial_window_burst: false, ..Default::default()
+    });
     let mut owner = Owner::with_config(
         local,
         (Ipv4Addr::new(10, 73, 0, 1), 24),
@@ -243,6 +247,7 @@ fn typed_core_settings_reach_native_connections() {
         rate_gain_percent: 150,
         max_bytes_per_second: Some(1200),
         max_burst_segments: 1,
+        initial_window_burst: true,
     });
     config.validate().unwrap();
     let mut a = Owner::with_config(local, (local, 24), [2; 32], None, config.tcp).unwrap();

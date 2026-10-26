@@ -17,6 +17,7 @@ pub(crate) struct Departure {
     pub syn: bool,
     pub syn_timestamp: Option<u32>,
     pub fast_open: bool,
+    pub fast_open_option: bool,
     pub passive_syn_data_acked: bool,
     pub fin: bool,
     pub rto: bool,
@@ -24,12 +25,12 @@ pub(crate) struct Departure {
     pub prior_rto_deadline: Option<Instant>,
     pub tlp: bool,
     pub persist: bool,
-    pub persist_probe: bool,
     pub keepalive: bool,
     pub shrink: bool,
     pub unanswered: bool,
     pub bypass: bool,
     pub interval: Option<u128>,
+    pub initial_burst: bool,
     pub legacy_rate: Option<(u64, u32)>,
 }
 
@@ -101,6 +102,10 @@ pub(crate) struct OutputReservation {
     pub index: usize,
     pub bytes: Vec<u8>,
     pub payload: Vec<u8>,
+    pub shared: Vec<crate::Payload>,
+    shared_header: Option<wire::Header>,
+    shared_options: [u8; 40],
+    shared_option_len: usize,
     pub gso: Option<GsoLimits>,
     pub current: Option<ReservedOutput>,
     pub ordinal: u64,
@@ -126,6 +131,10 @@ impl OutputReservation {
             index: 0,
             bytes: Vec::new(),
             payload: Vec::new(),
+            shared: Vec::new(),
+            shared_header: None,
+            shared_options: [0; 40],
+            shared_option_len: 0,
             gso: None,
             current: None,
             ordinal: 0,
@@ -141,7 +150,134 @@ impl OutputReservation {
         })
     }
 
+    pub fn clear(&mut self) {
+        self.current = None;
+        self.shared.clear();
+        self.shared_header = None;
+    }
+
+    pub fn is_shared(&self) -> bool {
+        self.shared_header.is_some()
+    }
+
+    pub fn capture_shared(
+        &mut self,
+        packet: Transmit,
+        header: &[u8],
+        payload: &[crate::Payload],
+        attempt: TransmitAttempt,
+    ) -> Result<(), EndpointError> {
+        let length = payload
+            .iter()
+            .try_fold(0usize, |n, p| n.checked_add(p.len()))
+            .ok_or(Error::InvalidArgument)?;
+        let n = packet
+            .len
+            .checked_sub(length)
+            .ok_or(Error::InvalidArgument)?;
+        if !(20..=60).contains(&n) || n > header.len() || payload.len() > self.shared.capacity() {
+            return Err(Error::InvalidArgument.into());
+        }
+        self.clear();
+        self.bytes[..n].copy_from_slice(&header[..n]);
+        self.shared.extend(payload.iter().cloned());
+        let word = |at| u16::from_be_bytes(header[at..at + 2].try_into().unwrap());
+        let seq = |at| u32::from_be_bytes(header[at..at + 4].try_into().unwrap());
+        self.shared_header = Some(wire::Header {
+            source_port: word(0),
+            destination_port: word(2),
+            sequence: seq(4),
+            acknowledgment: seq(8),
+            flags: header[13],
+            window: word(14),
+            urgent_pointer: word(18),
+        });
+        self.shared_options[..n - 20].copy_from_slice(&header[20..n]);
+        self.shared_option_len = n - 20;
+        self.current = Some(ReservedOutput {
+            packet,
+            attempt: Some(attempt),
+            group: None,
+            abandon_attempt: attempt,
+            offset: 0,
+            sacks: 0,
+            emitted_bytes: length,
+            emitted_sacks: 0,
+            finished: true,
+            repaired: false,
+            departure: None,
+        });
+        Ok(())
+    }
+
+    pub fn fragment_shared(
+        &mut self,
+        limit: usize,
+        out: &mut [u8],
+        payload: &mut Vec<crate::Payload>,
+    ) -> Result<Transmit, EndpointError> {
+        payload.clear();
+        let r = self.current.as_mut().ok_or(Error::InvalidState)?;
+        let mut header = self.shared_header.ok_or(Error::InvalidState)?;
+        let header_len = 20 + self.shared_option_len;
+        let limit = limit.min(out.len());
+        if limit <= header_len || out.len() < header_len || payload.capacity() == 0 {
+            return Err(EndpointError::ReservationMtuTooSmall);
+        }
+        let total: usize = self.shared.iter().map(crate::Payload::len).sum();
+        let mut count = 0;
+        let mut skip = r.offset;
+        let max = limit - header_len;
+        for part in &self.shared {
+            if skip >= part.len() {
+                skip -= part.len();
+                continue;
+            }
+            let n = (part.len() - skip).min(max - count);
+            payload.push(part.slice(skip..skip + n).unwrap());
+            count += n;
+            skip = 0;
+            if count == max || payload.len() == payload.capacity() {
+                break;
+            }
+        }
+        let finished = r.offset + count == total;
+        header.sequence = header.sequence.wrapping_add(r.offset as u32);
+        if !finished {
+            header.flags &= !(wire::FIN | wire::PSH);
+        }
+        if r.offset != 0 {
+            header.flags &= !wire::CWR;
+        }
+        if header.flags & wire::URG != 0 {
+            header.urgent_pointer = header
+                .urgent_pointer
+                .saturating_sub(r.offset.min(u16::MAX as usize) as u16);
+            if header.urgent_pointer == 0 {
+                header.flags &= !wire::URG;
+            }
+        }
+        let n = wire::encode_shared(
+            r.packet.ip,
+            header,
+            &self.shared_options[..self.shared_option_len],
+            payload,
+            out,
+        )
+        .map_err(Error::Wire)?;
+        r.emitted_bytes = count;
+        r.emitted_sacks = 0;
+        r.finished = finished;
+        Ok(Transmit {
+            len: n + count,
+            tx_timestamp: None,
+            ecn: if count == 0 { 0 } else { r.packet.ecn },
+            ..r.packet
+        })
+    }
+
     pub fn capture(&mut self, packet: Transmit, bytes: &[u8], attempt: TransmitAttempt) {
+        self.clear();
         self.bytes[..packet.len].copy_from_slice(&bytes[..packet.len]);
         self.current = Some(ReservedOutput {
             packet,
@@ -161,6 +297,9 @@ impl OutputReservation {
     // Encode only from immutable, already-admitted output. No sender selection or
     // credit accounting occurs here. Buffer space was reserved before selection.
     pub fn fragment(&mut self, limit: usize, out: &mut [u8]) -> Result<Transmit, EndpointError> {
+        if self.is_shared() {
+            return Err(Error::InvalidArgument.into());
+        }
         if limit < 20 {
             return Err(EndpointError::ReservationMtuTooSmall);
         }

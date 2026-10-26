@@ -4383,6 +4383,7 @@ fn pacing_endpoint_budget_and_halfclose() {
 #[test]
 fn general_pacing_endpoint_budget_and_halfclose() {
     pacing_endpoint_budget_case(Some(crate::PacingConfig {
+        initial_window_burst: false,
         max_burst_segments: 1,
         ..crate::PacingConfig::default()
     }));
@@ -5531,3 +5532,7 @@ mod handshake_limit {
 
 #[path = "endpoint_accept_reset_tests.rs"]
 mod accept_reset;
+
+mod shared_payload {
+    include!("shared_payload_tests.rs");
+}

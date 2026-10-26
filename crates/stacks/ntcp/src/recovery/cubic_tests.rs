@@ -138,7 +138,7 @@ fn cubic_ecn_one_mss_floor_no_ece_growth_and_idle_restart() {
         flight = c.cwnd;
     }
     assert_eq!((c.cwnd, c.ssthresh), (1000, 2000));
-    c.restart_after_idle();
+    c.restart_after_idle(c.initial_window());
     assert_eq!(c.cwnd, 1000);
 }
 
@@ -157,7 +157,7 @@ fn cubic_mss_byte_bounds_and_growth_protection() {
     c.prepare_ack(300, Some(100), Seq(2001), 1000, MAX_WINDOW);
     c.on_ack(Seq(2001), 1000, 0);
     assert_eq!(c.cwnd, 2000);
-    c.restart_after_idle();
+    c.restart_after_idle(c.initial_window());
     assert_eq!(c.cwnd, 2000); // Restart never increases the reduced window.
     for mss in [1, 1000, u32::MAX] {
         let mut c = controller(RecoveryAlgorithm::Reno, mss);
@@ -239,7 +239,7 @@ fn hystart_exit_is_authoritative_and_congestion_disables_initial_startup() {
             assert!(!c.congestion_avoidance); // Standard SS after RTO.
         }
         assert!(c.hystart.is_none());
-        c.restart_after_idle();
+        c.restart_after_idle(c.initial_window());
         assert!(c.hystart.is_none());
     }
     let c = controller(RecoveryAlgorithm::Reno, 1000).with_cubic_hystart(false);
@@ -588,3 +588,6 @@ fn cubic_no_sack_cwnd_basis_keeps_app_and_receiver_growth_guards() {
         }
     }
 }
+
+#[path = "cubic_idle_restart_tests.rs"]
+mod idle_restart;

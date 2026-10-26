@@ -1013,7 +1013,8 @@ impl Congestion {
         }
         if let Some(cubic) = &mut self.cubic {
             // Published section 4.10 uses slow start at equality. Recovery's
-            // explicit congestion-avoidance state remains authoritative.
+            // explicit congestion-avoidance state remains authoritative until
+            // a real idle decrease reselects startup with its final window.
             //= https://www.rfc-editor.org/rfc/rfc9438#section-4.10
             //= reason=Slow start includes equality until explicit CSS exit/congestion/recovery makes CA authoritative; this authority prevents restarting startup at exit equality.
             //# When _cwnd_ is no more than _ssthresh_, CUBIC MUST employ a slow
@@ -1727,11 +1728,32 @@ impl Congestion {
         self.cwnd = self.cwnd.min(window);
     }
 
-    pub(crate) fn restart_after_idle(&mut self) {
+    //= https://www.rfc-editor.org/rfc/rfc9438#section-4.10
+    //= reason=Final selected idle window, including a stricter restart fallback, re-enters startup only after an actual decrease to or below ssthresh. Active loss/ECN PRR, isolated probe response and unchanged CSS-exit equality preserve their phase.
+    //# When _cwnd_ is no more than _ssthresh_, CUBIC MUST employ a slow
+    //# start algorithm.
+    //= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
+    //= reason=Idle resumption after completed initial startup uses standard slow start. No HyStart state is recreated; timeout fallback and active initial CSS retain their independent lifetime rules.
+    //# An implementation SHOULD use HyStart++ only for the initial slow
+    //# start (when the ssthresh is at its initial value of arbitrarily high
+    //# per [RFC5681]) and fall back to using standard slow start for the
+    //# remainder of the connection lifetime.
+    pub(crate) fn restart_after_idle(&mut self, window: u32) {
+        let before = self.cwnd;
         if let Some(cubic) = &mut self.cubic {
             cubic.restart();
         }
-        self.cwnd = self.cwnd.min(self.initial_window());
+        self.cwnd = self.cwnd.min(self.initial_window()).min(window);
+        // Only an actual idle-window decrease can change this phase. PRR,
+        // recovery admission and CSS exit retain their existing authority.
+        if self.cwnd < before
+            && self.cwnd <= self.ssthresh
+            && !self.in_recovery()
+            && self.ecn_prr.is_none()
+            && self.probe_response.is_none()
+        {
+            self.congestion_avoidance = false;
+        }
         self.acknowledged = 0;
         self.reset_duplicate_acks();
     }
@@ -2664,11 +2686,11 @@ mod tests {
                 let mut c = Congestion::new(mss, algorithm, InitialWindow::Iw10, Seq(u32::MAX));
                 assert_eq!(c.cwnd(), window);
                 c.on_ack(Seq(1), 1, 0);
-                c.restart_after_idle();
+                c.restart_after_idle(c.initial_window());
                 assert_eq!(c.cwnd(), window);
                 c.on_timeout(window, Seq(2));
                 assert_eq!(c.cwnd(), mss.min(MAX_WINDOW));
-                c.restart_after_idle();
+                c.restart_after_idle(c.initial_window());
                 assert_eq!(c.cwnd(), mss.min(MAX_WINDOW));
             }
         }
@@ -2684,7 +2706,7 @@ mod tests {
         assert_eq!(c.cwnd(), 5_000);
         c.set_mss(1_000);
         assert_eq!(c.cwnd(), 5_000);
-        c.restart_after_idle();
+        c.restart_after_idle(c.initial_window());
         assert_eq!(c.cwnd(), 5_000);
         c.on_timeout(5_000, Seq(100));
         c.set_initial_mss(500, true);
@@ -3385,10 +3407,10 @@ mod tests {
             c.on_ack(Seq(1_000), 1_000, 0);
             c.set_mss(500);
             assert_eq!(c.cwnd(), 2_500);
-            c.restart_after_idle();
+            c.restart_after_idle(c.initial_window());
             assert_eq!(c.cwnd(), 2_000);
             c.on_timeout(10_000, Seq(10_000));
-            c.restart_after_idle();
+            c.restart_after_idle(c.initial_window());
             assert_eq!(c.cwnd(), 500);
             c.set_mss(1_000);
             assert_eq!(c.cwnd(), 1_000);

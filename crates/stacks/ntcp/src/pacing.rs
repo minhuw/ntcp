@@ -36,6 +36,14 @@ impl Pacer {
         })
     }
 
+    // The one-time startup exemption consumes initial-window credit instead
+    // of accumulating a whole flight of rate debt. Keep the ordinary bucket
+    // charged, so crossing the startup boundary cannot grant another burst.
+    pub(crate) fn startup_sent(&mut self, now: Instant, bytes: usize, interval: u128, burst: u32) {
+        self.sent(now, bytes, interval);
+        self.debt = self.debt.min(u128::from(burst) * FRACTION);
+    }
+
     pub(crate) fn sent(&mut self, now: Instant, bytes: usize, interval: u128) {
         self.debt = self.debt_at(now).saturating_add(bytes as u128 * FRACTION);
         self.at = now;
@@ -47,6 +55,20 @@ impl Pacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_exemption_leaves_only_normal_bucket_debt_without_extra_credit() {
+        let mut p = Pacer::default();
+        let interval = Pacer::interval(100000, 10000, 125, None, 1000000);
+        for _ in 0..10 {
+            p.startup_sent(0, 1000, interval, 2000);
+        }
+        assert_eq!(p.deadline(0, 2000, 1000), Some(8000));
+        assert_eq!(p.deadline(7999, 2000, 1000), Some(8000));
+        assert_eq!(p.deadline(8000, 2000, 1000), None);
+        p.sent(8000, 1000, interval);
+        assert_eq!(p.deadline(8000, 2000, 1000), Some(16000));
+    }
 
     #[test]
     fn general_pacing_fractional_rate_debt_and_saturation() {

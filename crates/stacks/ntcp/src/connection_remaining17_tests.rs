@@ -366,14 +366,14 @@ fn limited_transmit_sacked_tail_cannot_discount_historical_eligible_prefix() {
     a.write(&vec![0x55; 10000]).unwrap();
     drain(&mut a, 200000, &mut rows);
     assert!(ack(&mut a, 330000, 9001, &[], &mut rows).is_empty());
-    assert_eq!(a.congestion.cwnd(), 18000); // Fresh delayed ACK retains L=8.
+    assert_eq!(a.congestion.cwnd(), 19000); // Nine newly delivered MSS fit the tuned L16.
     a.write(&vec![0x66; 2000]).unwrap();
     assert_eq!(drain(&mut a, 330000, &mut rows).len(), 2);
     assert_eq!(a.congestion.growth_prefix(Seq(9001), 3000), 1000);
     assert!(ack(&mut a, 340000, 9001, &[(10001, 12001)], &mut rows).is_empty());
-    assert_eq!(a.congestion.cwnd(), 18000);
-    assert!(ack(&mut a, 350000, 12001, &[], &mut rows).is_empty());
     assert_eq!(a.congestion.cwnd(), 19000);
+    assert!(ack(&mut a, 350000, 12001, &[], &mut rows).is_empty());
+    assert_eq!(a.congestion.cwnd(), 20000);
     assert_eq!(a.send.len(), 0);
 }
 

@@ -8,7 +8,13 @@ use alloc::{
 
 use core::mem::MaybeUninit;
 
-use crate::seq::Seq;
+use crate::{Payload, seq::Seq};
+
+#[derive(Clone, Debug)]
+struct SharedSpan {
+    start: u64,
+    payload: Payload,
+}
 
 #[derive(Debug)]
 pub(crate) struct SendBuffer {
@@ -16,17 +22,26 @@ pub(crate) struct SendBuffer {
     // ACK, truncation, and resize move metadata with the data.
     data: VecDeque<(u8, u8)>,
     capacity: usize,
+    head: u64,
+    shared: VecDeque<SharedSpan>,
+    shared_output: Option<usize>,
 }
 
 impl SendBuffer {
     pub(crate) fn new(capacity: usize) -> Result<Self, ()> {
         let mut data = VecDeque::new();
         data.try_reserve_exact(capacity).map_err(|_| ())?;
-        Ok(Self { data, capacity })
+        Ok(Self {
+            data,
+            capacity,
+            head: 0,
+            shared: VecDeque::new(),
+            shared_output: None,
+        })
     }
 
     pub(crate) fn storage_bytes(&self) -> usize {
-        self.data.capacity() * core::mem::size_of::<(u8, u8)>()
+        self.data.capacity() * core::mem::size_of::<(u8, u8)>() + self.shared_storage_bytes()
     }
 
     pub(crate) fn allocation_capacity(&self) -> usize {
@@ -36,6 +51,12 @@ impl SendBuffer {
     pub(crate) fn resized(&self, capacity: usize) -> Result<Self, ()> {
         let mut result = Self::new(capacity.max(self.data.capacity()))?;
         result.data.extend(self.data.iter().copied());
+        result
+            .shared
+            .try_reserve_exact(self.shared.capacity())
+            .map_err(|_| ())?;
+        result.shared.extend(self.shared.iter().cloned());
+        result.head = self.head;
         result.capacity = capacity;
         Ok(result)
     }
@@ -132,6 +153,18 @@ impl SendBuffer {
 
     pub(crate) fn truncate(&mut self, len: usize) {
         self.data.truncate(len);
+        while self
+            .shared
+            .back()
+            .is_some_and(|span| span.start.wrapping_sub(self.head) as usize >= len)
+        {
+            self.shared.pop_back();
+        }
+        if let Some(span) = self.shared.back_mut() {
+            let start = span.start.wrapping_sub(self.head) as usize;
+            let keep = span.payload.len().min(len.saturating_sub(start));
+            span.payload = span.payload.slice(0..keep).unwrap();
+        }
     }
 
     // Storage only: the caller validates SEG.ACK and converts its advance into a data-byte
@@ -145,15 +178,159 @@ impl SendBuffer {
             return Err(());
         }
         self.data.drain(..count);
+        self.head = self.head.wrapping_add(count as u64);
+        while let Some(span) = self.shared.front_mut() {
+            let consumed = self.head.wrapping_sub(span.start) as usize;
+            if consumed >= 1usize << (usize::BITS - 1) {
+                break;
+            }
+            if consumed >= span.payload.len() {
+                self.shared.pop_front();
+            } else {
+                span.start = self.head;
+                span.payload = span.payload.slice(consumed..span.payload.len()).unwrap();
+                break;
+            }
+        }
         Ok(())
     }
 
     pub(crate) fn copy(&self, offset: usize, out: &mut [u8]) -> usize {
-        let count = self.record_len(offset, out.len());
+        let count = self.selection_len(offset, self.record_len(offset, out.len()));
+        if self.shared_output.is_some()
+            && self.shared_prefix(offset, count, usize::MAX) == count
+            && count != 0
+        {
+            return count;
+        }
         for (dst, src) in out[..count].iter_mut().zip(self.data.iter().skip(offset)) {
             *dst = src.0;
         }
+        for span in &self.shared {
+            let start = span.start.wrapping_sub(self.head) as usize;
+            let left = start.max(offset);
+            let right = (start + span.payload.len()).min(offset + count);
+            if left < right {
+                out[left - offset..right - offset]
+                    .copy_from_slice(&span.payload.as_slice()[left - start..right - start]);
+            }
+        }
         count
+    }
+
+    pub(crate) fn shared_storage_bytes(&self) -> usize {
+        self.shared.capacity() * core::mem::size_of::<SharedSpan>()
+    }
+
+    pub(crate) fn prepare_shared(&mut self, peak_room: usize) -> Result<(), ()> {
+        if self.shared.len() < self.shared.capacity() {
+            return Ok(());
+        }
+        let needed = self.shared.len().checked_add(1).ok_or(())?;
+        let bound = needed
+            .checked_next_power_of_two()
+            .ok_or(())?
+            .checked_mul(core::mem::size_of::<SharedSpan>())
+            .ok_or(())?;
+        if bound > peak_room {
+            return Err(());
+        }
+        let mut staged = VecDeque::new();
+        staged.try_reserve_exact(needed).map_err(|_| ())?;
+        if staged.capacity() * core::mem::size_of::<SharedSpan>() > peak_room {
+            return Err(());
+        }
+        staged.extend(self.shared.iter().cloned());
+        self.shared = staged;
+        Ok(())
+    }
+
+    pub(crate) fn write_shared(&mut self, payload: Payload) -> usize {
+        let count = payload.len().min(self.remaining());
+        if count == 0 {
+            return 0;
+        }
+        assert!(self.shared.len() < self.shared.capacity());
+        let start = self.head.wrapping_add(self.data.len() as u64);
+        self.shared.push_back(SharedSpan {
+            start,
+            payload: payload.slice(0..count).unwrap(),
+        });
+        // Only PUSH/EOR bookkeeping is initialized. Payload remains in its
+        // original immutable allocation and is never read/copied here.
+        self.data.extend((0..count).map(|_| (0, 0)));
+        count
+    }
+
+    pub(crate) fn set_shared_output(&mut self, segments: Option<usize>) {
+        self.shared_output = segments;
+    }
+
+    fn shared_prefix(&self, offset: usize, count: usize, max_segments: usize) -> usize {
+        let mut at = offset;
+        let mut used = 0;
+        for span in &self.shared {
+            let start = span.start.wrapping_sub(self.head) as usize;
+            let end = start + span.payload.len();
+            if end <= at {
+                continue;
+            }
+            if start > at || used == max_segments {
+                break;
+            }
+            let n = (end - at).min(count - (at - offset));
+            at += n;
+            used += 1;
+            if at - offset == count {
+                break;
+            }
+        }
+        at - offset
+    }
+
+    pub(crate) fn selection_len(&self, offset: usize, count: usize) -> usize {
+        let Some(max) = self.shared_output else {
+            return count;
+        };
+        let shared = self.shared_prefix(offset, count, max);
+        if shared != 0 {
+            return shared;
+        }
+        self.shared
+            .iter()
+            .map(|s| s.start.wrapping_sub(self.head) as usize)
+            .find(|&start| start > offset)
+            .map_or(count, |start| count.min(start - offset))
+    }
+
+    pub(crate) fn shared_slices(
+        &self,
+        offset: usize,
+        count: usize,
+        out: &mut Vec<Payload>,
+    ) -> bool {
+        if count == 0 || self.shared_prefix(offset, count, out.capacity()) != count {
+            return false;
+        }
+        let mut at = offset;
+        for span in &self.shared {
+            let start = span.start.wrapping_sub(self.head) as usize;
+            let end = start + span.payload.len();
+            if end <= at {
+                continue;
+            }
+            let n = (end - at).min(count - (at - offset));
+            out.push(span.payload.slice(at - start..at - start + n).unwrap());
+            at += n;
+            if at - offset == count {
+                break;
+            }
+        }
+        true
+    }
+
+    pub(crate) fn release_shared(&mut self) {
+        self.shared.clear();
     }
 }
 

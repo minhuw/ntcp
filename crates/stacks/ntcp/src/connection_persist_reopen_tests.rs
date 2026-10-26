@@ -59,27 +59,9 @@ fn sender(iss: u32, scale: u64, nagle: bool) -> Connection {
     a
 }
 
-fn snapshot(a: &Connection, label: &str, wire_len: usize) -> alloc::string::String {
-    std::format!(
-        "{{\"label\":\"{label}\",\"wire_payload_bytes\":{wire_len},\"una\":{},\"nxt\":{},\"flight\":{},\"notsent\":{},\"cwnd\":{},\"probe_pending\":{},\"retx_pending\":{},\"loss_timer\":\"{:?}\",\"rwnd_limited_us\":{},\"prr_active\":{}}}",
-        a.snd_una.0,
-        a.snd_nxt.0,
-        a.flight(),
-        a.transport_info().notsent_bytes,
-        a.congestion.cwnd(),
-        a.probe_pending,
-        a.retx_pending,
-        a.loss_timer,
-        a.transport_info().rwnd_limited_us,
-        a.prr.is_some(),
-    )
-}
 
 #[test]
-fn modern_persist_reopen_committed_vs_pending_probe() {
-    let mut traces = Vec::new();
-    // 0: window before deadline handling; 1: timeout without wire output;
-    // 2: probe committed before window update. Only committed output advances NXT.
+fn empty_probe_reopening_orders_preserve_first_transmission() {
     for order in 0..3 {
         for iss in [0, u32::MAX] {
             for scale in [1, 1000] {
@@ -87,267 +69,191 @@ fn modern_persist_reopen_committed_vs_pending_probe() {
                     let mut a = sender(iss, scale, nagle);
                     let base = Seq(iss.wrapping_add(1));
                     let now = 210_000 * scale;
-                    let mut states = vec![snapshot(&a, "queued", 0)];
-                    if order != 0 {
-                        a.timeout(now).unwrap();
-                        assert!(a.probe_pending);
-                        assert_eq!(a.snd_nxt, base);
-                        states.push(snapshot(&a, "timeout_before_output", 0));
-                    }
+                    if order != 0 { a.timeout(now).unwrap(); }
                     if order == 2 {
                         let bytes = packet(&mut a, now);
-                        let segment = wire::parse(ip(tuple()), &bytes).unwrap();
-                        assert_eq!(segment.header.sequence, base.0);
-                        assert_eq!(segment.payload, &[0x55]);
-                        assert_eq!(a.snd_nxt, base.wrapping_add(1));
-                        assert_eq!(a.flight(), 1);
-                        assert_eq!(a.persist_interval, 400_000 * scale);
-                        states.push(snapshot(&a, "probe_committed", 1));
+                        let probe = wire::parse(ip(tuple()), &bytes).unwrap();
+                        assert_eq!((probe.header.sequence, probe.payload.len()), (iss, 0));
+                        assert_eq!(probe.header.flags, ACK);
+                        assert_eq!(a.snd_nxt, base);
+                        assert_eq!(a.flight(), 0);
+                        assert_eq!(a.rack.packet_counts().unacked, 0);
+                        assert_eq!(a.last_output_range, None);
+                        assert_eq!(a.rto_deadline, None);
                     }
                     inject(&mut a, now, Seq(901), base, ACK, 2000, &[]);
-                    assert_eq!(a.snd_wnd, 2000);
+                    assert_eq!(a.transport_info().rwnd_limited_us, 200_000);
                     assert!(!a.probe_pending);
                     assert_eq!(a.persist_deadline, None);
-                    assert_eq!(a.transport_info().rwnd_limited_us, 200_000);
-                    assert!(a.prr.is_none());
-                    states.push(snapshot(&a, "window_opened", 0));
                     let bytes = packet(&mut a, now);
                     let data = wire::parse(ip(tuple()), &bytes).unwrap();
-                    let expected = if order == 2 { 999 } else { 1000 };
-                    let seq = base.wrapping_add(u32::from(order == 2));
-                    assert_eq!(
-                        (data.header.sequence, data.payload.len()),
-                        (seq.0, expected)
-                    );
-                    assert_eq!(data.header.flags, ACK | PSH);
+                    assert_eq!((data.header.sequence, data.payload.len()), (base.0, 1000));
+                    assert_eq!(data.header.flags, PSH | ACK);
                     assert_eq!(a.snd_nxt, base.wrapping_add(1000));
-                    assert_eq!(a.snd_una, base); // Reopening never fabricates delivery.
-                    assert_eq!(a.persist_probe_end, None);
                     assert_eq!(a.consecutive_timeouts, 0);
-                    states.push(snapshot(&a, "immediate_data", expected));
-                    traces.push(std::format!(
-                        "{{\"order\":{order},\"iss\":{iss},\"ticks_per_us\":{scale},\"nagle\":{nagle},\"states\":[{}]}}",
-                        states.join(",")
-                    ));
+                    assert!(!a.congestion.in_recovery());
                 }
             }
         }
     }
-    if let Ok(directory) = std::env::var("NTCP_PERSIST_REOPEN_STUDY_DIR") {
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(
-            std::format!("{directory}/core-traces.json"),
-            std::format!("[{}]\n", traces.join(",")),
-        )
-        .unwrap();
-    }
 }
 
 #[test]
-fn modern_persist_probe_ack_releases_tail_without_disabling_nagle() {
+fn empty_probe_cannot_authorize_ack_of_queued_data() {
     for iss in [0, u32::MAX] {
         let mut a = sender(iss, 1, true);
-        let base = Seq(iss.wrapping_add(1));
+        let base = a.snd_nxt;
         a.timeout(210_000).unwrap();
         packet(&mut a, 210_000);
-        // A reopened one-byte window still has no room beyond the probe.
-        inject(&mut a, 210_000, Seq(901), base, ACK, 1, &[]);
-        assert_eq!(a.transmit(210_000, &mut [0; 1500]), Ok(None));
-        // A real ACK of the probe byte eliminates the Nagle flight condition.
-        inject(
-            &mut a,
-            211_000,
-            Seq(901),
-            base.wrapping_add(1),
-            ACK,
-            2000,
-            &[],
-        );
-        let bytes = packet(&mut a, 211_000);
-        let data = wire::parse(ip(tuple()), &bytes).unwrap();
-        assert_eq!(
-            (data.header.sequence, data.payload.len()),
-            (base.wrapping_add(1).0, 999)
-        );
-        assert_eq!(a.consecutive_timeouts, 0);
-        assert_eq!(a.persist_probe_end, None);
-    }
-}
-
-#[test]
-fn persist_reopen_failed_output_and_one_shot_window_updates() {
-    for iss in [0, u32::MAX] {
-        let mut a = sender(iss, 1, true);
-        let base = Seq(iss.wrapping_add(1));
-        a.timeout(210_000).unwrap();
-        assert_eq!(
-            a.transmit(210_000, &mut [0; 19]),
-            Err(Error::OutputTooSmall)
-        );
-        assert_eq!(a.snd_nxt, base);
-        assert_eq!(a.persist_probe_end, None);
-        packet(&mut a, 210_000);
-        assert_eq!(a.persist_probe_end, Some(base.wrapping_add(1)));
-        // An ACK beyond what was sent cannot reopen the window or earn credit.
-        inject(
-            &mut a,
-            210_001,
-            Seq(901),
-            base.wrapping_add(2),
-            ACK,
-            2000,
-            &[],
-        );
-        assert_eq!(a.snd_wnd, 0);
-        assert!(!a.persist_reopen_nagle_exception());
+        inject(&mut a, 210_001, Seq(901), base.wrapping_add(1), ACK, 2000, &[]);
+        assert_eq!((a.snd_una, a.snd_nxt, a.snd_wnd), (base, base, 0));
+        assert_eq!(a.send.len(), 1000);
+        let reply = packet(&mut a, 210_001);
+        assert!(wire::parse(ip(tuple()), &reply).unwrap().payload.is_empty());
         inject(&mut a, 210_002, Seq(901), base, ACK, 2000, &[]);
-        assert!(a.persist_reopen_nagle_exception());
-        assert_eq!(
-            a.transmit(210_002, &mut [0; 19]),
-            Err(Error::OutputTooSmall)
-        );
-        assert_eq!(a.snd_nxt, base.wrapping_add(1));
-        assert!(a.persist_reopen_nagle_exception());
-        let bytes = packet(&mut a, 210_002);
-        let tail = wire::parse(ip(tuple()), &bytes).unwrap();
-        assert_eq!(
-            (tail.header.sequence, tail.payload.len()),
-            (base.wrapping_add(1).0, 999)
-        );
-        assert_eq!(a.persist_probe_end, None);
-        assert_eq!(a.snd_una, base);
-        a.write(&[0x66]).unwrap();
-        inject(&mut a, 210_003, Seq(901), base, ACK, 2000, &[]);
-        assert_eq!(a.transmit(210_003, &mut [0; 1500]), Ok(None));
-        // Only actual delivery, not another window update, releases this write.
-        inject(
-            &mut a,
-            210_004,
-            Seq(901),
-            base.wrapping_add(1000),
-            ACK,
-            2000,
-            &[],
-        );
-        let bytes = packet(&mut a, 210_004);
-        assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload, &[0x66]);
+        let before = (a.snd_nxt, a.congestion.cwnd(), a.rto_deadline);
+        assert_eq!(a.transmit(210_002, &mut [0; 19]), Err(Error::OutputTooSmall));
+        assert_eq!((a.snd_nxt, a.congestion.cwnd(), a.rto_deadline), before);
+        let data = packet(&mut a, 210_002);
+        assert_eq!(wire::parse(ip(tuple()), &data).unwrap().payload.len(), 1000);
+        assert_eq!(a.congestion.cwnd(), 10_000);
     }
 }
 
 #[test]
-fn persist_reopen_reservations_record_and_consume_only_on_departure() {
+fn empty_probe_backoff_and_history_ignore_closed_window_feedback() {
     for iss in [0, u32::MAX] {
         let mut a = sender(iss, 1, true);
-        let base = Seq(iss.wrapping_add(1));
-        a.timeout(210_000).unwrap();
-        let mut out = [0; 1500];
-        a.transmit_selected(210_000, &mut out, true)
-            .unwrap()
-            .unwrap();
-        let mut probe = a.last_departure.unwrap();
-        assert!(probe.persist_probe);
-        assert_eq!(a.persist_probe_end, None);
-        a.accept_reserved_output(210_001, &mut probe, 0, 0, false)
-            .unwrap();
-        assert_eq!(a.persist_probe_end, None);
-        a.accept_reserved_output(210_002, &mut probe, 0, 1, true)
-            .unwrap();
-        assert_eq!(a.persist_probe_end, Some(base.wrapping_add(1)));
-        inject(&mut a, 210_003, Seq(901), base, ACK, 2000, &[]);
-        let n = a
-            .transmit_selected(210_003, &mut out, true)
-            .unwrap()
-            .unwrap();
-        let segment = wire::parse(ip(tuple()), &out[..n]).unwrap();
-        assert_eq!(
-            (segment.header.sequence, segment.payload.len()),
-            (base.wrapping_add(1).0, 999)
-        );
-        let mut tail = a.last_departure.unwrap();
-        assert!(!tail.persist_probe);
-        assert_eq!(a.persist_probe_end, Some(base.wrapping_add(1)));
-        a.accept_reserved_output(210_004, &mut tail, 0, 0, false)
-            .unwrap();
-        assert_eq!(a.persist_probe_end, Some(base.wrapping_add(1)));
-        // A backend MTU split consumes the exception on its first accepted data.
-        a.accept_reserved_output(210_005, &mut tail, 0, 400, false)
-            .unwrap();
-        assert_eq!(a.persist_probe_end, None);
-        a.accept_reserved_output(210_006, &mut tail, 400, 599, true)
-            .unwrap();
-        assert_eq!(a.snd_una, base);
-        assert_eq!(a.snd_nxt, base.wrapping_add(1000));
+        let base = a.snd_nxt;
+        let baseline = (a.rto(), a.congestion.cwnd(), a.rtt_sample_after);
+        for (now, next) in [(210_000, 610_000), (610_000, 1_410_000), (1_410_000, 3_010_000)] {
+            a.timeout(now).unwrap();
+            let before = (a.persist_interval, a.loss_timer);
+            assert_eq!(a.transmit(now, &mut [0; 19]), Err(Error::OutputTooSmall));
+            assert_eq!((a.persist_interval, a.loss_timer), before);
+            let bytes = packet(&mut a, now);
+            let probe = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!((probe.header.sequence, probe.payload.len()), (base.wrapping_add(u32::MAX).0, 0));
+            assert_eq!(a.loss_timer, Some((LossTimer::Zwp, next)));
+            inject(&mut a, now + 1, Seq(901), base, ACK, 0, &[]);
+            assert_eq!(a.loss_timer, Some((LossTimer::Zwp, next)));
+            assert_eq!((a.snd_una, a.snd_nxt), (base, base));
+            assert_eq!((a.rto(), a.congestion.cwnd(), a.rtt_sample_after), baseline);
+            assert_eq!(a.transport_info().notsent_bytes, 1000);
+            assert_eq!(a.consecutive_timeouts, 0);
+        }
     }
 }
 
 #[test]
-// Ordinary data and old-data persist retries never gain the Nagle exception.
-//= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.4
-//= type=test
-//# A TCP implementation SHOULD implement the Nagle algorithm to
-//# coalesce short segments (SHLD-7).
-fn persist_reopen_ordinary_short_flight_still_obeys_nagle() {
+fn reserved_empty_probe_timer_uses_actual_acceptance_and_not_stream_credit() {
     for iss in [0, u32::MAX] {
-        let cfg = ConnectionConfig {
-            timestamps: false,
-            rack: true,
-            sack: true,
-            prr: true,
-            prr_algorithm: PrrAlgorithm::Rfc9937,
-            rto_min_us: 200_000,
-            ..config(65_536, 1000)
-        };
-        let (mut a, _) = pair(cfg, iss);
-        let base = a.snd_una;
-        let next = a.receive.next();
-        a.write(&[0x55]).unwrap();
-        packet(&mut a, 100);
-        assert_eq!(a.flight(), 1);
-        assert_eq!(a.persist_probe_end, None);
-        a.write(&[0x55; 999]).unwrap();
-        assert_eq!(a.transmit(100, &mut [0; 1500]), Ok(None));
-        inject(&mut a, 110, next, base, ACK, 0, &[]);
+        for opened in [false, true] {
+            let mut a = sender(iss, 1, true);
+            let base = a.snd_nxt;
+            a.timeout(210_000).unwrap();
+            let mut out = [0; 1500];
+            let n = a.transmit_selected(210_000, &mut out, true).unwrap().unwrap();
+            let probe = wire::parse(ip(tuple()), &out[..n]).unwrap();
+            assert!(probe.payload.is_empty());
+            let mut d = a.last_departure.unwrap();
+            assert!(d.persist && !d.stream && !d.rto);
+            assert_eq!(a.persist_unanswered_since, None);
+            let interval = a.persist_interval;
+            assert_eq!(a.snd_nxt, base);
+            if opened { inject(&mut a, 211_000, Seq(901), base, ACK, 2000, &[]); }
+            a.accept_reserved_output(212_000, &mut d, 0, 0, true).unwrap();
+            assert!(!d.persist);
+            assert_eq!(a.rto_deadline, None);
+            assert_eq!(a.snd_nxt, base);
+            assert_eq!(a.rack.packet_counts().unacked, 0);
+            assert_eq!(a.persist_unanswered_since, if opened { None } else { Some(212_000) });
+            assert_eq!(a.persist_deadline, if opened { None } else { Some(212_000 + interval) });
+            // A repeated acceptance cannot restart the accepted control epoch.
+            a.accept_reserved_output(212_001, &mut d, 0, 0, true).unwrap();
+            assert_eq!(a.persist_deadline, if opened { None } else { Some(212_000 + interval) });
+        }
+    }
+}
+
+#[test]
+fn window_probe_with_real_flight_retransmits_existing_byte() {
+    for iss in [0, u32::MAX] {
+        let mut a = sender(iss, 1, true);
+        let base = a.snd_nxt;
+        inject(&mut a, 20_000, Seq(901), base, ACK, 2000, &[]);
+        packet(&mut a, 20_000);
+        let high = a.snd_nxt;
+        inject(&mut a, 21_000, Seq(901), base, ACK, 0, &[]);
         let deadline = a.next_deadline().unwrap();
         a.timeout(deadline).unwrap();
         let bytes = packet(&mut a, deadline);
-        assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 1);
-        assert_eq!(a.persist_probe_end, None);
-        inject(&mut a, deadline + 1, next, base, ACK, 2000, &[]);
-        assert!(!a.persist_reopen_nagle_exception());
-        assert_eq!(a.transmit(deadline + 1, &mut [0; 1500]), Ok(None));
+        let probe = wire::parse(ip(tuple()), &bytes).unwrap();
+        assert_eq!((probe.header.sequence, probe.payload.len()), (base.0, 1));
+        assert_eq!(probe.payload, &[0x55]);
+        assert_eq!((a.snd_una, a.snd_nxt), (base, high));
+        assert_eq!(a.consecutive_timeouts, 0);
+        assert_eq!(a.transport_info().notsent_bytes, 0);
     }
+}
+
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.4
+//= type=test
+//= reason=A real receiver with full storage receives the current-sequence urgent control before the old-sequence window probe; application urgent notification advances without consuming receive space or queued sender data. The two controls consume only one persist-backoff event.
+//# A TCP receiver MUST process the RST and URG fields of all incoming segments,
+//# even when the receive window is zero (MUST-66).
+fn empty_probe_preserves_zero_window_urgent_notification() {
+    let (mut a, mut b) = pair(config(4, 4), 100);
+    a.write(b"abcd").unwrap();
+    deliver(&mut a, &mut b, 40);
+    deliver(&mut b, &mut a, 50);
+    assert_eq!(b.receive_window(), 0);
+    a.write_urgent(b"e").unwrap();
+    let base = a.snd_nxt;
+    let deadline = a.next_deadline().unwrap();
+    let interval = a.persist_interval;
+    a.timeout(deadline).unwrap();
+    let bytes = deliver(&mut a, &mut b, deadline);
+    let notice = wire::parse(ip(tuple()), &bytes).unwrap();
+    assert_eq!((notice.header.sequence, notice.payload.len()), (base.0, 0));
+    assert_eq!(b.take_events().urgent, Some(5));
+    assert_eq!(a.persist_interval, interval);
+    assert!(a.probe_pending);
+    let bytes = deliver(&mut a, &mut b, deadline);
+    let probe = wire::parse(ip(tuple()), &bytes).unwrap();
+    assert_eq!((probe.header.sequence, probe.payload.len()), (base.wrapping_add(u32::MAX).0, 0));
+    assert!(!a.probe_pending);
+    assert_eq!(a.persist_interval, 2 * interval);
+    deliver(&mut b, &mut a, deadline + 1);
+    assert_eq!(a.snd_nxt, base);
+    assert_eq!(a.transmit(deadline + 1, &mut [0; 64]), Ok(None));
 }
 
 #[test]
-fn persist_reopen_window_cork_and_timeout_guards() {
-    for iss in [0, u32::MAX] {
-        let mut a = sender(iss, 1, true);
-        let base = Seq(iss.wrapping_add(1));
+fn empty_probe_large_urgent_pointer_is_bounded_without_repeating_notice() {
+    for reserved in [false, true] {
+        let mut a = sender(u32::MAX - 500, 1, true);
+        assert_eq!(a.write_urgent(&[0x77; 65_000]).unwrap(), 64_536);
+        let base = a.snd_nxt;
         a.timeout(210_000).unwrap();
-        packet(&mut a, 210_000);
-        inject(&mut a, 210_000, Seq(901), base, ACK, 1, &[]);
-        assert!(a.persist_reopen_nagle_exception());
-        // Exemption is only from Nagle, never from the receive window.
-        assert_eq!(a.transmit(210_000, &mut [0; 1500]), Ok(None));
-        a.set_cork(true);
-        inject(&mut a, 210_001, Seq(901), base, ACK, 2000, &[]);
-        assert_eq!(a.transmit(210_001, &mut [0; 1500]), Ok(None));
-        a.set_cork(false);
-        packet(&mut a, 210_001);
-        assert_eq!(a.persist_probe_end, None);
-
-        let mut a = sender(iss, 1, true);
-        a.timeout(210_000).unwrap();
-        packet(&mut a, 210_000);
-        inject(&mut a, 210_000, Seq(901), base, ACK, 1, &[]);
-        a.timeout(610_000).unwrap();
-        assert_eq!(a.persist_probe_end, None);
-        assert!(!a.persist_reopen_nagle_exception());
-        assert_eq!(a.consecutive_timeouts, 1);
-        let mut a = sender(iss, 1, true);
-        a.timeout(210_000).unwrap();
-        packet(&mut a, 210_000);
-        a.terminal(CloseReason::Aborted);
-        assert_eq!(a.persist_probe_end, None);
+        let mut out = [0; 1500];
+        for (index, seq) in [base, base.wrapping_add(u32::MAX)].into_iter().enumerate() {
+            let n = if reserved { a.transmit_selected(210_000, &mut out, true) } else { a.transmit(210_000, &mut out) }.unwrap().unwrap();
+            let p = wire::parse(ip(tuple()), &out[..n]).unwrap();
+            assert_eq!((p.header.sequence, p.payload.len()), (seq.0, 0));
+            assert_eq!(p.header.urgent_pointer, u16::MAX);
+            if reserved {
+                let mut d = a.last_departure.unwrap();
+                assert_eq!(d.persist, index == 1);
+                a.accept_reserved_output(210_000, &mut d, 0, 0, true).unwrap();
+            }
+        }
+        assert!(!a.probe_pending);
+        assert_eq!(a.transmit(210_000, &mut out), Ok(None));
+        assert_eq!(a.snd_nxt, base);
     }
 }
+
+mod real_peer { include!("connection_persist_peer_tests.rs"); }

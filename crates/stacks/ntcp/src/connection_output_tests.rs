@@ -272,7 +272,7 @@ fn selected_recovery_output_policy_matrix() {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc9937#section-3
 //= type=test
-//= reason=rwnd reconciliation is limited to RFC9293 sections3.8.6/3.8.6.1 old-data shrink retries and prescribed zero-window probes, with RFC7323 section2.4 items4/5 stricter scaled limits. This matrix asserts no fresh TLP overcommit of rwnd, unscaled shrink clipping, a single octet persist probe and no additional output; it runs scaled first/sub-scale/subsequent/configuration/ledger/wrap/failed-output checks and strict PRR cancellation before persist. ordinary_output_policy_matrix and selected_recovery_output_policy_matrix separately bound ordinary and recovery output. No blanket recovery waiver.
+//= reason=rwnd reconciliation is limited to RFC9293 sections3.8.6/3.8.6.1 old-data shrink retries and prescribed zero-window probes, with RFC7323 section2.4 items4/5 stricter scaled limits. This matrix asserts no fresh TLP overcommit of rwnd, unscaled shrink clipping, an empty old-sequence probe without flight and no additional output; it runs scaled first/sub-scale/subsequent/configuration/ledger/wrap/failed-output checks and strict PRR cancellation before persist. ordinary_output_policy_matrix and selected_recovery_output_policy_matrix separately bound ordinary and recovery output. No blanket recovery waiver.
 //# At any given time, a connection MUST
 //# NOT send data with a sequence number higher than the sum of
 //# SND.UNA and rwnd.
@@ -1307,7 +1307,7 @@ fn hystart_wire_raw_samples_css_fallback_five_rounds_and_wrap() {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
 //= type=test
-//= reason=Actual ten-segment ACK applies L=8 unless all effective pacing prerequisites hold; explicit standard-SS opt-out remains separate.
+//= reason=Actual ten- then twenty-segment ACKs distinguish tuned L16 from truly paced growth; explicit standard-SS opt-out remains separate.
 //# The following pseudocode uses a limit, L, to control the
 //# aggressiveness of the cwnd increase during both standard slow start
 //# and CSS.  While an arriving ACK may newly acknowledge an arbitrary
@@ -1315,7 +1315,7 @@ fn hystart_wire_raw_samples_css_fallback_five_rounds_and_wrap() {
 //# bytes applied to increase the cwnd to L*SMSS bytes.
 //= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
 //= type=test
-//= reason=Actual ten-segment ACK applies L=8 unless all effective pacing prerequisites hold; explicit standard-SS opt-out remains separate.
+//= reason=Actual ten- then twenty-segment ACKs distinguish tuned L16 from truly paced growth; explicit standard-SS opt-out remains separate.
 //# For each arriving ACK in slow start, where N is the number of
 //# previously unacknowledged bytes acknowledged in the arriving ACK:
 //#
@@ -1324,7 +1324,7 @@ fn hystart_wire_raw_samples_css_fallback_five_rounds_and_wrap() {
 //# cwnd = cwnd + min(N, L * SMSS)
 //= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
 //= type=test
-//= reason=Actual ten-segment ACK applies L=8 unless all effective pacing prerequisites hold; explicit standard-SS opt-out remains separate.
+//= reason=Actual ten- then twenty-segment ACKs distinguish tuned L16 from truly paced growth; explicit standard-SS opt-out remains separate.
 //# A paced TCP implementation SHOULD use L =
 //# infinity.
 //= https://www.rfc-editor.org/rfc/rfc9438#section-4.10
@@ -1335,9 +1335,9 @@ fn hystart_wire_raw_samples_css_fallback_five_rounds_and_wrap() {
 //# algorithm [RFC5681] in the rare cases when HyStart++ is not suitable.
 fn hystart_wire_delayed_ack_runtime_pacing_and_opt_out() {
     for (prr, algorithm, pacing, expected) in [
-        (false, PrrAlgorithm::Rfc9937, true, 8000),
-        (true, PrrAlgorithm::Rfc9937, false, 8000),
-        (true, PrrAlgorithm::Rfc9937, true, 10_000),
+        (false, PrrAlgorithm::Rfc9937, true, 16_000),
+        (true, PrrAlgorithm::Rfc9937, false, 16_000),
+        (true, PrrAlgorithm::Rfc9937, true, 20_000),
     ] {
         let (mut a, _) = primed_pair(
             ConnectionConfig {
@@ -1365,7 +1365,18 @@ fn hystart_wire_delayed_ack_runtime_pacing_and_opt_out() {
             }
         }
         hystart_wire_ack(&mut a, sent + 100_000, base.wrapping_add(10_000), ACK);
-        assert_eq!(a.congestion.cwnd(), 10_000 + expected);
+        assert_eq!(a.congestion.cwnd(), 20_000);
+        a.write(&[0x66; 10_000]).unwrap(); // Fill the enlarged twenty-MSS window.
+        sent += 100_000;
+        for _ in 0..20 {
+            let bytes = packet(&mut a, sent);
+            assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 1000);
+            if a.pacing_enabled() {
+                sent = a.pacing_deadline.unwrap();
+            }
+        }
+        hystart_wire_ack(&mut a, sent + 100_000, base.wrapping_add(30_000), ACK);
+        assert_eq!(a.congestion.cwnd(), 20_000 + expected);
     }
     let (mut a, _) = primed_pair(
         ConnectionConfig {
@@ -1614,9 +1625,17 @@ fn hystart_wire_paced_tlp_bypass_retains_unpaced_ack_cap() {
         100,
     );
     let base = a.snd_una;
-    a.write(&[0x55; 11_000]).unwrap();
+    a.write(&[0x55; 10_000]).unwrap();
     let mut now = 100_000;
     for _ in 0..10 {
+        packet(&mut a, now);
+        now = a.pacing_deadline.unwrap();
+    }
+    hystart_wire_ack(&mut a, now + 100_000, base.wrapping_add(10_000), ACK);
+    assert_eq!(a.congestion.cwnd(), 20_000);
+    a.write(&[0x66; 20_000]).unwrap();
+    now += 100_000;
+    for _ in 0..16 {
         packet(&mut a, now);
         now = a.pacing_deadline.unwrap();
     }
@@ -1624,11 +1643,15 @@ fn hystart_wire_paced_tlp_bypass_retains_unpaced_ack_cap() {
     a.tlp_pending = true;
     let bytes = packet(&mut a, now - 1);
     let probe = wire::parse(ip(tuple()), &bytes).unwrap();
-    assert_eq!(probe.header.sequence, base.wrapping_add(10_000).0);
+    assert_eq!(probe.header.sequence, base.wrapping_add(26_000).0);
     assert_eq!(probe.payload.len(), 1000);
     assert!(a.tlp_end.is_some());
-    hystart_wire_ack(&mut a, now + 100_000, base.wrapping_add(11_000), ACK);
-    assert_eq!(a.congestion.cwnd(), 18_000); // Not 21k despite pacing flag.
+    for _ in 0..3 {
+        now = a.pacing_deadline.unwrap();
+        packet(&mut a, now);
+    }
+    hystart_wire_ack(&mut a, now + 100_000, base.wrapping_add(30_000), ACK);
+    assert_eq!(a.congestion.cwnd(), 36_000); // Finite L16, rather than paced40k.
 }
 
 #[test]
@@ -2145,19 +2168,19 @@ fn cork_zero_window_probe_reopen_shutdown_and_rto_stay_live() {
         let persist = a.persist_deadline.unwrap();
         a.timeout(persist).unwrap();
         assert_eq!(
-            a.transmit(persist, &mut [0; 20]),
+            a.transmit(persist, &mut [0; 19]),
             Err(Error::OutputTooSmall)
         );
         let bytes = packet(&mut a, persist);
         let segment = wire::parse(ip(tuple()), &bytes).unwrap();
-        assert_eq!(segment.payload, b"a");
-        assert_eq!(a.snd_nxt, base.wrapping_add(1));
+        assert!(segment.payload.is_empty());
+        assert_eq!(a.snd_nxt, base);
         let ack = a.snd_nxt;
         inject(&mut a, persist + 1, next, ack, ACK, 64, &[]);
         a.shutdown().unwrap();
         let bytes = packet(&mut a, persist + 2);
         let segment = wire::parse(ip(tuple()), &bytes).unwrap();
-        assert_eq!(segment.payload, b"b");
+        assert_eq!(segment.payload, b"ab");
         assert_eq!(segment.header.flags & FIN, 0);
         let bytes = packet(&mut a, persist + 2);
         let segment = wire::parse(ip(tuple()), &bytes).unwrap();
@@ -2168,7 +2191,7 @@ fn cork_zero_window_probe_reopen_shutdown_and_rto_stay_live() {
         assert_eq!(a.transmit(rto, &mut [0; 20]), Err(Error::OutputTooSmall));
         let bytes = packet(&mut a, rto);
         let segment = wire::parse(ip(tuple()), &bytes).unwrap();
-        assert_eq!(segment.payload, b"b");
+        assert_eq!(segment.payload, b"ab");
         assert_eq!(segment.header.flags & FIN, 0);
     }
 }
@@ -2424,7 +2447,7 @@ fn lowat_byte_admission_transmission_ack_resize_flush_and_wrap() {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc9937#section-6.4
 //= type=test
-//= reason=Opt-in general pacing bounds same-tick and idle bursts with both Reno and CUBIC and PRR disabled; failed encoding preserves fractional debt. Caller microsecond and nanosecond units are exercised.
+//= reason=With the initial-flight exemption disabled, general pacing bounds same-tick and idle bursts with both Reno and CUBIC and PRR disabled; failed encoding preserves fractional debt. Caller microsecond and nanosecond units are exercised.
 //# It is RECOMMENDED that implementations use pacing to reduce the
 //# burstiness of data traffic.
 fn general_pacing_wire_fractional_burst_idle_and_failed_encode() {
@@ -2432,7 +2455,8 @@ fn general_pacing_wire_fractional_burst_idle_and_failed_encode() {
         for scale in [1, 1000] {
             let (mut a, _) = pair(
                 ConnectionConfig {
-                    pacing: Some(PacingConfig::default()),
+                    // Exercise the ordinary bucket independently of startup.
+                    pacing: Some(PacingConfig { initial_window_burst: false, ..Default::default() }),
                     prr: false,
                     prr_pacing: false,
                     congestion_algorithm: algorithm,
@@ -2656,4 +2680,8 @@ fn general_pacing_saturated_clock_preserves_burst_bound_and_actual_send_time() {
     let ack = packet(&mut a, u64::MAX);
     assert!(wire::parse(ip(tuple()), &ack).unwrap().payload.is_empty());
     assert_eq!(a.pacer, debt);
+}
+
+mod initial_burst {
+    include!("connection_initial_burst_tests.rs");
 }

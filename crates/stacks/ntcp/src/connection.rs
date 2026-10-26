@@ -108,9 +108,12 @@ pub struct PacingConfig {
     pub rate_gain_percent: u16,
     // Stream bytes, including retransmissions, per second; excludes headers.
     pub max_bytes_per_second: Option<u64>,
-    // Maximum ordinary-data burst in effective sender MSS units. Nonzero;
+    // Maximum rate-paced burst after startup, in effective sender MSS units. Nonzero;
     // the product with configured MSS must fit u32. Probes may exceed it.
     pub max_burst_segments: u32,
+    // One initial flight may bypass rate spacing, bounded by its selected IW.
+    // Explicit byte-rate caps and pre-data loss keep ordinary pacing instead.
+    pub initial_window_burst: bool,
 }
 
 impl Default for PacingConfig {
@@ -119,6 +122,7 @@ impl Default for PacingConfig {
             rate_gain_percent: 125,
             max_bytes_per_second: None,
             max_burst_segments: 2,
+            initial_window_burst: true,
         }
     }
 }
@@ -261,6 +265,19 @@ impl ConnectionConfig {
                 .search_aging
                 .ticks(self.timebase.units_per_second)?;
             p.initial_values(self.initial_path_bound(p.first_hop_mtu, ipv4), ipv4)?;
+            if !ipv4
+                && [
+                    p.route_mtu,
+                    p.initial_mtu,
+                    p.initial_search_low,
+                    p.initial_search_high,
+                ]
+                .into_iter()
+                .flatten()
+                .any(|mtu| mtu < self.packetization_mtu_floor(false))
+            {
+                return Err(Error::InvalidArgument);
+            }
         }
         if !self.valid_timestamp_timebase()
             || !self.valid_pacing()
@@ -326,6 +343,16 @@ impl ConnectionConfig {
 
     pub(crate) fn valid_timestamp_timebase(&self) -> bool {
         self.timebase.valid()
+    }
+
+    pub(crate) fn packetization_mtu_floor(&self, ipv4: bool) -> u32 {
+        if ipv4 {
+            68
+        } else {
+            // Administrative limits must still fit the IPv6 header, enabled
+            // TCP options and the same minimum data budget as normal output.
+            40 + 20 + u32::from(self.timestamps) * 12 + u32::from(self.sack) * 12 + 8
+        }
     }
 
     pub(crate) fn minimum_send_budget(&self) -> u16 {
@@ -624,6 +651,9 @@ pub(crate) struct Connection {
     irs: Option<Seq>,
     passive_open: bool,
     fast_open: Option<wire::FastOpenCookie>,
+    fast_open_client_policy: crate::FastOpenClientPolicy,
+    // Physical option provenance is independent of early-send authorization.
+    fast_open_option_sent: bool,
     fast_open_initial: usize,
     fast_open_attempt: bool,
     pub(crate) fast_open_negative: bool,
@@ -696,6 +726,7 @@ pub(crate) struct Connection {
     // general-pacing debt lives separately and survives servicing this timer.
     pacing_deadline: Option<Instant>,
     pacer: Pacer,
+    initial_pacing_open: bool,
     #[cfg(test)]
     prr_exit_trace: Option<Prr>,
     receive_used: usize,
@@ -804,8 +835,6 @@ pub(crate) struct Connection {
     persist_deadline: Option<Instant>,
     persist_interval: u64,
     persist_unanswered_since: Option<Instant>,
-    // End of a committed fresh persist octet sent with no ordinary data in flight.
-    persist_probe_end: Option<Seq>,
     shrink_unanswered_since: Option<Instant>,
     sws_deadline: Option<Instant>,
     sws_override: bool,
@@ -945,6 +974,8 @@ impl Connection {
             irs: None,
             passive_open: false,
             fast_open: None,
+            fast_open_client_policy: crate::FastOpenClientPolicy::RequireCookie,
+            fast_open_option_sent: false,
             fast_open_initial: 0,
             fast_open_attempt: false,
             fast_open_negative: false,
@@ -1002,6 +1033,7 @@ impl Connection {
             prr: None,
             pacing_deadline: None,
             pacer: Pacer::default(),
+            initial_pacing_open: true,
             #[cfg(test)]
             prr_exit_trace: None,
             receive_used: 0,
@@ -1090,7 +1122,6 @@ impl Connection {
             persist_deadline: None,
             persist_interval: 0,
             persist_unanswered_since: None,
-            persist_probe_end: None,
             shrink_unanswered_since: None,
             sws_deadline: None,
             sws_override: false,
@@ -1145,7 +1176,7 @@ impl Connection {
         iss: u32,
         now: Instant,
         syn: &Segment<'_>,
-        authenticated_syn: bool,
+        early_authorized: bool,
         receive: &mut Option<ReceiveBuffer>,
         rx_timestamps: RxTimestamps,
         timestamps: RxPacketTimestamps,
@@ -1158,10 +1189,10 @@ impl Connection {
         connection.rx_timestamps = rx_timestamps;
         connection.input_timestamps = timestamps;
         connection.passive_open = true;
-        // Authentication authorizes an early child even for a server-first
+        // Listener policy authorizes an early child even for a server-first
         // exchange. Payload presence separately controls readable data.
-        connection.fast_open_early = authenticated_syn;
-        connection.learn_syn(syn, authenticated_syn);
+        connection.fast_open_early = early_authorized;
+        connection.learn_syn(syn, early_authorized);
         connection.input_timestamps = RxPacketTimestamps::default();
         connection.state = State::SynReceived;
         Ok(connection)
@@ -1219,7 +1250,7 @@ impl Connection {
 
     pub(crate) fn resize_peak_charge(&self, send: usize, receive: usize) -> Option<usize> {
         let sender = if send > self.send.allocation_capacity() {
-            Self::allocation_bytes(send, 0, 0)?
+            Self::allocation_bytes(send, 0, 0)?.checked_add(self.send.shared_storage_bytes())?
         } else {
             0
         };
@@ -1354,6 +1385,9 @@ impl Connection {
     ) -> Result<usize, Error> {
         self.prepare_fast_open_with_budget(cached, initial, usize::MAX)
     }
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+    //= reason=Server policy selection does not change the ordinary active-open path: cold client accepts zero initial data and sends a cookie request.
+    //# To open a TFO connection, the client MUST have obtained a cookie from the server:
     pub(crate) fn prepare_fast_open_with_budget(
         &mut self,
         cached: Option<crate::fast_open::CachedCookie>,
@@ -1364,12 +1398,56 @@ impl Connection {
         let Some(cached) = cached else {
             return Ok(0);
         };
-        self.peer_mss = cached.mss;
+        self.prepare_fast_open_with_server_cookie(
+            cached.cookie,
+            Some(cached.mss),
+            initial,
+            max_charge,
+        )
+    }
+
+    // A supplied cookie is a credential obtained from this server, including
+    // an explicitly agreed zero cookie for a protected RFC7413 section7.3 service.
+    // It is still serialized as a Fast Open option; no omitted-option bypass.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3
+    //= reason=Cold supplied-cookie admission uses the address-family peer MSS default before applying configuration, path, option and storage limits.
+    //# Without a cached server MSS, the amount of data in the SYN packet is limited to the default MSS of 536 bytes for IPv4 [RFC1122] and 1220 bytes for IPv6 [RFC2460].
+    pub(crate) fn prepare_fast_open_with_server_cookie(
+        &mut self,
+        cookie: wire::FastOpenCookie,
+        peer_mss: Option<u16>,
+        initial: &[u8],
+        max_charge: usize,
+    ) -> Result<usize, Error> {
+        self.fast_open = Some(cookie);
+        self.prepare_fast_open_data(peer_mss, initial, max_charge)
+    }
+
+    pub(crate) fn prepare_fast_open_without_cookie(
+        &mut self,
+        peer_mss: Option<u16>,
+        initial: &[u8],
+        max_charge: usize,
+    ) -> Result<usize, Error> {
+        self.fast_open_client_policy = crate::FastOpenClientPolicy::ApplicationProtected;
+        self.prepare_fast_open_data(peer_mss, initial, max_charge)
+    }
+
+    fn prepare_fast_open_data(
+        &mut self,
+        peer_mss: Option<u16>,
+        initial: &[u8],
+        max_charge: usize,
+    ) -> Result<usize, Error> {
+        self.peer_mss = peer_mss.unwrap_or(if self.tuple.remote.is_ipv4() {
+            536
+        } else {
+            1220
+        });
         // Reserve the entire option budget, including cookies up to 16 bytes.
         // A changed path may clip the SYN further; all accepted bytes remain queued.
         let limit = usize::from(
-            cached
-                .mss
+            self.peer_mss
                 .min(self.config.mss)
                 .min(self.config.user_mss.unwrap_or(u16::MAX)),
         )
@@ -2454,26 +2532,8 @@ impl Connection {
         self.resolve_probe_response();
     }
 
-    // User-approved scoped SHLD-7 departure: a sole persist octet must not
-    // strand the fresh tail after a valid window reopening. This changes only
-    // Nagle admission; ordinary data, SWS, CORK, rwnd/cwnd and pacing still gate.
-    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.4
-    //= reason=Scoped persist-reopen SHOULD departure is recorded in rfc9293-todos.toml; only a physically committed fresh persist octet with no other flight can admit one fresh segment. Ordinary-short-flight, one-shot, window/CORK, wrap, failed-output and reserved-departure tests bound this policy.
-    //# A TCP implementation SHOULD implement the Nagle algorithm to
-    //# coalesce short segments (SHLD-7).
-    fn persist_reopen_nagle_exception(&self) -> bool {
-        self.snd_wnd != 0
-            && self.persist_probe_end == Some(self.snd_nxt)
-            && self.flight() == 1
-            && !self.retx_pending
-            && self.consecutive_timeouts == 0
-            && !self.congestion.in_recovery()
-            && self.prr.is_none()
-            && self.sack_recovery.is_none()
-    }
-
     pub(crate) fn reserved_pacing_deadline(&self, now: Instant, d: &Departure) -> Option<Instant> {
-        if d.bypass || !d.stream {
+        if d.bypass || d.initial_burst || !d.stream {
             return None;
         }
         if d.interval.is_some() {
@@ -2656,6 +2716,7 @@ impl Connection {
         if d.syn {
             if finished {
                 self.fast_open_attempt |= d.fast_open && !self.syn_committed;
+                self.fast_open_option_sent |= d.fast_open_option;
                 self.record_syn_departure(d.syn_timestamp);
             }
             self.syn_payload_sent = self.syn_payload_sent.max(count);
@@ -2675,7 +2736,12 @@ impl Connection {
         if d.stream && count != 0 {
             self.last_sent = now;
             if let Some(interval) = d.interval {
-                self.pacer.sent(now, count, interval);
+                if d.initial_burst {
+                    let burst = self.config.pacing.unwrap().max_burst_segments * self.mss as u32;
+                    self.pacer.startup_sent(now, count, interval, burst);
+                } else {
+                    self.pacer.sent(now, count, interval);
+                }
                 self.pacing_deadline = self.general_pacing_deadline(now);
             } else if let Some((rtt, cwnd)) = d.legacy_rate {
                 let spacing = (count as u128 * rtt as u128)
@@ -2713,23 +2779,22 @@ impl Connection {
             self.shrink_unanswered_since = Some(now);
             d.shrink = false;
         }
-        if sequence && !d.persist && !d.keepalive {
-            self.persist_probe_end = None;
-        }
-        if sequence && d.persist {
-            if count != 0 && d.persist_probe {
-                self.persist_probe_end = Some(Seq(d.start).wrapping_add(1));
-                d.persist_probe = false;
+        if d.persist && (sequence || finished) {
+            if self.snd_wnd == 0 {
+                if d.unanswered {
+                    self.persist_unanswered_since = Some(now);
+                }
+                if self.flight() != 0 {
+                    self.rto_deadline = Some(now.saturating_add(self.persist_interval));
+                } else {
+                    self.persist_deadline = Some(now.saturating_add(self.persist_interval));
+                }
+            } else if sequence && self.flight() != 0 {
+                // A real data retry accepted after reopening rejoins normal
+                // RTO management. An empty control cannot create that timer.
+                self.rto_deadline = Some(now.saturating_add(self.rto()));
             }
-            if d.unanswered {
-                self.persist_unanswered_since = Some(now);
-                d.unanswered = false;
-            }
-            if self.flight() != 0 {
-                self.rto_deadline = Some(now.saturating_add(self.persist_interval));
-            } else {
-                self.persist_deadline = Some(now.saturating_add(self.persist_interval));
-            }
+            d.unanswered = false;
             d.persist = false;
         }
         if d.keepalive {
@@ -2831,11 +2896,8 @@ impl Connection {
 
     pub(crate) fn validate_route_mtu(&self, now: Instant, mtu: Option<u32>) -> Result<(), Error> {
         self.check_time(now)?;
-        let range = if self.tuple.local.is_ipv4() {
-            68..=65535
-        } else {
-            1280..=65575
-        };
+        let ipv4 = self.tuple.local.is_ipv4();
+        let range = self.config.packetization_mtu_floor(ipv4)..=if ipv4 { 65535 } else { 65575 };
         if self.pmtud.is_none() || mtu.is_some_and(|mtu| !range.contains(&mtu)) {
             return Err(Error::InvalidArgument);
         }
@@ -3342,7 +3404,7 @@ impl Connection {
     //# Window Scale option is received with a shift.cnt value larger than
     //# 14, the TCP SHOULD log the error but MUST use 14 instead of the
     //# specified value.
-    fn learn_syn(&mut self, syn: &Segment<'_>, authenticated_syn: bool) {
+    fn learn_syn(&mut self, syn: &Segment<'_>, early_authorized: bool) {
         self.learn_ecn(syn.header.flags);
         self.sack_send |= self.config.sack && syn.options.sack_permitted;
         self.timestamps = self.config.timestamps && syn.options.timestamps.is_some();
@@ -3412,7 +3474,7 @@ impl Connection {
         let fin = syn.header.flags & FIN != 0 && syn.payload.len() < self.syn_window as usize;
         let urgent = (syn.header.flags & URG != 0 && syn.header.urgent_pointer > 1)
             .then(|| (syn.header.urgent_pointer - 1) as u64);
-        if !authenticated_syn {
+        if !early_authorized {
             if count == 0 && !fin && urgent.is_none() {
                 return;
             }
@@ -3660,6 +3722,7 @@ impl Connection {
         self.fast_open_retry = None;
         self.deferred_tfo_push = false;
         self.reason = Some(reason);
+        self.send.release_shared();
         self.events.closed = Some(reason);
         if reason != CloseReason::Aborted {
             self.pending_rst = None;
@@ -3678,7 +3741,6 @@ impl Connection {
         self.challenge_ack_pending = false;
         self.retx_pending = false;
         self.probe_pending = false;
-        self.persist_probe_end = None;
         self.keepalive_pending = false;
         self.rto_deadline = None;
         self.loss_timer = None;
@@ -3842,10 +3904,10 @@ impl Connection {
                 }
             }
         } else if !early_response {
-            self.persist_deadline = None;
             self.probe_pending = false;
             self.persist_interval = 0;
             self.persist_unanswered_since = None;
+            self.persist_deadline = None;
             if self.flight() != 0 && self.rto_deadline.is_none() && !self.retx_pending {
                 self.rto_deadline = Some(self.now.saturating_add(self.rto()));
             }
@@ -4108,6 +4170,22 @@ impl Connection {
         Ok(())
     }
 
+    pub(crate) fn prepare_shared_storage(&mut self, peak_room: usize) -> Result<(), Error> {
+        self.send
+            .prepare_shared(peak_room)
+            .map_err(|_| Error::NoMemory)
+    }
+
+    pub(crate) fn write_shared(
+        &mut self,
+        payload: crate::Payload,
+        more: bool,
+        end_of_record: bool,
+        lowat: Option<u32>,
+    ) -> Result<usize, Error> {
+        self.queue_write_input(&[], Some(payload), !more, more, end_of_record, lowat)
+    }
+
     fn queue_write(
         &mut self,
         data: &[u8],
@@ -4116,6 +4194,19 @@ impl Connection {
         end_of_record: bool,
         lowat: Option<u32>,
     ) -> Result<usize, Error> {
+        self.queue_write_input(data, None, push, more, end_of_record, lowat)
+    }
+
+    fn queue_write_input(
+        &mut self,
+        data: &[u8],
+        shared: Option<crate::Payload>,
+        push: bool,
+        more: bool,
+        end_of_record: bool,
+        lowat: Option<u32>,
+    ) -> Result<usize, Error> {
+        let input_len = shared.as_ref().map_or(data.len(), crate::Payload::len);
         if self.shutdown
             || !matches!(
                 self.state,
@@ -4124,19 +4215,24 @@ impl Connection {
         {
             return Err(Error::InvalidState);
         }
-        if data.is_empty() {
+        if input_len == 0 {
             self.send_issued = true;
             if push {
                 self.send.mark_push();
             }
             return Ok(0);
         }
-        self.prepare_send_metadata(data.len(), lowat, usize::MAX, None)?;
+        self.prepare_send_metadata(input_len, lowat, usize::MAX, None)?;
         let application_idle = !self.application_timer_needed();
         let idle = !self.user_timer_needed();
         let room = self.send_admission_room(lowat);
-        let count = self.send.write(&data[..data.len().min(room)]);
-        self.send_backpressured |= count < data.len();
+        let count = if let Some(payload) = shared {
+            self.send
+                .write_shared(payload.slice(0..input_len.min(room)).unwrap())
+        } else {
+            self.send.write(&data[..input_len.min(room)])
+        };
+        self.send_backpressured |= count < input_len;
         if count == 0 {
             return Err(Error::WouldBlock);
         }
@@ -4722,14 +4818,16 @@ impl Connection {
                     false,
                     0,
                 );
-                if self.fast_open.is_some() {
-                    self.fast_open_learned = Some((
-                        segment
-                            .options
-                            .fast_open
-                            .filter(|cookie| !cookie.as_bytes().is_empty()),
-                        self.peer_mss,
-                    ));
+                if self.fast_open.is_some()
+                    || self.fast_open_client_policy
+                        == crate::FastOpenClientPolicy::ApplicationProtected
+                {
+                    let cookie = self
+                        .fast_open_option_sent
+                        .then_some(segment.options.fast_open)
+                        .flatten()
+                        .filter(|cookie| !cookie.as_bytes().is_empty());
+                    self.fast_open_learned = Some((cookie, self.peer_mss));
                 }
                 self.establish();
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
@@ -5717,14 +5815,7 @@ impl Connection {
                     self.start_sack_recovery();
                 }
             }
-        } else if !advancing
-            && ack == self.snd_una
-            && self.data_flight() != 0
-            && segment.payload.is_empty()
-            && h.flags & FIN == 0
-            && self.snd_wnd == old_window
-            && self.snd_wnd != 0
-        {
+        } else if duplicate {
             self.duplicate_acks = self.duplicate_acks.saturating_add(1);
             //= https://www.rfc-editor.org/rfc/rfc3042#section-2
             //= reason=Non-SACK first two consecutive duplicates grant fresh output; advancing/ineligible ACKs reset the epoch. Wire tests assert fresh sequence, one packet per grant, cwnd invariance, and denial with exhausted window or queue. Negotiated SACK uses RFC6675 SetPipe, not a claim of one output packet per SACK ACK.
@@ -6162,6 +6253,7 @@ impl Connection {
             0
         };
         if bytes != 0 {
+            self.initial_pacing_open = false;
             self.send
                 .acknowledge(bytes as usize)
                 .expect("ACK is bounded by sent sequence space");
@@ -6186,12 +6278,6 @@ impl Connection {
             }
         }
         self.snd_una = ack;
-        if self
-            .persist_probe_end
-            .is_some_and(|end| at_or_after(ack, end))
-        {
-            self.persist_probe_end = None;
-        }
         if let Some((start, end)) = self.fast_open_retry {
             self.fast_open_retry = if at_or_after(ack, end) {
                 None
@@ -7185,12 +7271,42 @@ impl Connection {
         self.transmit_selected_with_gso(now, out, reserve, None)
     }
 
+    pub(crate) fn transmit_shared_selected(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        payload: &mut Vec<crate::Payload>,
+    ) -> Result<Option<usize>, Error> {
+        payload.clear();
+        if payload.capacity() == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        self.send.set_shared_output(Some(payload.capacity()));
+        let result = self.transmit_selected_payload(now, out, true, None, Some(&mut *payload));
+        self.send.set_shared_output(None);
+        if result.is_err() {
+            payload.clear();
+        }
+        result
+    }
+
     pub(crate) fn transmit_selected_with_gso(
         &mut self,
         now: Instant,
         out: &mut [u8],
         reserve: bool,
+        gso: Option<crate::output_reservation::GsoBuffer<'_>>,
+    ) -> Result<Option<usize>, Error> {
+        self.transmit_selected_payload(now, out, reserve, gso, None)
+    }
+
+    fn transmit_selected_payload(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        reserve: bool,
         mut gso: Option<crate::output_reservation::GsoBuffer<'_>>,
+        mut shared: Option<&mut Vec<crate::Payload>>,
     ) -> Result<Option<usize>, Error> {
         self.check_time(now)?;
         if self.local_resource.is_some_and(|r| r.retry_at.is_some()) {
@@ -7223,6 +7339,19 @@ impl Connection {
             && self.retx_pending
             && self.flight() != 0;
         let probe = reset.is_none() && !syn && live && self.probe_pending;
+        // An old-sequence control elicits a window reply, but cannot deliver
+        // a new urgent pointer. First notify URG at the acceptable sequence;
+        // the unchanged probe obligation then emits the old-sequence control.
+        // Compare the encodable pointer edge so long urgent runs stay bounded.
+        let urgent_probe = probe
+            && self.flight() == 0
+            && self.snd_up.is_some_and(|end| {
+                let distance = end.distance_from(self.snd_una);
+                let edge = self.snd_una.wrapping_add(distance.min(u16::MAX as u32));
+                distance != 0
+                    && distance < 1 << 31
+                    && self.advertised_snd_up.is_none_or(|old| after(edge, old))
+            });
         let tlp = reset.is_none()
             && !syn
             && live
@@ -7417,6 +7546,9 @@ impl Connection {
             options[option_len..option_len + 4].copy_from_slice(&[1, 3, 3, self.local_scale]);
             option_len += 4;
         }
+        //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+        //= reason=Supplied cookies use the existing first-SYN-only data/option selection; actual timer retry drops both and preserves service failure evidence.
+        //# To deal with network or servers dropping SYN packets with payload or unknown options, when the SYN timer fires, the client SHOULD retransmit a SYN packet without data and Fast Open options.
         let fast_open_option = if syn && self.snd_nxt == self.iss && !self.syn_timed_out {
             self.fast_open.filter(|cookie| {
                 let padded = (option_len + cookie.as_bytes().len() + 2 + 3) & !3;
@@ -7425,6 +7557,9 @@ impl Connection {
         } else {
             None
         };
+        //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
+        //= reason=Early-send credentials remain serialized in a kind34 option; output selects SYN data only when the option fits, and admission applies known-peer or conservative default MSS.
+        //# Otherwise, include the Fast Open option with the cookie of the server. Include any data up to the cached server MSS or default 536 bytes.
         if let Some(cookie) = fast_open_option {
             let bytes = cookie.as_bytes();
             let length = bytes.len() + 2;
@@ -7499,7 +7634,10 @@ impl Connection {
         } else {
             u32::MAX
         };
-        let retry_mss = self
+        // New data accompanying an upward probe retains the current MSS.
+        // Repair copies use the smaller search floor so a failed large
+        // probe can still be delivered and classified.
+        let repair_mss = self
             .pmtud
             .as_ref()
             .filter(|p| p.probe.is_some())
@@ -7515,17 +7653,43 @@ impl Connection {
                         .max(1) as usize,
                 )
             });
-        let wire_mss = retry_mss
-            .saturating_sub(sack_option_len)
-            .min((self.path_payload_limit()).saturating_sub(20 + option_len));
-        let packet_mss = wire_mss
-            // With zero credit, retain a plan so the transactional gate reports
-            // exhaustion instead of consuming the pending output obligation.
-            .min(if timestamp_credit == 0 {
-                usize::MAX
-            } else {
-                timestamp_credit as usize
-            });
+        // Shared output writes only headers, but the caller's complete-packet
+        // capacity still bounds the selected wire span. No header-only encoder
+        // error may silently bypass a backend's packet-size bound.
+        let output_limit = if shared.is_some() {
+            out.len()
+        } else {
+            usize::MAX
+        };
+        let payload_mss = |mss: usize| {
+            mss.saturating_sub(sack_option_len).min(
+                self.path_payload_limit()
+                    .min(output_limit)
+                    .saturating_sub(20 + option_len),
+            )
+        };
+        // A probe below the current estimate is validating an uncertain
+        // baseline: keep its surrounding packets at the safe lower bound.
+        // Larger ordinary packets could otherwise invalidate an isolated
+        // probe-loss inference. Upward probes need no such reduction.
+        let ordinary_mss = if self.pmtud.as_ref().is_some_and(|p| {
+            p.probe
+                .is_some_and(|probe| probe.size <= p.info.current_mtu)
+        }) {
+            repair_mss
+        } else {
+            self.mss
+        };
+        let wire_mss = payload_mss(ordinary_mss);
+        // With zero credit, retain a plan so the transactional gate reports
+        // exhaustion instead of consuming the pending output obligation.
+        let timestamp_limit = if timestamp_credit == 0 {
+            usize::MAX
+        } else {
+            timestamp_credit as usize
+        };
+        let packet_mss = wire_mss.min(timestamp_limit);
+        let repair_packet_mss = payload_mss(repair_mss).min(timestamp_limit);
         let mut burst_push = false;
         let mut sack_segment = None;
         if reset.is_none()
@@ -7545,7 +7709,7 @@ impl Connection {
                 if credit != 0 {
                     sack_segment = self
                         .rack
-                        .lowest_lost((packet_mss as u32).min(credit))
+                        .lowest_lost((repair_packet_mss as u32).min(credit))
                         .map(|(left, right)| (left, right, false, recovery.entry_pending));
                 }
             } else if recovery.entry_pending {
@@ -7558,7 +7722,7 @@ impl Connection {
                     self.snd_una.wrapping_add(
                         self.data_high()
                             .distance_from(self.snd_una)
-                            .min(packet_mss as u32),
+                            .min(repair_packet_mss as u32),
                     ),
                 ));
                 sack_segment = range.map(|(left, right)| (left, right, false, true));
@@ -7586,7 +7750,7 @@ impl Connection {
                     if let Some((left, right)) = self.scoreboard.lowest_hole(
                         recovery.high_rxt,
                         self.data_high(),
-                        packet_mss as u32,
+                        repair_packet_mss as u32,
                         false,
                     ) {
                         sack_segment = Some((left, right, false, false));
@@ -7596,7 +7760,7 @@ impl Connection {
                     {
                         sack_segment = self
                             .scoreboard
-                            .tail_hole(self.snd_una, self.data_high(), packet_mss as u32)
+                            .tail_hole(self.snd_una, self.data_high(), repair_packet_mss as u32)
                             .map(|(left, right)| {
                                 let offset = self.send.tail_record_offset(
                                     left.distance_from(self.send_base) as usize,
@@ -7629,7 +7793,7 @@ impl Connection {
         {
             sack_segment = self
                 .rack
-                .lowest_lost((packet_mss as u32).min(prr.credit()))
+                .lowest_lost((repair_packet_mss as u32).min(prr.credit()))
                 .map(|(left, right)| (left, right, false, false));
         }
         // RFC 6675 §5.1 recommends filling the newly reported holes after an
@@ -7646,10 +7810,14 @@ impl Connection {
             && self.congestion.cwnd().saturating_sub(self.post_rto_pipe()) >= self.mss as u32
         {
             if self.rack_enabled() {
-                self.rack.lowest_lost(packet_mss as u32)
+                self.rack.lowest_lost(repair_packet_mss as u32)
             } else {
-                self.scoreboard
-                    .lowest_hole(high_rxt, self.data_high(), packet_mss as u32, false)
+                self.scoreboard.lowest_hole(
+                    high_rxt,
+                    self.data_high(),
+                    repair_packet_mss as u32,
+                    false,
+                )
             }
         } else {
             None
@@ -7667,7 +7835,12 @@ impl Connection {
             seq = self.iss;
             flags = SYN | if self.irs.is_some() { ACK } else { 0 };
             retransmitted = self.snd_nxt != self.iss;
-            if self.state == State::SynSent && !retransmitted && fast_open_option.is_some() {
+            if self.state == State::SynSent
+                && !retransmitted
+                && (fast_open_option.is_some()
+                    || self.fast_open_client_policy
+                        == crate::FastOpenClientPolicy::ApplicationProtected)
+            {
                 let limit = self
                     .fast_open_initial
                     .min(packet_mss)
@@ -7701,7 +7874,7 @@ impl Connection {
             count = self.send.copy(
                 seq.distance_from(self.send_base) as usize,
                 &mut self.scratch[..(right.distance_from(left) as usize)
-                    .min(packet_mss)
+                    .min(repair_packet_mss)
                     .min(credit as usize)],
             );
             retransmitted = count != 0;
@@ -7729,7 +7902,7 @@ impl Connection {
                     flags |= FIN;
                     retransmitted = true;
                 }
-            } else if let Some((left, right)) = self.rack.tail_segment(packet_mss as u32) {
+            } else if let Some((left, right)) = self.rack.tail_segment(repair_packet_mss as u32) {
                 seq = left;
                 let limit = self.retry_limit(left, right.distance_from(left)) as usize;
                 count = self.send.copy(
@@ -7762,9 +7935,21 @@ impl Connection {
             }
             count = self.send.copy(
                 start.distance_from(self.send_base) as usize,
-                &mut self.scratch[..limit.min(packet_mss).min(credit as usize)],
+                &mut self.scratch[..limit.min(repair_packet_mss).min(credit as usize)],
             );
             retransmitted = count != 0;
+        } else if probe && self.flight() == 0 {
+            // Empty-flight window discovery must not create an unacknowledged
+            // stream byte. An old-sequence ACK elicits the peer's current ACK
+            // and window, without advancing NXT or entering the loss ledger.
+            // This selects Linux-style control probing rather than RFC9293
+            // section3.8.6.1's data-octet description; ordinary outstanding
+            // data below retains its actual retransmission and RTO history.
+            seq = if urgent_probe {
+                self.snd_una
+            } else {
+                self.snd_una.wrapping_add(u32::MAX)
+            };
         } else if retransmit || probe {
             seq = self.snd_una;
             let offset = seq.distance_from(self.send_base) as usize;
@@ -7801,7 +7986,7 @@ impl Connection {
                 } else {
                     self.flight()
                 };
-                self.retry_limit(seq, (packet_mss as u32).min(boundary)) as usize
+                self.retry_limit(seq, (repair_packet_mss as u32).min(boundary)) as usize
             };
             let limit = if probe {
                 limit
@@ -7947,6 +8132,12 @@ impl Connection {
             } else {
                 self.snd_wnd.min(cwnd_limit).saturating_sub(self.flight()) as usize
             };
+            let initial_room = self.initial_pacing_room();
+            let usable = if initial_room != 0 {
+                usable.min(initial_room as usize)
+            } else {
+                usable
+            };
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
             //# However, a TCP implementation SHOULD send a maximum-sized segment
             //# whenever possible (SHLD-28) to improve performance (see Section
@@ -8042,10 +8233,12 @@ impl Connection {
                             + u32::from(self.ip_header_len)
                     && payload > 0
                     && payload <= self.scratch.len()
+                    && payload <= output_limit.saturating_sub(20 + option_len)
                     && usable >= needed
                     && paced
                     && unsent >= needed
                     && timestamp_credit as usize >= payload
+                    && self.send.selection_len(offset, payload) == payload
                     && self.send.record_len(offset, payload) == payload)
                     .then_some((size, payload, trailing))
             });
@@ -8053,7 +8246,10 @@ impl Connection {
             let packet_mss = candidate.map_or(packet_mss, |(_, payload, _)| payload);
             let record = self.send.record_len(offset, unsent.min(wire_mss));
             count = record.min(packet_mss).min(usable);
-            pmtu_probe = candidate;
+            let selected = self.send.selection_len(offset, count);
+            let descriptor_limited = selected < count;
+            count = selected;
+            pmtu_probe = candidate.filter(|(_, payload, _)| count == *payload);
             let flush_credit = self
                 .cork_flush
                 .filter(|&end| after(end, self.snd_nxt))
@@ -8074,15 +8270,12 @@ impl Connection {
                 } else {
                     self.flight()
                 };
-                let nagle = !flushing
-                    && !final_fin
-                    && self.config.nagle
-                    && nagle_flight != 0
-                    && !self.persist_reopen_nagle_exception();
+                let nagle = !flushing && !final_fin && self.config.nagle && nagle_flight != 0;
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.2.1
                 //# A TCP implementation MUST include a SWS avoidance algorithm in the
                 //# sender (MUST-38).
                 let sws = !flushing
+                    && !descriptor_limited
                     && !self.sws_override
                     && count < record
                     && count < (self.max_snd_wnd / 2) as usize;
@@ -8252,7 +8445,8 @@ impl Connection {
                     .saturating_add(count as u32),
             )
         });
-        if self.sack_receive && retransmit_burst.is_some_and(|(_, bytes)| bytes > packet_mss as u32)
+        if self.sack_receive
+            && retransmit_burst.is_some_and(|(_, bytes)| bytes > repair_packet_mss as u32)
         {
             let offset = seq.distance_from(self.send_base) as usize;
             let end = seq.wrapping_add(count as u32);
@@ -8328,9 +8522,8 @@ impl Connection {
             && !probe
             && !keepalive
             && count != 0;
-        // Persist can be the first data-bearing output after an idle period.
-        // Share the actual restart decision with feedback and burst tracking;
-        // probe packets themselves remain ineligible for ECT/CWR.
+        // Only actual stream output can restart an idle data flight. An
+        // empty window probe preserves idle age and deferred ECN feedback.
         let idle_restart = !keepalive
             && count != 0
             && self.flight() == 0
@@ -8568,14 +8761,32 @@ impl Connection {
             s.terminal_flags = flags;
             wire_header.flags &= !PSH;
         }
-        let size = wire::encode(
-            ip,
-            wire_header,
-            &options[..option_len],
-            &self.scratch[..wire_count],
-            out,
-        )
-        .map_err(|error| {
+        let shared_payload = if count != 0 && !keepalive {
+            shared
+                .as_deref_mut()
+                .is_some_and(|parts| self.send.shared_slices(offset, wire_count, parts))
+        } else {
+            false
+        };
+        let encoded = if shared_payload {
+            wire::encode_shared(
+                ip,
+                wire_header,
+                &options[..option_len],
+                shared.as_deref().unwrap(),
+                out,
+            )
+            .map(|n| n + wire_count)
+        } else {
+            wire::encode(
+                ip,
+                wire_header,
+                &options[..option_len],
+                &self.scratch[..wire_count],
+                out,
+            )
+        };
+        let size = encoded.map_err(|error| {
             if error == wire::WireError::OutputTooSmall {
                 Error::OutputTooSmall
             } else {
@@ -8629,9 +8840,12 @@ impl Connection {
             self.syn_data_fully_acked |= passive_syn_data_acked;
         }
         self.reserved_ledger = None;
-        let persist_probe =
-            probe && count == 1 && !retransmitted && self.flight() == 0 && self.snd_wnd == 0;
+        let initial_burst = fresh_data
+            && count != 0
+            && pmtu_probe.is_none()
+            && self.initial_pacing_room() >= count as u32;
         self.last_departure = reserve.then_some(Departure {
+            initial_burst,
             data_ack,
             defer_push: self.repair_undo.is_some()
                 && flags & PSH != 0
@@ -8646,7 +8860,12 @@ impl Connection {
             stream: count != 0 && !keepalive,
             syn,
             syn_timestamp: timestamp.map(|(value, _)| value),
-            fast_open: fast_open_option.is_some() && !self.passive_open,
+            fast_open: !self.passive_open
+                && (fast_open_option.is_some()
+                    || self.fast_open_client_policy
+                        == crate::FastOpenClientPolicy::ApplicationProtected
+                        && count != 0),
+            fast_open_option: fast_open_option.is_some() && !self.passive_open,
             fin: flags & FIN != 0,
             rto: !keepalive
                 && !probe
@@ -8659,14 +8878,13 @@ impl Connection {
                     .map(|(_, sent)| sent.saturating_add(self.rto()))
             }),
             tlp: (fresh_data || new_fin) && !tlp,
-            persist: probe,
-            persist_probe,
+            persist: probe && !urgent_probe,
             keepalive,
             shrink: retransmit
                 && self.shrink_unanswered_since.is_none()
                 && self.snd_wnd != 0
                 && self.flight() > self.snd_wnd,
-            unanswered: probe && self.persist_unanswered_since.is_none(),
+            unanswered: probe && !urgent_probe && self.persist_unanswered_since.is_none(),
             bypass: probe
                 || tlp
                 || keepalive
@@ -8674,6 +8892,10 @@ impl Connection {
                 || (retransmit && self.consecutive_timeouts != 0 && self.prr.is_none()),
             ..Departure::default()
         });
+        // Protocol payload/probes must not reopen an ordinary startup epoch.
+        if count != 0 && (!fresh_data || pmtu_probe.is_some() || !self.handshake_complete()) {
+            self.initial_pacing_open = false;
+        }
         self.last_pmtu_output = None;
         if let Some(p) = &mut self.pmtud {
             if let Some((size, payload, trailing)) = pmtu_probe {
@@ -8717,9 +8939,7 @@ impl Connection {
                 self.congestion.limit_restart(self.mss as u32);
             }
         }
-        if self.config.initial_window == InitialWindow::Iw10
-            && (fresh_data || probe && idle_restart)
-        {
+        if self.config.initial_window == InitialWindow::Iw10 && fresh_data {
             if !self.iw_started || idle_restart {
                 self.iw_epoch = Some(IwEpoch {
                     start: seq,
@@ -8735,9 +8955,7 @@ impl Connection {
                 && epoch.open
             {
                 epoch.end = seq.wrapping_add(count as u32);
-                // Include the initiating probe's real byte once; retransmitted
-                // probes do not enter this block. Its ACK alone cannot close
-                // the ordinary data flight that will follow it.
+                // Only unique new stream bytes contribute to the IW epoch.
                 epoch.bytes = epoch.bytes.saturating_add(count as u32);
                 if fresh_data {
                     epoch.fresh_start.get_or_insert(seq);
@@ -8889,8 +9107,8 @@ impl Connection {
         //# Therefore, a TCP SHOULD set cwnd to no more than RW before beginning transmission
         //# if the TCP has not sent data in an interval exceeding the retransmission timeout.
         if idle_restart {
-            self.congestion.restart_after_idle();
-            self.congestion.limit_restart(self.restart_window());
+            let window = self.restart_window();
+            self.congestion.restart_after_idle(window);
         }
         if !challenge {
             if count != 0 && !keepalive {
@@ -8948,8 +9166,13 @@ impl Connection {
         }
         let length = count as u32 + u32::from(flags & SYN != 0) + u32::from(flags & FIN != 0);
         if syn && !reserve {
-            self.fast_open_attempt |=
-                fast_open_option.is_some() && !self.passive_open && !self.syn_committed;
+            self.fast_open_attempt |= !self.passive_open
+                && !self.syn_committed
+                && (fast_open_option.is_some()
+                    || self.fast_open_client_policy
+                        == crate::FastOpenClientPolicy::ApplicationProtected
+                        && count != 0);
+            self.fast_open_option_sent |= fast_open_option.is_some() && !self.passive_open;
             self.record_syn_departure(timestamp.map(|(value, _)| value));
             self.syn_payload_sent = self.syn_payload_sent.max(count);
             self.rack
@@ -9029,16 +9252,11 @@ impl Connection {
                 self.shrink_unanswered_since.get_or_insert(now);
             }
         }
-        if !reserve && (count != 0 && !keepalive || new_fin) {
-            if persist_probe {
-                self.persist_probe_end = Some(seq.wrapping_add(1));
-            } else if !probe {
-                self.persist_probe_end = None;
-            }
-        }
-        if probe {
+        if probe && !urgent_probe {
             self.probe_pending = false;
-            self.persist_unanswered_since.get_or_insert(now);
+            if !reserve {
+                self.persist_unanswered_since.get_or_insert(now);
+            }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
             //= reason=arm_work starts at the current RTO; each emitted probe doubles the interval up to the timer cap.
             //# The transmitting host SHOULD send the first zero-window probe when a
@@ -9102,7 +9320,7 @@ impl Connection {
         if count != 0 && !syn && !keepalive {
             self.congestion.on_startup_sent(
                 self.snd_nxt,
-                self.pacing_enabled() && !probe && !tlp && !retransmit,
+                self.pacing_enabled() && !initial_burst && !probe && !tlp && !retransmit,
             );
         }
         self.arm_work();
@@ -9124,7 +9342,16 @@ impl Connection {
             if let Some(departure) = &mut self.last_departure {
                 departure.interval = Some(interval);
             } else {
-                self.pacer.sent(now, count, interval);
+                if initial_burst {
+                    self.pacer.startup_sent(
+                        now,
+                        count,
+                        interval,
+                        pacing.max_burst_segments * self.mss as u32,
+                    );
+                } else {
+                    self.pacer.sent(now, count, interval);
+                }
                 self.pacing_deadline = self.general_pacing_deadline(now);
             }
         } else if count != 0 && !syn && !keepalive && self.pacing_enabled() {
@@ -9151,11 +9378,44 @@ impl Connection {
         self.config.pacing.is_some() || (self.config.prr && self.config.prr_pacing)
     }
 
+    fn initial_pacing_room(&self) -> u32 {
+        if !self.initial_pacing_open
+            || !self
+                .config
+                .pacing
+                .is_some_and(|p| p.initial_window_burst && p.max_bytes_per_second.is_none())
+            || !self.handshake_complete()
+            || !matches!(self.state, State::Established | State::CloseWait)
+            || self.congestion.in_recovery()
+            || self.congestion.in_ecn_response(self.snd_una)
+            || self.congestion.ecn_prr_end().is_some()
+            || self.prr.is_some()
+            || self.sack_recovery.is_some()
+            || self.sack_post_rto.is_some()
+            || self.limited_pending
+            || self.retx_pending
+            || self.probe_pending
+            || self.tlp_pending
+            || self.consecutive_timeouts != 0
+            || self.pmtud.as_ref().is_some_and(|p| p.probe.is_some())
+        {
+            return 0;
+        }
+        // Before the first data ACK this serial distance is unique initial
+        // payload, including any already selected immutable reservation.
+        self.initial_window()
+            .min(self.congestion.cwnd())
+            .saturating_sub(self.snd_nxt.distance_from(self.iss.wrapping_add(1)))
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.4
-    //= reason=Opt-in PacingConfig gates ordinary/startup and recovery data independently of PRR or Reno/CUBIC. Fractional byte debt bounds startup/idle/late-poll bursts to max_burst_segments effective MSS; successful output alone consumes bytes. cwnd/SRTT times configured gain (RTO fallback), optional caller-unit-correct byte-rate cap, and retained debt across rate changes drive existing next_deadline/timeout wakeups. Protocol-control/probe exemptions remain scoped at transmit; no future-launch or QUIC compliance is claimed. general_pacing tests cover fractional output, bounds, rates, recovery, rollback and saturation; legacy pacing tests cover None unchanged.
+    //= reason=Opt-in PacingConfig gates ordinary/startup and recovery data independently of PRR or Reno/CUBIC. Fractional byte debt bounds ordinary/idle/late-poll bursts to max_burst_segments effective MSS; the one-time configured initial flight is IW/window-bounded and recorded as unpaced; successful output alone consumes bytes. cwnd/SRTT times configured gain (RTO fallback), optional caller-unit-correct byte-rate cap, and retained debt across rate changes drive existing next_deadline/timeout wakeups. Protocol-control/probe exemptions remain scoped at transmit; no future-launch or QUIC compliance is claimed. general_pacing tests cover fractional output, bounds, rates, recovery, rollback and saturation; legacy pacing tests cover None unchanged.
     //# It is RECOMMENDED that implementations use pacing to reduce the
     //# burstiness of data traffic.
     fn general_pacing_deadline(&self, now: Instant) -> Option<Instant> {
+        if self.initial_pacing_room() != 0 {
+            return None;
+        }
         self.config.pacing.and_then(|p| {
             self.pacer
                 .deadline(now, p.max_burst_segments * self.mss as u32, self.mss)
@@ -9167,6 +9427,7 @@ impl Connection {
     }
 
     fn note_iw_loss(&mut self, start: Seq) {
+        self.initial_pacing_open = false;
         if let Some(epoch) = &mut self.iw_epoch
             && at_or_after(start, epoch.start)
             && after(epoch.end, start)
@@ -9521,8 +9782,8 @@ impl Connection {
             self.reset_limited_transmit();
             self.rto_deadline = None;
             self.sample = None;
-            self.persist_probe_end = None;
             self.rtt.backoff();
+            self.initial_pacing_open = false;
             self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
             let cooldown = self.pmtu_cooldown();
             if let Some(p) = &mut self.pmtud {
@@ -9673,10 +9934,10 @@ mod tests {
         assert_eq!(a.loss_timer.unwrap().0, LossTimer::Zwp);
         let expiry = a.loss_timer.unwrap().1;
         a.timeout(expiry).unwrap();
-        assert_eq!(a.transmit(expiry, &mut [0; 20]), Err(Error::OutputTooSmall));
+        assert_eq!(a.transmit(expiry, &mut [0; 19]), Err(Error::OutputTooSmall));
         assert_eq!(a.loss_timer, None);
         packet(&mut a, expiry);
-        assert_eq!(a.loss_timer.unwrap().0, LossTimer::Rto); // now outstanding
+        assert_eq!(a.loss_timer.unwrap().0, LossTimer::Zwp); // control created no flight
         let high = a.snd_nxt;
         inject(&mut a, expiry + 1, seq, high, ACK, 64, &[]);
         assert_eq!(a.loss_timer, None);
@@ -11028,34 +11289,19 @@ mod tests {
                 a.timeout(210_000).unwrap();
                 let bytes = packet(&mut a, 210_000);
                 let probe = wire::parse(ip(tuple()), &bytes).unwrap();
-                assert_eq!((probe.header.sequence, probe.payload.len()), (101, 1));
-                assert_eq!(a.snd_nxt, Seq(102));
+                assert_eq!((probe.header.sequence, probe.payload.len()), (100, 0));
+                assert_eq!(a.snd_nxt, Seq(101));
                 assert_eq!(a.congestion.cwnd(), 10_000);
             }
             // Both event orders share the script's 200ms reopen/probe boundary.
             inject(&mut a, 210_000, Seq(901), Seq(101), ACK, 2000, &[]);
             assert_eq!(a.snd_wnd, 2000);
             assert!(!a.probe_pending);
-            assert_eq!(a.persist_deadline, None);
             assert_eq!(a.transport_info().rwnd_limited_us, 200_000);
-            if probe_first {
-                // The probe remains unacknowledged; the scoped Nagle departure
-                // admits only the fresh tail, without retransmitting its byte.
-                assert!(a.config.nagle);
-                assert_eq!((a.snd_una, a.snd_nxt, a.flight()), (Seq(101), Seq(102), 1));
-                assert_eq!(a.transport_info().notsent_bytes, 999);
-                let bytes = packet(&mut a, 210_000);
-                let tail = wire::parse(ip(tuple()), &bytes).unwrap();
-                assert_eq!((tail.header.sequence, tail.payload.len()), (102, 999));
-                assert_eq!(tail.header.flags, PSH | ACK);
-                assert_eq!(a.snd_una, Seq(101));
-                assert_eq!(a.consecutive_timeouts, 0);
-            } else {
-                let bytes = packet(&mut a, 210_000);
-                let data = wire::parse(ip(tuple()), &bytes).unwrap();
-                assert_eq!((data.header.sequence, data.payload.len()), (101, 1000));
-                assert_eq!(data.header.flags, PSH | ACK);
-            }
+            let bytes = packet(&mut a, 210_000);
+            let data = wire::parse(ip(tuple()), &bytes).unwrap();
+            assert_eq!((data.header.sequence, data.payload.len()), (101, 1000));
+            assert_eq!(data.header.flags, PSH | ACK);
             let first_ack_at = 240_000;
             inject(&mut a, first_ack_at, Seq(901), Seq(1101), ACK, 10, &[]);
             a.write(&[2; 1000]).unwrap();
@@ -22770,7 +23016,7 @@ mod tests {
         assert_eq!(a.persist_deadline, None);
         assert!(a.probe_pending);
         assert_eq!(
-            a.transmit(deadline, &mut [0; 20]),
+            a.transmit(deadline, &mut [0; 19]),
             Err(Error::OutputTooSmall)
         );
         assert_eq!(a.persist_interval, first_rto);
@@ -23914,7 +24160,7 @@ mod tests {
             let deadline = a.loss_timer.unwrap().1;
             a.timeout(deadline).unwrap();
             let bytes = deliver(&mut a, &mut b, deadline);
-            assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 1);
+            assert_eq!(wire::parse(ip(tuple()), &bytes).unwrap().payload.len(), 0);
             b.timeout(deadline).unwrap();
             let bytes = deliver(&mut b, &mut a, deadline);
             assert_eq!(
@@ -24276,12 +24522,15 @@ mod tests {
             a.ecn_cwr_pending = enabled;
             let bytes = packet(&mut a, deadline);
             let mut probe = wire::parse(ip(tuple()), &bytes).unwrap();
-            assert_eq!(probe.payload.len(), 1);
+            assert_eq!(probe.payload.len(), 0);
             assert_eq!(a.last_output_ecn(), 0);
             assert_eq!(probe.header.flags & CWR, 0);
             assert_eq!(a.ecn_cwr_pending, enabled);
             let next = b.receive.next();
-            assert_eq!(probe.header.sequence, next.0);
+            assert_eq!(probe.header.sequence, next.wrapping_add(u32::MAX).0);
+            // Our empty old-sequence control does not admit stream data.
+            // Still accept and validate data-octet probes used by other peers.
+            probe.payload = &[2];
             for (seq, ack, flags) in [
                 (next.wrapping_add(1).0, b.snd_una.0, ACK),
                 (next.wrapping_add(u32::MAX).0, b.snd_una.0, ACK),
@@ -29330,6 +29579,9 @@ mod tests {
 
     mod route_mtu {
         include!("connection_route_mtu_tests.rs");
+        mod conservative_ipv6 {
+            include!("connection_ipv6_packetization_tests.rs");
+        }
     }
 
     mod pmtud_config {

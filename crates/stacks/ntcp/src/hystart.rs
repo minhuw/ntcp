@@ -3,6 +3,11 @@ use core::cmp::Ordering;
 
 use crate::{connection::CallerTimebase, seq::Seq};
 
+// Explicit non-paced startup policy: admit credit for coalesced ACKs up to
+// sixteen segments. RFC9406 section4.3 permits tuning its recommended eight;
+// this trades a larger bounded burst for faster stretch-ACK window growth.
+const UNPACED_ACK_LIMIT: u32 = 16;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StartupAck {
     pub(crate) rtt: Option<u64>,
@@ -52,7 +57,7 @@ impl HyStart {
     // The boundary ACK belongs to the round it completes. An empty-flight
     // boundary is armed from committed SND.NXT on the next arriving ACK.
     //= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
-    //= reason=Fixed published constants are applied below; no deployment-specific tuning profile is selected.
+    //= reason=Published RTT/CSS constants retained; non-paced L is explicitly tuned to16 under section4.3, independently of actual pacing provenance.
     //# MIN_RTT_THRESH = 4 msec
     //# MAX_RTT_THRESH = 16 msec
     //# MIN_RTT_DIVISOR = 8
@@ -61,9 +66,13 @@ impl HyStart {
     //# CSS_ROUNDS = 5
     //# L = infinity if paced, L = 8 if non-paced
     //= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
-    //= reason=Fixed published constants are applied below; no deployment-specific tuning profile is selected.
+    //= reason=Published RTT/CSS constants retained; non-paced L is explicitly tuned to16 under section4.3, independently of actual pacing provenance.
     //# It is RECOMMENDED that a HyStart++ implementation use the following
     //# constants:
+    //= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
+    //= reason=Selected L16 tuning improves credit for coalesced ACKs while retaining a finite non-paced bound. Larger bursts and loss are a policy tradeoff, not a claim of measured performance improvement.
+    //# An implementation MAY tune them for different
+    //# network characteristics.
     pub(crate) fn ack(
         &mut self,
         ack: Seq,
@@ -82,14 +91,14 @@ impl HyStart {
         //# set to SND.NXT.
         let end = *self.window_end.get_or_insert(context.snd_nxt);
         //= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
-        //= reason=Eligible newly acknowledged bytes are capped at eight SMSS unless actually paced, including bypass-flight tracking.
+        //= reason=Eligible newly acknowledged bytes use tuned L=16 unless actually paced; bypassed output retains the finite limit.
         //# The following pseudocode uses a limit, L, to control the
         //# aggressiveness of the cwnd increase during both standard slow start
         //# and CSS.  While an arriving ACK may newly acknowledge an arbitrary
         //# number of bytes, the HyStart++ algorithm limits the number of those
         //# bytes applied to increase the cwnd to L*SMSS bytes.
         //= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
-        //= reason=Eligible newly acknowledged bytes are capped at eight SMSS unless actually paced, including bypass-flight tracking.
+        //= reason=Eligible newly acknowledged bytes use tuned L=16 unless actually paced; bypassed output retains the finite limit.
         //# For each arriving ACK in slow start, where N is the number of
         //# previously unacknowledged bytes acknowledged in the arriving ACK:
         //#
@@ -97,13 +106,13 @@ impl HyStart {
         //#
         //# cwnd = cwnd + min(N, L * SMSS)
         //= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
-        //= reason=Eligible newly acknowledged bytes are capped at eight SMSS unless actually paced, including bypass-flight tracking.
+        //= reason=Eligible newly acknowledged bytes use tuned L=16 unless actually paced; bypassed output retains the finite limit.
         //# A paced TCP implementation SHOULD use L =
         //# infinity.
         let bytes = if context.paced && self.unpaced_end.is_none() {
             eligible_bytes
         } else {
-            eligible_bytes.min(mss.saturating_mul(8))
+            eligible_bytes.min(mss.saturating_mul(UNPACED_ACK_LIMIT))
         };
         if self.unpaced_end.is_some_and(|end| {
             matches!(

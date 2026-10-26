@@ -650,7 +650,7 @@ fn fast_open_cache_enable_budget_exact_fit_and_idempotence() {
     let charge = FastOpen::allocation_bytes();
     assert_eq!(
         charge,
-        64 * (core::mem::size_of::<crate::fast_open::CachedCookie>()
+        64 * (core::mem::size_of::<crate::fast_open::CachedPeer>()
             + core::mem::size_of::<crate::fast_open::NegativeService>())
     );
     let (local, remote) = addresses(false, 40001);
@@ -1961,4 +1961,11 @@ fn clear_client_cache_explicitly_discards_service_failure_and_does_not_enable_se
         deliver(&mut a, 120, &cache_reply(&syn, 940, Some(&[9; 8])));
         assert!(a.can_defer_fast_open(120, local.ip(), remote).unwrap());
     }
+}
+
+#[path = "fast_open_server_cookie_tests.rs"]
+mod server_cookie;
+
+mod client_policy {
+    include!("fast_open_client_policy_tests.rs");
 }

@@ -997,3 +997,6 @@ fn passive_abandon_listener_cleanup_does_not_rearm_closed_or_reused_listener() {
     );
     assert_eq!(endpoint.next_event(), None);
 }
+
+#[path = "fast_open_early_data_policy_tests.rs"]
+mod early_data_policy;

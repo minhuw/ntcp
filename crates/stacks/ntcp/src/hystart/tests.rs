@@ -30,7 +30,7 @@ fn round(h: &mut HyStart, base: Seq, rtt: u64, ticks: u64) -> bool {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
 //= type=test
-//= reason=Together with threshold and cap/division tests, asserts published fixed constants, five-round limit including partial entry, wrap and us/ns clocks.
+//= reason=Together with threshold and cap/division tests, asserts published RTT/CSS constants and selected L16 tuning, five-round limit including partial entry, wrap and us/ns clocks.
 //# MIN_RTT_THRESH = 4 msec
 //# MAX_RTT_THRESH = 16 msec
 //# MIN_RTT_DIVISOR = 8
@@ -40,7 +40,7 @@ fn round(h: &mut HyStart, base: Seq, rtt: u64, ticks: u64) -> bool {
 //# L = infinity if paced, L = 8 if non-paced
 //= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
 //= type=test
-//= reason=Together with threshold and cap/division tests, asserts published fixed constants, five-round limit including partial entry, wrap and us/ns clocks.
+//= reason=Together with threshold and cap/division tests, asserts published RTT/CSS constants and selected L16 tuning, five-round limit including partial entry, wrap and us/ns clocks.
 //# It is RECOMMENDED that a HyStart++ implementation use the following
 //# constants:
 fn delay_css_fallback_and_five_rounds_include_entry_partial_round() {
@@ -165,7 +165,7 @@ fn delayed_ack_cap_division_fraction_mss_and_actual_pacing() {
         let end = Seq(mss * 20);
         assert_eq!(
             h.ack(end, context(end, None, false), mss * 20, mss, tb).0,
-            mss * 8
+            mss * 16
         );
         assert_eq!(
             h.ack(end, context(end, None, true), mss * 20, mss, tb).0,
@@ -174,7 +174,7 @@ fn delayed_ack_cap_division_fraction_mss_and_actual_pacing() {
         h.sent(end, false); // Protocol bypass does not qualify as paced.
         assert_eq!(
             h.ack(end, context(end, None, true), mss * 20, mss, tb).0,
-            mss * 8
+            mss * 16
         );
     }
     let mut whole = HyStart {
@@ -245,4 +245,56 @@ fn unavailable_rtt_initialization_and_round_minima() {
     assert_eq!((h.last_min, h.current_min, h.samples), (Some(90), None, 0));
     h.ack(Seq(20), context(Seq(20), None, false), 0, 1000, tb);
     assert_eq!((h.last_min, h.current_min, h.samples), (None, None, 0));
+}
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc9406#section-4.3
+//= type=test
+//= reason=Explicit L16 policy is bounded around16MSS in standard SS and CSS; genuine pacing remains uncapped and a committed bypass retains the finite limit, including wrap. This tests the selected tuning without asserting the published recommendation changed.
+//# An implementation MAY tune them for different
+//# network characteristics.
+fn tuned_unpaced_limit_boundaries_css_and_pacing_provenance() {
+    let tb = CallerTimebase::default();
+    for (delivered, standard, css) in [
+        (0, 0, 0),
+        (1, 1, 0),
+        (15_999, 15_999, 3999),
+        (16_000, 16_000, 4000),
+        (16_001, 16_000, 4000),
+        (32_000, 16_000, 4000),
+    ] {
+        for base in [Seq(0), Seq(u32::MAX - 500)] {
+            let end = base.wrapping_add(delivered);
+            let mut h = HyStart::default();
+            assert_eq!(
+                h.ack(end, context(end, None, false), delivered, 1000, tb).0,
+                standard
+            );
+            let mut h = HyStart {
+                baseline: Some(100),
+                ..HyStart::default()
+            };
+            assert_eq!(
+                h.ack(end, context(end, None, false), delivered, 1000, tb).0,
+                css
+            );
+            let mut h = HyStart::default();
+            assert_eq!(
+                h.ack(end, context(end, None, true), delivered, 1000, tb).0,
+                delivered
+            );
+            let mut h = HyStart::default();
+            h.sent(end, false);
+            assert_eq!(
+                h.ack(end, context(end, None, true), delivered, 1000, tb).0,
+                standard
+            );
+        }
+    }
+    let mut h = HyStart::default();
+    assert_eq!(
+        h.ack(Seq(1), context(Seq(1), None, false), u32::MAX, u32::MAX, tb)
+            .0,
+        u32::MAX
+    );
 }

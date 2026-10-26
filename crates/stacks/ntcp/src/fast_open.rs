@@ -5,6 +5,29 @@ use sha2::Sha256;
 
 use crate::{Error, Instant, wire::FastOpenCookie};
 
+/// Authorization for delivering SYN data before the handshake completes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FastOpenEarlyDataPolicy {
+    /// Authenticate using the listener's configured cookie algorithm.
+    #[default]
+    RequireCookie,
+    /// Linux-compatible cookie bypass for explicitly protected applications.
+    /// The application supplies independent resource/amplification protection
+    /// and accepts ordinary Fast Open replay semantics (RFC7413 section7.3).
+    ApplicationProtected,
+}
+
+/// Client authorization for sending application data in the first SYN.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FastOpenClientPolicy {
+    /// Require a learned or explicitly supplied server cookie.
+    #[default]
+    RequireCookie,
+    /// The target service has independently agreed to protected early data.
+    /// Omit the FO option; retain cold peer-MSS and negative-response limits.
+    ApplicationProtected,
+}
+
 /// Server cookie authentication policy. Selecting a policy does not enable TFO.
 #[derive(Clone, Debug, Default)]
 pub enum FastOpenCookiePolicy {
@@ -110,6 +133,12 @@ pub(crate) const LIFETIME_US: u64 = 3_600_000_000;
 pub(crate) struct CachedCookie {
     pub cookie: FastOpenCookie,
     pub mss: u16,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CachedPeer {
+    credential: Option<(FastOpenCookie, Instant)>,
+    mss: u16,
     local: IpAddr,
     remote: IpAddr,
     learned: Instant,
@@ -123,7 +152,7 @@ pub(crate) struct NegativeService {
 }
 
 pub(crate) struct FastOpen {
-    entries: Vec<CachedCookie>,
+    entries: Vec<CachedPeer>,
     next: usize,
     negative: Vec<NegativeService>,
     negative_next: usize,
@@ -131,7 +160,7 @@ pub(crate) struct FastOpen {
 
 impl FastOpen {
     pub const fn allocation_bytes() -> usize {
-        CAPACITY * (core::mem::size_of::<CachedCookie>() + core::mem::size_of::<NegativeService>())
+        CAPACITY * (core::mem::size_of::<CachedPeer>() + core::mem::size_of::<NegativeService>())
     }
 
     pub fn new() -> Result<Self, Error> {
@@ -197,25 +226,68 @@ impl FastOpen {
         local: IpAddr,
         remote: IpAddr,
     ) -> Option<CachedCookie> {
-        self.entries.iter().copied().find(|e| {
-            e.local == local && e.remote == remote && now >= e.learned && now - e.learned < lifetime
+        let peer = self.peer(now, lifetime, local, remote)?;
+        let (cookie, learned) = peer.credential?;
+        (now >= learned && now - learned < lifetime).then_some(CachedCookie {
+            cookie,
+            mss: peer.mss,
         })
     }
 
-    // A validated SYN-ACK can update MSS without supplying a replacement credential.
-    // Keep the original cookie age; MSS-only learning cannot create or revive one.
-    pub fn update_mss(
-        &mut self,
+    fn peer(
+        &self,
         now: Instant,
         lifetime: u64,
         local: IpAddr,
         remote: IpAddr,
-        mss: u16,
-    ) {
-        if let Some(entry) = self.entries.iter_mut().find(|e| {
+    ) -> Option<&CachedPeer> {
+        self.entries.iter().find(|e| {
             e.local == local && e.remote == remote && now >= e.learned && now - e.learned < lifetime
-        }) {
-            entry.mss = mss;
+        })
+    }
+
+    pub fn peer_mss(
+        &self,
+        now: Instant,
+        lifetime: u64,
+        local: IpAddr,
+        remote: IpAddr,
+    ) -> Option<u16> {
+        self.peer(now, lifetime, local, remote).map(|e| e.mss)
+    }
+
+    // Validated MSS observations have their own age. They neither create a
+    // credential nor refresh a credential's lifetime.
+    pub fn update_mss(&mut self, now: Instant, local: IpAddr, remote: IpAddr, mss: u16) {
+        if mss == 0 {
+            return;
+        }
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.local == local && e.remote == remote)
+        {
+            if now >= entry.learned {
+                entry.mss = mss;
+                entry.learned = now;
+            }
+        } else {
+            self.insert_peer(CachedPeer {
+                credential: None,
+                mss,
+                local,
+                remote,
+                learned: now,
+            });
+        }
+    }
+
+    fn insert_peer(&mut self, peer: CachedPeer) {
+        if self.entries.len() < CAPACITY {
+            self.entries.push(peer);
+        } else {
+            self.entries[self.next] = peer;
+            self.next = (self.next + 1) % CAPACITY;
         }
     }
 
@@ -227,11 +299,13 @@ impl FastOpen {
         cookie: FastOpenCookie,
         mss: u16,
     ) {
-        if cookie.as_bytes().is_empty() {
+        // Empty wire options do not by themselves establish a server agreement
+        // for a zero cookie. That authorization must be supplied explicitly.
+        if cookie.as_bytes().is_empty() || mss == 0 {
             return;
         }
-        let entry = CachedCookie {
-            cookie,
+        let peer = CachedPeer {
+            credential: Some((cookie, now)),
             mss,
             local,
             remote,
@@ -242,12 +316,11 @@ impl FastOpen {
             .iter_mut()
             .find(|e| e.local == local && e.remote == remote)
         {
-            *old = entry;
-        } else if self.entries.len() < CAPACITY {
-            self.entries.push(entry);
+            if now >= old.learned {
+                *old = peer;
+            }
         } else {
-            self.entries[self.next] = entry;
-            self.next = (self.next + 1) % CAPACITY;
+            self.insert_peer(peer);
         }
     }
 }
@@ -315,36 +388,44 @@ mod tests {
             let other = other.parse().unwrap();
             let cookie = FastOpenCookie::new(&[0; 4]).unwrap();
             let replacement = FastOpenCookie::new(&[2; 16]).unwrap();
-            for now in [9, 10, 109, 110, 111] {
-                let mut cache = FastOpen::new().unwrap();
-                cache.update_mss(now, 100, local, remote, 940);
-                assert!(cache.entries.is_empty());
-                cache.learn(10, local, remote, cookie, 1460);
-                cache.learn(10, other, remote, cookie, 1220);
-                cache.learn(10, local, other, cookie, 536);
-                cache.update_mss(now, 100, local, remote, 940);
-                let entry = cache.get(109, 100, local, remote).unwrap();
-                assert_eq!(entry.mss, if (10..110).contains(&now) { 940 } else { 1460 });
-                assert_eq!(entry.cookie, cookie);
-                assert_eq!(entry.learned, 10);
-                assert!(cache.get(110, 100, local, remote).is_none());
-                assert_eq!(cache.get(109, 100, other, remote).unwrap().mss, 1220);
-                assert_eq!(cache.get(109, 100, local, other).unwrap().mss, 536);
-                assert_eq!(cache.next, 0);
-                assert_eq!(cache.entries.len(), 3);
-                cache.learn(110, local, remote, replacement, 1000);
-                let entry = cache.get(209, 100, local, remote).unwrap();
-                assert_eq!(entry.cookie, replacement);
-                assert_eq!(entry.mss, 1000);
-                assert_eq!(entry.learned, 110);
-                assert!(cache.get(210, 100, local, remote).is_none());
-            }
+            let mut cache = FastOpen::new().unwrap();
+            cache.update_mss(9, local, remote, 940);
+            assert_eq!(cache.peer_mss(9, 100, local, remote), Some(940));
+            assert!(cache.get(9, 100, local, remote).is_none());
+            cache.learn(10, local, remote, cookie, 1460);
+            cache.learn(10, other, remote, cookie, 1220);
+            cache.learn(10, local, other, cookie, 536);
+            cache.update_mss(109, local, remote, 940);
+            let entry = cache.get(109, 100, local, remote).unwrap();
+            assert_eq!(entry.mss, 940);
+            assert_eq!(entry.cookie, cookie);
+            assert!(cache.get(110, 100, local, remote).is_none());
+            assert_eq!(cache.peer_mss(110, 100, local, remote), Some(940));
+            // Later observations update MSS while the credential stays expired.
+            cache.update_mss(111, local, remote, 1000);
+            assert!(cache.get(111, 100, local, remote).is_none());
+            assert_eq!(cache.peer_mss(111, 100, local, remote), Some(1000));
+            assert_eq!(cache.get(109, 100, other, remote).unwrap().mss, 1220);
+            assert_eq!(cache.get(109, 100, local, other).unwrap().mss, 536);
+            assert_eq!(cache.next, 0);
+            assert_eq!(cache.entries.len(), 3);
+            cache.learn(112, local, remote, replacement, 1000);
+            assert_eq!(
+                cache.get(211, 100, local, remote).unwrap().cookie,
+                replacement
+            );
+            assert!(cache.get(212, 100, local, remote).is_none());
+            assert_eq!(cache.peer_mss(212, 100, local, remote), None);
+            // Older observations and empty wire options cannot install a key.
+            cache.update_mss(1, local, remote, 400);
+            assert!(cache.get(212, 100, local, remote).is_none());
+            cache.learn(213, local, remote, FastOpenCookie::request(), 1000);
+            assert!(cache.get(213, 100, local, remote).is_none());
             let mut cache = FastOpen::new().unwrap();
             cache.learn(u64::MAX - 10, local, remote, cookie, 1460);
-            cache.update_mss(u64::MAX, 10, local, remote, 940);
-            assert_eq!(cache.entries[0].mss, 1460);
-            cache.update_mss(u64::MAX, 11, local, remote, 940);
-            assert_eq!(cache.get(u64::MAX, 11, local, remote).unwrap().mss, 940);
+            cache.update_mss(u64::MAX, local, remote, 940);
+            assert!(cache.get(u64::MAX, 10, local, remote).is_none());
+            assert_eq!(cache.peer_mss(u64::MAX, 10, local, remote), Some(940));
         }
     }
 
@@ -414,7 +495,7 @@ mod negative_tests {
             assert!(!cache.suppressed(10, lifetime, other, remote));
             assert!(!cache.suppressed(10, lifetime, local, SocketAddr::new(other, 80)));
             assert!(!cache.suppressed(10, lifetime, local, SocketAddr::new(remote.ip(), 81)));
-            assert_eq!(cache.entries[0].learned, 1);
+            assert_eq!(cache.entries[0].credential.unwrap().1, 1);
             assert_eq!(cache.entries[0].mss, 536);
             cache.learn(11, local, remote.ip(), cookie, 940);
             assert!(cache.suppressed(11, lifetime, local, remote));
@@ -430,7 +511,7 @@ mod negative_tests {
             assert_eq!(cache.negative.len(), CAPACITY);
             assert_eq!(cache.negative.capacity(), CAPACITY);
             assert!(!cache.suppressed(20, lifetime, local, remote));
-            assert_eq!(cache.entries[0].learned, 11);
+            assert_eq!(cache.entries[0].credential.unwrap().1, 11);
             assert_eq!(cache.entries[0].mss, 940);
         }
     }

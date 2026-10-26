@@ -83,8 +83,10 @@ impl Default for PmtudPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PmtudConfig {
     pub first_hop_mtu: u32,
-    // Same-path administrative ceiling, independent of interface MTU and
-    // network-discovered limits. None imposes no additional route ceiling.
+    // Same-path administrative packetization ceiling, independent of physical
+    // interface MTU and network-discovered limits. Explicit IPv6 ceilings may
+    // be smaller than 1280; they do not authorize accepting subminimum PTB.
+    // None imposes no additional route ceiling.
     pub route_mtu: Option<u32>,
     pub initial_mtu: Option<u32>,
     pub initial_search_low: Option<u32>,
@@ -105,7 +107,7 @@ impl PmtudConfig {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc4821#section-7.2
-    //= reason=Reviewed 0030a96: independent creation-only initial_search_low is validated with initial_mtu/initial_search_high, family and allocation bounds. Defaults remain conservative IPv4 min(mtu,1024) and IPv6 min(mtu,1280); dual-family tests assert defaults, independent overrides, rejection rather than silent clamping, and subsequent peer caps. Destination policy configuration is independently covered at071/119.
+    //= reason=Reviewed 0030a96: independent creation-only initial_search_low is validated with initial_mtu/initial_search_high, family and allocation bounds. Defaults remain conservative IPv4 min(mtu,1024) and IPv6 min(mtu,1280); explicit transport bounds use packet/header limits independently of physical IPv6 link and PTB minimums. Tests assert defaults, independent overrides, rejection rather than silent clamping, and subsequent peer caps. Destination policy configuration is independently covered at071/119.
     //# It is RECOMMENDED that search_low be initially set to an MTU size that is likely
     //# to work over a very wide range of environments. Given today's technologies, a
     //# value of 1024 bytes is probably safe enough. The initial value for search_low
@@ -113,12 +115,18 @@ impl PmtudConfig {
 
     pub(crate) fn initial_values(self, bound: u32, ipv4: bool) -> Result<(u32, u32, u32), Error> {
         let floor = if ipv4 { 68 } else { 1280 };
+        // Preserve the physical link minimum. Explicit transport bounds only
+        // need space for base headers and the existing eight-byte data minimum;
+        // ConnectionConfig additionally reserves its enabled TCP options.
+        // IPv6 base headers plus eight data bytes also equal IPv4's legal
+        // 68-byte minimum. Option-aware checks belong to ConnectionConfig.
+        let packet_floor = 40 + 20 + 8;
         let max = if ipv4 { 65535 } else { 65575 };
         let bound = bound.min(self.route_mtu.unwrap_or(bound));
         if !(floor..=max).contains(&self.first_hop_mtu)
             || self
                 .route_mtu
-                .is_some_and(|mtu| !(floor..=max).contains(&mtu))
+                .is_some_and(|mtu| !(packet_floor..=max).contains(&mtu))
             || [
                 self.initial_mtu,
                 self.initial_search_low,
@@ -126,7 +134,7 @@ impl PmtudConfig {
             ]
             .into_iter()
             .flatten()
-            .any(|v| !(floor..=bound.min(self.first_hop_mtu)).contains(&v))
+            .any(|v| !(packet_floor..=bound.min(self.first_hop_mtu)).contains(&v))
         {
             return Err(Error::InvalidArgument);
         }

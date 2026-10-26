@@ -24,6 +24,7 @@ fn parser_and_typed_validation() {
             rate_gain_percent: 150,
             max_bytes_per_second: Some(u64::MAX),
             max_burst_segments: 3,
+            initial_window_burst: true,
         }
     );
     for suffix in [

@@ -1066,7 +1066,12 @@ impl Pmtud {
         //# For TCP, this occurs when the R1 timeout threshold described by
         //# [RFC1122] expires.
         if consecutive >= 3 && !self.icmp_since_progress {
-            let floor = self.floor.min(self.bound);
+            // An explicit conservative transport bound is not an undersized
+            // physical link or PTB. Recovery must never raise packet size or
+            // exceed a current administrative ceiling. Unconfigured IPv6
+            // still retains the normal 1280-byte blackhole fallback floor.
+            let ceiling = self.route_bound().min(self.info.current_mtu);
+            let floor = self.floor.min(self.initial_low).min(ceiling);
             let low = if consecutive == 3 {
                 if self.info.current_mtu > self.info.search_low {
                     self.info.search_low
@@ -1076,7 +1081,8 @@ impl Pmtud {
             } else {
                 self.info.current_mtu / 2
             }
-            .max(floor);
+            .max(floor)
+            .min(ceiling);
             self.info.current_mtu = low;
             self.info.search_low = self.info.search_low.min(low);
             self.probe = None;

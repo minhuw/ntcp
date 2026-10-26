@@ -337,6 +337,7 @@ struct Slot {
     received_ipv4_options: Option<Ipv4Options>,
 }
 struct Listener {
+    early_data_policy: crate::FastOpenEarlyDataPolicy,
     fast_open_cookie_policy: Option<FastOpenCookiePolicy>,
     fast_open_limit: usize,
     reset_debt: usize,
@@ -807,6 +808,7 @@ impl Endpoint {
             .try_reserve_exact(backlog)
             .map_err(|_| Error::NoMemory)?;
         self.listeners[slot] = Some(Listener {
+            early_data_policy: crate::FastOpenEarlyDataPolicy::RequireCookie,
             fast_open_limit: 0,
             reset_debt: 0,
             reset_debt_expiry: None,
@@ -1129,21 +1131,40 @@ impl Endpoint {
                 .as_ref()
                 .unwrap_or(&self.fast_open_cookie_policy);
             let epoch = self.now / self.fast_open_lifetime();
-            let valid = syn.options.fast_open.is_some_and(|cookie| {
-                policy.valid(
-                    &self.secret,
-                    tuple.local.ip(),
-                    tuple.remote.ip(),
-                    epoch,
-                    cookie,
-                )
-            });
-            accept_syn_data = valid && pending.saturating_add(reset_debt) < limit;
+            let protected = self.listeners[listener.slot]
+                .as_ref()
+                .unwrap()
+                .early_data_policy
+                == crate::FastOpenEarlyDataPolicy::ApplicationProtected;
+            // Authorization replaces the credential check, not TCP parsing or
+            // resource admission. A plain data-less SYN remains ordinary TCP.
+            let application_authorized = protected
+                && (syn.options.fast_open.is_some()
+                    || !syn.payload.is_empty()
+                    || syn.header.flags & wire::FIN != 0);
+            let valid = !protected
+                && syn.options.fast_open.is_some_and(|cookie| {
+                    policy.valid(
+                        &self.secret,
+                        tuple.local.ip(),
+                        tuple.remote.ip(),
+                        epoch,
+                        cookie,
+                    )
+                });
+            //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2
+            //= reason=Pending children plus reset debt constrain both authorization modes before admitting a new early child.
+            //# If this variable goes over a preset system limit, the server MUST disable TFO for all new connection requests until PendingFastOpenRequests drops below the system limit.
+            accept_syn_data =
+                (valid || application_authorized) && pending.saturating_add(reset_debt) < limit;
             // Pending quota also covers authenticated, data-less early children.
             early = accept_syn_data;
             // RFC 7413 §4.2.2 permits omission; Linux does not refresh valid cookies.
             // This decision is independent of payload admission and pending quota.
-            if syn.options.fast_open.is_some() && (!valid || policy.refresh_valid_cookie()) {
+            if !protected
+                && syn.options.fast_open.is_some()
+                && (!valid || policy.refresh_valid_cookie())
+            {
                 fast_open_response =
                     policy.issue(&self.secret, tuple.local.ip(), tuple.remote.ip(), epoch);
             }
@@ -1169,7 +1190,7 @@ impl Endpoint {
                 iss,
                 self.now,
                 syn,
-                accept_syn_data && syn.options.fast_open.is_some(),
+                early,
                 &mut receive,
                 rx_timestamps,
                 timestamps,
@@ -1312,6 +1333,29 @@ impl Endpoint {
         Ok(id)
     }
 
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-2
+    //= reason=Default per-listener RequireCookie and independent disabled service/listener state are exercised; choosing protected policy never enables TFO.
+    //# TCP implementations MUST NOT use TFO by default, but only use TFO if requested explicitly by the application on a per-service-port basis.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2
+    //= reason=Service and listener enablement remain independent of early-data authorization; disabled listeners keep ordinary handshake and no cookie response.
+    //# FastOpenEnabled: default is off. It MUST be turned on explicitly by the application. When this flag is off, the server does not perform any TFO-related operations and MUST ignore all cookie options.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-7.3
+    //= reason=ApplicationProtected is an explicit host assertion of independent application defenses, not a proof of application security; tests show authorization replaces MAC checks only for this opt-in. Omitted-option wire behavior is a Linux-compatible choice.
+    //# cookies are not necessary if the server has application-level protection or is immune to these attacks.
+    /// Set one listener's authorization for future SYNs. This does not enable
+    /// endpoint/listener TFO, alter existing children, or change pending/reset
+    /// quotas. ApplicationProtected requires independent application protection
+    /// and replay tolerance; it bypasses cookie validation and cookie generation.
+    pub fn set_listener_fast_open_early_data_policy(
+        &mut self,
+        id: ListenerId,
+        policy: crate::FastOpenEarlyDataPolicy,
+    ) -> Result<(), EndpointError> {
+        self.listener(id)?;
+        self.listeners[id.slot].as_mut().unwrap().early_data_policy = policy;
+        Ok(())
+    }
+
     /// Replace the default server cookie policy for future passive opens.
     /// Does not enable TFO, change quotas/cache/ISN secrets, or alter existing children.
     pub fn set_fast_open_cookie_policy(&mut self, policy: FastOpenCookiePolicy) {
@@ -1414,7 +1458,39 @@ impl Endpoint {
         local: IpAddr,
         remote: SocketAddr,
     ) -> Result<bool, EndpointError> {
-        Ok(self.has_fast_open_cookie(now, local, remote.ip())?
+        self.can_defer_fast_open_with_server_cookie(now, local, remote, None)
+    }
+
+    /// A supplied cookie must have been obtained from this target server.
+    /// This checks eligibility only; it does not enable TFO or clear failures.
+    pub fn can_defer_fast_open_with_server_cookie(
+        &self,
+        now: Instant,
+        local: IpAddr,
+        remote: SocketAddr,
+        cookie: Option<wire::FastOpenCookie>,
+    ) -> Result<bool, EndpointError> {
+        self.check_clock(now)?;
+        Ok(
+            (cookie.is_some() || self.has_fast_open_cookie(now, local, remote.ip())?)
+                && self.fast_open.as_ref().is_some_and(|service| {
+                    !service.suppressed(now, self.fast_open_negative_lifetime(), local, remote)
+                }),
+        )
+    }
+
+    /// Check a protected-service agreement independently of cookie possession.
+    /// Negative-response suppression remains authoritative for either policy.
+    pub fn can_defer_fast_open_with_policy(
+        &self,
+        now: Instant,
+        local: IpAddr,
+        remote: SocketAddr,
+        policy: crate::FastOpenClientPolicy,
+    ) -> Result<bool, EndpointError> {
+        self.check_clock(now)?;
+        Ok((policy == crate::FastOpenClientPolicy::ApplicationProtected
+            || self.has_fast_open_cookie(now, local, remote.ip())?)
             && self.fast_open.as_ref().is_some_and(|service| {
                 !service.suppressed(now, self.fast_open_negative_lifetime(), local, remote)
             }))
@@ -1470,12 +1546,70 @@ impl Endpoint {
         initial: &[u8],
         options: ActiveOpenOptions,
     ) -> Result<(ConnectionId, usize), EndpointError> {
+        self.connect_fast_open_with_server_cookie(now, local, remote, initial, options, None)
+    }
+
+    /// Open using a cookie already obtained from `remote` for this local address, or the ordinary
+    /// learned cache when `cookie` is None. A supplied zero cookie requires
+    /// explicit agreement with a protected service under RFC7413 section7.3.
+    /// The option is sent on wire. Without learned peer MSS, protocol defaults
+    /// bound initial data. Suppression, memory and output admission still apply.
+    //= https://www.rfc-editor.org/rfc/rfc7413#section-7.3
+    //= reason=Only an explicit server-provided/agreed zero cookie is admitted through the supplied-cookie API; default misses still request a cookie. The protected server and client opt in independently.
+    //# For such applications the server may choose to generate a trivial or even a zero-length cookie to improve performance by avoiding the cookie generation and verification.
+    pub fn connect_fast_open_with_server_cookie(
+        &mut self,
+        now: Instant,
+        local: SocketAddr,
+        remote: SocketAddr,
+        initial: &[u8],
+        options: ActiveOpenOptions,
+        cookie: Option<wire::FastOpenCookie>,
+    ) -> Result<(ConnectionId, usize), EndpointError> {
+        self.connect_fast_open_authorized(
+            now,
+            local,
+            remote,
+            initial,
+            options,
+            cookie,
+            crate::FastOpenClientPolicy::RequireCookie,
+        )
+    }
+
+    /// Open to an explicitly agreed protected service without a cookie option.
+    /// Default policy still requires a cookie. Neither this authorization nor
+    /// absence of an option invents a peer MSS or clears failure evidence.
+    pub fn connect_fast_open_with_policy(
+        &mut self,
+        now: Instant,
+        local: SocketAddr,
+        remote: SocketAddr,
+        initial: &[u8],
+        options: ActiveOpenOptions,
+        policy: crate::FastOpenClientPolicy,
+    ) -> Result<(ConnectionId, usize), EndpointError> {
+        self.connect_fast_open_authorized(now, local, remote, initial, options, None, policy)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn connect_fast_open_authorized(
+        &mut self,
+        now: Instant,
+        local: SocketAddr,
+        remote: SocketAddr,
+        initial: &[u8],
+        options: ActiveOpenOptions,
+        cookie: Option<wire::FastOpenCookie>,
+        policy: crate::FastOpenClientPolicy,
+    ) -> Result<(ConnectionId, usize), EndpointError> {
         options.validate()?;
         self.check_clock(now)?;
         let service = self.fast_open.as_ref().ok_or(Error::InvalidState)?;
         let suppressed =
             service.suppressed(now, self.fast_open_negative_lifetime(), local.ip(), remote);
         let cached = service.get(now, self.fast_open_lifetime(), local.ip(), remote.ip());
+        let peer_mss = service.peer_mss(now, self.fast_open_lifetime(), local.ip(), remote.ip());
         let tuple = Tuple { local, remote };
         self.admission_with_buffers(tuple, (options.send_capacity, options.receive_capacity))?;
         self.clock(now)?;
@@ -1489,17 +1623,19 @@ impl Endpoint {
             RxPacketTimestamps::default(),
         )?;
         let old_charge = connection.buffer_charge();
+        let budget = self
+            .config
+            .max_buffer_bytes
+            .saturating_sub(self.buffer_bytes)
+            .saturating_add(connection.buffer_charge());
         let accepted = match if suppressed {
             Ok(0)
+        } else if let Some(cookie) = cookie {
+            connection.prepare_fast_open_with_server_cookie(cookie, peer_mss, initial, budget)
+        } else if policy == crate::FastOpenClientPolicy::ApplicationProtected {
+            connection.prepare_fast_open_without_cookie(peer_mss, initial, budget)
         } else {
-            connection.prepare_fast_open_with_budget(
-                cached,
-                initial,
-                self.config
-                    .max_buffer_bytes
-                    .saturating_sub(self.buffer_bytes)
-                    .saturating_add(connection.buffer_charge()),
-            )
+            connection.prepare_fast_open_with_budget(cached, initial, budget)
         } {
             Ok(count) => count,
             Err(error) => {
@@ -1834,7 +1970,6 @@ impl Endpoint {
     }
 
     fn refresh(&mut self, index: usize) {
-        let fast_open_lifetime = self.fast_open_lifetime();
         // RFC 7413 §5.1: retain recent remote resets in admission accounting.
         // Sixty seconds and latest-reset batch retention are local policy.
         let reset_cooldown = self.config.connection.timebase.ticks_from_us(60_000_000);
@@ -1852,13 +1987,7 @@ impl Endpoint {
                 if let Some(cookie) = cookie {
                     service.learn(self.now, tuple.local.ip(), tuple.remote.ip(), cookie, mss);
                 } else {
-                    service.update_mss(
-                        self.now,
-                        fast_open_lifetime,
-                        tuple.local.ip(),
-                        tuple.remote.ip(),
-                        mss,
-                    );
+                    service.update_mss(self.now, tuple.local.ip(), tuple.remote.ip(), mss);
                 }
             }
             if core::mem::take(&mut slot.connection.fast_open_peer_reset)
@@ -2502,6 +2631,37 @@ impl Endpoint {
         self.buffer_bytes =
             self.buffer_bytes - own_charge + self.slot(id)?.connection.buffer_charge();
         Ok(())
+    }
+
+    /// Admit an immutable payload prefix without copying its bytes. The caller
+    /// owns the backing allocation's budget; the endpoint charges its bounded
+    /// queued-byte and range metadata. Partial ACKs retain the unacknowledged
+    /// range. Backend clones can outlive ACK or connection termination.
+    pub fn write_shared(
+        &mut self,
+        id: ConnectionId,
+        payload: crate::Payload,
+        more: bool,
+        end_of_record: bool,
+        lowat: Option<u32>,
+    ) -> Result<usize, EndpointError> {
+        self.prepare_write_metadata(id, payload.len(), lowat, None)?;
+        if !payload.is_empty() {
+            let room = self
+                .config
+                .max_buffer_bytes
+                .saturating_sub(self.buffer_bytes);
+            let before = self.slot(id)?.connection.buffer_charge();
+            self.slot_mut(id)?.connection.prepare_shared_storage(room)?;
+            let after = self.slot(id)?.connection.buffer_charge();
+            self.buffer_bytes += after - before;
+        }
+        let result =
+            self.slot_mut(id)?
+                .connection
+                .write_shared(payload, more, end_of_record, lowat);
+        self.refresh(id.slot);
+        result.map_err(Into::into)
     }
 
     pub fn write(&mut self, id: ConnectionId, bytes: &[u8]) -> Result<usize, EndpointError> {
@@ -3505,6 +3665,93 @@ impl Endpoint {
             .is_some_and(|(deadline, _)| deadline <= now))
     }
 
+    /// Allocate reusable payload-reference descriptors before packet service.
+    /// The existing reservation pool must be enabled first and contain no held
+    /// output. `max_segments` is a caller/backend resource bound, not a TCP MSS.
+    pub fn enable_shared_output(&mut self, max_segments: usize) -> Result<(), EndpointError> {
+        if max_segments == 0
+            || max_segments > self.config.connection.send_capacity
+            || self.reservations.is_empty()
+        {
+            return Err(Error::InvalidArgument.into());
+        }
+        if self.reservations.iter().any(|s| s.current.is_some()) {
+            return Err(EndpointError::OutputReserved);
+        }
+        if self
+            .reservations
+            .iter()
+            .all(|s| s.shared.capacity() >= max_segments)
+        {
+            return Ok(());
+        }
+        let needed = self
+            .reservations
+            .len()
+            .checked_mul(max_segments)
+            .and_then(|n| n.checked_mul(core::mem::size_of::<crate::Payload>()))
+            .ok_or(Error::NoMemory)?;
+        if needed
+            > self
+                .config
+                .max_buffer_bytes
+                .saturating_sub(self.buffer_bytes)
+        {
+            return Err(Error::NoMemory.into());
+        }
+        let mut staged = reserved_vec(self.reservations.len())?;
+        let mut charge = 0usize;
+        for _ in &self.reservations {
+            let v: Vec<crate::Payload> = reserved_vec(max_segments)?;
+            charge = charge
+                .checked_add(v.capacity() * core::mem::size_of::<crate::Payload>())
+                .ok_or(Error::NoMemory)?;
+            staged.push(v);
+        }
+        if charge
+            > self
+                .config
+                .max_buffer_bytes
+                .saturating_sub(self.buffer_bytes)
+        {
+            return Err(Error::NoMemory.into());
+        }
+        for (slot, payload) in self.reservations.iter_mut().zip(staged) {
+            self.buffer_bytes -= slot.shared.capacity() * core::mem::size_of::<crate::Payload>();
+            slot.shared = payload;
+        }
+        self.buffer_bytes += charge;
+        Ok(())
+    }
+
+    /// Poll one owner with immutable payload references. For shared output,
+    /// `packet.len` includes payload but only its TCP header is written to `out`;
+    /// subtract payload lengths to obtain the initialized header length. Empty
+    /// `payload` denotes a normal/control packet fully encoded into `out`.
+    /// Its capacity bounds the entire TCP wire packet even when only a header
+    /// is written; size it to the backend's complete-packet TCP budget.
+    /// Reuse the ordinary accept/reject/abandon reservation APIs. Do not submit
+    /// both representations or reuse an uncertain submission.
+    pub fn poll_reserved_transmit_shared_for(
+        &mut self,
+        now: Instant,
+        id: ConnectionId,
+        out: &mut [u8],
+        payload: &mut Vec<crate::Payload>,
+        budget: usize,
+    ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
+        payload.clear();
+        if payload.capacity() == 0
+            || self
+                .reservations
+                .iter()
+                .any(|s| s.shared.capacity() < payload.capacity())
+        {
+            return Err(Error::InvalidArgument.into());
+        }
+        self.poll_reserved_selected(now, out, budget, Some(id), Some(payload))
+    }
+
     pub fn enable_output_reservations(&mut self) -> Result<(), EndpointError> {
         self.enable_output_reservations_with_capacity(1)
     }
@@ -3848,7 +4095,7 @@ impl Endpoint {
         budget: usize,
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
         self.retained_slot(id)?;
-        self.poll_reserved_selected(now, out, budget, Some(id))
+        self.poll_reserved_selected(now, out, budget, Some(id), None)
     }
 
     pub fn poll_reserved_stateless_transmit(
@@ -3857,7 +4104,7 @@ impl Endpoint {
         out: &mut [u8],
         budget: usize,
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
-        self.poll_reserved_selected(now, out, budget, None)
+        self.poll_reserved_selected(now, out, budget, None, None)
     }
 
     pub fn poll_reserved_transmit(
@@ -3899,7 +4146,7 @@ impl Endpoint {
                 self.cleanup_one();
                 continue;
             }
-            let result = self.poll_reserved_selected(now, out, 1, owner)?;
+            let result = self.poll_reserved_selected(now, out, 1, owner, None)?;
             if let Some(id) = owner {
                 // Repairs share the ready queue rather than monopolizing its head.
                 if self.is_output_reserved(id) {
@@ -3927,6 +4174,7 @@ impl Endpoint {
         out: &mut [u8],
         budget: usize,
         selected: Option<ConnectionId>,
+        mut shared: Option<&mut Vec<crate::Payload>>,
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
         if self.reservations.is_empty() {
             return Err(Error::InvalidArgument.into());
@@ -3967,7 +4215,15 @@ impl Endpoint {
                 .connection
                 .path_payload_limit();
             self.clock(now)?;
-            let packet = self.reservations[index].fragment(limit, out)?;
+            let packet = if self.reservations[index].is_shared() {
+                self.reservations[index].fragment_shared(
+                    limit,
+                    out,
+                    shared.as_deref_mut().ok_or(Error::InvalidArgument)?,
+                )?
+            } else {
+                self.reservations[index].fragment(limit, out)?
+            };
             let r = self.reservations[index].current.as_ref().unwrap();
             if r.emitted_bytes != 0
                 && let Some(d) = &r.departure
@@ -4010,17 +4266,29 @@ impl Endpoint {
         let mut payload = core::mem::take(&mut self.reservations[index].payload);
         let gso = self.reservations[index]
             .gso
+            .filter(|_| shared.is_none())
             .map(|limits| crate::output_reservation::GsoBuffer {
                 limits,
                 payload: &mut payload[..],
             });
-        let output =
-            self.poll_transmit_inner(now, &mut out[..capacity], budget, true, Some(selected), gso);
+        let output = self.poll_transmit_inner(
+            now,
+            &mut out[..capacity],
+            budget,
+            true,
+            Some(selected),
+            gso,
+            shared.as_deref_mut(),
+        );
         self.reservations[index].payload = payload;
         let output = output?;
         if let Some(packet) = output.packet {
             attempt.connection = packet.connection;
-            self.reservations[index].capture(packet, out, attempt);
+            if let Some(parts) = shared.filter(|p| !p.is_empty()) {
+                self.reservations[index].capture_shared(packet, out, parts, attempt)?;
+            } else {
+                self.reservations[index].capture(packet, out, attempt);
+            }
             if let Some(id) = packet.connection {
                 let departure = self.retained_slot(id)?.connection.last_departure;
                 let r = self.reservations[index].current.as_mut().unwrap();
@@ -4096,7 +4364,7 @@ impl Endpoint {
         let r = self.reservations[index].current.as_mut().unwrap();
         let connection = r.packet.connection;
         if finished {
-            self.reservations[index].current = None;
+            self.reservations[index].clear();
         } else {
             r.departure = departure;
             r.offset += r.emitted_bytes;
@@ -4142,7 +4410,7 @@ impl Endpoint {
             return Ok(false);
         }
         let Some(connection) = r.packet.connection else {
-            self.reservations[index].current = None;
+            self.reservations[index].clear();
             return Ok(true);
         };
         let timestamp = r.packet.tx_timestamp;
@@ -4220,7 +4488,7 @@ impl Endpoint {
                     .cancel_transmit(token.stream_range(), source);
             }
         }
-        self.reservations[index].current = None;
+        self.reservations[index].clear();
         self.refresh(id.slot);
         Ok(true)
     }
@@ -4269,7 +4537,7 @@ impl Endpoint {
         {
             return Ok(false);
         }
-        self.reservations[attempt.reservation].current = None;
+        self.reservations[attempt.reservation].clear();
         self.refresh(id.slot);
         self.rearm_pending_accept(id);
         Ok(true)
@@ -4299,11 +4567,11 @@ impl Endpoint {
             slot.connection.abandon_reserved_output();
             slot.reset_deadline = None;
             slot.closed_output_drained = true;
-            self.reservations[index].current = None;
+            self.reservations[index].clear();
             self.refresh(id.slot);
             self.rearm_pending_accept(id);
         } else {
-            self.reservations[index].current = None;
+            self.reservations[index].clear();
         }
         Ok(true)
     }
@@ -4314,9 +4582,10 @@ impl Endpoint {
         out: &mut [u8],
         budget: usize,
     ) -> Result<PollTransmit, EndpointError> {
-        self.poll_transmit_inner(now, out, budget, false, None, None)
+        self.poll_transmit_inner(now, out, budget, false, None, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)] // Selection policy and reusable output carriers stay explicit.
     fn poll_transmit_inner(
         &mut self,
         now: Instant,
@@ -4325,6 +4594,7 @@ impl Endpoint {
         reserve: bool,
         selected: Option<Option<ConnectionId>>,
         mut gso: Option<crate::output_reservation::GsoBuffer<'_>>,
+        mut shared: Option<&mut Vec<crate::Payload>>,
     ) -> Result<PollTransmit, EndpointError> {
         self.clock(now)?;
         for _ in 0..budget {
@@ -4400,7 +4670,9 @@ impl Endpoint {
             let slot = self.slots[index].as_mut().unwrap();
             let tuple = slot.connection.tuple();
             let terminal_reset = slot.connection.reset_pending();
-            let output = if reserve {
+            let output = if let Some(parts) = shared.as_deref_mut() {
+                slot.connection.transmit_shared_selected(now, out, parts)
+            } else if reserve {
                 slot.connection.transmit_selected_with_gso(
                     now,
                     out,

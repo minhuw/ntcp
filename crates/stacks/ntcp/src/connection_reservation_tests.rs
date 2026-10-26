@@ -231,7 +231,7 @@ fn reserved_control_departure_owns_only_its_timers() {
     let mut d = a.last_departure.unwrap();
     assert!(d.persist && d.bypass && !d.rto);
     let interval = a.persist_interval;
-    a.accept_reserved_output(2_000_000, &mut d, 0, 1, true)
+    a.accept_reserved_output(2_000_000, &mut d, 0, 0, true)
         .unwrap();
     assert_eq!(a.persist_interval, interval); // no second probe/backoff charge
     assert_eq!(a.persist_unanswered_since, Some(2_000_000));
@@ -253,6 +253,7 @@ fn reserved_probe_pacing_preserves_prior_debt_and_options_ack_costs_nothing() {
             prr_pacing: true,
             prr_algorithm: PrrAlgorithm::Rfc9937,
             pacing: general.then_some(PacingConfig {
+                initial_window_burst: false,
                 max_burst_segments: 1,
                 ..Default::default()
             }),
