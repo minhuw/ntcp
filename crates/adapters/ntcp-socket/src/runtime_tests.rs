@@ -9,7 +9,7 @@ mod large_write_tests;
 mod lowat_tests;
 #[cfg(feature = "packet-test")]
 #[path = "runtime_lowat_upstream_tests.rs"]
-mod lowat_upstream_study;
+mod lowat_upstream;
 #[path = "runtime_mss_mark_tests.rs"]
 mod mss_mark_tests;
 #[path = "runtime_pacing_tests.rs"]
@@ -20,7 +20,7 @@ mod route_policy;
 mod syncnt_tests;
 #[cfg(feature = "packet-test")]
 #[path = "runtime_timestamp_partial_tests.rs"]
-mod timestamp_partial_study;
+mod timestamp_partial;
 #[path = "timestamp_tests.rs"]
 mod timestamp_tests;
 #[test]

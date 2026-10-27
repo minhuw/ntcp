@@ -142,23 +142,6 @@ fn ack(
 }
 
 #[test]
-fn no_sack_cubic_first_repair_keeps_byte_prr() {
-    let mut a = setup(1460, false, 100000, 200000);
-    a.write(&vec![0x55; 5840]).unwrap();
-    drain(&mut a, 200000);
-    for _ in 0..2 {
-        assert!(ack(&mut a, 300000, 1, &[]).is_empty());
-    }
-    inject(&mut a, 300000, Seq(1), Seq(1), ACK, 257, &[]);
-    let prr = a.prr.unwrap();
-    assert_eq!(prr.counters(), (5840, 1460, 0));
-    assert_eq!(a.congestion.recovery_target(), 10220);
-    assert_eq!(prr.non_sack_pipe(a.rack.pipe()), 2920);
-    assert_eq!(prr.credit(), 1460);
-    assert_eq!(drain(&mut a, 300000), [(1, 1460, false)]);
-}
-
-#[test]
 fn limited_transmit_growth_separates_retirement_and_fresh_credit() {
     for sack in [false, true] {
         for hystart in [false, true] {

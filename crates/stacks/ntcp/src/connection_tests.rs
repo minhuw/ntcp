@@ -1015,7 +1015,7 @@ mod adaptive_ack_tests;
 mod statistics;
 
 #[path = "connection_persist_reopen_tests.rs"]
-mod persist_reopen_study;
+mod persist_reopen;
 
 #[path = "fast_open_connection_tests.rs"]
 mod fast_open_tests;
