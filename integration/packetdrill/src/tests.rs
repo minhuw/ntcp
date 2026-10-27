@@ -183,6 +183,7 @@ fn syn_with_options(sequence: u32, destination_port: u16, options: &[u8]) -> Vec
 
 #[test]
 fn abi_table_null_counts_vectors_variadics_and_host_clock() {
+    #[link(name = "abi_selfcheck", kind = "static")]
     unsafe extern "C" {
         fn ntcp_abi_check(userdata: *mut c_void);
     }
@@ -241,15 +242,18 @@ fn abi_table_null_counts_vectors_variadics_and_host_clock() {
     .unwrap();
     call(&adapter, 14, 0, 0, packet, 0).unwrap();
     let accepted = call(&adapter, 4, listener, 0, vec![], 16).unwrap().value as i32;
+    #[link(name = "abi_selfcheck", kind = "static")]
     unsafe extern "C" {
         fn ntcp_abi_fault_check(userdata: *mut c_void, fd: i32);
     }
     unsafe {
         ntcp_abi_fault_check(userdata, accepted);
     }
+    #[link(name = "abi_selfcheck", kind = "static")]
     unsafe extern "C" {
         fn ntcp_abi_send_error_check(userdata: *mut c_void, fd: i32, first_error: i32);
     }
+    #[link(name = "abi_selfcheck", kind = "static")]
     unsafe extern "C" {
         fn ntcp_abi_zerocopy_check(userdata: *mut c_void, fd: i32);
     }
@@ -1013,6 +1017,7 @@ fn receive_callbacks_reject_flags_but_accept_large_requests() {
         );
         return;
     }
+    #[link(name = "abi_selfcheck", kind = "static")]
     unsafe extern "C" {
         fn ntcp_abi_receive_unsupported(u: *mut c_void);
     }
