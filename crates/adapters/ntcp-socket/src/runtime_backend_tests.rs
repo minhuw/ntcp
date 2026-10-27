@@ -1322,6 +1322,9 @@ fn reserved_pacing_alone_has_no_deadline_and_late_accept_debits_once() {
     assert!(a.endpoint.is_output_reserved(cid));
     let first = a.now() + 1_000_000;
     advance(&mut a, 50_000);
+    // The refused ticket is still held just before its I/O deadline.
+    a.expire_egress(first - 1).unwrap();
+    assert!(a.endpoint.is_output_reserved(cid));
     state.lock().unwrap().block = false;
     a.service_egress().unwrap();
     assert_eq!(state.lock().unwrap().sent.len(), 2);
@@ -1358,9 +1361,15 @@ fn reserved_pacing_alone_has_no_deadline_and_late_accept_debits_once() {
         a.endpoint.next_deadline(),
         a.endpoint.transport_info(cid)
     );
-    // New obligation, new deadline: the first one has no effect on it.
+    let second = a.now() + 1_000_000;
+    // New obligation, new and later deadline: the first one has no effect on it.
+    assert!(second > first);
     a.expire_egress(first).unwrap();
     assert!(a.endpoint.is_output_reserved(cid));
+    a.expire_egress(second - 1).unwrap();
+    assert!(a.endpoint.is_output_reserved(cid));
+    a.expire_egress(second).unwrap();
+    assert_eq!(a.endpoint.state(cid), Ok(ntcp::State::Closed));
 }
 
 #[test]
