@@ -553,24 +553,20 @@ impl ReceiveBuffer {
 
     // Call once on the raw packet, before trimming or inserting; insertion must not
     // replace this record with one based on the trimmed payload. FIN is not data.
-    // Scope: Existing SACK negotiation gates duplicate reports, no separate D-SACK capability flag or handshake option.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-2
     //= reason=Existing SACK negotiation gates duplicate reports, no separate D-SACK capability flag or handshake option.
     //# The use of D-SACK does not require separate negotiation between a TCP
     //# sender and receiver that have already negotiated SACK capability.
-    // Scope: Connection input clears prior D-SACK after clock validation and before all protocol drops; Endpoint rejects checksum-invalid packets before this boundary. Only SACK-negotiated, validated duplicate text records a new interval; FIN/control is not duplicate data. Packet batching tests cover ACK-only, rejected ACK/sequence, missing TS and PAWS-stale supersession across wrap, while output failure without new arrival preserves the report.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-4
     //= reason=Connection input clears prior D-SACK after clock validation and before all protocol drops; Endpoint rejects checksum-invalid packets before this boundary. Only SACK-negotiated, validated duplicate text records a new interval; FIN/control is not duplicate data. Packet batching tests cover ACK-only, rejected ACK/sequence, missing TS and PAWS-stale supersession across wrap, while output failure without new arrival preserves the report.
     //# (1) A D-SACK block is only used to report a duplicate contiguous
     //# sequence of data received by the receiver in the most recent packet.
-    // Scope: Records raw duplicate start/exclusive end before trimming, including already-read cumulative bytes and wrap.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-4
     //= reason=Records raw duplicate start/exclusive end before trimming, including already-read cumulative bytes and wrap.
     //# (3) The left edge of the D-SACK block specifies the first sequence
     //# number of the duplicate contiguous sequence, and the right edge of
     //# the D-SACK block specifies the sequence number immediately following
     //# the last sequence in the duplicate contiguous sequence.
-    // Scope: First raw prefix/earliest retained-range overlap wins; erratum365 fixes illustrative second arrival to 2500-2999 and existing example6 test matches it.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-4.2
     //= reason=First raw prefix/earliest retained-range overlap wins; erratum365 fixes illustrative second arrival to 2500-2999 and existing example6 test matches it.
     //# When the SACK option is used for reporting partial duplicate
@@ -641,26 +637,22 @@ impl ReceiveBuffer {
     //# Each block represents received bytes of data that are contiguous and
     //# isolated; that is, the bytes just below the block, (Left Edge of Block - 1),
     //# and just above the block, (Right Edge of Block), have not been received.
-    // Scope: D-SACK alters option contents only; cumulative ACK still follows receive frontier and ACK scheduling remains normal TCP.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-2
     //= reason=D-SACK alters option contents only; cumulative ACK still follows receive frontier and ACK scheduling remains normal TCP.
     //# This document does not make any changes to TCP's use of the
     //# cumulative acknowledgement field, or to the TCP receiver's decision
     //# of *when* to send an acknowledgement packet.
-    // Scope: Above-ACK DSACK emits full containing range second; one-slot budget declines that duplicate report and emits ordinary enclosing block instead, avoiding ambiguous DSACK. Conditional rule applies only if DSACK actually reported.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-4
     //= reason=Above-ACK DSACK emits full containing range second; one-slot budget declines that duplicate report and emits ordinary enclosing block instead, avoiding ambiguous DSACK. Conditional rule applies only if DSACK actually reported.
     //# (4) If the D-SACK block reports a duplicate contiguous sequence from
     //# a (possibly larger) block of data in the receiver's data queue above
     //# the cumulative acknowledgement, then the second SACK block in that
     //# SACK option should specify that (possibly larger) block of data.
-    // Scope: Remaining available slots contain other retained ranges (at most four total/three with padded TS); ordinary RFC2018 reporting resource gaps remain separate TODOs.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-4
     //= reason=Remaining available slots contain other retained ranges (at most four total/three with padded TS); ordinary RFC2018 reporting resource gaps remain separate TODOs.
     //# (5) Following the SACK blocks described above for reporting duplicate
     //# segments, additional SACK blocks can be used for reporting additional
     //# blocks of data, as specified in RFC 2018.
-    // Scope: Pending raw duplicate occupies first block, ahead of containing/other ordinary SACK ranges; option budget may decline duplicate report, not mislabel an ordinary block as DSACK.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-4
     //= reason=Pending raw duplicate occupies first block, ahead of containing/other ordinary SACK ranges; option budget may decline duplicate report, not mislabel an ordinary block as DSACK.
     //# When D-SACK is used, the
@@ -1488,13 +1480,11 @@ mod tests {
     }
 
     #[test]
-    // Scope: Connection input clears prior D-SACK after clock validation and before all protocol drops; Endpoint rejects checksum-invalid packets before this boundary. Only SACK-negotiated, validated duplicate text records a new interval; FIN/control is not duplicate data. Packet batching tests cover ACK-only, rejected ACK/sequence, missing TS and PAWS-stale supersession across wrap, while output failure without new arrival preserves the report.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-4
     //= type=test
     //= reason=Connection input clears prior D-SACK after clock validation and before all protocol drops; Endpoint rejects checksum-invalid packets before this boundary. Only SACK-negotiated, validated duplicate text records a new interval; FIN/control is not duplicate data. Packet batching tests cover ACK-only, rejected ACK/sequence, missing TS and PAWS-stale supersession across wrap, while output failure without new arrival preserves the report.
     //# (1) A D-SACK block is only used to report a duplicate contiguous
     //# sequence of data received by the receiver in the most recent packet.
-    // Scope: Records raw duplicate start/exclusive end before trimming, including already-read cumulative bytes and wrap.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-4
     //= type=test
     //= reason=Records raw duplicate start/exclusive end before trimming, including already-read cumulative bytes and wrap.
@@ -1548,7 +1538,6 @@ mod tests {
     }
 
     #[test]
-    // Scope: Above-ACK DSACK emits full containing range second; one-slot budget declines that duplicate report and emits ordinary enclosing block instead, avoiding ambiguous DSACK. Conditional rule applies only if DSACK actually reported.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-4
     //= type=test
     //= reason=Above-ACK DSACK emits full containing range second; one-slot budget declines that duplicate report and emits ordinary enclosing block instead, avoiding ambiguous DSACK. Conditional rule applies only if DSACK actually reported.
@@ -1556,14 +1545,12 @@ mod tests {
     //# a (possibly larger) block of data in the receiver's data queue above
     //# the cumulative acknowledgement, then the second SACK block in that
     //# SACK option should specify that (possibly larger) block of data.
-    // Scope: Remaining available slots contain other retained ranges (at most four total/three with padded TS); ordinary RFC2018 reporting resource gaps remain separate TODOs.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-4
     //= type=test
     //= reason=Remaining available slots contain other retained ranges (at most four total/three with padded TS); ordinary RFC2018 reporting resource gaps remain separate TODOs.
     //# (5) Following the SACK blocks described above for reporting duplicate
     //# segments, additional SACK blocks can be used for reporting additional
     //# blocks of data, as specified in RFC 2018.
-    // Scope: First raw prefix/earliest retained-range overlap wins; erratum365 fixes illustrative second arrival to 2500-2999 and existing example6 test matches it.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-4.2
     //= type=test
     //= reason=First raw prefix/earliest retained-range overlap wins; erratum365 fixes illustrative second arrival to 2500-2999 and existing example6 test matches it.

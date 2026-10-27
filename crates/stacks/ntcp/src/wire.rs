@@ -227,12 +227,10 @@ fn read_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> 
                         if outgoing && bytes[2] > 14 {
                             return Err(WireError::InvalidOption);
                         }
-                        // Scope: Parser clamps peer exponent to 14; local exponent search bounded 0..=14. Erratum 5585 is editorial; rejected 5586 does not replace the <2^30 requirement.
                         //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
                         //= reason=Parser clamps peer exponent to 14; local exponent search bounded 0..=14. Erratum 5585 is editorial; rejected 5586 does not replace the <2^30 requirement.
                         //# Thus, the shift count
                         //# MUST be limited to 14 (which allows windows of 2^30 = 1 GiB).
-                        // Scope: Parser preserves one invalid raw exponent for the bounded connection diagnostic while keeping the effective WS clamp at 14. Wire 15/255 vectors and connection event coalescing test the notification path.
                         //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
                         //= reason=Parser preserves one invalid raw exponent for the bounded connection diagnostic while keeping the effective WS clamp at 14. Wire 15/255 vectors and connection event coalescing test the notification path.
                         //# If a
@@ -261,11 +259,9 @@ fn read_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> 
                             ));
                         }
                     }
-                    // Scope: TS parser/output literal kind 8.
                     //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
                     //= reason=TS parser/output literal kind 8.
                     //# Kind: 8
-                    // Scope: TS has two four-byte fields plus kind/length, padding external to length.
                     //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
                     //= reason=TS has two four-byte fields plus kind/length, padding external to length.
                     //# Length: 10 bytes
@@ -741,13 +737,11 @@ mod tests {
             seal(ip, &mut bytes);
             let parsed = parse(ip, &bytes).unwrap();
             assert_eq!(parsed.options.mss, Some(0));
-            // Scope: Parser clamps peer exponent to 14; local exponent search bounded 0..=14. Erratum 5585 is editorial; rejected 5586 does not replace the <2^30 requirement.
             //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
             //= type=test
             //= reason=Parser clamps peer exponent to 14; local exponent search bounded 0..=14. Erratum 5585 is editorial; rejected 5586 does not replace the <2^30 requirement.
             //# Thus, the shift count
             //# MUST be limited to 14 (which allows windows of 2^30 = 1 GiB).
-            // Scope: Parser preserves one invalid raw exponent for the bounded connection diagnostic while keeping the effective WS clamp at 14. Wire 15/255 vectors and connection event coalescing test the notification path.
             //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
             //= type=test
             //= reason=Parser preserves one invalid raw exponent for the bounded connection diagnostic while keeping the effective WS clamp at 14. Wire 15/255 vectors and connection event coalescing test the notification path.
@@ -1175,12 +1169,10 @@ mod tests {
     }
 
     #[test]
-    // Scope: TS parser/output literal kind 8.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
     //= type=test
     //= reason=TS parser/output literal kind 8.
     //# Kind: 8
-    // Scope: TS has two four-byte fields plus kind/length, padding external to length.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-3.2
     //= type=test
     //= reason=TS has two four-byte fields plus kind/length, padding external to length.

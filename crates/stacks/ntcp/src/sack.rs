@@ -160,27 +160,23 @@ impl Scoreboard {
             (packet_span < HALF_SPACE && start < end && end <= packet_span).then_some((left, right))
         };
 
-        // Scope: Detection compares the original first block to the packet ACK, independently of the live trim edge. Reordered ACK regressions distinguish ordinary blocks below snd_una from true below-packet-ACK and contained DSACK, including wrap.
         //= https://www.rfc-editor.org/rfc/rfc2883#section-5
         //= reason=Detection compares the original first block to the packet ACK, independently of the live trim edge. Reordered ACK regressions distinguish ordinary blocks below snd_una from true below-packet-ACK and contained DSACK, including wrap.
         //# An implementation MUST NOT compare the
         //# sequence space in the SACK block to the TCP state variable snd.una
         //# (which carries the total cumulative ACK), as this may result in the
         //# wrong conclusion if ACK packets are reordered.
-        // Scope: Compares wire first/second containment before sorting and excludes DSACK block from newly delivered bytes. Future/malformed bounds excluded.
         //= https://www.rfc-editor.org/rfc/rfc2883#section-5
         //= reason=Compares wire first/second containment before sorting and excludes DSACK block from newly delivered bytes. Future/malformed bounds excluded.
         //# If the sequence space in the first SACK block is greater than the
         //# cumulative ACK, then the sender next compares the sequence space in
         //# the first SACK block with the sequence space in the second SACK
         //# block, if there is one.
-        // Scope: Prior-cycle ambiguity is not ruled out by DSACK; sender bounds interval validity and never counts DSACK as delivery, but RACK growth/TLP cancellation consume it without prior-cycle-specific assertion. Closure: inject stale prior-cycle duplicate report across sequence wrap and assert bounded advisory-only response, no release of send bytes, inappropriate congestion undo, or fresh RTT credit. Partial evidence; closure remains TODO.
         //= https://www.rfc-editor.org/rfc/rfc2883#section-4.3
         //= reason=Prior-cycle ambiguity is not ruled out by DSACK; sender bounds interval validity and never counts DSACK as delivery, but RACK growth/TLP cancellation consume it without prior-cycle-specific assertion. Closure: inject stale prior-cycle duplicate report across sequence wrap and assert bounded advisory-only response, no release of send bytes, inappropriate congestion undo, or fresh RTT credit. Partial evidence; closure remains TODO.
         //# TCP senders receiving D-SACK blocks should be aware that a segment
         //# reported as a duplicate segment could possibly have been from a prior
         //# cycle through the sequence number space.
-        // Scope: Connection supplies the wire ACK separately from the live cumulative trim edge; reordered ACK SACK evidence is retained without substituting snd_una for DSACK classification.
         //= https://www.rfc-editor.org/rfc/rfc2883#section-5
         //= reason=Connection supplies the wire ACK separately from the live cumulative trim edge; reordered ACK SACK evidence is retained without substituting snd_una for DSACK classification.
         //# In order for the sender to check that the first (D)SACK block of an
@@ -591,7 +587,6 @@ mod tests {
     }
 
     #[test]
-    // Scope: Compares wire first/second containment before sorting and excludes DSACK block from newly delivered bytes. Future/malformed bounds excluded.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-5
     //= type=test
     //= reason=Compares wire first/second containment before sorting and excludes DSACK block from newly delivered bytes. Future/malformed bounds excluded.
@@ -621,7 +616,6 @@ mod tests {
     }
 
     #[test]
-    // Scope: Detection compares the original first block to the packet ACK, independently of the live trim edge. Reordered ACK regressions distinguish ordinary blocks below snd_una from true below-packet-ACK and contained DSACK, including wrap.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-5
     //= type=test
     //= reason=Detection compares the original first block to the packet ACK, independently of the live trim edge. Reordered ACK regressions distinguish ordinary blocks below snd_una from true below-packet-ACK and contained DSACK, including wrap.
@@ -629,7 +623,6 @@ mod tests {
     //# sequence space in the SACK block to the TCP state variable snd.una
     //# (which carries the total cumulative ACK), as this may result in the
     //# wrong conclusion if ACK packets are reordered.
-    // Scope: Connection supplies the wire ACK separately from the live cumulative trim edge; reordered ACK SACK evidence is retained without substituting snd_una for DSACK classification.
     //= https://www.rfc-editor.org/rfc/rfc2883#section-5
     //= type=test
     //= reason=Connection supplies the wire ACK separately from the live cumulative trim edge; reordered ACK SACK evidence is retained without substituting snd_una for DSACK classification.
