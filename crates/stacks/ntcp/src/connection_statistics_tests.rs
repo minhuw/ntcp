@@ -1,4 +1,5 @@
 use super::*;
+use crate::connection::test_support::commit_reserved;
 
 fn client(v6: bool, timestamps: bool, size: usize) -> Connection {
     let tuple = if v6 {
@@ -46,10 +47,7 @@ fn output(a: &mut Connection, selected: u64, accepted: u64, reserved: bool) -> V
             .transmit_selected(selected, &mut bytes, true)
             .unwrap()
             .unwrap();
-        let mut d = a.last_departure.unwrap();
-        let count = d.payload;
-        a.accept_reserved_output(accepted, &mut d, 0, count, true)
-            .unwrap();
+        commit_reserved(a, accepted);
         size
     } else {
         a.transmit(accepted, &mut bytes).unwrap().unwrap()

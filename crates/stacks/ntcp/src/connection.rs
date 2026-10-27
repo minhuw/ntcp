@@ -9734,5 +9734,9 @@ impl Connection {
 }
 
 #[cfg(test)]
+#[path = "connection_test_support.rs"]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 #[path = "connection_tests.rs"]
 mod tests;

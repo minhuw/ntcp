@@ -1,45 +1,21 @@
 // Deterministic recovery timing regression: no adapter code or synthetic delivery.
 use super::*;
+use crate::connection::test_support::{drain_wire, upstream_config};
 use alloc::format;
 
 fn profile() -> ConnectionConfig {
-    // Manually audited against packet_profile::config(Upstream(default)); peer
-    // omits TS, so negotiation must disable it, not this configuration.
+    // Peer omits TS, so negotiation must disable it, not this configuration.
     ConnectionConfig {
-        receive_capacity: 8 * 1024 * 1024,
-        mss: 1460,
-        initial_window: InitialWindow::Iw10,
-        congestion_algorithm: CongestionAlgorithm::Cubic,
-        cubic_hystart: true,
-        cubic_fast_convergence: true,
-        timestamps: true,
-        sack: true,
-        rack: true,
-        tlp: true,
-        prr: true,
-        prr_pacing: false,
-        pacing: None,
-        rto_min_us: 200_000,
-        adaptive_ack: true,
-        delayed_ack_us: 200_000,
         coalesce_read_window_updates: false,
-        receive_ip_payload_limit: 65515,
-        send_ip_payload_limit: 65515,
-        ..ConnectionConfig::default()
+        ..upstream_config()
     }
 }
 
 fn output(a: &mut Connection, now: u64) -> Vec<(u64, u32, usize)> {
-    let mut sent = Vec::new();
-    for _ in 0..32 {
-        let mut bytes = vec![0; 65535];
-        let Some(n) = a.transmit(now, &mut bytes).unwrap() else {
-            return sent;
-        };
-        let seg = wire::parse(ip(a.tuple()), &bytes[..n]).unwrap();
-        sent.push((now, seg.header.sequence, seg.payload.len()));
-    }
-    panic!("output did not quiesce");
+    drain_wire(a, now, 32)
+        .into_iter()
+        .map(|(sequence, len, _)| (now, sequence, len))
+        .collect()
 }
 
 fn advance(a: &mut Connection, now: u64) -> Vec<(u64, u32, usize)> {

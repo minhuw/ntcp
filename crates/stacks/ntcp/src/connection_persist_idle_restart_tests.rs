@@ -1,4 +1,5 @@
 use super::*;
+use crate::connection::test_support::select_and_commit;
 use alloc::format;
 
 fn warmed(
@@ -43,21 +44,15 @@ fn queue_closed(a: &mut Connection, bytes: usize) -> Instant {
     a.persist_deadline.unwrap()
 }
 
-fn emit(a: &mut Connection, now: Instant, reserved: bool) -> Option<(Header, usize, u8)> {
+fn emit_segment(a: &mut Connection, now: Instant, reserved: bool) -> Option<(Header, usize, u8)> {
     let mut out = [0; 65535];
     let n = if reserved {
-        a.transmit_selected(now, &mut out, true).unwrap()?
+        select_and_commit(a, now, &mut out, true)?
     } else {
         a.transmit(now, &mut out).unwrap()?
     };
     let segment = wire::parse(ip(a.tuple()), &out[..n]).unwrap();
-    let result = (segment.header, segment.payload.len(), a.last_output_ecn);
-    if reserved {
-        let mut departure = a.last_departure.unwrap();
-        a.accept_reserved_output(now, &mut departure, 0, result.1, true)
-            .unwrap();
-    }
-    Some(result)
+    Some((segment.header, segment.payload.len(), a.last_output_ecn))
 }
 
 #[test]
@@ -88,7 +83,7 @@ fn persist_restart_feedback_survives_probe_ack_and_failed_output() {
                             a.transmit(deadline, &mut [0; 19]),
                             Err(Error::OutputTooSmall)
                         );
-                        let probe = emit(&mut a, deadline, reserved).unwrap();
+                        let probe = emit_segment(&mut a, deadline, reserved).unwrap();
                         assert_eq!((probe.1, probe.0.flags & CWR, probe.2), (0, 0, 0));
                         assert_eq!(Seq(probe.0.sequence), a.snd_una.wrapping_add(u32::MAX));
                         assert_eq!(
@@ -120,7 +115,7 @@ fn persist_restart_feedback_survives_probe_ack_and_failed_output() {
                             before
                         );
                         let base = a.snd_nxt;
-                        let first = emit(&mut a, deadline + 2, reserved).unwrap();
+                        let first = emit_segment(&mut a, deadline + 2, reserved).unwrap();
                         assert_eq!(a.congestion.cwnd(), a.restart_window());
                         assert_eq!(
                             (first.0.flags & CWR != 0, first.2),
@@ -128,7 +123,9 @@ fn persist_restart_feedback_survives_probe_ack_and_failed_output() {
                         );
                         assert!(!a.ecn_cwr_pending);
                         let mut bytes = first.1;
-                        while let Some((header, count, _)) = emit(&mut a, deadline + 2, reserved) {
+                        while let Some((header, count, _)) =
+                            emit_segment(&mut a, deadline + 2, reserved)
+                        {
                             assert_eq!(header.flags & CWR, 0);
                             bytes += count;
                         }
@@ -159,12 +156,12 @@ fn persist_restart_loss_threshold_counts_only_fresh_data() {
             let deadline = queue_closed(&mut a, size);
             let prior = format!("{:?}", a.iw_epoch);
             a.timeout(deadline).unwrap();
-            assert_eq!(emit(&mut a, deadline, reserved).unwrap().1, 0);
+            assert_eq!(emit_segment(&mut a, deadline, reserved).unwrap().1, 0);
             assert_eq!(format!("{:?}", a.iw_epoch), prior);
             let ack = a.snd_una;
             input_ack(&mut a, deadline + 1, ack, 32768);
             let mut sent = 0;
-            while let Some((_, count, _)) = emit(&mut a, deadline + 1, reserved) {
+            while let Some((_, count, _)) = emit_segment(&mut a, deadline + 1, reserved) {
                 sent += count;
             }
             assert_eq!(sent, size);
@@ -189,7 +186,7 @@ fn repeated_empty_probe_feedback_preserves_idle_epoch() {
         );
         for _ in 0..3 {
             a.timeout(deadline).unwrap();
-            let probe = emit(&mut a, deadline, reserved).unwrap();
+            let probe = emit_segment(&mut a, deadline, reserved).unwrap();
             assert_eq!((probe.1, probe.2, probe.0.flags & CWR), (0, 0, 0));
             let ack = a.snd_una;
             input_ack(&mut a, deadline + 1, ack, 0);

@@ -44,6 +44,25 @@ fn packet(endpoint: &mut Endpoint, now: u64) -> (IpMetadata, Vec<u8>) {
     }
     panic!("no packet");
 }
+// Emits id's next packet; a reserved one is polled for id and accepted whole.
+fn emit(
+    endpoint: &mut Endpoint,
+    now: u64,
+    id: ConnectionId,
+    reserved: bool,
+) -> (IpMetadata, Vec<u8>) {
+    if !reserved {
+        return packet(endpoint, now);
+    }
+    let mut bytes = [0; 2048];
+    let (poll, token) = endpoint
+        .poll_reserved_transmit_for(now, id, &mut bytes, 16)
+        .unwrap();
+    let tx = poll.packet.unwrap();
+    let result = (tx.ip, bytes[..tx.len].to_vec());
+    assert!(endpoint.accept_transmit(now, token.unwrap()).unwrap());
+    result
+}
 fn deliver(endpoint: &mut Endpoint, now: u64, p: &(IpMetadata, Vec<u8>)) {
     endpoint.input(now, p.0, &p.1).unwrap();
 }

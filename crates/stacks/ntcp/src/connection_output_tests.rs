@@ -1,20 +1,13 @@
 use super::*;
+use crate::connection::test_support::drain_wire;
 
 // Actual wire ranges, not a cwnd/pipe-only assertion. Ignore independent pure ACKs.
 fn outputs(a: &mut Connection, now: u64, base: Seq) -> Vec<(u32, usize)> {
-    let mut ranges = Vec::new();
-    let mut out = [0; 1500];
-    while let Some(size) = a.transmit(now, &mut out).unwrap() {
-        let segment = wire::parse(ip(tuple()), &out[..size]).unwrap();
-        if !segment.payload.is_empty() {
-            ranges.push((
-                Seq(segment.header.sequence).distance_from(base),
-                segment.payload.len(),
-            ));
-        }
-        assert!(ranges.len() < 2000);
-    }
-    ranges
+    drain_wire(a, now, 2000)
+        .into_iter()
+        .filter(|&(_, len, _)| len != 0)
+        .map(|(sequence, len, _)| (Seq(sequence).distance_from(base), len))
+        .collect()
 }
 
 #[test]

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Endpoint contract checks for a real RACK-timer repair and local rejection.
 use super::*;
+use crate::connection::test_support::upstream_config;
 use alloc::vec;
 fn local_failure_input(
     a: &mut Endpoint,
@@ -41,27 +42,8 @@ fn local_failure_endpoint() -> (Endpoint, ConnectionId, u32) {
             max_listeners: 1,
             max_buffer_bytes: 32 * 1024 * 1024,
             connection: ConnectionConfig {
-                receive_capacity: 8 * 1024 * 1024,
-                mss: 1460,
-                receive_ip_payload_limit: 65515,
-                send_ip_payload_limit: 65515,
-                initial_window: crate::InitialWindow::Iw10,
-                congestion_algorithm: crate::CongestionAlgorithm::Cubic,
-                cubic_hystart: true,
-                cubic_fast_convergence: true,
-                timestamps: true,
-                sack: true,
-                rack: true,
-                tlp: true,
-                prr: true,
-                prr_pacing: false,
-                pacing: None,
-                rto_min_us: 200_000,
-                adaptive_ack: true,
-                delayed_ack_us: 200_000,
-                coalesce_read_window_updates: true,
                 abort_with_ack: true,
-                ..ConnectionConfig::default()
+                ..upstream_config()
             },
             ..EndpointConfig::default()
         },

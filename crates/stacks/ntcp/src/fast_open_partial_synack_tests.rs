@@ -1,24 +1,5 @@
 use super::*;
 
-fn emit(
-    endpoint: &mut Endpoint,
-    now: u64,
-    id: ConnectionId,
-    reserved: bool,
-) -> (IpMetadata, Vec<u8>) {
-    if !reserved {
-        return packet(endpoint, now);
-    }
-    let mut bytes = [0; 2048];
-    let (poll, token) = endpoint
-        .poll_reserved_transmit_for(now, id, &mut bytes, 16)
-        .unwrap();
-    let tx = poll.packet.unwrap();
-    let result = (tx.ip, bytes[..tx.len].to_vec());
-    assert!(endpoint.accept_transmit(now, token.unwrap()).unwrap());
-    result
-}
-
 fn response(syn: &(IpMetadata, Vec<u8>), acknowledged_data: u32) -> (IpMetadata, Vec<u8>) {
     let mut result = cache_reply(syn, 1460, Some(&[0x12, 0x34, 0xab, 0xcd]));
     let iss = wire::parse(syn.0, &syn.1).unwrap().header.sequence;

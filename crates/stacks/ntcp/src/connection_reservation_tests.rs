@@ -1,4 +1,5 @@
 use super::*;
+use crate::connection::test_support::commit_reserved;
 
 #[test]
 fn reserved_nonhead_sack_retry_keeps_exhausted_prr_credit_and_recovery_state() {
@@ -370,10 +371,7 @@ fn reserved_fresh_rtt_uses_departure_not_retained_timestamp_selection() {
         .unwrap()
         .unwrap();
     let echo = a.timestamp_value(40);
-    let mut d = a.last_departure.unwrap();
-    let count = d.payload;
-    a.accept_reserved_output(2_000_000, &mut d, 0, count, true)
-        .unwrap();
+    commit_reserved(&mut a, 2_000_000);
     assert!(a.sample.is_none());
     let mut expected = a.rtt.clone();
     expected.sample(100);

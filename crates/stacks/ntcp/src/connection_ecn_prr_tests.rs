@@ -1,4 +1,5 @@
 use super::*;
+use crate::connection::test_support::upstream_config;
 
 fn sender(sack: bool, rack: bool, iss: u32, bytes: usize) -> Connection {
     let mut cfg = config(32_000, 1000);
@@ -661,25 +662,8 @@ mod recovery_timing;
 fn packetdrill_passive_ecn_cwr_prr_characterization() {
     // Audited upstream,ecn baseline; no congestion/flight state fabrication.
     let cfg = ConnectionConfig {
-        receive_capacity: 8 * 1024 * 1024,
-        receive_ip_payload_limit: 65515,
-        send_ip_payload_limit: 65515,
-        initial_window: InitialWindow::Iw10,
-        congestion_algorithm: CongestionAlgorithm::Cubic,
-        cubic_hystart: true,
-        cubic_fast_convergence: true,
-        timestamps: true,
-        sack: true,
-        rack: true,
-        tlp: true,
-        prr: true,
-        prr_pacing: false,
-        pacing: None,
-        rto_min_us: 200_000,
-        adaptive_ack: true,
-        coalesce_read_window_updates: true,
         ecn: true,
-        ..ConnectionConfig::default()
+        ..upstream_config()
     };
     let metadata = ip(reverse(tuple()));
     let encode = |flags, seq, ack, window, options: &[u8]| {

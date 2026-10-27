@@ -1,4 +1,5 @@
 use super::*;
+use crate::connection::test_support::drain_wire;
 
 fn startup_paced_pair(mut cfg: ConnectionConfig, iss: u32) -> (Connection, Connection) {
     cfg.pacing = Some(PacingConfig::default());
@@ -18,16 +19,11 @@ fn startup_paced_pair(mut cfg: ConnectionConfig, iss: u32) -> (Connection, Conne
 }
 
 fn startup_packets(a: &mut Connection, now: u64) -> Vec<(u32, usize)> {
-    let mut bytes = vec![0; 65535];
-    let mut result = Vec::new();
-    while let Some(n) = a.transmit(now, &mut bytes).unwrap() {
-        let p = wire::parse(ip(tuple()), &bytes[..n]).unwrap();
-        if !p.payload.is_empty() {
-            result.push((p.header.sequence, p.payload.len()));
-        }
-        assert!(result.len() < 100);
-    }
-    result
+    drain_wire(a, now, 100)
+        .into_iter()
+        .filter(|&(_, len, _)| len != 0)
+        .map(|(sequence, len, _)| (sequence, len))
+        .collect()
 }
 
 #[test]

@@ -23,26 +23,6 @@ fn cold(scale: u64, reserved: bool) -> Endpoint {
     endpoint
 }
 
-fn emit(
-    endpoint: &mut Endpoint,
-    now: u64,
-    id: ConnectionId,
-    reserved: bool,
-) -> (IpMetadata, Vec<u8>) {
-    if !reserved {
-        return packet(endpoint, now);
-    }
-    let mut bytes = [0; 2048];
-    let (poll, attempt) = endpoint
-        .poll_reserved_transmit_for(now, id, &mut bytes, 16)
-        .unwrap();
-    let tx = poll.packet.unwrap();
-    let ip = tx.ip;
-    let bytes = bytes[..tx.len].to_vec();
-    assert!(endpoint.accept_transmit(now, attempt.unwrap()).unwrap());
-    (ip, bytes)
-}
-
 #[test]
 fn cookie_request_first_timeout_success_preserves_next_attempt() {
     let initial = [0x55; 10_000];

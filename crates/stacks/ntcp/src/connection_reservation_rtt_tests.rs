@@ -1,4 +1,5 @@
 use super::*;
+use crate::connection::test_support::commit_reserved;
 
 fn output(c: &mut Connection, selected: u64, accepted: u64, reserved: bool) -> Vec<u8> {
     if !reserved {
@@ -9,10 +10,7 @@ fn output(c: &mut Connection, selected: u64, accepted: u64, reserved: bool) -> V
         .transmit_selected(selected, &mut bytes, true)
         .unwrap()
         .unwrap();
-    let mut d = c.last_departure.unwrap();
-    let count = d.payload;
-    c.accept_reserved_output(accepted, &mut d, 0, count, true)
-        .unwrap();
+    commit_reserved(c, accepted);
     bytes.truncate(n);
     bytes
 }
@@ -26,10 +24,7 @@ fn first_loss_output(c: &mut Connection, reserved: bool) -> (u64, Vec<u8>) {
         let mut bytes = vec![0; 2048];
         if let Some(n) = c.transmit_selected(now, &mut bytes, reserved).unwrap() {
             if reserved {
-                let mut d = c.last_departure.unwrap();
-                let count = d.payload;
-                c.accept_reserved_output(now, &mut d, 0, count, true)
-                    .unwrap();
+                commit_reserved(c, now);
             }
             bytes.truncate(n);
             return (now, bytes);

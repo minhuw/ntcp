@@ -1,4 +1,5 @@
 use super::*;
+use crate::connection::test_support::{commit_reserved, select_and_commit};
 
 fn client(iss: u32, size: usize) -> Connection {
     let mut cfg = config(8192, 536);
@@ -231,10 +232,7 @@ fn selected_packet(a: &mut Connection, now: &mut u64, reserved: bool) -> Option<
     let mut bytes = vec![0; 2048];
     let len = a.transmit_selected(*now, &mut bytes, reserved).unwrap()?;
     if reserved {
-        let mut departure = a.last_departure.unwrap();
-        let payload = departure.payload;
-        a.accept_reserved_output(*now + 10, &mut departure, 0, payload, true)
-            .unwrap();
+        commit_reserved(a, *now + 10);
     }
     *now += 100;
     bytes.truncate(len);
@@ -1039,10 +1037,7 @@ fn fast_open_negative_requires_physical_option_and_reports_once() {
                 a.reject_reserved_output();
                 a.timeout(1_000_000).unwrap();
                 assert!(!a.fast_open_negative);
-                let mut departure = a.last_departure.unwrap();
-                let payload = departure.payload;
-                a.accept_reserved_output(2_000_000, &mut departure, 0, payload, true)
-                    .unwrap();
+                commit_reserved(&mut a, 2_000_000);
             }
             assert_eq!(a.fast_open_attempt, option);
             let timeout = a.rto_deadline.unwrap();
@@ -1407,18 +1402,9 @@ fn fast_open_synack_classification_shared_across_handshake_roles() {
 #[test]
 fn inventory_tfo_partial_synack_resegmentation_counts_original_identity() {
     extern crate std;
-    fn emit(a: &mut Connection, now: u64, reserved: bool) -> Vec<u8> {
+    fn emit_at(a: &mut Connection, now: u64, reserved: bool) -> Vec<u8> {
         let mut bytes = vec![0; 4096];
-        let n = a
-            .transmit_selected(now, &mut bytes, reserved)
-            .unwrap()
-            .unwrap();
-        if reserved {
-            let mut d = a.last_departure.unwrap();
-            let count = d.payload;
-            a.accept_reserved_output(now, &mut d, 0, count, true)
-                .unwrap();
-        }
+        let n = select_and_commit(a, now, &mut bytes, reserved).unwrap();
         bytes.truncate(n);
         bytes
     }
@@ -1439,7 +1425,7 @@ fn inventory_tfo_partial_synack_resegmentation_counts_original_identity() {
             );
             let cached = cache.get(0, 100, tuple().local.ip(), tuple().remote.ip());
             assert_eq!(a.prepare_fast_open(cached, &[42; 1420]).unwrap(), 1420);
-            emit(&mut a, 0, reserved);
+            emit_at(&mut a, 0, reserved);
             let response = Segment {
                 header: Header {
                     source_port: tuple().remote.port(),
@@ -1463,7 +1449,7 @@ fn inventory_tfo_partial_synack_resegmentation_counts_original_identity() {
             assert_eq!(a.send.len(), 1320);
             let mut total = 0;
             for length in [1000, 320] {
-                let bytes = emit(&mut a, 10_000, reserved);
+                let bytes = emit_at(&mut a, 10_000, reserved);
                 let retry = wire::parse(ip(tuple()), &bytes).unwrap();
                 assert_eq!(retry.header.sequence, iss.wrapping_add(101 + total));
                 assert_eq!(retry.payload.len(), length);

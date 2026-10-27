@@ -1,30 +1,12 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 // Diagnostic controls for common upstream PUSH admission, no fixture exceptions.
 use super::*;
+use crate::connection::test_support::{drain_wire, upstream_config};
 
 fn profile() -> ConnectionConfig {
     ConnectionConfig {
-        receive_capacity: 8 * 1024 * 1024,
-        receive_ip_payload_limit: 65515,
-        send_ip_payload_limit: 65515,
-        mss: 1460,
-        initial_window: InitialWindow::Iw10,
-        congestion_algorithm: CongestionAlgorithm::Cubic,
-        cubic_hystart: true,
-        cubic_fast_convergence: true,
         ecn: false,
-        timestamps: true,
-        sack: true,
-        rack: true,
-        tlp: true,
-        prr: true,
-        prr_pacing: false,
-        pacing: None,
-        rto_min_us: 200000,
-        adaptive_ack: true,
-        delayed_ack_us: 200000,
-        coalesce_read_window_updates: true,
-        ..ConnectionConfig::default()
+        ..upstream_config()
     }
 }
 
@@ -94,22 +76,10 @@ fn setup_sequence(
 }
 
 fn drain(a: &mut Connection, now: u64) -> Vec<(u32, usize, bool)> {
-    let mut packets = Vec::new();
-    for _ in 0..64 {
-        let mut out = [0; 2048];
-        let Some(n) = a.transmit(now, &mut out).unwrap() else {
-            return packets;
-        };
-        let seg = wire::parse(ip(a.tuple()), &out[..n]).unwrap();
-        if !seg.payload.is_empty() {
-            packets.push((
-                seg.header.sequence,
-                seg.payload.len(),
-                seg.header.flags & PSH != 0,
-            ));
-        }
-    }
-    panic!("output did not quiesce");
+    drain_wire(a, now, 64)
+        .into_iter()
+        .filter(|&(_, len, _)| len != 0)
+        .collect()
 }
 fn ack(
     a: &mut Connection,

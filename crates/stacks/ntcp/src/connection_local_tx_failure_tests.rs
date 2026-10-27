@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Deterministic diagnostic: local rejection is distinct from network loss.
 use super::*;
+use crate::connection::test_support::upstream_config;
 
 fn local_sender() -> Connection {
-    let mut cfg = profile();
+    let mut cfg = upstream_config();
     // Remaining common upstream options, audited against packet_profile::config.
-    cfg.coalesce_read_window_updates = true;
     cfg.abort_with_ack = true;
     cfg.output_group_flush = true;
     let incoming = ip(reverse(tuple()));

@@ -1,17 +1,9 @@
 // SPDX-License-Identifier: MIT
 use super::*;
+use crate::connection::test_support::drain_wire;
 
 fn drain(a: &mut Connection, now: u64) -> usize {
-    let mut bytes = [0; 2048];
-    let mut total = 0;
-    for _ in 0..1024 {
-        let Some(n) = a.transmit(now, &mut bytes).unwrap() else {
-            return total;
-        };
-        let segment = wire::parse(ip(a.tuple()), &bytes[..n]).unwrap();
-        total += segment.payload.len();
-    }
-    panic!("output did not quiesce");
+    drain_wire(a, now, 1024).iter().map(|p| p.1).sum()
 }
 
 fn advance_to(a: &mut Connection, now: u64) {

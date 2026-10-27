@@ -1,4 +1,5 @@
 use super::*;
+use crate::connection::test_support::select_and_commit;
 use crate::{ConnectionId, Endpoint, EndpointConfig, GsoLimits, ListenerId};
 
 fn cfg(units: u64) -> ConnectionConfig {
@@ -54,19 +55,10 @@ fn opening(
     (peer, server, bytes)
 }
 
-fn emit(a: &mut Connection, us: u64, reserved: bool) -> Vec<u8> {
+fn emit_at_us(a: &mut Connection, us: u64, reserved: bool) -> Vec<u8> {
     let now = a.config.timebase.ticks_from_us(us);
     let mut out = vec![0; 65535];
-    let n = a
-        .transmit_selected(now, &mut out, reserved)
-        .unwrap()
-        .expect("packet");
-    if reserved {
-        let mut d = a.last_departure.unwrap();
-        let count = d.payload;
-        a.accept_reserved_output(now, &mut d, 0, count, true)
-            .unwrap();
-    }
+    let n = select_and_commit(a, now, &mut out, reserved).expect("packet");
     out.truncate(n);
     out
 }
@@ -130,7 +122,7 @@ fn early_response_actual_gate_and_committed_synack() {
                         a.accept_reserved_output(20_000, &mut d, 0, 0, true)
                             .unwrap();
                     } else {
-                        let bytes = emit(&mut a, 20_000, false);
+                        let bytes = emit_at_us(&mut a, 20_000, false);
                         let synack = wire::parse(ip(a.tuple()), &bytes).unwrap();
                         assert_eq!(synack.header.flags & (SYN | ACK), SYN | ACK);
                         assert!(synack.payload.is_empty());
@@ -167,7 +159,7 @@ fn early_response_actual_cap_window_mss_and_bounded_early_gso() {
                 // Vary receive credit without fabricating a completed handshake.
                 a.snd_wnd = window;
                 a.write(&vec![42; 12_000]).unwrap();
-                emit(&mut a, 20_000, false);
+                emit_at_us(&mut a, 20_000, false);
                 let anchor = a.rto_deadline;
                 let cap = a
                     .initial_window()
@@ -221,7 +213,7 @@ fn early_response_actual_cap_window_mss_and_bounded_early_gso() {
                         .min(a.congestion.cwnd())
                         .min(window.saturating_sub(1))
                 {
-                    let bytes = emit(&mut a, 600_000, false);
+                    let bytes = emit_at_us(&mut a, 600_000, false);
                     assert_eq!(wire::parse(ip(a.tuple()), &bytes).unwrap().payload, b"more");
                     4
                 } else {
@@ -232,7 +224,7 @@ fn early_response_actual_cap_window_mss_and_bounded_early_gso() {
                     acknowledge(&mut a, 700_000, cap + extra, &[]);
                     assert!(a.handshake_complete());
                     a.write(b"after").unwrap();
-                    let data = emit(&mut a, 710_000, false);
+                    let data = emit_at_us(&mut a, 710_000, false);
                     assert!(
                         !wire::parse(ip(a.tuple()), &data)
                             .unwrap()
@@ -252,7 +244,7 @@ fn assert_early_response_window_boundary(window: u32) {
             // Isolate receive credit without completing the handshake.
             a.snd_wnd = window;
             a.write(&[42; 4000]).unwrap();
-            emit(&mut a, 20_000, reserved);
+            emit_at_us(&mut a, 20_000, reserved);
             assert_eq!((a.flight(), a.data_flight()), (1, 0));
             let una = a.snd_una;
             let anchor = a.rto_deadline;
@@ -325,10 +317,10 @@ fn early_response_actual_syn_retry_anchor_and_ack_handoff() {
                     c.rto_min_us = 1;
                     let (_, mut a, syn) = opening(c, iss, true, b"request");
                     a.write(&[42; 4000]).unwrap();
-                    emit(&mut a, 20_000, reserved);
+                    emit_at_us(&mut a, 20_000, reserved);
                     let anchor = a.rto_deadline.unwrap();
                     for us in [40_000, 50_000, 60_000, 70_000] {
-                        emit(&mut a, us, reserved);
+                        emit_at_us(&mut a, us, reserved);
                     }
                     assert_eq!(a.data_flight(), 4000);
                     let head = a.rack.head_transmission(a.iss.wrapping_add(1));
@@ -340,7 +332,7 @@ fn early_response_actual_syn_retry_anchor_and_ack_handoff() {
                     .unwrap();
                     assert_eq!(a.readable_bytes(), read_before);
                     assert_eq!(a.rto_deadline, Some(anchor));
-                    let retry = emit(&mut a, 90_000, reserved);
+                    let retry = emit_at_us(&mut a, 90_000, reserved);
                     assert!(
                         wire::parse(ip(a.tuple()), &retry)
                             .unwrap()
@@ -350,7 +342,7 @@ fn early_response_actual_syn_retry_anchor_and_ack_handoff() {
                     let deadline = a.rto_deadline.unwrap();
                     a.timeout(deadline).unwrap();
                     let us = a.config.timebase.us_from_ticks(deadline);
-                    let retry = emit(&mut a, us, reserved);
+                    let retry = emit_at_us(&mut a, us, reserved);
                     let retry = wire::parse(ip(a.tuple()), &retry).unwrap();
                     assert!(retry.payload.is_empty() && retry.options.fast_open.is_none());
                     assert_eq!(a.rack.head_transmission(a.iss.wrapping_add(1)), head);
@@ -378,7 +370,7 @@ fn early_response_actual_partial_sack_prr_and_fin_wait() {
         c.rack = false;
         c.tlp = false;
         let (_, mut a, _) = opening(c, iss, true, b"request");
-        emit(&mut a, 20_000, false);
+        emit_at_us(&mut a, 20_000, false);
         for (n, us) in [
             (500, 40_000),
             (500, 50_000),
@@ -387,7 +379,7 @@ fn early_response_actual_partial_sack_prr_and_fin_wait() {
             (1000, 80_000),
         ] {
             a.write(&vec![42; n]).unwrap();
-            emit(&mut a, us, false);
+            emit_at_us(&mut a, us, false);
         }
         a.shutdown().unwrap();
         assert_eq!(a.transmit(90_000, &mut [0; 2048]), Ok(None));
@@ -397,7 +389,7 @@ fn early_response_actual_partial_sack_prr_and_fin_wait() {
         assert_eq!(a.prr.unwrap().counters(), (4000, 3500, 0));
         assert_eq!(a.acknowledged, 500);
         acknowledge(&mut a, 210_000, 4000, &[]);
-        let bytes = emit(&mut a, 220_000, false);
+        let bytes = emit_at_us(&mut a, 220_000, false);
         let fin = wire::parse(ip(a.tuple()), &bytes).unwrap();
         assert!(fin.payload.is_empty());
         assert_eq!(fin.header.flags & FIN, FIN);
@@ -419,9 +411,9 @@ fn early_response_actual_pmtu_shrink_and_pacing_keep_syn_anchor() {
         });
         let (_, mut a, _) = opening(c, 100, true, b"request");
         a.write(&[42; 6000]).unwrap();
-        emit(&mut a, 20_000, false);
+        emit_at_us(&mut a, 20_000, false);
         let anchor = a.rto_deadline;
-        emit(&mut a, 40_000, false);
+        emit_at_us(&mut a, 40_000, false);
         assert_eq!(a.transmit(a.now, &mut [0; 2048]), Ok(None));
         let pace = a.general_pacing_deadline(a.now).unwrap();
         a.set_first_hop_mtu(a.now, 540).unwrap();
@@ -431,7 +423,7 @@ fn early_response_actual_pmtu_shrink_and_pacing_keep_syn_anchor() {
         a.timeout(pace).unwrap();
         // Existing PMTU shrink behavior queues a data-free SYN-ACK first.
         let us = a.config.timebase.us_from_ticks(pace);
-        let retry = emit(&mut a, us, false);
+        let retry = emit_at_us(&mut a, us, false);
         let retry = wire::parse(ip(a.tuple()), &retry).unwrap();
         assert_ne!(retry.header.flags & SYN, 0);
         assert!(retry.payload.is_empty());
@@ -441,7 +433,7 @@ fn early_response_actual_pmtu_shrink_and_pacing_keep_syn_anchor() {
         assert_eq!(a.data_flight(), 1000);
         a.snd_wnd = 16_384;
         let us = a.config.timebase.us_from_ticks(pace);
-        let bytes = emit(&mut a, us, false);
+        let bytes = emit_at_us(&mut a, us, false);
         assert_eq!(
             wire::parse(ip(a.tuple()), &bytes).unwrap().payload.len(),
             500
@@ -753,7 +745,7 @@ fn early_response_cork_and_timestamp_readiness_after_reserved_synack() {
         let (_, mut a, _) = opening(cfg(units), 100, true, b"request");
         a.write_with_options(b"queued", true, false).unwrap();
         assert!(a.cork_deadline.is_none());
-        emit(&mut a, 20_000, true);
+        emit_at_us(&mut a, 20_000, true);
         assert_eq!(
             a.cork_deadline,
             Some(a.config.timebase.ticks_from_us(220_000))
@@ -761,7 +753,7 @@ fn early_response_cork_and_timestamp_readiness_after_reserved_synack() {
         assert_eq!(a.transmit(a.now, &mut [0; 2048]), Ok(None));
         let end = a.cork_deadline.unwrap();
         a.timeout(end).unwrap();
-        let data = emit(&mut a, 220_000, true);
+        let data = emit_at_us(&mut a, 220_000, true);
         assert_eq!(
             wire::parse(ip(a.tuple()), &data).unwrap().payload,
             b"queued"
@@ -772,7 +764,7 @@ fn early_response_cork_and_timestamp_readiness_after_reserved_synack() {
         let (_, mut a, _) = opening(c, 100, true, b"r");
         a.config.timestamp_bytes_per_tick = 1; // Server-only budget; client's SYN has data.
         a.write(b"abc").unwrap();
-        emit(&mut a, 20_000, true);
+        emit_at_us(&mut a, 20_000, true);
         assert_eq!(
             a.transmit(a.now, &mut [0; 2048]),
             Err(Error::TimestampBudgetExceeded)
@@ -782,7 +774,7 @@ fn early_response_cork_and_timestamp_readiness_after_reserved_synack() {
             Some(a.config.timebase.ticks_from_us(21_000))
         );
         a.timeout(a.next_deadline().unwrap()).unwrap();
-        let data = emit(&mut a, 21_000, true);
+        let data = emit_at_us(&mut a, 21_000, true);
         assert_eq!(wire::parse(ip(a.tuple()), &data).unwrap().payload, b"a");
     }
 }
@@ -801,15 +793,15 @@ fn early_response_close_drains_queue_after_handshake_and_keeps_empty_early_fin()
             } else {
                 a.shutdown().unwrap();
             }
-            emit(&mut a, 20_000, false);
+            emit_at_us(&mut a, 20_000, false);
             for us in [40_000, 50_000, 60_000, 70_000] {
-                let bytes = emit(&mut a, us, false);
+                let bytes = emit_at_us(&mut a, us, false);
                 let data = wire::parse(ip(a.tuple()), &bytes).unwrap();
                 assert_eq!(data.payload.len(), 1000);
                 assert_eq!(data.header.flags & FIN, 0);
             }
             let early_tail = if initial_window == InitialWindow::Iw10 {
-                let bytes = emit(&mut a, 80_000, false);
+                let bytes = emit_at_us(&mut a, 80_000, false);
                 let tail = wire::parse(ip(a.tuple()), &bytes).unwrap();
                 assert_eq!(tail.payload.len(), 500);
                 assert_eq!(tail.header.flags & FIN, 0);
@@ -821,7 +813,7 @@ fn early_response_close_drains_queue_after_handshake_and_keeps_empty_early_fin()
             assert_eq!(a.fin_sequence, None);
             assert_eq!(a.send.len(), 4500);
             acknowledge(&mut a, 200_000, 4000 + early_tail, &[]);
-            let bytes = emit(&mut a, 210_000, false);
+            let bytes = emit_at_us(&mut a, 210_000, false);
             let tail = wire::parse(ip(a.tuple()), &bytes).unwrap();
             assert_eq!(tail.payload.len(), (500 - early_tail) as usize);
             assert_eq!(tail.header.flags & FIN, FIN);
@@ -842,8 +834,8 @@ fn early_response_close_drains_queue_after_handshake_and_keeps_empty_early_fin()
     let (_, mut a, _) = opening(cfg(1_000_000), 100, true, b"request");
     assert_eq!(a.read(&mut [0; 32]).unwrap(), 7);
     a.close().unwrap();
-    emit(&mut a, 20_000, false);
-    let bytes = emit(&mut a, 30_000, false);
+    emit_at_us(&mut a, 20_000, false);
+    let bytes = emit_at_us(&mut a, 30_000, false);
     let fin = wire::parse(ip(a.tuple()), &bytes).unwrap();
     assert_eq!(fin.header.flags & FIN, FIN);
     assert!(fin.payload.is_empty());
@@ -858,9 +850,9 @@ fn passive_tfo_split_ack_history_uses_single_wire_advance() {
     for iss in [100, u32::MAX] {
         for count in [0, 500, 1000] {
             let (_, mut a, _) = opening(cfg(1_000_000), iss, true, b"request");
-            emit(&mut a, 0, false); // SYN-ACK
+            emit_at_us(&mut a, 0, false); // SYN-ACK
             a.write(&[1; 1000]).unwrap();
-            emit(&mut a, 20_000, false); // Early response before final handshake ACK.
+            emit_at_us(&mut a, 20_000, false); // Early response before final handshake ACK.
             assert_eq!(a.congestion.ack_history(), None);
             acknowledge(&mut a, 100_000, count, &[]);
             assert_eq!(a.state(), State::Established);
@@ -924,7 +916,7 @@ fn inventory_tfo_server_early_policy_and_pre_handshake_payload_cap() {
                     RxPacketTimestamps::default(),
                 )
                 .unwrap();
-                emit(&mut a, 1000, reserved);
+                emit_at_us(&mut a, 1000, reserved);
                 assert!(!a.handshake_complete());
                 assert_eq!(a.read(&mut vec![0; 1000]).unwrap(), request.len());
                 assert_eq!(a.write(&vec![7; response_bytes]).unwrap(), response_bytes);
@@ -998,7 +990,7 @@ fn inventory_tfo_server_early_policy_and_pre_handshake_payload_cap() {
                 .unwrap();
                 assert!(a.handshake_complete());
                 a.write(b"after").unwrap();
-                let bytes = emit(&mut a, 21_000, reserved);
+                let bytes = emit_at_us(&mut a, 21_000, reserved);
                 assert!(!wire::parse(ip(tuple()), &bytes).unwrap().payload.is_empty());
                 std::eprintln!(
                     "TFO_INVENTORY {{\"probe\":\"server_early_policy\",\"enabled\":{enabled},\"reserved\":{reserved},\"write_bytes\":{response_bytes},\"timestamps\":{timestamps},\"mss\":{mss},\"cwnd_bytes\":{before_ack_cwnd},\"pre_handshake_sent\":{sent},\"lengths\":{lengths:?},\"gso\":{grouped},\"handshake_completed_on_control_ack\":true}}"
