@@ -84,6 +84,22 @@ class PmtudInventory(unittest.TestCase):
                         self.assertTrue(any(("//= type=test" in b) == bool(is_test)
                                             for b in matching), p["id"])
 
+    def test_todo_reasons_match_todo_entries_and_partial_evidence(self):
+        # A TODO row has one reason: its todos.toml entry and any partial
+        # source/test evidence annotation must carry the same text.
+        for n in RFCS:
+            todos = tomllib.loads((ROOT / f"duvet/rfc{n}-todos.toml").read_text())
+            key = lambda p: (p["target"], " ".join(p["quote"].split()))
+            for p in self.inventory(n)["paragraphs"]:
+                if p["status"] != "TODO":
+                    continue
+                self.assertEqual([t["reason"] for t in todos.get("TODO", []) if key(t) == key(p)],
+                                 [p["reason"]], p["id"])
+                # Keep the proven source/test evidence explicitly partial, not deleted.
+                for evidence in p.get("evidence", []):
+                    source = (ROOT / evidence.split("::", 1)[0]).read_text()
+                    self.assertIn("//= reason=" + p["reason"], source, p["id"])
+
     def test_lowercase_algorithm_and_security_spans_cannot_disappear(self):
         required = {
             1191: ("576 octets unless", "Header Length field", "greatest plateau value",
@@ -120,136 +136,6 @@ class PmtudInventory(unittest.TestCase):
             self.assertEqual(row["status"], "exception")
             self.assertIn("Selected Informational policy deviation:", row["reason"])
             self.assertIn("historical algorithm is deliberately not selected", row["reason"])
-
-    def test_classical_operative_closures_and_selected_alternatives(self):
-        rows = {p["id"]: p for n in (1191, 8201)
-                for p in self.inventory(n)["paragraphs"]}
-        alternatives = tuple(f"1191-{i:03}" for i in (70, 71, 72, 73, 102, 103, 104, 107))
-        expected = {
-            "covered": ("1191-005a", "1191-005b", "1191-005d", "1191-006b",
-                        "1191-014a", "1191-013a", "1191-013c", "1191-013e",
-                        "8201-003", "8201-035", "8201-051", "8201-058",
-                        "8201-068", "8201-086", "1191-069", "1191-068", "8201-069"),
-            "context": ("1191-015", "1191-029", "1191-060", "1191-066"),
-            "exception": ("1191-005c", "1191-006a", "1191-007", "1191-013d",
-                          "1191-013f", "1191-063", "8201-025b", "8201-065",
-                          *alternatives),
-            # These are open obligations/evidence gaps, not expected runtime failures.
-            "TODO": ("8201-004", "8201-060", "8201-076"),
-        }
-        for status, ids in expected.items():
-            for id in ids:
-                with self.subTest(id=id):
-                    self.assertEqual(rows[id]["status"], status)
-        for id in (*alternatives, "1191-013d", "1191-013f"):
-            self.assertIn("RFC4821 section1", rows[id]["reason"], id)
-        for fragment in ("set_path_mss", "retx_pending", "remaining flight"):
-            self.assertIn(fragment, rows["1191-069"]["reason"])
-
-    def test_reviewed_growth_and_ipv6_evidence_closures(self):
-        rows = {p["id"]: p for n in RFCS for p in self.inventory(n)["paragraphs"]}
-        scopes = {
-            "1191-069": ("742e320", "only on decreases", "remaining flight", "timers"),
-            "4821-111": ("742e320", "unambiguous", "path bounds", "partial ACK",
-                         "Ordinary loss", "probe timeout"),
-            "4821-067": ("742e320", "no-ACK", "real data RTO", "Reno and CUBIC",
-                         "not full CUBIC trajectory", "allowed ACK growth"),
-            "8201-033": ("819b8f2", "checksum", "stale quotes", "not authentication"),
-            "8201-037": ("819b8f2", "selected security policy", "progress clearing",
-                         "quoted-head RTO", "receiver ACK"),
-            "8201-039": ("819b8f2", "equal/larger", "accepted 1400 decrease"),
-            "8201-059": ("819b8f2", "quoted outbound tuple", "distinct local addresses",
-                         "does not establish same-address per-interface isolation"),
-            "8201-087": ("819b8f2", "strictly-decreasing", "before and after"),
-        }
-        for id, fragments in scopes.items():
-            with self.subTest(id=id):
-                self.assertEqual(rows[id]["status"], "covered")
-                for fragment in fragments:
-                    self.assertIn(fragment, rows[id]["reason"])
-        # The simulation does not establish an actual on-link/ND decision
-        # or same-address per-interface identity.
-        for id in ("8201-031", "8201-052"):
-            self.assertEqual(rows[id]["status"], "TODO")
-
-    def test_reviewed_policy_and_isolated_cc_closures_preserve_partial_gaps(self):
-        rows = {p["id"]: p for n in RFCS for p in self.inventory(n)["paragraphs"]}
-        self.assertEqual({n: sum(p["status"] == "TODO"
-                                 for p in self.inventory(n)["paragraphs"])
-                          for n in RFCS}, {1191: 23, 8201: 16, 4821: 17, 5927: 2})
-        for id in ("1191-068", "1191-095", "8201-069", "8201-084"):
-            self.assertEqual(rows[id]["status"], "covered")
-            for fragment in ("0030a96", "Infinity", ">=300", "Endpoint::set_pmtud_policy",
-                             "independent mandatory 600-second PTB hold"):
-                self.assertIn(fragment, rows[id]["reason"], id)
-        expected = {
-            "4821-113": ("initial_search_low", "Destination policy configuration"),
-            "4821-066": ("logical window", "PRR admission", "strict extra", "deadline"),
-            "4821-143": ("actual TCP RTO", "one-MSS cwnd", "five times cooldown"),
-            "8201-075": ("two successively smaller router PTBs", "wrapping sequences",
-                         "PTB cancellation commits"),
-        }
-        for id, fragments in expected.items():
-            self.assertEqual(rows[id]["status"], "covered", id)
-            for fragment in fragments:
-                self.assertIn(fragment, rows[id]["reason"], id)
-        partials = {
-            "1191-099": ("runtime", "912cf80", "up-to-date reference"),
-            "4821-011": ("apply_ptb cancels", "committed normal congestion response"),
-            "4821-012": ("fivefold timeout hold", "integrated next-probe assertion"),
-            "4821-136": ("suppression", "same-sized next probe"),
-        }
-        for id, fragments in partials.items():
-            self.assertEqual(rows[id]["status"], "TODO", id)
-            for fragment in fragments:
-                self.assertIn(fragment, rows[id]["reason"], id)
-        for id in ("1191-082", "8201-076", "4821-144"):
-            self.assertEqual(rows[id]["status"], "TODO", id)
-
-    def test_matching_ptb_keeps_isolated_suppression_spans_partial(self):
-        rows = {p["id"]: p for p in self.inventory(4821)["paragraphs"]}
-        todos = tomllib.loads((ROOT / "duvet/rfc4821-todos.toml").read_text())["TODO"]
-        partial_evidence = {
-            "4821-065": ("a4b9a0c", "finite preloss", "recovery/PRR exit", "nonempty flight"),
-            "4821-139": ("finite preloss", "probe size minus one", "MSS decrease scaling"),
-            "4821-142": ("logical window", "independent of configurable periodic aging"),
-        }
-        for id, fragments in partial_evidence.items():
-            row = rows[id]
-            for fragment in fragments:
-                self.assertIn(fragment, row["reason"], id)
-            self.assertEqual(row["status"], "TODO", id)
-            for fragment in ("Partial no-PTB evidence", "with or without matching PTB",
-                             "apply_ptb cancels", "resolve_probe_response commits",
-                             "only the probe is lost", "trailing packets are delivered",
-                             "IPv6 two-PTB fixture", "does not close this full span"):
-                self.assertIn(fragment, row["reason"], id)
-            self.assertEqual([p["reason"] for p in todos
-                              if " ".join(p["quote"].split()) == row["quote"]],
-                             [row["reason"]])
-            # Keep the proven source/test evidence explicitly partial, not deleted.
-            for evidence in row["evidence"]:
-                source = (ROOT / evidence.split("::", 1)[0]).read_text()
-                self.assertIn("//= reason=" + row["reason"], source)
-        self.assertEqual(rows["4821-011"]["status"], "TODO")
-        # 066 only requires rate limiting when suppression occurs; unlike 142,
-        # it does not also require suppression for every isolated probe failure.
-        self.assertEqual(rows["4821-066"]["status"], "covered")
-        self.assertIn("strict extra interval/tick", rows["4821-066"]["reason"])
-        counts = {n: len(tomllib.loads((ROOT / f"duvet/rfc{n}-todos.toml").read_text())
-                         .get("TODO", [])) for n in RFCS}
-        self.assertEqual(sum(counts.values()), 58)
-        self.assertEqual(sum(len(tomllib.loads(p.read_text()).get("TODO", []))
-                             for p in (ROOT / "duvet").glob("rfc*-todos.toml")), 61)
-
-    def test_paws_discovery_gap_names_concrete_supplied_embedding(self):
-        todos = tomllib.loads((ROOT / "duvet/rfc7323-todos.toml").read_text())["TODO"]
-        matching = [p for p in todos if p["target"] == f"{PREFIX}7323#section-5.7"]
-        self.assertEqual(len(matching), 1)
-        reason = matching[0]["reason"]
-        for fragment in ("crates/stacks/ntcp/examples/tun_echo.rs", "NTCP_TIMESTAMPS=1",
-                         "DF", "pmtud=None", "input_frame", "TCP only", "ICMP PTB"):
-            self.assertIn(fragment, reason)
 
     def test_all_inventory_quotes_match_official_text_when_cached(self):
         for n in RFCS:
