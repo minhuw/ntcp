@@ -2623,6 +2623,7 @@ fn software_gso_cpu_sample() {
     }
 }
 
+#[cfg(feature = "packet-test")]
 #[path = "runtime_local_repair_tests.rs"]
 mod local_repair;
 

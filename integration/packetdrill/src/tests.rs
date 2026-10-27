@@ -311,7 +311,9 @@ fn abi_table_null_counts_vectors_variadics_and_host_clock() {
     let expected = call(&adapter, 18, fd, 1, vec![], TCP_INFO_SIZE)
         .unwrap()
         .bytes;
-    assert_eq!(&info[..TCP_INFO_SIZE], expected);
+    // last_data_recv (bytes 52..56) advances with the wall clock between reads.
+    assert_eq!(&info[..52], &expected[..52]);
+    assert_eq!(&info[56..TCP_INFO_SIZE], &expected[56..]);
     for (option, length) in [(TCP_CC_INFO, 0), (TCP_INFO, TCP_INFO_SIZE)] {
         for capacity in [0, 1, 7, TCP_INFO_SIZE + 8] {
             info.fill(0xa5);
@@ -493,7 +495,8 @@ int main(int argc, char **argv) {
     unsigned char info[288], abi[280]; memset(info, 0xa5, sizeof(info)); socklen_t n = sizeof(info);
     assert(GETOPT(fd, IPPROTO_TCP, TCP_INFO, info, &n) == 0 && n == 280 && info[0] == 2);
     n = sizeof(abi); assert(p.getsockopt(p.userdata, fd, IPPROTO_TCP, TCP_INFO, abi, &n) == 0);
-    assert(memcmp(info, abi, sizeof(abi)) == 0 && info[280] == 0xa5);
+    // last_data_recv (bytes 52..56) advances with the wall clock between reads.
+    assert(memcmp(info, abi, 52) == 0 && memcmp(info + 56, abi + 56, sizeof(abi) - 56) == 0 && info[280] == 0xa5);
     n = sizeof(abi); assert(syscall(SYS_getsockopt, fd, IPPROTO_TCP, TCP_INFO, abi, &n) == -1);
     n = sizeof(abi); assert(GETOPT(fd, IPPROTO_TCP, TCP_CC_INFO, abi, &n) == 0 && n == 0);
     n = sizeof(abi); assert(GETOPT(fd, SOL_SOCKET, SO_MEMINFO, abi, &n) == -1 && errno == ENOSYS);
@@ -519,7 +522,9 @@ int main(int argc, char **argv) {
     int host = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP); assert(host >= 0);
     unsigned char kernel[104], forwarded[104]; socklen_t k = sizeof(kernel); n = sizeof(forwarded);
     assert(syscall(SYS_getsockopt, host, IPPROTO_TCP, TCP_INFO, kernel, &k) == 0);
-    assert(getsockopt(host, IPPROTO_TCP, TCP_INFO, forwarded, &n) == 0 && k == n && !memcmp(kernel, forwarded, n));
+    assert(getsockopt(host, IPPROTO_TCP, TCP_INFO, forwarded, &n) == 0 && k == n);
+    // The kernel's last_data_sent (44..48), last_data_recv (52..56) and last_ack_recv (56..60) advance with jiffies between the reads.
+    assert(memcmp(kernel, forwarded, 44) == 0 && memcmp(kernel + 48, forwarded + 48, 4) == 0 && memcmp(kernel + 60, forwarded + 60, n - 60) == 0);
     k = sizeof(kernel); n = sizeof(forwarded);
     assert(syscall(SYS_getsockopt, host, SOL_SOCKET, SO_MEMINFO, kernel, &k) == 0);
     assert(GETOPT(host, SOL_SOCKET, SO_MEMINFO, forwarded, &n) == 0 && k == n && !memcmp(kernel, forwarded, n)); close(host);
