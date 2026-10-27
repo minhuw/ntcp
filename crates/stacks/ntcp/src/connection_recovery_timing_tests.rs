@@ -1,7 +1,6 @@
 // Deterministic recovery timing regression: no adapter code or synthetic delivery.
-extern crate std;
 use super::*;
-use alloc::{format, string::String};
+use alloc::format;
 
 fn profile(algorithm: PrrAlgorithm) -> ConnectionConfig {
     // Manually audited against packet_profile::config(Upstream(default)); peer
@@ -31,65 +30,35 @@ fn profile(algorithm: PrrAlgorithm) -> ConnectionConfig {
     }
 }
 
-fn state(a: &Connection, observed_at: u64, label: &str, rows: &mut Vec<String>) {
-    let counts = a.rack.counts();
-    let (fs, delivered, out, credit) = a.prr.map_or((0, 0, 0, 0), |p| {
-        let (fs, delivered, out) = p.counters();
-        (fs, delivered, out, p.credit())
-    });
-    rows.push(format!(concat!(
-        "{{\"event\":\"{}\",\"now_us\":{},\"observed_at_us\":{},\"snd_una\":{},\"snd_nxt\":{},",
-        "\"flight\":{},\"rack_pipe\":{},\"recovery_pipe\":\"{:?}\",",
-        "\"lost\":{},\"sacked\":{},\"cwnd\":{},\"ssthresh\":{},\"recovery_target\":{},",
-        "\"prr_active\":{},\"recover_fs\":{},\"prr_delivered\":{},\"prr_out\":{},\"prr_credit\":{},",
-        "\"entry_pending\":{},\"retx_pending\":{},\"loss_timer\":\"{:?}\",",
-        "\"rack_deadline\":\"{:?}\",\"deadline\":\"{:?}\",\"rto_deadline\":\"{:?}\",",
-        "\"snd_wnd\":{},\"peer_scale\":{},\"recovery\":{},\"duplicate_acks\":{}}}"),
-        label, a.now, observed_at, a.snd_una.0, a.snd_nxt.0, a.flight(), a.rack.pipe(),
-        a.sack_recovery.map(|r| r.pipe), counts.lost, counts.sacked,
-        a.congestion.cwnd(), a.congestion.ssthresh(), a.congestion.recovery_target(),
-        a.prr.is_some(), fs, delivered, out, credit,
-        a.sack_recovery.is_some_and(|r| r.entry_pending), a.retx_pending,
-        a.loss_timer, a.rack.deadline, a.next_deadline(), a.rto_deadline,
-        a.snd_wnd, a.peer_scale, a.congestion.in_recovery(), a.duplicate_acks));
-}
-
-fn output(a: &mut Connection, now: u64, rows: &mut Vec<String>) -> Vec<(u64, u32, usize)> {
+fn output(a: &mut Connection, now: u64) -> Vec<(u64, u32, usize)> {
     let mut sent = Vec::new();
     for _ in 0..32 {
-        state(a, now, "before_output_selection", rows);
         let mut bytes = vec![0; 65535];
         let Some(n) = a.transmit(now, &mut bytes).unwrap() else {
-            state(a, now, "output_none", rows);
             return sent;
         };
         let seg = wire::parse(ip(a.tuple()), &bytes[..n]).unwrap();
-        rows.push(format!("{{\"event\":\"wire_commit\",\"now_us\":{},\"seq\":{},\"ack\":{},\"bytes\":{},\"flags\":{}}}",
-            now, seg.header.sequence, seg.header.acknowledgment, seg.payload.len(), seg.header.flags));
         sent.push((now, seg.header.sequence, seg.payload.len()));
-        state(a, now, "after_wire_commit", rows);
     }
     panic!("output did not quiesce");
 }
 
-fn advance(a: &mut Connection, now: u64, rows: &mut Vec<String>) -> Vec<(u64, u32, usize)> {
+fn advance(a: &mut Connection, now: u64) -> Vec<(u64, u32, usize)> {
     let mut sent = Vec::new();
     for _ in 0..32 {
         let Some(deadline) = a.next_deadline().filter(|d| *d <= now) else {
             break;
         };
         assert!(deadline >= a.now);
-        state(a, deadline, "before_due_timeout", rows);
         a.timeout(deadline).unwrap();
-        state(a, deadline, "after_due_timeout", rows);
-        sent.extend(output(a, deadline, rows));
+        sent.extend(output(a, deadline));
         assert!(
             a.next_deadline().is_none_or(|d| d > deadline),
             "stuck deadline"
         );
     }
     // A poll at a supplied observation point also exercises output admission.
-    sent.extend(output(a, now, rows));
+    sent.extend(output(a, now));
     sent
 }
 
@@ -146,8 +115,7 @@ fn retransmit_delay_characterization() {
                 let syn = wire::parse(metadata, &bytes[..n]).unwrap();
                 let mut a =
                     Connection::passive(tuple(), profile(algorithm), 0, syn_at, &syn).unwrap();
-                let mut rows = Vec::new();
-                output(&mut a, syn_at, &mut rows);
+                output(&mut a, syn_at);
                 inject(&mut a, write_at, Seq(1), Seq(1), ACK, window, &[]);
                 assert_eq!(a.state(), State::Established);
                 assert_eq!(a.sack_send, sack);
@@ -157,7 +125,6 @@ fn retransmit_delay_characterization() {
                 assert_eq!(a.mss, if sack { 1000 } else { 1460 });
                 assert_eq!(a.rtt.srtt(), Some(100_000));
                 assert_eq!(a.config.timebase.units_per_second, 1_000_000);
-                state(&a, write_at, "handshake_ack", &mut rows);
                 let len = if shift {
                     10000
                 } else if sack {
@@ -166,7 +133,7 @@ fn retransmit_delay_characterization() {
                     5840
                 };
                 a.write(&vec![0x55; len]).unwrap();
-                let initial = output(&mut a, write_at, &mut rows);
+                let initial = output(&mut a, write_at);
                 assert_eq!(initial.iter().map(|(_, _, n)| n).sum::<usize>(), len);
                 assert_eq!(a.snd_nxt, Seq(1 + len as u32));
                 // All ACK/SACK edges below are for successfully committed data.
@@ -189,8 +156,7 @@ fn retransmit_delay_characterization() {
                         &[],
                         &first,
                     );
-                    state(&a, ack_at, "peer_ack", &mut rows);
-                    let sent = output(&mut a, ack_at, &mut rows);
+                    let sent = output(&mut a, ack_at);
                     if sack || duplicate < 3 {
                         assert!(sent.is_empty());
                     } else {
@@ -247,7 +213,7 @@ fn retransmit_delay_characterization() {
                 events.sort_by_key(|e| e.0);
                 let mut emissions = early_emissions;
                 for (now, blocks) in events {
-                    emissions.extend(advance(&mut a, now, &mut rows));
+                    emissions.extend(advance(&mut a, now));
                     if sack && now == ack_at + 25_000 {
                         assert!(a.congestion.in_recovery());
                         assert_eq!(a.rack.counts().lost, if shift { 7 } else { 3 });
@@ -266,8 +232,7 @@ fn retransmit_delay_characterization() {
                     }
                     if !blocks.is_empty() {
                         inject_sack(&mut a, now, Seq(1), Seq(1), ACK, 257, &[], &blocks);
-                        state(&a, now, "peer_ack", &mut rows);
-                        emissions.extend(output(&mut a, now, &mut rows));
+                        emissions.extend(output(&mut a, now));
                     }
                 }
                 let expected_delay = if sack { 25_000 } else { 0 };
@@ -291,22 +256,6 @@ fn retransmit_delay_characterization() {
                         .iter()
                         .all(|(at, _, len)| *len == 0 || *at >= first_data.0)
                 );
-                let directory = std::env::var("NTCP_DELAY_STUDY_DIR").ok();
-                if let Some(directory) = directory {
-                    std::fs::create_dir_all(&directory).unwrap();
-                    std::fs::write(
-                        format!(
-                            "{directory}/{case}-{algorithm:?}-{}.json",
-                            if continue_peer_script {
-                                "continued"
-                            } else {
-                                "prefix-only"
-                            }
-                        ),
-                        format!("[\n{}\n]\n", rows.join(",\n")),
-                    )
-                    .unwrap();
-                }
             }
         }
     }
@@ -476,7 +425,6 @@ fn timer_repair_respects_pipe_and_pacing_and_cannot_repeat_on_active_timer() {
 
 // The actual NewReno heuristic and a separate Reno policy control now both
 // enter immediately. Keep their downstream byte-credit assertions independent.
-// Historical pre-fix traces in workbench/newreno-entry-study stay unchanged.
 #[test]
 fn no_sack_first_flight_heuristic_and_reno_policy_control() {
     for iss in [0u32, u32::MAX] {
@@ -505,8 +453,7 @@ fn no_sack_first_flight_heuristic_and_reno_policy_control() {
                 .unwrap();
                 let syn = wire::parse(metadata, &bytes[..n]).unwrap();
                 let mut a = Connection::passive(tuple(), cfg, iss, 100_000, &syn).unwrap();
-                let mut rows = Vec::new();
-                output(&mut a, 100_000, &mut rows);
+                output(&mut a, 100_000);
                 let base = Seq(iss).wrapping_add(1);
                 inject(&mut a, 200_000, Seq(1), base, ACK, 257, &[]);
                 assert_eq!(a.state(), State::Established);
@@ -514,7 +461,7 @@ fn no_sack_first_flight_heuristic_and_reno_policy_control() {
                 assert_eq!((a.mss, a.peer_scale, a.local_scale), (1460, 7, 8));
                 assert_eq!(a.rtt.srtt(), Some(100_000));
                 a.write(&vec![0x55; 4 * 1460]).unwrap();
-                let initial = output(&mut a, 200_000, &mut rows);
+                let initial = output(&mut a, 200_000);
                 assert_eq!(
                     initial,
                     (0..4)
@@ -525,11 +472,10 @@ fn no_sack_first_flight_heuristic_and_reno_policy_control() {
                     inject(&mut a, 300_000, Seq(1), base, ACK, 257, &[]);
                     assert_eq!(a.duplicate_acks, duplicate);
                     assert_eq!(a.snd_una, base); // No application bytes cumulatively ACKed.
-                    state(&a, 300_000, "qualified_duplicate_ack", &mut rows);
                     if duplicate < 3 {
                         assert!(!a.congestion.in_recovery() && !a.retx_pending);
                         assert!(a.prr.is_none());
-                        assert!(output(&mut a, 300_000, &mut rows).is_empty());
+                        assert!(output(&mut a, 300_000).is_empty());
                     }
                 }
                 assert!(a.congestion.in_fast_recovery());
@@ -543,13 +489,7 @@ fn no_sack_first_flight_heuristic_and_reno_policy_control() {
                 } else {
                     assert!(a.prr.is_none()); // No-SACK delivery is accounted by PRR.
                 }
-                state(
-                    &a,
-                    300_000,
-                    "after_third_duplicate_before_output",
-                    &mut rows,
-                );
-                let emitted = output(&mut a, 300_000, &mut rows);
+                let emitted = output(&mut a, 300_000);
                 let first = emitted.iter().find(|(_, _, len)| *len != 0).unwrap();
                 assert_eq!(first.0, 300_000);
                 assert_eq!(first.1, base.0);
@@ -558,14 +498,6 @@ fn no_sack_first_flight_heuristic_and_reno_policy_control() {
                 if algorithm == PrrAlgorithm::Rfc9937 {
                     assert_eq!(a.prr.unwrap().counters().2, first.2 as u64);
                     assert_eq!(a.prr.unwrap().credit(), 0);
-                }
-                if let Ok(directory) = std::env::var("NTCP_NEWRENO_ENTRY_STUDY_DIR") {
-                    std::fs::create_dir_all(&directory).unwrap();
-                    std::fs::write(
-                        format!("{directory}/{policy:?}-{algorithm:?}-iss{iss}.json"),
-                        format!("[\n{}\n]\n", rows.join(",\n")),
-                    )
-                    .unwrap();
                 }
             }
         }
@@ -591,8 +523,7 @@ fn initial_heuristic_wire_ack_validation_and_both_handshake_roles() {
             let history = Some((a.iss, a.iss.wrapping_add(1)));
             assert_eq!(a.congestion.ack_history(), history);
             a.write(&[1; 4000]).unwrap();
-            let mut rows = Vec::new();
-            assert_eq!(output(&mut a, 40, &mut rows).len(), 4);
+            assert_eq!(output(&mut a, 40).len(), 4);
             // Invalid old/future ACKs and valid window-only changes cannot
             // supply cumulative history or qualifying duplicate evidence.
             for (edge, window) in [
@@ -605,7 +536,7 @@ fn initial_heuristic_wire_ack_validation_and_both_handshake_roles() {
                 assert_eq!(a.congestion.ack_history(), history);
                 assert_eq!(a.duplicate_acks, 0);
                 assert!(!a.congestion.in_recovery());
-                output(&mut a, 50, &mut rows); // Any invalid-ACK reply.
+                output(&mut a, 50); // Any invalid-ACK reply.
             }
             for duplicate in 1..=3 {
                 inject(&mut a, 60, seq, base, ACK, 32_000, &[]);
@@ -619,14 +550,14 @@ fn initial_heuristic_wire_ack_validation_and_both_handshake_roles() {
             assert_eq!(a.transmit(60, &mut [0; 20]), Err(Error::OutputTooSmall));
             assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 0));
             assert_eq!(a.prr.unwrap().credit(), 1000);
-            assert_eq!(output(&mut a, 60, &mut rows), vec![(60, base.0, 1000)]);
+            assert_eq!(output(&mut a, 60), vec![(60, base.0, 1000)]);
             assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 1000));
             assert_eq!(a.prr.unwrap().credit(), 0);
             let boundary = a.snd_nxt;
             inject(&mut a, 70, seq, boundary, ACK, 32_000, &[]);
             assert!(!a.congestion.in_fast_recovery());
             a.write(&[2; 4000]).unwrap();
-            output(&mut a, 80, &mut rows);
+            output(&mut a, 80);
             let threshold = a.congestion.ssthresh();
             for _ in 0..3 {
                 inject(&mut a, 90, seq, boundary, ACK, 32_000, &[]);
@@ -650,12 +581,11 @@ fn initial_heuristic_rto_before_application_ack_keeps_epoch_guard() {
         let base = a.snd_una;
         let seq = a.receive.next();
         a.write(&[1; 4000]).unwrap();
-        let mut rows = Vec::new();
-        output(&mut a, 40, &mut rows);
+        output(&mut a, 40);
         let boundary = a.snd_nxt;
         let deadline = a.rto_deadline.unwrap();
         a.timeout(deadline).unwrap();
-        output(&mut a, deadline, &mut rows);
+        output(&mut a, deadline);
         a.congestion.prr_window(10_000); // Deliberately test beyond the one-MSS check.
         for _ in 0..3 {
             inject(&mut a, deadline + 1, seq, base, ACK, 32_000, &[]);
@@ -665,7 +595,7 @@ fn initial_heuristic_rto_before_application_ack_keeps_epoch_guard() {
         inject(&mut a, deadline + 2, seq, boundary, ACK, 32_000, &[]);
         a.write(&[2; 4000]).unwrap();
         a.congestion.prr_window(10_000);
-        output(&mut a, deadline + 3, &mut rows);
+        output(&mut a, deadline + 3);
         for _ in 0..3 {
             inject(&mut a, deadline + 4, seq, boundary, ACK, 32_000, &[]);
         }
@@ -714,41 +644,19 @@ fn initial_heuristic_syn_rto_disarms_even_when_iw10_is_retained() {
             }
             let mss = a.mss as usize;
             a.write(&vec![1; 4 * mss]).unwrap();
-            let mut rows = Vec::new();
-            output(&mut a, deadline + 2, &mut rows);
+            output(&mut a, deadline + 2);
             let seq = a.receive.next();
             for _ in 0..3 {
                 inject(&mut a, deadline + 3, seq, base, ACK, 32_000, &[]);
             }
             assert!(!a.congestion.in_fast_recovery() && !a.retx_pending);
-            assert!(output(&mut a, deadline + 3, &mut rows).is_empty());
+            assert!(output(&mut a, deadline + 3).is_empty());
         }
     }
 }
 
 // Original prefix stops at the missing third repair. Continuations deliberately
 // inject later peer inputs despite that mismatch; they are not whole-script runs.
-fn stale_ack_state(a: &Connection, now: u64, label: &str, rows: &mut Vec<String>) {
-    state(a, now, label, rows);
-    rows.push(format!(
-        concat!(
-            "{{\"event\":\"scoreboard_detail\",\"observed_at_us\":{},",
-            "\"label\":\"{}\",\"scoreboard_sacked_bytes\":{},",
-            "\"high_rxt\":{},\"effective_recovery_pipe\":{},\"lowest_lost\":\"{:?}\",",
-            "\"wl1\":{},\"wl2\":{},\"scoreboard\":\"{:?}\"}}"
-        ),
-        now,
-        label,
-        a.flight() - a.scoreboard.unsacked_bytes(a.snd_una, a.data_high()),
-        a.sack_recovery.map_or(a.snd_una.0, |r| r.high_rxt.0),
-        a.sack_recovery.map_or(a.rack.pipe(), |r| r.pipe),
-        a.rack.lowest_lost(a.mss as u32),
-        a.wl1.0,
-        a.wl2.0,
-        a.scoreboard.ranges(),
-    ));
-}
-
 #[test]
 fn stale_ack_prr_prefix_and_counterfactual_delivery() {
     {
@@ -774,8 +682,7 @@ fn stale_ack_prr_prefix_and_counterfactual_delivery() {
             .unwrap();
             let syn = wire::parse(metadata, &bytes[..n]).unwrap();
             let mut a = Connection::passive(tuple(), profile(algorithm), 0, 0, &syn).unwrap();
-            let mut rows = Vec::new();
-            output(&mut a, 0, &mut rows);
+            output(&mut a, 0);
             inject(&mut a, 10_000, Seq(1), Seq(1), ACK, 320, &[]);
             assert_eq!(a.state(), State::Established);
             assert!(a.sack_send && a.sack_receive && !a.timestamps);
@@ -787,24 +694,22 @@ fn stale_ack_prr_prefix_and_counterfactual_delivery() {
             assert!(a.config.cubic_hystart && a.config.adaptive_ack);
             assert_eq!(a.congestion.cwnd(), 10_000);
             assert_eq!(a.write(&[0x55; 10_000]).unwrap(), 10_000);
-            let initial = output(&mut a, 10_000, &mut rows);
+            let initial = output(&mut a, 10_000);
             assert_eq!(
                 initial,
                 (0..10)
                     .map(|i| (10_000, 1 + i * 1000, 1000))
                     .collect::<Vec<_>>()
             );
-            assert!(advance(&mut a, 20_000, &mut rows).is_empty());
+            assert!(advance(&mut a, 20_000).is_empty());
             let mut repairs = Vec::new();
-            for (label, blocks) in [
+            for (_label, blocks) in [
                 ("first_sack", vec![(1001, 2001)]),
                 ("second_sack", vec![(1001, 3001)]),
                 ("third_sack", vec![(1001, 3001), (8001, 9001)]),
             ] {
-                stale_ack_state(&a, 20_000, "before_sack", &mut rows);
                 inject_sack(&mut a, 20_000, Seq(1), Seq(1), ACK, 320, &[], &blocks);
-                stale_ack_state(&a, 20_000, label, &mut rows);
-                repairs.extend(output(&mut a, 20_000, &mut rows));
+                repairs.extend(output(&mut a, 20_000));
             }
             assert_eq!(repairs, vec![(20_000, 1, 1000)]);
             // Service *all* deadlines in order, including any RACK deadline
@@ -819,9 +724,8 @@ fn stale_ack_prr_prefix_and_counterfactual_delivery() {
             assert_eq!((a.rack.counts().lost, a.rack.counts().sacked), (6, 3));
             assert_eq!(a.sack_recovery.unwrap().high_rxt, Seq(1001));
             assert!(!a.sack_recovery.unwrap().entry_pending && !a.retx_pending);
-            let between = advance(&mut a, 32_000, &mut rows);
+            let between = advance(&mut a, 32_000);
             assert!(between.is_empty());
-            stale_ack_state(&a, 32_000, "before_ack4001", &mut rows);
             // A test-only ledger copy separates ACK removal from loss detection;
             // actual production input below remains the authoritative state.
             let mut rack_before = a.rack.grown(10_000).unwrap();
@@ -835,7 +739,6 @@ fn stale_ack_prr_prefix_and_counterfactual_delivery() {
                 &[],
                 &[(8001, 9001)],
             );
-            stale_ack_state(&a, 32_000, "after_ack4001_before_output", &mut rows);
             assert_eq!(a.prr.unwrap().counters(), (recover_fs, 3000, 1000));
             assert_eq!(a.prr.unwrap().credit(), 2000);
             assert_eq!(a.congestion.recovery_target(), 7000);
@@ -866,16 +769,8 @@ fn stale_ack_prr_prefix_and_counterfactual_delivery() {
             assert_eq!(rack_before.pipe(), 0);
             // RACK detection reduced pipe: further_loss=true, hence SafeACK=false.
             // RFC9937: min(7000-0, max(3000-1000,2000)+0) = 2000.
-            rows.push(String::from(concat!(
-                "{\"event\":\"ack4001_loss_detector_oracle\",\"observed_at_us\":32000,",
-                "\"delivered_bytes\":2000,\"pipe_before_detect\":1000,\"pipe_after_detect\":0,",
-                "\"lost_before_detect\":4,\"lost_after_detect\":5,\"further_loss\":true,",
-                "\"new_loss_start\":9001,\"new_loss_end\":10001,",
-                "\"safe_ack_derived\":false,\"rfc9937_credit\":2000,\"hypothetical_safe_credit\":3000}"
-            )));
-            let after_ack = output(&mut a, 32_000, &mut rows);
+            let after_ack = output(&mut a, 32_000);
             assert_eq!(after_ack, vec![(32_000, 4001, 1000), (32_000, 5001, 1000)]);
-            stale_ack_state(&a, 32_000, "after_ack4001_output", &mut rows);
             assert_eq!(a.prr.unwrap().counters(), (recover_fs, 3000, 3000));
             assert_eq!(a.prr.unwrap().credit(), 0);
             assert_eq!(a.rack.lowest_lost(1000), Some((Seq(6001), Seq(7001))));
@@ -883,9 +778,8 @@ fn stale_ack_prr_prefix_and_counterfactual_delivery() {
                 // Counterfactual: upstream would still be waiting for 6001:7001.
                 // The new SACK is valid: 5001:7001 was originally sent at 10 ms.
                 assert_eq!(a.write(&[0x66; 10_000]).unwrap(), 10_000);
-                stale_ack_state(&a, 32_000, "counterfactual_write", &mut rows);
-                assert!(output(&mut a, 32_000, &mut rows).is_empty());
-                assert!(advance(&mut a, 34_000, &mut rows).is_empty());
+                assert!(output(&mut a, 32_000).is_empty());
+                assert!(advance(&mut a, 34_000).is_empty());
                 if continuation == "with-old-ack" {
                     let una = a.snd_una;
                     let window = (a.snd_wnd, a.wl1, a.wl2);
@@ -900,14 +794,13 @@ fn stale_ack_prr_prefix_and_counterfactual_delivery() {
                         &[],
                         &[(5001, 7001)],
                     );
-                    stale_ack_state(&a, 34_000, "after_old_ack_before_output", &mut rows);
                     assert_eq!(a.snd_una, una);
                     assert_eq!((a.snd_wnd, a.wl1, a.wl2), window);
                     assert_eq!(a.prr.unwrap().counters().1, p.1 + 2000);
                     assert_eq!(a.prr.unwrap().credit(), 2000);
                     assert_eq!(a.rack.counts().sacked, 3);
                     assert_eq!(
-                        output(&mut a, 34_000, &mut rows),
+                        output(&mut a, 34_000),
                         vec![(34_000, 7001, 1000), (34_000, 9001, 1000)]
                     );
                     assert_eq!(a.snd_nxt, Seq(10001));
@@ -923,9 +816,8 @@ fn stale_ack_prr_prefix_and_counterfactual_delivery() {
                         &[],
                         &[(5001, 7001)],
                     );
-                    stale_ack_state(&a, 34_000, "after_identical_old_ack", &mut rows);
                     assert_eq!(a.prr.unwrap().counters(), before);
-                    assert!(output(&mut a, 34_000, &mut rows).is_empty());
+                    assert!(output(&mut a, 34_000).is_empty());
                 }
             }
             // No further receiver feedback: characterize the next timeout,
@@ -939,19 +831,9 @@ fn stale_ack_prr_prefix_and_counterfactual_delivery() {
                     232_000
                 }
             );
-            assert!(advance(&mut a, rto - 1, &mut rows).is_empty());
-            stale_ack_state(&a, rto, "before_no_feedback_rto", &mut rows);
-            assert_eq!(advance(&mut a, rto, &mut rows), vec![(rto, 4001, 1000)]);
+            assert!(advance(&mut a, rto - 1).is_empty());
+            assert_eq!(advance(&mut a, rto), vec![(rto, 4001, 1000)]);
             assert!(a.prr.is_none());
-            stale_ack_state(&a, rto, "after_no_feedback_rto", &mut rows);
-            if let Ok(directory) = std::env::var("NTCP_STALE_ACK_STUDY_DIR") {
-                std::fs::create_dir_all(&directory).unwrap();
-                std::fs::write(
-                    format!("{directory}/{algorithm:?}-{continuation}.json"),
-                    format!("[\n{}\n]\n", rows.join(",\n")),
-                )
-                .unwrap();
-            }
         }
     }
 }
@@ -985,20 +867,17 @@ fn unsupported_bulk_prefix_enters_rfc9406_css_before_legacy_hystart_exit() {
         .unwrap();
         let syn = wire::parse(metadata, &bytes[..n]).unwrap();
         let mut a = Connection::passive(tuple(), cfg, 0, 0, &syn).unwrap();
-        let mut rows = Vec::new();
-        output(&mut a, 0, &mut rows);
+        output(&mut a, 0);
         inject(&mut a, 100_000, Seq(1), Seq(1), ACK, 514, &[]);
         a.write(&vec![7; 100_000]).unwrap();
-        output(&mut a, 100_000, &mut rows);
+        output(&mut a, 100_000);
         for step in 1..=15 {
             let now = 100_000 + step * 100_000;
-            advance(&mut a, now - 1, &mut rows);
+            advance(&mut a, now - 1);
             let ack = Seq(1 + step as u32 * 2000);
             assert!(!after(ack, a.snd_nxt));
             inject(&mut a, now, Seq(1), ack, ACK, 514, &[]);
             let startup = a.congestion.startup_state().unwrap();
-            rows.push(format!("{{\"event\":\"startup_observation\",\"at_us\":{now},\"ack\":{},\"cwnd\":{},\"samples\":{},\"css_baseline\":{},\"css_rounds\":{},\"paced\":{paced}}}",
-                ack.0, a.congestion.cwnd(), startup.0, startup.1.map_or("null".into(), |v|format!("{v}")), startup.2));
             assert!(a.prr.is_none() && !a.congestion.in_recovery());
             if step == 13 {
                 assert_eq!(a.congestion.cwnd(), 36_000);
@@ -1007,17 +886,9 @@ fn unsupported_bulk_prefix_enters_rfc9406_css_before_legacy_hystart_exit() {
             if step >= 14 {
                 assert_eq!(a.congestion.cwnd(), 36_000 + (step as u32 - 13) * 500);
             }
-            output(&mut a, now, &mut rows);
+            output(&mut a, now);
         }
         assert_eq!(a.congestion.cwnd(), 37_000);
-        if let Ok(directory) = std::env::var("NTCP_UNSUPPORTED13_STUDY_DIR") {
-            std::fs::create_dir_all(&directory).unwrap();
-            std::fs::write(
-                format!("{directory}/bulk-css-paced-{paced}.json"),
-                format!("[\n{}\n]\n", rows.join(",\n")),
-            )
-            .unwrap();
-        }
     }
 }
 

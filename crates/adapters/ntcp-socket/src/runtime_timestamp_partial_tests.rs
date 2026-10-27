@@ -142,17 +142,6 @@ fn ack(f: &mut Fixture, now: u64, data: u32) {
     f.owner.drain_timestamps(ClockPair::sample(&f.owner));
 }
 
-fn save(name: &str, rows: &[String]) {
-    if let Ok(dir) = std::env::var("NTCP_TIMESTAMP_PARTIAL_STUDY_DIR") {
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            format!("{dir}/{name}.json"),
-            format!("[{}]\n", rows.join(",")),
-        )
-        .unwrap();
-    }
-}
-
 #[test]
 fn timestamp_partial_actual_admission_and_first_flight() {
     let mut f = fixture();
@@ -176,13 +165,6 @@ fn timestamp_partial_actual_admission_and_first_flight() {
     let after = f.owner.endpoint.transport_info(f.cid).unwrap();
     assert_eq!((after.send_used, after.notsent_bytes), (4608, 2608));
     assert!(timestamp_records(&f.owner, f.id).is_empty());
-    save(
-        "actual-admission",
-        &[format!(
-            "{{\"requested\":10000,\"accepted\":{n},\"mss\":988,\"max_window\":2000,\"core_capacity\":4608,\"wire_sent\":2000,\"notsent\":2608,\"first_psh\":{},\"second_psh\":{},\"timestamp_records\":0,\"target_byte_id\":4607}}",
-            packets[0].2, packets[1].2
-        )],
-    );
 }
 
 #[test]
@@ -223,15 +205,6 @@ fn timestamp_partial_controlled_prefix_tracks_last_byte_and_all_phases() {
     let info = f.owner.endpoint.transport_info(f.cid).unwrap();
     assert!((5000..=20000).contains(&info.rtt_us.unwrap()));
     assert_eq!(info.send_used, 0);
-    save(
-        "controlled-prefix",
-        &[format!(
-            "{{\"counterfactual_requested\":2964,\"socket_capacity_unchanged\":4608,\"initial_sent\":1976,\"initial_first_psh\":{},\"initial_second_psh\":{},\"tail_sent_at_us\":20000,\"tail_seq\":1977,\"tail_len\":988,\"tail_psh\":true,\"sched_snd_phases_at_20ms\":2,\"all_phases_after_ack_at_30ms\":3,\"all_ids\":2963,\"srtt_us\":{}}}",
-            initial[0].2,
-            initial[1].2,
-            info.rtt_us.unwrap()
-        )],
-    );
 }
 
 #[test]

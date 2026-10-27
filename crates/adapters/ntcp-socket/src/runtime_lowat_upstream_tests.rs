@@ -139,17 +139,6 @@ fn drain(a: &mut Owner, now: u64, iss: u32) -> Vec<(u32, usize, bool)> {
     panic!("output did not quiesce");
 }
 
-fn save(name: &str, rows: &[String]) {
-    if let Ok(directory) = std::env::var("NTCP_LOWAT_STUDY_DIR") {
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(
-            format!("{directory}/{name}.json"),
-            format!("[{}]\n", rows.join(",")),
-        )
-        .unwrap();
-    }
-}
-
 fn nonblocking_request(id: u64, op: Op) -> (Request, Receiver<Result<Reply>>) {
     let (reply, rx) = mpsc::sync_channel(1);
     (
@@ -306,7 +295,6 @@ fn lowat_nonblocking_fault_after_accepted_batch_finalizes_one_logical_completion
 
 #[test]
 fn upstream_lowat_counterfactual_26k_ack_and_readiness_timeline() {
-    let mut rows = Vec::new();
     for global in [false, true] {
         let (mut a, child, cid, ip, mut incoming, iss) = established(global);
         // Diagnostic only: bypass the lowat admission gate for this one prefix.
@@ -340,16 +328,13 @@ fn upstream_lowat_counterfactual_26k_ack_and_readiness_timeline() {
             assert_eq!(info.cwnd, expected_cwnd);
             let ready = a.execute(child, Op::Ready).unwrap().value & EPOLLOUT != 0;
             assert_eq!(ready, stage == 4);
-            rows.push(format!("{{\"global_default\":{global},\"counterfactual_admission\":26000,\"stage\":{stage},\"now_us\":{now},\"acknowledged_payload\":{ack},\"sent_this_stage\":{expected_sent},\"highest_data_end\":{last_end},\"notsent\":{expected_unsent},\"cwnd\":{expected_cwnd},\"pollout\":{ready},\"terminal_psh\":true}}"));
         }
         assert_eq!(last_end, 26001);
     }
-    save("counterfactual-timeline", &rows);
 }
 
 #[test]
 fn upstream_lowat_half_threshold_and_write_admission_are_distinct() {
-    let mut rows = Vec::new();
     for global in [false, true] {
         for queued in [11999, 12000, 13999, 14000] {
             let (mut a, child, cid, _, _, iss) = established(global);
@@ -362,10 +347,8 @@ fn upstream_lowat_half_threshold_and_write_admission_are_distinct() {
             assert_eq!(ready, unsent < 2000);
             let room = a.endpoint.send_admission_room(cid, Some(4000)).unwrap();
             assert_eq!(room, 4000usize.saturating_sub(unsent));
-            rows.push(format!("{{\"global_default\":{global},\"counterfactual_queued\":{queued},\"notsent\":{unsent},\"pollout\":{ready},\"write_admission_room\":{room}}}"));
         }
     }
-    save("thresholds", &rows);
 }
 
 #[test]
@@ -432,10 +415,9 @@ fn lowat_nonblocking_held_output_returns_prefix_then_finalizes_boundary() {
 
 #[test]
 fn unsupported_buffer_native_capacity_and_writable_edge_controls() {
-    let mut rows = Vec::new();
     for capacity in [50_000usize, 65_536] {
         for lowat in [0u32, u32::MAX, 32_000] {
-            let (mut a, child, cid, ip, mut incoming, iss) = established(false);
+            let (mut a, child, _, ip, mut incoming, iss) = established(false);
             a.execute(child, Op::Set(SOL_SOCKET, SO_SNDBUF, (capacity / 2) as i32))
                 .unwrap();
             a.execute(child, Op::Set(IPPROTO_TCP, TCP_NOTSENT_LOWAT, lowat as i32))
@@ -464,8 +446,6 @@ fn unsupported_buffer_native_capacity_and_writable_edge_controls() {
             assert_eq!(a.execute(child, Op::Write(vec![1])).unwrap_err(), EAGAIN);
             let blocked = a.execute(child, Op::Ready).unwrap();
             assert_eq!(blocked.value & EPOLLOUT, 0);
-            let info = a.endpoint.transport_info(cid).unwrap();
-            rows.push(format!("{{\"event\":\"blocked\",\"capacity\":{capacity},\"lowat\":{lowat},\"accepted\":{accepted},\"wire_end\":{wire_end},\"notsent\":{}}}", info.notsent_bytes));
             let mut writable = false;
             for ack_bytes in (1000..=accepted as u32).step_by(1000) {
                 assert!(ack_bytes < wire_end);
@@ -494,7 +474,6 @@ fn unsupported_buffer_native_capacity_and_writable_edge_controls() {
                         repeated.readiness_generations
                     ));
                     assert_eq!(a.execute(child, Op::Write(vec![3; 17])).unwrap().value, 17);
-                    rows.push(format!("{{\"event\":\"writable\",\"capacity\":{capacity},\"lowat\":{lowat},\"ack_bytes\":{ack_bytes},\"wire_end\":{wire_end},\"accepted\":{accepted}}}"));
                     writable = true;
                     break;
                 }
@@ -502,12 +481,10 @@ fn unsupported_buffer_native_capacity_and_writable_edge_controls() {
             assert!(writable);
         }
     }
-    save("unsupported-buffer-native-controls", &rows);
 }
 
 #[test]
 fn short_rtt_send_admission_is_stable_with_timer_service() {
-    let mut rows = Vec::new();
     for (handshake_us, service_timers, expected) in
         [(1, false, 42000), (1, true, 42000), (10000, true, 42000)]
     {
@@ -548,14 +525,11 @@ fn short_rtt_send_admission_is_stable_with_timer_service() {
         assert_eq!(info.cwnd, 10000);
         assert_eq!(info.notsent_bytes, 32000);
         assert_eq!(wire_end, if expected == 43000 { 11001 } else { 10001 });
-        rows.push(format!("{{\"handshake_us\":{handshake_us},\"service_timers\":{service_timers},\"accepted\":{accepted},\"wire_end\":{wire_end},\"cwnd\":{},\"notsent\":{}}}",info.cwnd,info.notsent_bytes));
     }
-    save("zero-rtt-lowat-probe-controls", &rows);
 }
 
 #[test]
 fn short_rtt_ack_precedes_margin_probe_and_preserves_completion_ids() {
-    let mut rows = Vec::new();
     for (handshake_us, timers) in [(1, true), (1, false), (10_000, true)] {
         let (mut a, child, cid, ip, mut incoming, iss) =
             established_with_timing(false, 32792, 257, handshake_us);
@@ -616,41 +590,24 @@ fn short_rtt_ack_precedes_margin_probe_and_preserves_completion_ids() {
             a.sockets[&child].completions.front(),
             Some(Completion::ZeroCopy(0, 1))
         ));
-        let packets = |items: &[(u32, usize, bool)]| {
-            format!(
-                "[{}]",
-                items
-                    .iter()
-                    .map(|p| format!("[{},{},{}]", p.0, p.1, p.2))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        };
-        rows.push(format!("{{\"handshake_us\":{handshake_us},\"timers\":{timers},\"first_send_at\":{now},\"probe_deadline\":{deadline},\"ack_at\":{feedback_at},\"initial\":{},\"probes\":{},\"next\":{},\"zc_next\":2}}", packets(&initial), packets(&probes), packets(&next)));
     }
-    save("remaining-five-probe-order", &rows);
 }
 
 #[test]
 fn remaining_five_passive_large_send_allocation_timing() {
-    let mut rows = Vec::new();
     for request in [0, 2_000_000] {
         let settings =
             crate::packet_profile::profile("upstream,local=192.168.0.1,budget224m").unwrap();
         let mut a = Owner::packet(settings).unwrap();
         a.test_now = Some(0);
         let listener = new(&mut a, SOCK_NONBLOCK);
-        let clock = std::time::Instant::now();
         if request != 0 {
             a.execute(listener, Op::Set(SOL_SOCKET, SO_SNDBUF, request))
                 .unwrap();
         }
-        let set_us = clock.elapsed().as_micros();
         a.execute(listener, Op::Bind("192.168.0.1:8080".parse().unwrap()))
             .unwrap();
-        let clock = std::time::Instant::now();
         a.execute(listener, Op::Listen(1)).unwrap();
-        let listen_us = clock.elapsed().as_micros();
         let ip = ntcp::IpMetadata {
             source: "192.0.2.1".parse().unwrap(),
             destination: "192.168.0.1".parse().unwrap(),
@@ -673,28 +630,16 @@ fn remaining_five_passive_large_send_allocation_timing() {
             &mut bytes,
         )
         .unwrap();
-        let clock = std::time::Instant::now();
         a.input(0, ip, 0, &bytes[..n]).unwrap();
-        let input_us = clock.elapsed().as_micros();
-        let clock = std::time::Instant::now();
         let tx = a
             .endpoint
             .poll_transmit(0, &mut bytes, BUDGET)
             .unwrap()
             .packet
             .unwrap();
-        let output_us = clock.elapsed().as_micros();
         assert_eq!(
             wire::parse(tx.ip, &bytes[..tx.len]).unwrap().header.flags & (SYN | ACK),
             SYN | ACK
         );
-        let incoming = ntcp::Tuple {
-            local: "192.168.0.1:8080".parse().unwrap(),
-            remote: "192.0.2.1:40000".parse().unwrap(),
-        };
-        let cid = a.endpoint.connection_id(incoming).unwrap();
-        let info = a.endpoint.transport_info(cid).unwrap();
-        rows.push(format!("{{\"sndbuf_request\":{request},\"send_capacity\":{},\"retained_bytes\":{},\"setsockopt_us\":{set_us},\"listen_us\":{listen_us},\"syn_input_us\":{input_us},\"first_output_us\":{output_us}}}",info.send_capacity,a.endpoint.buffer_bytes()));
     }
-    save("remaining-five-passive-cost", &rows);
 }

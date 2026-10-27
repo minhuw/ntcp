@@ -668,9 +668,6 @@ mod retransmit_delay_study {
 
 #[test]
 fn packetdrill_passive_ecn_cwr_prr_characterization() {
-    extern crate std;
-    use alloc::{format, string::String};
-    let mut rows: Vec<String> = Vec::new();
     {
         let algorithm = crate::PrrAlgorithm::Rfc9937;
         // Audited upstream,ecn baseline; no congestion/flight state fabrication.
@@ -760,38 +757,6 @@ fn packetdrill_passive_ecn_cwr_prr_characterization() {
         assert_eq!(a.transport_info_at(205_000).cwnd, 10_000);
         assert_eq!((a.data_flight(), a.rack.pipe()), (4000, 4000));
         assert!(a.prr.is_none());
-        let snapshot = |a: &Connection, event: &str, at, rows: &mut Vec<String>| {
-            let (fs, delivered, out, credit) = a.prr.map_or((0, 0, 0, 0), |p| {
-                let (fs, delivered, out) = p.counters();
-                (fs, delivered, out, p.credit())
-            });
-            rows.push(format!(
-                concat!(
-                    "{{\"algorithm\":\"{:?}\",\"event\":\"{}\",\"at_us\":{},",
-                    "\"cwnd_bytes\":{},\"logical_cwnd_bytes\":{},\"ssthresh_bytes\":{},",
-                    "\"flight_bytes\":{},\"pipe_bytes\":{},\"recover_fs\":{},",
-                    "\"delivered\":{},\"out\":{},\"credit\":{},\"lost\":{},",
-                    "\"ecn_response\":{},\"cwr_pending\":{},\"rto_deadline\":{:?}}}"
-                ),
-                algorithm,
-                event,
-                at,
-                a.congestion.cwnd(),
-                a.congestion.unsuppressed_cwnd(),
-                a.congestion.ssthresh(),
-                a.data_flight(),
-                a.rack.pipe(),
-                fs,
-                delivered,
-                out,
-                credit,
-                a.rack.counts().lost,
-                a.transport_info_at(at).ecn_response,
-                a.ecn_cwr_pending,
-                a.rto_deadline.unwrap()
-            ));
-        };
-        snapshot(&a, "before_ece", 205_000, &mut rows);
         inject(&mut a, 300_000, Seq(1), Seq(1001), ACK | ECE, 320, &[]); // Not-ECT.
         assert_eq!(a.congestion.ssthresh(), 7000);
         assert_eq!(a.congestion.unsuppressed_cwnd(), 7000);
@@ -801,7 +766,6 @@ fn packetdrill_passive_ecn_cwr_prr_characterization() {
         assert!(a.rack.deadline.is_none());
         assert!(a.ecn_cwr_pending && a.transport_info_at(305_000).ecn_response);
         assert!(a.next_deadline().unwrap() > 305_000);
-        snapshot(&a, "after_ece", 305_000, &mut rows);
 
         assert_eq!(a.congestion.ecn_prr_end(), Some(Seq(4001)));
         assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 0));
@@ -820,7 +784,6 @@ fn packetdrill_passive_ecn_cwr_prr_characterization() {
         assert_eq!(a.congestion.ssthresh(), 7000);
         assert!(a.transmit(305_001, &mut [0; 1500]).unwrap().is_none());
         assert!(a.ecn_cwr_pending);
-        snapshot(&a, "repeated_ece_no_delivery", 305_001, &mut rows);
         // Counterfactual continuation beyond the fixture: test real admission.
         a.write(&[2; 3000]).unwrap();
         for i in 0..2 {
@@ -837,10 +800,6 @@ fn packetdrill_passive_ecn_cwr_prr_characterization() {
         assert_eq!(a.data_flight(), 5000);
         assert!(!a.ecn_cwr_pending);
         assert!(a.transmit(306_000, &mut [0; 1500]).unwrap().is_none());
-        snapshot(&a, "counterfactual_two_fresh_segments", 306_000, &mut rows);
-    }
-    if let Ok(path) = std::env::var("NTCP_ECN_CWR_STATE_PATH") {
-        std::fs::write(path, format!("[\n{}\n]\n", rows.join(",\n"))).unwrap();
     }
 }
 

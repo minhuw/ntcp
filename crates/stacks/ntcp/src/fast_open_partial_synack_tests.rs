@@ -29,7 +29,6 @@ fn response(syn: &(IpMetadata, Vec<u8>), acknowledged_data: u32) -> (IpMetadata,
 
 #[test]
 fn partial_synack_rtt_repair_and_next_service_admission() {
-    let mut rows = Vec::new();
     for v6 in [false, true] {
         for scale in [1, 1000] {
             for reserved in [false, true] {
@@ -137,21 +136,9 @@ fn partial_synack_rtt_repair_and_next_service_admission() {
                             .len(),
                         700
                     );
-                    rows.push(std::format!(
-                        "{{\"ipv6\":{v6},\"ticks_per_us\":{scale},\"reserved\":{reserved},\"syn_payload\":700,\"acknowledged_data\":{acknowledged},\"repair_payload\":{},\"first_rtt_us\":20000,\"syn_data_acked\":{},\"cookie_cached\":true,\"same_service_next_accepted\":{n},\"same_service_next_has_fast_open\":{},\"other_service_accepted\":{other_n},\"syn_only_ack_rtt_us\":30000}}",
-                        700-acknowledged, before.syn_data_acked, next.options.fast_open.is_some()
-                    ));
                 }
             }
         }
-    }
-    if let Ok(directory) = std::env::var("NTCP_PARTIAL_SYNACK_STUDY_DIR") {
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(
-            std::format!("{directory}/core-matrix.json"),
-            std::format!("[{}]\n", rows.join(",")),
-        )
-        .unwrap();
     }
 }
 

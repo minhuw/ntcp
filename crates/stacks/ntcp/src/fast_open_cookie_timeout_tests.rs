@@ -45,7 +45,6 @@ fn emit(
 
 #[test]
 fn cookie_request_first_timeout_success_preserves_next_attempt() {
-    let mut rows = Vec::new();
     let initial = [0x55; 10_000];
     for v6 in [false, true] {
         for scale in [1, 1000] {
@@ -106,22 +105,10 @@ fn cookie_request_first_timeout_success_preserves_next_attempt() {
                         let other = wire::parse(other.0, &other.1).unwrap();
                         assert!(other.options.fast_open.is_some());
                         assert_eq!(other_accepted, if returned_cookie { 1200 } else { 0 });
-                        rows.push(std::format!(
-                            "{{\"ipv6\":{v6},\"ticks_per_us\":{scale},\"reserved\":{reserved},\"first_syn_timeout\":{timeout},\"syn_payload_bytes\":0,\"handshake_succeeded\":true,\"returned_cookie\":{returned_cookie},\"cookie_cached\":{cached},\"next_has_fast_open_option\":{},\"next_accepted_bytes\":{next_accepted},\"other_service_has_fast_open_option\":true,\"other_service_accepted_bytes\":{other_accepted}}}",
-                            next.options.fast_open.is_some()
-                        ));
                     }
                 }
             }
         }
-    }
-    if let Ok(directory) = std::env::var("NTCP_COOKIE_TIMEOUT_STUDY_DIR") {
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(
-            std::format!("{directory}/core-matrix.json"),
-            std::format!("[{}]\n", rows.join(",")),
-        )
-        .unwrap();
     }
 }
 

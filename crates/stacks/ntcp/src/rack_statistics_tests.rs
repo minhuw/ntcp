@@ -469,8 +469,6 @@ fn physical_packet_counts_keep_logical_admissions_and_retry_units_separate() {
 // are exercised together by the separate combined-ACK regression.
 #[test]
 fn reordering_events_deduplicate_each_stage_across_splits_and_wrap() {
-    extern crate std;
-    let mut rows = Vec::new();
     for base in [Seq(0), Seq(u32::MAX - 4999)] {
         for split in [false, true] {
             let seq = |n| base.wrapping_add(n);
@@ -485,7 +483,7 @@ fn reordering_events_deduplicate_each_stage_across_splits_and_wrap() {
                     assert!(rack.split(seq(offset)));
                 }
             }
-            for (event, ack, blocks, expected) in [
+            for (_event, ack, blocks, expected) in [
                 ("first_sack", 0, vec![(9000, 10_000)], 0),
                 ("lower_sack", 0, vec![(3000, 4000), (9000, 10_000)], 1),
                 ("repeated_sack", 0, vec![(3000, 4000), (9000, 10_000)], 1),
@@ -510,21 +508,9 @@ fn reordering_events_deduplicate_each_stage_across_splits_and_wrap() {
                 assert_eq!(rack.reordering_events, expected);
                 assert_eq!(rack.reordering_seen, expected != 0);
                 assert_eq!(rack.min_rtt, Some(20_000));
-                rows.push(alloc::format!(
-                    "{{\"base\":{},\"split\":{},\"event\":\"{}\",\"reordering_events\":{},\"reordering_seen\":{},\"min_rtt_ticks\":{}}}",
-                    base.0, split, event, rack.reordering_events, rack.reordering_seen, rack.min_rtt.unwrap()
-                ));
             }
             assert_eq!(rack.reordering, 10);
         }
-    }
-    if let Ok(directory) = std::env::var("NTCP_REORDER_METRIC_FIX_DIR") {
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(
-            alloc::format!("{directory}/reordering-evidence.json"),
-            alloc::format!("[\n{}\n]\n", rows.join(",\n")),
-        )
-        .unwrap();
     }
 }
 

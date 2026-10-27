@@ -2,20 +2,11 @@
 // Deterministic diagnostic: local rejection is distinct from network loss.
 use super::*;
 
-fn local_state(a: &Connection, now: u64, label: &str, rows: &mut Vec<String>) {
-    state(a, now, label, rows);
-    let info = a.transport_info();
-    rows.push(format!(
-        "{{\"event\":\"{label}_statistics\",\"at_us\":{now},\"retransmitted\":{},\"reordering\":{},\"receive_used\":{},\"rtt_us\":{},\"state\":\"{:?}\"}}",
-        info.retransmitted, info.reordering, info.receive_used, info.rtt_us.unwrap_or(0), info.state
-    ));
+fn local_sender() -> Connection {
+    local_sender_with_algorithm(PrrAlgorithm::Rfc9937)
 }
 
-fn local_sender(rows: &mut Vec<String>) -> Connection {
-    local_sender_with_algorithm(rows, PrrAlgorithm::Rfc9937)
-}
-
-fn local_sender_with_algorithm(rows: &mut Vec<String>, algorithm: PrrAlgorithm) -> Connection {
+fn local_sender_with_algorithm(algorithm: PrrAlgorithm) -> Connection {
     let mut cfg = profile(algorithm);
     // Remaining common upstream options, audited against packet_profile::config.
     cfg.coalesce_read_window_updates = true;
@@ -41,32 +32,27 @@ fn local_sender_with_algorithm(rows: &mut Vec<String>, algorithm: PrrAlgorithm) 
     .unwrap();
     let syn = wire::parse(incoming, &bytes[..n]).unwrap();
     let mut a = Connection::passive(tuple(), cfg, 0, 0, &syn).unwrap();
-    output(&mut a, 0, rows);
+    output(&mut a, 0);
     inject(&mut a, 20_000, Seq(1), Seq(1), ACK, 320, &[]);
     assert_eq!(a.rtt.srtt(), Some(20_000));
     a.write(&[7; 10_000]).unwrap();
     assert_eq!(
-        output(&mut a, 20_000, rows)
-            .iter()
-            .map(|p| p.2)
-            .sum::<usize>(),
+        output(&mut a, 20_000).iter().map(|p| p.2).sum::<usize>(),
         10_000
     );
     for blocks in [&[(9001, 10001)][..], &[(3001, 4001), (9001, 10001)][..]] {
         inject_sack(&mut a, 40_000, Seq(1), Seq(1), ACK, 320, &[], blocks);
-        local_state(&a, 40_000, "prefix_sack", rows);
-        assert!(output(&mut a, 40_000, rows).is_empty());
+        assert!(output(&mut a, 40_000).is_empty());
     }
     assert_eq!(a.rack.counts().sacked, 2);
     inject(&mut a, 40_000, Seq(1), Seq(10001), ACK, 320, &[]);
-    local_state(&a, 40_000, "prefix_cumulative_ack", rows);
     assert_eq!(a.rack.counts().sacked, 0);
     assert_eq!(a.transport_info().reordering_events, 2);
     assert_eq!(a.transport_info().min_rtt_us, Some(20_000));
     // Record actual growth. Do not change pacing provenance or fabricate cwnd19.
-    assert!(advance(&mut a, 60_000, rows).is_empty());
+    assert!(advance(&mut a, 60_000).is_empty());
     a.write(&[8; 2000]).unwrap();
-    let sent = output(&mut a, 65_000, rows);
+    let sent = output(&mut a, 65_000);
     assert_eq!(sent.iter().map(|p| p.2).sum::<usize>(), 2000);
     inject_sack(
         &mut a,
@@ -78,12 +64,10 @@ fn local_sender_with_algorithm(rows: &mut Vec<String>, algorithm: PrrAlgorithm) 
         &[],
         &[(11001, 12001)],
     );
-    local_state(&a, 85_000, "second_flight_sack", rows);
-    assert!(output(&mut a, 85_000, rows).is_empty());
+    assert!(output(&mut a, 85_000).is_empty());
     let deadline = a.next_deadline().unwrap();
     assert!(deadline > 85_000 && deadline <= 105_000);
     a.timeout(deadline).unwrap();
-    local_state(&a, deadline, "rack_timeout_before_selection", rows);
     assert!(a.congestion.in_recovery());
     assert_eq!(a.rack.counts().lost, 1);
     assert_eq!(a.rack.counts().retransmitted, 0);
@@ -97,8 +81,7 @@ fn local_rack_failure_selection_rejection_acceptance_and_encoding_controls() {
         "encode_failure_then_input",
         "abandoned",
     ] {
-        let mut rows = Vec::new();
-        let mut a = local_sender(&mut rows);
+        let mut a = local_sender();
         let now = a.now;
         let before = a.prr.unwrap().counters();
         if mode == "encode_failure_then_input" {
@@ -108,7 +91,6 @@ fn local_rack_failure_selection_rejection_acceptance_and_encoding_controls() {
             );
             assert_eq!(a.prr.unwrap().counters(), before);
             assert_eq!(a.rack.counts().retransmitted, 0);
-            local_state(&a, now, "encoding_failed", &mut rows);
             // No selection/reservation exists, so input is legal immediately.
             inject_sack(
                 &mut a,
@@ -124,14 +106,12 @@ fn local_rack_failure_selection_rejection_acceptance_and_encoding_controls() {
             assert!(a.congestion.in_recovery());
             assert_eq!(a.prr.unwrap().counters(), before);
             assert_eq!(a.rack.counts().retransmitted, 0);
-            local_state(&a, 115_000, "input_after_encoding_failure", &mut rows);
         } else {
             let mut bytes = [0; 2048];
             let n = a.transmit_selected(now, &mut bytes, true).unwrap().unwrap();
             let seg = wire::parse(ip(tuple()), &bytes[..n]).unwrap();
             assert_eq!((seg.header.sequence, seg.payload.len()), (10001, 1000));
             let mut departure = a.last_departure.unwrap();
-            local_state(&a, now, "reserved_selection_not_submitted", &mut rows);
             let selected = a.prr.unwrap().counters();
             assert_eq!(selected, before);
             // The timer-entry repair charges PRR only at physical acceptance.
@@ -141,12 +121,10 @@ fn local_rack_failure_selection_rejection_acceptance_and_encoding_controls() {
             if mode == "abandoned" {
                 a.abandon_reserved_output();
                 assert_eq!(a.state(), State::Closed);
-                local_state(&a, now, "abandon_aborts_owner", &mut rows);
             } else {
                 a.reject_reserved_output();
                 assert_eq!(a.prr.unwrap().counters(), selected);
                 assert_eq!(a.rack.counts().retransmitted, 1);
-                local_state(&a, now, "certified_rejection_keeps_admission", &mut rows);
                 // Real owner retains reservation across rejection. Never inject
                 // into the core until the immutable selected repair is accepted.
                 a.accept_reserved_output(110_000, &mut departure, 0, 1000, true)
@@ -154,7 +132,6 @@ fn local_rack_failure_selection_rejection_acceptance_and_encoding_controls() {
                 let accepted = a.prr.unwrap().counters();
                 assert_eq!(accepted.2, selected.2 + 1000);
                 assert!(!a.prr.unwrap().timer_repair());
-                local_state(&a, 110_000, "repair_physically_accepted", &mut rows);
                 inject_sack(
                     &mut a,
                     115_000,
@@ -168,24 +145,14 @@ fn local_rack_failure_selection_rejection_acceptance_and_encoding_controls() {
                 assert_eq!(a.receive_used, 1000);
                 assert!(a.congestion.in_recovery());
                 assert_eq!(a.prr.unwrap().counters(), accepted);
-                local_state(&a, 115_000, "input_after_acceptance", &mut rows);
             }
-        }
-        if let Ok(directory) = std::env::var("NTCP_LOCAL_TX_STUDY_DIR") {
-            std::fs::create_dir_all(&directory).unwrap();
-            std::fs::write(
-                format!("{directory}/core-{mode}.json"),
-                format!("[\n{}\n]\n", rows.join(",\n")),
-            )
-            .unwrap();
         }
     }
 }
 
 #[test]
 fn local_repair_accepted_prefix_cannot_be_cancelled_or_refund_prr() {
-    let mut rows = Vec::new();
-    let mut a = local_sender(&mut rows);
+    let mut a = local_sender();
     let mut bytes = [0; 2048];
     a.transmit_selected(a.now, &mut bytes, true)
         .unwrap()
@@ -206,8 +173,7 @@ fn local_repair_accepted_prefix_cannot_be_cancelled_or_refund_prr() {
 
 #[test]
 fn local_repair_cancel_restores_receive_sack_debt_and_partial_retry_history() {
-    let mut rows = Vec::new();
-    let mut a = local_sender(&mut rows);
+    let mut a = local_sender();
     // Out-of-order inbound data needs a SACK on the failed outbound repair.
     inject_sack(
         &mut a,
@@ -298,8 +264,7 @@ fn local_repair_cancel_restores_receive_sack_debt_and_partial_retry_history() {
 
 #[test]
 fn rack_timer_prr_window_survives_rejection_and_zero_delivery() {
-    let mut rows = Vec::new();
-    let mut a = local_sender(&mut rows);
+    let mut a = local_sender();
     let before = a.prr.unwrap().counters();
     let target = a.congestion.recovery_target();
     assert_eq!(before, (1000, 0, 0));
@@ -307,7 +272,6 @@ fn rack_timer_prr_window_survives_rejection_and_zero_delivery() {
     assert_eq!(a.prr.unwrap().credit(), 1000);
     assert_eq!((a.congestion.cwnd(), target), (1000, 2000));
     let admission = 1000;
-    local_state(&a, 90_000, "synchronized_timer_entry", &mut rows);
     for at in [90_000, 91_000] {
         let mut bytes = [0; 2048];
         let n = a.transmit_selected(at, &mut bytes, true).unwrap().unwrap();
@@ -325,7 +289,6 @@ fn rack_timer_prr_window_survives_rejection_and_zero_delivery() {
         assert_eq!(a.transport_info().reordering_events, 2);
         assert_eq!(a.transport_info().min_rtt_us, Some(20_000));
     }
-    local_state(&a, 91_000, "twice_rejected", &mut rows);
     inject_sack(
         &mut a,
         95_000,
@@ -340,7 +303,6 @@ fn rack_timer_prr_window_survives_rejection_and_zero_delivery() {
     assert_eq!(a.prr.unwrap().counters(), before);
     assert_eq!(a.prr.unwrap().credit(), 1000);
     assert_eq!(a.congestion.cwnd(), admission);
-    local_state(&a, 95_000, "input_without_new_delivery", &mut rows);
     let mut bytes = [0; 2048];
     let n = a
         .transmit_selected(96_000, &mut bytes, true)
@@ -359,26 +321,11 @@ fn rack_timer_prr_window_survives_rejection_and_zero_delivery() {
     assert_eq!(a.prr.unwrap().credit(), 0);
     assert_eq!(a.transport_info().retransmitted, 1);
     assert_eq!(a.congestion.recovery_target(), target);
-    assert!(output(&mut a, 96_000, &mut rows).iter().all(|p| p.2 == 0));
-    local_state(&a, 96_000, "repair_accepted_credit_exhausted", &mut rows);
+    assert!(output(&mut a, 96_000).iter().all(|p| p.2 == 0));
     inject(&mut a, 100_000, Seq(1001), Seq(12001), ACK, 320, &[]);
     assert!(!a.congestion.in_recovery());
     assert!(a.prr.is_none());
     assert_eq!(a.congestion.cwnd(), target);
-    local_state(
-        &a,
-        100_000,
-        "recovery_completed_at_original_target",
-        &mut rows,
-    );
-    if let Ok(directory) = std::env::var("NTCP_RACK_WINDOW_FIX_DIR") {
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(
-            format!("{directory}/core-window-regression.json"),
-            format!("[\n{}\n]\n", rows.join(",\n")),
-        )
-        .unwrap();
-    }
 }
 
 #[test]
