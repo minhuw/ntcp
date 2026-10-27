@@ -195,8 +195,6 @@ mod tests {
             fd,
             ifindex: 0,
             timestamps: None,
-            scheduling: None,
-            scheduling_error: None,
             packet_mark: 0,
             vnet_header: true,
         };
@@ -204,8 +202,6 @@ mod tests {
             fd: peer,
             ifindex: 0,
             timestamps: None,
-            scheduling: None,
-            scheduling_error: None,
             packet_mark: 0,
             vnet_header: false,
         };
