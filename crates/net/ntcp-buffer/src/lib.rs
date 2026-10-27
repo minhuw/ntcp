@@ -12,8 +12,6 @@ use core::{any::Any, fmt, ops::Range};
 /// Any DMA mapping must remain valid until the storage itself is dropped.
 pub unsafe trait StablePayloadStorage: AsRef<[u8]> + Send + Sync + Any {}
 unsafe impl StablePayloadStorage for Vec<u8> {}
-unsafe impl StablePayloadStorage for Box<[u8]> {}
-unsafe impl StablePayloadStorage for Arc<[u8]> {}
 
 trait Storage: Send + Sync {
     fn bytes(&self) -> &[u8];
@@ -66,9 +64,6 @@ impl Payload {
     pub fn from_vec(bytes: Vec<u8>) -> Self {
         Self::new(bytes)
     }
-    pub fn from_arc(bytes: Arc<[u8]>) -> Self {
-        Self::new(bytes)
-    }
     pub fn as_slice(&self) -> &[u8] {
         &self.storage.bytes()[self.range.clone()]
     }
@@ -80,9 +75,6 @@ impl Payload {
     }
     pub fn offset(&self) -> usize {
         self.range.start
-    }
-    pub fn storage_len(&self) -> usize {
-        self.storage.bytes().len()
     }
     pub fn storage<T: Any>(&self) -> Option<&T> {
         self.storage.as_any().downcast_ref()

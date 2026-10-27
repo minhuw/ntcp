@@ -77,13 +77,11 @@ fn delayed_fifo_head_and_blocked_backend_do_not_block_other_flows() {
     scheduler.enqueue(a, metadata(1, 1, 50), "a-first").unwrap();
     scheduler.enqueue(a, metadata(1, 1, 0), "a-second").unwrap();
     scheduler.enqueue(b, metadata(1, 1, 0), "b-first").unwrap();
-    assert_eq!(scheduler.next_wakeup(), Some(50));
     let token = ready(&mut scheduler, 10);
     assert_eq!(*scheduler.view(token).unwrap().payload, "b-first");
     scheduler
         .resolve(token, Outcome::Retry { not_before: 80 })
         .unwrap();
-    assert_eq!(scheduler.next_wakeup(), Some(50));
     assert!(matches!(
         scheduler.poll_ready(49, &mut 20).unwrap(),
         Poll::Idle
@@ -98,13 +96,11 @@ fn delayed_fifo_head_and_blocked_backend_do_not_block_other_flows() {
         returned(&mut scheduler, token, Outcome::Accepted).payload,
         "a-second"
     );
-    assert_eq!(scheduler.next_wakeup(), Some(80));
     let token = ready(&mut scheduler, 80);
     assert_eq!(
         returned(&mut scheduler, token, Outcome::Accepted).payload,
         "b-first"
     );
-    assert_eq!(scheduler.next_wakeup(), None);
 }
 
 #[test]
@@ -118,8 +114,7 @@ fn multiple_leases_retry_cancel_and_stale_handles() {
     let t1 = ready(&mut scheduler, 0);
     let t2 = ready(&mut scheduler, 0);
     assert_eq!(t1.packet_id(), first);
-    assert_eq!(t2.packet_id().flow(), b);
-    assert_eq!(a.identity(), 10);
+    assert_eq!(t2.packet_id().flow, b);
     assert_eq!(scheduler.view(t1).unwrap().payload, &1);
     assert!(matches!(scheduler.cancel(first), Err(Error::Busy)));
     assert_eq!(scheduler.disable_flow(a), Err(Error::Busy));
@@ -300,7 +295,6 @@ fn bounded_poll_progress_and_monotonic_clock_at_max() {
     scheduler
         .enqueue(key, metadata(3, 0, u64::MAX - 1), ())
         .unwrap();
-    assert_eq!(scheduler.next_wakeup(), Some(u64::MAX - 1));
     assert!(matches!(
         scheduler.poll_ready(u64::MAX - 2, &mut 10).unwrap(),
         Poll::Idle
@@ -614,6 +608,6 @@ fn exhausted_poll_preserves_all_state_and_previous_clock() {
     // Restore only the test-injected exhaustion to demonstrate the old clock still works.
     scheduler.attempt = 1;
     let token = ready(&mut scheduler, 5);
-    assert_eq!(token.packet_id().flow(), b);
+    assert_eq!(token.packet_id().flow, b);
     assert!(scheduler.view(lease).is_ok());
 }

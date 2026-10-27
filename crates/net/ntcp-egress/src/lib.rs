@@ -49,18 +49,6 @@ pub struct TryToken {
     attempt: u64,
 }
 
-impl FlowKey {
-    pub fn identity(self) -> u64 {
-        self.identity
-    }
-}
-
-impl PacketId {
-    pub fn flow(self) -> FlowKey {
-        self.flow
-    }
-}
-
 impl TryToken {
     pub fn packet_id(self) -> PacketId {
         self.packet
@@ -376,17 +364,6 @@ impl<P> Scheduler<P> {
             payload: &packet.payload,
             metadata: packet.metadata,
         })
-    }
-
-    pub fn next_wakeup(&self) -> Option<u64> {
-        self.flows
-            .iter()
-            .filter_map(|flow| {
-                let packet = self.packets[flow.head?].packet.as_ref()?;
-                (packet.lease.is_none() && packet.metadata.not_before > self.now)
-                    .then_some(packet.metadata.not_before)
-            })
-            .min()
     }
 
     pub fn resolve(&mut self, token: TryToken, outcome: Outcome) -> Result<Resolution<P>, Error> {
