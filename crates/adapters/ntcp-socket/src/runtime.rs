@@ -674,14 +674,37 @@ fn context(io: &crate::IoConfig) -> Result<(IpAddr, u8)> {
         return Err(EADDRNOTAVAIL);
     }
     let pair = found.ok_or(EADDRNOTAVAIL)?;
-    if let IpAddr::V4(local) = io.address {
-        let mask = u32::MAX.checked_shl(32 - u32::from(pair.1)).unwrap_or(0);
-        let network = u32::from(local) & mask;
-        if pair.1 <= 30 && (u32::from(local) == network || u32::from(local) == network | !mask) {
-            return Err(EADDRNOTAVAIL);
-        }
+    if crate::ip::network_or_broadcast(io.address, pair.1) {
+        return Err(EADDRNOTAVAIL);
     }
     Ok(pair)
+}
+// Blocking getrandom with no fallback source: an owner never starts with a
+// weak secret.
+fn random_secret() -> Result<[u8; 32]> {
+    let mut secret = [0u8; 32];
+    let mut offset = 0;
+    while offset < secret.len() {
+        let n = unsafe {
+            syscall(
+                SYS_getrandom,
+                secret[offset..].as_mut_ptr(),
+                secret.len() - offset,
+                0,
+            )
+        };
+        if n < 0 {
+            if errno() == EINTR {
+                continue;
+            }
+            return Err(errno());
+        }
+        if n == 0 {
+            return Err(EIO);
+        }
+        offset += n as usize;
+    }
+    Ok(secret)
 }
 impl Owner {
     fn new(config: &SocketConfig) -> Result<Self> {
@@ -694,28 +717,7 @@ impl Owner {
             return Err(errno());
         }
         let subnet = context(&config.io)?;
-        let mut secret = [0u8; 32];
-        let mut offset = 0;
-        while offset < secret.len() {
-            let n = unsafe {
-                syscall(
-                    SYS_getrandom,
-                    secret[offset..].as_mut_ptr(),
-                    secret.len() - offset,
-                    0,
-                )
-            };
-            if n < 0 {
-                if errno() == EINTR {
-                    continue;
-                }
-                return Err(errno());
-            }
-            if n == 0 {
-                return Err(EIO);
-            }
-            offset += n as usize;
-        }
+        let secret = random_secret()?;
         let tcp = backend::backend_config_family(config.tcp.clone(), &tun, local)?;
         let mut owner = Self::with_config(local, subnet, secret, Some(tun), tcp)?;
         owner.apply_socket_config(config)?;

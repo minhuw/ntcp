@@ -120,36 +120,11 @@ impl Owner {
         if !unicast(local) {
             return Err(EADDRNOTAVAIL);
         }
-        if let (IpAddr::V4(local), IpAddr::V4(network)) = (local, network) {
-            let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
-            if prefix <= 30 && (local == network || u32::from(local) == u32::from(network) | !mask)
-            {
-                return Err(EADDRNOTAVAIL);
-            }
+        if crate::ip::network_or_broadcast(local, prefix) {
+            return Err(EADDRNOTAVAIL);
         }
         let tcp = backend_config_family(config.tcp.clone(), &*backend.io, local)?;
-        let mut secret = [0; 32];
-        let mut offset = 0;
-        while offset < secret.len() {
-            let n = unsafe {
-                syscall(
-                    SYS_getrandom,
-                    secret[offset..].as_mut_ptr(),
-                    secret.len() - offset,
-                    0,
-                )
-            };
-            if n < 0 {
-                if errno() == EINTR {
-                    continue;
-                }
-                return Err(errno());
-            }
-            if n == 0 {
-                return Err(EIO);
-            }
-            offset += n as usize;
-        }
+        let secret = random_secret()?;
         let mut owner = Self::with_config(config.io.address, (network, prefix), secret, None, tcp)?;
         owner.apply_socket_config(config)?;
         owner.ethernet = Some(EthernetBackend {
@@ -215,28 +190,7 @@ impl Owner {
             tx_completion_capacity: timestamps::PHASES,
         })
         .map_err(|e| e.raw_os_error().unwrap_or(EOPNOTSUPP))?;
-        let mut secret = [0u8; 32];
-        let mut at = 0;
-        while at < secret.len() {
-            let n = unsafe {
-                syscall(
-                    SYS_getrandom,
-                    secret[at..].as_mut_ptr(),
-                    secret.len() - at,
-                    0,
-                )
-            };
-            if n < 0 {
-                if errno() == EINTR {
-                    continue;
-                }
-                return Err(errno());
-            }
-            if n == 0 {
-                return Err(EIO);
-            }
-            at += n as usize;
-        }
+        let secret = random_secret()?;
         let mut owner = Self::with_config(
             local,
             subnet,

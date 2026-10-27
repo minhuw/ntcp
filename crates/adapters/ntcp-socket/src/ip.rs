@@ -46,6 +46,17 @@ pub(crate) fn network(ip: IpAddr, prefix: u8) -> Option<IpAddr> {
         _ => None,
     }
 }
+// IPv4 /31 and /32 subnets have no network or broadcast address to reserve.
+pub(crate) fn network_or_broadcast(ip: IpAddr, prefix: u8) -> bool {
+    match ip {
+        IpAddr::V4(v) if prefix <= 30 => {
+            let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
+            let network = u32::from(v) & mask;
+            u32::from(v) == network || u32::from(v) == network | !mask
+        }
+        _ => false,
+    }
+}
 #[derive(Debug)]
 pub(crate) struct Packet<'a> {
     pub ip: ntcp::IpMetadata,
