@@ -655,31 +655,15 @@ impl Owner {
                     // Full shared retention queue necessarily backpressures all RX.
                     break;
                 };
-                let received = match self.receive_backend(input) {
-                    Ok(Some(received)) => received,
-                    Ok(None) => break,
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::Interrupted
-                                | std::io::ErrorKind::InvalidData
-                                | std::io::ErrorKind::Unsupported
-                        ) =>
-                    {
-                        continue;
-                    }
-                    Err(error) => return Err(error),
+                let (bytes, stamps, segment_size) = match self.receive_ip_packet(input)? {
+                    backend::BackendReceive::Packet {
+                        bytes,
+                        stamps,
+                        segment_size,
+                    } => (bytes, stamps, segment_size),
+                    backend::BackendReceive::Skipped => continue,
+                    backend::BackendReceive::Empty => break,
                 };
-                let bytes = &input[..received.len];
-                let bytes = if self.ethernet.is_some() {
-                    let Ok(frame) = ntcp_ethernet::parse_ethernet(bytes) else {
-                        continue;
-                    };
-                    frame.payload
-                } else {
-                    bytes
-                };
-                let stamps = backend::core_stamps(received.timestamps);
                 if let Some(owner) = self.ingress_owner(bytes)
                     && self.endpoint.is_output_reserved(owner)
                 {
@@ -690,10 +674,10 @@ impl Owner {
                     slot.bytes.extend_from_slice(bytes);
                     slot.owner = Some(owner);
                     slot.stamps = stamps;
-                    slot.segment_size = received.tcp_segment_size;
+                    slot.segment_size = segment_size;
                     egress.received.push_back(index);
                 } else {
-                    self.input_ip_metadata(bytes, stamps, received.tcp_segment_size);
+                    self.input_ip_metadata(bytes, stamps, segment_size);
                 }
             }
             Ok(())

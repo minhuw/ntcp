@@ -48,11 +48,22 @@ fn core_stamp(stamp: PacketTimestamp) -> Option<ntcp::RxTimestamp> {
         clock,
     })
 }
-pub(super) fn core_stamps(stamps: PacketTimestamps) -> ntcp::RxPacketTimestamps {
+fn core_stamps(stamps: PacketTimestamps) -> ntcp::RxPacketTimestamps {
     ntcp::RxPacketTimestamps {
         software: stamps.software.and_then(core_stamp),
         hardware: stamps.hardware.and_then(core_stamp),
     }
+}
+// The outcome of one receive loop iteration, shared by both receive loops.
+pub(super) enum BackendReceive<'a> {
+    Packet {
+        bytes: &'a [u8],
+        stamps: ntcp::RxPacketTimestamps,
+        segment_size: Option<core::num::NonZeroU16>,
+    },
+    // A transient backend error or a rejected Ethernet frame.
+    Skipped,
+    Empty,
 }
 // Startup only: local_ip_mtu may block on the backend's control plane.
 #[cfg(test)]
@@ -290,35 +301,52 @@ impl Owner {
             return self.receive_scheduled(input);
         }
         for _ in 0..BUDGET {
-            match self.receive_backend(input) {
-                Ok(Some(received)) => {
-                    let bytes = &input[..received.len];
-                    let bytes = if self.ethernet.is_some() {
-                        let Ok(frame) = ntcp_ethernet::parse_ethernet(bytes) else {
-                            continue;
-                        };
-                        frame.payload
-                    } else {
-                        bytes
-                    };
-                    self.input_ip_metadata(
-                        bytes,
-                        core_stamps(received.timestamps),
-                        received.tcp_segment_size,
-                    );
-                }
-                Ok(None) => break,
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::Interrupted
-                            | std::io::ErrorKind::InvalidData
-                            | std::io::ErrorKind::Unsupported
-                    ) => {}
-                Err(e) => return Err(e),
+            match self.receive_ip_packet(input)? {
+                BackendReceive::Packet {
+                    bytes,
+                    stamps,
+                    segment_size,
+                } => self.input_ip_metadata(bytes, stamps, segment_size),
+                BackendReceive::Skipped => {}
+                BackendReceive::Empty => break,
             }
         }
         Ok(())
+    }
+    // Transient backend errors are skipped; any other error ends the batch.
+    pub(super) fn receive_ip_packet<'a>(
+        &mut self,
+        input: &'a mut [u8],
+    ) -> std::io::Result<BackendReceive<'a>> {
+        let received = match self.receive_backend(input) {
+            Ok(Some(received)) => received,
+            Ok(None) => return Ok(BackendReceive::Empty),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::InvalidData
+                        | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                return Ok(BackendReceive::Skipped);
+            }
+            Err(error) => return Err(error),
+        };
+        let bytes = &input[..received.len];
+        let bytes = if self.ethernet.is_some() {
+            let Ok(frame) = ntcp_ethernet::parse_ethernet(bytes) else {
+                return Ok(BackendReceive::Skipped);
+            };
+            frame.payload
+        } else {
+            bytes
+        };
+        Ok(BackendReceive::Packet {
+            bytes,
+            stamps: core_stamps(received.timestamps),
+            segment_size: received.tcp_segment_size,
+        })
     }
     //= https://www.rfc-editor.org/rfc/rfc1191#section-2
     //= reason=Native IPv4 input validates codec output then dispatches quoted tuple/sequence to endpoint policy; tests reject wrong checksum/tuple/window and observe bounded output after valid PTB.
