@@ -2477,23 +2477,23 @@ fn software_gso_cpu_sample() {
     }
     for gso in [None, Some(SOFTWARE_GSO)] {
         let mut ns = 0;
-        let mut selections = 0;
+        let mut segments = 0;
         let mut submissions = 0;
         // Setup/handshake/allocation excluded; fixed seed, clock and two full
-        // physical segments per sample. Counts are runtime fresh selections,
-        // not an assertion about core instruction counts or wire completion.
+        // physical segments per sample. Counts are captured wire segments and
+        // backend calls, not an assertion about core instruction counts.
         for _ in 0..100 {
             let (mut a, _, clients, _, state) = scheduled_pair_gso(1, gso);
             a.execute(clients[0], Op::Write(vec![7; 26000])).unwrap();
             let start = cpu_ns();
             a.service_egress().unwrap();
             ns += cpu_ns() - start;
-            selections += a.egress.as_ref().unwrap().selected_ranges;
+            segments += state.lock().unwrap().sent.len();
             submissions += state.lock().unwrap().output_calls;
             assert_eq!(state.lock().unwrap().sent.len(), 2);
         }
         eprintln!(
-            "gso={} samples=100 service_cpu_ns={ns} fresh_selections={selections} backend_calls={submissions}",
+            "gso={} samples=100 service_cpu_ns={ns} wire_segments={segments} backend_calls={submissions}",
             gso.is_some()
         );
     }

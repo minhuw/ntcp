@@ -5,7 +5,8 @@ use super::*;
 pub(super) struct PacketBackend {
     pub(super) profile: crate::packet_profile::Profile,
     input: VecDeque<(Vec<u8>, Option<core::num::NonZeroU16>)>,
-    pub(super) output: VecDeque<Reply>,
+    // Accepted output, each with the packet mark it was submitted under.
+    pub(super) output: VecDeque<(Reply, u32)>,
     capacity: usize,
     pub(super) local_reject: bool,
     mark: u32,
@@ -93,13 +94,15 @@ impl PacketIo for PacketBackend {
         bytes.extend_from_slice(packet);
         // ABI capture time is realtime epoch microseconds at backend acceptance,
         // not capture dequeue. Protocol timers continue to use Owner::now().
-        self.output.push_back(Reply {
-            value: bytes.len() as i32,
-            packet_mark: self.mark,
-            bytes,
-            stamp: (timestamps::realtime() / 1000).min(i64::MAX as u64) as i64,
-            ..Reply::default()
-        });
+        self.output.push_back((
+            Reply {
+                value: bytes.len() as i32,
+                bytes,
+                stamp: (timestamps::realtime() / 1000).min(i64::MAX as u64) as i64,
+                ..Reply::default()
+            },
+            self.mark,
+        ));
         Ok(TxOutcome::Submitted)
     }
 }

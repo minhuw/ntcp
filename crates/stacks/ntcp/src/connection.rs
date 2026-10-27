@@ -666,8 +666,6 @@ pub(crate) struct Connection {
     // Its exclusive ACK is sufficient proof; no per-byte receive ledger is needed.
     passive_syn_data_start: Option<Seq>,
     syn_delivered: bool,
-    // Current accepted FIN-bearing packet, not a historical standalone latch.
-    fin_packet_has_payload: Option<bool>,
     fin_delivered: bool,
     fin_needs_separate_credit: bool,
     deferred_tfo_push: bool,
@@ -728,8 +726,6 @@ pub(crate) struct Connection {
     pacing_deadline: Option<Instant>,
     pacer: Pacer,
     initial_pacing_open: bool,
-    #[cfg(test)]
-    prr_exit_trace: Option<Prr>,
     receive_used: usize,
     deferred_syn: Option<DeferredSyn>,
     sack_omit: bool,
@@ -985,7 +981,6 @@ impl Connection {
             syn_data_fully_acked: false,
             passive_syn_data_start: None,
             syn_delivered: false,
-            fin_packet_has_payload: None,
             fin_delivered: false,
             fin_needs_separate_credit: false,
             deferred_tfo_push: false,
@@ -1035,8 +1030,6 @@ impl Connection {
             pacing_deadline: None,
             pacer: Pacer::default(),
             initial_pacing_open: true,
-            #[cfg(test)]
-            prr_exit_trace: None,
             receive_used: 0,
             deferred_syn: None,
             sack_omit: false,
@@ -2630,7 +2623,6 @@ impl Connection {
             || self
                 .rack
                 .record_fin_payload(start, start.wrapping_add(payload as u32));
-        self.fin_packet_has_payload = Some(payload != 0);
     }
 
     pub(crate) fn accept_reserved_output(
@@ -5645,20 +5637,12 @@ impl Connection {
             .is_some_and(|end| at_or_after(self.snd_una, end))
         {
             self.congestion.complete_prr();
-            #[cfg(test)]
-            {
-                self.prr_exit_trace = self.prr;
-            }
             self.prr = None;
         }
         if let Some(mut recovery) = self.sack_recovery {
             if at_or_after(self.snd_una, recovery.recovery_point) {
                 if self.prr.is_some() {
                     self.congestion.complete_prr();
-                    #[cfg(test)]
-                    {
-                        self.prr_exit_trace = self.prr;
-                    }
                 }
                 self.sack_recovery = None;
                 self.congestion.end_ecn_prr();
@@ -5671,10 +5655,6 @@ impl Connection {
         }
         if ordinary_prr && !self.congestion.in_fast_recovery() {
             self.congestion.complete_prr();
-            #[cfg(test)]
-            {
-                self.prr_exit_trace = self.prr;
-            }
             self.congestion.end_ecn_prr();
             self.prr = None;
             recovery_exited = true;
@@ -5887,7 +5867,7 @@ impl Connection {
         // evidence (which can include SACKs). An ACK entering recovery uses
         // the pre-ACK scoreboard baseline; no earlier ACK is replayed.
         //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-        //= reason=Current entry ACK is processed; ending ACK leaves prr_exit_trace counters unchanged and clears PRR before ordinary output. No deferred causative ACK replay; timer/default trace asserts that separately.
+        //= reason=Current entry ACK is processed; ending ACK clears PRR without running its per-ACK steps, before ordinary output. No deferred causative ACK replay; timer/default trace asserts that separately.
         //# On every ACK starting or during fast recovery, excluding the ACK that
         //# concludes a PRR episode, PRR executes the following steps.
         //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
@@ -10251,7 +10231,7 @@ mod tests {
                     Some((base.wrapping_add(4), 100))
                 );
                 assert_eq!(
-                    a.rack.original_transmission(partial),
+                    crate::rack::tests::original_packet(&a.rack, partial),
                     Some((base, base.wrapping_add(4), 100, false))
                 );
                 let head = base.wrapping_add(257);
@@ -14530,10 +14510,9 @@ mod tests {
             let fs = a.prr.unwrap().counters().0;
             strict_ack(&mut a, 202_000, 2000, &[(4000, 10_000)]);
             assert_eq!(a.prr.unwrap().counters().0, fs);
-            let before = a.prr.unwrap().counters();
+            assert_eq!(a.prr.unwrap().counters(), (9000, 7000, 0));
             strict_ack(&mut a, 203_000, 10_000, &[]);
             assert!(a.prr.is_none());
-            assert_eq!(a.prr_exit_trace.unwrap().counters(), before);
             assert_eq!(a.congestion.cwnd(), a.congestion.ssthresh());
         }
     }
@@ -14541,7 +14520,7 @@ mod tests {
     #[test]
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
     //= type=test
-    //= reason=Current entry ACK is processed; ending ACK leaves prr_exit_trace counters unchanged and clears PRR before ordinary output. No deferred causative ACK replay; timer/default trace asserts that separately.
+    //= reason=Current entry ACK is processed; ending ACK clears PRR without running its per-ACK steps, before ordinary output. No deferred causative ACK replay; timer/default trace asserts that separately.
     //# On every ACK starting or during fast recovery, excluding the ACK that
     //# concludes a PRR episode, PRR executes the following steps.
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
@@ -14591,9 +14570,8 @@ mod tests {
             assert_eq!(sent, 250);
             assert_eq!(a.prr.unwrap().counters().2, before.counters().2 + 250);
             assert_eq!(a.prr.unwrap().credit(), before.credit() - 250);
-            let before = a.prr.unwrap().counters();
+            assert_eq!(a.prr.unwrap().counters(), (10_000, 4000, 1250));
             strict_ack(&mut a, 203_000, 10_000, &[]);
-            assert_eq!(a.prr_exit_trace.unwrap().counters(), before);
             assert!(a.prr.is_none());
             assert_eq!(a.congestion.cwnd(), 5000);
         }
@@ -14659,10 +14637,9 @@ mod tests {
                 prr_packet(&mut a, 202_000),
                 (a.iss.wrapping_add(1001).0, 500)
             );
-            let before = a.prr.unwrap().counters();
+            assert_eq!(a.prr.unwrap().counters(), (9000, 1000, 500));
             rack_sack(&mut a, 203_000, 10_000, &[]);
             assert!(a.prr.is_none());
-            assert_eq!(a.prr_exit_trace.unwrap().counters(), before);
             assert_eq!(a.congestion.cwnd(), 4500);
         }
     }
@@ -14770,6 +14747,7 @@ mod tests {
             assert_eq!(a.prr.unwrap().counters(), before.counters());
             assert_eq!(a.prr.unwrap().credit(), before.credit());
             assert_eq!(a.congestion.cwnd(), cwnd); // No Reno inflation on capped delivery.
+            assert_eq!(a.prr.unwrap().counters(), (10_000, 10_000, 500));
             if zero_window {
                 inject(&mut a, 200_004, seq, base.wrapping_add(1000), ACK, 0, &[]);
                 assert!(a.prr.is_none() && !a.congestion.in_recovery());
@@ -14816,7 +14794,6 @@ mod tests {
                 &[],
             );
             assert!(a.prr.is_none());
-            assert_eq!(a.prr_exit_trace.unwrap().counters(), before.counters());
             assert_eq!(a.congestion.cwnd(), a.congestion.ssthresh());
         }
     }
@@ -15086,9 +15063,6 @@ mod tests {
                             let remaining = u64::from(target.saturating_sub(final_pipe));
                             strict_ack(&mut a, now, ack as u32, &blocks);
                             assert!(a.prr.is_none());
-                            let trace = a.prr_exit_trace.unwrap();
-                            assert_eq!(trace.counters().1, epoch_delivery);
-                            assert_eq!(trace.counters().2, epoch_out);
                             assert_eq!(a.congestion.cwnd(), target);
                             assert_eq!(a.rack.pipe(), final_pipe);
                             let mut handoff_output = 0;
@@ -15104,9 +15078,7 @@ mod tests {
                             undone += handoff_output.saturating_sub(u64::from(delivered));
                             assert_eq!(
                                 voluntary - undone,
-                                trace.counters().1 + u64::from(delivered)
-                                    - trace.counters().2
-                                    - handoff_output
+                                epoch_delivery + u64::from(delivered) - epoch_out - handoff_output
                             );
                             final_windows.push((a.rack.pipe(), target));
                             assert_eq!(a.rack.pipe(), target, "losses={losses:?}");
@@ -15379,13 +15351,15 @@ mod tests {
                 assert_eq!(a.prr.unwrap().credit(), 0); // No repeated-ACK floor.
                 assert_eq!(a.sack_recovery.unwrap().pipe, pipe + credit);
                 assert_eq!(a.transmit(now + 1, &mut [0; 1500]), Ok(None));
+                assert_eq!(
+                    a.prr.unwrap().counters(),
+                    (recover_fs, delivered, u64::from(credit))
+                );
+                assert_eq!(a.prr.unwrap().credit(), 0);
                 strict_ack(&mut a, now + 2, 10_000, &[]);
                 assert_eq!(a.snd_una, point);
                 assert!(a.sack_recovery.is_none());
                 assert!(a.prr.is_none());
-                let exit = a.prr_exit_trace.unwrap();
-                assert_eq!(exit.counters(), (recover_fs, delivered, u64::from(credit)));
-                assert_eq!(exit.credit(), 0);
                 assert_eq!(a.congestion.cwnd(), 5000);
                 assert_eq!(a.recovery_pipe(end), 0);
                 assert_eq!(a.transmit(now + 2, &mut [0; 1500]), Ok(None));
@@ -15505,7 +15479,7 @@ mod tests {
             peer.input(100_000, &synack).unwrap();
             deliver(&mut peer, &mut sender, 100_000);
             assert!(!sender.timestamps);
-            assert_eq!(sender.rtt.updates, 1);
+            // Exactly one 100ms sample: RTTVAR = R/2.
             assert_eq!(
                 (sender.rtt.srtt(), sender.rtt.variance(), sender.rto()),
                 (Some(100_000), 50_000, 300_000)
@@ -15514,8 +15488,8 @@ mod tests {
             sender.write(&[0x55; 1000]).unwrap();
             packet(&mut sender, 100_000);
             rack_sack(&mut sender, 200_000, 1000, &[]);
-            // Ordinary and RACK candidates on the same ACK count only once.
-            assert_eq!(sender.rtt.updates, 2);
+            // Ordinary and RACK candidates on the same ACK count only once:
+            // a third 100ms sample would leave RTTVAR at 28125.
             assert_eq!(
                 (sender.rtt.srtt(), sender.rtt.variance(), sender.rto()),
                 (Some(100_000), 37_500, 250_000)
@@ -15544,7 +15518,10 @@ mod tests {
             let retry_bytes = packet(&mut sender, pto + 250_000);
             let retry = wire::parse(ip(sender.tuple()), &retry_bytes).unwrap();
             assert_eq!((retry.header.sequence, retry.payload.len()), (1001, 1000));
-            assert_eq!(sender.rtt.updates, 2);
+            assert_eq!(
+                (sender.rtt.srtt(), sender.rtt.variance()),
+                (Some(100_000), 37_500)
+            );
         }
     }
 
@@ -27112,7 +27089,9 @@ mod tests {
                 let next = a.receive.next();
                 let una = a.snd_una;
                 if rack {
-                    // Dense SACK delivery uses the same estimator gate as RTTM.
+                    // Dense SACK delivery uses the same estimator gate as RTTM:
+                    // only the round's first SACK updates the estimator.
+                    expected.sample(latency);
                     for end in &ends {
                         let mut options = vec![1, 1, 8, 10];
                         options.extend_from_slice(&((sent / 1000) as u32).to_be_bytes());
@@ -27144,10 +27123,12 @@ mod tests {
                             &wire::parse(ip(reverse(tuple())), &bytes[..n]).unwrap(),
                         )
                         .unwrap();
-                        assert_eq!(a.rtt.updates, round as usize + 1);
+                        assert_eq!(
+                            (a.rtt.srtt(), a.rtt.variance(), a.rtt.rto()),
+                            (expected.srtt(), expected.variance(), expected.rto())
+                        );
                         assert_eq!(a.sample, pending);
                     }
-                    expected.sample(latency);
                 }
                 for (i, end) in ends.into_iter().enumerate() {
                     timestamp_input(
@@ -27169,7 +27150,6 @@ mod tests {
                     );
                 }
                 assert_eq!(a.send.len(), 0);
-                assert_eq!(a.rtt.updates, round as usize + 1);
             }
         }
     }
@@ -27208,6 +27188,7 @@ mod tests {
                                 let (mut a, _) = pair(cfg, u32::MAX - 100);
                                 a.timestamp_offset = u32::MAX - 2000;
                                 a.rtt = RttEstimator::new(1_000_000);
+                                let mut expected = RttEstimator::new(1_000_000);
                                 let mut expected_local = RttEstimator::new(1_000_000);
                                 a.rtt_sample_after = None;
                                 let mut flight = alloc::collections::VecDeque::new();
@@ -27258,10 +27239,21 @@ mod tests {
                                         inject(&mut a, now, next, ack, ACK, 8192, b"");
                                     }
                                     // One update per window-sized causal round, even though
-                                    // flight never drains and delayed ACKs cover multiple sends.
+                                    // flight never drains and delayed ACKs cover multiple sends:
+                                    // 1 + group * batch / width updates so far, eight in all.
+                                    // The round's first ACK takes one sample: a valid RTTM echo
+                                    // times the round's first original, otherwise the local
+                                    // ledger times the latest one. RTTVAR stays positive, so a
+                                    // missing or extra update changes the estimator.
+                                    if group * batch % width == 0 {
+                                        let (_, first_sent, first_echo) = delivered[0];
+                                        let rttm =
+                                            !timestamps || (*forge == 0 && first_echo == echo);
+                                        expected.sample(now - if rttm { first_sent } else { sent });
+                                    }
                                     assert_eq!(
-                                        a.rtt.updates,
-                                        1 + group * batch / width,
+                                        (a.rtt.srtt(), a.rtt.variance(), a.rtt.rto()),
+                                        (expected.srtt(), expected.variance(), expected.rto()),
                                         "TS={timestamps} RACK={rack} batch={batch} step={step}"
                                     );
                                     if *forge != 0 {
@@ -27284,7 +27276,6 @@ mod tests {
                                         flight.push_back(send_one(&mut a, now + i as u64 * step));
                                     }
                                 }
-                                assert_eq!(a.rtt.updates, 8);
                             }
                         }
                     }
@@ -27325,14 +27316,18 @@ mod tests {
                 b"",
             );
             // Invalid RTTM is not eligible; both algorithms use local original timing.
-            assert_eq!(a.rtt.updates, 1);
+            // Exactly one 100ms sample: RTTVAR = R/2.
             assert_eq!(
                 (a.rtt.srtt(), a.rtt.variance(), a.rtt.rto()),
                 (Some(100_000), 50_000, 1_000_000)
             );
             assert!(a.sample.is_none());
             timestamp_input(&mut a, 2_100_000, next, end, ACK, Some((3000, echo)), b"");
-            assert_eq!(a.rtt.updates, 1); // No new output needed to rearm.
+            // No new output needed to rearm; a second sample would reduce RTTVAR.
+            assert_eq!(
+                (a.rtt.srtt(), a.rtt.variance(), a.rtt.rto()),
+                (Some(100_000), 50_000, 1_000_000)
+            );
 
             let (mut a, _) = pair(cfg, 100);
             a.rtt = RttEstimator::new(1_000_000);
@@ -27345,13 +27340,13 @@ mod tests {
             let next = a.receive.next();
             let echo = a.timestamp_value(3_000_000);
             timestamp_input(&mut a, 3_100_000, next, end, ACK, Some((4000, echo)), b"");
-            assert_eq!(a.rtt.updates, 0); // Matching echo does not undo Karn.
+            assert_eq!(a.rtt.srtt(), None); // Matching echo does not undo Karn.
             a.write(b"fresh").unwrap();
             packet(&mut a, 3_100_000);
             let end = a.snd_nxt;
             let echo = a.timestamp_value(3_100_000);
             timestamp_input(&mut a, 3_200_000, next, end, ACK, Some((4000, echo)), b"");
-            assert_eq!(a.rtt.updates, 1);
+            assert_eq!((a.rtt.srtt(), a.rtt.variance()), (Some(100_000), 50_000));
         }
     }
 
@@ -27815,7 +27810,7 @@ mod tests {
             timestamp_input(&mut a, 2_600_000, next, ack, ACK, Some((5, echo)), b"");
             // Only a matching echo qualifies for RTTM. Every other value falls
             // back to the same unambiguous local 600ms measurement, never the echo.
-            assert_eq!(a.rtt.updates, 1);
+            // Exactly one sample: RTTVAR = R/2.
             assert_eq!(
                 (a.rtt.srtt(), a.rtt.variance(), a.rtt.rto()),
                 (Some(600_000), 300_000, 1_800_000)
@@ -27845,7 +27840,7 @@ mod tests {
             let ack = a.snd_nxt;
             timestamp_input(&mut a, 3_600_000, next, ack, ACK, Some((6, echo)), b"");
             assert_eq!(a.rtt.rto(), rto);
-            assert_eq!(a.rtt.updates, 0);
+            assert_eq!(a.rtt.srtt(), None);
         }
     }
 
@@ -28824,8 +28819,11 @@ mod tests {
             deliver(&mut b, &mut a, now + 10);
             assert_eq!(a.send.len(), 0);
             expected_rtt.sample(10);
-            assert_eq!(a.rtt.updates, expected_rtt.updates);
             assert_eq!(a.rtt.srtt(), expected_rtt.srtt());
+            assert_eq!(
+                (a.rtt.variance(), a.rtt.rto()),
+                (expected_rtt.variance(), expected_rtt.rto())
+            );
         }
         assert_eq!(values[0], values[1]);
     }
@@ -29258,7 +29256,10 @@ mod tests {
                     assert_eq!(repair.header.sequence, base.0);
                     assert_eq!(repair.payload.len(), repair_credit as usize);
                     assert!(repair.payload.iter().all(|&byte| byte == 0x55));
-                    let counters = a.prr.unwrap().counters();
+                    assert_eq!(
+                        a.prr.unwrap().counters(),
+                        (10_000, 1000, u64::from(repair_credit))
+                    );
                     inject(
                         &mut a,
                         300_000,
@@ -29269,7 +29270,6 @@ mod tests {
                         b"",
                     );
                     assert!(a.prr.is_none());
-                    assert_eq!(a.prr_exit_trace.unwrap().counters(), counters);
                     // Existing RFC9937 completion sets cwnd=ssthresh for BOTH
                     // congestion algorithms. No CUBIC-only exit override.
                     assert_eq!(a.congestion.cwnd(), threshold);
@@ -29475,7 +29475,7 @@ mod tests {
                 let repair = wire::parse(ip(tuple()), &bytes).unwrap();
                 assert_eq!(repair.header.sequence, base.0);
                 assert_eq!(repair.payload.len(), 1000);
-                let ending = a.prr.unwrap().counters();
+                assert_eq!(a.prr.unwrap().counters(), (recover_fs, 3000, 1000));
                 inject_sack(
                     &mut a,
                     now + 100_000,
@@ -29487,7 +29487,6 @@ mod tests {
                     &[],
                 );
                 assert!(a.sack_recovery.is_none() && a.prr.is_none());
-                assert_eq!(a.prr_exit_trace.unwrap().counters(), ending);
                 assert_eq!(a.congestion.cwnd(), threshold);
             }
         }

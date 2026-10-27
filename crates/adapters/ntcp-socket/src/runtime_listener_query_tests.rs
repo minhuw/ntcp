@@ -90,13 +90,25 @@ fn listener_query_preserves_held_output_and_progresses_under_backpressure() {
     a.service_egress().unwrap();
     assert!(a.endpoint.is_output_reserved(held));
     let attempt = a.egress.as_ref().unwrap().attempt(held);
-    let bytes = a.packets.as_ref().unwrap().output.front().unwrap().bytes.clone();
+    let bytes = a
+        .packets
+        .as_ref()
+        .unwrap()
+        .output
+        .front()
+        .unwrap()
+        .0
+        .bytes
+        .clone();
     let descriptor = a.endpoint.transmit_segmentation(attempt).unwrap();
     let deadline = a.endpoint.next_deadline();
     assert!(present(&mut a,8081));
     assert!(a.endpoint.is_output_reserved(held));
     assert_eq!(a.egress.as_ref().unwrap().attempt(held),attempt);
-    assert_eq!(a.packets.as_ref().unwrap().output.front().unwrap().bytes,bytes);
+    assert_eq!(
+        a.packets.as_ref().unwrap().output.front().unwrap().0.bytes,
+        bytes
+    );
     assert_eq!(a.endpoint.transmit_segmentation(attempt).unwrap(),descriptor);
     assert_eq!(a.endpoint.next_deadline(),deadline);
 }

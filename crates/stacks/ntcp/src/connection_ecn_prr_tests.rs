@@ -69,11 +69,9 @@ fn cubic_ecn_prr_safe_entry_output_multiple_acks_and_handoff() {
             ack(&mut a, 70, base.wrapping_add(3000), false, &[]);
             assert_eq!(a.congestion.unsuppressed_cwnd(), 7000);
             assert_eq!(a.prr.unwrap().counters(), (4000, 3000, 2000));
-            let before = a.prr.unwrap().counters();
             ack(&mut a, 80, end, true, &[]);
             assert!(a.prr.is_none());
             assert_eq!(a.congestion.ecn_prr_end(), None);
-            assert_eq!(a.prr_exit_trace.unwrap().counters(), before);
             assert_eq!(a.congestion.cwnd(), 7000);
             // Ordinary output uses the restored logical window, not stale credit.
             for _ in 0..5 {
@@ -126,10 +124,9 @@ fn cubic_ecn_prr_signed_sack_delivery_replay_and_loss_takeover() {
             assert_eq!(a.prr.unwrap().credit(), credit);
             ack(&mut a, 53, base.wrapping_add(3000), false, &[]);
             assert_eq!(a.prr.unwrap().counters(), (3000, 3000, 0)); // Only unsacked hole is new.
-            let before = a.prr.unwrap().counters();
             ack(&mut a, 54, end, true, &[]);
-            assert_eq!(a.prr_exit_trace.unwrap().counters(), before);
             assert!(a.prr.is_none());
+            assert_eq!(a.congestion.cwnd(), a.congestion.ssthresh());
         }
     }
     for sack in [false, true] {
@@ -184,10 +181,10 @@ fn cubic_ecn_prr_small_flight_fin_and_cancellations() {
         if fin {
             ack(&mut a, 60, base.wrapping_add(4000), true, &[]);
             assert!(a.prr.is_some()); // FIN is part of the boundary, not delivered payload.
-            let before = a.prr.unwrap().counters();
+            assert_eq!(a.prr.unwrap().counters(), (4000, 4000, 0));
             ack(&mut a, 70, end, true, &[]);
-            assert_eq!(a.prr_exit_trace.unwrap().counters(), before);
             assert!(a.prr.is_none());
+            assert_eq!(a.congestion.cwnd(), a.congestion.ssthresh());
             assert_eq!(a.state(), State::FinWait2);
         } else {
             let threshold = a.congestion.ssthresh();
@@ -501,9 +498,8 @@ fn cubic_ecn_prr_entry_ack_pmtu_verification_rollback() {
             assert_ne!(seg.header.flags & CWR, 0);
             assert_eq!(a.prr.unwrap().credit(), 0);
             assert!(a.transmit(now + 1, &mut [0; 1500]).unwrap().is_none());
-            let counters = a.prr.unwrap().counters();
+            assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 500));
             ack(&mut a, now + 2, end, true, &[]);
-            assert_eq!(a.prr_exit_trace.unwrap().counters(), counters);
         }
         assert!(a.prr.is_none());
         assert_eq!(a.congestion.ecn_prr_end(), None);

@@ -337,9 +337,9 @@ fn timer_repair_failed_selection_short_commit_and_episode_end() {
                 assert_eq!(a.prr.unwrap().counters(), (9000, 0, 250));
                 assert_eq!(a.prr.unwrap().credit(), 0);
             }
+            assert_eq!(a.prr.unwrap().counters(), (9000, 0, 250));
             strict_ack(&mut a, now + 5 * scale, 10_000, &[]);
             assert!(a.prr.is_none() && a.sack_recovery.is_none());
-            assert_eq!(a.prr_exit_trace.unwrap().counters(), (9000, 0, 250));
             assert_eq!(a.congestion.cwnd(), 5000);
 
             let mut a = timer_sender(scale, iss);

@@ -1165,7 +1165,9 @@ fn hystart_wire_round(a: &mut Connection, sent: u64, delay: u64) {
     let ranges = outputs(a, sent, base);
     assert_eq!(ranges.len(), 10);
     assert_eq!(a.snd_nxt, base.wrapping_add(10 * mss));
-    let rto_updates = a.rtt.updates;
+    // Every estimator update changes SRTT or RTTVAR here; count those changes.
+    let mut rtt = (a.rtt.srtt(), a.rtt.variance());
+    let mut rto_updates = 0;
     for n in 1..=10 {
         // A window-only ACK cannot supply a cached RTT to HyStart++. Bare
         // no-SACK duplicates separately imply delivery and discount growth.
@@ -1173,7 +1175,15 @@ fn hystart_wire_round(a: &mut Connection, sent: u64, delay: u64) {
         let window = ((a.snd_wnd >> a.peer_scale) as u16) - 1;
         hystart_wire_ack_echo_window(a, sent + delay, a.snd_una, ACK, u32::MAX, window);
         assert_eq!(a.congestion.startup_state(), state);
+        if (a.rtt.srtt(), a.rtt.variance()) != rtt {
+            rtt = (a.rtt.srtt(), a.rtt.variance());
+            rto_updates += 1;
+        }
         hystart_wire_ack(a, sent + delay, base.wrapping_add(n * mss), ACK);
+        if (a.rtt.srtt(), a.rtt.variance()) != rtt {
+            rtt = (a.rtt.srtt(), a.rtt.variance());
+            rto_updates += 1;
+        }
         if n < 10 && a.congestion.startup_state().is_some() {
             assert_eq!(a.congestion.startup_state().unwrap().0, n as u8);
             assert_eq!(
@@ -1184,7 +1194,7 @@ fn hystart_wire_round(a: &mut Connection, sent: u64, delay: u64) {
     }
     // HyStart got ten fresh samples while the fixed-weight estimator accepted
     // at most one from this same causal flight.
-    assert!(a.rtt.updates - rto_updates <= 1);
+    assert!(rto_updates <= 1);
 }
 
 #[test]

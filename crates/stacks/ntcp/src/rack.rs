@@ -240,23 +240,6 @@ impl Rack {
         })
     }
 
-    // Original physical wire span/time plus whether any of that original
-    // packet has been retransmitted. Used by scaled-window first-retry policy.
-    #[allow(dead_code)] // Consumer is the parallel TCP-options integration.
-    pub(crate) fn original_transmission(&self, start: Seq) -> Option<(Seq, Seq, u64, bool)> {
-        self.intervals
-            .iter()
-            .find(|r| !after(r.start, start) && after(r.end, start))
-            .map(|r| {
-                (
-                    r.original_wire_start,
-                    r.original_wire_end,
-                    r.original_sent,
-                    r.original_retransmitted,
-                )
-            })
-    }
-
     pub(crate) fn original_retry_span(
         &self,
         seq: Seq,
@@ -513,7 +496,6 @@ impl Rack {
     // Capture only when this output actually called transmit, not for pure ACKs.
     // The caller binds the token to its connection generation and freezes input
     // and timeout processing until the reserved output has been resolved.
-    #[allow(dead_code)] // Consumer: reserved-output timing integration.
     pub(crate) fn departure_selection(&self) -> Option<DepartureSelection> {
         self.departure_selection.filter(|_| self.valid())
     }
@@ -1332,11 +1314,27 @@ impl Rack {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     mod statistics {
         include!("rack_statistics_tests.rs");
+    }
+
+    // Original physical wire span/time plus whether any of that original
+    // packet has been retransmitted.
+    pub(crate) fn original_packet(rack: &Rack, start: Seq) -> Option<(Seq, Seq, u64, bool)> {
+        rack.intervals
+            .iter()
+            .find(|r| !after(r.start, start) && after(r.end, start))
+            .map(|r| {
+                (
+                    r.original_wire_start,
+                    r.original_wire_end,
+                    r.original_sent,
+                    r.original_retransmitted,
+                )
+            })
     }
 
     #[test]
@@ -1559,18 +1557,18 @@ mod tests {
             assert_eq!(rack.head_transmission(seq(4)), Some((seq(12), 100)));
             assert_eq!(rack.head_transmission(seq(12)), Some((seq(24), 10)));
             assert_eq!(
-                rack.original_transmission(base),
+                original_packet(&rack, base),
                 Some((base, seq(4), 200, false))
             );
             assert_eq!(
-                rack.original_transmission(seq(4)),
+                original_packet(&rack, seq(4)),
                 Some((seq(4), seq(12), 100, false))
             );
             assert_eq!(rack.original_retry_span(base, seq(24)), Some(span));
             assert!(rack.commit_departure(token, seq(12), seq(24), 300));
             assert_eq!(rack.head_transmission(base), Some((seq(4), 200)));
             assert_eq!(
-                rack.original_transmission(seq(12)),
+                original_packet(&rack, seq(12)),
                 Some((seq(12), seq(24), 300, false))
             );
             assert_eq!(rack.counts().unacked, counts.unacked);
@@ -1599,8 +1597,8 @@ mod tests {
             // without splitting the original window/first-retry permission.
             rack.transmit(base, seq(2), 400, true);
             rack.commit_retry_span(base, seq(2));
-            assert!(rack.original_transmission(seq(3)).unwrap().3);
-            assert!(!rack.original_transmission(seq(4)).unwrap().3);
+            assert!(original_packet(&rack, seq(3)).unwrap().3);
+            assert!(!original_packet(&rack, seq(4)).unwrap().3);
             assert_eq!(
                 rack.original_retry_span(seq(4), seq(24))
                     .unwrap()
@@ -1632,7 +1630,7 @@ mod tests {
             let before = *r;
             let counts = rack.counts();
             let pipe = rack.pipe();
-            let original = rack.original_transmission(seq(4));
+            let original = original_packet(&rack, seq(4));
             assert!(rack.commit_departure(token, seq(8), seq(16), 100));
             let accepted = rack.intervals.iter().find(|r| r.start == seq(8)).unwrap();
             let expected = Interval {
@@ -1650,7 +1648,7 @@ mod tests {
             assert_eq!(*accepted, expected);
             assert_eq!(rack.head_transmission(seq(4)), Some((seq(8), 30)));
             assert_eq!(rack.head_transmission(seq(16)), Some((seq(20), 30)));
-            assert_eq!(rack.original_transmission(seq(8)), original);
+            assert_eq!(original_packet(&rack, seq(8)), original);
             assert_eq!(rack.counts().unacked, counts.unacked);
             assert_eq!(rack.counts().sacked, counts.sacked);
             assert_eq!(rack.counts().lost, counts.lost);
@@ -1684,11 +1682,11 @@ mod tests {
         let retry = rack.departure_selection().unwrap();
         assert!(rack.commit_departure(retry, Seq(6), Seq(16), 50));
         assert_eq!(
-            rack.original_transmission(Seq(6)),
+            original_packet(&rack, Seq(6)),
             Some((Seq(0), Seq(8), 20, true))
         );
         assert_eq!(
-            rack.original_transmission(Seq(8)),
+            original_packet(&rack, Seq(8)),
             Some((Seq(8), Seq(24), 30, true))
         );
         assert_eq!(rack.head_transmission(Seq(6)), Some((Seq(16), 50)));
@@ -1746,10 +1744,7 @@ mod tests {
                     let start = base.wrapping_add(n * 8);
                     let end = base.wrapping_add((n + 1) * 8);
                     assert_eq!(rack.head_transmission(start), Some((end, 20)));
-                    assert_eq!(
-                        rack.original_transmission(start),
-                        Some((start, end, 20, false))
-                    );
+                    assert_eq!(original_packet(&rack, start), Some((start, end, 20, false)));
                 }
                 assert!(!rack.intervals.last().unwrap().departure_committed);
                 assert!(!rack.validate_departure_group(token, base, 8, 3, 20));
@@ -1888,7 +1883,7 @@ mod tests {
                 assert_eq!(span.successful_retries, retries);
                 assert_eq!(span.retry_end, base.wrapping_add(retry_end));
                 assert_eq!(
-                    rack.original_transmission(base.wrapping_add(offset)),
+                    original_packet(&rack, base.wrapping_add(offset)),
                     Some((base, end, 10, true))
                 );
             }
@@ -1988,7 +1983,7 @@ mod tests {
         );
         assert_eq!(rack.intervals.len(), 512);
         assert_eq!(
-            rack.original_transmission(Seq(255)),
+            original_packet(&rack, Seq(255)),
             Some((Seq(0), Seq(512), 0, true))
         );
         for byte in 0..512 {
@@ -2378,7 +2373,7 @@ mod tests {
             assert_eq!(rack.intervals.len(), 3);
             assert_eq!(rack.intervals[0].start, base.wrapping_add(2));
             assert_eq!(
-                rack.original_transmission(base.wrapping_add(2)),
+                original_packet(&rack, base.wrapping_add(2)),
                 Some((base, base.wrapping_add(4), 100, false))
             );
             assert_eq!(rack.latest, None);

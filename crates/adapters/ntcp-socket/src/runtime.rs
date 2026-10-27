@@ -122,8 +122,6 @@ pub struct Reply {
     pub addr: Option<SocketAddr>,
     #[cfg(feature = "packet-test")]
     pub stamp: i64,
-    #[cfg(feature = "packet-test")]
-    pub packet_mark: u32,
 }
 struct Request {
     id: u64,
@@ -1808,11 +1806,11 @@ impl Owner {
             }
             Op::Capture(capacity) => {
                 let packets = self.packets.as_mut().ok_or(EOPNOTSUPP)?;
-                let front = packets.output.front().ok_or(EAGAIN)?;
+                let (front, _) = packets.output.front().ok_or(EAGAIN)?;
                 if front.bytes.len() > *capacity {
                     return Err(EMSGSIZE);
                 }
-                return Ok(packets.output.pop_front().unwrap());
+                return Ok(packets.output.pop_front().unwrap().0);
             }
             _ => (),
         }

@@ -18,8 +18,6 @@ pub(crate) struct RttEstimator {
     rto: u64,
     minimum: u64,
     timebase: CallerTimebase,
-    #[cfg(test)]
-    pub(crate) updates: usize,
 }
 
 // Partial evidence: estimator arithmetic and bounded backoff only. The connection selects
@@ -45,8 +43,6 @@ impl RttEstimator {
         Self {
             minimum: timebase.ticks_from_us(minimum),
             timebase,
-            #[cfg(test)]
-            updates: 0,
             srtt: None,
             variance: 0,
             rto: timebase.ticks_from_us(MIN_RTO),
@@ -135,10 +131,6 @@ impl RttEstimator {
     //# "collapsing" RTO back down after it has been subject to exponential back off (rule
     //# 5.5).
     pub(crate) fn sample(&mut self, rtt_ticks: u64) {
-        #[cfg(test)]
-        {
-            self.updates += 1;
-        }
         let srtt = match self.srtt {
             None => {
                 self.variance = rtt_ticks / 2;

@@ -376,11 +376,15 @@ fn reserved_fresh_rtt_uses_departure_not_retained_timestamp_selection() {
     a.accept_reserved_output(2_000_000, &mut d, 0, count, true)
         .unwrap();
     assert!(a.sample.is_none());
-    let updates = a.rtt.updates;
+    let mut expected = a.rtt.clone();
+    expected.sample(100);
     let (next, end) = (a.receive.next(), a.snd_nxt);
     timestamp_input(&mut a, 2_000_100, next, end, ACK, Some((2000, echo)), b"");
     assert_eq!(a.rack.ack_sample, Some(100));
-    assert_eq!(a.rtt.updates, updates + 1);
+    assert_eq!(
+        (a.rtt.srtt(), a.rtt.variance(), a.rtt.rto()),
+        (expected.srtt(), expected.variance(), expected.rto())
+    );
 }
 
 #[test]
@@ -815,7 +819,7 @@ fn group_preflight_and_same_submit_time_keep_rack_spans_and_first_timer_across_w
             let left = start.wrapping_add(n * 100);
             let right = start.wrapping_add((n + 1) * 100);
             assert_eq!(
-                a.rack.original_transmission(left),
+                crate::rack::tests::original_packet(&a.rack, left),
                 Some((left, right, 50, false))
             );
             assert_eq!(a.rack.head_transmission(left), Some((right, 50)));

@@ -257,7 +257,6 @@ fn reserved_control_echo_validation_karn_and_syn_backoff() {
                         assert_eq!(c.state(), State::SynSent);
                         assert!(!c.syn_delivered);
                         assert_eq!(c.rtt.srtt(), None);
-                        assert_eq!(c.rtt.updates, 0);
                         assert_eq!(c.rto(), 1_000_000);
                         assert_eq!(c.rto_deadline, Some(3_000_000));
                         continue;
@@ -269,7 +268,8 @@ fn reserved_control_echo_validation_karn_and_syn_backoff() {
                         eligible.then_some(100_000),
                         "passive={passive}, timestamps={timestamps}, retry={retry}, valid_echo={valid_echo}"
                     );
-                    assert_eq!(c.rtt.updates, usize::from(eligible));
+                    // RTTVAR = R/2: exactly one sample when eligible.
+                    assert_eq!(c.rtt.variance(), if eligible { 50_000 } else { 0 });
                     assert_eq!(
                         c.rto(),
                         if retry {
@@ -292,7 +292,8 @@ fn reserved_fin_eligibility_older_sample_and_subsequent_scalar_clock() {
         let (_, mut b) = handshake(true, timestamps, 0, 100_000);
         b.shutdown().unwrap();
         output(&mut b, 200_000, 2_000_000, true);
-        let updates = b.rtt.updates;
+        let mut expected = b.rtt.clone();
+        expected.sample(100_000);
         let next = b.receive.next();
         let end = b.snd_nxt;
         let echo = b.timestamp_value(200_000);
@@ -305,7 +306,10 @@ fn reserved_fin_eligibility_older_sample_and_subsequent_scalar_clock() {
             timestamps.then_some((3000, echo)),
             b"",
         );
-        assert_eq!(b.rtt.updates, updates + 1);
+        assert_eq!(
+            (b.rtt.srtt(), b.rtt.variance(), b.rtt.rto()),
+            (expected.srtt(), expected.variance(), expected.rto())
+        );
         assert_eq!(b.rtt.srtt(), Some(100_000));
 
         let (_, mut b) = handshake(true, timestamps, 0, 100_000);
@@ -368,13 +372,13 @@ fn reserved_fin_options_fragment_waits_for_sequence_and_retry_cannot_sample() {
         .unwrap();
     assert_eq!(b.sample_departure, Some(300_000));
     b.timeout(600_000).unwrap();
-    let updates = b.rtt.updates;
+    let rtt = (b.rtt.srtt(), b.rtt.variance());
     output(&mut b, 600_000, 2_000_000, true);
     assert!(b.sample.is_none());
     let next = b.receive.next();
     let end = b.snd_nxt;
     let echo = b.timestamp_value(200_000); // Delayed ACK of the original FIN.
     timestamp_input(&mut b, 2_100_000, next, end, ACK, Some((3000, echo)), b"");
-    assert_eq!(b.rtt.updates, updates);
+    assert_eq!((b.rtt.srtt(), b.rtt.variance()), rtt);
     assert_eq!(b.rto(), 600_000); // Ambiguous ACK cannot collapse the backoff.
 }

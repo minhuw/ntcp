@@ -983,7 +983,7 @@ fn timed_out_syn_ack_rearms_residual_tfo_with_data_phase_floor() {
             // accept_ack rearms this flight before establish changes handshake state.
             assert_eq!(a.rto_deadline, Some(4_100_000));
             assert_eq!(a.rto(), 3_000_000);
-            assert_eq!(a.rtt.updates, 0); // Neither SYN retry nor SYN data supplies fresh RTT.
+            assert_eq!(a.rtt.srtt(), None); // Neither SYN retry nor SYN data supplies fresh RTT.
         }
     }
 }

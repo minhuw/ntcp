@@ -82,7 +82,14 @@ fn packet_marks_are_per_flow_and_unmarked_packets_restore_zero() {
         assert_eq!(o.execute(id, Op::Connect("192.0.2.2:9000".parse().unwrap())).unwrap_err(), EINPROGRESS);
     }
     o.service_egress().unwrap();
-    let mut marks: Vec<_> = o.packets.as_mut().unwrap().output.drain(..).map(|r| r.packet_mark).collect();
+    let mut marks: Vec<_> = o
+        .packets
+        .as_mut()
+        .unwrap()
+        .output
+        .drain(..)
+        .map(|(_, mark)| mark)
+        .collect();
     marks.sort();
     assert_eq!(marks, [0, u32::MAX]);
     // Changing the option affects future submissions, not queued captures.
@@ -92,7 +99,7 @@ fn packet_marks_are_per_flow_and_unmarked_packets_restore_zero() {
     o.service_egress().unwrap();
     let captures = &o.packets.as_ref().unwrap().output;
     assert!(!captures.is_empty());
-    assert!(captures.iter().all(|r| r.packet_mark == 0));
+    assert!(captures.iter().all(|&(_, mark)| mark == 0));
 }
 
 #[test]

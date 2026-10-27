@@ -68,31 +68,9 @@ pub fn inject_segmented(bytes: Vec<u8>, segment_size: core::num::NonZeroU16) -> 
     Ok(())
 }
 
-// Capture host-local output policy metadata separately from on-wire bytes.
-pub fn try_capture_with_mark(capacity: usize) -> Result<(Vec<u8>, i64, u32)> {
-    let reply = runtime()?.call(0, Op::Capture(capacity))?;
-    Ok((reply.bytes, reply.stamp, reply.packet_mark))
-}
 pub fn try_capture(capacity: usize) -> Result<(Vec<u8>, i64)> {
     let reply = runtime()?.call(0, Op::Capture(capacity))?;
     Ok((reply.bytes, reply.stamp))
-}
-pub fn capture(capacity: usize) -> Result<(Vec<u8>, i64)> {
-    loop {
-        match try_capture(capacity) {
-            Ok(reply) => return Ok(reply),
-            Err(EAGAIN) => {
-                let mut p = pollfd {
-                    fd: runtime()?.wake,
-                    events: POLLIN,
-                    revents: 0,
-                };
-                raw(unsafe { syscall(SYS_poll, &mut p, 1, 1) })?;
-                drain_wake();
-            }
-            Err(e) => return Err(e),
-        }
-    }
 }
 
 // Changes future negotiation only; existing connection state and caches survive.

@@ -175,7 +175,7 @@ fn software_segments_match_scalar_and_share_a_bounded_service_turn() {
             .unwrap()
             .output
             .drain(..)
-            .map(|r| r.bytes)
+            .map(|(r, _)| r.bytes)
             .collect();
         assert_eq!(packets.len(), 6);
         assert!(packets.len() <= BUDGET);
@@ -192,13 +192,24 @@ fn software_segments_match_scalar_and_share_a_bounded_service_turn() {
             ports,
             [ports[0], ports[1], ports[0], ports[1], ports[0], ports[1]]
         );
+        // GSO selects each connection's 4380 bytes once, as one range of three
+        // software segments; scalar output selects every segment separately.
+        // A one-packet backend holds that range after its first segment.
+        let (mut held, _, held_clients, _) = pair(profile, 1);
+        held.execute(held_clients[0], Op::Write(vec![8; 4380]))
+            .unwrap();
+        held.service_egress().unwrap();
+        let attempt = held
+            .egress
+            .as_ref()
+            .unwrap()
+            .attempt(cid(&held, held_clients[0]));
+        assert_eq!(held.packets.as_ref().unwrap().output.len(), 1);
         assert_eq!(
-            a.egress.as_ref().unwrap().selected_ranges,
-            if profile == Profile::PipelineGso {
-                6
-            } else {
-                10
-            }
+            held.endpoint
+                .transmit_segmentation(attempt)
+                .map(|range| (range.payload_len, range.segment_payload_len)),
+            (profile == Profile::PipelineGso).then_some((4380, 1460))
         );
         runs.push(packets);
     }
@@ -271,6 +282,7 @@ fn full_deferred_commands_do_not_hide_capture_or_inject() {
                     .output
                     .front()
                     .unwrap()
+                    .0
                     .bytes
                     .clone();
                 let mut replies = Vec::new();

@@ -183,8 +183,8 @@ fn early_ack_handoff_syn_only_partial_full_and_sack_once() {
                             1 + u64::from(offset == 500)
                         }
                     );
-                    assert_eq!(a.rtt.updates, 1);
                     assert_eq!(a.rtt.srtt(), Some(ticks(&a, 180_000))); // SYN departure, not response.
+                    assert_eq!(a.rtt.variance(), ticks(&a, 90_000)); // RTTVAR = R/2: one sample.
                     if offset < 500 {
                         assert_eq!(
                             a.rack.head_transmission(a.snd_una),
@@ -206,7 +206,10 @@ fn early_ack_handoff_syn_only_partial_full_and_sack_once() {
                     ack(&mut a, 210_000, offset, &[(3000, 4000)]);
                     assert_eq!(a.acknowledged, u64::from(offset));
                     assert_eq!(a.rack.delivered_segments, delivered);
-                    assert_eq!(a.rtt.updates, 1);
+                    assert_eq!(
+                        (a.rtt.srtt(), a.rtt.variance()),
+                        (Some(ticks(&a, 180_000)), ticks(&a, 90_000))
+                    );
                     assert_eq!(a.rto_deadline, deadline);
                     assert_eq!(a.pmtud.as_ref().unwrap().info, path);
                     assert_eq!(a.take_events().acknowledged, None);
@@ -248,7 +251,7 @@ fn early_ack_handoff_rejects_full_ack_before_mutation_and_ignores_invalid_sack()
                 before
             );
             assert_eq!(a.acknowledged, 0);
-            assert_eq!(a.rtt.updates, 0);
+            assert_eq!(a.rtt.srtt(), None);
             assert_eq!(a.rack.delivered_segments, 0);
             assert!(a.scoreboard.ranges().is_empty());
             assert!(a.prr.is_none());
@@ -323,7 +326,7 @@ fn early_ack_handoff_synack_retry_preserves_karn_and_three_second_floor() {
                 assert!(a.syn_timed_out);
                 ack(&mut a, 1_200_000, offset, &[(3000, 4000)]);
                 assert!(a.syn_delivered && a.syn_timed_out);
-                assert_eq!(a.rtt.updates, 0);
+                assert_eq!(a.rtt.srtt(), None);
                 assert!(a.rto() >= ticks(&a, 3_000_000));
                 assert_eq!(a.rto_deadline, (offset < 4000).then(|| a.now + a.rto()));
                 assert_eq!(a.acknowledged, u64::from(offset));
@@ -352,7 +355,7 @@ fn early_ack_handoff_bare_syn_credit_and_non_sack_payload_growth() {
                         u64::from(offset == 500)
                     }
                 );
-                assert_eq!(a.rtt.updates, 1);
+                assert_eq!((a.rtt.srtt(), a.rtt.variance()), (Some(180_000), 90_000));
                 assert!(a.prr.is_none());
             }
         }
@@ -380,7 +383,14 @@ fn early_ack_handoff_ack_timestamp_reports_once_and_bad_echo_cannot_resample() {
                 );
             }
             ack(&mut a, 200_000, 500, &[(3000, 4000)]);
-            assert_eq!(a.rtt.updates, usize::from(!bad_echo));
+            assert_eq!(
+                (a.rtt.srtt(), a.rtt.variance()),
+                if bad_echo {
+                    (None, 0)
+                } else {
+                    (Some(ticks(&a, 180_000)), ticks(&a, 90_000))
+                }
+            );
             let event = a.tx_timestamps.next().unwrap();
             assert_eq!(
                 (event.cookie, event.target, event.stage),
@@ -415,7 +425,7 @@ fn early_ack_handoff_syn_only_sack_keeps_rejected_syn_echo_out_of_rto() {
         let mut a = response(cfg(units, true, true), u32::MAX - 1000, true, false);
         a.sample = Some((a.iss.wrapping_add(1), ticks(&a, 21_000)));
         ack(&mut a, 200_000, 0, &[(3000, 4000)]);
-        assert_eq!(a.rtt.updates, 0);
+        assert_eq!(a.rtt.srtt(), None);
         assert!(a.syn_delivered);
         assert_eq!(a.acknowledged, 0);
         assert_eq!(a.send.len(), 4000);

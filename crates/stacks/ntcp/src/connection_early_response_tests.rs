@@ -363,7 +363,7 @@ fn early_response_actual_syn_retry_anchor_and_ack_handoff() {
                     assert!(a.handshake_complete());
                     assert_eq!(a.acknowledged, u64::from(acked));
                     assert_eq!(a.send.len(), 4001 - acked as usize);
-                    assert_eq!(a.rtt.updates, 0);
+                    assert_eq!(a.rtt.srtt(), None);
                     assert!(a.rto() >= a.config.timebase.ticks_from_us(3_000_000));
                 }
             }

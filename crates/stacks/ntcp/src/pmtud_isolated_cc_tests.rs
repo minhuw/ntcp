@@ -131,6 +131,8 @@ fn isolated_probe_cc_real_receiver_recovery_matrix() {
                         let initial_prr = a.prr.map(|p| p.counters());
                         assert_eq!(initial_prr.is_some(), prr);
                         let mut sent = 0;
+                        // PRR counters immediately before the ACK that concludes the episode.
+                        let mut concluding = None;
                         for _ in 0..20 {
                             now += 1;
                             let bytes = paced_packet(&mut a, &mut now);
@@ -141,7 +143,11 @@ fn isolated_probe_cc_real_receiver_recovery_matrix() {
                                 assert_eq!(p.counters().2, sent);
                                 assert!(p.counters().1 <= u64::from(p.counters().0));
                             }
+                            let active = a.prr.map(|p| p.counters());
                             real_ack(&mut a, &mut b, &bytes, now, false);
+                            if active.is_some() && a.prr.is_none() {
+                                concluding = active;
+                            }
                             if a.pmtud.as_ref().unwrap().probe.is_none() {
                                 break;
                             }
@@ -163,7 +169,7 @@ fn isolated_probe_cc_real_receiver_recovery_matrix() {
                             assert_eq!(a.congestion.ssthresh(), threshold);
                             assert!(a.prr.is_none());
                             if prr {
-                                assert_eq!(a.prr_exit_trace.unwrap().counters().2, sent);
+                                assert_eq!(concluding.unwrap().2, sent);
                             }
                             let deadline = a.pmtud.as_ref().unwrap().deadline.unwrap();
                             let interval =

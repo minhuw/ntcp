@@ -33,8 +33,6 @@ pub(super) struct Egress {
     packet_capacity: usize,
     cursor: usize,
     shared_segments: usize,
-    #[cfg(test)]
-    pub(super) selected_ranges: usize,
 }
 fn buffer(size: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -91,8 +89,6 @@ impl Egress {
             packet_capacity,
             cursor: 0,
             shared_segments: 0,
-            #[cfg(test)]
-            selected_ranges: 0,
         })
     }
     #[cfg(test)]
@@ -398,10 +394,6 @@ impl Owner {
         let wire_bytes = (bytes.len() + shared_len).max(if ethernet { 60 } else { 0 });
         self.drain_timestamps(ClockPair::sample(self));
         if existing.is_none() {
-            #[cfg(test)]
-            {
-                egress.selected_ranges += 1;
-            }
             let flow = egress.scheduler.open_flow(index as u64).map_err(|_| EIO)?;
             egress.tx[index].entry = Some(Entry {
                 owner,
