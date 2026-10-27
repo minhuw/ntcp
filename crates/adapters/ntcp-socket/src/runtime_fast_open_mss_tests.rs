@@ -2,7 +2,10 @@
 use super::fast_open_tests::{
     tfo_capture, tfo_client_synack, tfo_deliver, tfo_no_output, tfo_send, tfo_setup,
 };
+use super::memory::tests::{cid, exchange, owner, segment};
+use super::tests::new;
 use super::*;
+use crate::packet_profile::Profile;
 
 #[test]
 fn fast_open_socket_mss_limits_initial_copy_in_explicit_and_deferred_opens() {

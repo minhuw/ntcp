@@ -1,5 +1,8 @@
 use super::fast_open_tests::tfo_setup;
+use super::memory::tests::{cid, exchange, owner, pair};
+use super::tests::new;
 use super::*;
+use crate::packet_profile::Profile;
 
 fn listen_at(owner: &mut Owner, port: u16) -> u64 {
     let fd = new(owner, SOCK_NONBLOCK);

@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
-// Child module of runtime_memory_tests: bounded PacketIo and production Egress only.
+// TCP Fast Open client and listener socket behavior over the bounded in-memory
+// PacketIo and production Egress. The tfo_* helpers are shared with the other
+// packet-test suites.
+use super::memory::tests::{cid, exchange, owner, receive, segment};
+use super::tests::new;
 use super::*;
+use crate::packet_profile::Profile;
 
 fn tfo_listener(b: &mut Owner) -> u64 {
     let listener = new(b, SOCK_NONBLOCK);

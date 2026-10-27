@@ -4,7 +4,7 @@ use super::*;
 
 pub(super) struct PacketBackend {
     pub(super) profile: crate::packet_profile::Profile,
-    input: VecDeque<(Vec<u8>, Option<core::num::NonZeroU16>)>,
+    pub(super) input: VecDeque<(Vec<u8>, Option<core::num::NonZeroU16>)>,
     // Accepted output, each with the packet mark it was submitted under.
     pub(super) output: VecDeque<(Reply, u32)>,
     capacity: usize,
@@ -127,4 +127,4 @@ impl Owner {
 
 #[cfg(test)]
 #[path = "runtime_memory_tests.rs"]
-mod tests;
+pub(super) mod tests;

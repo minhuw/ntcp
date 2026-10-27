@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
-// Child module of runtime_memory_tests: actual packet admission and shared egress.
+// ICMP error reports at the socket layer (SO_ERROR, Source Quench, reserved
+// owners, listeners and reused tuples), over actual packet admission and shared
+// egress.
 use super::fast_open_tests::{tfo_capture, tfo_deliver};
+use super::memory::tests::{
+    cid, owner, path_mtu, ptb_checksums, ptb_frame, ptb_pair, receive, segment,
+};
+use super::tests::new;
 use super::*;
+use crate::packet_profile::Profile;
 
 fn icmp_error_frame(packet: &[u8], kind: u8, code: u8) -> Vec<u8> {
     let mut bytes = ptb_frame(packet);

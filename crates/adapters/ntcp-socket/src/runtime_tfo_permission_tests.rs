@@ -1,4 +1,6 @@
 use super::fast_open_tests::{tfo_capture, tfo_deliver, tfo_no_output, tfo_send, tfo_setup};
+use super::memory::tests::{exchange, segment};
+use super::tests::new;
 use super::*;
 
 #[test]

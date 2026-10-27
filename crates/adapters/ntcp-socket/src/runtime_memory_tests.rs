@@ -2,11 +2,11 @@
 use super::*;
 use crate::packet_profile::Profile;
 use crate::packet_test::Options;
+use crate::runtime::fast_open_tests::{tfo_capture, tfo_deliver, tfo_no_output};
+use crate::runtime::pmtud_profile_tests::upstream_runtime_pmtud_profile_tests;
 use crate::runtime::tests::{ip_packet, new};
-use fast_open_tests::{tfo_capture, tfo_deliver, tfo_no_output};
-use pmtud_profile_tests::upstream_runtime_pmtud_profile_tests;
 
-fn owner(last: u8, profile: Profile, capacity: usize) -> Owner {
+pub(crate) fn owner(last: u8, profile: Profile, capacity: usize) -> Owner {
     let mut owner = Owner::packet_with_options(
         (Ipv4Addr::new(192, 0, 2, last), profile),
         Options {
@@ -32,11 +32,11 @@ fn owner(last: u8, profile: Profile, capacity: usize) -> Owner {
     );
     owner
 }
-fn receive(owner: &mut Owner) {
+pub(crate) fn receive(owner: &mut Owner) {
     owner.receive_batch(&mut vec![0; 65535]).unwrap();
     owner.events();
 }
-fn exchange(a: &mut Owner, b: &mut Owner) {
+pub(crate) fn exchange(a: &mut Owner, b: &mut Owner) {
     for _ in 0..16 {
         for reverse in [false, true] {
             let (from, to) = if reverse {
@@ -53,7 +53,7 @@ fn exchange(a: &mut Owner, b: &mut Owner) {
         }
     }
 }
-fn pair(profile: Profile, capacity: usize) -> (Owner, Owner, [u64; 2], [u64; 2]) {
+pub(crate) fn pair(profile: Profile, capacity: usize) -> (Owner, Owner, [u64; 2], [u64; 2]) {
     pair_with_owner(owner(1, profile, capacity))
 }
 fn pair_with_owner(mut a: Owner) -> (Owner, Owner, [u64; 2], [u64; 2]) {
@@ -79,13 +79,13 @@ fn pair_with_owner(mut a: Owner) -> (Owner, Owner, [u64; 2], [u64; 2]) {
     }
     (a, b, clients, servers)
 }
-fn cid(owner: &Owner, fd: u64) -> ConnectionId {
+pub(crate) fn cid(owner: &Owner, fd: u64) -> ConnectionId {
     let Handle::Connection(id) = owner.sockets[&fd].handle else {
         panic!()
     };
     id
 }
-fn segment(bytes: &[u8]) -> ntcp::wire::Segment<'_> {
+pub(crate) fn segment(bytes: &[u8]) -> ntcp::wire::Segment<'_> {
     let p = ntcp_ip::parse(bytes, false).unwrap();
     ntcp::wire::parse(p.ip, p.payload).unwrap()
 }
@@ -347,11 +347,8 @@ fn last_close_retries_full_admission_instead_of_leaking_removed_fd() {
     worker.join().unwrap();
 }
 
-#[path = "runtime_fast_open_tests.rs"]
-mod fast_open_tests;
-
 // PMTUD is opt-in independently of packet admission; keep profile defaults intact.
-fn ptb_pair(capacity: usize) -> (Owner, Owner, [u64; 2], [u64; 2]) {
+pub(crate) fn ptb_pair(capacity: usize) -> (Owner, Owner, [u64; 2], [u64; 2]) {
     let mut a = owner(1, Profile::PipelineGso, capacity);
     let mut config = crate::packet_profile::config(Profile::PipelineGso);
     config.connection.pmtud = Some(ntcp::PmtudConfig::new(1500));
@@ -360,7 +357,7 @@ fn ptb_pair(capacity: usize) -> (Owner, Owner, [u64; 2], [u64; 2]) {
         .unwrap();
     pair_with_owner(a)
 }
-fn ptb_checksums(bytes: &mut [u8]) {
+pub(crate) fn ptb_checksums(bytes: &mut [u8]) {
     bytes[10..12].fill(0);
     let sum = ntcp_ip::checksum(&bytes[..20]);
     bytes[10..12].copy_from_slice(&sum.to_be_bytes());
@@ -368,7 +365,7 @@ fn ptb_checksums(bytes: &mut [u8]) {
     let sum = ntcp_icmp::checksum(&bytes[20..]);
     bytes[22..24].copy_from_slice(&sum.to_be_bytes());
 }
-fn ptb_frame(packet: &[u8]) -> Vec<u8> {
+pub(crate) fn ptb_frame(packet: &[u8]) -> Vec<u8> {
     let mut bytes = vec![0; 56];
     bytes[0] = 0x45;
     bytes[2..4].copy_from_slice(&56u16.to_be_bytes());
@@ -383,7 +380,7 @@ fn ptb_frame(packet: &[u8]) -> Vec<u8> {
     ptb_checksums(&mut bytes);
     bytes
 }
-fn path_mtu(a: &Owner, fd: u64) -> u32 {
+pub(crate) fn path_mtu(a: &Owner, fd: u64) -> u32 {
     a.endpoint
         .path_mtu_info(cid(a, fd))
         .unwrap()
@@ -522,11 +519,6 @@ fn packet_ptb_queued_feedback_still_checks_target_tuple_and_sequence() {
     assert_eq!(path_mtu(&a, clients[0]), 1200);
     assert_eq!(path_mtu(&a, clients[1]), 1500);
 }
-
-#[path = "runtime_adaptive_ack_profile_tests.rs"]
-mod adaptive_ack_profile_tests;
-#[path = "runtime_pmtud_profile_tests.rs"]
-mod pmtud_profile_tests;
 
 #[test]
 fn icmp_synrecv_baseline_soft_errors_preserve_handshake() {
@@ -740,21 +732,3 @@ fn icmp_synrecv_baseline_soft_errors_preserve_handshake() {
         );
     }
 }
-
-#[path = "runtime_icmp_tests.rs"]
-mod icmp_tests;
-
-#[path = "runtime_fast_open_mss_tests.rs"]
-mod fast_open_mss;
-
-#[path = "runtime_accept_reset_tests.rs"]
-mod accept_reset;
-
-#[path = "runtime_tfo_copied_completion_tests.rs"]
-mod tfo_copied_completion;
-
-#[path = "runtime_tfo_permission_tests.rs"]
-mod client_tfo_permission;
-
-#[path = "runtime_listener_query_tests.rs"]
-mod listener_query;

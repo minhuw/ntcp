@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
+use super::memory::tests::{cid, exchange, owner};
+use super::tests::new;
 use super::*;
+use crate::packet_profile::Profile;
 
 #[test]
 fn established_reset_before_accept_preserves_socket_error_data_and_readiness() {

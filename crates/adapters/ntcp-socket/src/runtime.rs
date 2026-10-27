@@ -2838,6 +2838,42 @@ mod early_data_policy_tests;
 #[path = "runtime_ipv6_tests.rs"]
 mod ipv6_tests;
 
+#[cfg(all(test, feature = "packet-test"))]
+#[path = "runtime_fast_open_tests.rs"]
+mod fast_open_tests;
+
+#[cfg(all(test, feature = "packet-test"))]
+#[path = "runtime_adaptive_ack_profile_tests.rs"]
+mod adaptive_ack_profile_tests;
+
+#[cfg(all(test, feature = "packet-test"))]
+#[path = "runtime_pmtud_profile_tests.rs"]
+mod pmtud_profile_tests;
+
+#[cfg(all(test, feature = "packet-test"))]
+#[path = "runtime_icmp_tests.rs"]
+mod icmp_tests;
+
+#[cfg(all(test, feature = "packet-test"))]
+#[path = "runtime_fast_open_mss_tests.rs"]
+mod fast_open_mss;
+
+#[cfg(all(test, feature = "packet-test"))]
+#[path = "runtime_accept_reset_tests.rs"]
+mod accept_reset;
+
+#[cfg(all(test, feature = "packet-test"))]
+#[path = "runtime_tfo_copied_completion_tests.rs"]
+mod tfo_copied_completion;
+
+#[cfg(all(test, feature = "packet-test"))]
+#[path = "runtime_tfo_permission_tests.rs"]
+mod client_tfo_permission;
+
+#[cfg(all(test, feature = "packet-test"))]
+#[path = "runtime_listener_query_tests.rs"]
+mod listener_query;
+
 #[path = "runtime_address.rs"]
 mod address_policy;
 use address_policy::binding_overlap;

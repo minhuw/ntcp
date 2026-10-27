@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
-// Child module of runtime_memory_tests: configured production PacketIo and reservations.
+// Adaptive delayed-ACK profile behavior for handshakes, Fast Open writers and
+// inq server reads, over configured production PacketIo and reservations.
 use super::fast_open_tests::{tfo_capture, tfo_deliver, tfo_no_output, tfo_send};
+use super::memory::tests::{cid, owner, receive, segment};
+use super::tests::{ip_packet, new};
 use super::*;
 
 fn adaptive_peer(a: &mut Owner, packet: &[u8], syn: bool, mss: u16, payload: &[u8]) {

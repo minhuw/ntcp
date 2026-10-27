@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
 use super::fast_open_tests::{tfo_capture, tfo_deliver, tfo_no_output, tfo_send, tfo_setup};
+use super::memory::tests::{cid, exchange, segment};
+use super::tests::new;
 use super::*;
 
 struct Flight {

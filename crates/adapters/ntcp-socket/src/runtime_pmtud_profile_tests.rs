@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT AND GPL-2.0-or-later
-// Child module of runtime_memory_tests: actual profile, IP admission and production egress.
+// Fast Open path MTU discovery under the PMTUD packet profile, over the actual
+// profile, IP admission and production egress.
 use super::fast_open_tests::{tfo_capture, tfo_deliver, tfo_no_output, tfo_send};
+use super::memory::tests::{cid, owner, path_mtu, ptb_checksums, ptb_frame, segment};
+use super::tests::{ip_packet, new};
 use super::*;
 
 fn pmtud_peer_reply(a: &mut Owner, packet: &[u8], syn: bool) {
