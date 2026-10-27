@@ -197,7 +197,6 @@ name = "ntcp-ip6"
 version = "0.0.1"
 dependencies = [
  "ntcp",
- "ntcp-ip",
  "ntcp-ip-common",
 ]
 

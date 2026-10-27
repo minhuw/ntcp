@@ -8,6 +8,3 @@ repository = "https://github.com/minhuw/ntcp"
 [dependencies]
 ntcp-ip-common = { version = "0.0.1", path = "../ntcp-ip-common" }
 ntcp = { version = "0.0.1", path = "../ntcp" }
-
-[dev-dependencies]
-ntcp-ip = { version = "0.0.1", path = "../ntcp-ip" }

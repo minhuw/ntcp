@@ -1,38 +1,57 @@
+use ntcp::{IpMetadata, OutgoingIpv4Options, Transmit};
 use ntcp_ip::{encode, parse};
-use ntcp_ip_common::Error;
-#[path = "../../ntcp-ip/tests/support/mod.rs"]
-mod support;
-use support::seal;
-use support::tx;
+use ntcp_ip_common::{Error, checksum};
+fn tx(v6: bool, len: usize) -> Transmit {
+    Transmit {
+        connection: None,
+        tx_timestamp: None,
+        ip: IpMetadata {
+            source: if v6 { "2001:db8::1" } else { "192.0.2.1" }
+                .parse()
+                .unwrap(),
+            destination: if v6 { "2001:db8::2" } else { "192.0.2.2" }
+                .parse()
+                .unwrap(),
+        },
+        len,
+        hop_limit: 64,
+        dscp: 37,
+        ecn: 3,
+        ipv4_options: OutgoingIpv4Options::default(),
+    }
+}
+fn seal(b: &mut [u8]) {
+    b[10..12].fill(0);
+    let sum = checksum(&b[..usize::from(b[0] & 15) * 4]);
+    b[10..12].copy_from_slice(&sum.to_be_bytes());
+}
 #[test]
 fn fullwidth_and_malformed_frames() {
-    for v6 in [false] {
-        let header = if v6 { 40 } else { 20 };
-        let max_payload = if v6 { 65535 } else { 65535 - 20 };
-        let mut b = vec![0xa5; header + max_payload + 1];
-        let len = encode(&mut b, tx(v6, max_payload), 0).unwrap();
-        let p = parse(&b[..len], false).unwrap();
-        assert_eq!(p.payload.len(), max_payload);
-        assert_eq!(p.ip, tx(v6, 0).ip);
-        assert_eq!(p.traffic_class, (37 << 2) | 3);
-        assert_eq!(p.hop_limit, 64);
-        assert_eq!(parse(&b[..len + 1], false).unwrap_err(), Error::Length);
-        for cut in [0, 1, header - 1, header, len - 1] {
-            assert!(parse(&b[..cut], false).is_err());
-        }
-        let before = b.clone();
-        for size in [max_payload + 1, usize::MAX] {
-            assert!(encode(&mut b, tx(v6, size), 0).is_err());
-            assert_eq!(b, before);
-        }
-        for (dscp, ecn, hop) in [(64, 0, 1), (0, 4, 1), (0, 0, 0)] {
-            let mut t = tx(v6, 20);
-            t.dscp = dscp;
-            t.ecn = ecn;
-            t.hop_limit = hop;
-            assert!(encode(&mut b, t, 0).is_err());
-            assert_eq!(b, before);
-        }
+    let header = 20;
+    let max_payload = 65535 - 20;
+    let mut b = vec![0xa5; header + max_payload + 1];
+    let len = encode(&mut b, tx(false, max_payload), 0).unwrap();
+    let p = parse(&b[..len], false).unwrap();
+    assert_eq!(p.payload.len(), max_payload);
+    assert_eq!(p.ip, tx(false, 0).ip);
+    assert_eq!(p.traffic_class, (37 << 2) | 3);
+    assert_eq!(p.hop_limit, 64);
+    assert_eq!(parse(&b[..len + 1], false).unwrap_err(), Error::Length);
+    for cut in [0, 1, header - 1, header, len - 1] {
+        assert!(parse(&b[..cut], false).is_err());
+    }
+    let before = b.clone();
+    for size in [max_payload + 1, usize::MAX] {
+        assert!(encode(&mut b, tx(false, size), 0).is_err());
+        assert_eq!(b, before);
+    }
+    for (dscp, ecn, hop) in [(64, 0, 1), (0, 4, 1), (0, 0, 0)] {
+        let mut t = tx(false, 20);
+        t.dscp = dscp;
+        t.ecn = ecn;
+        t.hop_limit = hop;
+        assert!(encode(&mut b, t, 0).is_err());
+        assert_eq!(b, before);
     }
     let mut b = [0; 60];
     let len = encode(&mut b, tx(false, 20), 0).unwrap();
