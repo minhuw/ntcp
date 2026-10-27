@@ -280,21 +280,8 @@ fn endpoint_route_update_rejects_held_gso_and_preserves_descriptor() {
     .unwrap();
     a.write(id, &[7; 5000]).unwrap();
     let (_, token) = a.poll_reserved_transmit_for(2, id, &mut bytes, 64).unwrap();
-    let group = a
-        .prepare_transmit_group(
-            token.unwrap(),
-            crate::TransmitGroupLimits {
-                max_bytes: usize::MAX,
-                max_segments: usize::MAX,
-                allow_psh: true,
-                allow_cwr: true,
-            },
-        )
-        .unwrap()
-        .unwrap();
-    let payload = a.transmit_group(group).unwrap().payload.to_vec();
-    let view = a.transmit_group(group).unwrap();
-    let segmentation = (view.segment_payload_len, view.segment_count);
+    let token = token.unwrap();
+    let segmentation = a.transmit_segmentation(token).unwrap();
     let before = (
         a.path_mtu_info(id).unwrap(),
         a.send_progress(id).unwrap(),
@@ -304,9 +291,7 @@ fn endpoint_route_update_rejects_held_gso_and_preserves_descriptor() {
         a.set_route_mtu(1000, id, Some(640)),
         Err(EndpointError::OutputReserved)
     );
-    assert_eq!(a.transmit_group(group).unwrap().payload, payload);
-    let view = a.transmit_group(group).unwrap();
-    assert_eq!((view.segment_payload_len, view.segment_count), segmentation);
+    assert_eq!(a.transmit_segmentation(token), Some(segmentation));
     assert_eq!(
         (
             a.path_mtu_info(id).unwrap(),
@@ -315,8 +300,11 @@ fn endpoint_route_update_rejects_held_gso_and_preserves_descriptor() {
         ),
         before
     );
-    assert!(a.validate_transmit_group(3, group).unwrap());
-    assert!(a.accept_transmit_group(3, group).unwrap());
+    assert!(a.accept_transmit(3, token).unwrap());
+    while a.is_output_reserved(id) {
+        let (_, token) = a.poll_reserved_transmit_for(3, id, &mut bytes, 64).unwrap();
+        assert!(a.accept_transmit(3, token.unwrap()).unwrap());
+    }
     a.set_route_mtu(4, id, Some(640)).unwrap();
     assert_eq!(a.path_mtu_info(id).unwrap().unwrap().current_mtu, 640);
 }

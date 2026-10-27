@@ -28,7 +28,7 @@ fn reserved_nonhead_sack_retry_keeps_exhausted_prr_credit_and_recovery_state() {
         assert!(!payload.is_empty());
         let mut reservation = OutputReservation::new();
         reservation.bytes.resize(2048, 0);
-        let token = reservation.token(None).unwrap();
+        let token = reservation.token().unwrap();
         reservation.capture(
             crate::Transmit {
                 connection: None,
@@ -525,7 +525,7 @@ fn gso_wrap_eor_cwr_rack_physical_segments_and_no_hotpath_allocation() {
         assert_eq!(s.segment_payload_len, 100);
         let start = Seq(departure.start);
         assert_eq!(a.snd_nxt, start.wrapping_add(300));
-        let token = reservation.token(None).unwrap();
+        let token = reservation.token().unwrap();
         reservation.capture(
             crate::Transmit {
                 connection: None,
@@ -793,18 +793,7 @@ fn group_preflight_and_same_submit_time_keep_rack_spans_and_first_timer_across_w
         let mut departure = a.last_departure.unwrap();
         let start = Seq(departure.start);
         let nxt = a.snd_nxt;
-        let snapshot = alloc::format!("{:?}", a.rack);
-        assert_eq!(
-            a.validate_reserved_group(39, &departure, 0, 3),
-            Err(Error::TimeWentBackwards)
-        );
-        assert_eq!(
-            a.validate_reserved_group(50, &departure, 0, usize::MAX),
-            Err(Error::InvalidArgument)
-        );
-        assert_eq!(alloc::format!("{:?}", a.rack), snapshot);
         crate::allocation_tests::fail_after(0, || {
-            a.validate_reserved_group(50, &departure, 0, 3).unwrap();
             for n in 0..3 {
                 a.accept_reserved_output(50, &mut departure, n * 100, 100, false)
                     .unwrap();
@@ -954,7 +943,7 @@ fn actual_group_flush_tracks_final_accepted_fragment_through_mtu_shrink() {
     let mut departure = a.last_departure.unwrap();
     let total = departure.segmentation.unwrap().payload_len;
     assert_eq!(total, 4000);
-    let token = reservation.token(None).unwrap();
+    let token = reservation.token().unwrap();
     reservation.capture(
         crate::Transmit {
             connection: None,

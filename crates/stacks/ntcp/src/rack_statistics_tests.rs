@@ -185,9 +185,6 @@ fn statistics_mixed_credit_is_checked_per_accepted_packet_not_reservation() {
         assert!(rack.delivered_segments_valid); // Selection alone is not evidence.
         assert!(!rack.commit_departure(token, Seq(0), Seq(21), 1200));
         assert!(rack.delivered_segments_valid);
-        if ends == [10, 20] {
-            assert!(rack.validate_departure_group(token, Seq(0), 10, 2, 1200));
-        }
         let mut start = Seq(0);
         for &end in ends {
             assert!(rack.commit_departure(token, start, Seq(end), 1200));

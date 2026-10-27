@@ -26,10 +26,7 @@ mod fast_open_policy_tests;
 #[cfg(test)]
 mod fast_open_tests;
 mod output_reservation;
-pub use output_reservation::{
-    GsoLimits, TransmitAttempt, TransmitGroup, TransmitGroupLimits, TransmitGroupView,
-    TransmitSegmentation,
-};
+pub use output_reservation::{GsoLimits, TransmitAttempt, TransmitSegmentation};
 #[cfg(test)]
 mod endpoint_tests;
 mod hystart;

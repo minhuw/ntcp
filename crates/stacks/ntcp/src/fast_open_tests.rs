@@ -453,8 +453,7 @@ fn fast_open_service_does_not_enable_ordinary_connect_or_listener() {
 fn fast_open_reserved_syn_is_indivisible_after_path_shrink() {
     let (mut a, _, _) = warm(false);
     let (local, remote) = addresses(false, 40001);
-    let (id, _) = a
-        .connect_fast_open(100, local, remote, b"one handshake")
+    a.connect_fast_open(100, local, remote, b"one handshake")
         .unwrap();
     let mut bytes = [0; 2048];
     let tx = a
@@ -464,7 +463,7 @@ fn fast_open_reserved_syn_is_indivisible_after_path_shrink() {
         .unwrap();
     let mut reservation = crate::output_reservation::OutputReservation::new();
     reservation.bytes = vec![0; 2048];
-    let attempt = reservation.token(Some(id)).unwrap();
+    let attempt = reservation.token().unwrap();
     reservation.capture(tx, &bytes, attempt);
     assert_eq!(
         reservation.fragment(tx.len - 1, &mut bytes),

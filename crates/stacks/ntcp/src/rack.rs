@@ -547,36 +547,6 @@ impl Rack {
         true
     }
 
-    // Count all distinct splits before submitting an indivisible hardware group.
-    pub(crate) fn validate_departure_group(
-        &self,
-        selection: DepartureSelection,
-        start: Seq,
-        size: u32,
-        segments: usize,
-        now: u64,
-    ) -> bool {
-        let Some(bytes) = (size as usize).checked_mul(segments) else {
-            return false;
-        };
-        if size == 0 || segments < 2 || bytes >= 1 << 31 {
-            return false;
-        }
-        let end = start.wrapping_add(bytes as u32);
-        if !self.validate_departure(selection, start, end, now) {
-            return false;
-        }
-        let splits = (0..=segments)
-            .filter(|&i| {
-                let edge = start.wrapping_add((i * size as usize) as u32);
-                self.intervals
-                    .iter()
-                    .any(|r| edge.after(r.start) && r.end.after(edge))
-            })
-            .count();
-        splits <= self.capacity.saturating_sub(self.intervals.len())
-    }
-
     pub(crate) fn commit_departure(
         &mut self,
         selection: DepartureSelection,
