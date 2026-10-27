@@ -2476,24 +2476,32 @@ fn software_gso_cpu_sample() {
         time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
     }
     for gso in [None, Some(SOFTWARE_GSO)] {
+        // Untimed probe: a blocked backend holds the first selection, whose
+        // core segment group shows how many physical segments one selection
+        // covers. Scalar output selects one segment at a time.
+        let (mut a, _, clients, _, state) = scheduled_pair_gso(1, gso);
+        a.execute(clients[0], Op::Write(vec![7; 26000])).unwrap();
+        state.lock().unwrap().block = true;
+        a.service_egress().unwrap();
+        let per_selection = held_segmentation(&a, connection(&a, clients[0])).map_or(1, |group| {
+            group.payload_len.div_ceil(group.segment_payload_len)
+        });
         let mut ns = 0;
-        let mut segments = 0;
         let mut submissions = 0;
         // Setup/handshake/allocation excluded; fixed seed, clock and two full
-        // physical segments per sample. Counts are captured wire segments and
-        // backend calls, not an assertion about core instruction counts.
+        // physical segments per sample. Counts are backend calls, not an
+        // assertion about core instruction counts.
         for _ in 0..100 {
             let (mut a, _, clients, _, state) = scheduled_pair_gso(1, gso);
             a.execute(clients[0], Op::Write(vec![7; 26000])).unwrap();
             let start = cpu_ns();
             a.service_egress().unwrap();
             ns += cpu_ns() - start;
-            segments += state.lock().unwrap().sent.len();
             submissions += state.lock().unwrap().output_calls;
             assert_eq!(state.lock().unwrap().sent.len(), 2);
         }
         eprintln!(
-            "gso={} samples=100 service_cpu_ns={ns} wire_segments={segments} backend_calls={submissions}",
+            "gso={} samples=100 service_cpu_ns={ns} segments_per_selection={per_selection} backend_calls={submissions}",
             gso.is_some()
         );
     }

@@ -27200,10 +27200,12 @@ mod tests {
                                     // One update per window-sized causal round, even though
                                     // flight never drains and delayed ACKs cover multiple sends:
                                     // 1 + group * batch / width updates so far, eight in all.
-                                    // The round's first ACK takes one sample: a valid RTTM echo
-                                    // times the round's first original, otherwise the local
-                                    // ledger times the latest one. RTTVAR stays positive, so a
-                                    // missing or extra update changes the estimator.
+                                    // The round's first ACK takes one sample. Without timestamps
+                                    // the ordinary timed segment times the round's first
+                                    // original; with timestamps a valid RTTM echo times that
+                                    // same original, otherwise the local ledger times the
+                                    // latest one. RTTVAR stays positive, so a missing or extra
+                                    // update changes the estimator.
                                     if group * batch % width == 0 {
                                         let (_, first_sent, first_echo) = delivered[0];
                                         let rttm =
