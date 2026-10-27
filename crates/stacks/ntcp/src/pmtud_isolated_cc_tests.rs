@@ -109,7 +109,7 @@ fn isolated_probe_cc_real_receiver_recovery_matrix() {
                             trailing.push(paced_packet(&mut a, &mut now));
                         }
                         let trailing_end = a.snd_nxt;
-                        assert!(after(trailing_end, probe.trailing_end));
+                        assert!(trailing_end.after(probe.trailing_end));
                         now += 100;
                         for (n, bytes) in trailing.iter().enumerate() {
                             if second_hole && n == 5 {
@@ -631,7 +631,7 @@ fn isolated_probe_cc_replenishment_does_not_extend_recovery_proof() {
                     (a.congestion.cwnd(), a.congestion.ssthresh(), a.mss);
                 let trailing: Vec<_> = (0..8).map(|_| packet(&mut a, 41)).collect();
                 let proof_end = a.snd_nxt;
-                assert!(after(proof_end, probe.trailing_end));
+                assert!(proof_end.after(probe.trailing_end));
                 let mut now = 140;
                 for bytes in &trailing {
                     real_ack(&mut a, &mut b, bytes, now, false);
@@ -651,7 +651,7 @@ fn isolated_probe_cc_replenishment_does_not_extend_recovery_proof() {
                     if end == probe.end {
                         break bytes;
                     }
-                    assert!(after(probe.end, end));
+                    assert!(probe.end.after(end));
                     real_ack(&mut a, &mut b, &bytes, now, false);
                 };
                 assert!(a.congestion.in_recovery());

@@ -7,7 +7,6 @@ use crate::{
 };
 #[cfg(test)]
 use alloc::vec::Vec;
-use core::cmp::Ordering;
 
 #[cfg(test)]
 const CAPACITY: usize = 256;
@@ -146,11 +145,8 @@ pub(crate) struct Rack {
     pub(crate) delivered_segments_valid: bool,
 }
 
-fn after(a: Seq, b: Seq) -> bool {
-    a.serial_cmp(b) == Some(Ordering::Greater)
-}
 fn sent_after(a: (u64, Seq), b: (u64, Seq)) -> bool {
-    a.0 > b.0 || a.0 == b.0 && after(a.1, b.1)
+    a.0 > b.0 || a.0 == b.0 && a.1.after(b.1)
 }
 
 mod storage {
@@ -245,13 +241,13 @@ impl Rack {
         seq: Seq,
         proposed_end: Seq,
     ) -> Option<OriginalRetrySpan> {
-        if !self.valid() || !after(proposed_end, seq) {
+        if !self.valid() || !proposed_end.after(seq) {
             return None;
         }
         let index = self
             .intervals
             .iter()
-            .position(|r| !after(r.start, seq) && after(r.end, seq))?;
+            .position(|r| !r.start.after(seq) && r.end.after(seq))?;
         let head = self.intervals[index];
         let end = self
             .intervals
@@ -268,7 +264,7 @@ impl Rack {
             original_end: head.original_end,
             originally_in_window: head.originally_in_window,
             successful_retries: head.successful_retries,
-            retry_end: if after(end, proposed_end) {
+            retry_end: if end.after(proposed_end) {
                 proposed_end
             } else {
                 end
@@ -287,7 +283,7 @@ impl Rack {
     }
 
     pub(crate) fn commit_retry_span(&mut self, start: Seq, end: Seq) {
-        if !after(end, start) || !self.valid() {
+        if !end.after(start) || !self.valid() {
             return;
         }
         if !self.split(start) || !self.split(end) {
@@ -296,7 +292,7 @@ impl Rack {
             return;
         }
         for r in &mut self.intervals {
-            if !after(start, r.start) && !after(r.end, end) {
+            if !start.after(r.start) && !r.end.after(end) {
                 r.successful_retries = r.successful_retries.saturating_add(1);
             }
         }
@@ -307,7 +303,7 @@ impl Rack {
         let first = self
             .intervals
             .iter()
-            .position(|r| !after(r.start, start) && after(r.end, start))?;
+            .position(|r| !r.start.after(start) && r.end.after(start))?;
         let head = self.intervals[first];
         let end = self
             .intervals
@@ -372,7 +368,7 @@ impl Rack {
     pub(crate) fn trim_cumulative(&mut self, ack: Seq) {
         self.acknowledge_packets(ack, None);
         self.intervals.retain_mut(|r| {
-            if !after(r.end, ack) {
+            if !r.end.after(ack) {
                 if !r.stats_flag(PACKET_DELIVERED)
                     && r.end == r.transmission_end
                     && !r.stats_flag(SYN_PAYLOAD)
@@ -381,12 +377,12 @@ impl Rack {
                 }
                 return false;
             }
-            if after(ack, r.start) {
+            if ack.after(r.start) {
                 r.start = ack;
             }
             true
         });
-        if self.fallback.is_some_and(|boundary| !after(boundary, ack)) {
+        if self.fallback.is_some_and(|boundary| !boundary.after(ack)) {
             self.fallback = None;
             self.fack = Some(ack);
         }
@@ -405,7 +401,7 @@ impl Rack {
         let Some(i) = self
             .intervals
             .iter()
-            .position(|r| after(edge, r.start) && after(r.end, edge))
+            .position(|r| edge.after(r.start) && r.end.after(edge))
         else {
             return true;
         };
@@ -421,7 +417,7 @@ impl Rack {
     }
 
     pub(crate) fn retry_undo(&self, start: Seq, end: Seq) -> Option<RetryUndo> {
-        if !self.valid() || !after(end, start) {
+        if !self.valid() || !end.after(start) {
             return None;
         }
         let prior = *self.intervals.iter().find(|r| r.start == start)?;
@@ -432,7 +428,7 @@ impl Rack {
         for r in self
             .intervals
             .iter()
-            .filter(|r| after(end, r.start) && after(r.end, start))
+            .filter(|r| end.after(r.start) && r.end.after(start))
         {
             if r.start != covered
                 || r.original_wire_start != prior.original_wire_start
@@ -452,7 +448,7 @@ impl Rack {
             {
                 return None;
             }
-            covered = if after(r.end, end) { end } else { r.end };
+            covered = if r.end.after(end) { end } else { r.end };
         }
         (covered == end).then_some(RetryUndo { start, end, prior })
     }
@@ -464,7 +460,7 @@ impl Rack {
             || selection.start != undo.start
             || selection.end != undo.end
             || self.intervals.iter().any(|r| {
-                after(undo.end, r.start) && after(r.end, undo.start) && r.departure_committed
+                undo.end.after(r.start) && r.end.after(undo.start) && r.departure_committed
             })
         {
             return false;
@@ -475,7 +471,7 @@ impl Rack {
             {
                 r.original_retransmitted = undo.prior.original_retransmitted;
             }
-            if !after(undo.start, r.start) && !after(r.end, undo.end) {
+            if !undo.start.after(r.start) && !r.end.after(undo.end) {
                 r.transmission_start = undo.prior.transmission_start;
                 r.transmission_end = undo.prior.transmission_end;
                 r.sent = undo.prior.sent;
@@ -511,7 +507,7 @@ impl Rack {
     ) -> bool {
         if !self.valid()
             || self.departure_selection != Some(selection)
-            || !after(end, start)
+            || !end.after(start)
             || start.distance_from(selection.start) >= selection.end.distance_from(selection.start)
             || end.distance_from(selection.start) > selection.end.distance_from(selection.start)
             || now < selection.selected
@@ -522,9 +518,9 @@ impl Rack {
         for r in self
             .intervals
             .iter()
-            .filter(|r| after(end, r.start) && after(r.end, start))
+            .filter(|r| end.after(r.start) && r.end.after(start))
         {
-            if after(r.start, covered)
+            if r.start.after(covered)
                 || r.departure_committed
                 || r.sent != selection.selected
                 || r.transmission_start != selection.start
@@ -533,7 +529,7 @@ impl Rack {
             {
                 return false;
             }
-            covered = if after(r.end, end) { end } else { r.end };
+            covered = if r.end.after(end) { end } else { r.end };
         }
         if covered != end {
             return false;
@@ -543,7 +539,7 @@ impl Rack {
             .filter(|&&edge| {
                 self.intervals
                     .iter()
-                    .any(|r| after(edge, r.start) && after(r.end, edge))
+                    .any(|r| edge.after(r.start) && r.end.after(edge))
             })
             .count();
         if splits > self.capacity.saturating_sub(self.intervals.len()) {
@@ -576,7 +572,7 @@ impl Rack {
                 let edge = start.wrapping_add((i * size as usize) as u32);
                 self.intervals
                     .iter()
-                    .any(|r| after(edge, r.start) && after(r.end, edge))
+                    .any(|r| edge.after(r.start) && r.end.after(edge))
             })
             .count();
         splits <= self.capacity.saturating_sub(self.intervals.len())
@@ -603,7 +599,7 @@ impl Rack {
             previous.set_stats_flag(DELIVERY_END, true);
         }
         for r in &mut self.intervals {
-            if !after(start, r.start) && !after(r.end, end) {
+            if !start.after(r.start) && !r.end.after(end) {
                 r.set_stats_flag(DELIVERY_END, r.end == end);
                 if selection.retransmit {
                     r.set_stats_flag(SYN_PAYLOAD, false);
@@ -655,7 +651,7 @@ impl Rack {
         });
         if let Some(boundary) = self.fallback {
             self.departure_selection = None;
-            if after(end, boundary) {
+            if end.after(boundary) {
                 self.fallback = Some(end);
             }
             return;
@@ -677,7 +673,7 @@ impl Rack {
                     last += 1;
                 }
                 if (first..last).any(|i| {
-                    after(end, self.intervals[i].start) && after(self.intervals[i].end, start)
+                    end.after(self.intervals[i].start) && self.intervals[i].end.after(start)
                 }) {
                     for i in first..last {
                         self.intervals[i].original_retransmitted = true;
@@ -686,7 +682,7 @@ impl Rack {
                 first = last;
             }
             for r in &mut self.intervals {
-                if !after(start, r.start) && !after(r.end, end) {
+                if !start.after(r.start) && !r.end.after(end) {
                     r.set_stats_flag(SYN_PAYLOAD, false);
                     r.transmission_start = start;
                     r.transmission_end = end;
@@ -735,7 +731,7 @@ impl Rack {
         let mut all_credited = true;
         let mut fin_credited = false;
         for r in &mut self.intervals {
-            if !after(start, r.start) && !after(r.end, end) {
+            if !start.after(r.start) && !r.end.after(end) {
                 all_credited &= r.stats_flag(PACKET_DELIVERED);
                 fin_credited |= r.stats_flag(PACKET_DELIVERED) && r.stats_flag(PACKET_INCLUDES_FIN);
                 if !r.stats_flag(PACKET_DELIVERED) {
@@ -757,9 +753,9 @@ impl Rack {
             }
             let complete = self.intervals.range(start, end + 1).all(|r| {
                 r.departure_committed
-                    && (!after(r.end, ack)
+                    && (!r.end.after(ack)
                         || scoreboard.is_some_and(|s| {
-                            s.unsacked_bytes(if after(r.start, ack) { r.start } else { ack }, r.end)
+                            s.unsacked_bytes(if r.start.after(ack) { r.start } else { ack }, r.end)
                                 == 0
                         }))
             });
@@ -790,7 +786,7 @@ impl Rack {
     // the SYN is acknowledged. A subsequent data repair is a distinct packet.
     pub(crate) fn record_syn_payload(&mut self, start: Seq, end: Seq) {
         for r in &mut self.intervals {
-            if !after(start, r.start) && !after(r.end, end) {
+            if !start.after(r.start) && !r.end.after(end) {
                 r.set_stats_flag(SYN_PAYLOAD, true);
             }
         }
@@ -912,11 +908,11 @@ impl Rack {
         let mut sack_reordered = false;
         let mut cumulative_reordered = false;
         for r in &mut self.intervals {
-            let cumulative = !after(r.end, ack);
+            let cumulative = !r.end.after(ack);
             let covered = cumulative || scoreboard.unsacked_bytes(r.start, r.end) == 0;
-            let packet_complete = !after(r.transmission_end, ack)
+            let packet_complete = !r.transmission_end.after(ack)
                 || scoreboard.unsacked_bytes(
-                    if after(r.transmission_start, ack) {
+                    if r.transmission_start.after(ack) {
                         r.transmission_start
                     } else {
                         ack
@@ -930,7 +926,7 @@ impl Rack {
                 }
                 if !r.original_retransmitted
                     && let Some(fack) = self.fack
-                    && after(fack, r.end)
+                    && fack.after(r.end)
                 {
                     self.reordering_seen = true;
                     self.reordering = self
@@ -940,12 +936,12 @@ impl Rack {
                     // aggregate each evidence stage, not its split intervals;
                     // cumulative filling refers to the pre-ACK frontier.
                     if cumulative {
-                        cumulative_reordered |= prior_fack.is_some_and(|old| after(old, r.end));
+                        cumulative_reordered |= prior_fack.is_some_and(|old| old.after(r.end));
                     } else {
                         sack_reordered = true;
                     }
                 }
-                if self.fack.is_none_or(|old| after(r.end, old)) {
+                if self.fack.is_none_or(|old| r.end.after(old)) {
                     self.fack = Some(r.end);
                 }
                 let rtt = now.saturating_sub(r.sent);
@@ -983,8 +979,8 @@ impl Rack {
             }
             // Karn: retransmissions can advance RACK, not the ordinary RTT estimator.
         }
-        self.intervals.retain(|r| after(r.end, ack));
-        if self.dsack_round.is_some_and(|end| !after(end, ack)) {
+        self.intervals.retain(|r| r.end.after(ack));
+        if self.dsack_round.is_some_and(|end| !end.after(ack)) {
             self.dsack_round = None;
         }
         if dsack && self.dsack_round.is_none() {
@@ -1326,7 +1322,7 @@ pub(crate) mod tests {
     pub(crate) fn original_packet(rack: &Rack, start: Seq) -> Option<(Seq, Seq, u64, bool)> {
         rack.intervals
             .iter()
-            .find(|r| !after(r.start, start) && after(r.end, start))
+            .find(|r| !r.start.after(start) && r.end.after(start))
             .map(|r| {
                 (
                     r.original_wire_start,
@@ -1693,7 +1689,7 @@ pub(crate) mod tests {
         assert!(
             rack.intervals
                 .iter()
-                .filter(|r| !after(Seq(4), r.start) && !after(r.end, Seq(20)))
+                .filter(|r| !Seq(4).after(r.start) && !r.end.after(Seq(20)))
                 .all(|r| r.successful_retries == 1 && r.retransmitted && r.loss_response_pending)
         );
         rack.abandon(Seq(24));

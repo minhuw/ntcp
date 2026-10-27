@@ -305,7 +305,7 @@ fn cubic_ecn_prr_loss_ending_ack_starts_new_logical_event() {
         for _ in 0..3 {
             packet(&mut a, 71);
         }
-        assert!(after(a.snd_nxt, end.wrapping_add(1000)));
+        assert!(a.snd_nxt.after(end.wrapping_add(1000)));
         let now = if rollback {
             pending_verification_rollback(&mut a, 500)
         } else {

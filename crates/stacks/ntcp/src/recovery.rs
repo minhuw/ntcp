@@ -886,12 +886,10 @@ impl Congestion {
         flight_after_ack: u32,
         ece: bool,
     ) -> bool {
-        if self.retransmitted_end.is_some_and(|end| {
-            matches!(
-                ack.serial_cmp(end),
-                Some(Ordering::Equal | Ordering::Greater)
-            )
-        }) {
+        if self
+            .retransmitted_end
+            .is_some_and(|end| ack.at_or_after(end))
+        {
             self.retransmitted_end = None;
         }
         self.observe_ack(ack);
@@ -900,10 +898,7 @@ impl Congestion {
         }
         self.reset_duplicate_acks();
         self.timeout_retransmitted = false;
-        if self
-            .tlp_reduction_end
-            .is_some_and(|end| ack.serial_cmp(end) == Some(Ordering::Greater))
-        {
+        if self.tlp_reduction_end.is_some_and(|end| ack.after(end)) {
             self.tlp_reduction_end = None;
         }
         let relation = self.recover.and_then(|recover| ack.serial_cmp(recover));
@@ -991,10 +986,7 @@ impl Congestion {
         if self.probe_response.is_some() {
             return false; // Repair completed, but trailing flight still needs proof.
         }
-        if self
-            .ecn_end
-            .is_some_and(|end| ack.serial_cmp(end) == Some(Ordering::Greater))
-        {
+        if self.ecn_end.is_some_and(|end| ack.after(end)) {
             self.ecn_end = None;
         }
         if ece || self.ecn_prr.is_some() {
@@ -1077,19 +1069,12 @@ impl Congestion {
     pub(crate) fn on_tlp_repair(&mut self, ack: Seq, flight: u32, highest_sent: Seq) -> bool {
         self.commit_probe_response();
         if self.in_recovery()
-            || self
-                .recover
-                .is_some_and(|end| ack.serial_cmp(end) != Some(Ordering::Greater))
-            || self
-                .tlp_reduction_end
-                .is_some_and(|end| ack.serial_cmp(end) != Some(Ordering::Greater))
+            || self.recover.is_some_and(|end| !ack.after(end))
+            || self.tlp_reduction_end.is_some_and(|end| !ack.after(end))
         {
             return false;
         }
-        if self
-            .ecn_end
-            .is_some_and(|end| ack.serial_cmp(end) == Some(Ordering::Greater))
-        {
+        if self.ecn_end.is_some_and(|end| ack.after(end)) {
             self.ecn_end = None;
         }
         if self.ecn_end.is_none() {
@@ -1130,27 +1115,15 @@ impl Congestion {
     ) -> bool {
         if self.sack_recovery
             || self.fast_recovery
-            || self.recover.is_some_and(|end| {
-                !matches!(
-                    ack.serial_cmp(end),
-                    Some(Ordering::Equal | Ordering::Greater)
-                )
-            })
+            || self.recover.is_some_and(|end| !ack.at_or_after(end))
         {
             return false;
         }
         self.end_ecn_prr();
-        if self
-            .ecn_end
-            .is_some_and(|end| ack.serial_cmp(end) == Some(Ordering::Greater))
-        {
+        if self.ecn_end.is_some_and(|end| ack.after(end)) {
             self.ecn_end = None;
         }
-        if self.ecn_end.is_none()
-            && self
-                .tlp_reduction_end
-                .is_none_or(|end| ack.serial_cmp(end) == Some(Ordering::Greater))
-        {
+        if self.ecn_end.is_none() && self.tlp_reduction_end.is_none_or(|end| ack.after(end)) {
             if let Some(start) = probe {
                 self.begin_probe_response(start, flight);
             } else {
@@ -1173,8 +1146,7 @@ impl Congestion {
     // The deduplication marker can outlive the active epoch after recovery/FIN ACKs.
     // Equality remains active, independently of the next fresh packet's CWR signal.
     pub(crate) fn in_ecn_response(&self, snd_una: Seq) -> bool {
-        self.ecn_end
-            .is_some_and(|end| snd_una.serial_cmp(end) != Some(Ordering::Greater))
+        self.ecn_end.is_some_and(|end| !snd_una.after(end))
     }
 
     pub(crate) fn in_recovery(&self) -> bool {
@@ -1314,10 +1286,7 @@ impl Congestion {
     //# Acknowledgment field results in a sequence wraparound that affects the ordering between the
     //# Cumulative Acknowledgment field and the state variable recover.
     pub(crate) fn observe_ack(&mut self, ack: Seq) {
-        if self
-            .initial_recover
-            .is_some_and(|end| ack.serial_cmp(end) == Some(Ordering::Greater))
-        {
+        if self.initial_recover.is_some_and(|end| ack.after(end)) {
             // Clear on the first bounded advancement; never retain a stale ISS
             // across half-space or subsequent sequence wraps.
             self.initial_recover = None;
@@ -1328,7 +1297,7 @@ impl Congestion {
     // the previous SND.UNA, including ISS before the SYN is acknowledged.
     // Internal split processing of a TFO ACK must call this only once.
     pub(crate) fn observe_ack_advance(&mut self, previous: Seq, ack: Seq) {
-        if ack.serial_cmp(previous) == Some(Ordering::Greater) {
+        if ack.after(previous) {
             self.ack_history = Some((previous, ack));
             self.observe_ack(ack);
         }
@@ -1488,15 +1457,9 @@ impl Congestion {
     //# of 1 SMSS.
     pub(crate) fn on_ecn(&mut self, ack: Seq, flight: u32, highest_sent: Seq) -> bool {
         self.commit_probe_response();
-        if self
-            .tlp_reduction_end
-            .is_some_and(|end| ack.serial_cmp(end) != Some(Ordering::Greater))
-            || self
-                .ecn_end
-                .is_some_and(|end| ack.serial_cmp(end) != Some(Ordering::Greater))
-            || self
-                .recover
-                .is_some_and(|end| ack.serial_cmp(end) != Some(Ordering::Greater))
+        if self.tlp_reduction_end.is_some_and(|end| !ack.after(end))
+            || self.ecn_end.is_some_and(|end| !ack.after(end))
+            || self.recover.is_some_and(|end| !ack.after(end))
         {
             return false;
         }
@@ -1592,10 +1555,7 @@ impl Congestion {
     // covering it covers all retransmissions (live spans must remain below 2^31).
     // This conservatively tracks unacknowledged retransmissions, not SACK delivery.
     pub(crate) fn on_retransmit(&mut self, end: Seq) {
-        if self
-            .retransmitted_end
-            .is_none_or(|old| end.serial_cmp(old) == Some(Ordering::Greater))
-        {
+        if self.retransmitted_end.is_none_or(|old| end.after(old)) {
             self.retransmitted_end = Some(end);
         }
     }

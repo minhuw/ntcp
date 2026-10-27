@@ -76,9 +76,6 @@ pub(crate) struct Pmtud {
     verification: Option<(u32, Instant, u64, u64)>,
 }
 
-fn covered(ack: Seq, end: Seq) -> bool {
-    ack.distance_from(end) < 1 << 31
-}
 fn overlaps(a: Seq, b: Seq, c: Seq, d: Seq) -> bool {
     a.in_window(c, d.distance_from(c)) == Some(true)
         || c.in_window(a, b.distance_from(a)) == Some(true)
@@ -307,7 +304,7 @@ impl Pmtud {
     }
 
     pub fn take_probe_outcome(&mut self, ack: Seq) -> Option<ProbeOutcome> {
-        if self.outcome.is_some_and(|o| covered(ack, o.end)) {
+        if self.outcome.is_some_and(|o| ack.at_or_after(o.end)) {
             self.outcome.take()
         } else {
             None
@@ -335,7 +332,7 @@ impl Pmtud {
             && !p.loss_reported
             && !p.retried
             && !p.timeout
-            && covered(end, p.trailing_end)
+            && end.at_or_after(p.trailing_end)
         {
             // Retain the minimum trailing requirement and all flight emitted
             // before loss. Recovery/replenishment must not move proof forever.
@@ -352,10 +349,10 @@ impl Pmtud {
                     p.retried = true;
                     // A second copy of already repaired gap bytes is another
                     // loss, unlike the next smaller segment of a split repair.
-                    if start != p.repair_end && covered(p.repair_end, start) {
+                    if start != p.repair_end && p.repair_end.at_or_after(start) {
                         p.other_loss = true;
                     }
-                    if covered(end, p.repair_end) {
+                    if end.at_or_after(p.repair_end) {
                         p.repair_end = end;
                     }
                 }
@@ -823,14 +820,17 @@ impl Pmtud {
     //# interpreted as congestion signal.
 
     pub fn ack(&mut self, ack: Seq, now: Instant, cooldown: u64, rto: u64) {
-        if self.repair_range.is_some_and(|(_, end)| covered(ack, end)) {
+        if self
+            .repair_range
+            .is_some_and(|(_, end)| ack.at_or_after(end))
+        {
             self.repair_range = None;
         }
         self.pending = None;
         self.icmp_since_progress = false;
         for entry in &mut self.sent {
             if let Some(packet) = entry
-                && covered(ack, packet.end)
+                && ack.at_or_after(packet.end)
             {
                 if !packet.ambiguous {
                     self.max_acked = self.max_acked.max(packet.size);
@@ -857,7 +857,7 @@ impl Pmtud {
             .verification
             .is_some_and(|(_, since, _, _)| now.saturating_sub(since) >= rto.saturating_mul(2));
         if let Some(p) = self.probe {
-            if !p.retried && !p.timeout && covered(ack, p.end) {
+            if !p.retried && !p.timeout && ack.at_or_after(p.end) {
                 //= https://www.rfc-editor.org/rfc/rfc4821#section-7.6.1
                 //# Set search_low to the probe
                 //# size.  If the probe size is larger than the eff_pmtu, raise eff_pmtu
@@ -873,7 +873,7 @@ impl Pmtud {
                     self.info.current_mtu = p.size;
                 }
                 self.probe = None;
-            } else if covered(ack, p.trailing_end) {
+            } else if ack.at_or_after(p.trailing_end) {
                 self.outcome = Some(ProbeOutcome {
                     start: p.start,
                     end: p.trailing_end,

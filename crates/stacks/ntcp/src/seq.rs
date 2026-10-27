@@ -21,6 +21,19 @@ impl Seq {
         }
     }
 
+    // False at a distance of exactly 2^31, where the order is undefined.
+    pub(crate) fn after(self, other: Self) -> bool {
+        self.serial_cmp(other) == Some(Ordering::Greater)
+    }
+
+    // False at a distance of exactly 2^31, where the order is undefined.
+    pub(crate) fn at_or_after(self, other: Self) -> bool {
+        matches!(
+            self.serial_cmp(other),
+            Some(Ordering::Equal | Ordering::Greater)
+        )
+    }
+
     pub(crate) fn wrapping_add(self, amount: u32) -> Self {
         Self(self.0.wrapping_add(amount))
     }
@@ -60,6 +73,40 @@ mod tests {
             assert_eq!(Seq(a).serial_cmp(Seq(b)), None);
             assert_eq!(Seq(b).serial_cmp(Seq(a)), None);
         }
+    }
+
+    #[test]
+    fn after_and_at_or_after() {
+        for base in [Seq(0), Seq(42), Seq(u32::MAX)] {
+            assert!(!base.after(base));
+            assert!(base.at_or_after(base));
+            for distance in [1, 0x7fff_ffff] {
+                let later = base.wrapping_add(distance);
+                assert!(later.after(base));
+                assert!(later.at_or_after(base));
+                assert!(!base.after(later));
+                assert!(!base.at_or_after(later));
+            }
+            // Exactly half the space apart, neither side is ahead.
+            let opposite = base.wrapping_add(0x8000_0000);
+            assert!(!opposite.after(base));
+            assert!(!opposite.at_or_after(base));
+            assert!(!base.after(opposite));
+            assert!(!base.at_or_after(opposite));
+            // Past half the space, the order flips.
+            let beyond = base.wrapping_add(0x8000_0001);
+            assert!(!beyond.after(base));
+            assert!(!beyond.at_or_after(base));
+            assert!(base.after(beyond));
+            assert!(base.at_or_after(beyond));
+        }
+        // Across the u32 wrap.
+        assert!(Seq(0).after(Seq(u32::MAX)));
+        assert!(Seq(0).at_or_after(Seq(u32::MAX)));
+        assert!(!Seq(u32::MAX).after(Seq(0)));
+        assert!(!Seq(u32::MAX).at_or_after(Seq(0)));
+        assert!(Seq(5).after(Seq(u32::MAX - 5)));
+        assert!(!Seq(u32::MAX - 5).at_or_after(Seq(5)));
     }
 
     #[test]

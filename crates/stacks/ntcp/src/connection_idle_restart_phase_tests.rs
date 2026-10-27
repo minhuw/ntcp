@@ -66,7 +66,7 @@ fn established_ca(iss: u32) -> (Connection, u64) {
         now += 100_000;
         advance_to(&mut a, now - 1);
         let ack = base.wrapping_add(step * 2000);
-        assert!(!after(ack, a.snd_nxt));
+        assert!(!ack.after(a.snd_nxt));
         inject(&mut a, now, Seq(1), ack, ACK, 514, &[]);
         assert!(!a.congestion.in_recovery() && a.prr.is_none());
         drain(&mut a, now);
@@ -122,7 +122,7 @@ fn actual_idle_restart_returns_to_standard_ss_after_scalar_and_reserved_output()
             assert_eq!(a.congestion.cwnd(), window);
             assert_eq!(a.congestion.ssthresh(), threshold);
             let ack = base.wrapping_add(2000);
-            assert!(!after(ack, a.snd_nxt));
+            assert!(!ack.after(a.snd_nxt));
             inject(&mut a, at + 100_000, Seq(1), ack, ACK, 514, &[]);
             assert_eq!(a.congestion.cwnd(), window + 1000);
             assert_eq!(a.congestion.ssthresh(), threshold);
@@ -161,7 +161,7 @@ fn no_idle_restart_preserves_cubic_growth_after_the_same_bulk_flow() {
     assert!(drain(&mut a, at) > a.restart_window() as usize);
     assert_eq!(a.congestion.cwnd(), before);
     let ack = base.wrapping_add(2000);
-    assert!(!after(ack, a.snd_nxt));
+    assert!(!ack.after(a.snd_nxt));
     inject(&mut a, at + 100_000, Seq(1), ack, ACK, 514, &[]);
     assert!(a.congestion.cwnd() > before && a.congestion.cwnd() < before + 1000);
 }

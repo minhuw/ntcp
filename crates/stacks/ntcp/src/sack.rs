@@ -138,14 +138,10 @@ impl Scoreboard {
         let mut old_bytes = 0;
         for index in 0..self.len {
             let (left, right) = self.ranges[index];
-            if right.serial_cmp(ack) != Some(Ordering::Greater) {
+            if !right.after(ack) {
                 continue;
             }
-            let left = if left.serial_cmp(ack) == Some(Ordering::Greater) {
-                left
-            } else {
-                ack
-            };
+            let left = if left.after(ack) { left } else { ack };
             self.ranges[count] = (left, right);
             count += 1;
             old_bytes += right.distance_from(left);
@@ -198,11 +194,8 @@ impl Scoreboard {
             let size = right.distance_from(left);
             let below = size > 0
                 && size < HALF_SPACE
-                && left.serial_cmp(packet_ack) == Some(Ordering::Less)
-                && matches!(
-                    right.serial_cmp(packet_ack),
-                    Some(Ordering::Less | Ordering::Equal)
-                );
+                && packet_ack.after(left)
+                && packet_ack.at_or_after(right);
             let contained = match (valid(blocks[0]), valid(blocks[1])) {
                 (Some((a, b)), Some((c, d))) => {
                     a.distance_from(packet_ack) >= c.distance_from(packet_ack)
@@ -217,13 +210,9 @@ impl Scoreboard {
                 continue;
             }
             if let Some((left, right)) = valid(block)
-                && right.serial_cmp(ack) == Some(Ordering::Greater)
+                && right.after(ack)
             {
-                let left = if left.serial_cmp(ack) == Some(Ordering::Greater) {
-                    left
-                } else {
-                    ack
-                };
+                let left = if left.after(ack) { left } else { ack };
                 self.ranges[count] = (left, right);
                 count += 1;
             }
@@ -281,11 +270,7 @@ impl Scoreboard {
         let bytes: u64 = ranges
             .iter()
             .map(|&(left, right)| {
-                let start = if left.serial_cmp(above) == Some(Ordering::Greater) {
-                    left
-                } else {
-                    above
-                };
+                let start = if left.after(above) { left } else { above };
                 u64::from(right.distance_from(start))
             })
             .sum();
@@ -305,10 +290,10 @@ impl Scoreboard {
             while index < self.len {
                 let (left, right) = self.ranges[index];
                 index += 1;
-                if right.serial_cmp(ack) != Some(Ordering::Greater) {
+                if !right.after(ack) {
                     continue;
                 }
-                let start = if left.serial_cmp(ack) == Some(Ordering::Greater) {
+                let start = if left.after(ack) {
                     left.distance_from(ack).min(span)
                 } else {
                     0
@@ -359,7 +344,7 @@ impl Scoreboard {
     //# twice by the above mechanism.
     pub(crate) fn pipe(&self, ack: Seq, high_data: Seq, high_rxt: Seq, mss: u32) -> u32 {
         let span = high_data.distance_from(ack);
-        let retransmitted = if high_rxt.serial_cmp(ack) == Some(Ordering::Greater) {
+        let retransmitted = if high_rxt.after(ack) {
             high_rxt.distance_from(ack).min(span)
         } else {
             0

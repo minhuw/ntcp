@@ -1,6 +1,4 @@
 //! RFC 9406 initial slow start. Times are unsmoothed caller-clock ticks.
-use core::cmp::Ordering;
-
 use crate::{connection::CallerTimebase, seq::Seq};
 
 // Explicit non-paced startup policy: admit credit for coalesced ACKs up to
@@ -114,12 +112,7 @@ impl HyStart {
         } else {
             eligible_bytes.min(mss.saturating_mul(UNPACED_ACK_LIMIT))
         };
-        if self.unpaced_end.is_some_and(|end| {
-            matches!(
-                ack.serial_cmp(end),
-                Some(Ordering::Equal | Ordering::Greater)
-            )
-        }) {
+        if self.unpaced_end.is_some_and(|end| ack.at_or_after(end)) {
             self.unpaced_end = None;
         }
         // Entry ACK grows in standard SS; fallback ACK still grows in CSS.
@@ -217,10 +210,7 @@ impl HyStart {
                 }
             }
         }
-        if matches!(
-            ack.serial_cmp(end),
-            Some(Ordering::Equal | Ordering::Greater)
-        ) {
+        if ack.at_or_after(end) {
             if self.baseline.is_some() {
                 //= https://www.rfc-editor.org/rfc/rfc9406#section-4.2
                 //= reason=The partial entry round counts towards five completed CSS rounds.
@@ -244,8 +234,7 @@ impl HyStart {
             self.last_min = self.current_min;
             self.current_min = None;
             self.samples = 0;
-            self.window_end = (context.snd_nxt.serial_cmp(ack) == Some(Ordering::Greater))
-                .then_some(context.snd_nxt);
+            self.window_end = context.snd_nxt.after(ack).then_some(context.snd_nxt);
         }
         (increase, false)
     }

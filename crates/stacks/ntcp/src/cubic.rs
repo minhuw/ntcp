@@ -2,8 +2,6 @@
 //! Recovery, ECN epochs and PRR remain owned by Congestion/Connection.
 //! Source: https://www.rfc-editor.org/rfc/rfc9438 (published text).
 
-use core::cmp::Ordering;
-
 use crate::{connection::CallerTimebase, seq::Seq};
 
 const WINDOW_SCALE: u128 = 1 << 32;
@@ -130,12 +128,7 @@ impl Cubic {
         self.rtt = rtt.unwrap_or(0);
         let start = ack.wrapping_add(0u32.wrapping_sub(acked));
         self.acked = self.growth_prefix(start, acked);
-        if self.limited_end.is_some_and(|end| {
-            matches!(
-                ack.serial_cmp(end),
-                Some(Ordering::Equal | Ordering::Greater)
-            )
-        }) {
+        if self.limited_end.is_some_and(|end| ack.at_or_after(end)) {
             self.limited_end = None;
             self.active = false;
         }
@@ -149,7 +142,7 @@ impl Cubic {
     // The committed full-flight boundary can lie inside that interval.
     pub(crate) fn growth_prefix(&self, start: Seq, bytes: u32) -> u32 {
         self.limited_end.map_or(0, |end| {
-            if end.serial_cmp(start) == Some(Ordering::Greater) {
+            if end.after(start) {
                 bytes.min(end.distance_from(start))
             } else {
                 0

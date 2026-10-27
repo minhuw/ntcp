@@ -838,7 +838,7 @@ fn unsupported_bulk_prefix_enters_rfc9406_css_before_legacy_hystart_exit() {
             let now = 100_000 + step * 100_000;
             advance(&mut a, now - 1);
             let ack = Seq(1 + step as u32 * 2000);
-            assert!(!after(ack, a.snd_nxt));
+            assert!(!ack.after(a.snd_nxt));
             inject(&mut a, now, Seq(1), ack, ACK, 514, &[]);
             let startup = a.congestion.startup_state().unwrap();
             assert!(a.prr.is_none() && !a.congestion.in_recovery());

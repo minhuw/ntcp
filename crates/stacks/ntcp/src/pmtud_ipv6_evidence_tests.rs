@@ -197,7 +197,7 @@ fn ipv6_below_proven_ptb_progress_clears_but_head_rto_applies() {
             receive(&mut b, expiry, &repair);
             let una = a.snd_una;
             deliver(&mut b, &mut a, expiry + 1);
-            assert!(after(a.snd_una, una));
+            assert!(a.snd_una.after(una));
         }
     }
 }
@@ -413,12 +413,12 @@ fn lost_probe_repairs(iss: u32, smaller_ptb: bool) {
         }
         receive(&mut b, now, &frame);
         deliver(&mut b, &mut a, now);
-        if a.pmtud.as_ref().unwrap().probe.is_none() && !after(probe.end, a.snd_una) {
+        if a.pmtud.as_ref().unwrap().probe.is_none() && !probe.end.after(a.snd_una) {
             break;
         }
     }
     assert!(repairs >= 2);
-    assert!(!after(probe.end, a.snd_una));
+    assert!(!probe.end.after(a.snd_una));
     assert!(a.pmtud.as_ref().unwrap().probe.is_none());
     assert_eq!(a.path_mtu_info().unwrap().current_mtu, 1280);
     if !smaller_ptb {
@@ -514,7 +514,7 @@ fn ipv6_same_prefix_proxy_wire_path_does_not_bypass_downstream_ptb() {
         assert_eq!(a.path_mtu_info().unwrap().first_hop_mtu, 1500);
         assert_eq!(a.path_mtu_info().unwrap().current_mtu, 1280);
         for attempt in 0..4 {
-            if !after(end, a.snd_una) {
+            if !end.after(a.snd_una) {
                 break;
             }
             let now = if attempt == 0 {
