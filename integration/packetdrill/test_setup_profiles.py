@@ -129,14 +129,14 @@ class SetupProfiles(unittest.TestCase):
 
     def test_linux_cookie_explicit_listener_setup_and_capability_metadata(self):
         from run import (LINUX_COOKIE_OPTION, LINUX_COOKIE_SCRIPTS,
-                         LINUX_COOKIE_SETTINGS, IMPLICIT_TFO_LISTENER_SCRIPTS, CUSTOM_TFO_SOURCES, preflight, tcp_info_only)
+                         LINUX_COOKIE_SETTINGS, IMPLICIT_TFO_LISTENER_SCRIPTS, CUSTOM_TFO_SCRIPTS, preflight, tcp_info_only)
         directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
         if not directory.is_dir():
             self.skipTest('pinned checkout unavailable')
         manifest = json.loads((HERE / 'adaptations.json').read_text())
         self.assertEqual({name for name, entry in manifest['scripts'].items()
                           if LINUX_COOKIE_OPTION in entry['adapter_flags'].split(',')},
-                         LINUX_COOKIE_SCRIPTS | CUSTOM_TFO_SOURCES.keys())
+                         LINUX_COOKIE_SCRIPTS | CUSTOM_TFO_SCRIPTS)
         for name in sorted(LINUX_COOKIE_SCRIPTS):
             entry = manifest['scripts'][name]
             source = (directory / name).read_bytes()
@@ -180,11 +180,11 @@ class SetupProfiles(unittest.TestCase):
 
     def test_fastopen_pmtud_only_two_exact_setup_mappings(self):
         from run import (FASTOPEN_PMTUD_OPTION, FASTOPEN_PMTUD_SCRIPTS,
-                         FASTOPEN_PMTUD_SETTINGS, ROUTE_SCRIPT, preflight)
+                         FASTOPEN_PMTUD_SETTINGS, preflight)
         manifest = json.loads((HERE / 'adaptations.json').read_text())
         self.assertEqual({name for name, entry in manifest['scripts'].items()
                           if FASTOPEN_PMTUD_OPTION in entry['adapter_flags'].split(',')},
-                         FASTOPEN_PMTUD_SCRIPTS | {ROUTE_SCRIPT})
+                         FASTOPEN_PMTUD_SCRIPTS | {'mtu_probe/basic-v4.pkt'})
         self.assertEqual(len(FASTOPEN_PMTUD_SCRIPTS), 2)
         directory = HERE.parent.parent / 'workbench/packetdrill-upstream' / PIN['tcp_tests']
         if not directory.is_dir():

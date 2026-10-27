@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from expectations import NATIVE_SETUP_SCRIPTS, PORTED_EXCLUSION, PORTED_SCRIPTS, apply_expectations, digest, load_expectations
-from run import HERE, PIN, adapt_source, main, preflight, select_cases
+from run import HERE, PIN, adapt_source, enabled_controls, main, preflight, select_cases
 
 
 class AccountingExpectations(unittest.TestCase):
@@ -58,7 +58,7 @@ class AccountingExpectations(unittest.TestCase):
             self.assertFalse(any('assertion bytes remain unchanged' in reason
                                  or 'original timing bounds remain unchanged' in reason
                                  for reason in changed['mapping']['reasons']))
-            self.assertEqual(preflight(derived.decode(), True, route_control=changed.get('route_control') is True), [])
+            self.assertEqual(preflight(derived.decode(), True, enabled_controls(changed)), [])
             self.assertEqual(changed['mapping']['ntcp_settings'], audit['mapping']['ntcp_settings'])
         original, audit = self.generated('notsent_lowat/notsent-lowat-setsockopt.pkt')
         self.assertEqual(apply_expectations(HERE, 'notsent_lowat/notsent-lowat-setsockopt.pkt', original, audit, self.manifest), (original, audit))
@@ -175,7 +175,7 @@ class AccountingExpectations(unittest.TestCase):
         self.assertIn('4001:4987(986)', derived)
         self.assertIn('4987:5973(986)', derived)
         self.assertIn('5973:6001(28)', derived)
-        self.assertEqual(preflight(derived, route_control=True), [])
+        self.assertEqual(preflight(derived, controls=('route_control',)), [])
         self.assertTrue(preflight(derived))
         self.assertEqual(changed['expectation_adjustment']['expectation_kind'], 'ntcp-transport-policy')
 

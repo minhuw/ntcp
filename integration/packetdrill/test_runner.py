@@ -14,8 +14,8 @@ from unittest.mock import patch
 
 from expectations import PORTED_SCRIPTS
 
-from run import (COOKIELESS_CLIENT_SCRIPT, SYNACK_DATA_SCRIPT, ROUTE_SCRIPT, LISTENER_ASSERT_SCRIPT, TFO_PERMISSION_SOURCES, CACHE_FLUSH_SCRIPT, SYN_DATA_ACK_SCRIPTS, TIMESTAMP_SOURCES, RESOURCE_SCRIPT, RESOURCE_EVENT, RESOURCE_CONTROL, SLOW_START_ACK_SCRIPTS, FASTOPEN_CLIENT_SCRIPTS, NON_TFO_SETUP_COMMANDS, ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
-                 fixture_command, HERE, PIN, adapt_source, check_plugin_hash, invoke, main, outcome,
+from run import (AUDITED_CONTROLS, CUSTOM_TFO_SCRIPTS, SYN_DATA_ACK_SCRIPTS, SLOW_START_ACK_SCRIPTS, FASTOPEN_CLIENT_SCRIPTS, NON_TFO_SETUP_COMMANDS, ADAPTIVE_ACK_SCRIPTS, FASTOPEN_PMTUD_SCRIPTS, LINUX_COOKIE_SCRIPTS, FIXTURE_CHILD, FIXTURE_UNSUPPORTED, SENDFILE_FIXTURE, SENDFILE_SETUP,
+                 fixture_command, HERE, PIN, adapt_source, check_plugin_hash, enabled_controls, invoke, main, outcome,
                  preflight, profile_metadata, select_cases, variants, verify_backend)
 
 
@@ -503,20 +503,9 @@ class AdaptationChecks(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name) / PIN['tcp_tests']
         self.manifest = json.loads((HERE / 'adaptations.json').read_text())
-        # Timed resource commands require the exact real source/hash and have
-        # separate capability tests; generic synthetic sources cannot enable it.
-        self.manifest['scripts'].pop(ROUTE_SCRIPT)
-        self.manifest['scripts'].pop(RESOURCE_SCRIPT)
-        self.manifest['scripts'].pop(SYNACK_DATA_SCRIPT)
-        self.manifest['scripts'].pop(COOKIELESS_CLIENT_SCRIPT)  # Exact dynamic source has its own audit tests.
-        self.manifest['scripts'].pop(CACHE_FLUSH_SCRIPT)
-        self.manifest['scripts'].pop(LISTENER_ASSERT_SCRIPT)
-        from run import COOKIELESS_SERVER_SETUP, CUSTOM_TFO_SOURCES
-        for name in CUSTOM_TFO_SOURCES.keys() | COOKIELESS_SERVER_SETUP.keys():
-            self.manifest['scripts'].pop(name)
-        for name in TFO_PERMISSION_SOURCES:
-            self.manifest['scripts'].pop(name)
-        for name in TIMESTAMP_SOURCES:
+        # Audited control scripts require the exact real source/hash and have
+        # separate table-driven tests; generic synthetic sources cannot enable them.
+        for name in AUDITED_CONTROLS:
             self.manifest['scripts'].pop(name)
         # Synthetic generic sources have no IPv6-only filename constraints.
         for name in list(self.manifest['scripts']):
@@ -881,8 +870,7 @@ class AdaptationChecks(unittest.TestCase):
                    if 'budget128m' in entry['mapping']['option_reasons']}
         retained = reasons.pop('zerocopy/fastopen-client.pkt')
         self.assertIn('Two client connections retain', retained)
-        from run import CUSTOM_TFO_SOURCES
-        for name in CUSTOM_TFO_SOURCES:
+        for name in CUSTOM_TFO_SCRIPTS:
             self.assertIn('TIME_WAIT storage', reasons.pop(name))
         self.assertEqual(len(reasons), 6)
         self.assertTrue(all('SO_SNDBUF=200000' in reason and 'staged' in reason for reason in reasons.values()))
@@ -1334,7 +1322,7 @@ class PublishedSelectionChecks(unittest.TestCase):
                         expected = expected.replace(entry['restore_line'].encode(),
                                                     entry['restore_replacement_line'].encode(), 1)
                     self.assertEqual(generated, expected)
-                    self.assertEqual(preflight(generated.decode(), entry.get('embedded_tcp_info') is True, resource_control=entry.get('resource_control') is True), [])
+                    self.assertEqual(preflight(generated.decode(), entry.get('embedded_tcp_info') is True, enabled_controls(entry)), [])
                     self.assertEqual(audit['generated_sha256'], hashlib.sha256(generated).hexdigest())
                 self.assertEqual((self.directory / name).read_bytes(), source)
                 if name in DEFAULTS_ONLY_CUBIC | SLOW_START_ACK_SCRIPTS and b'SO_SNDBUF' in source:
@@ -1366,8 +1354,9 @@ class PublishedSelectionChecks(unittest.TestCase):
                     if 'restore_line' in entry:
                         restored = restored.replace(entry['restore_replacement_line'].encode(),
                                                     entry['restore_line'].encode(), 1)
-                    if name == RESOURCE_SCRIPT:
-                        restored = restored.replace(RESOURCE_CONTROL, RESOURCE_EVENT, 1)
+                    if name in AUDITED_CONTROLS:
+                        for event, local in AUDITED_CONTROLS[name]['events']:
+                            restored = restored.replace(local, event, 1)
                     self.assertEqual(restored, source)
                     self.assertIn('generated_sha256', audit)
                 self.assertFalse(entry['mapping']['linux_defaults_reproduced'])
@@ -1419,7 +1408,7 @@ class PublishedSelectionChecks(unittest.TestCase):
                                     self.manifest['scripts'][n]['adapter_flags'])[0] == path.read_bytes())
                     entry = self.manifest['scripts'][name]
                     self.assertFalse(entry.get('blocked_reasons'), name)
-                    self.assertEqual(preflight(path.read_text(), entry.get('embedded_tcp_info') is True, resource_control=entry.get('resource_control') is True), [])
+                    self.assertEqual(preflight(path.read_text(), entry.get('embedded_tcp_info') is True, enabled_controls(entry)), [])
                     if '--dry_run' not in argv:
                         executed.append(name)
                     return 1 if '--dry_run' not in argv else 0, False, 'diagnostic mismatch'
